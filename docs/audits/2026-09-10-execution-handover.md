@@ -30,27 +30,28 @@ Before edits, recheck HEAD/tree, dirt, fetched divergence and process ownership.
 Published review remains `00003b6f`; subsequent integration and Assistant work is
 local. Closeout documentation follows the code candidate.
 
-The current installed Assistant candidate is
-`fa297cb59a07971a472c6020586ea876fdc9a220`, tree
-`4c1eaa05448ab2de64c685df4872f7a7d23b245d`. It contains Sash's UI in the canonical
-Assistant capsule and protected v2 workspace adoption. The bounded Mac checkpoint
-passes one identity, canonical and legacy launch, real Qwen reply/save/reload,
-original draft/exact model preservation and full Runtime restart. Shutdown closed
-29 owned processes and the held HTTP connection. Runtime, capsule and served
-hashes match their current installation receipts. Providers, engine and the six
-admitted package files are reused. See
-[the convergence check](2026-09-11-assistant-convergence.md) for the acceptance
-mapping and the distinction between installed data and three-store fixture proof.
+The current installed candidate is `3c2f9a80012ff510449998f0b423a21c47ad2a98`,
+tree `6be3ed9cde01c6dea8850ebd6ac381c5f03a9480`. Runtime built/installed SHA-256
+is `1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666`.
+It preserves the accepted one-Assistant consolidation and adds pending Keep
+intent, normal Marketplace Models rows/details, shared theme tokens and distinct
+activity. Both existing Mac checkpoint Homes have matching receipts and all 84
+affected browser files match served bytes. One Runtime build; providers, engine
+and admitted Qwen package reused. Installed System Keep readback, actual Qwen
+reply/save/reload, original draft/exact model and owned restart pass. Pending
+Keep during preparation is source/rendered proof; the installed checks preserve
+existing admission. See [the convergence check](2026-09-11-assistant-convergence.md)
+for provenance, exact checks and acceptance limits.
 
-A separate fresh Mac human Home serves the same candidate and has a verified
-locally cached Qwen package. The user has enrolled a passkey account. The private
-checkpoint records its URL and receipt. Human review found stale release metadata
-for System and Marketplace; installer guard `822c4e3d` and corrected metadata now
-pass normal launches in the actual browser. Account and Profile data remain
-intact. Human Qwen admission and reply acceptance are next. The earlier recovery human Homes
-remain `1e320578`; existing user previews and public stage remain `d790a48e`.
-The original recovery, retry, reload, media reuse and Carrier cleanup receipts
-remain accepted. Full AUTH-01 human acceptance is still pending.
+Anders confirms Assistant works. His enrolled account, Profile and conversation
+data are preserved. Normal browser controls show the new System and Marketplace
+Models views with Qwen available on the device. The earlier System/Marketplace
+metadata repair and installer guard `822c4e3d` remain in place. Original recovery
+human Homes retain `1e320578`; existing public stage remains `d790a48e`. The private
+checkpoint records current process/port ownership; the old Linux preview tunnel
+was absent on this resume and was left unchanged. Original recovery, retry,
+reload, media reuse and Carrier cleanup receipts retain their exact earlier
+verdicts. Full AUTH-01 human acceptance remains pending.
 
 The full model donor `6972e165` is merged by `b318bfda`. Sash shelf history is
 reconciled by `37c82d4f`; Irzhy foundation `617796a9` (PR60 replacing PR57) is
@@ -60,10 +61,10 @@ work. The full old-tip merge proposal remains superseded. The
 [preservation check](2026-09-11-integration-preservation.md) accounts for all
 13 September contributor PRs and retains each remaining feature gate.
 
-This implementation checkpoint is closed at its bounded Mac result and waits
-for human acceptance. Linux needs the recorded additional disk headroom and a
+This user-feedback checkpoint closes at its bounded Mac result. Full human J3
+acceptance remains required. Linux needs the recorded additional disk headroom and a
 reviewed startup profile. Cold Carrier delivery, Marketplace handoff,
-retention/removal, remaining UI differences, Irzhy authority cutover and follow-up,
+safe removal, remaining UI differences, Irzhy authority cutover and follow-up,
 dedicated provider-host/J5 proof and full J1–J5 retain their dependency order and
 Required gates. Confirmed backend cancellation remains distinct from the accepted
 honest unknown result. Recurring monitoring remains paused; Jetson is deferred.

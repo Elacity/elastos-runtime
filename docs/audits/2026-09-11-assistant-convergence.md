@@ -30,7 +30,61 @@ run cursor and complete output history. Reload reads the same run; opening or
 switching modes creates no run. Chat and Studio keep separate drafts. An absent
 image/video offer produces the existing unavailable state.
 
-## Installed Mac result
+## Current model and activity follow-up
+
+Candidate `3c2f9a80012ff510449998f0b423a21c47ad2a98`, tree
+`6be3ed9cde01c6dea8850ebd6ac381c5f03a9480`, is installed on both existing Mac
+checkpoint Homes. Runtime built and installed SHA-256 is
+`1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666`.
+One affected Runtime build took 139 seconds. All 84 browser files in Assistant,
+System and Marketplace match source, installed and served hashes on each Home;
+current installation receipts bind the Runtime, components and capsule tree.
+Providers, engine and admitted model files were reused.
+
+| Reported behavior | Repair and target proof | Verdict |
+| --- | --- | --- |
+| Keep during preparation | Runtime saves principal/CID retention intent independently of admission. Eleven retention tests cover replay, restart, promotion, cancellation, failure and shared ownership; rendered System/Marketplace tests cover pending Keep and admission during its response. | Pass source and rendered; installed Homes reuse existing admission |
+| Saved local retention | Installed synthetic System toggles Keep, reads it back after refresh and restores the original choice. | Pass Mac installed |
+| Normal Models category and consistent controls | Existing Marketplace rows/details host typed model controls; shared theme tokens style System. Installed Marketplace and actual human System/Marketplace show Qwen available locally. | Pass Mac installed and observed human browser |
+| Repeated category headings | Single-category and Installed views keep one page heading; Discover keeps its section headings. Rendered category/layout checks pass. | Pass Mac rendered; human Models category observed |
+| Repeated Assistant activity | Summary owns current activity; expansion contains distinct history or visible model reasoning. Rendered reasoning/history tests pass. Actual installed Qwen run shows one initial status, then returns `4`. | Pass Mac rendered and installed |
+| Preserve replies, drafts and owned resources | Installed reply/save/reload preserves the original draft, exact model and legacy snapshots, with zero implicit runs. Updates close 13 synthetic and 15 human owned processes and release ports; restart succeeds. 148 synthetic and 147 human non-artifact files are byte-identical across installation. | Pass Mac installed |
+
+After the real Qwen run, the current candidate also closes all 29 owned processes,
+closes a held HTTP connection, releases its listener and restarts with the data-root
+lock released. This separate receipt binds cleanup to the new Runtime binary.
+
+Anders reports that Assistant works. The human Home keeps its enrolled account,
+Profile and conversation data. Its new Models views were checked through normal
+browser controls after the update. Keep was left at the user's existing choice.
+
+Model UI provenance is explicit: `b0c4c2f5` added the dedicated model screens in
+the integration work. The reviewed Sash and Irzhy snapshots contain no separate
+Models design. Repeated category headings are present in Sash's `f7c58625` and
+were retained by the adaptation; current Marketplace files matched donor
+`6972e165` before this repair. This follow-up reuses Sash's existing category and
+detail layout. The bounded donor review found no existing remedy to merge.
+
+Preparation writes and verifies a local model closure. Its byte counter can
+advance from already-local Content reads; it does not measure network traffic or
+RAM use. Keep protects Runtime's prepared cache from reclamation. A pending choice
+survives reconciliation and successful admission; settled cancellation, failure
+or expiry clears it when no matching pending/admitted operation remains. It does
+not pin IPFS or reserve model memory. The native engine starts or reuses its model
+when inference begins. Cold Content/Carrier availability and delivery remain
+Required; this run makes no new zero-transfer or remote-availability claim.
+
+Independent review accepts this bounded Mac result. First-failure diagnostics
+retain a stale retired-capsule test assumption, fixture timing/selectors, and
+installed script frame/selector repairs. No second Runtime build was needed.
+Existing image-load diagnostics remain recorded; this is not whole-UI acceptance.
+Linux candidate proof remains pending on disk headroom and its reviewed startup
+profile. Marketplace-to-Assistant exact selection handoff, safe removal, cold
+Carrier delivery, remaining contributor UI differences and full J1–J5/D1–D6
+keep their gates. Broader execution and monitoring remain paused. Publication,
+final package stamping and signing retain their existing approval/release gates.
+
+## Earlier Assistant consolidation proof
 
 Candidate `fa297cb59a07971a472c6020586ea876fdc9a220`, tree
 `4c1eaa05448ab2de64c685df4872f7a7d23b245d`, passes the bounded installed
@@ -60,12 +114,12 @@ old protected workspace bytes remain exact. The test intentionally saved new
 canonical messages and Home window state; readback proves their contents.
 A separate fresh Mac Home serves the same candidate for human passkey setup. Its
 Qwen package was imported from the verified local closure with zero network
-download; normal user enrollment and model admission remain to be exercised there.
+download. Subsequent enrollment and successful Assistant use are recorded in the current follow-up above.
 Existing human previews remain unchanged.
 
 Independent review accepts this bounded Mac result. Linux convergence remains
 pending on the recorded disk headroom and startup-profile requirements. Human
-acceptance, cold Carrier delivery, Marketplace handoff, retention/removal and
+acceptance of the complete journey, cold Carrier delivery, Marketplace handoff, safe removal and
 full cross-platform J3 retain their Required gates.
 
 ## Review and failure disposition

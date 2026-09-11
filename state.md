@@ -13,7 +13,7 @@ changes. The proposed full old-URUX-tip merge is superseded by review of concret
 remaining behavior differences. The remaining protected-content stack retains
 its source order and feature-preservation gates
 in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
-The approved Assistant consolidation `fa297cb5` now passes source, rendered and installed Mac checks: one identity, real Qwen reply/save/reload, original draft/model preservation and full Runtime restart. The separate human Home now has an enrolled passkey account. Human review exposed stale System/Marketplace archive metadata; guard `822c4e3d` and corrected installation receipts close that launch gap. Both apps open in the actual user browser, and Marketplace shows Qwen with Use available. Original UI parity beyond this slice and full cross-platform J3 acceptance remain open. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md).
+The approved Assistant consolidation `fa297cb5` now passes source, rendered and installed Mac checks: one identity, real Qwen reply/save/reload, original draft/model preservation and full Runtime restart. The separate human Home now has an enrolled passkey account. Human review exposed stale System/Marketplace archive metadata; guard `822c4e3d` and corrected installation receipts close that launch gap. Anders confirms Assistant works. Current candidate `3c2f9a80` adds Keep intent during preparation, ordinary Marketplace model rows/details, shared Models theme tokens and distinct Assistant activity. Both Mac Homes have matching Runtime `1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666` and 84 served browser artifact records. Installed System retention readback and a real Qwen reply/save/reload pass; the human Home shows Qwen available locally with account and data preserved. Pending preparation is covered by Runtime/rendered tests while installed proof reuses the existing model admission. Original UI parity beyond this slice and full cross-platform J3 acceptance remain open. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md).
 
 
 The earlier isolated Mac J3 receipt records Runtime `fbf1a4b0` with matching build,
@@ -888,7 +888,7 @@ complete. Installed proof and the atomic authority cutover remain open.
   saved/reloaded text and model selection, and owned shutdown/restart. Current
   build/installed/served receipts match. The new human Home has an enrolled passkey account and a locally cached
   Qwen package. System/Marketplace metadata repair `822c4e3d` passes actual
-  launch; human model admission and reply acceptance remain pending. Earlier Home Agent and standalone Assistant observations above are
+  launch. Anders now confirms successful Assistant use; current `3c2f9a80` also passes the bounded Models/activity follow-up described above. Full human J3 acceptance remains pending. Earlier Home Agent and standalone Assistant observations above are
   historical target receipts. Advanced tools, Library reads, search and broader Studio capabilities
   retain their typed-contract gates.
 
