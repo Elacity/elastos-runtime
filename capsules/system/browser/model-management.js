@@ -28,6 +28,11 @@
     } else check(!r.admitted && !r.kept && !r.dispatch_ready);
     return r;
   }
+  function formatBytes(bytes) {
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const rank = bytes ? Math.min(4, Math.floor(Math.log(bytes) / Math.log(1000))) : 0;
+    return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
+  }
   function element(tag, value, className) {
     const node = document.createElement(tag);
     if (value) node.textContent = value;
@@ -43,7 +48,7 @@
       dispatch_ready: output.dispatch_ready, offer_id: output.offer_id, preparation }, cid);
   }
   window.ElastosModelManagement = {
-    create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary" }) {
+    create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: selectedCid = null, compact = false }) {
       let visible = false, closed = false, generation = 0, busy = false, timer, reader;
       let model = null, methods = new Map(), message = "", loading = false, polls = 0;
       let unresolvedUse = null, reconcileRequired = false;
@@ -84,6 +89,7 @@
         check(entries.length <= 1 && (!entries.length || catalog.model_catalog_state === "verified"));
         if (!entries.length) return null;
         const entry = entries[0];
+        if (selectedCid && entry.cid !== selectedCid) return null;
         check(entry.role === "content" && entry.installed === false && entry.launchable === false
           && CID.test(entry.cid) && text(entry.title) && text(entry.publisher_did, 256)
           && entry.publisher_did.startsWith("did:") && entry.signature_state === "catalog-signature-verified"
@@ -166,11 +172,14 @@
           if (epoch !== generation || !show() || model?.cid !== cid) return;
           check(result.cid === cid);
           if (operation === "retention") {
-            check(result.kept === keep && result.admitted === true);
-            // Keep is confirmed only by the current caller's Runtime response.
-            const candidate = operationRuntime(result, cid, model.model_runtime.preparation);
-            check(candidate.kept === keep);
-            model.model_runtime = candidate;
+            check(result.kept === keep && typeof result.admitted === "boolean");
+            // Admission can finish while Keep is in flight. Read a fresh catalog
+            // instead of combining new readiness with an older preparation.
+            const catalog = await request("/api/capsules/catalog", null, io.signal);
+            if (epoch !== generation || !show() || model?.cid !== cid) return;
+            const candidate = parseCatalog(catalog);
+            check(candidate?.cid === cid);
+            model = candidate;
           } else {
             const r = operationRuntime(result, cid);
             check(r.preparation?.operation_id === result.operation_id && (operation !== "cancel" || result.operation_id === id));
@@ -213,15 +222,20 @@
         }
         const r = model.model_runtime, p = r.preparation;
         const row = element("article", "", "model-row");
-        row.append(element("h2", model.title), element("p", `Verified publisher: ${model.publisher_did}`),
-          element("p", `Content ID: ${model.cid}`, "model-identity"), element("p", `${model.content_size_bytes.toLocaleString()} bytes`));
-        const label = message ? "Current status unavailable" : r.dispatch_ready ? "Ready to use" : r.admitted ? "Prepared. The model offer is unavailable."
-          : active(p) ? (p.cancel_requested ? "Cancelling preparation…" : p.state === "capacity_pending" ? "Waiting for local capacity…" : p.state === "uncertain" ? "Waiting for preparation to settle…" : "Preparing…")
-            : p ? ({ reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", failed: failureText(p), expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Not prepared";
+        if (!compact) {
+          row.append(element("h2", model.title), element("p", formatBytes(model.content_size_bytes), "model-size"));
+          const identity = element("details", "", "model-details");
+          identity.append(element("summary", "Content details"), element("p", `Verified publisher: ${model.publisher_did}`),
+            element("p", `Content ID: ${model.cid}`, "model-identity"));
+          row.append(identity);
+        }
+        const label = message ? "Current status unavailable" : r.dispatch_ready ? "Available on this device" : r.admitted ? "Available on this device. Model service unavailable."
+          : active(p) ? (p.cancel_requested ? "Cancelling preparation…" : p.state === "capacity_pending" ? "Waiting for local capacity…" : p.state === "uncertain" ? "Waiting for preparation to settle…" : p.state === "verifying" ? "Checking model files…" : "Preparing local files…")
+            : p ? ({ reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", failed: failureText(p), expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Ready to prepare";
         row.append(element("p", label));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;
-          progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${p.completed_bytes.toLocaleString()} of ${p.total_bytes.toLocaleString()} bytes`));
+          progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${formatBytes(p.completed_bytes)} of ${formatBytes(p.total_bytes)} prepared`));
         }
         const controls = element("div", "", "model-controls");
         const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : "Use", () => void act("use"), active(p) || reconcileRequired);
@@ -229,10 +243,15 @@
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (active(p)) { const cancel = button("Cancel preparation", () => void act("cancel"), p.cancel_requested || reconcileRequired); cancel.dataset.modelControl = "cancel"; controls.append(cancel); }
         const labelNode = element("label", "", "model-keep"), toggle = element("input");
-        toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !r.admitted || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
+        toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
         toggle.addEventListener("change", () => void act("retention", toggle.checked));
         labelNode.append(toggle, document.createTextNode("Keep on this device")); controls.append(labelNode);
-        row.append(controls); root.append(row);
+        row.append(controls);
+        row.append(element("p", r.kept
+          ? (r.admitted ? "Kept on this device. Release this choice to allow cache cleanup." : "Keep choice saved for this preparation.")
+          : "Prepared files can be removed during cache cleanup.", "model-hint"));
+        row.append(element("p", "The model loads into memory when you use it in Assistant.", "model-hint"));
+        root.append(row);
         restoreFocus();
       }
       function setVisible(value) {
@@ -240,9 +259,15 @@
         visible = value; root.hidden = !value; ++generation; stopRead();
         if (show()) void load();
       }
-      document.addEventListener("visibilitychange", () => { ++generation; stopRead(); if (show()) void load(); });
-      window.addEventListener("pagehide", () => { closed = true; ++generation; stopRead(); });
-      return { setVisible, refresh: load };
+      const onVisibility = () => { ++generation; stopRead(); if (show()) void load(); };
+      function destroy() {
+        closed = true; ++generation; stopRead();
+        document.removeEventListener("visibilitychange", onVisibility);
+        window.removeEventListener("pagehide", destroy);
+      }
+      document.addEventListener("visibilitychange", onVisibility);
+      window.addEventListener("pagehide", destroy);
+      return { setVisible, refresh: load, destroy };
     },
   };
 })();

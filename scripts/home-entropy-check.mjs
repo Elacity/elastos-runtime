@@ -5035,13 +5035,13 @@ assert(
   "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
-  marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
+  marketplaceUi.includes('capsule.cid ? "Verified app" : "Local app"') &&
     marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
     marketplaceUi.includes("Trust:") &&
     marketplaceUi.includes("Status:") &&
     marketplaceUi.includes("Available actions") &&
     !marketplaceUi.includes("CID-backed") &&
-    !marketplaceUi.includes("Content ID") &&
+    !marketplaceUi.replace(/function technicalDetails\(app\) \{[\s\S]*?function packageLabel/, "").includes("Content ID") &&
     !marketplaceUi.includes("Signed package") &&
     !marketplaceUi.includes("Package identity:") &&
     !marketplaceUi.includes('price-tag">${app.cid ? "CID"') &&

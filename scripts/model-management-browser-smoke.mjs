@@ -17,6 +17,7 @@ let dispatchPending = false;
 let failure = false;
 let delayStatus = null;
 let delayUse = null;
+let delayRetention = null;
 let wrongIdentity = false;
 let executable = true;
 let selectedCid = cid;
@@ -81,7 +82,7 @@ const server = createServer(async (req, res) => {
       if (method.operation === "use") { assert.deepEqual(input.input, { cid }); phase = "preparing"; }
       if (method.operation === "use" && loseUseResponse) { req.socket.destroy(); return; }
       if (["status", "cancel"].includes(method.operation)) assert.deepEqual(input.input, { operation_id: operation });
-      if (method.operation === "cancel") phase = "cancelled";
+      if (method.operation === "cancel") { phase = "cancelled"; kept = false; }
       if (method.operation === "retention") { assert.deepEqual(input.input, { cid, keep: !kept }); kept = input.input.keep; }
       const readiness = runtime();
       const facts = { admitted: readiness.admitted, kept: readiness.kept, dispatch_ready: readiness.dispatch_ready, offer_id: readiness.offer_id };
@@ -95,6 +96,7 @@ const server = createServer(async (req, res) => {
       const reply = () => json(result);
       if (method.operation === "status" && delayStatus) { delayStatus(reply); return; }
       if (method.operation === "use" && delayUse) { delayUse(reply); return; }
+      if (method.operation === "retention" && delayRetention) { delayRetention(reply, output); return; }
       reply(); return;
     }
     if (["/api/apps/home/summary", "/api/apps/system/summary"].includes(url.pathname)) { json(makeSystemSummary(makeAppearanceRecord())); return; }
@@ -111,18 +113,37 @@ const server = createServer(async (req, res) => {
 });
 server.listen(0, "127.0.0.1"); await once(server, "listening");
 const browser = await chromium.launch({ executablePath: brave, headless: true });
+let activePage;
 try {
   for (const app of ["marketplace", "system"]) {
     phase = "unprepared"; kept = false; failure = false; calls.length = 0;
     selectedCid = cid; executable = true; trust = "verified";
     const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
+    activePage = page;
     const pageErrors = [];
     page.on("pageerror", error => pageErrors.push(String(error)));
     await page.goto(`http://127.0.0.1:${server.address().port}/?app=${app}`);
     const frame = page.frameLocator("iframe");
+    if (app === "marketplace") {
+      for (const title of ["Installed", "Apps", "Models"]) {
+        await frame.locator("#store-sections").getByRole("heading", { name: title, exact: true }).waitFor();
+      }
+      for (const title of ["Apps", "Installed"]) {
+        await frame.locator(`[data-destination="${title.toLowerCase()}"]`).first().click();
+        await frame.locator("#store-sections").getByText("People", { exact: true }).waitFor();
+        assert.equal(await frame.getByRole("heading", { name: title, exact: true }).count(), 1, `${title} has one page title`);
+        assert.equal(await frame.locator("#store-sections .store-section-head").count(), 0, `${title} omits the repeated section heading`);
+      }
+    }
     await frame.getByRole("button", { name: "Models", exact: true }).click({ timeout: 3000 });
-    await frame.getByRole("heading", { name: "Fixture model", exact: true }).waitFor();
-    assert.match(await frame.locator("[data-model-management]").innerText(), /did:key:zFixturePublisher/);
+    if (app === "marketplace") {
+      await frame.getByRole("button", { name: "Details", exact: true }).waitFor();
+      assert.equal(await frame.getByRole("heading", { name: "Models", exact: true }).count(), 1, "Models has one page title");
+      assert.equal(await frame.locator("#store-sections .store-section-head").count(), 0, "Models omits the repeated section heading");
+      await frame.getByRole("button", { name: "Details", exact: true }).click();
+    }
+    await (app === "marketplace" ? frame.locator(".modal-title") : frame.getByRole("heading", { name: "Fixture model", exact: true })).waitFor();
+    assert.match(await frame.locator("body").textContent(), /did:key:zFixturePublisher/);
     phase = "capacity_pending";
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByText("Waiting for local capacity…", { exact: true }).waitFor();
@@ -135,7 +156,7 @@ try {
     assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isEnabled(), false);
     phase = "unprepared";
     await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByText("Not prepared", { exact: true }).waitFor();
+    await frame.getByText("Ready to prepare", { exact: true }).waitFor();
     let releaseUse;
     const useReceived = new Promise(resolveUse => { delayUse = reply => { releaseUse = reply; resolveUse(); }; });
     await frame.getByRole("button", { name: "Use", exact: true }).evaluate(button => { button.click(); button.click(); });
@@ -144,22 +165,51 @@ try {
     delayUse = null; releaseUse();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, 1);
+    await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
+    await frame.getByText("Keep choice saved for this preparation.", { exact: true }).waitFor();
+    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+    assert.equal(calls.filter(c => c.method === "content.use").length, 1, "retention never starts another preparation");
     await frame.getByRole("button", { name: "Cancel preparation" }).click();
     await frame.getByRole("button", { name: "Retry", exact: true }).waitFor();
+    assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), false, "cancelled attempt releases pending choice");
     await frame.getByRole("button", { name: "Retry", exact: true }).click();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     phase = "admitted"; activationPending = app === "marketplace"; dispatchPending = true;
-    await frame.getByText("Prepared. The model offer is unavailable.", { exact: true }).waitFor();
+    await frame.getByText("Available on this device. Model service unavailable.", { exact: true }).waitFor();
     const activationUses = calls.filter(c => c.method === "content.use").length;
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "admitted content is not cancellable");
     activationPending = false; dispatchPending = false;
-    await frame.locator("[data-model-management] p").filter({ hasText: /^Ready to use$/ }).waitFor();
+    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, activationUses, "activation readiness uses status without another Use");
     const readyStatuses = calls.filter(c => c.method === "content.status").length;
     await page.waitForTimeout(1750);
     assert.equal(calls.filter(c => c.method === "content.status").length, readyStatuses, "ready state stops polling");
     await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
     await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+    await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
+    await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
+    phase = "preparing";
+    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
+    const usesBeforeRetentionRace = calls.filter(c => c.method === "content.use").length;
+    const statusesBeforeRetentionRace = calls.filter(c => c.method === "content.status").length;
+    let releaseRetention;
+    const retentionReceived = new Promise(resolveRetention => {
+      delayRetention = (reply, output) => { releaseRetention = reply; resolveRetention(output); };
+    });
+    // Click does not wait for the checked state while the test holds the ack.
+    await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
+    const pendingRetentionAck = await retentionReceived;
+    assert.equal(pendingRetentionAck.admitted, false, "retention acknowledgement captures the pending preparation");
+    assert.equal(pendingRetentionAck.kept, true);
+    phase = "admitted";
+    delayRetention = null; releaseRetention();
+    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+    await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "fresh admission replaces the pending preparation after retention settles");
+    assert.equal(calls.filter(c => c.method === "content.use").length, usesBeforeRetentionRace, "admission during retention does not dispatch another Use");
+    assert.equal(calls.filter(c => c.method === "content.status").length, statusesBeforeRetentionRace, "retention reads fresh admission before another status poll can hide stale state");
     await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
     await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
     failure = true;
@@ -189,6 +239,10 @@ try {
     await frame.getByRole("checkbox", { name: "Keep on this device" }).scrollIntoViewIfNeeded();
     if (process.env.MODEL_UI_SCREENSHOTS) await page.screenshot({ path: `${process.env.MODEL_UI_SCREENSHOTS}/${app}-models-narrow.png` });
 
+    await frame.locator("html").evaluate(node => node.dataset.elTheme = "light");
+    await bounds();
+    if (process.env.MODEL_UI_SCREENSHOTS) await page.screenshot({ path: `${process.env.MODEL_UI_SCREENSHOTS}/${app}-models-light.png` });
+    await frame.locator("html").evaluate(node => node.dataset.elTheme = "dark");
     await page.setViewportSize({ width: 1100, height: 800 });
     phase = "unprepared"; kept = false;
     await frame.getByRole("button", { name: "Refresh models" }).click();
@@ -265,7 +319,10 @@ try {
     const hiddenCount = calls.filter(c => c.method === "content.status").length;
     await new Promise(resolveTick => setTimeout(resolveTick, 1750));
     assert.equal(calls.filter(c => c.method === "content.status").length, hiddenCount, "hidden document stops polling");
-    const leave = () => frame.getByRole("button", { name: app === "marketplace" ? "Discover" : "About", exact: true }).click();
+    const leave = async () => {
+      if (app === "marketplace") await frame.getByRole("button", { name: "Close", exact: true }).first().click();
+      await frame.getByRole("button", { name: app === "marketplace" ? "Discover" : "About", exact: true }).click();
+    };
     await leave();
     const statusCount = calls.filter(c => c.method === "content.status").length;
     await new Promise(resolveTick => setTimeout(resolveTick, 1750));
@@ -277,17 +334,62 @@ try {
     }
     selectedCid = `bafybei${"b".repeat(52)}`; phase = "unprepared";
     await frame.locator("body").evaluate(() => { delete document.hidden; document.dispatchEvent(new Event("visibilitychange")); });
+    if (app === "marketplace") {
+      const refreshed = page.waitForResponse(r => new URL(r.url()).pathname === "/api/capsules/catalog");
+      await frame.locator("body").evaluate(() => window.dispatchEvent(new MessageEvent("message", {
+        origin: "null", source: window.parent, data: { type: "elastos:menu-command", cmd: "refresh" },
+      })));
+      await refreshed;
+      await frame.getByRole("button", { name: "Models", exact: true }).click();
+      await frame.locator(`[data-app="model:${selectedCid}"]`).first().waitFor({ state: "attached" });
+    }
     await frame.getByRole("button", { name: "Models", exact: true }).click();
-    await frame.locator(".model-identity").filter({ hasText: selectedCid }).waitFor();
+    if (app === "marketplace") await frame.getByRole("button", { name: "Details", exact: true }).click();
+    if (app === "system") await frame.getByText("Content details", { exact: true }).click();
+    if (app === "marketplace") await frame.getByText("Technical details", { exact: true }).click();
+    await frame.locator(app === "marketplace" ? ".model-content-identity" : ".model-identity").filter({ hasText: selectedCid }).waitFor();
     delayStatus = null; releaseStatus();
     const deliveredStatus = await frame.locator("body").evaluate(() => window.modelStatusDelivered);
     assert.equal(deliveredStatus.cid, cid, "old status actually reaches the consumer after the CID switch");
     assert.equal(deliveredStatus.operation_id, operation);
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "late old operation cannot replace new identity");
-    assert.match(await frame.locator(".model-identity").innerText(), new RegExp(selectedCid));
+    assert.match(await frame.locator(app === "marketplace" ? ".model-content-identity" : ".model-identity").innerText(), new RegExp(selectedCid));
+    if (app === "marketplace") {
+      await frame.getByRole("button", { name: "Use", exact: true }).waitFor();
+      const detailCid = selectedCid;
+      await frame.locator("[data-model-management]").evaluate(node => {
+        window.fixtureOpenModelDetail = node;
+        window.fixturePreviousModelUse = node.querySelector('[data-model-control="use"]');
+      });
+      const mutationsBeforeRotation = calls.filter(c => c.method !== "content.status").length;
+      selectedCid = `bafybei${"c".repeat(52)}`;
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.getByText("No verified model is available. Ask your administrator to configure a trusted catalog.", { exact: true }).waitFor();
+      assert.equal(await frame.locator("[data-model-management]").evaluate(node => node === window.fixtureOpenModelDetail), true, "CID rotation leaves the same detail controller mounted");
+      assert.match(await frame.locator(".model-content-identity").innerText(), new RegExp(detailCid), "the open detail keeps its original CID");
+      assert.equal(await frame.locator('[data-model-control="use"], [data-model-control="keep"], [data-model-control="cancel"]').count(), 0, "the previous detail exposes no actions for the replacement CID");
+      const staleMutationAttempts = await frame.locator("body").evaluate(() => {
+        const originalFetch = window.fetch;
+        let attempts = 0;
+        window.fetch = (...args) => {
+          if (args[0] === "/api/capsules/interfaces/invoke") attempts++;
+          return originalFetch(...args);
+        };
+        try { window.fixturePreviousModelUse.click(); } finally { window.fetch = originalFetch; }
+        return attempts;
+      });
+      assert.equal(staleMutationAttempts, 0, "even a detached previous Use control cannot dispatch after CID rotation");
+      assert.equal(calls.filter(c => c.method !== "content.status").length, mutationsBeforeRotation, "CID rotation performs no model mutation");
+    }
     assert.deepEqual(pageErrors, []);
     await page.close();
   }
   assert.deepEqual(fixtureErrors, []);
   console.log("PASS Marketplace/System model management browser smoke");
+} catch (error) {
+  if (process.env.MODEL_UI_SCREENSHOTS && activePage && !activePage.isClosed()) {
+    await activePage.screenshot({ path: `${process.env.MODEL_UI_SCREENSHOTS}/failure.png` });
+    console.error((await activePage.locator("iframe").contentFrame().locator("body").innerText()).slice(0, 8000));
+  }
+  throw error;
 } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolveClose => server.close(resolveClose)); }

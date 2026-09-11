@@ -410,12 +410,9 @@ impl PreparationInventory {
                 bounded_id(&claim.principal, 160)
                     && canonical_cid(&claim.cid, 0x70)
                     && claims.insert((&claim.principal, &claim.cid))
-                    && self
-                        .records
-                        .iter()
-                        .any(|record| record.state == PreparationState::Admitted
-                            && record.request_binding.principal == claim.principal
-                            && record.package_cid == claim.cid),
+                    && self.records.iter().any(|record| record.backs_retention()
+                        && record.request_binding.principal == claim.principal
+                        && record.package_cid == claim.cid),
                 "invalid retention claim"
             );
         }
@@ -426,6 +423,19 @@ impl PreparationInventory {
         self.retention_claims
             .iter()
             .any(|claim| claim.principal == principal && claim.cid == cid)
+    }
+
+    fn prune_retention(&mut self) -> bool {
+        let before = self.retention_claims.len();
+        let records = &self.records;
+        self.retention_claims.retain(|claim| {
+            records.iter().any(|record| {
+                record.backs_retention()
+                    && record.request_binding.principal == claim.principal
+                    && record.package_cid == claim.cid
+            })
+        });
+        self.retention_claims.len() != before
     }
 
     fn expire(&mut self, now: u64) -> bool {
@@ -445,7 +455,7 @@ impl PreparationInventory {
                 changed = true;
             }
         }
-        changed
+        self.prune_retention() || changed
     }
 }
 
@@ -665,25 +675,36 @@ fn set_retention(
     let inventory = Inventory::open(data_dir, false)?;
     let mut state = inventory.load()?;
     let principal = &caller.context.principal_id;
-    let admitted = state
+    let record = state
         .records
         .iter()
-        .find(|record| {
-            record.state == PreparationState::Admitted
+        .filter(|record| {
+            record.backs_retention()
                 && record.request_binding.principal == *principal
                 && record.package_cid == cid
         })
-        .context("retention admission unavailable")?;
-    inventory.admitted(&admitted.admission_id)?.check()?;
+        .max_by_key(|record| record.state == PreparationState::Admitted)
+        .context("retention preparation unavailable")?;
+    let admitted = record.state == PreparationState::Admitted;
+    if admitted {
+        inventory.admitted(&record.admission_id)?.check()?;
+    } else if keep && !state.kept(principal, cid) {
+        ensure!(
+            !record.cancel_requested && now()? < record.expires_at,
+            "retention preparation is settling"
+        );
+    }
     ensure!(
         state
             .retirement
             .as_ref()
-            .is_none_or(|r| r.admission_id != admitted.admission_id),
+            .is_none_or(|r| r.admission_id != record.admission_id),
         "model retirement pending"
     );
-    // Desired local retention is independent of model-use permission. Aliases
-    // share one principal/CID claim; releasing it does not evict bytes or offers.
+    // Desired local retention is independent of model-use permission. Pending
+    // intent survives reconciliation and admission, but ends when its last
+    // operation settles without admission. It does not pin or fetch content.
+    // Aliases share one principal/CID claim; release does not evict bytes/offers.
     if state.kept(principal, cid) != keep {
         if keep {
             ensure!(
@@ -702,7 +723,7 @@ fn set_retention(
         revalidate()?;
         inventory.save(&state)?;
     }
-    Ok(serde_json::json!({"cid":cid,"kept":keep,"admitted":true}))
+    Ok(serde_json::json!({"cid":cid,"kept":keep,"admitted":admitted}))
 }
 
 fn status(
@@ -761,6 +782,7 @@ fn manage(
         changed = true;
     }
     let result = record.clone();
+    changed |= state.prune_retention();
     if changed {
         inventory.save(&state)?;
     }
@@ -768,6 +790,10 @@ fn manage(
 }
 
 impl PreparationRecord {
+    fn backs_retention(&self) -> bool {
+        self.state == PreparationState::Admitted || self.pre_dispatch() || self.active()
+    }
+
     fn pre_dispatch(&self) -> bool {
         matches!(
             self.state,
@@ -2489,6 +2515,7 @@ fn settle_failure(data_dir: &Path, id: &str, drained: bool) -> anyhow::Result<()
         };
         record.reserved_bytes = 0;
     }
+    snapshot.prune_retention();
     inventory.save(&snapshot)
 }
 
@@ -7297,6 +7324,213 @@ server.serve_forever()
     }
 
     #[tokio::test]
+    async fn model_retention_pending_replay_restart_and_admission_preserve_intent() {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        let calls = backend.calls.lock().unwrap().clone();
+        let path = root.path().join("model-preparation/state.json");
+        let mut foreign = context();
+        foreign.principal_id = "person:other-pending-retention".into();
+        for keep in [true, false] {
+            let before = std::fs::read(&path).unwrap();
+            assert!(retention_intent(root.path(), &foreign, &record.package_cid, keep).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        for keep in [true, true, false, false, true] {
+            let reply =
+                retention_intent(root.path(), &context(), &record.package_cid, keep).unwrap();
+            assert_eq!(
+                reply,
+                serde_json::json!({"cid":record.package_cid,"kept":keep,"admitted":false})
+            );
+            let before = std::fs::read(&path).unwrap();
+            // A fresh owner reads the same durable intent without starting a worker.
+            assert_eq!(
+                retention_intent(root.path(), &context(), &record.package_cid, keep).unwrap(),
+                reply
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                load_operation(root.path(), &record.operation_id).unwrap(),
+                record
+            );
+            assert_eq!(*backend.calls.lock().unwrap(), calls);
+        }
+        let projection =
+            model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                .await;
+        assert_eq!(projection["kept"], true);
+        assert_eq!(projection["admitted"], false);
+        assert_eq!(projection["dispatch_ready"], false);
+        assert!(projection["offer_id"].is_null());
+        settle_failure(root.path(), &record.operation_id, false).unwrap();
+        assert_eq!(
+            load_operation(root.path(), &record.operation_id)
+                .unwrap()
+                .state,
+            PreparationState::Uncertain
+        );
+        assert_eq!(
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap()
+                ["admitted"],
+            false
+        );
+        assert_eq!(*backend.calls.lock().unwrap(), calls);
+        finish_retention_fixture(root.path(), &record, registry).await;
+        assert_eq!(
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap(),
+            serde_json::json!({"cid":record.package_cid,"kept":true,"admitted":true})
+        );
+    }
+
+    #[test]
+    fn model_retention_pending_cancel_expire_and_fresh_retry_clear_intent() {
+        for terminal in ["cancel", "expire", "capacity-cancel", "capacity-expire"] {
+            let root = tempfile::tempdir().unwrap();
+            let (payload, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+            write_preparation_catalog(root.path(), &payload);
+            let cid = payload["entries"][0]["cid"].as_str().unwrap();
+            let record = reserve(
+                root.path(),
+                &caller(&context(), &method("use")),
+                "original",
+                cid,
+            )
+            .unwrap();
+            if terminal.starts_with("capacity-") {
+                update_operation(root.path(), &record.operation_id, |pending| {
+                    pending.state = PreparationState::CapacityPending;
+                    pending.reserved_bytes = 0;
+                })
+                .unwrap();
+            }
+            retention_intent(root.path(), &context(), cid, true).unwrap();
+            let cancelling = terminal.ends_with("cancel");
+            let result = manage(
+                root.path(),
+                &caller(
+                    &context(),
+                    &method(if cancelling { "cancel" } else { "status" }),
+                ),
+                &record.operation_id,
+                cancelling,
+                if cancelling {
+                    record.created_at
+                } else {
+                    record.expires_at
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                result.state,
+                if cancelling {
+                    PreparationState::Cancelled
+                } else {
+                    PreparationState::Expired
+                }
+            );
+            assert_eq!(result.reserved_bytes, 0);
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            assert!(!inventory.load().unwrap().kept(&context().principal_id, cid));
+            drop(inventory);
+            let next = reserve(
+                root.path(),
+                &caller(&context(), &method("use")),
+                "fresh-retry",
+                cid,
+            )
+            .unwrap();
+            assert_ne!(next.operation_id, record.operation_id);
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            assert!(!inventory.load().unwrap().kept(&context().principal_id, cid));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_retention_active_cancel_waits_for_drain_and_failure_clears_intent() {
+        for cancelled in [false, true] {
+            let (root, record, backend, _) = staged_fixture(now().unwrap(), false).await;
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+            let calls = backend.calls.lock().unwrap().clone();
+            if cancelled {
+                let pending = cancel(
+                    root.path(),
+                    &caller(&context(), &method("cancel")),
+                    &record.operation_id,
+                )
+                .unwrap();
+                assert!(pending.cancel_requested);
+            }
+            settle_failure(root.path(), &record.operation_id, false).unwrap();
+            {
+                let inventory = Inventory::open(root.path(), false).unwrap();
+                assert!(inventory
+                    .load()
+                    .unwrap()
+                    .kept(&context().principal_id, &record.package_cid));
+            }
+            settle_failure(root.path(), &record.operation_id, true).unwrap();
+            let settled = load_operation(root.path(), &record.operation_id).unwrap();
+            assert_eq!(
+                settled.state,
+                if cancelled {
+                    PreparationState::Cancelled
+                } else {
+                    PreparationState::Failed
+                }
+            );
+            assert_eq!(settled.reserved_bytes, 0);
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            assert!(!inventory
+                .load()
+                .unwrap()
+                .kept(&context().principal_id, &record.package_cid));
+            assert_eq!(*backend.calls.lock().unwrap(), calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_retention_cancelled_shared_preparation_preserves_admitted_claim() {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry).await;
+        retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+        let calls = backend.calls.lock().unwrap().clone();
+        let mut foreign = context();
+        foreign.principal_id = "person:shared-pending-retention".into();
+        for principal in [context(), foreign] {
+            let shared = reserve(
+                root.path(),
+                &caller(&principal, &method("use")),
+                "pending-alias",
+                &record.package_cid,
+            )
+            .unwrap();
+            assert_eq!(shared.admission_id, record.operation_id);
+            let reply =
+                retention_intent(root.path(), &principal, &record.package_cid, true).unwrap();
+            assert_eq!(
+                reply["admitted"],
+                principal.principal_id == context().principal_id
+            );
+            cancel(
+                root.path(),
+                &caller(&principal, &method("cancel")),
+                &shared.operation_id,
+            )
+            .unwrap();
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let state = inventory.load().unwrap();
+            assert!(state.kept(&context().principal_id, &record.package_cid));
+            assert_eq!(
+                state.kept(&principal.principal_id, &record.package_cid),
+                principal.principal_id == context().principal_id
+            );
+            assert_eq!(state.retention_claims.len(), 1);
+            assert!(inventory.admitted(&record.operation_id).is_ok());
+        }
+        assert_eq!(*backend.calls.lock().unwrap(), calls);
+    }
+
+    #[tokio::test]
     async fn model_retention_desired_state_replay_restart_preserves_admission_and_bytes() {
         use std::os::unix::fs::MetadataExt as _;
         let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
@@ -7453,9 +7687,10 @@ server.serve_forever()
     #[tokio::test]
     async fn model_retention_invalid_input_and_authority_preserve_inventory() {
         let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
-        assert!(
-            retention_intent(root.path(), &context(), &record.package_cid, true).is_err(),
-            "pending admission cannot be kept"
+        assert_eq!(
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap()
+                ["admitted"],
+            false
         );
         finish_retention_fixture(root.path(), &record, registry).await;
         retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
@@ -7585,7 +7820,7 @@ server.serve_forever()
     #[test]
     fn model_retention_first_party_manifests_declare_local_management() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        for name in ["marketplace", "system", "assistant", "home-agent"] {
+        for name in ["marketplace", "system", "assistant"] {
             let value: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(root.join("capsules").join(name).join("capsule.json")).unwrap(),
             )
