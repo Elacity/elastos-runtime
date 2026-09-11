@@ -1197,7 +1197,6 @@ for tool in ffmpeg ffprobe; do
         exit 1
     }
 done
-browser_vm_backup_retention >/dev/null
 require_minimum_free_space "${ROOT}"
 require_minimum_free_space "${DATA_DIR}"
 
