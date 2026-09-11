@@ -59,13 +59,15 @@ exact Qwen preparation and admission; the package hashes match and the activatio
 record binds the reviewed engine and weights. The Marketplace view stops polling
 at admission before dispatch readiness arrives. A bounded polling repair passes
 rendered regression checks in both Marketplace and System; it awaits installation.
-A fresh view confirms readiness, but Assistant receives a catalog read denial
-before dispatch. The explicit consumer allowlist repair passes scoped authority
-regressions. Rebuild Runtime only, install both reviewed repairs, then prove the
-actual Assistant reply, stop, reload and restart/reuse. Preserve the admitted
-package and reuse provider artifacts.
-Linux J3 requires additional disk headroom before its installed proof. The
-preservation check and private checkpoint bind these receipts and remaining work.
+A fresh view confirms readiness. The Assistant catalog read denial is repaired
+in installed Runtime `f72810fb`, with matching hashes and both UI asset manifests
+refreshed. Cold restart then fails model startup because the admitted package
+verifier's local IPFS backend is idle. The source repair prepares that backend
+before hashing; 23 related tests pass and four environment tests remain separate.
+Rebuild Runtime only for this repair, preserve the admitted package, then prove
+exact selection, actual reply, stop, reload and restart/reuse. Linux needs
+additional disk headroom and a reviewed startup profile. The private checkpoint
+owns current processes and receipts; user Homes remain preserved.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

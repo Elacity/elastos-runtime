@@ -254,3 +254,27 @@ expired, unrelated-app and wrong-origin authority fail. Existing Home Agent run
 binding and unrelated-capsule model rejection also pass. Independent source
 review finds no blocking issue. The next installation changes Runtime and the
 two readiness-polling assets; the admitted package and providers are reused.
+
+
+## Cold model startup prerequisite
+
+Runtime `f72810fb` and both readiness assets are installed on the isolated Mac
+Home with matching build, installed and served hashes. Installation also fills
+missing Marketplace/System browser asset records. The prior manifest is recovered
+exactly by removing those two records and comparing its recorded SHA-256; remaining
+artifacts and the admitted package retain their identities.
+
+Cold startup then reports an unavailable directory-hash backend and skips model
+registration. IPFS is registered with a lazy backend; admitted-model startup calls
+its private hash operation without first requesting readiness. The cold fixture
+reproduces the missing prerequisite. The repair calls existing Runtime-owned backend
+preparation after local catalog/engine/file validation and before hashing, under
+the current worker guard. Integrity checks and package identity remain mandatory.
+
+The startup module passes 23 tests, including cold success, readiness failure,
+unchanged package/configuration, no new Content reads, identity, activation and
+retirement. Four native/environment cases remain ignored in that source run.
+Independent review finds no blocking issue. The installed cold restart must still
+advertise the same offer without another Use or model transfer, before reply and
+lifecycle acceptance. The Runtime startup profile currently accepts Mac ARM64;
+Linux needs its reviewed profile and target proof as well as disk headroom.

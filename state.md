@@ -15,18 +15,17 @@ Assistant consolidation, original UI parity and installed Qwen proof remain open
 
 
 The isolated Mac J3 installation verifies signed Qwen catalog visibility in
-System and Marketplace, Use/cancel/retry, local package reuse and owned
-shutdown/restart. Installed Runtime `ab993a99` completes preparation and admission
-of the exact 6,169,366,387-byte Qwen package. The admitted weight hash matches the
-reviewed package; Runtime activation records the exact model offer. Marketplace
-stops polling at admission and can retain a stale unavailable message. A reproduced
-browser regression now passes with continued bounded readiness polling in both
-Marketplace and System. A fresh view confirms the exact model ready. Assistant then receives a catalog
-read denial before dispatch; the explicit consumer allowlist repair passes scoped
-authority regressions. These two repairs await installation. Reply, stop, reload
-and restart/reuse remain pending. Human Homes retain their existing candidate.
-Linux J3 needs additional disk headroom before model preparation and build margin;
-its previews and data remain preserved. The integration check records proof limits.
+System and Marketplace, Use/cancel/retry, exact local package admission and a
+fresh ready view. Runtime `f72810fb` and the readiness UI repair are installed
+with matching build/install/served hashes and refreshed manifests. The catalog
+consumer repair passes scoped authority tests. Cold restart then exposes a missing
+IPFS readiness step before package hashing, leaving the model provider unavailable.
+The regression reproduces this failure; the readiness repair passes 23 related
+startup/integrity/activation/retirement tests, with four environment tests ignored.
+Its installed check is next. Reply, stop, reload and restart/reuse remain pending.
+Human Homes retain their existing candidate. Linux J3 requires additional disk
+headroom and a reviewed target startup profile; its previews and data are preserved.
+The integration check records the failure, repair and proof limits.
 
 Last updated: 2026-09-11 UTC
 

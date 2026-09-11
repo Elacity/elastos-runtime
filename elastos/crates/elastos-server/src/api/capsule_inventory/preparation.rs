@@ -2381,6 +2381,8 @@ async fn append_admitted_model_offers_locked(
         for file in &closure.files {
             stage.verify_model_file(file, file.path == entry.manifest.entrypoint)?;
         }
+        // The local verifier is lazy and may be cold after Runtime restart.
+        registry.prepare_local_ipfs_backend().await?;
         verify_package_identity(registry, &stage, record, &entry, &closure).await?;
         current_entry(data_dir, record)?;
         ensure!(
@@ -2557,6 +2559,7 @@ mod tests {
         after_weight_read: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
         hold_drain: AtomicBool,
         fail_drain: AtomicBool,
+        cold_backend: AtomicBool,
         hold_read: AtomicBool,
         hold_hash: AtomicBool,
         read_fault: Mutex<Option<&'static str>>,
@@ -2700,9 +2703,15 @@ mod tests {
                             "fixture drain failed".into(),
                         ));
                     }
+                    self.cold_backend.store(false, Ordering::Release);
                     Ok(serde_json::json!({"status":"ok"}))
                 }
                 "runtime_hash_staged_directory" => {
+                    if self.cold_backend.load(Ordering::Acquire) {
+                        return Err(elastos_runtime::provider::ProviderError::Unavailable(
+                            "directory hash backend unavailable".into(),
+                        ));
+                    }
                     if self.hold_hash.swap(false, Ordering::AcqRel) {
                         self.entered.notify_one();
                         self.release.notified().await;
@@ -4756,6 +4765,54 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn model_startup_prepares_cold_verifier_before_reusing_admitted_package() {
+            for unavailable in [false, true] {
+                let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+                admit(root.path(), &record);
+                let _engine = install_engine(root.path());
+                backend.cold_backend.store(true, Ordering::Release);
+                backend.fail_drain.store(unavailable, Ordering::Release);
+                let mut actual = config(root.path());
+                let before = actual.extra.clone();
+                let result =
+                    append_admitted_model_startup_offers(root.path(), &registry, &mut actual).await;
+                if unavailable {
+                    assert!(result.is_err());
+                    assert_eq!(
+                        actual.extra, before,
+                        "failed readiness preserves configuration"
+                    );
+                    assert_eq!(*backend.calls.lock().unwrap(), ["runtime_prepare_backend"]);
+                } else {
+                    assert!(
+                        result.is_ok(),
+                        "cold verifier must become ready before hashing"
+                    );
+                    assert_eq!(actual.extra["offers"].as_array().unwrap().len(), 2);
+                    assert_eq!(
+                        *backend.calls.lock().unwrap(),
+                        ["runtime_prepare_backend", "runtime_hash_staged_directory"]
+                    );
+                }
+                assert!(
+                    backend.read_sizes.lock().unwrap().is_empty(),
+                    "restart reuses admitted bytes without Content reads"
+                );
+                let stage = root
+                    .path()
+                    .join("model-preparation")
+                    .join(format!("admitted-{}", record.admission_id));
+                for (name, bytes) in &backend.files {
+                    assert_eq!(
+                        &std::fs::read(stage.join(name)).unwrap(),
+                        bytes,
+                        "admitted package remains intact"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn model_startup_binding_consumes_admission_with_stable_restart_and_alias_identity() {
             let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
             admit(root.path(), &record);
@@ -4791,7 +4848,7 @@ mod tests {
             );
             assert_eq!(
                 backend.calls.lock().unwrap().as_slice(),
-                ["runtime_hash_staged_directory"]
+                ["runtime_prepare_backend", "runtime_hash_staged_directory"]
             );
 
             {
@@ -4885,7 +4942,9 @@ mod tests {
             assert_eq!(
                 backend.calls.lock().unwrap().as_slice(),
                 [
+                    "runtime_prepare_backend",
                     "runtime_hash_staged_directory",
+                    "runtime_prepare_backend",
                     "runtime_hash_staged_directory"
                 ]
             );
@@ -5401,6 +5460,7 @@ server.serve_forever()
                 after_weight_read: Mutex::new(None),
                 hold_drain: AtomicBool::new(false),
                 fail_drain: AtomicBool::new(false),
+                cold_backend: AtomicBool::new(false),
                 hold_read: AtomicBool::new(false),
                 hold_hash: AtomicBool::new(false),
                 read_fault: Mutex::new(None),
