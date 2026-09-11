@@ -3371,6 +3371,12 @@ impl Provider for MockBrowserEngineProvider {
             .get("principal_id")
             .and_then(|value| value.as_str())
             .is_some());
+        if request["op"] == "readiness" {
+            return Ok(json!({"status": "ok", "data": {
+                "schema": "elastos.browser.engine-readiness/v1",
+                "adapter_id": request["adapter_id"], "readiness": {"state": "ready"}
+            }}));
+        }
         if request.get("op").and_then(|value| value.as_str()) == Some("status")
             && request.get("lifecycle_generation").is_some()
         {
@@ -3571,7 +3577,7 @@ impl Provider for MockBrowserEngineProvider {
                 "data": {
                     "schema": "elastos.browser.engine.page/v1",
                     "provider": "browser-engine-adapter",
-                    "protocol_version": "2.0",
+                    "protocol_version": "2.1",
                     "page_id": page_id,
                     "adapter": adapter,
                     "engine": "selkies_gstreamer",
@@ -3772,7 +3778,7 @@ impl Provider for MockBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
-                "protocol_version": "2.0",
+                "protocol_version": "2.1",
                 "status": "configured",
                 "adapter_count": 2,
                 "adapters": [
@@ -3833,6 +3839,22 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         match request.get("op").and_then(|value| value.as_str()) {
+            Some("status")
+                if request.get("lifecycle_generation").is_none()
+                    && matches!(
+                        self.failure,
+                        MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct
+                            | MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                            | MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                            | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                    ) =>
+            {
+                let mut response = MockBrowserEngineProvider.send_raw(request).await?;
+                response["data"]["adapters"][0]["supported_guarantee_levels"] =
+                    json!(["mechanism_microvm"]);
+                response["data"]["adapters"][0]["backing_substrate"] = json!("macos_vz");
+                Ok(response)
+            }
             Some("launch") => {
                 let launch_call = self
                     .launch_calls
@@ -3938,7 +3960,7 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         "data": {
                             "schema": "elastos.browser.engine.page/v1",
                             "provider": "browser-engine-adapter",
-                            "protocol_version": "2.0",
+                            "protocol_version": "2.1",
                             "page_id": "unsafe page id",
                         }
                     })),
@@ -4158,7 +4180,7 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                             "stream_id": stream_id,
                             "effect": {
                                 "provider": "browser-engine-adapter",
-                                "protocol_version": "2.0",
+                                "protocol_version": "2.1",
                                 "page_id": page_id,
                                 "adapter": "mock-browser-engine",
                                 "engine": "selkies_gstreamer",
@@ -4360,6 +4382,7 @@ impl Provider for MockRejectingBrowserEngineProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         match request.get("op").and_then(|value| value.as_str()) {
+            Some("readiness") => MockBrowserEngineProvider.send_raw(request).await,
             Some("launch") => Ok(json!({
                 "status": "error",
                 "code": "display_session_unavailable",
@@ -4382,13 +4405,17 @@ impl Provider for MockRejectingBrowserEngineProvider {
                 "status": "ok",
                 "data": {
                     "provider": "browser-engine-adapter",
-                    "protocol_version": "2.0",
+                    "protocol_version": "2.1",
                     "status": "configured",
                     "adapter_count": 1,
                     "adapters": [{
                         "id": "mock-browser-engine",
                         "engine": "selkies_gstreamer",
                         "default": true,
+                        "backing_substrate": "operator_rbi",
+                        "supported_display_modes": ["webrtc_remote_display"],
+                        "supported_guarantee_levels": ["operator_rbi"],
+                        "network_mode": "runtime_net_only",
                         "direct_network": false,
                         "wallet_injection": false
                     }],
@@ -4439,6 +4466,7 @@ impl Provider for MockMalformedBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
+                "protocol_version": "2.1",
                 "status": "configured",
                 "adapter_count": 1,
                 "required_byte_transport": "adapter_ipc",

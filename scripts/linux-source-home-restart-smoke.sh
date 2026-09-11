@@ -301,6 +301,16 @@ empty_receipt = os.environ.get("ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT")
 if empty_receipt is not None:
     print(empty_receipt)
     raise SystemExit(0)
+without_backup = os.environ.get("ELASTOS_SMOKE_UPGRADE_WITHOUT_BACKUP")
+if without_backup:
+    result = {"schema":"elastos.principal-root.upgrade-receipt/v1",
+              "status":"already_ready","root_count":0,"object_count":0,"roots":[]}
+    if without_backup == "changed":
+        result.update(status="upgraded", root_count=1, object_count=1)
+    elif without_backup == "invalid":
+        result = {"ok":True}
+    print(json.dumps(result))
+    raise SystemExit(0)
 backup = pathlib.Path(sys.argv[sys.argv.index("--backup-dir") + 1])
 backup.mkdir(mode=0o700, parents=True, exist_ok=False)
 proof = backup / "rollback.json"
@@ -662,6 +672,32 @@ def linux_active_proof(base):
     if "rollback_reconciliation_required" not in second.stderr or not process_alive(new_pid):
         raise AssertionError("second rollback was not blocked before stop")
 
+    ready = Fixture(base, "already-ready-without-backup")
+    ready_env = ready.environment(ELASTOS_SMOKE_UPGRADE_WITHOUT_BACKUP="ready")
+    ready.run(env=ready_env, ok=True)
+    ready_receipt = json.loads(ready.restart_receipt.read_text(encoding="utf-8"))
+    ready_pid = ready_receipt["gateway_pid"]
+    ready.processes.append(ready_pid)
+    tracked_pids.add(ready_pid)
+    if "principal_root_rollback" in ready_receipt or list((ready.data / "backups").iterdir()):
+        raise AssertionError("already-ready restart fabricated rollback state")
+    ready.run(env=ready_env, ok=True)
+    replacement = json.loads(ready.restart_receipt.read_text(encoding="utf-8"))["gateway_pid"]
+    ready.processes.append(replacement)
+    tracked_pids.add(replacement)
+    if process_alive(ready_pid) or not process_alive(replacement):
+        raise AssertionError("already-ready restart did not replace its exact gateway")
+    ready.cleanup()
+
+    for mode in ("changed", "invalid"):
+        missing = Fixture(base, f"missing-backup-{mode}")
+        result = missing.run(
+            env=missing.environment(ELASTOS_SMOKE_UPGRADE_WITHOUT_BACKUP=mode), ok=False
+        )
+        if "principal_root_upgrade_missing_rollback" not in result.stderr or missing.pid_file.exists():
+            raise AssertionError("restart accepted an unproved missing rollback")
+        missing.cleanup()
+
     failed = Fixture(base, "failed-readiness")
     failed_old = failed.start_gateway()
     failed.write_pid(failed_old.pid)
@@ -730,6 +766,7 @@ def main():
                 "source_dirt_rejected": True,
                 "exact_process_owner": True if active else "skipped_non_linux",
                 "rollback_and_failure_cleanup": True if active else "skipped_non_linux",
+                "already_ready_without_rollback": True if active else "skipped_non_linux",
                 "home_services_parity": True if active else "skipped_non_linux",
                 "empty_upgrade_without_rollback": True if active else "skipped_non_linux",
                 "fixture_residue": False,

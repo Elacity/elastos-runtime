@@ -439,6 +439,108 @@ as their journeys are accepted.
   transport before the Runtime-selected custody target handles the request.
   Public provider projection excludes these targets.
 
+## Browser contract and device qualification
+
+The Browser mission is paused at the user's request on 2026-09-09. All B01-B16
+full acceptance gates remain open. The accepted contract permits dependent work
+to continue; B01's open support matrix does not block every implementation slice.
+[Acceptance requirements](docs/BROWSER_ACCEPTANCE.md),
+[support matrix](docs/BROWSER_SUPPORT.md), and the
+[resume queue](TASKS.md#browser-maturity-workstream) remain canonical.
+
+The task Mac and Linux consumer/Exit have these installed artifacts:
+
+| Artifact | Verified source or SHA-256 |
+| --- | --- |
+| Mac Runtime, source `690170bc` | `f5b012ae4f704bf22cb94aa51699f29082839727b4ddbd4493b7b14d26c557bf` |
+| Mac Engine adapter | `192139afe6b274a25bc258648aa84cb98309b708ad3a7d86996ba9095be93c57` |
+| Mac rootfs | `58c82e397fa97d900159ba1a0a7854505cb1bce1f5e11a2c2a8e40e5a7f03971` |
+| Mac initrd | `d928d9f69e7929049575cb1f4c6366f87f66c62cf11921faddb5bb2963c5462c` |
+| Linux Runtime, source `b8c78d79` | `47ca650f8033727bfe57c20b52d4392fdb52d2f085b60307a5394697c44a87a3` |
+| Linux Engine adapter | `83b59f996fae053b66bfaf9a88111c77e0c8846966335d6724d4462a8c0c52c7` |
+| Browser UI on both installations | `f8515b7a28d8bd3dd191ce21ea5c6d1b8c7ed2eadf69852c8cdfd5128fee7ea0` |
+| WebRTC viewer on both installations | `f42217e02d39983924ab9311633c6a91696d8f8eb635317c3ffe7d185944a6e7` |
+
+Installed, served and provider checks pass for these sets. The Linux update
+preserves all five task configuration hashes. Native Runtime builds are debug
+builds, and the Mac image includes a bounded audio observer. They establish
+functional results; release performance still needs an exact release candidate.
+The kernel, media dependencies and matching helpers were reused wherever their
+inputs stayed unchanged. The final source-only patches below are not installed.
+
+Independent review accepts these bounded installed milestones:
+
+| Journey | Passed | Remaining limitation |
+| --- | --- | --- |
+| Local 92 | Home launch, controlled navigation, decoded video/audio, typing, scrolling, Engine inspection, viewer reload in 3872 ms, all 13 close effects in 788 ms, final Runtime/control counts zero | Individual functional sample; observed dropped frames and cumulative audio loss do not establish quality or latency distributions. |
+| Operator 93 | Actual installed Camofox and unchanged Playwright SDK workflow: owner invitation/approval, inspection, fill/clear, revoked-writer rejection and detach preserving the owner's page; media, reload and all 13 close effects also pass | Bounded adapter surface. General selectors, waits, actionability, frames, files, headless handoff and declared Camoufox/Firefox conformance remain open. |
+| Remote 96, A/B/A | Linux Home/consumer and Exit with Mac Engine: approved selection, controlled page, decoded frames, navigation, typing, inspection, short audio and scrolling; exact close in 1888 ms, all 13 effects absent and Runtime/control counts zero | Integrated run fails viewer reload at the unchanged five-second gate. Completed Runtime samples retain page binding; fresh viewer media is unproved before the deadline. |
+| Earlier A/A/B | Mac consumer/Engine uses approved Linux Exit for a public page and navigation; denial and renewal propagate; exact close reaches zero obligations | Controlled remote audio/input, pre-allocation revocation behavior and all placements still need proof on the final candidate. |
+
+Remote 96 first fails at `state_deadline` in the reload observation. Viewer
+page-status takes 1019 ms and precedes display attachment, which starts 3464 ms
+after reload. The observation also reads summary, remote status and local media
+serially; its failed substep was not recorded. A frozen UI scheduling patch
+starts status and attachment together after retained-owner admission, and a
+separate observation change records bounded substep timing. Source verification
+passes 302 focused tests, including an old-order regression failure, and
+independent review accepts the bounded slice. The dedicated delayed-JSON
+observer test and installed repeat remain pending. Existing authority checks
+and the five-second criterion remain.
+
+Earlier source and installed work provides Engine 2.1 readiness, image-set
+verification, bounded image acquisition, explicit Engine/Exit selection,
+Runtime-owned launch/close settlement, input and restored-address repairs,
+WebRTC attachment/recovery, Engine-page inspection and scoped operator writes.
+The RNG initrd change removes an observed five-second bootstrap delay; measured
+launcher samples still range around 9-11 seconds. These are accepted contract
+or bounded journey milestones, not completion of their full acceptance areas.
+A real roughly 898 MB image package is verified locally. Ordinary automatic
+acquisition of a complete published compatible set and second-maintainer setup
+remain open; source-home preparation still uses operator-supplied artifacts.
+
+| Additional source work | Evidence and installed status |
+| --- | --- |
+| `a3471808`, directional Exit EOF | Original regression fails; both repaired stream-direction tests pass independent review. Installed in Linux `b8c78d79`. Remote 96 advances past the prior navigation stall, but one pass does not establish sole cause or repeatability. |
+| `de0a299e`, auth renewal and audit in one state mutation | Independent review and 24 actual Rust checks pass, including six-to-three validation passes. A Mac Runtime candidate built successfully; installation and measured Home attribution remain pending. |
+| `52238f2f`, preserve existing profile disks after mount failure | Original destructive path fails its regression; 14 generated guest-shell and four VZ tests pass independent review. Install the matching host and guest together before persistence proof. Linux Browser profile disk attachment still needs implementation. |
+| `b8c78d79`, paired profile fixture/harness | Reviewed write/close/read proof for cookies, local storage and committed IndexedDB. Attempt 94 fails Home startup before Browser allocation; paired read 95 was stopped. Actual persistence remains unverified. |
+| `6ff70451`, selected upload bytes | Reviewed fixture validates an actual 64 KiB file and destination hash. Installed Library upload and changed-byte negative case remain pending. |
+| Frozen update candidate validation patch | Validates the staged executable before replacing the working Runtime. Three real-subprocess regression fixtures are prepared; actual Rust red/green execution and installed update proof remain pending. |
+
+Failures remain explicit. Earlier remote attempts include an unexplained Carrier
+connection failure and navigation timeouts with incomplete close receipts.
+Audio runs 57 and 72 and lifecycle probe 02 fail with silence or loss; later
+short passing probes do not explain them. A 60-second idle observation consumes
+34.4 CPU seconds with zero pages/VMs. Collaboration validation appears in sampled
+stacks, while a separate Home trace identifies auth-lock contention and repeated
+audit validation. These observations do not establish the full idle-CPU cause.
+Sash's failure on his own installation has no matching diagnostic receipt yet.
+
+The observed Mac is ARM64 with 24 GiB RAM and macOS 26.5.2. The Linux AMD64
+server supplies consumer/Exit evidence and has no KVM device. Every support
+matrix row retains full device, media, recovery and human qualification.
+Required 100 cold launches, 100 warm launches, 100 lifecycle cycles,
+uninterrupted 30-minute A/V and eight-hour mixed use have not started. The
+planned soak start was missed. The current runner lacks warm conditioning,
+input-to-visible latency and synchronized A/V offset proof. Full completion
+within the original deadline is unsupported.
+
+The final Home entropy, Browser entropy, display-mode and formatting checks
+pass. The objective audit returns failure because accepted provider media and
+matching manual UX evidence are absent. Two older documentation predicates also
+fail; they already failed before this cleanup and need reconciliation with the
+current Runtime contract. This audit establishes no product-readiness result.
+
+Runtime continues to own host compatibility, service selection, capabilities,
+lifecycle and audit. Providers own rendering, page semantics and egress;
+Carrier transports authorized remote effects. Human and agent operations share
+page authority. Profile protection/transfer, complete daily workflows and Wallet,
+human accessibility, bounded leases/revocation, updates and security maintenance
+retain their requirements. Public live and published source are unchanged by
+this mission. Earlier per-run detail is retained in Git history and private
+hash-bound receipts rather than duplicated as current truth.
+
 ## Branch Hygiene
 
 - Local UIUX subgroup branches are extraction scaffolding already contained in

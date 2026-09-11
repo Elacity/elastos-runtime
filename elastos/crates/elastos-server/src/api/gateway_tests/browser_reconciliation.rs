@@ -13,6 +13,7 @@ fn browser_lifecycle(owner_launch_id: &str) -> BrowserLaunchLifecycle {
         exit_id: "mock-exit".to_string(),
         engine_route_provider: "mock-browser-engine".to_string(),
         selected_engine_adapter: Some("mock-browser-engine".to_string()),
+        service_selection: None,
         profile_key_hash: None,
         vm_key_hash: None,
     }

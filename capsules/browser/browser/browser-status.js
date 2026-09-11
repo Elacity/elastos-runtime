@@ -15,7 +15,6 @@ export function isAuthoritySessionError(error) {
   const text = String(error?.message || "");
   return (
     error?.status === 401 ||
-    error?.status === 403 ||
     /auth session not found|auth session is not active|home launch token auth session is not active|home launch token expired/i.test(text)
   );
 }
@@ -63,7 +62,42 @@ export function friendlyOpenError(error) {
     return "Browser session expired. Reopening from Home...";
   }
   const outcome = runtimeOpenOutcome(error);
+  if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "viewer_compatibility") {
+    return error.payload.code === "unsupported_viewer_display_mode"
+      ? "This Browser view needs a streamed display. Open Browser from Home with its default display."
+      : "This browser cannot show the Browser session. Use a supported browser or enable WebRTC.";
+  }
+  if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_readiness") {
+    switch (error?.payload?.reason) {
+      case "artifact_invalid":
+        return "Browser Engine files need repair. Prepare this Engine or choose another approved Engine.";
+      case "host_unsupported":
+        return "The selected Engine needs a compatible host. Choose another approved Engine.";
+      case "readiness_unsupported":
+        return "Browser Engine needs an update to report readiness. Update it or choose another approved Engine.";
+      case "control_unavailable":
+        return "Browser Engine is unavailable. Restore its connection or choose another approved Engine.";
+      default:
+        return "Browser Engine needs preparation. Prepare it or choose another approved Engine.";
+    }
+  }
+  if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_compatibility") {
+    switch (error?.payload?.code) {
+      case "incompatible_engine_protocol":
+        return "Browser Engine and Runtime versions are incompatible. Update them to a compatible release.";
+      case "incompatible_engine_capabilities":
+        return "The selected Browser Engine does not support this display and isolation requirement.";
+      case "no_compatible_engine":
+        return "An approved Browser Engine with the required display and isolation capabilities is needed.";
+      case "engine_not_found":
+      case "engine_unavailable":
+        return "Browser Engine is unavailable. Choose an available approved Engine.";
+    }
+  }
   if (outcome?.state === "terminal_pre_effect_failure") {
+    if (error.status === 403) {
+      return "This page was blocked by your Exit Node settings.";
+    }
     return "Browser Engine failed to start cleanly. No Browser page or VM was acquired.";
   }
   if (outcome?.state === "terminal_post_effect_cleanup") {

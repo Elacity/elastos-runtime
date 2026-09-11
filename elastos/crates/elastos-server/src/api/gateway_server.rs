@@ -10,6 +10,7 @@ use super::{gateway_router_with_api_url, GatewayState, GATEWAY_VERSION};
 
 #[derive(Clone, Default)]
 pub struct GatewayCollaborationContext {
+    pub carrier_endpoint: Option<iroh::Endpoint>,
     pub chat_product_port: Option<crate::collaboration_product::CollaborationChatProductPort>,
     pub presence_product_port:
         Option<crate::collaboration_presence::CollaborationPresenceProductPort>,
@@ -36,6 +37,7 @@ pub async fn start_gateway_server(
             chat_product_port: collaboration_chat_product_port,
             presence_product_port: collaboration_presence_product_port,
             discovery_service: None,
+            carrier_endpoint: None,
         },
         cache_dir,
         data_dir,
@@ -105,6 +107,7 @@ async fn start_gateway_server_with_shutdown(
     let gateway_api_url = trusted_gateway_api_url(addr)?;
     let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let state = GatewayState {
+        carrier_endpoint: collaboration.carrier_endpoint,
         provider_registry,
         collaboration_chat_product_port: collaboration.chat_product_port,
         collaboration_presence_product_port: collaboration.presence_product_port,

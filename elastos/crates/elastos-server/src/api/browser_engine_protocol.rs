@@ -1,4 +1,4 @@
-pub const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
-pub const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0";
-pub const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-cleanup-binding/v2";
-pub const BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA: &str = "elastos.browser.engine-cleanup-result/v2";
+pub use elastos_common::browser_protocol::{
+    BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+    BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
+};

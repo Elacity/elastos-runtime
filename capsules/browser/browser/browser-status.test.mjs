@@ -4,8 +4,33 @@ import test from "node:test";
 import {
   collectWebrtcStats,
   friendlyOpenError,
+  isAuthoritySessionError,
   runtimeOpenOutcome,
 } from "./browser-status.js";
+
+test("destination policy denial preserves Browser authority and close ownership", () => {
+  const error = openError("terminal_pre_effect_failure");
+  error.status = 403;
+  error.message = "private host blocked: localhost";
+  assert.equal(isAuthoritySessionError(error), false);
+  assert.equal(friendlyOpenError(error), "This page was blocked by your Exit Node settings.");
+
+  error.payload.outcome.state = "cleanup_pending";
+  error.payload.outcome.effects.vm_acquired = true;
+  assert.match(friendlyOpenError(error), /cleanup is pending/);
+  assert.equal(isAuthoritySessionError({ status: 403, message: "permission denied" }), false);
+});
+
+test("authentication failures still request Home authority renewal", () => {
+  for (const error of [
+    { status: 401, message: "unauthorized" },
+    { status: 403, message: "Home launch token expired" },
+    { status: 403, message: "auth session is not active" },
+  ]) {
+    assert.equal(isAuthoritySessionError(error), true);
+    assert.match(friendlyOpenError(error), /session expired/);
+  }
+});
 
 function openError(state, effects) {
   const error = new Error("browser-vz-engine-supervisor exited");
@@ -35,6 +60,27 @@ test("pre-effect open failure never claims a missing terminal close", () => {
     "Browser Engine failed to start cleanly. No Browser page or VM was acquired.",
   );
   assert.doesNotMatch(friendlyOpenError(error), /terminal close/i);
+});
+
+test("compatibility denial explains the required repair before launch", () => {
+  for (const [code, message] of [
+    ["incompatible_engine_protocol", "Browser Engine and Runtime versions are incompatible. Update them to a compatible release."],
+    ["incompatible_engine_capabilities", "The selected Browser Engine does not support this display and isolation requirement."],
+    ["no_compatible_engine", "An approved Browser Engine with the required display and isolation capabilities is needed."],
+    ["engine_not_found", "Browser Engine is unavailable. Choose an available approved Engine."],
+  ]) {
+    const error = openError("terminal_pre_effect_failure");
+    error.payload.code = code;
+    error.payload.stage = "engine_compatibility";
+    assert.equal(friendlyOpenError(error), message);
+  }
+});
+
+test("compatibility wording cannot hide acquired effects or pending cleanup", () => {
+  const error = openError("cleanup_pending", { page_acquired: true, vm_acquired: true });
+  error.payload.code = "incompatible_engine_protocol";
+  error.payload.stage = "engine_compatibility";
+  assert.match(friendlyOpenError(error), /cleanup is pending/);
 });
 
 test("cleanup-pending open failure is driven by structured acquired effects", () => {
@@ -156,4 +202,22 @@ test("WebRTC diagnostics expose only selected pair types and inbound counters", 
   assert.equal(stats.selected_remote_candidate_type, "relay");
   assert.equal(stats.selected_protocol, "tcp");
   assert.doesNotMatch(JSON.stringify(stats), /must-not-be-projected/);
+});
+
+
+test("readiness failures explain the repair while cleanup retains priority", () => {
+  const expected = new Map([
+    ["artifact_invalid", /files need repair/],
+    ["host_unsupported", /needs a compatible host/],
+    ["readiness_unsupported", /update to report readiness/],
+    ["control_unavailable", /Restore its connection/],
+    ["preparation_required", /needs preparation/],
+  ]);
+  for (const [reason, message] of expected) {
+    const error = openError("terminal_pre_effect_failure");
+    Object.assign(error.payload, { stage:"engine_readiness", code:"engine_not_ready", reason });
+    assert.match(friendlyOpenError(error), message);
+    error.payload.outcome.state = "cleanup_pending";
+    assert.doesNotMatch(friendlyOpenError(error), message);
+  }
 });

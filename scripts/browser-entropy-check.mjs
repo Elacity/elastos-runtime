@@ -96,6 +96,7 @@ const browserWindowCloseHandshakeTest = read(
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
+  "elastos/crates/elastos-common/src/browser_protocol.rs",
   "capsules/browser-engine-adapter/src/main.rs",
   "capsules/browser-engine-adapter/src/display.rs",
   "capsules/browser-engine-adapter/src/ids.rs",
@@ -521,7 +522,7 @@ assert(
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
     browserEngineAdapter.includes(
-      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1"',
     ) &&
     browserEngineAdapter.includes(
       "elastos.browser.engine-cleanup-binding/v2",
@@ -1031,7 +1032,7 @@ assert(
     !browserSourceHomeConfig.includes("preferred_display_mode") &&
     browserSourceHomeConfig.includes("relay_ipc") &&
     browserSourceHomeConfig.includes("relay_ipc: true") &&
-    browserSourceHomeConfig.includes("-relay.sock") &&
+    browserSourceHomeConfig.includes('runtimeSocketPath(args, "exit-relay")') &&
     browserSourceHomeConfig.includes("browser-local-exit.json") &&
     browserSourceHomeConfig.includes("elastos.browser.local-exit.config/v1") &&
     browserSourceHomeConfig.includes("runtimeGatewayPrivateTargets") &&
@@ -1040,7 +1041,7 @@ assert(
     browserSourceHomeConfig.includes('ports: [80, 443]') &&
     browserSourceHomeConfig.includes("relay_ipc_path") &&
     browserSourceHomeConfig.includes("control_socket_path") &&
-    browserSourceHomeConfig.includes("/tmp/elastos-browser-vm-control-${args.platform}.sock") &&
+    browserSourceHomeConfig.includes('runtimeSocketPath(args, "vm-control")') &&
     browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_CONTROL_SOCKET") &&
     !browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
     browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS") &&
@@ -1140,31 +1141,18 @@ assert(
     setupSourceHome.includes("browser-vm-artifact-preflight.sh") &&
     setupSourceHome.includes("browser-vm-target-preflight.sh") &&
     setupSourceHome.includes("setup-source-home-browser-artifacts.sh") &&
+    !setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
+    !setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
     setupSourceHomeBrowserArtifacts.includes("elastos.setup-source-home.browser-artifacts/v1") &&
     setupSourceHomeBrowserArtifacts.includes("managed-runtimes") &&
     setupSourceHomeBrowserArtifacts.includes("browser-vm/rootfs.ext4") &&
     setupSourceHomeBrowserArtifacts.includes("bin/crosvm") &&
     setupSourceHomeBrowserArtifacts.includes("browser-vm/initrd") &&
     setupSourceHomeBrowserArtifacts.includes("bin/initrd") &&
+    setupSourceHomeBrowserArtifacts.includes("--verify-image-set") &&
+    setupSourceHomeBrowserArtifacts.includes("browser-vm/browser-vm-rootfs-manifest.json") &&
     setupSourceHomeBrowserArtifactsSmoke.includes("elastos.setup-source-home.browser-artifacts-smoke/v1") &&
-    setupSourceHomeBrowserArtifactsSmoke.includes("existing real kernel file must not be replaced") &&
-    setupSourceHomeBrowserArtifactsSmoke.includes("Linux managed setup must not create the Mac VZ initrd path") &&
-    setupSourceHomeBrowserArtifactsSmoke.includes("Mac managed setup must not create a crosvm link") &&
     setupSourceHome.includes("browser-selkies-control-service.mjs") &&
-    setupSourceHome.includes("browser-vm-selkies-start") &&
-    setupSourceHome.includes("browser-vm-init") &&
-    setupSourceHome.includes("extract_browser_vm_init") &&
-    setupSourceHome.includes("extract_browser_vm_selkies_start") &&
-    setupSourceHome.includes("write_browser_vm_target_manifest") &&
-    setupSourceHome.includes('"guarantee_level": "mechanism_microvm"') &&
-    setupSourceHome.includes("/etc/elastos/browser-vm-target.json") &&
-    setupSourceHome.includes("resolve_browser_vm_native_proxy_source") &&
-    setupSourceHome.includes("validate_linux_guest_binary") &&
-    setupSourceHome.includes("/opt/elastos/bin/browser-native-proxy-engine") &&
-    setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
-    setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
-    setupSourceHome.includes("ELASTOS_DEBUGFS_BIN") &&
-    setupSourceHome.includes("debugfs") &&
     setupSourceHome.includes("ELASTOS_NODE_BIN") &&
     setupSourceHome.includes("ELASTOS_BROWSER_VM_CONTROL_LAUNCHER") &&
     setupSourceHome.includes("existing_remote_browser_vm_config") &&
@@ -1584,8 +1572,8 @@ assert(
     browserVmTargetStage.includes("found_media_iface") &&
     browserVmTargetStage.includes('[ -n "$found_media_iface" ] && break') &&
     browserVmTargetStage.includes("patch_selkies_relay_policy") &&
-    browserVmTargetStage.includes("_elastos_raw_caps_with_framerate") &&
-    browserVmTargetStage.includes("stale Selkies Gst.Fraction constructor remains") &&
+    !browserVmTargetStage.includes("_elastos_raw_caps_with_framerate") &&
+    !browserVmTargetStage.includes("fraction_replacement") &&
     browserVmTargetStage.includes("/run/elastos/browser-ice-transport-policy") &&
     browserVmTargetStage.includes("ice-transport-policy") &&
     browserVmTargetStage.includes("elastos_ice_transport_policy") &&
@@ -1625,7 +1613,7 @@ assert(
     !browserVmTargetStage.includes('>"$ELASTOS_BROWSER_VM_SERIAL_LOG_DEV"') &&
     browserVmTargetStage.includes('"control_socket_ready_timeout_ms": 60000') &&
     browserVmTargetStage.includes('"control_request_timeout_ms": 120000') &&
-    !browserVmTargetStage.includes("--proxy-bypass-list=<-loopback>") &&
+    browserVmTargetStage.includes("--proxy-bypass-list=<-loopback>") &&
     browserVmRootfsBuild.includes("elastos.browser.vm-rootfs-build/v1") &&
     browserVmRootfsBuild.includes("debootstrap") &&
     browserVmRootfsBuild.includes("elastos-tiny-initrd") &&
@@ -1635,8 +1623,9 @@ assert(
     browserVmRootfsBuild.includes("require_mounts_clean") &&
     browserVmRootfsBuild.includes("rootfs pseudo-filesystem still mounted") &&
     browserVmRootfsBuild.includes("initrd_dump_diagnostics") &&
-    browserVmRootfsBuild.includes("_elastos_raw_caps_with_framerate") &&
-    browserVmRootfsBuild.includes("Selkies stale Gst.Fraction constructor remains") &&
+    browserVmRootfsBuild.includes("python3-gst-1.0") &&
+    browserVmRootfsBuild.includes("browser-gst-python-smoke.py") &&
+    browserVmRootfsBuild.includes("without raw GI workarounds") &&
     browserVmRootfsBuild.includes("browser-vm-initrd.log") &&
     browserVmRootfsBuild.includes("tail dmesg sync chmod") &&
     browserVmRootfsBuild.includes("initrd_mark_newroot") &&
@@ -1660,7 +1649,7 @@ assert(
     browserVmRootfsBuild.includes("/opt/gst-web/index.html") &&
     browserVmRootfsBuild.includes("python3 -m pip install") &&
     browserVmRootfsBuild.includes("linux-libc-dev") &&
-    browserVmRootfsBuild.includes("mke2fs -q -t ext4") &&
+    browserVmRootfsBuild.includes('"$mke2fs_bin" -q -t ext4') &&
     !browserVmRootfsBuild.includes("docker ") &&
     !browserVmRootfsBuild.includes("Docker is used here only as an") &&
     browserVmTargetStageSmoke.includes("elastos.browser.vm-target-stage-smoke/v1") &&
@@ -1683,8 +1672,8 @@ assert(
     browserVmTargetDoc.includes("full bootable rootfs must also pass runtime dependency mode") &&
     browserVmTargetDoc.includes("--target-dir /path/to/full-rootfs --require-runtime-deps") &&
     browserVmTargetDoc.includes("PipeWire, PipeWire Pulse, WirePlumber") &&
-    browserVmTargetDoc.includes("Refresh-only is not") &&
-    browserVmTargetDoc.includes("sufficient for package/dependency changes") &&
+    browserVmTargetDoc.includes("Guest drift requires a rebuilt image set") &&
+    browserVmTargetDoc.includes("preserves guest bytes") &&
     browserVmTargetDoc.includes("browser-vm-runtime-relay") &&
     browserVmTargetDoc.includes("browser-vm-guest-control-bridge") &&
     browserVmTargetDoc.includes("browser-vm-selkies-start") &&
@@ -1849,7 +1838,7 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260731b") &&
+    browser.includes("browser.js?v=browser-20260907c") &&
     !browser.includes("browser.js?v=browser-20260731a") &&
     !browser.includes("browser.js?v=browser-20260730a") &&
     !browser.includes("browser.js?v=browser-20260728a") &&
@@ -1895,8 +1884,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260730b") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260730b") &&
+  browserJs.includes("browser-status.js?v=browser-20260907c") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260907c") &&
     !browserJs.includes("browser-status.js?v=browser-20260711c") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
     !browserJs.includes("browser-status.js?v=browser-20260626e") &&
@@ -1911,7 +1900,7 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260731a") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260907c") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
@@ -2011,6 +2000,11 @@ const failRuntimeOwnedPageBlock = sourceBlock(
   "async function failRuntimeOwnedPage(",
   "Browser Runtime-owned failure cleanup",
 );
+const settleRemoteDisplayFailureBlock = sourceBlock(
+  browserMain.slice(browserMain.indexOf("function settleRemoteDisplayFailure(")),
+  "\n) {",
+  "Browser restored viewer failure",
+);
 assert(
   releaseRuntimePageForUnloadBlock.includes("stopPageStatusPolling();") &&
     releaseRuntimePageForUnloadBlock.includes("stopPageHeartbeat();") &&
@@ -2033,7 +2027,11 @@ assert(
     ) &&
     (browserMain.match(/currentPage = null;/g) || []).length === 2 &&
     (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 1 &&
-    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 2,
+    settleRemoteDisplayFailureBlock.includes("sameRuntimePageOwner(currentRuntimePageOwner(), restoredViewerOwner)") &&
+    settleRemoteDisplayFailureBlock.includes("closeRemoteDisplay();") &&
+    !settleRemoteDisplayFailureBlock.includes("currentPage = null") &&
+    !settleRemoteDisplayFailureBlock.includes("publishRuntimePageForHost(null)") &&
+    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 3,
   "Browser unload and post-ownership failure cleanup must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, or persistence",
 );
 

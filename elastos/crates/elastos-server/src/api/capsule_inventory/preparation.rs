@@ -3069,6 +3069,7 @@ mod tests {
             )
             .unwrap();
             let app = crate::api::gateway::gateway_router(crate::api::gateway::GatewayState {
+                carrier_endpoint: None,
                 provider_registry: Some(registry),
                 collaboration_chat_product_port: None,
                 collaboration_presence_product_port: None,
@@ -3259,6 +3260,7 @@ mod tests {
             .unwrap();
             (
                 crate::api::gateway::gateway_router(crate::api::gateway::GatewayState {
+                    carrier_endpoint: None,
                     provider_registry: Some(registry),
                     collaboration_chat_product_port: None,
                     collaboration_presence_product_port: None,

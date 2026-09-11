@@ -144,6 +144,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-engine".to_string(),
             selected_engine_adapter: Some("mock-adapter".to_string()),
+            service_selection: None,
             profile_key_hash: browser_lifecycle_hash("profile-test"),
             vm_key_hash: browser_lifecycle_hash("vm-test"),
         },
@@ -156,7 +157,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
         BrowserLaunchEffect {
             page_id: "profile-reset-live-page".to_string(),
             engine_provider: "browser-engine-adapter".to_string(),
-            engine_protocol_version: "2.0".to_string(),
+            engine_protocol_version: "2.1".to_string(),
             engine_adapter: "mock-adapter".to_string(),
             engine: "mock-engine".to_string(),
             provider_cleanup: serde_json::json!({

@@ -26,6 +26,13 @@ pub(super) fn validate_display_session(
     expected_display_mode: BrowserDisplayMode,
 ) -> Result<(), String> {
     if display_session
+        .get("display_generation")
+        .is_some_and(|value| !value.as_str().is_some_and(browser_display_generation_valid))
+    {
+        return Err("invalid Browser display generation".to_string());
+    }
+
+    if display_session
         .get("schema")
         .and_then(|value| value.as_str())
         != Some("elastos.browser.display-session/v1")
@@ -169,7 +176,37 @@ pub(super) fn validate_display_size(display_session: &Value) -> Result<(), Strin
 }
 
 pub(super) fn validate_webrtc_signal(signal: &Value) -> Result<&'static str, String> {
+    if signal
+        .get("display_generation")
+        .is_some_and(|value| !value.as_str().is_some_and(browser_display_generation_valid))
+    {
+        return Err("invalid Browser display generation".to_string());
+    }
+    if signal.get("schema").and_then(Value::as_str) != Some(BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA)
+        && signal.get("request_id").is_some()
+    {
+        return Err("WebRTC signal must not include request_id".to_string());
+    }
     match signal.get("schema").and_then(|value| value.as_str()) {
+        Some(BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA) => {
+            let keys = ["schema", "type", "request_id", "display_generation"];
+            if signal.get("type").and_then(Value::as_str) != Some("display_attach")
+                || !signal
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(browser_display_request_id_valid)
+                || !signal
+                    .get("display_generation")
+                    .and_then(Value::as_str)
+                    .is_some_and(browser_display_generation_valid)
+                || signal.as_object().is_none_or(|object| {
+                    object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key))
+                })
+            {
+                return Err("invalid Browser display attach request".to_string());
+            }
+            Ok("display_attach")
+        }
         Some("elastos.browser.webrtc-offer/v1") => {
             if signal.get("type").and_then(|value| value.as_str()) != Some("offer") {
                 return Err("WebRTC signal must be an offer".to_string());

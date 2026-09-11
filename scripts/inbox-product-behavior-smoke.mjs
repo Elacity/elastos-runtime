@@ -391,6 +391,32 @@ async function runInboxHomeChromeSmoke() {
   await settle();
   assert.equal(nodes.get("empty-title").textContent, "No requests need review");
   context.fetch = originalFetch;
+
+  const serviceActions = [];
+  context.fetch = async (path, options = {}) => {
+    if (path === "/api/apps/inbox/actions") {
+      serviceActions.push(JSON.parse(options.body).action_id);
+    }
+    return jsonResponse({ notifications: { entries: [{
+      id: "entry-service", kind: "service_access_request", title: "Browser Exit access",
+      body: "A contact requests Browser Exit access.", severity: "attention", read: false,
+      source_app: "services", action_ref: { action_id: "service-approve-request:service-1" },
+    }] } });
+  };
+  for (const callback of windowListeners.get("message") || []) {
+    callback({ origin: "null", source: parentFrame,
+      data: { type: "elastos:menu-command", cmd: "refresh" } });
+  }
+  await settle();
+  const buttons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
+  assert.deepEqual(buttons.map(button => button.textContent), ["Open", "Approve", "Deny"]);
+  assert.deepEqual(serviceActions, [], "Viewing a Services request must preserve its pending state");
+  for (const label of ["Approve", "Deny"]) {
+    const button = descendants(nodes.get("entry-rows")).find(node => node.tagName === "BUTTON" && node.textContent === label);
+    for (const callback of button.listeners.get("click") || []) callback();
+    await settle();
+  }
+  assert.deepEqual(serviceActions, ["service-approve-request:service-1", "service-deny-request:service-1"]);
 }
 
 async function runInboxLaunchSelectionSmoke() {

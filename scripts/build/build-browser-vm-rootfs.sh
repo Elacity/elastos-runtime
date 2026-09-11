@@ -135,7 +135,7 @@ as_root() {
 }
 
 require_cmd cargo
-require_cmd mke2fs
+mke2fs_bin="$(resolve_cmd mke2fs)"
 require_cmd cpio
 require_cmd gzip
 require_cmd python3
@@ -289,6 +289,7 @@ apt-get install --no-install-recommends -y -qq \
   python3-aiohttp \
   python3-gi \
   python3-gi-cairo \
+  python3-gst-1.0 \
   python3-numpy \
   python3-dev \
   python3-pip \
@@ -308,58 +309,6 @@ import re
 
 path = Path("/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py")
 text = path.read_text()
-needle = "from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC\n    fract = Gst.Fraction(60, 1)"
-replacement = """from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC
-    def _elastos_raw_caps_with_framerate(framerate):
-        return Gst.caps_from_string(f"video/x-raw,framerate={int(framerate)}/1")
-    fract = Gst.Fraction()"""
-if "_elastos_raw_caps_with_framerate" not in text:
-    if needle not in text:
-        raise SystemExit("Selkies Gst.Fraction compatibility patch target not found")
-    text = text.replace(needle, replacement)
-initial_caps = """        # Create capabilities for ximagesrc
-        self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-        self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
-"""
-patched_initial_caps = """        # Create capabilities for ximagesrc
-        self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)
-"""
-if initial_caps in text:
-    text = text.replace(initial_caps, patched_initial_caps)
-text = text.replace(
-    '        self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))',
-    '        self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)',
-)
-
-for set_framerate_caps in (
-    """            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(framerate, 1))
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""",
-    """            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""",
-):
-    if set_framerate_caps in text:
-        text = text.replace(set_framerate_caps, """            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(framerate)
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""")
-text = text.replace(
-    '            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(framerate, 1))',
-    '            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(framerate)',
-)
-text = text.replace(
-    '            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))',
-    '            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)',
-)
-for stale_fraction in (
-    "Gst.Fraction(60, 1)",
-    "Gst.Fraction(self.framerate, 1)",
-    "Gst.Fraction(framerate, 1)",
-):
-    if stale_fraction in text:
-        raise SystemExit(f"stale Selkies Gst.Fraction constructor remains: {stale_fraction}")
 marker = '        self.webrtcbin.set_property("latency", 0)\n'
 relay_patch = '''        elastos_ice_transport_policy = os.environ.get("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY", "").strip().lower()
         if elastos_ice_transport_policy:
@@ -587,6 +536,10 @@ kernel_version="$(
 [[ -n "$kernel_version" ]] || die "could not determine installed kernel version"
 printf '%s\n' "$kernel_version" > "$out_dir/kernel.version"
 
+echo "[browser-vm-rootfs] verify GStreamer Python bindings and Selkies module"
+as_root chroot "$rootfs_dir" /usr/bin/env PYTHONDONTWRITEBYTECODE=1 \
+  /usr/bin/python3 - < "$repo_root/scripts/build/browser-gst-python-smoke.py"
+
 echo "[browser-vm-rootfs] verify Debian kernel/modules: $kernel_version"
 as_root chroot "$rootfs_dir" /usr/bin/env KERNEL_VERSION="$kernel_version" /bin/sh <<'SH'
 set -eu
@@ -603,14 +556,6 @@ test -x /usr/bin/pipewire-pulse
 test -x /usr/bin/pw-cli
 test -x /usr/bin/wireplumber
 test -f /opt/gst-web/index.html
-python3 -c "import selkies_gstreamer" >/dev/null 2>&1
-python3 - <<'PY'
-import gi
-for namespace in ("Gst", "GstWebRTC", "GstSdp", "GstRtp"):
-    gi.require_version(namespace, "1.0")
-from gi.repository import Gst, GstWebRTC, GstSdp, GstRtp
-Gst.init(None)
-PY
 python3 - <<'PY'
 import importlib.util
 from pathlib import Path
@@ -623,15 +568,8 @@ if (
     or "confirmed ICE transport policy after TURN setup" not in text
 ):
     raise SystemExit("Selkies must apply ElastOS relay-only ICE policy to webrtcbin")
-if "_elastos_raw_caps_with_framerate" not in text:
-    raise SystemExit("Selkies must avoid Gst.Fraction(framerate, 1) on this PyGObject build")
-for stale_fraction in (
-    "Gst.Fraction(60, 1)",
-    "Gst.Fraction(self.framerate, 1)",
-    "Gst.Fraction(framerate, 1)",
-):
-    if stale_fraction in text:
-        raise SystemExit(f"Selkies stale Gst.Fraction constructor remains: {stale_fraction}")
+if "_elastos_raw_caps_with_framerate" in text or "Gst.Fraction()" in text:
+    raise SystemExit("Selkies must use the installed gst-python bindings without raw GI workarounds")
 if "self.build_video_pipeline()\n            self.build_audio_pipeline()" in text:
     raise SystemExit("Selkies must keep video/data and audio on separate product WebRTC peers")
 if "self.build_video_pipeline()" not in text or "self.build_audio_pipeline()" not in text:
@@ -806,6 +744,7 @@ for module in \
   virtio \
   virtio_ring \
   virtio_pci \
+  virtio_rng \
   virtio_console \
   virtio_net \
   virtio_blk \
@@ -885,7 +824,7 @@ echo "[browser-vm-rootfs] run rootfs preflight"
 
 echo "[browser-vm-rootfs] pack ext4 image"
 rm -f "$rootfs_image"
-as_root mke2fs -q -t ext4 -d "$rootfs_dir" -F "$rootfs_image" "$rootfs_size"
+as_root "$mke2fs_bin" -q -t ext4 -d "$rootfs_dir" -F "$rootfs_image" "$rootfs_size"
 as_root chown "$(id -u):$(id -g)" "$rootfs_image"
 
 python3 - "$out_dir" "$target_platform" "$rootfs_image" "$kernel_image" "$initrd_image" <<'PY'

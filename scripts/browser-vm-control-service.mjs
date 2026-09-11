@@ -5,10 +5,82 @@ import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
+let verifiedHostReadiness = null;
+
+function readinessArtifactIdentity(dataDir, launcher) {
+  const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
+  const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
+  const files = [
+    launcher,
+    artifact("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
+    artifact("ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "browser-vm/browser-vm-rootfs-manifest.json"),
+    artifact("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
+    linux ? artifact("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
+      : artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
+    path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
+  ];
+  if (linux) {
+    files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
+  } else if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin") {
+    const turnProgram = process.env.ELASTOS_BROWSER_VM_TURN_PROGRAM;
+    if (!turnProgram || !path.isAbsolute(turnProgram)) return null;
+    files.push(turnProgram);
+  }
+  try {
+    return JSON.stringify(files.map((file) => {
+      const info = fs.statSync(file, { bigint: true });
+      return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
+    }));
+  } catch {
+    return null;
+  }
+}
+
+async function engineReadiness(config) {
+  const unavailable = (reason) => ({
+    schema: "elastos.browser.engine-readiness/v1",
+    readiness: { state: "unavailable", reason },
+  });
+  // Remote providers report their own host readiness through the same Engine
+  // contract. An operator tunnel's local files cannot certify its remote host.
+  if (path.basename(config.launcher_program).startsWith("browser-vm-remote-vz-launcher")) {
+    return unavailable("readiness_unsupported");
+  }
+  const dataDir = process.env.ELASTOS_BROWSER_VM_DATA_DIR;
+  if (!dataDir || !path.isAbsolute(dataDir)) return unavailable("preparation_required");
+  const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
+  const identity = readinessArtifactIdentity(dataDir, config.launcher_program);
+  if (identity && verifiedHostReadiness?.identity === identity) return verifiedHostReadiness.result;
+  return new Promise((resolve) => {
+    execFile(script, ["--host-readiness"], {
+      timeout: 8000, maxBuffer: 64 * 1024,
+      env: {
+        ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
+        ...((process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")
+          ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
+      },
+    }, (error, stdout) => {
+      if (error) return resolve(unavailable("preparation_required"));
+      try {
+        const result = JSON.parse(stdout);
+        if (result.schema !== "elastos.browser.engine-readiness/v1") throw new Error("schema");
+        if (result.readiness?.state === "ready") {
+          if (!identity || readinessArtifactIdentity(dataDir, config.launcher_program) !== identity) {
+            return resolve(unavailable("preparation_required"));
+          }
+          verifiedHostReadiness = { identity, result };
+        }
+        resolve(result);
+      } catch {
+        resolve(unavailable("readiness_unsupported"));
+      }
+    });
+  });
+}
 const OPEN_REQUEST_ENV = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_INPUT_BODY_BYTES =
@@ -2112,6 +2184,7 @@ function requestJsonOverUnix(
   body,
   timeoutMs,
   signal,
+  maxResponseBytes = Infinity,
 ) {
   validateAbsolutePath(socketPath, "Browser VM guest control socket");
   const bytes = body == null ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body));
@@ -2136,7 +2209,17 @@ function requestJsonOverUnix(
       },
       (res) => {
         const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
+        let received = 0;
+        res.on("data", (chunk) => {
+          received += chunk.length;
+          if (received > maxResponseBytes) {
+            clearAbort();
+            reject(new Error("Browser control response exceeded its byte limit"));
+            res.destroy(); req.destroy(); return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("error", error => { clearAbort(); reject(error); });
         res.on("end", () => {
           clearAbort();
           const text = Buffer.concat(chunks).toString("utf8");
@@ -2150,7 +2233,8 @@ function requestJsonOverUnix(
             }
           }
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject(new Error(parsed.error || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`));
+            reject((requestPath.endsWith("/inspect") ? browserInspectionControlError(parsed, res.statusCode) : null) || browserDisplayControlError(parsed) ||
+              new Error((typeof parsed?.error === "string" && parsed.error) || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`));
             return;
           }
           resolve(parsed);
@@ -2168,6 +2252,29 @@ function requestJsonOverUnix(
     req.end(bytes);
     if (signal?.aborted) abortRequest();
   });
+}
+
+function browserDisplayControlError(payload) {
+  const status = {
+    display_attach_busy: 409,
+    display_generation_mismatch: 409,
+    display_owner_changed: 409,
+    display_attach_unsupported: 501,
+    display_attach_failed: 503,
+    display_attach_uncertain: 503,
+  };
+  if (typeof payload?.code !== "string" || !Object.hasOwn(status, payload.code)) return null;
+  return Object.assign(new Error("Browser display operation failed."), {
+    code: payload.code, displayHttpStatus: status[payload.code],
+  });
+}
+
+function browserInspectionControlError(payload, statusCode) {
+  const statuses = { invalid_inspection: 400, inspection_unsupported: 501, stale_inspection: 409,
+    inspection_busy: 409, inspection_owner_changed: 409, inspection_failed: 503 };
+  const code = typeof payload?.code === "string" && Object.hasOwn(statuses, payload.code)
+    ? payload.code : statusCode === 404 ? "inspection_unsupported" : "inspection_failed";
+  return Object.assign(new Error("Browser page inspection could not complete."), { code, inspectionHttpStatus: statuses[code] });
 }
 
 function postJsonOverUnix(socketPath, requestPath, body, timeoutMs, signal) {
@@ -3366,8 +3473,47 @@ async function proxyGuestPageRead(config, activePages, activeVms, pageId, op) {
   );
 }
 
+async function proxyGuestPageInspect(activePages, activeVms, pageId, body) {
+  const { record, controlSocketPath } = activePageGuestControl(activePages, activeVms, pageId);
+  const ownerCurrent = () => {
+    try {
+      const current = activePageGuestControl(activePages, activeVms, pageId);
+      return current.record === record && current.controlSocketPath === controlSocketPath;
+    } catch { return false; }
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    const result = await requestJsonOverUnix(controlSocketPath, body === null ? "GET" : "POST",
+      `/pages/${encodeURIComponent(pageId)}/inspect`, body, 2000, controller.signal, 32768);
+    if (!ownerCurrent()) {
+      throw browserInspectionControlError({ code: "inspection_owner_changed" });
+    }
+    if (controller.signal.aborted) throw browserInspectionControlError({ code: "inspection_failed" });
+    return result;
+  } catch (error) {
+    if (!ownerCurrent()) throw browserInspectionControlError({ code: "inspection_owner_changed" });
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
 async function proxyGuestPageInput(config, activePages, activeVms, pageId, body) {
   const { controlSocketPath } = activePageGuestControl(activePages, activeVms, pageId);
+  if (String(body?.event?.type || "").startsWith("operator_")) {
+    const owner = activePages.get(pageId);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    try {
+      const result = await requestJsonOverUnix(controlSocketPath, "POST", `/pages/${encodeURIComponent(pageId)}/input`,
+        body, 2000, controller.signal, 4096);
+      if (controller.signal.aborted || activePages.get(pageId) !== owner ||
+          activePageGuestControl(activePages, activeVms, pageId).controlSocketPath !== controlSocketPath) {
+        throw new Error("Browser operator ownership changed");
+      }
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+
   return postJsonOverUnix(
     controlSocketPath,
     `/pages/${encodeURIComponent(pageId)}/input`,
@@ -3492,6 +3638,10 @@ function main() {
     };
     try {
       const url = new URL(req.url || "/", "http://browser-vm-control");
+      if (req.method === "GET" && url.pathname === "/readiness") {
+        sendJson(200, await engineReadiness(config));
+        return;
+      }
       if (req.method === "GET" && url.pathname === "/status") {
         sendJson(200, {
           schema: "elastos.browser.vm-control-service.status/v1",
@@ -3517,6 +3667,17 @@ function main() {
           network_mode: "runtime_net_only",
           direct_network: false,
         });
+        return;
+      }
+      const inspectionMatch = url.pathname.match(/^\/pages\/([^/]+)\/inspect$/);
+      if (inspectionMatch && ["GET", "POST"].includes(req.method)) {
+        try {
+          const body = req.method === "POST" ? await readJsonBody(req, 1024) : null;
+          sendJson(200, await proxyGuestPageInspect(activePages, activeVms, decodeURIComponent(inspectionMatch[1]), body));
+        } catch (error) {
+          const failure = browserInspectionControlError(error);
+          sendJson(failure.inspectionHttpStatus, { code: failure.code, error: failure.message });
+        }
         return;
       }
       const pageReadMatch = url.pathname.match(/^\/pages\/([^/]+)\/(status|diagnostics|logs)$/);
@@ -3569,7 +3730,11 @@ function main() {
             ),
           );
         } catch (error) {
-          sendJson(404, { error: error instanceof Error ? error.message : String(error) });
+          const displayError = browserDisplayControlError(error);
+          sendJson(displayError?.displayHttpStatus || 404, {
+            error: displayError?.message || (error instanceof Error ? error.message : String(error)),
+            ...(displayError ? { code: displayError.code } : {}),
+          });
         }
         return;
       }
@@ -3671,7 +3836,8 @@ function main() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(
-        error?.code === "resources_in_use" ? 409 : 400,
+        browserDisplayControlError(error)?.displayHttpStatus ||
+          (error?.code === "resources_in_use" ? 409 : 400),
         {
           ...(typeof error?.code === "string"
             ? { code: error.code, message }

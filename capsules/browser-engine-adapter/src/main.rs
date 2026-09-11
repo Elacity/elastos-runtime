@@ -5,6 +5,17 @@
 //! wallet, or browser-engine authority; configured host adapters attach only
 //! through Runtime-owned stream and display sessions.
 
+use elastos_common::browser_protocol::{
+    browser_display_generation_valid, browser_display_request_id_valid,
+    validate_browser_inspection_result, BrowserDisplayAttachment, BrowserDisplayError,
+    BrowserDisplayMode, BrowserEngineAdapterCapabilities, BrowserEngineReadiness,
+    BrowserEngineReadinessReason, BrowserGuaranteeLevel, BrowserInspectionError,
+    BrowserInspectionRequest, BrowserProfileDescriptor, BrowserViewport as ViewportRequest,
+    BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA, BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
+    BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA, BROWSER_ENGINE_PROTOCOL_VERSION,
+    BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_READINESS_SCHEMA,
+    BROWSER_INSPECTION_MAX_RESPONSE_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,10 +37,6 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
-const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
-const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0";
-const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-cleanup-binding/v2";
-const BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA: &str = "elastos.browser.engine-cleanup-result/v2";
 const BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA: &str =
     "elastos.browser.engine.launch-reconciliation/v1";
 const BROWSER_ENGINE_RECONCILIATION_TIMEOUT: std::time::Duration =
@@ -45,6 +52,11 @@ enum Request {
     Init {
         #[serde(default)]
         config: Value,
+    },
+    Readiness {
+        adapter_id: String,
+        #[serde(default)]
+        principal_id: Option<String>,
     },
     Status {
         #[serde(default)]
@@ -105,6 +117,13 @@ enum Request {
         page_id: String,
         #[serde(default)]
         principal_id: Option<String>,
+    },
+    Inspect {
+        page_id: String,
+        #[serde(default)]
+        principal_id: Option<String>,
+        #[serde(default)]
+        request: Option<BrowserInspectionRequest>,
     },
     Input {
         page_id: String,
@@ -233,6 +252,7 @@ struct DurableControlLaunchIdentity {
 
 #[derive(Debug, Clone)]
 struct PageControlSession {
+    display_attachment: BrowserDisplayAttachment,
     generation: String,
     stream_id: String,
     socket_path: String,
@@ -286,6 +306,7 @@ fn page_control_session_from_cleanup(
 ) -> Result<PageControlSession, String> {
     validate_engine_cleanup_binding(binding)?;
     Ok(PageControlSession {
+        display_attachment: BrowserDisplayAttachment::default(),
         generation: binding.generation.clone(),
         stream_id: binding.stream_id.clone(),
         socket_path: binding.control_socket_path.clone(),
@@ -718,6 +739,10 @@ impl BrowserEngineAdapter {
     fn handle(&mut self, request: Request) -> Response {
         match request {
             Request::Init { config } => self.init(config),
+            Request::Readiness {
+                adapter_id,
+                principal_id,
+            } => self.readiness(&adapter_id, principal_id),
             Request::Status {
                 principal_id,
                 lifecycle_generation,
@@ -792,6 +817,11 @@ impl BrowserEngineAdapter {
                 page_id,
                 principal_id,
             } => self.diagnostics(&page_id, principal_id),
+            Request::Inspect {
+                page_id,
+                principal_id,
+                request,
+            } => self.inspect(&page_id, principal_id, request),
             Request::Input {
                 page_id,
                 event,
@@ -835,13 +865,12 @@ impl BrowserEngineAdapter {
                     "result": result,
                 })),
                 Err(err) => {
-                    return Response::error(
-                        "engine_process_unavailable",
-                        format!(
-                            "Browser Engine Adapter prewarm failed for {}: {err}",
-                            adapter.id
-                        ),
-                    )
+                    prewarm_results.push(json!({
+                        "adapter": adapter.id,
+                        "status": "error",
+                        "code": "engine_process_unavailable",
+                        "message": err,
+                    }));
                 }
             }
         }
@@ -904,7 +933,55 @@ impl BrowserEngineAdapter {
             "adapters": self.adapter_summaries(),
             "supported_display_modes": self.supported_display_modes(),
             "supported_guarantee_levels": self.supported_guarantee_levels(),
-            "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"],
+            "operations": ["status", "readiness", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "inspect", "input", "webrtc_signal"],
+        }))
+    }
+
+    fn readiness(&self, adapter_id: &str, _principal_id: Option<String>) -> Response {
+        if adapter_id.is_empty() || !is_safe_id(adapter_id) {
+            return Response::error(
+                "invalid_request",
+                "Browser readiness requires a valid Engine identity",
+            );
+        }
+        let Some(adapter) = self.select_adapter(Some(adapter_id)) else {
+            return Response::error(
+                "engine_not_found",
+                "The selected Browser Engine is unavailable",
+            );
+        };
+        let readiness = adapter
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.control_socket_path.as_deref())
+            .map(|socket| {
+                supervisor_control_json_bounded(
+                    socket,
+                    "GET",
+                    "/readiness",
+                    None,
+                    std::time::Duration::from_secs(10),
+                    8192,
+                )
+                .map_err(|_| BrowserEngineReadinessReason::ControlUnavailable)
+                .and_then(|value| {
+                    if value.get("schema").and_then(Value::as_str)
+                        != Some(BROWSER_ENGINE_READINESS_SCHEMA)
+                    {
+                        return Err(BrowserEngineReadinessReason::ReadinessUnsupported);
+                    }
+                    serde_json::from_value::<BrowserEngineReadiness>(value["readiness"].clone())
+                        .map_err(|_| BrowserEngineReadinessReason::ReadinessUnsupported)
+                })
+                .unwrap_or_else(|reason| BrowserEngineReadiness::Unavailable { reason })
+            })
+            .unwrap_or(BrowserEngineReadiness::Unavailable {
+                reason: BrowserEngineReadinessReason::PreparationRequired,
+            });
+        Response::ok(json!({
+            "schema": BROWSER_ENGINE_READINESS_SCHEMA,
+            "adapter_id": adapter_id,
+            "readiness": readiness,
         }))
     }
 
@@ -1671,6 +1748,13 @@ impl BrowserEngineAdapter {
             self.page_control_sessions.insert(
                 result.page_id.clone(),
                 PageControlSession {
+                    display_attachment: BrowserDisplayAttachment::initial(
+                        result
+                            .display_session
+                            .get("display_generation")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ),
                     generation: lifecycle_generation.to_string(),
                     stream_id: context.stream_session.stream_id.clone(),
                     socket_path: socket_path.clone(),
@@ -1967,6 +2051,51 @@ impl BrowserEngineAdapter {
         }
     }
 
+    fn inspect(
+        &self,
+        page_id: &str,
+        principal_id: Option<String>,
+        request: Option<BrowserInspectionRequest>,
+    ) -> Response {
+        let error = |error: BrowserInspectionError| {
+            Response::error(error.code(), "Browser page inspection could not complete.")
+        };
+        if !is_safe_id(page_id) {
+            return error(BrowserInspectionError::Invalid);
+        }
+        let Some(session) = self.page_control_session(page_id) else {
+            return Response::error("page_not_found", "browser page not found");
+        };
+        if !page_control_session_principal_matches(session, principal_id.as_deref()) {
+            return Response::error("page_not_found", "browser page not found");
+        }
+        if let Some(request) = request.as_ref() {
+            if let Err(reason) = request.validate() {
+                return error(reason);
+            }
+        }
+        let body = request
+            .as_ref()
+            .map(|request| serde_json::to_value(request).expect("inspection request serializes"));
+        match supervisor_control_json_bounded(
+            &session.socket_path,
+            if body.is_some() { "POST" } else { "GET" },
+            &format!("/pages/{page_id}/inspect"),
+            body,
+            std::time::Duration::from_millis(2500),
+            BROWSER_INSPECTION_MAX_RESPONSE_BYTES + 4096,
+        ) {
+            Ok(data) => match validate_browser_inspection_result(page_id, request.as_ref(), data) {
+                Ok(data) => Response::ok(data),
+                Err(reason) => error(reason),
+            },
+            Err(reason) => error(
+                BrowserInspectionError::from_code(&reason)
+                    .unwrap_or(BrowserInspectionError::Failed),
+            ),
+        }
+    }
+
     fn input(&self, page_id: &str, event: Value, principal_id: Option<String>) -> Response {
         if !is_safe_id(page_id) {
             return Response::error("invalid_request", "page_id must be a safe identifier");
@@ -1979,6 +2108,32 @@ impl BrowserEngineAdapter {
         };
         if !page_control_session_principal_matches(session, principal_id.as_deref()) {
             return Response::error("page_not_found", "browser page not found");
+        }
+        if event
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("operator_"))
+        {
+            if !elastos_common::browser_protocol::browser_operator_event_valid(&event) {
+                return Response::error(
+                    "invalid_operator_input",
+                    "Browser operator input is invalid",
+                );
+            }
+            return match supervisor_control_json_bounded(
+                &session.socket_path,
+                "POST",
+                &format!("/pages/{page_id}/input"),
+                Some(json!({"event":event,"principal_id":principal_id})),
+                std::time::Duration::from_millis(2500),
+                8192,
+            ) {
+                Ok(data) => Response::ok(data),
+                Err(_) => Response::error(
+                    "operator_outcome_uncertain",
+                    "Browser operator input requires reconciliation",
+                ),
+            };
         }
         match supervisor_control_json(
             &session.socket_path,
@@ -1995,7 +2150,7 @@ impl BrowserEngineAdapter {
     }
 
     fn webrtc_signal(
-        &self,
+        &mut self,
         page_id: &str,
         signal: Value,
         channel: Option<String>,
@@ -2010,7 +2165,7 @@ impl BrowserEngineAdapter {
                 return Response::error("invalid_request", err);
             }
         };
-        let Some(session) = self.page_control_session(page_id) else {
+        let Some(session) = self.page_control_sessions.get_mut(page_id) else {
             return Response::error(
                 "engine_process_unavailable",
                 "Browser page has no page-scoped engine control session",
@@ -2019,29 +2174,91 @@ impl BrowserEngineAdapter {
         if !page_control_session_principal_matches(session, principal_id.as_deref()) {
             return Response::error("page_not_found", "browser page not found");
         }
+        let display_error =
+            |error: BrowserDisplayError| Response::error(error.code(), error.message());
+        let generation = signal.get("display_generation").and_then(Value::as_str);
+        let request_id = signal
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let attach = signal_type == "display_attach";
         let channel = match channel.as_deref() {
-            Some("audio") => "audio",
-            Some("video") | None => "video",
+            None if attach => None,
+            Some("audio") if !attach => Some("audio"),
+            Some("video") | None if !attach => Some("video"),
             _ => {
-                return Response::error("invalid_request", "WebRTC channel must be video or audio")
+                return Response::error(
+                    "invalid_request",
+                    "WebRTC channel must be video or audio; display attach replaces both",
+                )
             }
+        };
+        if attach {
+            match session
+                .display_attachment
+                .begin(request_id, generation.unwrap_or(""))
+            {
+                Ok(Some(cached)) => return Response::ok(cached),
+                Ok(None) => {}
+                Err(error) => return display_error(error),
+            }
+        } else if let Err(error) = session.display_attachment.check_signal(generation) {
+            return display_error(error);
         }
-        .to_string();
-        match supervisor_control_json(
-            &session.socket_path,
-            "POST",
-            &format!("/pages/{page_id}/webrtc"),
-            Some(json!({
-                "signal": signal,
-                "channel": channel,
-                "principal_id": principal_id,
-            })),
-        ) {
-            Ok(data) => match validate_webrtc_response(signal_type, &data) {
-                Ok(()) => Response::ok(data),
-                Err(err) => Response::error("invalid_engine_response", err),
+        let mut body = json!({"signal": signal, "principal_id": principal_id});
+        if let Some(channel) = channel {
+            body["channel"] = json!(channel);
+        }
+        let response = if attach {
+            supervisor_control_json_bounded(
+                &session.socket_path,
+                "POST",
+                &format!("/pages/{page_id}/webrtc"),
+                Some(body),
+                std::time::Duration::from_secs(5),
+                1024 * 1024,
+            )
+        } else {
+            supervisor_control_json(
+                &session.socket_path,
+                "POST",
+                &format!("/pages/{page_id}/webrtc"),
+                Some(body),
+            )
+        };
+        let outcome = match response {
+            Ok(data) => Ok(data),
+            Err(error) => match BrowserDisplayError::from_code(&error) {
+                Some(error) => Err(error),
+                None if attach => Err(BrowserDisplayError::Uncertain),
+                None => return Response::error("engine_process_unavailable", error),
             },
-            Err(err) => Response::error("engine_process_unavailable", err),
+        };
+        let outcome = if attach {
+            session.display_attachment.finish(
+                page_id,
+                request_id,
+                generation.unwrap_or(""),
+                outcome,
+            )
+        } else {
+            outcome.and_then(|data| {
+                validate_webrtc_response(signal_type, &data)
+                    .map_err(|_| BrowserDisplayError::Uncertain)?;
+                if let Some(generation) = generation {
+                    if data.get("display_generation").and_then(Value::as_str) != Some(generation)
+                        || data.get("page_id").and_then(Value::as_str) != Some(page_id)
+                        || (signal_type != "offer" && data.get("accepted") != Some(&json!(true)))
+                    {
+                        return Err(BrowserDisplayError::GenerationMismatch);
+                    }
+                }
+                Ok(data)
+            })
+        };
+        match outcome {
+            Ok(data) => Response::ok(data),
+            Err(error) => display_error(error),
         }
     }
 
@@ -2103,25 +2320,24 @@ impl BrowserEngineAdapter {
             .cloned()
     }
 
-    fn adapter_summaries(&self) -> Vec<Value> {
+    fn adapter_summaries(&self) -> Vec<BrowserEngineAdapterCapabilities> {
         self.adapters
             .iter()
             .enumerate()
-            .map(|(index, adapter)| {
-                json!({
-                    "id": adapter.id,
-                    "engine": adapter.kind,
-                    "default": index == 0,
-                    "supported_display_modes": adapter.display_modes
-                        .iter()
-                        .map(|mode| mode.as_str())
-                        .collect::<Vec<_>>(),
-                    "supported_guarantee_levels": adapter_guarantee_levels(adapter.kind),
-                    "backing_substrate": adapter_backing_substrate(adapter),
-                    "network_mode": "runtime_net_only",
-                    "direct_network": false,
-                    "wallet_injection": false,
-                })
+            .map(|(index, adapter)| BrowserEngineAdapterCapabilities {
+                id: adapter.id.clone(),
+                engine: serde_json::to_value(adapter.kind)
+                    .expect("AdapterKind serializes as a string")
+                    .as_str()
+                    .expect("AdapterKind has a string representation")
+                    .to_string(),
+                default: index == 0,
+                supported_display_modes: adapter.display_modes.clone(),
+                supported_guarantee_levels: adapter_guarantee_levels(adapter.kind),
+                backing_substrate: adapter_backing_substrate(adapter).to_string(),
+                network_mode: "runtime_net_only".to_string(),
+                direct_network: false,
+                wallet_injection: false,
             })
             .collect()
     }
@@ -2130,24 +2346,24 @@ impl BrowserEngineAdapter {
         let mut levels = BTreeSet::new();
         for adapter in &self.adapters {
             for level in adapter_guarantee_levels(adapter.kind) {
-                levels.insert(level);
+                levels.insert(level.as_str());
             }
         }
         levels.into_iter().collect()
     }
 }
 
-fn adapter_guarantee_levels(kind: AdapterKind) -> Vec<&'static str> {
+fn adapter_guarantee_levels(kind: AdapterKind) -> Vec<BrowserGuaranteeLevel> {
     match kind {
-        AdapterKind::ChromiumMicrovm => vec!["mechanism_microvm"],
+        AdapterKind::ChromiumMicrovm => vec![BrowserGuaranteeLevel::MechanismMicrovm],
         AdapterKind::SelkiesGstreamer
         | AdapterKind::HostedRemoteBrowser
         | AdapterKind::ChromiumHeadless
-        | AdapterKind::ContractProof => vec!["operator_rbi"],
+        | AdapterKind::ContractProof => vec![BrowserGuaranteeLevel::OperatorRbi],
         AdapterKind::Cef
         | AdapterKind::Webview2
         | AdapterKind::Geckoview
-        | AdapterKind::Wkwebview => vec!["policy_webview"],
+        | AdapterKind::Wkwebview => vec![BrowserGuaranteeLevel::PolicyWebview],
     }
 }
 
@@ -2275,24 +2491,6 @@ struct StreamSessionReceipt {
     relay_ipc: Option<RelayIpcEndpoint>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BrowserProfileDescriptor {
-    schema: String,
-    scope: String,
-    storage: String,
-    storage_posture: String,
-    protected_storage: bool,
-    encrypted: bool,
-    recoverable: bool,
-    recovery: String,
-    uri: String,
-    public_uri: String,
-    profile_key: String,
-    disk_path: String,
-    reset: String,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AdapterIpcEndpoint {
@@ -2312,47 +2510,6 @@ struct RelayIpcEndpoint {
     path: String,
     #[serde(default)]
     stream_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ViewportRequest {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum BrowserDisplayMode {
-    WebrtcRemoteDisplay,
-    NativeSurface,
-}
-
-impl BrowserDisplayMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::WebrtcRemoteDisplay => "webrtc_remote_display",
-            Self::NativeSurface => "native_surface",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum BrowserGuaranteeLevel {
-    MechanismMicrovm,
-    OperatorRbi,
-    PolicyWebview,
-}
-
-impl BrowserGuaranteeLevel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::MechanismMicrovm => "mechanism_microvm",
-            Self::OperatorRbi => "operator_rbi",
-            Self::PolicyWebview => "policy_webview",
-        }
-    }
 }
 
 fn adapter_supports_guarantee(kind: AdapterKind, guarantee_level: BrowserGuaranteeLevel) -> bool {

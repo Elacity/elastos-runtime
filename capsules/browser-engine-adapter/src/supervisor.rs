@@ -287,46 +287,89 @@ fn supervisor_control_json_inner(
     timeout: Option<Duration>,
     max_response_bytes: Option<usize>,
 ) -> Result<Value, String> {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     validate_control_socket_path(socket_path)?;
     let body_bytes = body
         .map(|body| serde_json::to_vec(&body).map_err(|err| err.to_string()))
         .transpose()?
         .unwrap_or_default();
-    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
-        .map_err(|err| format!("browser engine control socket unavailable: {err}"))?;
+    let mut stream = if let Some(remaining) = control_exchange_remaining(deadline)? {
+        let address = socket2::SockAddr::unix(socket_path).map_err(|err| err.to_string())?;
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+            .map_err(|err| err.to_string())?;
+        socket
+            .connect_timeout(&address, remaining)
+            .map_err(|err| format!("browser engine control socket unavailable: {err}"))?;
+        std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(socket))
+    } else {
+        std::os::unix::net::UnixStream::connect(socket_path)
+            .map_err(|err| format!("browser engine control socket unavailable: {err}"))?
+    };
     stream
-        .set_read_timeout(timeout)
-        .map_err(|err| format!("browser engine control read timeout setup failed: {err}"))?;
-    stream
-        .set_write_timeout(timeout)
-        .map_err(|err| format!("browser engine control write timeout setup failed: {err}"))?;
-    write!(
-        stream,
+        .set_nonblocking(deadline.is_some())
+        .map_err(|err| err.to_string())?;
+    let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: browser-engine\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
-    )
-    .map_err(|err| err.to_string())?;
-    if !body_bytes.is_empty() {
-        stream
-            .write_all(&body_bytes)
-            .map_err(|err| err.to_string())?;
+    ).into_bytes();
+    request.extend_from_slice(&body_bytes);
+    let mut written = 0;
+    while written < request.len() {
+        control_exchange_remaining(deadline)?;
+        match stream.write(&request[written..]) {
+            Ok(0) => return Err("browser engine control request write stopped".to_string()),
+            Ok(size) => written += size,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && deadline.is_some() => {
+                wait_control_exchange(deadline)?;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
     }
-    stream.flush().map_err(|err| err.to_string())?;
     let mut response = Vec::new();
-    if let Some(max_response_bytes) = max_response_bytes {
-        stream
-            .take(max_response_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut response)
-            .map_err(|err| err.to_string())?;
-        if response.len() > max_response_bytes {
+    loop {
+        // An inactivity timeout alone lets a trickling peer hold the serial
+        // provider indefinitely. Every partial read/write spends the same budget.
+        control_exchange_remaining(deadline)?;
+        let mut buffer = [0; 8192];
+        let limit = max_response_bytes.map_or(buffer.len(), |max| {
+            max.saturating_sub(response.len())
+                .saturating_add(1)
+                .min(buffer.len())
+        });
+        match stream.read(&mut buffer[..limit]) {
+            Ok(0) => break,
+            Ok(size) => response.extend_from_slice(&buffer[..size]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && deadline.is_some() => {
+                wait_control_exchange(deadline)?;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+        if max_response_bytes.is_some_and(|max| response.len() > max) {
             return Err("browser engine control response exceeded its byte limit".to_string());
         }
-    } else {
-        stream
-            .read_to_end(&mut response)
-            .map_err(|err| err.to_string())?;
     }
+    control_exchange_remaining(deadline)?;
     parse_http_json_response(&response)
+}
+
+fn control_exchange_remaining(deadline: Option<Instant>) -> Result<Option<Duration>, String> {
+    deadline
+        .map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| "browser engine control exchange timed out".to_string())
+        })
+        .transpose()
+}
+
+fn wait_control_exchange(deadline: Option<Instant>) -> Result<(), String> {
+    if let Some(remaining) = control_exchange_remaining(deadline)? {
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+    Ok(())
 }
 
 pub(super) fn cleanup_isolated_session(
@@ -490,6 +533,20 @@ pub(super) fn parse_http_json_response(response: &[u8]) -> Result<Value, String>
     let json: Value = serde_json::from_slice(body)
         .map_err(|err| format!("browser engine control response invalid JSON: {err}"))?;
     if !(200..300).contains(&status) {
+        if let Some(error) = json
+            .get("code")
+            .and_then(Value::as_str)
+            .and_then(BrowserInspectionError::from_code)
+        {
+            return Err(error.code().to_string());
+        }
+        if let Some(error) = json
+            .get("code")
+            .and_then(Value::as_str)
+            .and_then(BrowserDisplayError::from_code)
+        {
+            return Err(error.code().to_string());
+        }
         return Err(json
             .get("error")
             .and_then(|value| value.as_str())

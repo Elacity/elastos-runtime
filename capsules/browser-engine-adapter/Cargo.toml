@@ -10,6 +10,7 @@ name = "browser-engine-adapter"
 path = "src/main.rs"
 
 [dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
@@ -17,6 +18,7 @@ hex = "0.4"
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
+socket2 = "0.6"
 url = "2.5"
 
 [dev-dependencies]

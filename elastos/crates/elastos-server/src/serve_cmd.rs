@@ -390,6 +390,9 @@ pub async fn run_serve(
             if let Some(port) = collaboration_context.presence_product_port.clone() {
                 s.set_collaboration_presence_product_port(port);
             }
+            if let Some(endpoint) = collaboration_context.carrier_endpoint.clone() {
+                s.set_carrier_endpoint(endpoint);
+            }
             if let Some(service) = collaboration_context.discovery_service.clone() {
                 s.set_collaboration_discovery_service(service);
             }

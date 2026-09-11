@@ -1804,98 +1804,1457 @@ async fn test_home_summary_ignores_invalid_protected_services_state() {
     assert_eq!(payload["services"]["local_offer_count"], 0);
 }
 
+// Services must consume the same signed acceptance as People, without a legacy
+// services-peer-contacts.json file or a caller-supplied delivery endpoint.
+#[derive(Clone, Default)]
+struct ServicesExitProvider {
+    mode: Arc<TokioMutex<String>>,
+    requests: Arc<TokioMutex<Vec<Value>>>,
+    applied: Arc<TokioMutex<Value>>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ServicesExitProvider {
+    async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw config requests only".into()))
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["exit"]
+    }
+    fn name(&self) -> &'static str {
+        "services-exit-test"
+    }
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        assert_eq!(request["op"], "refresh_config");
+        self.requests.lock().await.push(request.clone());
+        let mode = {
+            let mut mode = self.mode.lock().await;
+            let captured = mode.clone();
+            if matches!(captured.as_str(), "lost_ack_once" | "hold_once") {
+                mode.clear();
+            }
+            captured
+        };
+        if mode == "hold_once" {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        if mode == "reject" {
+            return Ok(json!({"status":"error","code":"invalid_config","message":"rejected"}));
+        }
+        if mode == "unavailable" {
+            return Err(ProviderError::Unavailable("test transport".into()));
+        }
+        *self.applied.lock().await = request["config"].clone();
+        match mode.as_str() {
+            "lost_ack_once" => Err(ProviderError::Unavailable(
+                "lost acknowledgement after application".into(),
+            )),
+            "malformed" => Ok(json!({"status":"ok"})),
+            "wrong_id" => Ok(
+                json!({"status":"ok","data":{"schema":"elastos.exit.config-ack/v1","state":"applied","request_id":"other"}}),
+            ),
+            _ => Ok(
+                json!({"status":"ok","data":{"schema":"elastos.exit.config-ack/v1","state":"applied","request_id":request["request_id"]}}),
+            ),
+        }
+    }
+}
+
+// Use the same peer operations and bus as the attached Runtime fixture, through
+// the configured Gateway's existing registry. App launch tests still use HTTP.
+#[derive(Clone)]
+struct ServicesPeerProvider {
+    state: FakeRuntimeState,
+    send_failure: Arc<TokioMutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ServicesPeerProvider {
+    async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw peer requests only".into()))
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["peer"]
+    }
+    fn name(&self) -> &'static str {
+        "services-configured-peer-test"
+    }
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let op = request["op"].as_str().unwrap();
+        if op == "gossip_send" {
+            let failure = self.send_failure.lock().await.clone();
+            match failure.as_str() {
+                "unavailable" => {
+                    return Err(ProviderError::Unavailable(
+                        "configured peer unavailable".into(),
+                    ));
+                }
+                "error" => {
+                    return Ok(json!({"status":"error","message":"configured peer rejected send"}));
+                }
+                "deadline" => return std::future::pending().await,
+                _ => {}
+            }
+        }
+        let response = fake_runtime_provider(
+            AxumPath(("peer".into(), op.into())),
+            AxumState(self.state.clone()),
+            AxumJson(request.clone()),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Ok(serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
+struct ServicesContactFixture {
+    discovery_service: crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    peer_provider: ServicesPeerProvider,
+    registry: Arc<ProviderRegistry>,
+    exit_provider: ServicesExitProvider,
+    app: Router,
+    authority: TestPasskeyAuthority,
+    runtime: FakeRuntimeHandle,
+    store: crate::collaboration_contact_store::CollaborationContactStore,
+    profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+    device_key: SigningKey,
+    peer_id: String,
+}
+
+async fn services_contact_fixture(
+    data_dir: &std::path::Path,
+    name: &str,
+    bus: Arc<TokioMutex<FakePeerBus>>,
+    network: crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+) -> ServicesContactFixture {
+    let authority = passkey_authority_with_profile(data_dir, name);
+    let (device_key, did) = elastos_identity::load_or_create_did(data_dir).unwrap();
+    let device_key = SigningKey::from_bytes(&device_key.to_bytes());
+    let peer_id = crate::carrier::did_to_public_key(&did).unwrap().to_string();
+    let runtime = start_fake_runtime(data_dir, bus.clone(), &peer_id).await;
+    let peer_provider = ServicesPeerProvider {
+        state: FakeRuntimeState {
+            did: did.clone(),
+            signing_key: device_key.clone(),
+            attach_secret: String::new(),
+            peer_id: peer_id.clone(),
+            bus,
+            audit_events: Arc::new(TokioMutex::new(Vec::new())),
+            launch_requests: runtime.launch_requests.clone(),
+            provider_requests: Arc::new(TokioMutex::new(Vec::new())),
+            pending_capabilities: Arc::new(TokioMutex::new(HashMap::new())),
+            capabilities_start_pending: false,
+        },
+        send_failure: Arc::new(TokioMutex::new(String::new())),
+    };
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("peer", Arc::new(peer_provider.clone()))
+        .await
+        .unwrap();
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+        network.clone(),
+        &profile,
+        &did,
+    )
+    .unwrap();
+    let service = crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
+        SigningKey::from_bytes(&device_key.to_bytes()),
+        network,
+        registry.clone(),
+    )
+    .await
+    .unwrap();
+    let mut state = test_state(data_dir);
+    state.collaboration_discovery_service = Some(service.clone());
+    let exit_provider = ServicesExitProvider::default();
+    registry
+        .register_sub_provider("exit", Arc::new(exit_provider.clone()))
+        .await
+        .unwrap();
+    state.provider_registry = Some(registry.clone());
+
+    ServicesContactFixture {
+        discovery_service: service,
+        peer_provider,
+        registry,
+        exit_provider,
+        app: gateway_router(state),
+        authority,
+        runtime,
+        store,
+        profile,
+        device_key,
+        peer_id,
+    }
+}
+
+fn accept_services_contact_pair(left: &ServicesContactFixture, right: &ServicesContactFixture) {
+    use crate::collaboration_discovery::*;
+    use elastos_common::collaboration_protocol::{
+        CollaborationRecipient, CollaborationRecipientKind,
+    };
+    let now = crate::auth::now_ts().saturating_sub(3);
+    let advertisement = signed_discovery_message_for_test(
+        &right.device_key,
+        &right.profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: "services-contacts",
+            conversation_id: COLLABORATION_DISCOVERY_DIRECTORY_ID,
+        },
+        CollaborationRecipient {
+            kind: CollaborationRecipientKind::Conversation,
+            id: COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
+        },
+        COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+        serde_json::to_value(CollaborationDiscoveryAdvertisementPayload {
+            signed_profile: right.profile.signed_envelope().clone(),
+        })
+        .unwrap(),
+        now..now + COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
+    );
+    right
+        .store
+        .store_local_advertisement(&advertisement, now)
+        .unwrap();
+    let request = signed_discovery_message_for_test(
+        &left.device_key,
+        &left.profile.document().profile_did,
+        TestCollaborationMessageScope {
+            network_id: "services-contacts",
+            conversation_id: COLLABORATION_DISCOVERY_CONTACT_ID,
+        },
+        CollaborationRecipient {
+            kind: CollaborationRecipientKind::Profile,
+            id: right.profile.document().profile_did.clone(),
+        },
+        COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+        serde_json::to_value(CollaborationContactRequestPayload {
+            advertisement_envelope_sha256:
+                elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                    &advertisement,
+                ),
+            signed_profile: left.profile.signed_envelope().clone(),
+        })
+        .unwrap(),
+        now + 1..now + 1 + COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS,
+    );
+    left.store
+        .record_outgoing_contact_request(&request, &advertisement, now + 1)
+        .unwrap();
+    right
+        .store
+        .record_incoming_contact_request(&request, now + 1)
+        .unwrap();
+    let receipt = signed_contact_decision_for_test(
+        &right.device_key,
+        "services-contacts",
+        &request,
+        &right.profile.document().profile_did,
+        now + 2,
+    );
+    left.store
+        .record_contact_decision_receipt(&receipt, now + 2)
+        .unwrap();
+    right
+        .store
+        .record_contact_decision_receipt(&receipt, now + 2)
+        .unwrap();
+    assert_eq!(left.store.snapshot().unwrap().contacts().len(), 1);
+    assert_eq!(right.store.snapshot().unwrap().contacts().len(), 1);
+}
+
+async fn services_contact_post(
+    app: &Router,
+    token: &str,
+    uri: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(uri)
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+fn services_contact_offer(fixture: &ServicesContactFixture) -> String {
+    format!(
+        "offer:{}:browser-exit",
+        home_people_contact_id(&fixture.profile.document().profile_did,)
+    )
+}
+
+async fn services_messages(bus: &Arc<TokioMutex<FakePeerBus>>) -> Vec<serde_json::Value> {
+    bus.lock()
+        .await
+        .topic_messages
+        .values()
+        .flatten()
+        .filter_map(|message| serde_json::from_str(message.get("content")?.as_str()?).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_rejects_other_principal_and_removed_contact() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    let offer_id = services_contact_offer(&bob);
+    let other = passkey_authority_with_profile_role_credential(
+        left.path(),
+        "Other",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "other-services-principal",
+    );
+    let other_token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &other);
+    let (_, summary) = home_test_get_json(
+        &alice.app,
+        "/api/apps/services/summary",
+        &other_token,
+        "null",
+    )
+    .await;
+    assert!(summary["available_remote_offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = services_messages(&bus).await;
+    let (status, _) = services_contact_post(
+        &alice.app,
+        &other_token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(services_messages(&bus).await, before);
+
+    let contact_id = alice.store.snapshot().unwrap().contacts()[0]
+        .remote_profile_did()
+        .to_string();
+    let (status, _) = services_contact_post(
+        &alice.app,
+        &alice.authority.people_token,
+        "/api/apps/people/contacts/remove",
+        json!({"contact_id":home_people_contact_id(&contact_id)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let before = services_messages(&bus).await;
+    let (status, _) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(services_messages(&bus).await, before);
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    assert!(summary["available_remote_offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!left.path().join("config/exit-provider.json").exists());
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_ignores_substituted_legacy_endpoint() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    let contact_id = home_people_contact_id(&bob.profile.document().profile_did);
+    write_home_principal_object_json_for_authority(
+        left.path(),
+        &alice.authority,
+        "services-peer-contacts.json",
+        json!({
+            "schema":"elastos.services.peer-contacts-state/v1", "principal_id":alice.authority.principal_id,
+            "localhost_root":crate::auth::principal_localhost_root(&alice.authority.principal_id), "updated_at":10,
+            "contacts":{contact_id.clone():{"contact_id":contact_id,"peer_id":"substituted-endpoint","did":"did:key:substituted",
+                "display_name":"Substituted","added_at":10,"updated_at":10,"source":"people_discovery"}}
+        }),
+    );
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let legacy_only_app = gateway_router(test_state(left.path()));
+    let (_, summary) = home_test_get_json(
+        &legacy_only_app,
+        "/api/apps/services/summary",
+        &token,
+        "null",
+    )
+    .await;
+    assert!(summary["available_remote_offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = services_messages(&bus).await;
+    let (status, _) = services_contact_post(
+        &legacy_only_app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(services_messages(&bus).await, before);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = services_messages(&bus).await;
+    let requests = messages
+        .iter()
+        .filter(|message| message["kind"] == "service_access_request")
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["target_peer_id"], bob.peer_id);
+    assert!(!messages
+        .iter()
+        .any(|message| message["target_peer_id"] == "substituted-endpoint"));
+    // Acceptance/request delivery does not install a grant or enable the offer.
+    assert!(!left.path().join("config/exit-provider.json").exists());
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_contact_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "requested");
+    assert_eq!(offer["enabled"], false);
+    assert_eq!(offer["grant_required"], true);
+}
+
+async fn services_contact_pending_request(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    alice: &ServicesContactFixture,
+    bob: &ServicesContactFixture,
+) -> String {
+    std::fs::create_dir_all(right.join("config")).unwrap();
+    std::fs::write(right.join("config/exit-provider.json"), "{}").unwrap();
+    let token = app_token_for_authority(right, SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-exit","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = app_token_for_authority(left, SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = home_test_post_json(
+        &bob.app,
+        "/api/apps/home/launch",
+        &bob.authority.home_token,
+        "http://localhost:61180",
+        json!({"target":INBOX_CAPSULE_ID}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(right, INBOX_CAPSULE_ID, &bob.authority);
+    let (_, inbox) = home_test_get_json(&bob.app, "/api/apps/inbox/summary", &token, "null").await;
+    inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "service_access_request")
+        .unwrap()["action_ref"]["action_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn services_contact_saved_state(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    name: &str,
+) -> serde_json::Value {
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/.AppData/ElastOS/Home/{name}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    serde_json::from_slice(
+        &crate::auth::read_principal_root_object(
+            data_dir,
+            &authority.principal_id,
+            &root,
+            &uri,
+            &path,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_rechecks_pending_approval_before_delivery() {
+    for substituted in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action =
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+        if substituted {
+            let mut saved = services_contact_saved_state(
+                right.path(),
+                &bob.authority,
+                "services-requests.json",
+            );
+            for request in saved["requests"].as_object_mut().unwrap().values_mut() {
+                request["requester_peer_id"] = json!("substituted-endpoint");
+            }
+            write_home_principal_object_json_for_authority(
+                right.path(),
+                &bob.authority,
+                "services-requests.json",
+                saved,
+            );
+        } else {
+            let (status, body) = services_contact_post(
+                &bob.app,
+                &bob.authority.people_token,
+                "/api/apps/people/contacts/remove",
+                json!({"contact_id":home_people_contact_id(&alice.profile.document().profile_did)}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let before = services_messages(&bus).await;
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert!(!status.is_success(), "{body}");
+        assert_eq!(services_messages(&bus).await, before);
+        assert!(!left.path().join("config/exit-provider.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn test_services_contact_authority_rechecks_pending_decision_before_install() {
+    for case in ["removed", "saved_endpoint", "grant_endpoint"] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action =
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if case == "saved_endpoint" {
+            let mut saved =
+                services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+            for request in saved["remote_offer_requests"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                request["target_peer_id"] = json!("substituted-endpoint");
+            }
+            write_home_principal_object_json_for_authority(
+                left.path(),
+                &alice.authority,
+                "services-state.json",
+                saved,
+            );
+            // A matching forged decision cannot turn the saved route into authority.
+            for message in bus.lock().await.topic_messages.values_mut().flatten() {
+                let Some(content) = message["content"].as_str() else {
+                    continue;
+                };
+                let mut payload: serde_json::Value = serde_json::from_str(content).unwrap();
+                if payload["kind"] == "service_access_decision" {
+                    payload["provider_peer_id"] = json!("substituted-endpoint");
+                    payload["remote_exit_grant"]["peer_did"] = json!("substituted-endpoint");
+                    message["content"] = json!(payload.to_string());
+                }
+            }
+        } else if case == "grant_endpoint" {
+            for message in bus.lock().await.topic_messages.values_mut().flatten() {
+                let Some(content) = message["content"].as_str() else {
+                    continue;
+                };
+                let mut payload: serde_json::Value = serde_json::from_str(content).unwrap();
+                if payload["kind"] == "service_access_decision" {
+                    payload["remote_exit_grant"]["peer_did"] = json!("substituted-endpoint");
+                    message["content"] = json!(payload.to_string());
+                }
+            }
+        } else {
+            let (status, body) = services_contact_post(
+                &alice.app,
+                &alice.authority.people_token,
+                "/api/apps/people/contacts/remove",
+                json!({"contact_id":home_people_contact_id(&bob.profile.document().profile_did)}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, _) =
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!left.path().join("config/exit-provider.json").exists());
+        let saved =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        assert!(saved["remote_offer_requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|request| request["status"] == "requested"));
+    }
+}
+
+#[test]
+fn test_services_exit_refresh_is_runtime_owned() {
+    assert!(
+        crate::provider_resource::build_capability_resource("exit", "refresh_config", &json!({}),)
+            .is_err(),
+        "capsule capability routing must reject the Runtime config operation"
+    );
+}
+
+#[tokio::test]
+async fn test_services_exit_activation_waits_for_provider_ack() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+    accept_services_contact_pair(&alice, &bob);
+    let action = services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    std::fs::create_dir_all(left.path().join("config")).unwrap();
+    let path = left.path().join("config/exit-provider.json");
+    let prior = br#"{ "backends": [{"id":"existing","kind":"stream_relay","allowed_hosts":["example.com"]}], "remote_carrier_exits": [] }"#;
+    let prior_config: Value = serde_json::from_slice(prior).unwrap();
+    std::fs::write(&path, prior).unwrap();
+    *alice.exit_provider.applied.lock().await = prior_config.clone();
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    for mode in [
+        "reject",
+        "malformed",
+        "wrong_id",
+        "unavailable",
+        "lost_ack_once",
+    ] {
+        *alice.exit_provider.mode.lock().await = mode.into();
+        let (status, summary) =
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            std::fs::read(&path).unwrap() == prior,
+            "{mode}: failed activation preserves exact prior config bytes"
+        );
+        assert_eq!(*alice.exit_provider.applied.lock().await, prior_config);
+        let offer = summary["remote_offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|offer| offer["offer_id"] == services_contact_offer(&bob))
+            .unwrap();
+        assert_eq!(offer["enabled"], false);
+        assert_ne!(offer["status"], "active");
+        assert!(!summary.to_string().contains("connect_ticket"));
+        let saved =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        let record = &saved["remote_offer_requests"][services_contact_offer(&bob)];
+        assert_eq!(record["status"], "requested");
+        assert_eq!(record["pending_access_decision"]["decision"], "approved");
+    }
+    // Corrupt prior configuration is retained and never sent to the provider.
+    let calls = alice.exit_provider.requests.lock().await.len();
+    std::fs::write(&path, b"{invalid config").unwrap();
+    home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"{invalid config");
+    assert_eq!(alice.exit_provider.requests.lock().await.len(), calls);
+    std::fs::write(&path, prior).unwrap();
+    alice.exit_provider.mode.lock().await.clear();
+    // The mailbox has already advanced. The protected pending receipt retries.
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_contact_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "active");
+    assert_eq!(offer["enabled"], true);
+    let installed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(installed.get("schema").is_none());
+    assert_eq!(installed["backends"], prior_config["backends"]);
+    assert_eq!(*alice.exit_provider.applied.lock().await, installed);
+    let saved = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    assert!(saved["remote_offer_requests"][services_contact_offer(&bob)]
+        .get("pending_access_decision")
+        .is_none());
+    // A failed revocation refresh leaves the prior active grant/config usable;
+    // the same retained decision removes it only after the provider ACK.
+    let installed_bytes = std::fs::read(&path).unwrap();
+    let token_bob = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let deny = action.replacen("service-approve-request:", "service-deny-request:", 1);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token_bob,
+        "/api/apps/inbox/actions",
+        json!({"action_id":deny}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    *alice.exit_provider.mode.lock().await = "reject".into();
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    assert_eq!(std::fs::read(&path).unwrap(), installed_bytes);
+    assert!(summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|offer| offer["offer_id"] == services_contact_offer(&bob)
+            && offer["status"] == "active"));
+    alice.exit_provider.mode.lock().await.clear();
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    assert!(summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|offer| offer["offer_id"] == services_contact_offer(&bob)
+            && offer["status"] == "denied"
+            && offer["enabled"] == false));
+    let removed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(removed, prior_config);
+    assert_eq!(*alice.exit_provider.applied.lock().await, prior_config);
+}
+
+struct ServicesCarrierRelayProvider {
+    path: std::path::PathBuf,
+    calls: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+#[async_trait::async_trait]
+impl elastos_runtime::provider::Provider for ServicesCarrierRelayProvider {
+    async fn handle(
+        &self,
+        _: elastos_runtime::provider::ResourceRequest,
+    ) -> Result<elastos_runtime::provider::ResourceResponse, elastos_runtime::provider::ProviderError>
+    {
+        Err(elastos_runtime::provider::ProviderError::Provider(
+            "raw test Exit only".into(),
+        ))
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![]
+    }
+    fn name(&self) -> &'static str {
+        "services-carrier-relay-test"
+    }
+    async fn send_raw(
+        &self,
+        request: &Value,
+    ) -> Result<Value, elastos_runtime::provider::ProviderError> {
+        self.calls.lock().unwrap().push(request.clone());
+        if request["op"] == "close_stream" {
+            return Ok(json!({"status":"ok"}));
+        }
+        assert_eq!(request["op"], "open_stream");
+        Ok(
+            json!({"status":"ok", "data":{"schema":"elastos.exit.stream-session/v1",
+            "stream_id":"provider:stream:1", "target":"tls://example.com:443",
+            "relay_ipc":{"schema":"elastos.exit.relay-ipc/v1", "kind":"unix_socket",
+                "path":self.path, "stream_id":"provider:stream:1"}}}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn test_services_carrier_exit_admission_requires_current_issued_contact_grant() {
+    use crate::api::gateway::gateway_browser::{
+        browser_attach_runtime_stream_path, close_browser_runtime_stream_listener,
+    };
+    use iroh::Watcher as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    let action = services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+    let request_id = action.strip_prefix("service-approve-request:").unwrap();
+    let grant_id = format!(
+        "services-remote-exit-grant-{}",
+        hex::encode(&Sha256::digest(request_id.as_bytes())[..8])
+    );
+    let source = alice.peer_id.parse::<iroh::PublicKey>().unwrap();
+    let request = json!({"grant_id":grant_id,"principal_id":alice.authority.principal_id,
+        "stream_id":"consumer:stream:1","target":"tls://example.com:443"});
+    let authorize = |request: &Value, source: &iroh::PublicKey| {
+        crate::api::gateway::authorize_home_service_exit(
+            right.path(),
+            &network,
+            source,
+            request,
+            now_ts(),
+        )
+    };
+    assert!(
+        authorize(&request, &source).is_err(),
+        "contact acceptance and pending request do not grant use"
+    );
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let grant = authorize(&request, &source).unwrap();
+    assert_eq!(grant.provider_principal_id, bob.authority.principal_id);
+    assert_eq!(grant.requester_principal_id, alice.authority.principal_id);
+    assert_eq!(grant.max_active_streams, 64);
+    assert_eq!(grant.max_active_streams_per_principal, 64);
+    assert_eq!(
+        grant.expires_at - grant.revision,
+        crate::carrier::EXIT_GRANT_TTL_SECS
+    );
+    for field in ["principal_id", "grant_id"] {
+        let mut forged = request.clone();
+        forged[field] = json!("forged");
+        assert!(authorize(&forged, &source).is_err());
+    }
+    assert!(authorize(&request, &iroh::SecretKey::from_bytes(&[231; 32]).public()).is_err());
+    assert!(crate::api::gateway::authorize_home_service_exit(
+        right.path(),
+        &network,
+        &source,
+        &request,
+        grant.expires_at
+    )
+    .is_err());
+    // Actual Carrier TLS identity + saved provider grant + local relay byte path.
+    let relay_path = right.path().join("exit-test.sock");
+    let listener = tokio::net::UnixListener::bind(&relay_path).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(ServicesCarrierRelayProvider {
+                path: relay_path,
+                calls: calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let (_, alice_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
+    let (_, bob_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
+    let local = crate::carrier::start_isolated_carrier_node_with_registry(
+        &alice.device_key,
+        &alice_did,
+        left.path().to_path_buf(),
+        None,
+    )
+    .await
+    .unwrap();
+    let remote = crate::carrier::start_isolated_carrier_node_with_registry(
+        &bob.device_key,
+        &bob_did,
+        right.path().to_path_buf(),
+        Some(Arc::downgrade(&registry)),
+    )
+    .await
+    .unwrap();
+    let addr = remote.endpoint.watch_addr().get();
+    let ticket = data_encoding::BASE32_NOPAD
+        .encode(&serde_json::to_vec(&json!({"topic":null, "endpoints":[addr]})).unwrap())
+        .to_lowercase();
+    let mut local = crate::carrier::CarrierRuntimeService::new(local);
+    let mut remote = crate::carrier::CarrierRuntimeService::new(remote);
+    remote.configure_browser_exit_network(network.clone()).await;
+    let endpoint = local.endpoint().unwrap();
+    let wire = crate::carrier::BrowserCarrierStreamRequest {
+        connect_ticket: ticket,
+        peer_did: Some(bob.peer_id.clone()),
+        carrier_service: "elastos://exit/open_stream".into(),
+        grant_id: grant_id.clone(),
+        stream_id: "consumer:stream:1".into(),
+        target: "tls://example.com:443".into(),
+        principal_id: Some(alice.authority.principal_id.clone()),
+        reason: Some("caller text ignored".into()),
+        timeout_ms: Some(5000),
+    };
+    let receipt = json!({"schema":"elastos.exit.remote-carrier-session/v1", "byte_transport":"carrier_stream",
+        "stream_id":wire.stream_id, "target":wire.target, "principal_id":wire.principal_id,
+        "carrier":{"schema":"elastos.exit.remote-carrier/v1", "transport":"carrier_stream",
+            "connect_ticket":wire.connect_ticket, "peer_did":wire.peer_did,
+            "carrier_service":wire.carrier_service, "grant_id":wire.grant_id}});
+    let mut header = serde_json::to_vec(&json!({"schema":"elastos.exit.relay-open/v1", "stream_id":wire.stream_id,"target":wire.target})).unwrap();
+    header.extend_from_slice(b"\nping");
+    // A newly created anonymous endpoint cannot use the calling Runtime's grant.
+    let anonymous_dir = tempfile::tempdir().unwrap();
+    let (anonymous_key, anonymous_did) = elastos_identity::derive_did(&[232; 32]);
+    let anonymous_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &anonymous_key,
+        &anonymous_did,
+        anonymous_dir.path().to_path_buf(),
+        None,
+    )
+    .await
+    .unwrap();
+    let mut anonymous = crate::carrier::CarrierRuntimeService::new(anonymous_node);
+    let wrong = browser_attach_runtime_stream_path(
+        anonymous_dir.path(),
+        receipt.clone(),
+        anonymous.endpoint().as_ref(),
+    )
+    .await
+    .unwrap();
+    let wrong_path = std::path::PathBuf::from(
+        wrong["adapter_ipc"]["runtime_stream_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut wrong_stream = tokio::net::UnixStream::connect(&wrong_path).await.unwrap();
+    wrong_stream.write_all(&header).await.unwrap();
+    let mut byte = [0];
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wrong_stream.read(&mut byte),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(ended, Ok(0) | Err(_)));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a substituted endpoint must not reach Exit"
+    );
+    close_browser_runtime_stream_listener(anonymous_dir.path(), &wire.stream_id)
+        .await
+        .unwrap();
+    assert!(!wrong_path.exists());
+    anonymous.shutdown().await.unwrap();
+    let relay_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio::io::BufReader::new(socket);
+        let mut line = String::new();
+        socket.read_line(&mut line).await.unwrap();
+        let header: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(header["stream_id"], "provider:stream:1");
+        assert_eq!(header["target"], "tls://example.com:443");
+        let mut ping = [0; 4];
+        socket.read_exact(&mut ping).await.unwrap();
+        assert_eq!(&ping, b"ping");
+        socket.get_mut().write_all(b"pong").await.unwrap();
+        let mut rest = Vec::new();
+        socket.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    });
+    let attached = browser_attach_runtime_stream_path(left.path(), receipt, Some(&endpoint))
+        .await
+        .unwrap();
+    let runtime_path = std::path::PathBuf::from(
+        attached["adapter_ipc"]["runtime_stream_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut stream = tokio::net::UnixStream::connect(&runtime_path)
+        .await
+        .unwrap();
+    stream.write_all(&header).await.unwrap();
+    let mut pong = [0; 4];
+    stream.read_exact(&mut pong).await.unwrap();
+    assert_eq!(&pong, b"pong");
+    assert!(
+        crate::carrier::open_browser_carrier_stream_on_endpoint(&endpoint, &wire)
+            .await
+            .is_err(),
+        "duplicate stream has no new provider effect"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        calls.lock().unwrap()[0]["principal_id"],
+        bob.authority.principal_id
+    );
+    bus.lock()
+        .await
+        .local_only_message_substrings
+        .push("service_access_decision".into());
+    let deny = action.replacen("service-approve-request:", "service-deny-request:", 1);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":deny}),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "delivery failure must be reported: {body}"
+    );
+    assert!(
+        authorize(&request, &source).is_err(),
+        "provider denial takes effect before consumer config refresh"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), relay_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut byte = [0];
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(
+        matches!(ended, Ok(0) | Err(_)),
+        "revoked Carrier stream must terminate"
+    );
+    assert!(
+        crate::carrier::open_browser_carrier_stream_on_endpoint(&endpoint, &wire)
+            .await
+            .is_err(),
+        "denial rejects new opens before consumer refresh"
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["op"] == "open_stream")
+            .count(),
+        1
+    );
+    close_browser_runtime_stream_listener(left.path(), &wire.stream_id)
+        .await
+        .unwrap();
+    assert!(
+        !runtime_path.exists(),
+        "exact Browser stream close removes its listener"
+    );
+    remote.shutdown().await.unwrap();
+    local.shutdown().await.unwrap();
+    bus.lock().await.local_only_message_substrings.clear();
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(authorize(&request, &source).is_ok());
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &bob.authority.people_token,
+        "/api/apps/people/contacts/remove",
+        json!({"contact_id":home_people_contact_id(&alice.profile.document().profile_did)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        authorize(&request, &source).is_err(),
+        "removing the accepted contact revokes the issued grant"
+    );
+}
+
+#[tokio::test]
+async fn test_services_exit_decision_order_preserves_pending_and_committed_denial() {
+    for pending in [true, false] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action =
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+        let provider_token =
+            app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &provider_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (topic, approval) = {
+            let bus = bus.lock().await;
+            bus.topic_messages
+                .iter()
+                .find_map(|(topic, messages)| {
+                    messages
+                        .iter()
+                        .find(|message| {
+                            serde_json::from_str::<Value>(message["content"].as_str().unwrap())
+                                .unwrap()["kind"]
+                                == "service_access_decision"
+                        })
+                        .map(|message| (topic.clone(), message.clone()))
+                })
+                .unwrap()
+        };
+        let approved: Value = serde_json::from_str(approval["content"].as_str().unwrap()).unwrap();
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        let path = left.path().join("config/exit-provider.json");
+        assert!(path.exists());
+        let committed =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        let record = committed["remote_offer_requests"][services_contact_offer(&bob)].clone();
+        assert_eq!(record["access_decision_sha256"].as_str().unwrap().len(), 64);
+        let bytes = std::fs::read(&path).unwrap();
+        let calls = alice.exit_provider.requests.lock().await.len();
+        for changed_grant in [false, true] {
+            let mut replay = approval.clone();
+            let mut payload = approved.clone();
+            if changed_grant {
+                payload["remote_exit_grant"]["connect_ticket"] = json!("different-test-ticket");
+            }
+            crate::carrier::sign_service_message(right.path(), &mut payload).unwrap();
+            replay["content"] = json!(payload.to_string());
+            bus.lock()
+                .await
+                .topic_messages
+                .get_mut(&topic)
+                .unwrap()
+                .push(replay);
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+            let saved =
+                services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+            assert_eq!(
+                saved["remote_offer_requests"][services_contact_offer(&bob)],
+                record
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                alice.exit_provider.requests.lock().await.len(),
+                calls,
+                "same revision replay/conflict has no provider effect"
+            );
+        }
+        let deny = action.replacen("service-approve-request:", "service-deny-request:", 1);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &provider_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":deny}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let revision = approved["created_at"].as_u64().unwrap() + 1;
+        // Give the replay an exact, deterministic order independent of wall-clock ticks.
+        {
+            let mut bus = bus.lock().await;
+            let message = bus
+                .topic_messages
+                .get_mut(&topic)
+                .unwrap()
+                .last_mut()
+                .unwrap();
+            let mut denied: Value =
+                serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            assert_eq!(denied["decision"], "denied");
+            assert!(
+                denied["created_at"].as_u64().unwrap() > approved["created_at"].as_u64().unwrap(),
+                "the provider orders consecutive decisions even within one second"
+            );
+            denied["created_at"] = json!(revision);
+            crate::carrier::sign_service_message(right.path(), &mut denied).unwrap();
+            message["content"] = json!(denied.to_string());
+        }
+        if pending {
+            *alice.exit_provider.mode.lock().await = "reject".into();
+        }
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        let saved =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        let record = saved["remote_offer_requests"][services_contact_offer(&bob)].clone();
+        if pending {
+            assert_eq!(record["pending_access_decision"]["decision"], "denied");
+        } else {
+            assert_eq!(record["status"], "denied");
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        for (case, timestamp) in [
+            ("stale approval", approved["created_at"].clone()),
+            ("same revision conflict", json!(revision)),
+            ("missing timestamp", Value::Null),
+            ("string timestamp", json!(revision.to_string())),
+            ("zero timestamp", json!(0)),
+            ("overflow timestamp", json!(u64::MAX)),
+            ("future timestamp", json!(now_ts() + 3600)),
+        ] {
+            let mut replay = approval.clone();
+            let mut payload = approved.clone();
+            if timestamp.is_null() {
+                payload.as_object_mut().unwrap().remove("created_at");
+            } else {
+                payload["created_at"] = timestamp;
+            }
+            crate::carrier::sign_service_message(right.path(), &mut payload).unwrap();
+            replay["content"] = json!(payload.to_string());
+            bus.lock()
+                .await
+                .topic_messages
+                .get_mut(&topic)
+                .unwrap()
+                .push(replay);
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+            let saved =
+                services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+            assert_eq!(
+                saved["remote_offer_requests"][services_contact_offer(&bob)],
+                record,
+                "{case} must preserve the newest decision (pending={pending})"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "{case}: preserve installed policy"
+            );
+        }
+        alice.exit_provider.mode.lock().await.clear();
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        let saved =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        let record = &saved["remote_offer_requests"][services_contact_offer(&bob)];
+        assert_eq!(record["status"], "denied");
+        assert_eq!(record["updated_at"], revision);
+        assert!(record.get("pending_access_decision").is_none());
+        let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(config["remote_carrier_exits"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn test_services_exit_activation_fences_held_ack_and_rolls_back_failed_state_write() {
+    for fail_state_write in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action =
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        std::fs::create_dir_all(left.path().join("config")).unwrap();
+        let path = left.path().join("config/exit-provider.json");
+        let prior = b"{ \"remote_carrier_exits\": [] }";
+        std::fs::write(&path, prior).unwrap();
+        *alice.exit_provider.mode.lock().await = "hold_once".into();
+        let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let app = alice.app.clone();
+        let request = tokio::spawn(async move {
+            home_test_get_json(&app, "/api/apps/services/summary", &token, "null").await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            alice.exit_provider.entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            prior,
+            "ACK precedes publication"
+        );
+        let saved =
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+        assert_eq!(
+            saved["remote_offer_requests"][services_contact_offer(&bob)]["status"],
+            "requested"
+        );
+        // A held provider ACK in this data root does not serialize another Runtime.
+        let other_token =
+            app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+        let other = tokio::time::timeout(
+            Duration::from_secs(1),
+            home_test_get_json(&bob.app, "/api/apps/services/summary", &other_token, "null"),
+        )
+        .await;
+        if other.is_err() {
+            alice.exit_provider.release.notify_one();
+        }
+        assert_eq!(
+            other
+                .expect("independent Runtime progresses during held ACK")
+                .0,
+            StatusCode::OK
+        );
+        let root = crate::auth::principal_localhost_root(&alice.authority.principal_id);
+        let home = elastos_common::localhost::rooted_localhost_fs_path(
+            left.path(),
+            &format!("{root}/.AppData/ElastOS/Home"),
+        )
+        .unwrap();
+        let held = home.with_file_name("Home-held-for-write-failure");
+        if fail_state_write {
+            std::fs::rename(&home, &held).unwrap();
+            std::fs::write(&home, b"test-only write obstruction").unwrap();
+        }
+        alice.exit_provider.release.notify_one();
+        let (status, _) = request.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        if fail_state_write {
+            std::fs::remove_file(&home).unwrap();
+            std::fs::rename(&held, &home).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), prior);
+            assert_eq!(
+                *alice.exit_provider.applied.lock().await,
+                json!({"remote_carrier_exits":[]})
+            );
+            assert_eq!(
+                services_contact_saved_state(left.path(), &alice.authority, "services-state.json"),
+                saved
+            );
+        } else {
+            assert_ne!(std::fs::read(&path).unwrap(), prior);
+            let saved =
+                services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+            assert_eq!(
+                saved["remote_offer_requests"][services_contact_offer(&bob)]["status"],
+                "approved"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_services_remote_exit_request_delivers_provider_inbox_notification() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "services-left").await;
-    let _right_runtime = start_fake_runtime(right.path(), bus, "services-right").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let right_app = gateway_router(test_state(right.path()));
-    let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
-    let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
-    crate::auth::store_test_principal_root_protection(left.path(), &left_authority.principal_id);
-    crate::auth::store_test_principal_root_protection(right.path(), &right_authority.principal_id);
-    let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
-    let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
-
-    for (app, token, body) in [
-        (
-            left_app.clone(),
-            left_authority.people_token.as_str(),
-            r#"{"display_name":"Alice"}"#,
-        ),
-        (
-            right_app.clone(),
-            right_authority.people_token.as_str(),
-            r#"{"display_name":"Bob"}"#,
-        ),
-    ] {
-        let response = app
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/profile")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let left_fixture =
+        services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let right_fixture = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&left_fixture, &right_fixture);
+    let ServicesContactFixture {
+        app: left_app,
+        authority: left_authority,
+        runtime: _left_runtime,
+        ..
+    } = left_fixture;
+    let ServicesContactFixture {
+        app: right_app,
+        authority: right_authority,
+        runtime: _right_runtime,
+        peer_id: right_peer_id,
+        ..
+    } = right_fixture;
     std::fs::create_dir_all(right.path().join("config")).unwrap();
     std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
-
-    write_home_principal_object_json_for_authority(
-        left.path(),
-        &left_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": left_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&left_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {
-                "contact:right": {
-                    "contact_id": "contact:right",
-                    "peer_id": "services-right",
-                    "did": right_did,
-                    "display_name": "Bob",
-                    "handle": "Bob",
-                    "added_at": 10,
-                    "updated_at": 10,
-                    "source": "people_discovery"
-                }
-            }
-        }),
-    );
-    write_home_principal_object_json_for_authority(
-        right.path(),
-        &right_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": right_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&right_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {
-                "contact:left": {
-                    "contact_id": "contact:left",
-                    "peer_id": "services-left",
-                    "did": left_did,
-                    "display_name": "Alice",
-                    "handle": "Alice",
-                    "added_at": 10,
-                    "updated_at": 10,
-                    "source": "people_discovery"
-                }
-            }
-        }),
-    );
 
     let right_services_token =
         app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &right_authority);
@@ -2036,7 +3395,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     assert!(payload["message"]
         .as_str()
         .unwrap_or_default()
-        .contains("private remote Exit grant was sent"));
+        .contains("private scoped grant was sent"));
 
     let inbox_after = right_app
         .oneshot(
@@ -2098,8 +3457,8 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
         .unwrap()
         .iter()
         .find(|exit| {
-            exit["connect_ticket"] == "fake-ticket-services-right"
-                && exit["peer_did"] == "services-right"
+            exit["connect_ticket"] == format!("fake-ticket-{right_peer_id}")
+                && exit["peer_did"] == right_peer_id
         })
         .expect("approval should install a private remote Carrier Exit grant");
     assert_eq!(
@@ -2107,6 +3466,8 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
         left_authority.principal_id
     );
     assert_eq!(installed_exit["allowed_ports"], json!([80, 443]));
+    assert_eq!(installed_exit["max_active_streams"], 64);
+    assert_eq!(installed_exit["max_active_streams_per_principal"], 64);
 }
 
 #[tokio::test]
@@ -2114,68 +3475,18 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "services-left-local").await;
-    let _right_runtime =
-        start_fake_runtime(right.path(), bus.clone(), "services-right-local").await;
-    let left_app = gateway_router(test_state(left.path()));
-    let left_authority = passkey_authority_with_name(left.path(), Some("Alice"));
-    let right_authority = passkey_authority_with_name(right.path(), Some("Bob"));
-    crate::auth::store_test_principal_root_protection(left.path(), &left_authority.principal_id);
-    crate::auth::store_test_principal_root_protection(right.path(), &right_authority.principal_id);
-    let right_did = elastos_identity::load_or_create_did(right.path())
-        .unwrap()
-        .1;
-
-    write_home_principal_object_json_for_authority(
-        left.path(),
-        &left_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": left_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&left_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {
-                "contact:right": {
-                    "contact_id": "contact:right",
-                    "peer_id": "services-right-local",
-                    "did": right_did,
-                    "display_name": "Bob",
-                    "handle": "Bob",
-                    "added_at": 10,
-                    "updated_at": 10,
-                    "source": "people_discovery"
-                }
-            }
-        }),
-    );
-    write_home_principal_object_json_for_authority(
-        right.path(),
-        &right_authority,
-        "services-peer-contacts.json",
-        json!({
-            "schema": "elastos.services.peer-contacts-state/v1",
-            "principal_id": right_authority.principal_id,
-            "localhost_root": crate::auth::principal_localhost_root(&right_authority.principal_id),
-            "updated_at": 10,
-            "contacts": {}
-        }),
-    );
-
-    let profile = left_app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/people/profile")
-                .header("x-elastos-home-token", left_authority.people_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"Alice"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(profile.status(), StatusCode::OK);
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let left_fixture =
+        services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let right_fixture = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&left_fixture, &right_fixture);
+    let ServicesContactFixture {
+        app: left_app,
+        authority: left_authority,
+        runtime: _left_runtime,
+        ..
+    } = left_fixture;
 
     let left_services_token =
         app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &left_authority);
@@ -7331,5 +8642,996 @@ async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_st
     assert_eq!(
         non_regular_write.status(),
         StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+fn services_engine_offer(fixture: &ServicesContactFixture) -> String {
+    format!(
+        "offer:{}:browser-engine",
+        home_people_contact_id(&fixture.profile.document().profile_did)
+    )
+}
+
+#[tokio::test]
+async fn test_services_inbox_request_copy_matches_engine_or_exit_and_exact_approval() {
+    for (engine, service_name, offer_name, approval_text) in [
+        (
+            true,
+            "Browser Engine",
+            "Bob's Browser Engine",
+            "Approval allows the requested Browser Engine operations through your Runtime.",
+        ),
+        (
+            false,
+            "Browser Exit Node",
+            "Bob's Browser Exit",
+            "Approval records your intent; Browser access still requires an installed remote Exit grant.",
+        ),
+    ] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let action = if engine {
+            services_contact_pending_engine_request(left.path(), right.path(), &alice, &bob).await
+        } else {
+            services_contact_pending_request(left.path(), right.path(), &alice, &bob).await
+        };
+        let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (status, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "service_access_request")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "{inbox}");
+        let entry = entries[0];
+        assert_eq!(entry["title"], format!("Alice requests your {service_name}"));
+        assert_eq!(
+            entry["body"],
+            format!("Alice wants to use {offer_name}. {approval_text}")
+        );
+        assert_eq!(entry["source_app"], SERVICES_CAPSULE_ID);
+        assert_eq!(entry["action_ref"]["app"], SERVICES_CAPSULE_ID);
+        assert_eq!(entry["action_ref"]["action_id"], action);
+        assert_eq!(
+            entry["id"],
+            format!(
+                "service-access-request:{}",
+                action.strip_prefix("service-approve-request:").unwrap()
+            )
+        );
+        assert_eq!(entry["read"], false);
+    }
+}
+
+async fn services_contact_pending_engine_request(
+    left: &std::path::Path,
+    right: &std::path::Path,
+    alice: &ServicesContactFixture,
+    bob: &ServicesContactFixture,
+) -> String {
+    std::fs::create_dir_all(right.join("config")).unwrap();
+    std::fs::write(right.join("config/browser-engine-adapter.json"), "{}").unwrap();
+    let token = app_token_for_authority(right, SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-engine","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = app_token_for_authority(left, SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_engine_offer(bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = home_test_post_json(
+        &bob.app,
+        "/api/apps/home/launch",
+        &bob.authority.home_token,
+        "http://localhost:61180",
+        json!({"target":INBOX_CAPSULE_ID}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(right, INBOX_CAPSULE_ID, &bob.authority);
+    let (_, inbox) = home_test_get_json(&bob.app, "/api/apps/inbox/summary", &token, "null").await;
+    inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "service_access_request")
+        .unwrap()["action_ref"]["action_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[derive(Default)]
+struct ServicesEngineProbeProvider {
+    execution: super::remote_engine::RemoteEngineFixture,
+    calls: TokioMutex<Vec<Value>>,
+    hold: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl Provider for ServicesEngineProbeProvider {
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![]
+    }
+    fn name(&self) -> &'static str {
+        "services-engine-probe-test"
+    }
+    async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw only".into()))
+    }
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        self.calls.lock().await.push(request.clone());
+        self.entered.notify_one();
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        let mut response = self.execution.send_raw(request).await?;
+        if request["op"] == "status" {
+            response["data"]["capacity_available"] = json!(true);
+            response["data"]["max_active_sessions"] = json!(4);
+        }
+        response["data"]["private_control_path"] = json!("/private/never-publish");
+        response["data"]["credential"] = json!("never-publish-secret");
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn test_services_remote_engine_signed_approval_retains_scoped_execution_grant() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    let action =
+        services_contact_pending_engine_request(left.path(), right.path(), &alice, &bob).await;
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":action}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    use iroh::Watcher as _;
+    let provider = Arc::new(ServicesEngineProbeProvider::default());
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let (_, alice_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
+    let (_, bob_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
+    let local_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &alice.device_key,
+        &alice_did,
+        left.path().to_path_buf(),
+        None,
+    )
+    .await
+    .unwrap();
+    let remote_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &bob.device_key,
+        &bob_did,
+        right.path().to_path_buf(),
+        Some(Arc::downgrade(&provider_registry)),
+    )
+    .await
+    .unwrap();
+    let ticket = data_encoding::BASE32_NOPAD
+        .encode(
+            &serde_json::to_vec(
+                &json!({"topic":null,"endpoints":[remote_node.endpoint.watch_addr().get()]}),
+            )
+            .unwrap(),
+        )
+        .to_lowercase();
+    let mut local = crate::carrier::CarrierRuntimeService::new(local_node);
+    let mut remote = crate::carrier::CarrierRuntimeService::new(remote_node);
+    remote.configure_browser_exit_network(network.clone()).await;
+    let endpoint = local.endpoint().unwrap();
+    let consumer_registry = Arc::new(ProviderRegistry::new());
+    consumer_registry
+        .set_carrier_invoker(Arc::new(
+            crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(endpoint.clone()),
+        ))
+        .await;
+    // The fake gossip bus retains the actual serving endpoint in its signed decision.
+    // The consumer still validates that first decision through normal Services.
+    {
+        let mut mailbox = bus.lock().await;
+        for message in mailbox.topic_messages.values_mut().flatten() {
+            let mut payload: Value =
+                serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            if payload["kind"] == "service_access_decision" && payload["decision"] == "approved" {
+                payload["remote_engine_grant"]["connect_ticket"] = json!(ticket);
+                crate::carrier::sign_service_message(right.path(), &mut payload).unwrap();
+                message["content"] = json!(payload.to_string());
+            }
+        }
+    }
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_engine_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "approved");
+    assert_eq!(
+        offer["enabled"], false,
+        "launch awaits serving Runtime resource binding"
+    );
+    let saved = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    let grant = &saved["remote_offer_requests"][services_engine_offer(&bob)]["remote_engine_grant"];
+    assert_eq!(grant["schema"], "elastos.service.remote-engine-grant/v1");
+    assert_eq!(grant["peer_did"], bob.peer_id);
+    assert_eq!(grant["principal_id"], alice.authority.principal_id);
+    assert_eq!(
+        grant["operations"],
+        crate::carrier::browser_engine_binding::operations(Some(
+            crate::carrier::browser_engine_binding::EXECUTION_SCOPE
+        ))
+    );
+    assert!(!left.path().join("config/exit-provider.json").exists());
+    assert!(alice.exit_provider.requests.lock().await.is_empty());
+    let grant = grant.clone();
+    let status = crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
+        .await
+        .unwrap();
+    assert_eq!(status["data"]["launch_available"], true);
+    assert!(!status.to_string().contains("never-publish"));
+    let adapter = status["data"]["adapters"][0]["id"].as_str().unwrap();
+    let ready = crate::carrier::probe_browser_engine(
+        &consumer_registry,
+        &grant,
+        "readiness",
+        Some(adapter),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ready["data"]["readiness"]["state"], "ready");
+    let calls = provider.calls.lock().await.clone();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|call| call["principal_id"] == bob.authority.principal_id
+            && call.get("_runtime_invocation").is_none()
+            && call.get("grant_id").is_none()));
+    for field in ["principal_id", "grant_id"] {
+        let mut forged = grant.clone();
+        forged[field] = json!("foreign");
+        assert!(
+            crate::carrier::probe_browser_engine(&consumer_registry, &forged, "status", None)
+                .await
+                .is_err()
+        );
+    }
+    let anonymous_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await
+        .unwrap();
+    let anonymous_registry = ProviderRegistry::new();
+    anonymous_registry
+        .set_carrier_invoker(Arc::new(
+            crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                anonymous_endpoint.clone(),
+            ),
+        ))
+        .await;
+    assert!(
+        crate::carrier::probe_browser_engine(&anonymous_registry, &grant, "status", None)
+            .await
+            .is_err()
+    );
+    anonymous_endpoint.close().await;
+    assert_eq!(
+        provider.calls.lock().await.len(),
+        2,
+        "foreign requests never reach Engine"
+    );
+    let authority_request = json!({"op":"status","principal_id":alice.authority.principal_id,"grant_id":grant["grant_id"]});
+    assert!(crate::api::gateway::authorize_home_service_engine(
+        right.path(),
+        &network,
+        &endpoint.id(),
+        &authority_request,
+        grant["expires_at"].as_u64().unwrap()
+    )
+    .is_err());
+    // Exercise the actual Browser summary caller with a consumer that has no local Engine.
+    let mut consumer_state = test_state(left.path());
+    consumer_state.provider_registry = Some(consumer_registry.clone());
+    consumer_state.carrier_endpoint = Some(endpoint.clone());
+    consumer_state.collaboration_discovery_service = Some(
+        crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
+            SigningKey::from_bytes(&alice.device_key.to_bytes()),
+            network.clone(),
+            Arc::new(ProviderRegistry::new()),
+        )
+        .await
+        .unwrap(),
+    );
+    consumer_registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    let consumer_exit = Arc::new(super::remote_engine::ConsumerExitFixture {
+        stream_id: mock_attached_stream_id(left.path()),
+        calls: TokioMutex::default(),
+    });
+    consumer_registry
+        .register_sub_provider("exit", consumer_exit.clone())
+        .await
+        .unwrap();
+    let browser_app = gateway_router(consumer_state.clone());
+    let browser_token = app_token_for_authority(left.path(), BROWSER_CAPSULE_ID, &alice.authority);
+    let (code, browser_summary) = home_test_get_json(
+        &browser_app,
+        "/api/apps/browser/summary",
+        &browser_token,
+        "null",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let remote_offer = &browser_summary["engine_adapter"]["remote_services"]["offers"][0];
+    assert_eq!(remote_offer["state"], "approved", "{browser_summary}");
+    assert_eq!(remote_offer["readiness"]["state"], "ready");
+    assert_eq!(remote_offer["launch_available"], true);
+    for private in [
+        ticket.as_str(),
+        grant["grant_id"].as_str().unwrap(),
+        "never-publish",
+        "_runtime_invocation",
+    ] {
+        assert!(!browser_summary.to_string().contains(private));
+    }
+    assert_eq!(provider.calls.lock().await.len(), 4);
+    // Launch without a retained page/generation fails at the actual receiver before native effects.
+    use elastos_runtime::provider::{
+        ProviderCarrierRoute, ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
+    };
+    let invocation = ProviderInvocation {
+        source: "browser".into(),
+        target: "browser-engine".into(),
+        op: "launch".into(),
+        request: json!({"op":"launch","grant_id":grant["grant_id"],"principal_id":alice.authority.principal_id}),
+        transfer: ProviderTransfer::Json,
+        range: None,
+        progress: None,
+        transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
+            connect_ticket: ticket,
+            peer_did: Some(bob_did),
+            timeout_ms: Some(2000),
+        }),
+    };
+    assert!(consumer_registry.invoke_provider(invocation).await.is_err());
+    assert_eq!(provider.calls.lock().await.len(), 4);
+    super::remote_engine::exercise_signed_remote_engine_carrier(
+        &consumer_registry,
+        &grant,
+        right.path(),
+    )
+    .await;
+    super::remote_engine::exercise_consumer_http_remote_engine(
+        &browser_app,
+        &browser_token,
+        left.path(),
+        &remote_offer["selectable_adapters"][0]["id"],
+        &alice.authority.principal_id,
+        &consumer_exit,
+        &consumer_state,
+        &provider.calls,
+    )
+    .await;
+    super::remote_engine::exercise_revoked_remote_preparation_cleanup(
+        &consumer_state,
+        &grant,
+        &consumer_exit,
+        true,
+        right.path(),
+    )
+    .await;
+    let before_late_probe = provider.calls.lock().await.len();
+    // An approval cannot publish late readiness after the provider owner denies it.
+    provider
+        .hold
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pending_registry = consumer_registry.clone();
+    let pending_grant = grant.clone();
+    let pending = tokio::spawn(async move {
+        crate::carrier::probe_browser_engine(&pending_registry, &pending_grant, "status", None)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if provider.calls.lock().await.len() == before_late_probe + 1 {
+                break;
+            }
+            provider.entered.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let deny = action.replacen("service-approve-request:", "service-deny-request:", 1);
+    let (code, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":deny}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    provider.release.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    assert!(
+        crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.calls.lock().await.len(), before_late_probe + 1);
+    let cancellation =
+        json!({"principal_id":alice.authority.principal_id,"grant_id":grant["grant_id"]});
+    authorize_home_engine_preparation_cancellation(right.path(), &endpoint.id(), &cancellation)
+        .unwrap();
+    for field in ["principal_id", "grant_id"] {
+        let mut foreign = cancellation.clone();
+        foreign[field] = json!("foreign");
+        assert!(authorize_home_engine_preparation_cancellation(
+            right.path(),
+            &endpoint.id(),
+            &foreign
+        )
+        .is_err());
+    }
+    assert!(authorize_home_engine_preparation_cancellation(
+        right.path(),
+        &iroh::SecretKey::from_bytes(&[91; 32]).public(),
+        &cancellation
+    )
+    .is_err());
+    super::remote_engine::exercise_revoked_remote_preparation_cleanup(
+        &consumer_state,
+        &grant,
+        &consumer_exit,
+        false,
+        right.path(),
+    )
+    .await;
+    assert_eq!(
+        provider.calls.lock().await.len(),
+        before_late_probe + 1,
+        "revoked prepare and cancellation have no native effects"
+    );
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let saved = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    let record = &saved["remote_offer_requests"][services_engine_offer(&bob)];
+    assert_eq!(record["status"], "denied");
+    assert!(record.get("remote_engine_grant").is_none());
+    assert!(alice.exit_provider.requests.lock().await.is_empty());
+    local.shutdown().await.unwrap();
+    remote.shutdown().await.unwrap();
+}
+// Regression for a configured Gateway whose Carrier is already in process.
+fn configured_services_runtime_remove_attached_runtime(
+    data_dir: &std::path::Path,
+    fixture: &ServicesContactFixture,
+) {
+    fixture.runtime._task.abort();
+    for path in [
+        data_dir.join("runtime-coords.json"),
+        crate::runtime_control::home_runtime_coord_path(data_dir),
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+async fn configured_services_runtime_assert_preserved(
+    data_dir: &std::path::Path,
+    fixture: &ServicesContactFixture,
+) {
+    assert!(!data_dir.join("runtime-coords.json").exists());
+    assert!(!crate::runtime_control::home_runtime_coord_path(data_dir).exists());
+    assert!(fixture.runtime.launch_requests.lock().await.is_empty());
+    let (key, did) =
+        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)
+            .unwrap()
+            .unwrap();
+    assert_eq!(key.to_bytes(), fixture.device_key.to_bytes());
+    assert_eq!(did, fixture.peer_provider.state.did);
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_request_uses_existing_peer_without_coords() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let messages = bus
+        .lock()
+        .await
+        .topic_messages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    let request =
+        crate::carrier::verify_service_message(&messages[0], "requester_peer_id").unwrap();
+    assert_eq!(request["kind"], "service_access_request");
+    assert_eq!(request["requester_peer_id"], alice.peer_id);
+    assert_eq!(request["requester_did"], alice.peer_provider.state.did);
+    assert_eq!(
+        request["requester_principal_id"],
+        alice.authority.principal_id
+    );
+    assert_eq!(request["target_peer_id"], bob.peer_id);
+    let calls = alice
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .clone();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "get_ticket",
+            "gossip_join",
+            "gossip_join_peers",
+            "gossip_send"
+        ]
+    );
+    assert_eq!(calls[3]["body"]["sender_id"], alice.peer_id);
+    let (_, summary) =
+        home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+    let offer = summary["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == services_contact_offer(&bob))
+        .unwrap();
+    assert_eq!(offer["status"], "requested");
+    assert_eq!(offer["enabled"], false);
+    configured_services_runtime_assert_preserved(left.path(), &alice).await;
+    configured_services_runtime_assert_preserved(right.path(), &bob).await;
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_errors_preserve_state_without_starting_runtime() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let offer_id = services_contact_offer(&bob);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before = services_contact_saved_state(left.path(), &alice.authority, "services-state.json");
+    for failure in ["missing", "unavailable", "error", "deadline"] {
+        if failure == "missing" {
+            alice
+                .registry
+                .unregister_sub_provider("peer")
+                .await
+                .unwrap();
+        } else {
+            *alice.peer_provider.send_failure.lock().await = failure.into();
+        }
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            services_contact_post(
+                &alice.app,
+                &token,
+                "/api/apps/services/offers",
+                json!({"offer_id":offer_id,"section":"others","selected":true}),
+            ),
+        )
+        .await
+        .expect("Services must finish at the peer operation deadline");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failure}: {body}");
+        let expected = match failure {
+            "missing" => "no provider for scheme: peer",
+            "unavailable" => "configured peer unavailable",
+            "error" => "configured peer rejected send",
+            _ => "Services peer operation deadline",
+        };
+        assert!(body.contains(expected), "{failure}: {body}");
+        assert_eq!(
+            services_contact_saved_state(left.path(), &alice.authority, "services-state.json"),
+            before
+        );
+        assert!(services_messages(&bus).await.is_empty());
+        configured_services_runtime_assert_preserved(left.path(), &alice).await;
+        if failure == "missing" {
+            alice
+                .registry
+                .register_sub_provider("peer", Arc::new(alice.peer_provider.clone()))
+                .await
+                .unwrap();
+        }
+    }
+    // A failed send leaves the same live registry usable for an explicit retry.
+    alice.peer_provider.send_failure.lock().await.clear();
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":offer_id,"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(services_messages(&bus).await.len(), 1);
+    configured_services_runtime_assert_preserved(left.path(), &alice).await;
+    configured_services_runtime_assert_preserved(right.path(), &bob).await;
+}
+
+fn services_mailbox_saved_state(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    name: &str,
+) -> Value {
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/.AppData/ElastOS/Home/{name}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    if !path.exists() {
+        return json!({"requests":{},"remote_offer_requests":{}});
+    }
+    services_contact_saved_state(data_dir, authority, name)
+}
+
+fn services_background_worker(
+    data_dir: &std::path::Path,
+    fixture: &ServicesContactFixture,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(
+        crate::collaboration_startup::run_collaboration_discovery_sync_worker(
+            data_dir.to_path_buf(),
+            fixture.discovery_service.clone(),
+            stopped,
+        ),
+    );
+    (stop, worker)
+}
+
+async fn services_wait_for_background(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        while !ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Runtime Services receive progress must not require an Inbox launch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_services_runtime_mailbox_receives_and_activates_without_inbox_or_services_refresh() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    std::fs::create_dir_all(right.path().join("config")).unwrap();
+    std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let token = app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-exit","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (stop_bob, worker_bob) = services_background_worker(right.path(), &bob);
+    // Startup subscription happens before any incoming request and before Inbox.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if bob
+                .peer_provider
+                .state
+                .provider_requests
+                .lock()
+                .await
+                .iter()
+                .any(|call| call["op"] == "gossip_recv")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    services_wait_for_background(|| {
+        !services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    let requests =
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json");
+    assert_eq!(requests["requests"].as_object().unwrap().len(), 1);
+    let request = requests["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(request["authenticated_request"], true);
+    assert_eq!(request["status"], "pending");
+    assert_eq!(
+        request["requester_principal_id"].as_str(),
+        Some(alice.authority.principal_id.as_str())
+    );
+    assert!(alice.exit_provider.requests.lock().await.is_empty());
+    assert!(bob.exit_provider.requests.lock().await.is_empty());
+    // The first summary sees the already durable pending request, without any
+    // additional peer operation or Home launch caused by the read.
+    stop_bob.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_bob)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = bob.peer_provider.state.provider_requests.lock().await.len();
+    let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+    let (_, inbox) =
+        home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+    let notification = inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "service_access_request")
+        .unwrap();
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
+    assert!(bob.runtime.launch_requests.lock().await.is_empty());
+    // Only the provider's explicit Inbox approval grants use. The consumer's
+    // Runtime applies that decision with the real refresh acknowledgement path.
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &inbox_token,
+        "/api/apps/inbox/actions",
+        json!({"action_id":notification["action_ref"]["action_id"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (stop_alice, worker_alice) = services_background_worker(left.path(), &alice);
+    services_wait_for_background(|| {
+        services_mailbox_saved_state(left.path(), &alice.authority, "services-state.json")
+            ["remote_offer_requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|request| request["status"] == "approved")
+    })
+    .await;
+    stop_alice.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_alice)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice.exit_provider.requests.lock().await.len(), 1);
+    assert!(alice.runtime.launch_requests.lock().await.is_empty());
+    let state = services_mailbox_saved_state(left.path(), &alice.authority, "services-state.json");
+    assert!(state["remote_offer_requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|r| r["installed_remote_exit_id"].as_str().is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_signed_message() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    std::fs::create_dir_all(right.path().join("config")).unwrap();
+    std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
+    let service = bob.discovery_service.clone();
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert!(bob
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .is_empty());
+    assert!(
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Valid contact, invalid signature: background ingestion uses the same
+    // authenticated validator and cannot convert it into a pending approval.
+    {
+        let mut bus = bus.lock().await;
+        let message = &mut bus
+            .topic_messages
+            .get_mut("__elastos_internal/service-requests-v1")
+            .unwrap()[0];
+        let mut payload: Value =
+            serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        payload["requester_principal_id"] = json!("tampered-principal");
+        message["content"] = json!(payload.to_string());
+    }
+    let token = app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+    let (status, body) = services_contact_post(
+        &bob.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":"local:provider:browser-exit","section":"mine","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert!(
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(bob.exit_provider.requests.lock().await.is_empty());
+    // Signed request from an unaccepted sender also remains outside authority.
+    let foreign = tempfile::tempdir().unwrap();
+    let (_, foreign_did) = elastos_identity::load_or_create_did(foreign.path()).unwrap();
+    let foreign_peer = crate::carrier::did_to_public_key(&foreign_did)
+        .unwrap()
+        .to_string();
+    {
+        let mut bus = bus.lock().await;
+        let message = &mut bus
+            .topic_messages
+            .get_mut("__elastos_internal/service-requests-v1")
+            .unwrap()[0];
+        let mut payload: Value =
+            serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        payload["request_id"] = json!("00000000000000000000000000000000ab");
+        payload["requester_peer_id"] = json!(foreign_peer);
+        payload["requester_did"] = json!(foreign_did);
+        crate::carrier::sign_service_message(foreign.path(), &mut payload).unwrap();
+        message["sender_id"] = json!(foreign_peer);
+        message["content"] = json!(payload.to_string());
+        let repeated = message.clone();
+        bus.topic_messages
+            .get_mut("__elastos_internal/service-requests-v1")
+            .unwrap()
+            .push(repeated);
+    }
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert!(
+        services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
+            ["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    // Authority is loaded on each pass; a previously usable context is not a
+    // retained background capability after the owner binding is revoked.
+    crate::auth::revoke_passkey_binding(
+        right.path(),
+        &bob.authority.proof_binding_id,
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    let before = bob.peer_provider.state.provider_requests.lock().await.len();
+    service.sync_services_mailboxes_once(right.path(), 0).await;
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
+    let empty = tempfile::tempdir().unwrap();
+    service.sync_services_mailboxes_once(empty.path(), 0).await;
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
+    );
+    let (stop, stopped) = tokio::sync::watch::channel(true);
+    crate::collaboration_startup::run_collaboration_discovery_sync_worker(
+        right.path().to_path_buf(),
+        service,
+        stopped,
+    )
+    .await;
+    assert!(*stop.borrow());
+    assert_eq!(
+        before,
+        bob.peer_provider.state.provider_requests.lock().await.len()
     );
 }

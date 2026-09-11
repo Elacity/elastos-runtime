@@ -476,7 +476,7 @@ pub(in crate::api::gateway) fn validate_browser_vz_viewer_turn_capability(
         "turn_url",
         "ice_server",
     ];
-    if object.len() != keys.len()
+    if object.len() != keys.len() + usize::from(object.contains_key("viewer_ingress"))
         || keys.iter().any(|key| !object.contains_key(*key))
         || capability.get("schema").and_then(serde_json::Value::as_str)
             != Some(BROWSER_VZ_VIEWER_TURN_CAPABILITY_SCHEMA)
@@ -539,7 +539,10 @@ pub(in crate::api::gateway) fn validate_browser_vz_viewer_turn_capability(
         .pointer("/turn/listen_port")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "Browser VZ TURN listen port is missing".to_string())?;
-    if turn_url != format!("turn:{advertised_host}:{listen_port}?transport=tcp") {
+    if let Some(ingress) = capability.get("viewer_ingress") {
+        crate::carrier::browser_engine_media::validate_ingress(authority, ingress, turn_url)
+            .map_err(|error| error.to_string())?;
+    } else if turn_url != format!("turn:{advertised_host}:{listen_port}?transport=tcp") {
         return Err("Browser VZ viewer TURN endpoint mismatch".to_string());
     }
     Ok(())
@@ -1210,7 +1213,7 @@ mod tests {
         serde_json::json!({
             "schema": "elastos.browser.engine.page/v1",
             "provider": "browser-engine-adapter",
-            "protocol_version": "2.0",
+            "protocol_version": "2.1",
             "page_id": authority["page_id"],
             "adapter": "browser-vm-product",
             "engine": "chromium_microvm",
@@ -1246,6 +1249,7 @@ mod tests {
                 exit_id: "local-runtime".to_string(),
                 engine_route_provider: "browser-engine".to_string(),
                 selected_engine_adapter: Some("browser-vm-product".to_string()),
+                service_selection: None,
                 profile_key_hash: None,
                 vm_key_hash: None,
             },

@@ -4,6 +4,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
+import { friendlyOpenError, isAuthoritySessionError } from "../capsules/browser/browser/browser-status.js";
+import { sameRuntimePageOwner } from "../capsules/browser/browser/browser-page-cleanup.js";
 
 const browserSource = fs.readFileSync(
   new URL("../capsules/browser/browser/browser.js", import.meta.url),
@@ -89,6 +92,7 @@ const handshakeSource = [
   "classifyFreshWindowCloseSummary",
   "resolveRuntimeOwnershipForWindowClose",
   "settleInitialRuntimeOpenPostFailure",
+  "requestFreshRuntimeAuthority",
   "handleHomeBrowserWindowCloseRequest",
 ]
   .map((name) => extractFunction(browserSource, name))
@@ -105,6 +109,7 @@ const authorityRenewalSource = [
   "handleHomeBrowserAuthorityRenewalResult",
   "requestHomeRelaunch",
   "requestFreshRuntimeAuthority",
+  "handlePageObservationFailure",
   "startPageStatusPolling",
   "startPageHeartbeat",
 ]
@@ -112,7 +117,7 @@ const authorityRenewalSource = [
   .join("\n");
 
 function createActiveAuthorityExpiryHarness(surface) {
-  const error = new Error(`${surface} authority expired`);
+  const error = new Error(surface === "status" ? "unauthorized" : "home launch token expired");
   error.status = surface === "status" ? 401 : 403;
   const owner = Object.freeze({
     page_id: `page-${surface}`,
@@ -148,6 +153,7 @@ function createActiveAuthorityExpiryHarness(surface) {
     PAGE_STATUS_FIRST_POLL_MS: 1_200,
     PAGE_STATUS_INTERVAL_MS: 2_500,
     currentPage: page,
+    unloadCleanupStarted: false,
     pageHeartbeatTimer: 0,
     pageStatusTimer: 0,
     relaunchRequested: false,
@@ -176,12 +182,8 @@ function createActiveAuthorityExpiryHarness(surface) {
         timers.delete(id);
       },
     },
-    isAuthoritySessionError(candidate) {
-      return candidate?.status === 401 || candidate?.status === 403;
-    },
-    friendlyOpenError() {
-      return "Browser session expired. Reopening from Home...";
-    },
+    isAuthoritySessionError,
+    friendlyOpenError,
     showStatus() {},
     stopPageStatusPolling() {
       for (const [id, timer] of timers) {
@@ -211,6 +213,7 @@ function createActiveAuthorityExpiryHarness(surface) {
     },
     runtimePageCleanup: { status: () => null },
     currentRuntimePageOwner: () => owner,
+    sameRuntimePageOwner,
   });
   vm.runInContext(
     `${authorityRenewalSource}\nthis.authority = { handleHomeBrowserAuthorityRenewalResult, requestHomeRelaunch, startPageStatusPolling, startPageHeartbeat };`,
@@ -286,6 +289,7 @@ function createHarness({
   const fetchCalls = [];
   const posted = [];
   const statuses = [];
+  const renewalRequests = [];
   const context = vm.createContext({
     BROWSER_WINDOW_CLOSE_REQUEST_TYPE:
       "elastos.browser.window-close.request/v1",
@@ -295,7 +299,7 @@ function createHarness({
     browserInstanceId: "browser:0123456789abcdef0123456789abcdef",
     launchToken: "launch-token-exact",
     currentPage: recoverable || ownerless ? null : page,
-    currentPageGeneration: 7,
+    currentPageGeneration: 7, unloadCleanupStarted: false,
     currentBrowserEngineId: "engine-exact",
     currentRemoteExitId: "exit-exact",
     browserSummaryPromise: null,
@@ -332,8 +336,11 @@ function createHarness({
     closeRemoteDisplay() {},
     updateMetricsNode() {},
     updateNavState() {},
-    isAuthoritySessionError(error) {
-      return error?.status === 401 || error?.status === 403;
+    isAuthoritySessionError,
+    friendlyOpenError,
+    requestHomeRelaunch(reason) {
+      renewalRequests.push(reason);
+      return true;
     },
     normalizeUrl(value) {
       if (value === "invalid-initial-url") {
@@ -357,7 +364,7 @@ function createHarness({
     },
   });
   vm.runInContext(
-    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, settleInitialRuntimeOpenPostFailure };`,
+    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, requestFreshRuntimeAuthority, settleInitialRuntimeOpenPostFailure };`,
     context,
   );
   const request = {
@@ -373,11 +380,13 @@ function createHarness({
     parent,
     posted,
     request,
+    renewalRequests,
     statuses,
     deliver: context.handshake.deliverPendingHomeBrowserWindowClose,
     finalize: context.handshake.finalizeRuntimePageClose,
     handle: context.handshake.handleHomeBrowserWindowCloseRequest,
     normalizeOpenUrl: context.handshake.normalizeRuntimeOpenUrl,
+    refreshAuthority: context.handshake.requestFreshRuntimeAuthority,
     settleInitial: context.handshake.settleInitialRuntimeOpenPostFailure,
   };
 }
@@ -437,6 +446,38 @@ test("exact parent request closes the exact owner and returns terminal receipt",
   );
   assert.equal(harness.posted[0].origin, "*");
   assert.equal(harness.posted[1].origin, "*");
+});
+
+test("policy 403 leaves renewal idle and preserves an in-flight exact window close", async () => {
+  let finishClose;
+  const harness = createHarness({ outcome: new Promise(resolve => { finishClose = resolve; }) });
+  const closing = harness.handle({
+    origin: "null",
+    source: harness.parent,
+    data: harness.request,
+  });
+  const denied = Object.assign(new Error("private host blocked: localhost"), { status: 403 });
+  try {
+    assert.equal(harness.posted[0].message.state, "pending");
+    assert.equal(harness.refreshAuthority(denied), false);
+    assert.deepEqual(harness.renewalRequests, []);
+    assert.equal(harness.closeCalls.length, 1);
+    assert.equal(harness.closeCalls[0].candidate, harness.owner);
+  } finally {
+    finishClose({ state: "terminal", page_id: "page-exact", generation: 7, terminal_kind: "closed" });
+    await closing;
+  }
+  const receipt = harness.posted[1].message;
+  assert.equal(harness.posted.length, 2);
+  assert.equal(receipt.state, "terminal");
+  assert.equal(receipt.terminalKind, "closed");
+  assert.equal(receipt.pageId, harness.owner.page_id);
+  assert.equal(receipt.cleanupId, harness.owner.runtime_cleanup.id);
+  assert.equal(receipt.generation, harness.owner.generation);
+  assert.equal(receipt.requestId, harness.request.requestId);
+  assert.equal(receipt.homeToken, harness.request.homeToken);
+  assert.equal(receipt.browserInstance, harness.request.browserInstance);
+  assert.deepEqual(harness.renewalRequests, []);
 });
 
 test("timed-out open remains pending while its exact Runtime job is pending", async () => {
@@ -1110,7 +1151,7 @@ test("pending Home close blocks creation of a replacement Runtime owner", async 
     pendingHomeWindowCloseDelivery: {},
     homeWindowTerminalCloseConfirmed: false,
     currentPage: { page_id: "page-exact" },
-    currentPageGeneration: 7,
+    currentPageGeneration: 7, unloadCleanupStarted: false,
     cleanupPendingError(outcome) {
       const error = new Error("cleanup pending");
       error.cleanupOutcome = outcome;
@@ -1125,6 +1166,49 @@ test("pending Home close blocks creation of a replacement Runtime owner", async 
     context.requestRuntimeOpen("https://example.com/"),
     (error) => error?.cleanupOutcome?.reason === "home_window_close_pending",
   );
+});
+
+test("viewer denial preserves an existing page before close or open dispatch", async () => {
+  const page = { page_id: "page-kept" };
+  const loading = [];
+  const context = vm.createContext({
+    runtimeOpenInFlight: 0,
+    homeWindowCloseInFlight: false,
+    pendingHomeWindowCloseDelivery: null,
+    homeWindowTerminalCloseConfirmed: false,
+    currentPage: page,
+    currentPageGeneration: 7, unloadCleanupStarted: false,
+    currentRemoteExitId: "exit-kept",
+    currentBrowserEngineId: "engine-kept",
+    selectedRemoteExitId: "exit-next",
+    selectedBrowserEngineId: "engine-next",
+    runtimeOwnershipTerminallyAbsent: false,
+    normalizeRuntimeOpenUrl: (value) => value,
+    visibleAddressForUrl: (value) => value,
+    browserEngineLabel: (value) => value,
+    browserExitLabel: (value) => value,
+    setLoading: (value) => loading.push(value),
+    showStatus() {},
+    launchContractForOpen: async () => ({ displayMode: "webrtc_remote_display" }),
+    requireViewer: (mode) => requireBrowserViewer(mode, {}),
+    closeRuntimePage: () => assert.fail("Viewer rejection must preserve the old page"),
+    fetchJson: () => assert.fail("Viewer rejection must precede Engine dispatch"),
+    isAuthoritySessionError: () => false,
+    friendlyOpenError: (error) => error.message,
+  });
+  vm.runInContext(
+    `${extractFunction(browserSource, "proveRuntimeOwnershipAbsentBeforeDispatch")}\n${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
+    context,
+  );
+  await assert.rejects(
+    context.requestRuntimeOpen("https://example.com/"),
+    (error) => error.payload?.code === "viewer_unavailable",
+  );
+  assert.equal(context.currentPage, page);
+  assert.equal(context.currentPageGeneration, 7);
+  assert.equal(context.runtimeOwnershipTerminallyAbsent, false);
+  assert.equal(context.runtimeOpenInFlight, 0);
+  assert.deepEqual(loading, [true, false]);
 });
 
 test("ownership-changing open returns pending without closing or claiming terminal", async () => {

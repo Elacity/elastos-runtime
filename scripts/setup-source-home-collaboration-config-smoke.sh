@@ -86,9 +86,8 @@ set -euo pipefail
 functions_file="$1"
 repo_root="$2"
 set --
-source "$functions_file"
-ROOT="$repo_root"
-browser_vm_backup_retention
+eval "$(sed -n '/^backup_retention() {/,/^}/p' "$repo_root/scripts/browser-vm-target-refresh.sh")"
+backup_retention
 EOF
 chmod 755 "$retention_runner"
 
@@ -153,15 +152,15 @@ chmod 600 "$valid_a" "$valid_b" "$invalid"
 chmod 644 "$wrong_mode"
 
 if [[ "$(run_retention)" != "1" ]]; then
-  echo "setup-source-home did not keep exactly one Browser VM backup by default" >&2
+  echo "Browser host refresh did not keep exactly one helper backup by default" >&2
   exit 1
 fi
 if [[ "$(env PATH="$fake_bin_dir:$PATH" ELASTOS_BROWSER_VM_BACKUP_RETENTION=1 "$retention_runner" "$functions_file" "$repo_root")" != "1" ]]; then
-  echo "setup-source-home did not accept explicit one-backup retention" >&2
+  echo "Browser host refresh did not accept explicit one-backup retention" >&2
   exit 1
 fi
 if env PATH="$fake_bin_dir:$PATH" ELASTOS_BROWSER_VM_BACKUP_RETENTION=2 "$retention_runner" "$functions_file" "$repo_root" >/dev/null 2>"$tmp_dir/retention.err"; then
-  echo "setup-source-home accepted Browser VM backup retention above one" >&2
+  echo "Browser host refresh accepted backup retention above one" >&2
   exit 1
 fi
 grep -q "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be 1" "$tmp_dir/retention.err"
@@ -325,19 +324,16 @@ import sys
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 gate = 'require_minimum_free_space "${DATA_DIR}"'
 source_gate = 'require_minimum_free_space "${ROOT}"'
-retention_gate = 'browser_vm_backup_retention >/dev/null'
 config_only = 'if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then'
 config_toml = 'CONFIG_TOML="${DATA_DIR}/config.toml"'
 if gate not in source:
     raise SystemExit("setup-source-home is missing the free-space gate")
-if not (source.index(config_only) < source.index(retention_gate) < source.index(source_gate) < source.index(gate) < source.index(config_toml)):
+if not (source.index(config_only) < source.index(source_gate) < source.index(gate) < source.index(config_toml)):
     raise SystemExit("setup-source-home free-space gate is not positioned between config-only and build setup")
 
 refresh = pathlib.Path(sys.argv[1]).with_name("browser-vm-target-refresh.sh").read_text(encoding="utf-8")
-setup_retention = source.split("browser_vm_backup_retention() {", 1)[1].split("\n}", 1)[0]
-refresh_retention = refresh.split("backup_retention() {", 1)[1].split("\n}", 1)[0]
-if setup_retention != refresh_retention:
-    raise SystemExit("source setup and Browser refresh disagree on backup retention")
+if "browser_vm_backup_retention" in source or "refresh_browser_vm_rootfs_files" in source:
+    raise SystemExit("source setup must consume image sets without guest mutation or rollback copies")
 if refresh.index("backup_retention >/dev/null") > refresh.index('install_with_backup "$selkies_source"'):
     raise SystemExit("Browser refresh validates retention after starting installation")
 PY

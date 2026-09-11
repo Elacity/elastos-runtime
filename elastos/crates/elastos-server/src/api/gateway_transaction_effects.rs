@@ -3418,6 +3418,7 @@ mod approved_request_resume_tests {
             provider_registry,
             collaboration_chat_product_port: None,
             collaboration_presence_product_port: None,
+            carrier_endpoint: None,
             collaboration_discovery_service: None,
             identity_manager: Arc::new(OnceLock::new()),
             cache_dir: root.join("cache"),

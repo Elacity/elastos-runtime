@@ -67,6 +67,26 @@ use crate::operator_control::{
 use crate::sources::TrustedSource;
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
+#[path = "carrier_file.rs"]
+mod file_transfer;
+pub(crate) use file_transfer::fetch_file_from_trusted_source_to;
+#[path = "carrier_exit.rs"]
+mod browser_exit;
+pub(crate) use browser_exit::{
+    sign_service_message, verify_service_message, BrowserExitGrant, EXIT_GRANT_MAX_STREAMS,
+    EXIT_GRANT_TTL_SECS,
+};
+#[path = "carrier_engine.rs"]
+mod browser_engine;
+#[path = "carrier_engine_binding.rs"]
+pub(crate) mod browser_engine_binding;
+#[path = "carrier_engine_media.rs"]
+pub(crate) mod browser_engine_media;
+pub(crate) use browser_engine::{
+    call as call_browser_engine, grant_id as engine_grant_id, probe as probe_browser_engine,
+    BrowserEngineGrant, ENGINE_GRANT_TTL_SECS, ENGINE_LOCAL_OFFER, ENGINE_SERVICE_KIND,
+    ENGINE_SERVICE_URI,
+};
 const BROWSER_CARRIER_STREAM_SCHEMA: &str = "elastos.browser.carrier-stream/v1";
 const BROWSER_CARRIER_STREAM_ACK_MAX_BYTES: usize = 16 * 1024;
 const CHAT_DISCOVERY_TOPIC_GENERAL: &str = "__elastos_internal/chat-presence-v1/#general";
@@ -343,6 +363,19 @@ impl CarrierRuntimeService {
         }
     }
 
+    pub fn endpoint(&self) -> Option<Endpoint> {
+        self.node.as_ref().map(|node| node.endpoint.clone())
+    }
+
+    pub(crate) async fn configure_browser_exit_network(
+        &self,
+        network: crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    ) {
+        if let Some(node) = self.node.as_ref() {
+            node.gossip_state.lock().await.browser_exit_network = Some(network);
+        }
+    }
+
     pub async fn shutdown(&mut self) -> Result<()> {
         if let Some(node) = self.node.take() {
             node.shutdown().await;
@@ -379,6 +412,9 @@ pub struct GossipState {
     peers: Arc<Mutex<Vec<String>>>,
     topic_peers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     did: Option<String>,
+    browser_exit_network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
+    browser_exit_reservations: browser_exit::BrowserExitReservations,
+    browser_engine_probe_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl GossipState {
@@ -390,6 +426,9 @@ impl GossipState {
         did: Option<String>,
     ) -> Self {
         Self {
+            browser_exit_network: None,
+            browser_exit_reservations: browser_exit::BrowserExitReservations::default(),
+            browser_engine_probe_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             endpoint,
             gossip,
             memory_lookup,
@@ -929,7 +968,7 @@ pub async fn start_carrier_node_with_registry_bound(
 }
 
 #[cfg(test)]
-async fn start_isolated_carrier_node_with_registry(
+pub(crate) async fn start_isolated_carrier_node_with_registry(
     signing_key: &ed25519_dalek::SigningKey,
     did: &str,
     data_dir: PathBuf,
@@ -1303,12 +1342,7 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             }
-            let content = tokio::fs::read(&file_path).await?;
-            let len = content.len() as u64;
-            send.write_all(&len.to_be_bytes()).await?;
-            send.write_all(&content).await?;
-            send.finish()?;
-            send.stopped().await.ok();
+            let len = file_transfer::send_file(send, &file_path).await?;
             info!("carrier: served file {} ({} bytes)", path, len);
         }
         "content_fetch" => {
@@ -1373,9 +1407,54 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             };
-            let response =
-                carrier_provider_invoke_registry(&registry, &msg.data, &source_endpoint_id).await?;
+            let response = if msg.data["target"] == "browser-engine" {
+                let (network, slots, endpoint) = {
+                    let state = gossip_state.lock().await;
+                    (
+                        state.browser_exit_network.clone(),
+                        state.browser_engine_probe_slots.clone(),
+                        state.endpoint.clone(),
+                    )
+                };
+                browser_engine::invoke(
+                    registry.clone(),
+                    data_dir,
+                    network,
+                    slots,
+                    endpoint,
+                    source_endpoint_id,
+                    &msg.data,
+                )
+                .await
+            } else {
+                carrier_provider_invoke_registry(&registry, &msg.data, &source_endpoint_id).await?
+            };
             send_json(send, &response).await?;
+        }
+        "browser_engine_media" => {
+            let buffered = reader.buffer().to_vec();
+            return browser_engine_media::serve(
+                data_dir,
+                source_endpoint_id,
+                &msg.data,
+                send,
+                reader.into_inner(),
+                buffered,
+            )
+            .await;
+        }
+        #[cfg(unix)]
+        "browser_engine_egress" => {
+            let buffered = reader.buffer().to_vec();
+            return browser_engine_binding::serve_egress(
+                data_dir,
+                source_endpoint_id,
+                &msg.data,
+                send,
+                reader.into_inner(),
+                buffered,
+            )
+            .await;
         }
         "browser_exit_stream" => {
             let Some(registry) = provider_registry.and_then(|registry| registry.upgrade()) else {
@@ -1392,8 +1471,25 @@ async fn handle_file_stream(
             };
             let buffered = reader.buffer().to_vec();
             let recv = reader.into_inner();
-            return handle_browser_carrier_exit_stream(send, recv, buffered, registry, &msg.data)
-                .await;
+            let (network, reservations) = {
+                let state = gossip_state.lock().await;
+                (
+                    state.browser_exit_network.clone(),
+                    state.browser_exit_reservations.clone(),
+                )
+            };
+            return handle_browser_carrier_exit_stream(
+                send,
+                recv,
+                buffered,
+                registry,
+                &msg.data,
+                data_dir,
+                network,
+                source_endpoint_id,
+                reservations,
+            )
+            .await;
         }
         "gossip_push" => {
             let response = carrier_gossip_push(gossip_state, &msg.data).await;
@@ -1578,43 +1674,75 @@ async fn handle_browser_carrier_exit_stream(
     buffered: Vec<u8>,
     registry: Arc<ProviderRegistry>,
     data: &serde_json::Value,
+    data_dir: &std::path::Path,
+    network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
+    source: iroh::PublicKey,
+    reservations: browser_exit::BrowserExitReservations,
 ) -> Result<()> {
-    match browser_carrier_exit_relay_path(&registry, data).await {
-        Ok(relay_path) => {
-            let stream_id = data
-                .get("stream_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let target = data
-                .get("target")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            write_json_line(send, &serde_json::json!({"ok": true})).await?;
-            bridge_browser_carrier_stream_to_relay(
-                send, recv, buffered, relay_path, stream_id, target,
-            )
-            .await
+    let admitted = async {
+        let authority = browser_exit::BrowserExitAuthority {
+            data_dir: data_dir.to_path_buf(),
+            network: network.context("Exit contact authority unavailable")?,
+            source,
+            request: data.clone(),
+        };
+        let grant = authority.read().await?;
+        let reservation = reservations.reserve(
+            &grant,
+            data["stream_id"]
+                .as_str()
+                .context("Exit stream id required")?,
+        )?;
+        let relay = browser_carrier_exit_relay_path(&registry, data, &grant, &source).await?;
+        anyhow::ensure!(
+            authority.read().await? == grant,
+            "Exit authority changed during admission"
+        );
+        Ok::<_, anyhow::Error>((authority, grant, reservation, relay))
+    };
+    let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), admitted).await;
+    let (authority, grant, _reservation, (relay_path, relay_stream_id)) = match admitted {
+        Ok(Ok(admitted)) => admitted,
+        failed => {
+            match failed {
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "Browser Carrier Exit admission failed")
+                }
+                Err(_) => tracing::warn!("Browser Carrier Exit admission deadline"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+            return send_json(send, &serde_json::json!({"ok":false,
+                "code":"browser_exit_permission_denied", "error":"Runtime Exit grant is unavailable or does not authorize this stream"})).await;
         }
-        Err(err) => {
-            send_json(
-                send,
-                &serde_json::json!({
-                    "ok": false,
-                    "code": "browser_exit_stream_unavailable",
-                    "error": err.to_string(),
-                }),
-            )
-            .await
-        }
-    }
+    };
+    write_json_line(send, &serde_json::json!({"ok": true})).await?;
+    let result = tokio::select! {
+        result = bridge_browser_carrier_stream_to_relay(send, recv, buffered, relay_path,
+            data["stream_id"].as_str().unwrap().to_string(), relay_stream_id.clone(),
+            data["target"].as_str().unwrap().to_string()) => result,
+        result = authority.until_revoked(&grant) => result,
+    };
+    // The local relay owns its network connection; dropping the bridge closes it.
+    // Provider accounting receives an exact close even when authority has changed.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        registry.send_raw(
+            "exit",
+            &serde_json::json!({"op":"close_stream", "stream_id": relay_stream_id,
+            "principal_id":grant.provider_principal_id}),
+        ),
+    )
+    .await;
+    result
 }
 
 async fn browser_carrier_exit_relay_path(
     registry: &ProviderRegistry,
     data: &serde_json::Value,
-) -> Result<PathBuf> {
+    grant: &BrowserExitGrant,
+    source: &iroh::PublicKey,
+) -> Result<(PathBuf, String)> {
+    grant.validate(source, data, crate::auth::now_ts())?;
     let schema = data
         .get("schema")
         .and_then(|value| value.as_str())
@@ -1647,26 +1775,14 @@ async fn browser_carrier_exit_relay_path(
     {
         anyhow::bail!("browser_exit_stream stream_id must be a safe identifier");
     }
-    let principal_id = data
-        .get("principal_id")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let reason = data.get("reason").cloned().unwrap_or_else(|| {
-        serde_json::json!(format!(
-            "remote Browser Carrier exit stream {}",
-            data.get("grant_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown-grant")
-        ))
-    });
     let response = registry
         .send_raw(
             "exit",
             &serde_json::json!({
                 "op": "open_stream",
                 "target": target,
-                "principal_id": principal_id,
-                "reason": reason,
+                "principal_id": grant.provider_principal_id,
+                "reason": "Runtime-approved contact Browser Exit stream",
                 "stream_nonce": stream_id,
             }),
         )
@@ -1707,45 +1823,85 @@ async fn browser_carrier_exit_relay_path(
     {
         anyhow::bail!("remote exit provider relay_ipc path must not contain whitespace or NUL");
     }
-    Ok(PathBuf::from(path))
+    let stream_id = receipt
+        .get("stream_id")
+        .and_then(|value| value.as_str())
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
+        })
+        .context("remote exit provider stream id is invalid")?;
+    anyhow::ensure!(
+        relay_ipc.get("stream_id").and_then(|value| value.as_str()) == Some(stream_id),
+        "remote exit provider relay stream mismatch"
+    );
+    Ok((PathBuf::from(path), stream_id.to_string()))
+}
+
+fn browser_carrier_relay_header(
+    line: &[u8],
+    stream_id: &str,
+    relay_id: &str,
+    target: &str,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(line.len() <= 4096, "Exit relay header is too large");
+    let header: serde_json::Value = serde_json::from_slice(line)?;
+    anyhow::ensure!(
+        header["schema"] == "elastos.exit.relay-open/v1"
+            && header["stream_id"].as_str() == Some(stream_id)
+            && header["target"].as_str() == Some(target),
+        "Exit relay header differs from approved stream"
+    );
+    let parsed = url::Url::parse(target)?;
+    let mut trusted = serde_json::to_vec(
+        &serde_json::json!({"schema":"elastos.exit.relay-open/v1",
+        "stream_id":relay_id, "target":target, "scheme":parsed.scheme(), "host":parsed.host_str(), "public_only":true}),
+    )?;
+    trusted.push(b'\n');
+    Ok(trusted)
 }
 
 #[cfg(unix)]
 async fn bridge_browser_carrier_stream_to_relay(
     send: &mut iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+    recv: iroh::endpoint::RecvStream,
     buffered: Vec<u8>,
     relay_path: PathBuf,
     stream_id: String,
+    relay_id: String,
     target: String,
 ) -> Result<()> {
-    let mut relay_stream = UnixStream::connect(&relay_path)
-        .await
-        .with_context(|| format!("connect remote exit relay {}", relay_path.display()))?;
-    if !buffered.is_empty() {
-        relay_stream.write_all(&buffered).await?;
-    }
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+    let source = std::io::Cursor::new(buffered).chain(recv);
+    let mut reader = tokio::io::BufReader::new(source);
+    let mut line = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        (&mut reader).take(4097).read_until(b'\n', &mut line),
+    )
+    .await??;
+    let trusted = browser_carrier_relay_header(&line, &stream_id, &relay_id, &target)?;
+    let mut relay_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        UnixStream::connect(&relay_path),
+    )
+    .await??;
+    relay_stream.write_all(&trusted).await?;
     let (mut relay_read, mut relay_write) = relay_stream.split();
     let to_relay = async {
-        let copied = io::copy(&mut recv, &mut relay_write).await?;
-        relay_write.shutdown().await.ok();
-        Ok::<u64, anyhow::Error>(copied)
+        io::copy(&mut reader, &mut relay_write).await?;
+        relay_write.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
     };
     let from_relay = async {
-        let copied = io::copy(&mut relay_read, send).await?;
+        io::copy(&mut relay_read, send).await?;
         send.finish()?;
-        send.stopped().await.ok();
-        Ok::<u64, anyhow::Error>(copied)
+        Ok::<_, anyhow::Error>(())
     };
-    let (to_relay, to_engine) = tokio::try_join!(to_relay, from_relay)?;
-    tracing::info!(
-        relay = %relay_path.display(),
-        stream_id = %stream_id,
-        target = %target,
-        to_relay,
-        to_engine,
-        "Browser Carrier exit stream closed"
-    );
+    tokio::try_join!(to_relay, from_relay)?;
     Ok(())
 }
 
@@ -1756,6 +1912,7 @@ async fn bridge_browser_carrier_stream_to_relay(
     _buffered: Vec<u8>,
     _relay_path: PathBuf,
     _stream_id: String,
+    _relay_id: String,
     _target: String,
 ) -> Result<()> {
     anyhow::bail!("Browser Carrier exit stream requires a Unix relay host")
@@ -6653,39 +6810,58 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
 }
 
 pub async fn open_browser_carrier_stream(
+    _request: &BrowserCarrierStreamRequest,
+) -> Result<BrowserCarrierStream> {
+    anyhow::bail!("Browser Carrier Exit requires the owning Runtime endpoint")
+}
+
+pub async fn open_browser_carrier_stream_on_endpoint(
+    endpoint: &Endpoint,
     request: &BrowserCarrierStreamRequest,
 ) -> Result<BrowserCarrierStream> {
     let timeout_ms = request.timeout_ms.unwrap_or(5_000).clamp(1, 60_000);
-    let timeout_secs = timeout_ms.div_ceil(1_000);
-    let mut endpoints = decode_ticket_endpoints(&request.connect_ticket);
-    if let Some(peer_did) = request.peer_did.as_deref() {
-        endpoints.retain(|endpoint| carrier_endpoint_matches_peer(endpoint, peer_did));
-        if endpoints.is_empty() {
-            anyhow::bail!("Browser Carrier stream peer_did does not match connect_ticket");
+    let peer = request
+        .peer_did
+        .as_deref()
+        .context("Browser Exit provider identity required")?;
+    let peer_key = did_to_public_key(peer)
+        .or_else(|| {
+            peer.parse::<iroh::PublicKey>()
+                .ok()
+                .filter(|key| key.to_string() == peer)
+        })
+        .context("Browser Exit provider identity is invalid")?;
+    let endpoints = decode_ticket_endpoints(&request.connect_ticket)
+        .into_iter()
+        .filter(|address| address.id == peer_key)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !endpoints.is_empty(),
+        "Browser Exit ticket does not match provider identity"
+    );
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+        for address in endpoints {
+            let Ok(client) =
+                CarrierClient::connect_known_endpoint(endpoint, address, timeout_ms.div_ceil(1000))
+                    .await
+            else {
+                continue;
+            };
+            // Once a stream request is sent, its outcome may be uncertain. Do not replay on another route.
+            let (send, recv) = client
+                .open_browser_exit_stream(request)
+                .await
+                .map_err(|_| anyhow::anyhow!("Runtime Exit did not admit the stream"))?;
+            return Ok(BrowserCarrierStream {
+                send,
+                recv,
+                _client: client,
+            });
         }
-    }
-    if endpoints.is_empty() {
-        anyhow::bail!("Browser Carrier stream connect_ticket has no endpoints");
-    }
-
-    let mut errors = Vec::new();
-    for (index, endpoint) in endpoints.into_iter().enumerate() {
-        match CarrierClient::connect_endpoint_addr(endpoint, timeout_secs).await {
-            Ok(client) => match client.open_browser_exit_stream(request).await {
-                Ok((send, recv)) => {
-                    return Ok(BrowserCarrierStream {
-                        send,
-                        recv,
-                        _client: client,
-                    })
-                }
-                Err(err) => errors.push(format!("ticket[{index}] stream open failed: {err}")),
-            },
-            Err(err) => errors.push(format!("ticket[{index}] connect failed: {err:#}")),
-        }
-    }
-
-    anyhow::bail!("Browser Carrier stream open failed: {}", errors.join(" | "));
+        anyhow::bail!("Runtime Exit provider is unavailable")
+    })
+    .await
+    .context("Browser Carrier stream deadline")?
 }
 
 fn carrier_route_timeout_secs(route: &ProviderCarrierRoute) -> u64 {
@@ -9573,6 +9749,90 @@ mod tests {
         shutdown_test_carrier_node(fixture.local_node).await;
     }
 
+    #[test]
+    fn test_browser_carrier_relay_header_binds_target_and_maps_provider_stream() {
+        let header = serde_json::json!({"schema":"elastos.exit.relay-open/v1",
+            "stream_id":"consumer:1", "target":"tls://example.com:443",
+            "principal_id":"forged", "reason":"private payload"});
+        let trusted = browser_carrier_relay_header(
+            &serde_json::to_vec(&header).unwrap(),
+            "consumer:1",
+            "provider:1",
+            "tls://example.com:443",
+        )
+        .unwrap();
+        let trusted: serde_json::Value = serde_json::from_slice(&trusted).unwrap();
+        assert_eq!(trusted["stream_id"], "provider:1");
+        assert!(trusted.get("principal_id").is_none());
+        for (field, value) in [
+            ("stream_id", "consumer:2"),
+            ("target", "tls://other.example:443"),
+        ] {
+            let mut changed = header.clone();
+            changed[field] = serde_json::json!(value);
+            assert!(browser_carrier_relay_header(
+                &serde_json::to_vec(&changed).unwrap(),
+                "consumer:1",
+                "provider:1",
+                "tls://example.com:443"
+            )
+            .is_err());
+        }
+        assert!(browser_carrier_relay_header(
+            &vec![b' '; 4097],
+            "consumer:1",
+            "provider:1",
+            "tls://example.com:443"
+        )
+        .is_err());
+    }
+
+    fn browser_exit_test_grant() -> BrowserExitGrant {
+        BrowserExitGrant {
+            provider_principal_id: "person:provider".into(),
+            requester_principal_id: "person:local:alice".into(),
+            requester_endpoint: authenticated_test_source_endpoint(),
+            grant_id: "operator-grant:server-exit:alice".into(),
+            revision: crate::auth::now_ts(),
+            expires_at: crate::auth::now_ts() + 60,
+            max_active_streams: 4,
+            max_active_streams_per_principal: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_browser_carrier_exit_rejects_unissued_grant_before_provider_effect() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider(
+                "exit",
+                Arc::new(MockCarrierExitProvider {
+                    relay_path: Some("/tmp/unissued-exit-must-not-open.sock".to_string()),
+                }),
+            )
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "schema": BROWSER_CARRIER_STREAM_SCHEMA,
+            "carrier_service": "elastos://exit/open_stream",
+            "grant_id": "unissued-caller-grant",
+            "stream_id": "remote-carrier:unissued:test",
+            "target": "tls://example.com:443",
+            "principal_id": "person:local:forged-provider-owner"
+        });
+        assert!(
+            browser_carrier_exit_relay_path(
+                &registry,
+                &request,
+                &browser_exit_test_grant(),
+                &authenticated_test_source_endpoint()
+            )
+            .await
+            .is_err(),
+            "an unissued grant and caller principal must not reserve a provider relay"
+        );
+    }
+
     #[tokio::test]
     async fn test_browser_carrier_exit_stream_requires_remote_exit_relay_ipc() {
         let request = serde_json::json!({
@@ -9595,10 +9855,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let relay_path = browser_carrier_exit_relay_path(&registry, &request)
-            .await
-            .unwrap();
-        assert_eq!(relay_path, PathBuf::from("/tmp/elastos-remote-exit.sock"));
+        let relay_path = browser_carrier_exit_relay_path(
+            &registry,
+            &request,
+            &browser_exit_test_grant(),
+            &authenticated_test_source_endpoint(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(relay_path.0, PathBuf::from("/tmp/elastos-remote-exit.sock"));
 
         let registry = ProviderRegistry::new();
         registry
@@ -9608,10 +9873,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = browser_carrier_exit_relay_path(&registry, &request)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = browser_carrier_exit_relay_path(
+            &registry,
+            &request,
+            &browser_exit_test_grant(),
+            &authenticated_test_source_endpoint(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("relay_ipc"),
             "unexpected error for missing relay_ipc: {err}"
@@ -9619,19 +9889,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_carrier_browser_exit_stream_relays_bytes_between_runtimes() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
+    async fn test_remote_carrier_browser_exit_rejects_unissued_request_on_authenticated_connection()
+    {
         let remote_dir = tempfile::tempdir().unwrap();
         let relay_path = remote_dir.path().join("remote-exit.sock");
         let relay_listener = tokio::net::UnixListener::bind(&relay_path).unwrap();
-        let relay_task = tokio::spawn(async move {
-            let (mut relay, _addr) = relay_listener.accept().await.unwrap();
-            let mut request = [0_u8; 4];
-            relay.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"ping");
-            relay.write_all(b"pong").await.unwrap();
-        });
 
         let registry = Arc::new(ProviderRegistry::new());
         registry
@@ -9644,7 +9906,7 @@ mod tests {
             .await
             .unwrap();
         let (remote_sk, remote_did) = elastos_identity::derive_did(&[55u8; 32]);
-        let remote_node = start_carrier_node_with_registry(
+        let remote_node = start_isolated_carrier_node_with_registry(
             &remote_sk,
             &remote_did,
             remote_dir.path().to_path_buf(),
@@ -9665,14 +9927,28 @@ mod tests {
             timeout_ms: Some(5_000),
         };
 
-        let mut stream = open_browser_carrier_stream(&request).await.unwrap();
-        stream.send.write_all(b"ping").await.unwrap();
-        stream.send.finish().unwrap();
-        let mut response = [0_u8; 4];
-        stream.recv.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"pong");
-
-        relay_task.await.unwrap();
+        let (local_sk, local_did) = elastos_identity::derive_did(&[54u8; 32]);
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_node = start_isolated_carrier_node_with_registry(
+            &local_sk,
+            &local_did,
+            local_dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            open_browser_carrier_stream_on_endpoint(&local_node.endpoint, &request)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), relay_listener.accept())
+                .await
+                .is_err(),
+            "unissued request cannot connect the provider relay"
+        );
+        shutdown_test_carrier_node(local_node).await;
         shutdown_test_carrier_node(remote_node).await;
     }
 

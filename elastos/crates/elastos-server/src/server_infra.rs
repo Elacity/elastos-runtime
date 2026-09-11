@@ -1482,10 +1482,18 @@ async fn setup_server_infrastructure_impl(
             provider_registry.clone(),
         )
         .await?;
-    let collaboration_context = collaboration_service
+    if let (Some(collaboration), Some(carrier)) =
+        (collaboration_service.as_ref(), carrier_service.as_ref())
+    {
+        collaboration.configure_browser_exit_carrier(carrier).await;
+    }
+    let mut collaboration_context = collaboration_service
         .as_ref()
         .map(|service| service.gateway_context())
         .unwrap_or_default();
+    collaboration_context.carrier_endpoint = carrier_service
+        .as_ref()
+        .and_then(|service| service.endpoint());
 
     maybe_spawn_content_repair_scheduler(provider_registry.clone());
 
@@ -2292,7 +2300,8 @@ mod tests {
     async fn browser_engine_startup_reaps_old_or_mixed_version_before_launch() {
         for status in [
             provider_status(BROWSER_ENGINE_PROVIDER_ID, "1.0"),
-            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.1"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.0"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.2"),
             provider_status("other-provider", BROWSER_ENGINE_PROTOCOL_VERSION),
         ] {
             let registry = provider::ProviderRegistry::new();

@@ -244,6 +244,7 @@ pub async fn start_collaboration_runtime_service(
         shutdown_rx,
     ));
     let discovery_task = tokio::spawn(run_collaboration_discovery_sync_worker(
+        data_root.to_path_buf(),
         discovery_service.clone(),
         discovery_shutdown_rx,
     ));
@@ -269,6 +270,17 @@ pub async fn start_collaboration_runtime_service(
 }
 
 impl CollaborationRuntimeService {
+    pub async fn configure_browser_exit_carrier(
+        &self,
+        carrier: &crate::carrier::CarrierRuntimeService,
+    ) {
+        if let Some(discovery) = self.discovery_service.as_ref() {
+            carrier
+                .configure_browser_exit_network(discovery.network_profile())
+                .await;
+        }
+    }
+
     /// Return the opaque Chat product port retained by this configured service.
     pub fn chat_product_port(&self) -> CollaborationChatProductPort {
         self.product_port
@@ -291,6 +303,7 @@ impl CollaborationRuntimeService {
 
     pub fn gateway_context(&self) -> crate::api::gateway::GatewayCollaborationContext {
         crate::api::gateway::GatewayCollaborationContext {
+            carrier_endpoint: None,
             chat_product_port: Some(self.chat_product_port()),
             presence_product_port: Some(self.presence_product_port()),
             discovery_service: Some(self.discovery_service()),
@@ -416,10 +429,12 @@ async fn run_collaboration_worker(
 /// Discovery sync has the same Runtime lifecycle and shutdown signal as the
 /// collaboration worker, while remaining isolated from Chat/presence Carrier
 /// progress when a relay is slow or unavailable.
-async fn run_collaboration_discovery_sync_worker(
+pub(crate) async fn run_collaboration_discovery_sync_worker(
+    data_root: PathBuf,
     discovery_service: CollaborationDiscoveryService,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut mailbox_round = 0usize;
     loop {
         if *shutdown.borrow() {
             return;
@@ -431,7 +446,14 @@ async fn run_collaboration_discovery_sync_worker(
                     return;
                 }
             }
-            _ = discovery_service.sync_registered_contexts_once(now_secs()) => {}
+            _ = async {
+                tokio::join!(
+                    discovery_service.sync_registered_contexts_once(now_secs()),
+                    discovery_service.sync_services_mailboxes_once(&data_root, mailbox_round),
+                );
+            } => {
+                mailbox_round = mailbox_round.wrapping_add(1);
+            }
         }
         tokio::select! {
             biased;
@@ -1154,6 +1176,7 @@ mod tests {
             collaboration_chat_product_port: gateway_context.chat_product_port.clone(),
             collaboration_presence_product_port: gateway_context.presence_product_port.clone(),
             collaboration_discovery_service: gateway_context.discovery_service.clone(),
+            carrier_endpoint: gateway_context.carrier_endpoint.clone(),
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: temp.path().join("gateway-cache"),
             data_dir: temp.path().to_path_buf(),
@@ -1257,6 +1280,7 @@ mod tests {
             provider_registry: None,
             collaboration_chat_product_port: Some(chat_port.clone()),
             collaboration_presence_product_port: Some(presence_port.clone()),
+            carrier_endpoint: None,
             collaboration_discovery_service: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: temp.path().join("gateway-cache"),

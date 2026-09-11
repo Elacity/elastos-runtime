@@ -59,6 +59,7 @@ async fn model_test_state(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
+        carrier_endpoint: None,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),

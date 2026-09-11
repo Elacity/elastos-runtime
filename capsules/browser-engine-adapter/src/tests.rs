@@ -17,6 +17,65 @@ fn error_code(response: Response) -> String {
         .to_string()
 }
 
+#[test]
+fn inspection_adapter_requires_principal_and_valid_version_before_control_dispatch() {
+    let provider = display_attach_adapter("/tmp/inspection-must-not-connect.sock".into(), None);
+    for principal in [None, Some("person:foreign".into())] {
+        assert_eq!(
+            error_code(provider.inspect("page:attach", principal, None)),
+            "page_not_found"
+        );
+    }
+    let request = BrowserInspectionRequest {
+        schema: "future".into(),
+        limit: 64,
+        cursor: None,
+    };
+    assert_eq!(
+        error_code(provider.inspect("page:attach", Some("person:owner".into()), Some(request))),
+        "inspection_unsupported"
+    );
+}
+
+#[test]
+fn inspection_adapter_validates_exact_control_response_and_preserves_private_errors() {
+    let capability = json!({"schema":"elastos.browser.inspect-capabilities/v1", "page_id":"page:attach",
+        "formats":["accessibility_tree"],"max_nodes":512,"max_page_nodes":64,"max_snapshot_bytes":131072,
+        "max_response_bytes":32768,"snapshot_ttl_ms":30000,"timeout_ms":1500});
+    let socket = spawn_status_socket(capability.clone());
+    let provider = display_attach_adapter(socket.clone(), None);
+    let result =
+        serde_json::to_value(provider.inspect("page:attach", Some("person:owner".into()), None))
+            .unwrap();
+    assert_eq!(result["data"], capability);
+    let _ = std::fs::remove_file(socket);
+    let mut foreign = capability;
+    foreign["page_id"] = json!("page:foreign");
+    let socket = spawn_status_socket(foreign);
+    let provider = display_attach_adapter(socket.clone(), None);
+    assert_eq!(
+        error_code(provider.inspect("page:attach", Some("person:owner".into()), None)),
+        "inspection_unsupported"
+    );
+    let _ = std::fs::remove_file(socket);
+    for code in [
+        "invalid_inspection",
+        "stale_inspection",
+        "inspection_owner_changed",
+        "inspection_failed",
+        "inspection_busy",
+        "inspection_unsupported",
+    ] {
+        let body = json!({"code":code,"error":"private socket /secret"}).to_string();
+        let wire = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        assert_eq!(parse_http_json_response(wire.as_bytes()), Err(code.into()));
+    }
+}
+
 fn cleanup_binding_for(provider: &BrowserEngineAdapter, page_id: &str) -> EngineCleanupBinding {
     engine_cleanup_binding(
         page_id,
@@ -446,6 +505,44 @@ fn status_is_unavailable_without_configured_adapter() {
     assert_eq!(response["data"]["status"], "unavailable");
     assert_eq!(response["data"]["direct_network"], false);
     assert_eq!(response["data"]["wallet_injection"], false);
+    elastos_common::browser_protocol::BrowserEngineInventory::from_status(&response["data"])
+        .expect("provider status must satisfy the Runtime's shared inventory contract");
+}
+
+#[test]
+fn configured_inventory_uses_the_same_contract_as_runtime_selection() {
+    let mut provider = BrowserEngineAdapter::new();
+    let result = serde_json::to_value(provider.init(json!({
+        "adapters": [{
+            "id": "proof-engine", "kind": "contract_proof",
+            "display_modes": ["webrtc_remote_display"]
+        }]
+    })))
+    .unwrap();
+    assert_eq!(result["status"], "ok");
+    let status = serde_json::to_value(provider.status(None)).unwrap();
+    let inventory =
+        elastos_common::browser_protocol::BrowserEngineInventory::from_status(&status["data"])
+            .unwrap();
+    assert_eq!(
+        inventory
+            .select(
+                None,
+                BrowserDisplayMode::WebrtcRemoteDisplay,
+                BrowserGuaranteeLevel::OperatorRbi
+            )
+            .unwrap()
+            .id,
+        "proof-engine"
+    );
+    assert!(inventory
+        .select(
+            None,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm
+        )
+        .is_err());
+    assert!(provider.page_control_sessions.is_empty());
 }
 
 #[test]
@@ -1613,28 +1710,46 @@ fn init_prewarms_configured_vm_control_service() {
 }
 
 #[test]
-fn init_fails_when_configured_vm_prewarm_fails() {
+fn init_preserves_inventory_when_one_vm_prewarm_fails() {
     let mut provider = BrowserEngineAdapter::new();
+    let healthy_socket = spawn_status_socket_with_path(|_| {
+        json!({
+            "schema":BROWSER_ENGINE_READINESS_SCHEMA, "readiness":{"state":"ready"}
+        })
+    });
 
-    assert_eq!(
-        error_code(provider.init(json!({
-            "adapters": [{
-                "id": "mac-vm-product",
-                "kind": "chromium_microvm",
-                "display_modes": ["webrtc_remote_display"],
-                "supervisor": {
-                    "program": "/bin/sh",
-                    "args": ["-c", "echo prewarm failed >&2; exit 42"],
-                    "timeout_ms": 2000,
-                    "control_socket_path": "/tmp/elastos-browser-vm-prewarm-fail.sock",
-                    "env": {
-                        "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
-                    }
+    let response = serde_json::to_value(provider.init(json!({
+        "adapters": [{
+            "id": "mac-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/sh",
+                "args": ["-c", "echo prewarm failed >&2; exit 42"],
+                "timeout_ms": 2000,
+                "control_socket_path": "/tmp/elastos-browser-vm-prewarm-fail.sock",
+                "env": {
+                    "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
                 }
-            }]
-        }))),
+            }
+        }, {
+            "id":"other-engine", "kind":"chromium_microvm", "display_modes":["webrtc_remote_display"],
+            "supervisor":{"program":"/bin/sh", "control_socket_path":healthy_socket}
+        }]
+    })))
+    .unwrap();
+    assert_eq!(response["status"], "ok");
+    assert_eq!(
+        response["data"]["prewarm_results"][0]["code"],
         "engine_process_unavailable"
     );
+    assert_eq!(provider.adapters.len(), 2);
+    let readiness = serde_json::to_value(provider.readiness("mac-vm-product", None)).unwrap();
+    assert_eq!(readiness["data"]["readiness"]["state"], "unavailable");
+    let readiness = serde_json::to_value(provider.readiness("other-engine", None)).unwrap();
+    assert_eq!(readiness["data"]["readiness"]["state"], "ready");
+    assert!(provider.page_control_sessions.is_empty());
+    let _ = std::fs::remove_file(healthy_socket);
 }
 
 #[test]
@@ -1699,6 +1814,7 @@ fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
     provider.page_control_sessions.insert(
         "page:stale-vm".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: control_socket_path.clone(),
@@ -1746,6 +1862,7 @@ fn status_reaps_isolated_vm_session_when_control_socket_is_gone() {
     provider.page_control_sessions.insert(
         "page:dead-vm".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: format!(
@@ -2240,6 +2357,7 @@ fn launch_reconciliation_with_stale_in_memory_service_identity_stays_pending() {
     provider.page_control_sessions.insert(
         "page:stale-in-memory-service".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: generation.to_string(),
             stream_id: stream_id.to_string(),
             socket_path: "/tmp/elastos-browser-stale-guest.sock".to_string(),
@@ -2539,6 +2657,7 @@ fn close_page_missing_adapter_map_with_live_child_remains_indeterminate() {
 #[test]
 fn exact_typed_already_absent_supervisor_proof_is_terminal() {
     let session = PageControlSession {
+        display_attachment: BrowserDisplayAttachment::default(),
         generation: "sha256:typed-absent".to_string(),
         stream_id: "stream:typed-absent".to_string(),
         socket_path: "/tmp/elastos-browser-typed-absent.sock".to_string(),
@@ -2583,6 +2702,7 @@ fn page_operations_reject_mismatched_principal() {
     provider.page_control_sessions.insert(
         "page:owned".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: "/tmp/elastos-browser-owned-unused.sock".to_string(),
@@ -2644,6 +2764,7 @@ fn close_page_retains_non_isolated_session_when_close_fails() {
     provider.page_control_sessions.insert(
         "page:retry-close".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: socket_path.to_string(),
@@ -2685,6 +2806,7 @@ fn close_page_retains_isolated_session_when_shutdown_and_cleanup_fail() {
     provider.page_control_sessions.insert(
         "page:retry-isolated-close".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: socket_path.to_string(),
@@ -2739,6 +2861,7 @@ fn page_status_includes_redacted_engine_identity() {
     provider.page_control_sessions.insert(
         "page:browser-vm-status".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: status_socket,
@@ -2842,6 +2965,7 @@ fn isolated_close_uses_target_shutdown_contract() {
     provider.page_control_sessions.insert(
         "page:isolated-close".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: socket_path.clone(),
@@ -2935,6 +3059,7 @@ fn vm_isolated_close_uses_global_shutdown_socket() {
     provider.page_control_sessions.insert(
         "page:browser-vm-close".to_string(),
         PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
             generation: "sha256:test-generation".to_string(),
             stream_id: "stream:proof:test".to_string(),
             socket_path: "/tmp/elastos-browser-vm-page-control-not-used.sock".to_string(),
@@ -3688,4 +3813,331 @@ fn webrtc_answer_validator_rejects_provider_errors() {
         err,
         "WebRTC answer must use elastos.browser.webrtc-answer/v1"
     );
+}
+
+#[test]
+fn readiness_uses_the_typed_host_contract_without_acquiring_a_page() {
+    for (host_readiness, expected) in [
+        (json!({"state":"ready"}), "ready"),
+        (
+            json!({"state":"unavailable","reason":"artifact_invalid"}),
+            "unavailable",
+        ),
+        (json!({"state":"future_state"}), "unavailable"),
+    ] {
+        let socket = spawn_status_socket_with_path(|_| {
+            json!({
+                "schema":BROWSER_ENGINE_READINESS_SCHEMA, "readiness":host_readiness
+            })
+        });
+        let mut provider = BrowserEngineAdapter::new();
+        let initialized = serde_json::to_value(provider.init(json!({"adapters":[{
+            "id":"test-host", "kind":"chromium_microvm", "display_modes":["webrtc_remote_display"],
+            "supervisor":{"program":"/bin/sh", "control_socket_path":socket}
+        }]})))
+        .unwrap();
+        assert_eq!(initialized["status"], "ok");
+        let result = serde_json::to_value(
+            provider.handle(
+                serde_json::from_value(json!({
+                    "op":"readiness", "adapter_id":"test-host", "principal_id":"person:readiness"
+                }))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(result["data"]["adapter_id"], "test-host");
+        assert_eq!(result["data"]["schema"], BROWSER_ENGINE_READINESS_SCHEMA);
+        assert_eq!(result["data"]["readiness"]["state"], expected);
+        assert!(provider.page_control_sessions.is_empty());
+        let _ = std::fs::remove_file(socket);
+    }
+}
+
+fn display_attach_adapter(socket_path: String, generation: Option<String>) -> BrowserEngineAdapter {
+    let mut provider = BrowserEngineAdapter::new();
+    provider.page_control_sessions.insert(
+        "page:attach".to_string(),
+        PageControlSession {
+            display_attachment: BrowserDisplayAttachment::initial(generation),
+            generation: "sha256:cleanup-stays".to_string(),
+            stream_id: "stream:stays".to_string(),
+            socket_path,
+            shutdown_socket_path: None,
+            adapter_id: "adapter:test".to_string(),
+            principal_id: Some("person:owner".to_string()),
+            engine: AdapterKind::SelkiesGstreamer,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+            isolated_session: false,
+            isolation_session_dir: None,
+            isolation_kind: None,
+            control_service: None,
+            process: None,
+            transport_authority: None,
+            transport_receipt: None,
+        },
+    );
+    provider
+}
+
+fn display_attach_signal() -> Value {
+    json!({"schema":BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA,"type":"display_attach","request_id":"a".repeat(32),"display_generation":format!("display:{}","a".repeat(32))})
+}
+
+#[test]
+fn bounded_control_exchange_accepts_complete_response() {
+    let expected = json!({"ok":true});
+    let path = spawn_status_socket(expected.clone());
+    assert_eq!(
+        supervisor_control_json_bounded(
+            &path,
+            "GET",
+            "/status",
+            None,
+            Duration::from_secs(1),
+            4096
+        ),
+        Ok(expected)
+    );
+}
+
+#[test]
+fn display_attach_adapter_legacy_and_foreign_fail_before_control_io() {
+    let mut provider = display_attach_adapter("/tmp/unused-display-attach.sock".to_string(), None);
+    assert_eq!(
+        error_code(provider.webrtc_signal(
+            "page:attach",
+            display_attach_signal(),
+            None,
+            Some("person:owner".to_string())
+        )),
+        "display_attach_unsupported"
+    );
+    assert_eq!(
+        error_code(provider.webrtc_signal(
+            "page:attach",
+            display_attach_signal(),
+            None,
+            Some("person:foreign".to_string())
+        )),
+        "page_not_found"
+    );
+    assert_eq!(
+        provider.page_control_sessions["page:attach"].generation,
+        "sha256:cleanup-stays"
+    );
+}
+
+#[test]
+fn display_attach_adapter_reconciles_lost_response_and_rejects_stale_signals() {
+    assert_display_attach_adapter_reconciles_response(false);
+}
+
+#[test]
+fn display_attach_adapter_absolute_deadline_retains_uncertain_request() {
+    assert_display_attach_adapter_reconciles_response(true);
+}
+
+fn assert_display_attach_adapter_reconciles_response(trickle: bool) {
+    let old = format!("display:{}", "a".repeat(32));
+    let new = format!("display:{}", "b".repeat(32));
+    let path = format!(
+        "/tmp/evda-{}-{}.sock",
+        std::process::id(),
+        TEST_SOCKET_SEQUENCE.fetch_add(1, Ordering::SeqCst)
+    );
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let reply = json!({"schema":elastos_common::browser_protocol::BROWSER_DISPLAY_ATTACH_RESULT_SCHEMA,
+        "page_id":"page:attach","request_id":"a".repeat(32),"previous_display_generation":old,"display_generation":new,
+        "initial_offer":{"schema":"elastos.browser.webrtc-offer/v1","type":"offer","sdp":"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n","candidates":[]},
+        "audio_offer":{"schema":"elastos.browser.webrtc-offer/v1","type":"offer","sdp":"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n","candidates":[]}});
+    let expected = reply.clone();
+    let join = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut requests = Vec::new();
+        while requests.len() < 3 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !http_request_is_complete(&request) {
+                let mut buffer = [0; 4096];
+                let size = stream.read(&mut buffer).unwrap();
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..size]);
+            }
+            let start = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let body: Value = serde_json::from_slice(&request[start..]).unwrap();
+            requests.push(body.clone());
+            if requests.len() == 1 {
+                if trickle {
+                    // Traffic stays well inside the inactivity timeout, but must
+                    // not extend the five-second attachment exchange deadline.
+                    let until = Instant::now() + Duration::from_millis(5600);
+                    while Instant::now() < until {
+                        if stream.write_all(b" ").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                }
+                continue;
+            } // Effect may exist, but its response was lost.
+            let response = if requests.len() == 2 { reply.clone() } else {
+                json!({"schema":"elastos.browser.webrtc-signal-ack/v1","page_id":"page:attach","type":"end_of_candidates","accepted":true,"display_generation":new})
+            }.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+        requests
+    });
+    let mut provider = display_attach_adapter(path.clone(), Some(old));
+    let signal = display_attach_signal();
+    let owner = Some("person:owner".to_string());
+    let started = Instant::now();
+    assert_eq!(
+        error_code(provider.webrtc_signal("page:attach", signal.clone(), None, owner.clone())),
+        "display_attach_uncertain"
+    );
+    if trickle {
+        assert!(
+            started.elapsed() < Duration::from_millis(5400),
+            "continued response bytes extended the attachment deadline"
+        );
+    }
+    let mut different = signal.clone();
+    different["request_id"] = json!("b".repeat(32));
+    assert_eq!(
+        error_code(provider.webrtc_signal("page:attach", different, None, owner.clone())),
+        "display_attach_busy"
+    );
+    let response = serde_json::to_value(provider.webrtc_signal(
+        "page:attach",
+        signal.clone(),
+        None,
+        owner.clone(),
+    ))
+    .unwrap();
+    assert_eq!(response["data"], expected);
+    assert_eq!(
+        serde_json::to_value(provider.webrtc_signal("page:attach", signal, None, owner.clone()))
+            .unwrap(),
+        response
+    );
+    let mut candidate =
+        json!({"schema":"elastos.browser.webrtc-end-of-candidates/v1","type":"end_of_candidates"});
+    assert_eq!(
+        error_code(provider.webrtc_signal("page:attach", candidate.clone(), None, owner.clone())),
+        "display_generation_mismatch"
+    );
+    candidate["display_generation"] = json!(format!("display:{}", "a".repeat(32)));
+    assert_eq!(
+        error_code(provider.webrtc_signal("page:attach", candidate.clone(), None, owner.clone())),
+        "display_generation_mismatch"
+    );
+    candidate["display_generation"] = expected["display_generation"].clone();
+    assert_eq!(
+        serde_json::to_value(provider.webrtc_signal("page:attach", candidate, None, owner))
+            .unwrap()["status"],
+        "ok"
+    );
+    let requests = join.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0], requests[1]);
+    assert!(requests[0].get("channel").is_none());
+    assert_eq!(
+        provider.page_control_sessions["page:attach"].generation,
+        "sha256:cleanup-stays"
+    );
+    assert_eq!(
+        provider.page_control_sessions["page:attach"].stream_id,
+        "stream:stays"
+    );
+}
+
+#[test]
+fn display_attach_control_error_preserves_only_fixed_code() {
+    for error in [
+        BrowserDisplayError::Busy,
+        BrowserDisplayError::GenerationMismatch,
+        BrowserDisplayError::OwnerChanged,
+        BrowserDisplayError::Unsupported,
+        BrowserDisplayError::Failed,
+        BrowserDisplayError::Uncertain,
+    ] {
+        let body =
+            json!({"code":error.code(),"error":"private credential=secret", "logs":"private logs"})
+                .to_string();
+        let response = format!(
+            "HTTP/1.1 {} Error\r\nContent-Length: {}\r\n\r\n{}",
+            error.http_status(),
+            body.len(),
+            body
+        );
+        assert_eq!(
+            parse_http_json_response(response.as_bytes()),
+            Err(error.code().to_string())
+        );
+    }
+}
+
+#[test]
+fn operator_input_requires_principal_and_typed_payload_before_socket_dispatch() {
+    let provider = display_attach_adapter("/tmp/operator-must-not-connect.sock".into(), None);
+    let event = json!({"type":"operator_lease","command":"acquire","admission_id":"a".repeat(32),
+        "document_generation":"b".repeat(32),"duration_ms":30000,"actions":["click","type"]});
+    for principal in [None, Some("person:foreign".into())] {
+        assert_eq!(
+            error_code(provider.input("page:attach", event.clone(), principal)),
+            "page_not_found"
+        );
+    }
+    for field in ["principal_id", "provider_route", "extra"] {
+        let mut invalid = event.clone();
+        invalid[field] = json!("caller value");
+        assert_eq!(
+            error_code(provider.input("page:attach", invalid, Some("person:owner".into()))),
+            "invalid_operator_input"
+        );
+    }
+}
+
+#[test]
+fn operator_input_uses_existing_owned_control_session_and_bounds_private_failure() {
+    let reply = json!({"schema":"elastos.browser.input-result/v1","page_id":"page:attach","admission_id":"a".repeat(32),"accepted":true,"writer_acquired":false});
+    let socket = spawn_status_socket(reply.clone());
+    let provider = display_attach_adapter(socket.clone(), None);
+    let event = json!({"type":"operator_lease","command":"release","admission_id":"a".repeat(32)});
+    let result = serde_json::to_value(provider.input(
+        "page:attach",
+        event.clone(),
+        Some("person:owner".into()),
+    ))
+    .unwrap();
+    assert_eq!(result["data"], reply);
+    let _ = std::fs::remove_file(socket);
+    let provider = display_attach_adapter("/tmp/operator-private-unavailable.sock".into(), None);
+    let result =
+        serde_json::to_value(provider.input("page:attach", event, Some("person:owner".into())))
+            .unwrap();
+    assert_eq!(result["code"], "operator_outcome_uncertain");
+    assert!(!result.to_string().contains("/tmp/"));
 }

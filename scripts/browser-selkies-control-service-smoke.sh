@@ -2,6 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+control_only=0
+if [[ "$#" == 1 && "$1" == "--control-only" ]]; then
+  control_only=1
+elif [[ "$#" != 0 ]]; then
+  echo "usage: browser-selkies-control-service-smoke.sh [--control-only]" >&2
+  exit 2
+fi
 tmp_dir="$(mktemp -d)"
 selkies_pid=""
 cdp_pid=""
@@ -491,7 +498,7 @@ server.on("upgrade", (req, socket) => {
         const projection = message.params || {};
         if (
           projection.offline !== false ||
-          projection.latency !== 0 ||
+          projection.latency !== 1 ||
           projection.downloadThroughput !== -1 ||
           projection.uploadThroughput !== -1 ||
           projection.connectionType !== "other"
@@ -1306,7 +1313,7 @@ if (response.active_pages !== 0) throw new Error("failed open leaked an active S
 const projection = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (
   projection.offline !== false ||
-  projection.latency !== 0 ||
+  projection.latency !== 1 ||
   projection.downloadThroughput !== -1 ||
   projection.uploadThroughput !== -1 ||
   projection.connectionType !== "other"
@@ -2344,10 +2351,106 @@ if (response.accepted !== true || response.direct_network !== false) throw new E
 if (inserted !== "Paste Text 123") throw new Error(`paste_text did not use CDP Input.insertText: ${inserted}`);
 ' "$paste_response" "$tmp_dir/fake-cdp-ready.json.inserted-text"
 
+# Passive log reads share the real control route with status and page close.
+# This checks page-channel closure; the adapter cleanup boundary stays below.
+"$node_bin" --input-type=module - "$control_socket" "$page_id" "$tmp_dir/control.log" <<'NODE'
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+const [socketPath, encodedPageId, logPath] = process.argv.slice(2);
+const pageId = decodeURIComponent(encodedPageId);
+const controller = new AbortController();
+const deadline = setTimeout(() => controller.abort(), 2500);
+function request(path, method = "GET") {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path, method, signal: controller.signal }, res => {
+      const chunks = [];
+      res.on("data", chunk => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        try {
+          assert.equal(res.statusCode, 200, `${method} ${path}`);
+          resolve(JSON.parse(Buffer.concat(chunks)));
+        } catch (error) { reject(error); }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+function checkLogs(result) {
+  assert.equal(result.schema, "elastos.browser.selkies-control.logs/v1");
+  for (const log of Object.values(result.logs)) {
+    if (!log.present) continue;
+    assert.ok(Number.isFinite(Date.parse(log.mtime)), "retained log age must be visible");
+    assert.ok(log.tail.length <= 8192, "log tail must be bounded");
+  }
+}
+try {
+  let before;
+  for (let round = 0; round < 3; round++) {
+    const [logs, status] = await Promise.all([request("/logs"), request("/status")]);
+    checkLogs(logs);
+    assert.equal(status.schema, "elastos.browser.selkies-control.status/v1");
+    assert.ok(status.page_ids.includes(pageId), "log polling must retain the page");
+    before = status.page_ids;
+  }
+  const [firstLogs, closed, lastLogs] = await Promise.all([
+    request("/logs"), request(`/pages/${encodeURIComponent(pageId)}/close`, "POST"), request("/logs"),
+  ]);
+  checkLogs(firstLogs); checkLogs(lastLogs);
+  assert.deepEqual(closed, { schema: "elastos.browser.close-result/v1", page_id: pageId, closed: true });
+  const after = await request("/status");
+  assert.deepEqual(after.page_ids.sort(), before.filter(id => id !== pageId).sort());
+  const events = fs.readFileSync(logPath, "utf8").split("\n").filter(line => line.startsWith("{")).map(line => JSON.parse(line));
+  assert.equal(events.some(event => event.kind === "request" && event.path === "/logs"), false,
+    "log polling must not append its own request events");
+} finally {
+  clearTimeout(deadline);
+  controller.abort();
+}
+NODE
+
+if [[ "$control_only" == 1 ]]; then
+  printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service","adapter_cleanup_verified":false}'
+  exit 0
+fi
+
+# The shared control bridge owns page channels. This smoke owns Chromium,
+# Selkies, and the proxy, so the bridge cannot certify their terminal cleanup.
+# Keep the product display checks and require the adapter to reject that
+# incomplete close response instead of inventing a supervisor receipt here.
+preflight_status=0
 scripts/browser-selkies-target-preflight.sh \
   --out-dir "$tmp_dir/target-preflight" \
   --control-socket "$tmp_dir/target-preflight.sock" \
   --runtime-fetch-proxy-url "http://127.0.0.1:$runtime_proxy_port" \
   --selkies-ws-url "ws://127.0.0.1:$selkies_port/signaling" \
   --browser-cdp-endpoint "http://127.0.0.1:$cdp_port" \
-  --ice-server "stun:stun.example.invalid:3478" >/dev/null
+  --ice-server "stun:stun.example.invalid:3478" \
+  >"$tmp_dir/target-preflight.stdout" 2>"$tmp_dir/target-preflight.stderr" || preflight_status=$?
+if ! "$node_bin" - "$preflight_status" "$tmp_dir/target-preflight.stderr" <<'NODE'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const [status, stderrPath] = process.argv.slice(2);
+const stderr = fs.readFileSync(stderrPath, "utf8");
+// The unchanged display smoke reports each failed response as JSON and throws
+// its first failure after shutdown. Require close to be the only failing gate.
+const responses = [...stderr.matchAll(/^\{[\s\S]*?^\}/gm)].map(match => JSON.parse(match[0]));
+assert.equal(Number(status), 1, "shared bridge preflight must fail at terminal cleanup");
+assert.deepEqual(responses, [{
+  status: "error",
+  code: "engine_close_indeterminate",
+  message: "Browser supervisor did not return an exact typed terminal cleanup receipt",
+}]);
+assert.deepEqual(stderr.match(/^(?:\w*Error):[^\n]*/gm), ["Error: adapter close_page failed"],
+  "launch, display validation, and shutdown must pass before accepting the expected close rejection");
+NODE
+then
+  cat "$tmp_dir/target-preflight.stdout" "$tmp_dir/target-preflight.stderr" >&2
+  exit 1
+fi
+for fixture_pid in "$selkies_pid" "$cdp_pid" "$proxy_pid"; do
+  kill -0 "$fixture_pid"
+done
+printf '%s\n' '{"schema":"elastos.browser.selkies-control-service-smoke/v1","ok":true,"scope":"control-service-and-adapter-close-rejection","unowned_cleanup_rejected":true,"adapter_cleanup_verified":false}'

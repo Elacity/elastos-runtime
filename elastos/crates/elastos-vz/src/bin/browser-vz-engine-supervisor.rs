@@ -42,6 +42,7 @@ const EGRESS_COPY_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GUEST_CONTROL_ERROR_CHARS: usize = 512;
 const MAX_SETTLEMENT_MESSAGE_CHARS: usize = 2 * 1024;
 const DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS: u32 = 120_000;
 const BROWSER_VM_TARGET_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
@@ -79,6 +80,22 @@ const VZ_AUTHORITY_BOOT_ARG_PREFIXES: [&str; 4] = [
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--host-capabilities") {
+        let supported = elastos_vz::is_supported();
+        let entitled = std::env::current_exe()
+            .ok()
+            .is_some_and(|path| verify_virtualization_entitlement(&path).is_ok());
+        println!(
+            "{}",
+            json!({
+                "schema": "elastos.browser.vm-host-capabilities/v1",
+                "available": supported && entitled,
+                "reason": if !supported { Some("host_unsupported") }
+                    else if !entitled { Some("preparation_required") } else { None },
+            })
+        );
+        return;
+    }
     init_tracing();
     if let Err(error) = run().await {
         eprintln!("{error}");
@@ -459,6 +476,11 @@ async fn run() -> Result<(), String> {
             .as_ref()
             .expect("Browser VZ profile disk owner")
             .profile_key,
+        owner
+            .profile_disk
+            .as_ref()
+            .expect("Browser VZ profile disk owner")
+            .initialize,
     );
     owner.turn_process = true;
     owner.turn_cleanup = TurnCleanupEvidence::Indeterminate;
@@ -2380,6 +2402,7 @@ fn profile_disk_from_request(request: &Value) -> Result<(String, PathBuf), Strin
 struct PreparedBrowserProfileDisk {
     profile_key: String,
     path: PathBuf,
+    initialize: bool,
     _lock: LifetimeFileLock,
 }
 
@@ -2389,28 +2412,45 @@ fn prepare_browser_profile_disk(request: &Value) -> Result<PreparedBrowserProfil
         fs::create_dir_all(parent)
             .map_err(|err| format!("create Browser profile disk root failed: {err}"))?;
     }
-    ensure_sparse_profile_disk(&disk_path)?;
+    let lock =
+        LifetimeFileLock::acquire_disk_sidecar(&disk_path, "principal Browser profile disk")?;
+    let initialize = ensure_sparse_profile_disk(&disk_path, &profile_key)?;
     Ok(PreparedBrowserProfileDisk {
         profile_key,
-        _lock: LifetimeFileLock::acquire_disk_sidecar(
-            &disk_path,
-            "principal Browser profile disk",
-        )?,
+        initialize,
+        _lock: lock,
         path: disk_path,
     })
 }
 
-fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str) {
+fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str, initialize: bool) {
+    // This host owns profile arguments, including any caller-supplied override.
+    *boot_args = boot_args
+        .split_whitespace()
+        .filter(|arg| {
+            !arg.starts_with("elastos.browser_profile=")
+                && !arg.starts_with("elastos.browser_profile_disk=")
+                && !arg.starts_with("elastos.browser_profile_initialize=")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     *boot_args = format!(
         "{boot_args} elastos.browser_profile={profile_key} elastos.browser_profile_disk=required"
     );
+    if initialize {
+        boot_args.push_str(" elastos.browser_profile_initialize=new");
+    }
 }
 
 #[cfg(test)]
 fn attach_browser_profile_disk(vm_config: &mut VmConfig, request: &Value) -> Result<(), String> {
     let profile_disk = prepare_browser_profile_disk(request)?;
     vm_config.data_disk_path = Some(profile_disk.path);
-    append_browser_profile_boot_arg(&mut vm_config.boot_args, &profile_disk.profile_key);
+    append_browser_profile_boot_arg(
+        &mut vm_config.boot_args,
+        &profile_disk.profile_key,
+        profile_disk.initialize,
+    );
     Ok(())
 }
 
@@ -2430,9 +2470,17 @@ fn validate_profile_disk_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_sparse_profile_disk(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
+fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err("Browser profile disk must be a regular file with one link".to_string());
+            }
+            // Existing bytes, including incomplete creation, never renew intent.
+            return Ok(false);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect Browser profile disk failed: {error}")),
     }
     let size_mib = env_u64(
         "ELASTOS_BROWSER_VM_PROFILE_DISK_MIB",
@@ -2441,19 +2489,28 @@ fn ensure_sparse_profile_disk(path: &Path) -> Result<(), String> {
     if !(128..=65536).contains(&size_mib) {
         return Err("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB must be 128..65536".to_string());
     }
-    let file = File::create(path).map_err(|err| {
-        format!(
-            "create Browser profile disk {} failed: {err}",
-            path.display()
-        )
-    })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| {
+            format!(
+                "create Browser profile disk {} failed: {err}",
+                path.display()
+            )
+        })?;
     file.set_len(size_mib * 1024 * 1024).map_err(|err| {
         format!(
             "resize Browser profile disk {} failed: {err}",
             path.display()
         )
     })?;
-    Ok(())
+    // The guest consumes this marker before its sole authorized format attempt.
+    file.write_all(format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{profile_key}").as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("initialize Browser profile disk intent failed: {err}"))?;
+    Ok(true)
 }
 
 fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
@@ -2653,9 +2710,10 @@ fn sdp_has_media_kind(sdp: &str, kind: &str) -> bool {
 }
 
 fn is_retryable_guest_control_open_error(error: &str) -> bool {
-    error.contains("Browser VM guest control HTTP 503")
-        || error.contains("Connection reset")
-        || error.contains("Broken pipe")
+    // Only raw connection failures can mean the control service is still starting.
+    // A completed HTTP response is a page-open outcome, including HTTP 503.
+    let error = error.to_ascii_lowercase();
+    error.starts_with("connection reset") || error.starts_with("broken pipe")
 }
 
 fn is_guest_control_response_timeout(error: &str) -> bool {
@@ -2729,10 +2787,17 @@ async fn bootstrap_vz_transport(
         .write_all(&bytes)
         .and_then(|_| stream.flush())
         .map_err(|err| format!("Browser VZ transport bootstrap write failed: {err}"))?;
+    let receipt = read_vz_transport_bootstrap_receipt(&mut stream)?;
+    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
+    Ok(receipt)
+}
+
+fn read_vz_transport_bootstrap_receipt(stream: &mut impl Read) -> Result<Value, String> {
     let mut response = Vec::new();
-    stream
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut response)
+    // Bootstrap is one bounded JSON line. The peer may keep its write side
+    // open until we release the connection after validating that receipt.
+    BufReader::new(stream.take(64 * 1024 + 1))
+        .read_until(b'\n', &mut response)
         .map_err(|err| format!("Browser VZ transport bootstrap read failed: {err}"))?;
     if response.len() > 64 * 1024 {
         return Err("Browser VZ transport bootstrap receipt is too large".to_string());
@@ -2744,7 +2809,6 @@ async fn bootstrap_vz_transport(
             .ok_or_else(|| "Browser VZ transport bootstrap receipt is empty".to_string())?,
     )
     .map_err(|err| format!("Browser VZ transport bootstrap receipt is invalid JSON: {err}"))?;
-    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
     Ok(receipt)
 }
 
@@ -2981,13 +3045,7 @@ fn parse_http_json_response(response: &[u8]) -> Result<Value, String> {
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| {
-            format!(
-                "Browser VM guest control returned an invalid HTTP response: len={} preview={}",
-                response.len(),
-                response_preview(response)
-            )
-        })?;
+        .ok_or_else(|| "Browser VM guest control returned an invalid HTTP response".to_string())?;
     let (head, body) = response.split_at(split + 4);
     let head_text =
         std::str::from_utf8(head).map_err(|_| "Browser VM guest HTTP head is not UTF-8")?;
@@ -2997,39 +3055,60 @@ fn parse_http_json_response(response: &[u8]) -> Result<Value, String> {
         .nth(1)
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| "Browser VM guest HTTP status is invalid".to_string())?;
-    let parsed: Value = serde_json::from_slice(body)
-        .map_err(|err| format!("Browser VM guest control response is not JSON: {err}"))?;
+    let parsed = serde_json::from_slice::<Value>(body);
     if !(200..300).contains(&status) {
         let error = parsed
-            .get("error")
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("error"))
             .and_then(Value::as_str)
-            .unwrap_or("Browser VM guest control returned an error")
-            .to_string();
-        let mut message = format!("Browser VM guest control HTTP {status}: {error}");
-        if let Some(logs) = parsed.get("logs") {
-            let logs_text = serde_json::to_string(logs)
-                .unwrap_or_else(|_| "<failed to encode guest logs>".to_string());
-            let mut bounded = logs_text.chars().take(20_000).collect::<String>();
-            if logs_text.len() > bounded.len() {
-                bounded.push_str("...");
-            }
-            message.push_str(" logs=");
-            message.push_str(&bounded);
-        }
-        return Err(message);
+            .unwrap_or("Browser VM guest control returned an error");
+        // Guest log tails and call logs stay behind the private control /logs endpoint.
+        return Err(format!(
+            "Browser VM guest control HTTP {status}: {}",
+            brief_guest_control_error(error)
+        ));
     }
-    Ok(parsed)
+    parsed.map_err(|err| format!("Browser VM guest control response is not JSON: {err}"))
 }
 
-fn response_preview(response: &[u8]) -> String {
-    let mut preview = String::new();
-    for byte in response.iter().take(160) {
-        let _ = write!(preview, "{byte:02x}");
+fn brief_guest_control_error(error: &str) -> String {
+    let first_line: String = error
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_GUEST_CONTROL_ERROR_CHARS)
+        .filter(|character| !character.is_control())
+        .collect();
+    let brief = first_line
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://") || word.starts_with("turn:") || word.starts_with("turns:") {
+                "[redacted URL]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = brief.to_ascii_lowercase();
+    if brief.is_empty()
+        || [
+            "credential",
+            "secret",
+            "password",
+            "authorization",
+            "bearer ",
+            "home_token",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return "Browser VM guest control returned an error (details in private guest logs)"
+            .to_string();
     }
-    if response.len() > 160 {
-        preview.push_str("...");
-    }
-    preview
+    brief.chars().take(MAX_GUEST_CONTROL_ERROR_CHARS).collect()
 }
 
 fn spawn_control_proxy(
@@ -4456,6 +4535,40 @@ mod tests {
         assert!(vm_config
             .boot_args
             .contains("elastos.browser_profile_disk=required"));
+        assert!(vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize=new"));
+        let marker = b"ELASTOS_BROWSER_PROFILE_NEW_V1:profile-99bb2b58175e1e062cd2fb6b1b00feec63d169f520dd0a8cfe7230517cfc43e4";
+        let mut header = vec![0; marker.len()];
+        File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(header.as_slice(), marker);
+        assert_eq!(fs::metadata(&disk_path).unwrap().mode() & 0o777, 0o600);
+
+        // Reattaching even a marked, unformatted disk never renews creation
+        // intent; stale boot arguments from the first attachment are removed.
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
+        File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(header.as_slice(), marker);
+
+        // A corrupt or signature-free existing profile must remain byte exact.
+        fs::write(&disk_path, b"existing profile with unreadable filesystem").unwrap();
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert_eq!(
+            fs::read(&disk_path).unwrap(),
+            b"existing profile with unreadable filesystem"
+        );
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
     }
 
     #[test]
@@ -4482,6 +4595,7 @@ mod tests {
             }
         });
         let owner = prepare_browser_profile_disk(&request).unwrap();
+        assert!(owner.initialize);
         let lock_path = disk_lifetime_lock_path(&disk_path);
         assert_eq!(
             lock_path,
@@ -4502,7 +4616,36 @@ mod tests {
         assert_eq!(typed["path"], disk_path.to_string_lossy().as_ref());
 
         drop(owner);
-        prepare_browser_profile_disk(&request).unwrap();
+        assert!(!prepare_browser_profile_disk(&request).unwrap().initialize);
+    }
+
+    #[test]
+    fn profile_initialization_rejects_symlink_and_preserves_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing");
+        let disk = tmp.path().join("profile.ext4");
+        fs::write(&target, b"existing profile bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &disk).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing profile bytes");
+        fs::remove_file(&target).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn profile_initialization_intent_is_owned_by_exclusive_creation() {
+        let mut args = "console=hvc0 elastos.browser_profile_initialize=new elastos.browser_profile=other elastos.browser_profile_disk=other".to_string();
+        append_browser_profile_boot_arg(&mut args, "profile-owned", false);
+        assert_eq!(args, "console=hvc0 elastos.browser_profile=profile-owned elastos.browser_profile_disk=required");
+        append_browser_profile_boot_arg(&mut args, "profile-owned", true);
+        assert_eq!(
+            args.matches("elastos.browser_profile_initialize=new")
+                .count(),
+            1
+        );
+        append_browser_profile_boot_arg(&mut args, "profile-owned", false);
+        assert!(!args.contains("elastos.browser_profile_initialize="));
     }
 
     #[test]
@@ -4538,6 +4681,146 @@ mod tests {
         let (guest_to_runtime, runtime_to_guest) = bridge.join().unwrap().unwrap();
         assert_eq!(guest_to_runtime, 0);
         assert_eq!(runtime_to_guest, 4);
+    }
+
+    #[test]
+    fn bootstrap_receipt_completes_while_the_peer_write_side_stays_open() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let receipt = json!({"schema": "elastos.browser.vz-transport-bootstrap-receipt/v1"});
+        writeln!(peer, "{receipt}").unwrap();
+        assert_eq!(
+            read_vz_transport_bootstrap_receipt(&mut client).unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn bootstrap_receipt_read_rejects_empty_malformed_and_oversized_frames() {
+        for bytes in [b"".as_slice(), b"\n", b"{broken}\n"] {
+            assert!(read_vz_transport_bootstrap_receipt(&mut std::io::Cursor::new(bytes)).is_err());
+        }
+        let oversized = vec![b'x'; 64 * 1024 + 1];
+        assert!(
+            read_vz_transport_bootstrap_receipt(&mut std::io::Cursor::new(oversized))
+                .unwrap_err()
+                .contains("too large")
+        );
+    }
+
+    #[test]
+    fn guest_control_completed_http_errors_are_terminal_and_keep_brief_cause() {
+        for status in [503, 400, 403, 500] {
+            for cause in [
+                "Chromium did not accept the Runtime online-state projection",
+                "page.goto: net::ERR_NAME_NOT_RESOLVED",
+                "Connection reset while opening the page",
+                "Broken pipe while opening the page",
+            ] {
+                let body = json!({
+                    "schema": "elastos.browser.selkies-control.error/v1",
+                    "error": cause,
+                    "logs": {
+                        "browser-vm-control.log": { "tail": "Connection reset; Broken pipe" },
+                        "browser-vm-chromium.log": { "tail": "DevTools listening on ws://127.0.0.1:9222/private-control-id" },
+                        "turn": { "credential": "private-turn-credential", "auth_secret": "private-turn-secret" },
+                    },
+                });
+                let response = format!("HTTP/1.1 {status} Error\r\n\r\n{body}");
+                let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+                assert!(!is_retryable_guest_control_open_error(&error), "{error}");
+                assert_eq!(
+                    error,
+                    format!("Browser VM guest control HTTP {status}: {cause}")
+                );
+                assert!(!error.contains("logs="));
+                assert!(!error.contains("private-"));
+                assert!(!error.contains("ws://"));
+            }
+        }
+    }
+
+    #[test]
+    fn guest_control_non_json_http_error_keeps_status_and_discards_private_body() {
+        assert_eq!(
+            parse_http_json_response(b"credential=private-value").unwrap_err(),
+            "Browser VM guest control returned an invalid HTTP response"
+        );
+        for body in ["Broken pipe; credential=private-value", "{\"error\":", ""] {
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n{body}");
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+            assert!(
+                error.starts_with("Browser VM guest control HTTP 503:"),
+                "{error}"
+            );
+            assert!(!is_retryable_guest_control_open_error(&error));
+            assert!(!error.contains("private-value"));
+        }
+    }
+
+    #[test]
+    fn guest_control_brief_error_omits_urls_secrets_and_call_logs() {
+        for cause in [
+            "page.goto: net::ERR_NAME_NOT_RESOLVED at http://user:private-password@localhost/main?home_token=private-token\nCall log:\ncredential=private-credential",
+            "page.goto: net::ERR_NAME_NOT_RESOLVED\r\nDevTools listening on ws://127.0.0.1:9222/private-control-id",
+        ] {
+            let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+            assert!(error.contains("net::ERR_NAME_NOT_RESOLVED"), "{error}");
+            assert!(!error.contains("private-"));
+            assert!(!error.contains("://"));
+            assert!(!error.contains('\n'));
+            assert!(!is_retryable_guest_control_open_error(&error));
+        }
+        for cause in [
+            "TURN credential=private-value",
+            "auth_secret=private-value",
+            "transport_secret=private-value",
+        ] {
+            let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+            assert!(!error.contains("private-value"));
+            assert!(error.contains("private guest logs"));
+        }
+        let response = format!(
+            "HTTP/1.1 503 Error\r\n\r\n{}",
+            json!({ "error": "é".repeat(4096) })
+        );
+        let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+        assert!(error.chars().count() <= 550);
+    }
+
+    #[test]
+    fn guest_control_retry_is_limited_to_connection_startup_errors() {
+        for error in [
+            std::io::Error::from(ErrorKind::ConnectionReset).to_string(),
+            std::io::Error::from(ErrorKind::BrokenPipe).to_string(),
+            std::io::Error::from_raw_os_error(libc::ECONNRESET).to_string(),
+            std::io::Error::from_raw_os_error(libc::EPIPE).to_string(),
+        ] {
+            assert!(is_retryable_guest_control_open_error(&error), "{error}");
+        }
+        for error in [
+            "Browser VM guest control HTTP 503: Connection reset; Broken pipe",
+            "Browser VM guest control HTTP 500: failure logs=Broken pipe",
+            "Browser VM guest control returned an invalid HTTP response",
+            "Browser VM guest control response is not JSON: Broken pipe",
+            "Browser VM control HTTP response timed out",
+        ] {
+            assert!(!is_retryable_guest_control_open_error(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn guest_control_private_log_response_remains_available() {
+        let logs = json!({ "schema": "elastos.browser.selkies-control.logs/v1", "logs": { "control": "private-log-fixture" } });
+        let response = format!("HTTP/1.1 200 OK\r\n\r\n{logs}");
+        assert_eq!(parse_http_json_response(response.as_bytes()).unwrap(), logs);
     }
 
     #[test]

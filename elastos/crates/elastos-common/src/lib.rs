@@ -1,5 +1,6 @@
 //! Common types and utilities for ElastOS
 
+pub mod browser_protocol;
 pub mod chat_protocol;
 pub mod collaboration_protocol;
 mod error;

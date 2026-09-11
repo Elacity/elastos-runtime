@@ -48,6 +48,10 @@ mod gateway_assistant;
 mod gateway_assistant_workspace_v2;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
+pub(crate) use gateway_browser::gateway_browser_operator::{
+    register_browser_operator_sessions, BrowserOperatorService,
+};
+pub(crate) use gateway_browser::gateway_browser_remote::invoke as invoke_remote_browser_engine;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
@@ -116,6 +120,10 @@ pub(in crate::api) use gateway_home_runtime::capsule_icon_variants;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
+pub(crate) use gateway_home_system::{
+    authorize_home_engine_preparation_cancellation, authorize_home_service_engine,
+    authorize_home_service_exit, sync_runtime_services_mailboxes,
+};
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
 #[cfg(test)]
@@ -460,6 +468,7 @@ struct WalletPricePolicy {
 
 #[derive(Clone)]
 pub struct GatewayState {
+    pub(crate) carrier_endpoint: Option<iroh::Endpoint>,
     pub provider_registry: Option<Arc<ProviderRegistry>>,
     pub(crate) collaboration_chat_product_port:
         Option<crate::collaboration_product::CollaborationChatProductPort>,
@@ -829,6 +838,31 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/browser/pages/:page_id/diagnostics",
             get(gateway_browser::browser_app_page_diagnostics),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/inspect",
+            get(gateway_browser::browser_app_page_inspection_capabilities)
+                .post(gateway_browser::browser_app_page_inspect),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests",
+            get(gateway_browser::gateway_browser_operator::pending_admissions)
+                .post(gateway_browser::gateway_browser_operator::request_admission),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id",
+            get(gateway_browser::gateway_browser_operator::admission_status)
+                .post(gateway_browser::gateway_browser_operator::approve_admission)
+                .delete(gateway_browser::gateway_browser_operator::revoke_admission),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id/inspect",
+            post(gateway_browser::gateway_browser_operator::operator_inspect)
+                .layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/operator-requests/:id/detach",
+            post(gateway_browser::gateway_browser_operator::detach_operator),
         )
         .route(
             "/api/apps/browser/pages/:page_id/heartbeat",

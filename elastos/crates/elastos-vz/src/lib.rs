@@ -90,9 +90,9 @@ pub const CARRIER_GUEST_DEVICE_PATH: &str = "/dev/hvc1";
 
 /// Check whether the host supports the Vz backend.
 ///
-/// Returns `false` everywhere outside macOS. On macOS, returns `true` on
-/// Apple Silicon hosts where Virtualization.framework is the intended VM
-/// substrate.
+/// On Apple Silicon, ask Virtualization.framework whether this host supports
+/// virtual machines. Architecture alone does not establish host eligibility.
+/// Artifact, entitlement and VM configuration checks remain launch admission.
 ///
 /// **Fail-closed contract:** if this returns `false`, the runtime
 /// **must not** attempt to launch a `type: microvm` capsule on Mac.
@@ -100,7 +100,9 @@ pub const CARRIER_GUEST_DEVICE_PATH: &str = "/dev/hvc1";
 pub fn is_supported() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        true
+        // SAFETY: Apple's process-independent capability query takes no objects
+        // or callbacks and does not allocate or start a virtual machine.
+        unsafe { objc2_virtualization::VZVirtualMachine::isSupported() }
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {

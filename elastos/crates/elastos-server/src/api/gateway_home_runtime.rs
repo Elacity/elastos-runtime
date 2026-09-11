@@ -53,6 +53,7 @@ pub(super) async fn home_launch(
     // legacy Services mailbox behavior while keeping Inbox summary pure.
     let data_dir = state.data_dir.clone();
     let launch_context = context.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
     let sync_services = target_summary.target == INBOX_CAPSULE_ID;
     let services_sync_error = tokio::task::spawn_blocking(move || {
         super::gateway_home_system::migrate_legacy_services_peer_contacts(
@@ -63,6 +64,7 @@ pub(super) async fn home_launch(
             super::gateway_home_system::home_services_sync_access_requests(
                 &data_dir,
                 &launch_context,
+                discovery_service.as_ref(),
             )
             .err()
             .map(|error| error.to_string())
@@ -1129,6 +1131,21 @@ pub(super) fn home_service_offers_for_people_contact(
         contact_id: Some(contact.contact_id.clone()),
         capsule_hint: Some("browser".to_string()),
         route: None,
+    });
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: format!("offer:{}:browser-engine", contact.contact_id),
+        service_uri: crate::carrier::ENGINE_SERVICE_URI.to_string(),
+        service_kind: crate::carrier::ENGINE_SERVICE_KIND.to_string(),
+        display_name: format!("{}'s Browser Engine", contact.display_name),
+        provider_uri: Some("elastos://browser-engine/*".to_string()),
+        provider_label: "Remote Engine".to_string(),
+        policy_summary: "Ask this person to run Browser pages with a profile stored on their Runtime. Your Runtime keeps control of the page and its selected Exit. Existing profiles require an approved transfer.".to_string(),
+        status: "requestable".to_string(), enabled: false, grant_required: true,
+        grant_scope: crate::carrier::browser_engine_binding::EXECUTION_SCOPE.to_string(),
+        capsule_contract: "browser -> Runtime service grant -> owner-bound Engine page".to_string(),
+        source: "people_contact".to_string(), runtime_contract: None,
+        contact_id: Some(contact.contact_id.clone()), capsule_hint: Some("browser".to_string()), route: None,
     });
     offers
 }

@@ -1576,6 +1576,7 @@ const chainProvider = readAll([
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
+  "elastos/crates/elastos-common/src/browser_protocol.rs",
   "capsules/browser-engine-adapter/src/main.rs",
   "capsules/browser-engine-adapter/src/display.rs",
   "capsules/browser-engine-adapter/src/ids.rs",
@@ -2811,15 +2812,25 @@ assert(
     gatewayApi.includes("elastos.service-access-decision/v1") &&
     gatewayApi.includes("home_services_sync_access_decisions") &&
     gatewayApi.includes("home_services_send_access_decision") &&
-    gatewayApi.includes("home_services_install_remote_exit_grant") &&
-    gatewayApi.includes("home_services_remove_remote_exit_grant") &&
+    gatewayApi.includes("home_services_activate_pending_decision") &&
+    gatewayApi.includes("home_services_commit_exit_config") &&
+    gatewayApi.includes("elastos.exit.config-ack/v1") &&
+    gatewayApi.includes("pending_access_decision") &&
+    gatewayHomeSystemTests.includes("test_services_exit_activation_waits_for_provider_ack") &&
+    gatewayHomeSystemTests.includes("test_services_exit_activation_fences_held_ack_and_rolls_back_failed_state_write") &&
     gatewayApi.includes("elastos.service.remote-exit-grant/v1") &&
     gatewayApi.includes("installed_remote_exit_id") &&
     gatewayApi.includes(
       "Carrier service access request was not delivered to the other person's device",
     ) &&
     gatewayHomeSystemTests.includes('approved_offer["status"], "active"') &&
-    gatewayHomeSystemTests.includes("fake-ticket-services-right") &&
+    gatewayHomeSystemTests.includes('format!("fake-ticket-{right_peer_id}")') &&
+    gatewayHomeSystemTests.includes(
+      "test_services_contact_authority_rejects_other_principal_and_removed_contact",
+    ) &&
+    gatewayHomeSystemTests.includes(
+      "test_services_contact_authority_ignores_substituted_legacy_endpoint",
+    ) &&
     gatewayHomeSystemTests.includes(
       'assert_eq!(approved_offer["grant_required"], false)',
     ) &&
@@ -8549,7 +8560,7 @@ assert(
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
     browserEngineAdapter.includes(
-      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.1"',
     ) &&
     browserEngineAdapter.includes(
       "elastos.browser.engine-cleanup-binding/v2",
@@ -9922,22 +9933,15 @@ assert(
     ) &&
     browserSelkiesRuntimeExitSmoke.includes("--cleanup-after-verify") &&
     setupSourceHome.includes("install_browser_runtime_helpers") &&
+    !setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
+    !setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
     !setupSourceHome.includes("browser-per-launch-selkies-supervisor.mjs") &&
     !setupSourceHome.includes("browser-selkies-runtime-exit-target.sh") &&
     !setupSourceHome.includes("browser-hosted-product-operator-config.mjs") &&
     !setupSourceHome.includes("browser-hosted-product-supervisor.mjs") &&
     setupSourceHome.includes("browser-selkies-control-service.mjs") &&
-    setupSourceHome.includes("browser-vm-selkies-start") &&
     setupSourceHome.includes("build Browser VZ engine supervisor") &&
     setupSourceHome.includes("-p elastos-vz --bin browser-vz-engine-supervisor") &&
-    setupSourceHome.includes("extract_browser_vm_selkies_start") &&
-    setupSourceHome.includes("resolve_browser_vm_native_proxy_source") &&
-    setupSourceHome.includes("validate_linux_guest_binary") &&
-    setupSourceHome.includes("/opt/elastos/bin/browser-native-proxy-engine") &&
-    setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
-    setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
-    setupSourceHome.includes("ELASTOS_DEBUGFS_BIN") &&
-    setupSourceHome.includes("debugfs") &&
     read("scripts/browser-hosted-product-target-preflight.sh").includes(
       "browser-hosted-product-display-smoke.sh",
     ) &&
@@ -11600,7 +11604,7 @@ assert(
 assert(
   gatewayApi.includes("pub(crate) fn home_launch_auth_data_dir") &&
     authGatewayApi.includes("home_launch_auth_data_dir(&state.data_dir)") &&
-    authGatewayApi.includes("crate::auth::renew_session_grant(&auth_data_dir") &&
+    /crate::auth::renew_session_grant_with_audit\(\s*&auth_data_dir\s*,\s*grant\.clone\(\)/.test(authGatewayApi) &&
     authGatewayApi.includes("an open child token must survive host session renewal") &&
     authGatewayApi.includes("crate::auth::revoke_session_grant(&auth_data_dir") &&
     authGatewayApi.includes(

@@ -10,6 +10,161 @@ Guiding-star constraints live in [PRINCIPLES.md](PRINCIPLES.md).
 
 Do not add new product surface area until the `Now` section is materially tighter.
 
+## Browser maturity workstream
+
+The Browser work requested on 2026-09-07 has one acceptance contract:
+[Browser maturity goals](docs/BROWSER_ACCEPTANCE.md). The delivery queue below
+applies within this workstream; existing release work retains its own scope.
+People and agents use the same Browser authority and lifecycle. Runtime owns
+device compatibility and independent local or remote placement of Engine and
+Exit. These checkboxes are the canonical status; the linked document gives
+instructions, dependencies, and measurable acceptance criteria.
+
+Initial analysis source:
+[`8ac18bec65ca650615be879f7ab3f66799d9fc53`](https://github.com/Elacity/elastos-runtime/tree/8ac18bec65ca650615be879f7ab3f66799d9fc53).
+Revalidate those findings against the implementation base before each repair.
+
+### Delivery queue and 24-hour checkpoint plan
+
+Execution revision: 2026-09-08. The user requests the full Browser outcome by
+2026-09-09, approximately 13:34 UTC, 24 hours after the deadline instruction.
+B01-B16 remain the acceptance baseline. Their broad checkboxes track full
+qualification; the delivery slices below drive current work. B01 stays open for
+its support matrix while its accepted contract unblocks dependent work.
+
+The task Mac passes the requested Home-to-close journey, including decoded
+audio, reload and separately authorized native operator actions. Runs 92/93
+add independent acceptance on the current installed artifact set, including
+bounded actual Camofox and Playwright operation. Current evidence and artifact
+identity are in [state.md](state.md#browser-contract-and-device-qualification).
+Run 96 also completes ordinary browsing through the Linux consumer/Exit and
+Mac Engine, then confirms all 13 close effects. Its viewer reload fails the
+five-second recovery gate. This advances the remote contract milestone while
+the integrated remote journey remains failed.
+The initrd-only RNG activation removes an observed five-second bootstrap delay;
+current launcher samples range from about 9 to 11 seconds. A decoded-audio
+repeat fails with long silence, while a later controlled interruption passes
+audio/video/input recovery. That audio failure remains unexplained. Fresh ordinary installation,
+remote placements, complete operator use and release qualification need proof.
+Sash's reported failure on the published source remains unverified.
+
+| Delivery slice / acceptance mapping | Status and owner | Observable exit requirement |
+| --- | --- | --- |
+| B02.install: install and use Browser on a Mac; B01/B02/B03/B05/B06/B07/B11/B15 | Active; coordinator owns the Mac, installed artifacts and integration | An independently provisioned installation acquires one compatible artifact set and opens Browser through Home. Navigation, decoded video, audio, typing, scrolling, reload, interruption and close pass. Startup/input meet measured budgets, failures name the responsible stage, and a stalled launch leaves another admitted session responsive. |
+| B04.operator: a human and an authorized agent operate the same page; B04/B12/B13/B14 | Active; delegated owner implements operator approval and actions | Actual Engine-page inspection, actions and waits work through Runtime authority. Human/agent handoff retains page, profile and service identity. Native, Playwright and declared Camofox/Camoufox paths pass the shared workflow; stale references and revoked writers are rejected. Profile, files, approvals and accessibility keep their own acceptance cases. |
+| B10.placement: Engine and Exit move independently; B08/B09/B10/B14 | Active on the admitted Mac Engine and Linux consumer/Exit; coordinator owns target execution | The same capsule completes the same journey in A/A/A, A/B/A, A/A/B, A/B/B and A/B/C. Product service controls select approved peers; destination/DNS evidence identifies Exit. Physical LAN, supported WAN and relay-required cases prove media, recovery, revocation and cleanup. |
+| B16.qualification: sustained daily use on each claimed role; B01-B16 | Planned; coordinator assembles candidate, independent reviewer checks evidence, humans perform UX acceptance | Exact candidate artifacts pass the original device, media, recovery, concurrency, profile, wallet, authority, installation/update and operator gates. Include 100 lifecycle cycles, 100 cold and 100 warm launches, 30-minute A/V interaction, eight-hour mixed use, manual UX and the objective audit. A second maintainer repeats installation and use. |
+
+These delivery slices run through accepted contract outputs, rather than waiting
+for each preceding Bxx checkbox to close. Every acceptance ID retains its full
+instructions in `BROWSER_ACCEPTANCE.md`; grouping changes delivery order only.
+In particular, B12 profiles, B13 daily workflows/accessibility/Wallet, B14 leases
+and authority, and B15 update/repair need implementation and behavioral evidence
+alongside the local, operator and remote journeys.
+
+### Resume queue after the requested pause
+
+Work stopped at the user's request on 2026-09-09 for a usage-reset handover.
+The local branch and frozen source edits are preserved. The final private
+handover identifies exact artifact receipts, process ownership, patches and
+commands. A fresh session first reconciles those receipts with actual state.
+Source acceptance, installed journey acceptance and full qualification remain
+separate results. B01-B16 acceptance criteria and checkboxes below are unchanged.
+
+1. **B06/B08 remote reload:** review the frozen viewer scheduling and observation
+   patches, then install only the accepted UI change and repeat the same A/B/A
+   journey. Keep the current Runtime/image/helper set for attribution. The next
+   evidence must show timely display attachment, fresh decoded frames, retained
+   page/profile/services, input and all 13 close effects. Keep run 96 failed.
+2. **B02/B03/B11 Home and responsiveness:** install the reviewed `de0a299e`
+   Runtime candidate and repeat Home timing on the same principal, then the
+   canonical Browser journey. Measure an optimized candidate before release
+   performance claims. Diagnose idle CPU and intermittent audio with matched
+   producer/receiver evidence. Preserve normal fresh sign-in qualification.
+3. **B12/B13 state and daily operations:** install matched host/guest profile
+   protection `52238f2f`; run a new write/close/read pair for cookies, local
+   storage and committed IndexedDB. Preserve failed write 94 and stopped read 95.
+   Prove the reviewed 64 KiB Library upload and changed-byte rejection. Implement
+   Linux profile attachment, protected checkpoints/approved transfer, crash
+   recovery and ephemeral deletion. Downloads, large-file progress/cancel,
+   Wallet consent/return semantics and human accessibility remain open.
+4. **B04/B07/B08/B09/B10/B14 independent source and target work:** extend the
+   bounded installed operator surface to the complete shared workflow; qualify
+   Playwright, Camofox and declared Camoufox paths. Prove two-session progress
+   under a stalled operation. Complete A/A/A, A/B/A, A/A/B, A/B/B and A/B/C with
+   real approved peers, controlled destination/DNS evidence, recovery and
+   revocation. Expired-service selection, pre-allocation revocation and leases
+   retain their UX and authority checks. Use one owner for the shared Mac.
+5. **B02/B15 installation and update:** execute the frozen staged-executable
+   regression red/green tests before source acceptance. Bind the actual image
+   and matching helpers to the distributable component manifest and ordinary
+   installer. Prove missing/corrupt/incompatible/interrupted acquisition,
+   component health settlement, profile migration/rollback and upstream Engine
+   security maintenance. Sash and a second maintainer need the normal install
+   journey. Publication and public deployment require their own authorization.
+6. **B01/B05/B06/B11/B16 qualification:** certify each claimed role and device
+   on one frozen compatible candidate. Run launch/cycle distributions, continuous
+   media, mixed use, manual UX and the objective audit. The runner still needs
+   valid warm conditioning, input-to-visible latency and synchronized A/V offset
+   evidence. A qualifying 100-cold campaign may also supply the 100 lifecycle
+   facts when every cleanup requirement is retained. Idle periods in mixed use
+   do not count toward uninterrupted 30-minute A/V.
+   Reconcile the objective audit's older provider-documentation predicates with
+   the current Runtime contract while preserving real media and manual UX gates.
+
+The planned soak start was missed and none of the required full campaigns has
+started. The original deadline remains recorded below as history; the next
+session must establish a feasible execution schedule from remaining work.
+The user has not waived any acceptance requirement.
+
+### Time and resource control
+
+| Checkpoint from deadline instruction | Required evidence or decision |
+| --- | --- |
+| First 2 hours | Attempt a minimal fresh-install, operator and placement journey wherever the required target is available. For each of the five placements and each target role, record the first failing stage or the missing resource and owner. Check audio early. Establish target access and human-review availability before assigning qualification time. |
+| By hour 8 | Review measured local usability and integrated operator/remote progress. Report any unimplemented contract or unavailable device that threatens the deadline. Redirect source work to those gaps; small local performance gains do not justify leaving remote/operator behavior untested. |
+| By hour 12 | Produce the combined candidate and start the required eight-hour workloads on each independently available target. Complete shorter disruptive, lifecycle and launch-distribution tests before reserving a shared target for its soak. A target that cannot start now puts its full qualification past the planned review window. |
+| Hours 12-20 | Run sustained-use qualification on fixed candidate artifacts. Independent review and tests on other owned targets can continue. A material repair requires the affected evidence to be repeated on the repaired candidate. |
+| Hours 20-24 | Finish human and second-maintainer checks, review receipts, run the objective audit and prepare a local reviewable result with an exact pass/fail/pending matrix. Required publication and public deployment remain separate explicit actions. |
+
+This is an execution budget, not a prediction that all requirements will pass.
+Physical target access, complete operator adapters and remote service behavior
+are current schedule risks. Missing evidence retains its original acceptance
+requirement. Candidate-only platforms remain explicit in the support matrix;
+the deadline does not change a platform's support verdict.
+
+One coordinator owns the shared Mac Runtime, viewer, VM, builder, ports and
+fixture. Three source agents receive separate file scopes and can
+cross-review completed slices. Long jobs on that Mac are scheduled, because
+concurrent mutations would invalidate evidence. Reuse the verified image and
+matching artifacts; inspect standard dependency correctness before adding
+compatibility patches or changing engines.
+
+Each investigation names a hypothesis, the smallest discriminating experiment
+and the journey it restores. At each 30-minute evidence checkpoint, report
+passed, failed and pending milestones, what the user can do, the current failing
+stage and the next experiment. If a checkpoint produces no new evidence, change
+the experiment or the work order. Preserve useful receipts, run checks for the
+touched boundary and return each repair to its installed journey. Keep source
+verification separate from product acceptance and required human review.
+
+- [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
+- [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).
+- [ ] [B03: Every failure has an actionable diagnosis](docs/BROWSER_ACCEPTANCE.md#b03).
+- [ ] [B04: People and agents have equal Browser capabilities](docs/BROWSER_ACCEPTANCE.md#b04).
+- [ ] [B05: Input and navigation feel like a browser](docs/BROWSER_ACCEPTANCE.md#b05).
+- [ ] [B06: Sessions recover from normal interruptions](docs/BROWSER_ACCEPTANCE.md#b06).
+- [ ] [B07: One slow session cannot block the others](docs/BROWSER_ACCEPTANCE.md#b07).
+- [ ] [B08: Remote Engine is an ordinary Runtime service](docs/BROWSER_ACCEPTANCE.md#b08).
+- [ ] [B09: Exit has identical local and remote network semantics](docs/BROWSER_ACCEPTANCE.md#b09).
+- [ ] [B10: Prove independent placement of UI, Engine, and Exit](docs/BROWSER_ACCEPTANCE.md#b10).
+- [ ] [B11: Meet measured responsiveness and media budgets](docs/BROWSER_ACCEPTANCE.md#b11).
+- [ ] [B12: Profiles and user state survive safely](docs/BROWSER_ACCEPTANCE.md#b12).
+- [ ] [B13: Complete daily browser workflows and accessibility](docs/BROWSER_ACCEPTANCE.md#b13).
+- [ ] [B14: Preserve authority, privacy, and bounded revocation](docs/BROWSER_ACCEPTANCE.md#b14).
+- [ ] [B15: Updates and repair preserve a working installation](docs/BROWSER_ACCEPTANCE.md#b15).
+- [ ] [B16: Release only from repeatable product evidence](docs/BROWSER_ACCEPTANCE.md#b16).
+
 ## Now
 
 Mission revision R2, 2026-09-10. The [approved five-journey plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9)

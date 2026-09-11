@@ -422,7 +422,9 @@ function readDescriptor(socketPath) {
           const line = payload
             .subarray(0, payload.indexOf(0x0a))
             .toString("utf8");
-          resolve({ socket, request: JSON.parse(line) });
+          const request = JSON.parse(line);
+          clearTimeout(timeout);
+          resolve({ socket, request });
         } catch (error) {
           socket.destroy();
           reject(error);
@@ -435,8 +437,17 @@ function readDescriptor(socketPath) {
 }
 
 async function main() {
+  const startedAt = performance.now();
+  const markStage = (stage) => console.error(JSON.stringify({
+    schema: "elastos.browser.vz-bootstrap-stage/v1",
+    stage,
+    at: new Date().toISOString(),
+    elapsed_ms: Math.round(performance.now() - startedAt),
+  }));
   const config = readConfig();
+  markStage("descriptor_wait");
   const { socket, request } = await readDescriptor(config.relay_socket_path);
+  markStage("descriptor_received");
   if (
     !exactObjectKeys(request, ["schema", "authority", "secret"]) ||
     request.schema !== REQUEST_SCHEMA
@@ -446,8 +457,11 @@ async function main() {
   const authority = validateAuthority(request.authority);
   const secret = validateSecret(authority, request.secret);
   const network = guestNetworkState();
+  markStage("authority_validated");
   await proveDirectNetworkUnavailable(authority);
+  markStage("direct_network_checked");
   writeOwnerOnlyAtomic(config.authority_path, authority);
+  markStage("authority_written");
   writeOwnerOnlyAtomic(config.ice_servers_path, [
     {
       urls: [authority.turn.guest_url],
@@ -455,6 +469,7 @@ async function main() {
       credential: secret.credential,
     },
   ]);
+  markStage("ice_written");
   const receipt = {
     schema: RECEIPT_SCHEMA,
     binding_hash: authority.binding_hash,
@@ -473,7 +488,12 @@ async function main() {
       direct_network_probe_failed: true,
     },
   };
-  socket.end(`${JSON.stringify(receipt)}\n`);
+  // The descriptor reader is paused. Release both directions after the receipt
+  // flushes so the one-session relay and guest init can finish bootstrap.
+  socket.end(`${JSON.stringify(receipt)}\n`, () => {
+    markStage("receipt_write_callback");
+    socket.destroy();
+  });
 }
 
 export {

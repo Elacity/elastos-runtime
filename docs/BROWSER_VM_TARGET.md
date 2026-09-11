@@ -99,9 +99,14 @@ That mode adds the guest Xvfb, Python, PipeWire, PipeWire Pulse, WirePlumber,
 `pw-cli`, and `gst-inspect-1.0` checks required by the Selkies/WebRTC display
 and audio path. Use it for debootstrap-built rootfs trees and any ext4 manifest
 that will ship to Mac VZ or Linux crosvm targets. `browser-vm-artifact-preflight.sh`
-enforces the same complete contract for `rootfs.ext4` through `debugfs` when
-available, or through the rootfs sidecar manifest when direct ext4 inspection is
-not available.
+requires a rootfs sidecar manifest with matching architecture, image size and
+SHA-256, plus successful evidence for each guest and audio dependency. When
+`debugfs` is available, it inspects the guest files after verifying that receipt.
+Staged directories use the build-time target check; installed ext4 images need
+the image receipt. Publisher authorization, host eligibility, control-service
+readiness and product media remain separate admission and qualification gates.
+An image refresh must retain its source provenance and produce a matching
+receipt for the changed bytes before the image passes this check.
 
 This is a static target-image gate. It also checks that `browser-vm-init`
 starts the guest Runtime relay, starts the VM-local Selkies/Chromium stack, and
@@ -248,9 +253,14 @@ be backed by a local crosvm/VZ substrate or by a remote/operator VM provider
 reached through approved Runtime/Carrier/SSH-tunnel plumbing. Browser UI still
 talks only to Runtime, and the Browser Engine Adapter still requires
 `runtime_net_only`, `direct_network=false`, and `media_transport=runtime_relay`.
-Source-home config writes a stable `/tmp/elastos-browser-vm-control-<platform>.sock`
-control socket by default so the Browser VM supervisor has a single launch
-target instead of relying on ambient shell state.
+Source-home config defaults to
+`/tmp/elastos-browser-<platform>-<data-dir-hash>-vm-control.sock`. The hash uses
+the first 16 hex characters of SHA-256 over the normalized absolute Runtime
+data-directory path, so each Runtime has a stable launch target. The Mac VM
+proof reads `browser-vm-product.supervisor.control_socket_path` from the target
+data directory's `config/browser-engine-adapter.json`; an explicit
+`ELASTOS_BROWSER_VM_CONTROL_SOCKET` overrides that selection. A missing or
+invalid configured socket stops the proof before it contacts Home.
 
 `scripts/browser-vm-control-service.mjs` is the local Unix-socket control-plane
 contract. It serves `GET /status`, `POST /pages`, page-scoped `POST /shutdown`,
@@ -352,21 +362,29 @@ the matching `bin/initrd` when initramfs boot is used, and
 `browser-vm/rootfs.ext4` with its matching
 `browser-vm/browser-vm-rootfs-manifest.json`. Linux crosvm readiness requires
 `/dev/kvm`, `bin/crosvm`, `bin/vmlinux`, `browser-vm/initrd`, and the same
-rootfs contract. A no-KVM public gateway can still be launch-ready if
-`ELASTOS_BROWSER_VM_CONTROL_SOCKET` points to a local Runtime-facing control
-socket backed by an approved remote/operator VM provider.
+rootfs contract. A gateway without KVM can consume an approved remote Engine.
+Protocol 2.1 requires that Engine to report readiness; a local socket alone
+provides diagnostic connectivity evidence.
 
-`scripts/setup-source-home.sh` refreshes the VM guest manifest and startup
-scripts in the installed script mirror, `browser-vm/initrd` and `bin/initrd`
-when present, and `browser-vm/rootfs.ext4` when present. Existing VM artifacts
-are backed up before the refresh and verified by reading the updated files back
-from the artifact, so source-home Browser diagnostics, control behavior, and
-Selkies startup behavior do not drift from the checked-in source. This refresh
-path cannot add guest OS packages, change Python site-packages, or replace the
-complete guest image contract; those changes require a rebuilt rootfs artifact.
-`ELASTOS_BROWSER_VM_INITRD` and
-`ELASTOS_BROWSER_VM_INITRAMFS` can narrow the initrd refresh to explicit
-artifact paths for crosvm and VZ target maintenance.
+`scripts/setup-source-home.sh` consumes a verified image set. Its artifact
+helper checks rootfs, kernel and initrd against the same build manifest before
+creating links, and carries that manifest with the image. An existing file
+retains its owner; a mixed or changed set fails with a repair error. Managed
+Runtime projections use read-only links to the selected artifact store. Setup
+preserves guest bytes, including files reached through symlinks.
+
+Guest changes belong to `scripts/build/build-browser-vm-rootfs.sh`, which stages
+the guest and produces a new image, boot files and manifest together. Source-home
+setup builds the host Runtime and providers; it no longer cross-builds guest
+helpers or patches installed rootfs/initrd files. A host setup alone therefore
+does not establish that its guest was built from the same source. Bind the guest
+build provenance and host installation receipt before product qualification.
+
+Use `scripts/browser-vm-artifact-preflight.sh --verify-image-set` for the
+read-only image-set check, independent of host virtualization. It uses
+`ELASTOS_BROWSER_VM_INITRD` or `browser-vm/initrd` for Linux crosvm, and
+`ELASTOS_BROWSER_VM_INITRAMFS` or `bin/initrd` for Mac VZ, matching each launcher.
+The control-service readiness cache watches those same files.
 
 ## Source-Home Install Truth
 
@@ -390,16 +408,14 @@ generator/stager for:
 - `bin/browser-vm-remote-vz-launcher`
 - `bin/browser-vm-prepare-rootfs-pool`
 - `bin/browser-vz-engine-supervisor` on macOS after the VZ helper is built
-- `browser-vm/rootfs.ext4`, `browser-vm/initrd`, and their refreshed guest
-  scripts when those artifacts already exist
+- verified links to an existing rootfs, kernel, initrd and matching build manifest
 
 For already-provisioned targets, `scripts/browser-vm-target-refresh.sh` is the
-canonical drift-repair path. Do not repair target hosts by hand-copying one
-helper and editing `components.json`; that creates a second install truth. A
-future release may promote Browser VM helpers and rootfs/initrd artifacts into
-explicit component entries, but until that decision is made the renewable
-source-home setup/refresh scripts plus artifact preflight are the reviewable
-contract.
+host-helper maintenance path. Guest drift requires a rebuilt image set. Runtime
+package admission, automatic compatible artifact acquisition, and atomic updates
+of a complete host/guest set remain B01/B02/B15 work. These developer projections
+verify file integrity; publisher authorization and installed product proof retain
+their separate gates.
 
 ## Target Refresh
 
@@ -408,25 +424,17 @@ runtime from source. It requires the normal source toolchain because it can buil
 Rust helpers and WASM capsules.
 
 Use `scripts/browser-vm-target-refresh.sh` for already-provisioned Browser VM
-targets when the reviewed source checkout is current but the installed Browser
-VM helper scripts or guest script artifacts may have drifted. It does not build
-Rust/WASM artifacts. It copies the Browser VM script helpers, refreshes the
-guest target manifest, `browser-selkies-control-service.mjs`, and
-`browser-vm-selkies-start` inside existing rootfs artifacts, refreshes the
-initrd control service helper, preserves `browser-vm/initrd` and
-`browser-vm/rootfs.ext4` symlinks, and creates timestamped backups before
-changed writes. If the guest-control bridge binary has already been built for
-the Linux guest architecture, pass `--guest-control-bridge-bin <path>` to
-refresh `/opt/elastos/bin/browser-vm-guest-control-bridge` inside the rootfs
-with the same backup and `debugfs` verification path. Refresh-only is not
-sufficient for package/dependency changes, Chromium wrapper changes, Selkies
-Python package patches, or other complete guest image changes; rebuild/restage
-the Browser VM rootfs and run the artifact preflight before claiming parity.
+host helpers. It verifies the image set and checks guest parity before changing
+host helpers. A guest mismatch reports the required rebuild and preserves the
+rootfs, initrd, build manifest and installed host helpers. The optional
+`--guest-control-bridge-bin` compares the built bridge with the guest copy.
+The script retains one backup set for changed host helpers under its existing
+retention rule; guest artifacts remain build outputs.
 
-Run the target refresh in two phases: `--verify-only` first, then the write pass
-only if drift is reported. This keeps target closeout reviewable because the
-operator can see exactly whether source, installed helpers, or VM artifacts
-changed before mutating the target.
+Run `--verify-only` first. If host helpers alone differ, the write pass installs
+them. If guest files differ, build and install the complete image set before
+continuing. The image builder supplies guest dependencies, Chromium wrappers,
+Selkies patches and guest helpers through one build path.
 
 Typical Jetson source-home maintenance:
 

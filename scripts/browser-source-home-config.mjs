@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -57,7 +58,7 @@ function usage() {
 Options:
   --out-dir <dir>                 Default: <data-dir>/config
   --vm-supervisor <path>          Default: <data-dir>/bin/browser-vm-engine-supervisor
-  --vm-control-socket <path>      Default: /tmp/elastos-browser-vm-control-<platform>.sock
+  --vm-control-socket <path>      Default: /tmp/elastos-browser-<platform>-<data-dir-hash>-vm-control.sock
   --vm-control-launcher <path>    Optional launcher used to auto-start the VM control socket.
                                   Linux default: <data-dir>/bin/browser-vm-local-crosvm-launcher
                                   Darwin default: <data-dir>/bin/browser-vz-engine-supervisor
@@ -117,6 +118,12 @@ function validateAbsolute(label, value) {
   if (typeof value !== "string" || !value.startsWith("/") || /[\r\n\0]/.test(value)) {
     throw new Error(`${label} must be an absolute path without control characters`);
   }
+}
+
+function runtimeSocketPath(args, role) {
+  // Keep Runtime IPC stable and short even for long data dirs with spaces.
+  const scope = createHash("sha256").update(path.resolve(args.dataDir)).digest("hex").slice(0, 16);
+  return `/tmp/elastos-browser-${args.platform}-${scope}-${role}.sock`;
 }
 
 function hasVmIceEnv(env) {
@@ -574,7 +581,7 @@ function browserLocalExit(relaySocket, { allowPrivateTargets = false } = {}) {
 function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = null) {
   const supervisor = args.vmSupervisor || path.join(args.dataDir, "bin/browser-vm-engine-supervisor");
   validateAbsolute("--vm-supervisor", supervisor);
-  const controlSocket = args.vmControlSocket || `/tmp/elastos-browser-vm-control-${args.platform}.sock`;
+  const controlSocket = args.vmControlSocket || runtimeSocketPath(args, "vm-control");
   validateAbsolute("--vm-control-socket", controlSocket);
   const controlLauncher = args.vmControlLauncher ||
     (args.platform === "darwin-arm64"
@@ -681,8 +688,8 @@ function main() {
     validateAbsolute("--data-dir", args.dataDir);
     const outDir = args.outDir || path.join(args.dataDir, "config");
     validateAbsolute("--out-dir", outDir);
-    const adapterSocket = `/tmp/elastos-browser-source-home-${args.platform}.sock`;
-    const relaySocket = `/tmp/elastos-browser-source-home-${args.platform}-relay.sock`;
+    const adapterSocket = runtimeSocketPath(args, "exit-adapter");
+    const relaySocket = runtimeSocketPath(args, "exit-relay");
     const sourceEnv = runtimeTurnEnv(args);
     const selectedControlLauncher =
       args.vmControlLauncher ||

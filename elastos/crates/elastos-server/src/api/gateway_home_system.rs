@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Context as _;
 use elastos_common::CapsuleRole;
@@ -216,8 +216,20 @@ struct HomeServicesSelectionState {
     remote_offer_requests: BTreeMap<String, HomeServicesRemoteOfferRequestRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct HomeServicesPendingAccessDecision {
+    decision: String,
+    updated_at: u64,
+    // Constructed from bounded grant fields; stored only in protected principal state.
+    remote_exit: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_engine: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HomeServicesRemoteOfferRequestRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_scope: Option<String>,
     request_id: String,
     offer_id: String,
     service_uri: String,
@@ -229,6 +241,12 @@ struct HomeServicesRemoteOfferRequestRecord {
     status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed_remote_exit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_engine_grant: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_access_decision: Option<HomeServicesPendingAccessDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_decision_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +261,8 @@ struct HomeServicesRequestsState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HomeServiceAccessRequestRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_scope: Option<String>,
     request_id: String,
     offer_id: String,
     service_uri: String,
@@ -259,6 +279,14 @@ struct HomeServiceAccessRequestRecord {
     created_at: u64,
     updated_at: u64,
     status: String,
+    #[serde(default)]
+    authenticated_request: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_max_active_streams: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_max_active_streams_per_principal: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,11 +304,18 @@ pub(super) struct ServicesOfferUpdateRequest {
     selected: bool,
 }
 
+enum ServicesPeerTransportBlocking {
+    Runtime(crate::collaboration_discovery_runtime::CollaborationDiscoveryService),
+    Attached {
+        client: reqwest::blocking::Client,
+        api_url: String,
+        client_token: String,
+        peer_cap: String,
+    },
+}
+
 struct ServicesPeerRuntimeBlocking {
-    client: reqwest::blocking::Client,
-    api_url: String,
-    client_token: String,
-    peer_cap: String,
+    transport: ServicesPeerTransportBlocking,
     peer_id: String,
     connect_ticket: String,
 }
@@ -330,9 +365,12 @@ pub(super) async fn home_summary(
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) =
-                apply_services_peer_authority(&state.data_dir, context, &mut home_state.services)
-            {
+            if let Err(err) = apply_services_peer_authority(
+                &state.data_dir,
+                context,
+                state.collaboration_discovery_service.as_ref(),
+                &mut home_state.services,
+            ) {
                 return home_error_response(err);
             }
             if let Err(err) =
@@ -1817,9 +1855,12 @@ fn apply_profile_people_authority(
 fn apply_services_peer_authority(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     services: &mut HomeServicesSummary,
 ) -> anyhow::Result<()> {
-    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     let mut remote_offers = contacts
         .contacts
         .values()
@@ -1937,6 +1978,23 @@ pub(super) async fn people_profile_update(
     }
 }
 
+fn home_services_mutation_lock(data_dir: &std::path::Path) -> anyhow::Result<Arc<Mutex<()>>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(data_dir)?;
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let entry = locks.entry(key).or_default();
+    if let Some(lock) = entry.upgrade() {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    *entry = Arc::downgrade(&lock);
+    Ok(lock)
+}
+
 pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -1947,15 +2005,27 @@ pub(super) async fn services_summary(
             Err(err) => return home_error_response(err),
         };
     let data_dir = state.data_dir.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
+    let provider_registry = state.provider_registry.clone();
     match tokio::task::spawn_blocking(move || {
-        if let Err(err) = home_services_sync_access_decisions(&data_dir, &context) {
+        if let Err(err) = home_services_sync_access_decisions(
+            &data_dir,
+            &context,
+            discovery_service.as_ref(),
+            provider_registry.as_deref(),
+        ) {
             tracing::warn!(
                 error = %err,
                 "could not sync Services access decisions"
             );
         }
         let mut home_state = home_state(&data_dir);
-        apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
+        apply_services_peer_authority(
+            &data_dir,
+            &context,
+            discovery_service.as_ref(),
+            &mut home_state.services,
+        )?;
         apply_home_services_selection(&data_dir, &context, &mut home_state.services)?;
         Ok::<_, anyhow::Error>(home_state.services)
     })
@@ -1978,9 +2048,19 @@ pub(super) async fn services_offer_update(
             Err(err) => return home_error_response(err),
         };
     let data_dir = state.data_dir.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
     match tokio::task::spawn_blocking(move || {
+        let mutation_lock = home_services_mutation_lock(&data_dir)?;
+        let _guard = mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
         let mut home_state = home_state(&data_dir);
-        apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
+        apply_services_peer_authority(
+            &data_dir,
+            &context,
+            discovery_service.as_ref(),
+            &mut home_state.services,
+        )?;
         let offer_id = req.offer_id.trim();
         if offer_id.is_empty() {
             anyhow::bail!("service offer id is required");
@@ -2021,17 +2101,23 @@ pub(super) async fn services_offer_update(
                     }
                 } else if req.selected {
                     if offer.grant_required && !services_state.remote_offer_ids.contains(offer_id) {
-                        let sent = home_services_send_access_request(&data_dir, &context, offer)
-                            .map_err(|err| {
-                                if profile_required_message(&err).is_some() {
-                                    err
-                                } else {
-                                    anyhow::anyhow!("service access request delivery failed: {err}")
-                                }
-                            })?;
+                        let sent = home_services_send_access_request(
+                            &data_dir,
+                            &context,
+                            discovery_service.as_ref(),
+                            offer,
+                        )
+                        .map_err(|err| {
+                            if profile_required_message(&err).is_some() {
+                                err
+                            } else {
+                                anyhow::anyhow!("service access request delivery failed: {err}")
+                            }
+                        })?;
                         services_state.remote_offer_requests.insert(
                             offer_id.to_string(),
                             HomeServicesRemoteOfferRequestRecord {
+                                grant_scope: Some(offer.grant_scope.clone()),
                                 request_id: sent.request_id,
                                 offer_id: offer_id.to_string(),
                                 service_uri: offer.service_uri.clone(),
@@ -2042,6 +2128,9 @@ pub(super) async fn services_offer_update(
                                 updated_at: sent.created_at,
                                 status: "requested".to_string(),
                                 installed_remote_exit_id: None,
+                                remote_engine_grant: None,
+                                pending_access_decision: None,
+                                access_decision_sha256: None,
                             },
                         );
                     }
@@ -2279,6 +2368,9 @@ fn home_save_services_requests_state(
 fn home_services_peer_contact_record_for_offer(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     offer: &HomeServiceOfferSummary,
 ) -> anyhow::Result<HomeServicesPeerContactRecord> {
     let contact_id = offer
@@ -2287,7 +2379,7 @@ fn home_services_peer_contact_record_for_offer(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("service offer is not tied to a person"))?;
-    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     contacts
         .contacts
         .get(contact_id)
@@ -2337,22 +2429,57 @@ fn home_services_local_exit_shared(
         .contains(HOME_BROWSER_EXIT_LOCAL_OFFER_ID))
 }
 
+fn home_services_supported_request(kind: &str, uri: &str) -> bool {
+    (kind == HOME_REMOTE_EXIT_SERVICE_KIND && uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI)
+        || (kind == crate::carrier::ENGINE_SERVICE_KIND
+            && uri == crate::carrier::ENGINE_SERVICE_URI)
+}
+
+fn home_services_local_engine_shared(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<bool> {
+    Ok(home_services_selection_state(data_dir, context)?
+        .local_offer_ids
+        .contains(crate::carrier::ENGINE_LOCAL_OFFER))
+}
+
+fn home_services_request_shared(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    request: &HomeServiceAccessRequestRecord,
+) -> anyhow::Result<bool> {
+    if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+        && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
+    {
+        home_services_local_engine_shared(data_dir, context)
+    } else if request.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
+        && request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
+    {
+        home_services_local_exit_shared(data_dir, context)
+    } else {
+        Ok(false)
+    }
+}
+
 fn home_services_send_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     offer: &HomeServiceOfferSummary,
 ) -> anyhow::Result<HomeServiceAccessRequestSent> {
-    if offer.service_kind != HOME_REMOTE_EXIT_SERVICE_KIND
-        || offer.service_uri != HOME_BROWSER_EXIT_PEER_SERVICE_URI
-    {
-        anyhow::bail!("only Browser Exit service requests are supported");
+    if !home_services_supported_request(&offer.service_kind, &offer.service_uri) {
+        anyhow::bail!("only Browser Engine and Exit service requests are supported");
     }
-    let contact = home_services_peer_contact_record_for_offer(data_dir, context, offer)?;
+    let contact =
+        home_services_peer_contact_record_for_offer(data_dir, context, discovery_service, offer)?;
     let target_peer_id = contact.peer_id.trim();
     if target_peer_id.is_empty() {
         anyhow::bail!("service offer person has no Carrier peer route");
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2369,7 +2496,7 @@ fn home_services_send_access_request(
     let requester_handle = profile.handle.clone();
     let created_at = now_ts();
     let request_id = home_services_new_access_request_id(target_peer_id)?;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema": "elastos.service-access-request/v1",
         "kind": "service_access_request",
         "request_id": &request_id,
@@ -2386,11 +2513,9 @@ fn home_services_send_access_request(
         "grant_scope": &offer.grant_scope,
         "created_at": created_at,
     });
+    crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_send",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -2431,8 +2556,12 @@ fn home_services_require_remote_request_delivery(
 fn home_services_send_access_decision(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request: &HomeServiceAccessRequestRecord,
     decision: &str,
+    created_at: u64,
 ) -> anyhow::Result<()> {
     if !matches!(decision, "approved" | "denied") {
         anyhow::bail!("service access request decision is invalid");
@@ -2441,7 +2570,7 @@ fn home_services_send_access_decision(
     if target_peer_id.is_empty() {
         anyhow::bail!("service access request has no requester peer route");
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2454,7 +2583,6 @@ fn home_services_send_access_decision(
         PROFILE_REQUIRED_SERVICES_MESSAGE,
     )?;
     let provider_display_name = profile.display_name.clone();
-    let created_at = now_ts();
     let mut payload = serde_json::json!({
         "schema": "elastos.service-access-decision/v1",
         "kind": "service_access_decision",
@@ -2480,15 +2608,26 @@ fn home_services_send_access_decision(
             "connect_ticket": &runtime.connect_ticket,
             "allowed_schemes": ["tcp", "tls"],
             "allowed_ports": [80, 443],
-            "max_active_streams": 4,
-            "max_active_streams_per_principal": 2,
+            "expires_at": request.grant_expires_at,
+            "max_active_streams": request.exit_max_active_streams.unwrap_or(4),
+            "max_active_streams_per_principal": request.exit_max_active_streams_per_principal.unwrap_or(2),
         });
     }
+    if decision == "approved"
+        && request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+        && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
+    {
+        payload["remote_engine_grant"] = serde_json::json!({
+            "schema":"elastos.service.remote-engine-grant/v1",
+            "grant_id":crate::carrier::engine_grant_id(&request.request_id),
+            "peer_did":runtime.peer_id, "connect_ticket":runtime.connect_ticket,
+            "operations":crate::carrier::browser_engine_binding::operations(request.grant_scope.as_deref()),
+            "expires_at":request.grant_expires_at,
+        });
+    }
+    crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_send",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -2504,14 +2643,41 @@ fn home_services_send_access_decision(
 fn home_services_sync_access_decisions(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    provider_registry: Option<&elastos_runtime::provider::ProviderRegistry>,
 ) -> anyhow::Result<()> {
+    let mutation_lock = home_services_mutation_lock(data_dir)?;
+    let _guard = mutation_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     let mut state = home_services_selection_state(data_dir, context)?;
     if state.remote_offer_requests.is_empty() {
         return Ok(());
     }
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let current_requests = state
+        .remote_offer_requests
+        .values()
+        .filter(|request| {
+            contacts.contacts.values().any(|contact| {
+                let suffix = if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND {
+                    "browser-engine"
+                } else {
+                    "browser-exit"
+                };
+                home_services_supported_request(&request.service_kind, &request.service_uri)
+                    && request.offer_id == format!("offer:{}:{suffix}", contact.contact_id)
+                    && request.target_peer_id == contact.peer_id
+            })
+        })
+        .map(|request| request.request_id.clone())
+        .collect::<BTreeSet<_>>();
     let known_peers = state
         .remote_offer_requests
         .values()
+        .filter(|request| current_requests.contains(&request.request_id))
         .filter_map(|request| {
             let peer_id = request.target_peer_id.trim();
             (!peer_id.is_empty()).then(|| peer_id.to_string())
@@ -2520,7 +2686,7 @@ fn home_services_sync_access_decisions(
     if known_peers.is_empty() {
         return Ok(());
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2528,10 +2694,7 @@ fn home_services_sync_access_decisions(
         &known_peers.iter().cloned().collect::<Vec<_>>(),
     )?;
     let recv = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_recv",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -2546,24 +2709,20 @@ fn home_services_sync_access_decisions(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if messages.is_empty() {
-        return Ok(());
-    }
     let mut changed = false;
     for message in messages {
-        let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
+        let Ok(payload) = crate::carrier::verify_service_message(&message, "provider_peer_id")
+        else {
             continue;
         };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
+        if !payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| current_requests.contains(id))
+        {
             continue;
-        };
-        match home_services_merge_access_decision(
-            data_dir,
-            context,
-            &mut state,
-            &payload,
-            &runtime.peer_id,
-        ) {
+        }
+        match home_services_merge_access_decision(context, &mut state, &payload, &runtime.peer_id) {
             Ok(merged) => changed |= merged,
             Err(err) => tracing::warn!("service access decision ignored: {err}"),
         }
@@ -2572,11 +2731,23 @@ fn home_services_sync_access_decisions(
         state.updated_at = now_ts();
         home_save_services_selection_state(data_dir, context, &state)?;
     }
+    // Persist the bounded approved receipt before activation, so an ACK or
+    // filesystem failure can retry on the next read after the mailbox advances.
+    for request_id in current_requests {
+        if let Err(err) = home_services_activate_pending_decision(
+            data_dir,
+            context,
+            provider_registry,
+            &mut state,
+            &request_id,
+        ) {
+            tracing::warn!(error = %err, "Services Exit activation remains pending");
+        }
+    }
     Ok(())
 }
 
 fn home_services_merge_access_decision(
-    data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
     state: &mut HomeServicesSelectionState,
     payload: &serde_json::Value,
@@ -2616,10 +2787,12 @@ fn home_services_merge_access_decision(
     let Some(service_kind) = home_services_payload_text(payload, "service_kind", 128) else {
         return Ok(false);
     };
-    let updated_at = payload
+    let Some(updated_at) = payload
         .get("created_at")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or_else(now_ts);
+    else {
+        anyhow::bail!("service access decision requires a valid timestamp");
+    };
     let Some(record) = state.remote_offer_requests.values_mut().find(|record| {
         record.request_id == request_id
             && record.target_peer_id == provider_peer_id
@@ -2628,31 +2801,252 @@ fn home_services_merge_access_decision(
     }) else {
         return Ok(false);
     };
-    let mut installed_remote_exit_id = record.installed_remote_exit_id.clone();
-    if decision == "approved" {
-        if service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
-            && service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
-        {
-            installed_remote_exit_id = Some(home_services_install_remote_exit_grant(
-                data_dir, context, record, payload,
-            )?);
-        }
-    } else if decision == "denied" {
-        if let Some(installed_id) = record.installed_remote_exit_id.as_deref() {
-            home_services_remove_remote_exit_grant(data_dir, installed_id)?;
-        }
-        installed_remote_exit_id = None;
+    let skew = elastos_common::collaboration_protocol::MAX_COLLABORATION_CLOCK_SKEW_SECS;
+    if updated_at == 0
+        || updated_at > now_ts().saturating_add(skew)
+        || updated_at < record.created_at.saturating_sub(skew)
+    {
+        anyhow::bail!("service access decision timestamp is outside the request bounds");
     }
-    if record.status == decision
-        && record.updated_at == updated_at
-        && record.installed_remote_exit_id == installed_remote_exit_id
+    let committed = matches!(record.status.as_str(), "approved" | "denied");
+    // Pending revocation is already the newest provider decision even while the
+    // old grant remains installed until its acknowledgement succeeds.
+    if (committed && updated_at < record.updated_at)
+        || record
+            .pending_access_decision
+            .as_ref()
+            .is_some_and(|pending| updated_at < pending.updated_at)
     {
         return Ok(false);
     }
-    record.status = decision;
-    record.updated_at = updated_at;
-    record.installed_remote_exit_id = installed_remote_exit_id;
+    let pending = HomeServicesPendingAccessDecision {
+        remote_engine: if decision == "approved"
+            && record.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+        {
+            Some(home_services_remote_engine_grant(context, record, payload)?)
+        } else {
+            None
+        },
+        remote_exit: if decision == "approved"
+            && record.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
+        {
+            Some(home_services_remote_exit_grant(context, record, payload)?)
+        } else {
+            None
+        },
+        decision,
+        updated_at,
+    };
+    if let Some(previous) = record
+        .pending_access_decision
+        .as_ref()
+        .filter(|previous| previous.updated_at == updated_at)
+    {
+        if previous != &pending {
+            anyhow::bail!("service access decision revision conflicts");
+        }
+        return Ok(false);
+    }
+    if committed && record.updated_at == updated_at {
+        if record.status != pending.decision
+            || record
+                .access_decision_sha256
+                .as_ref()
+                .is_some_and(|digest| *digest != home_services_access_decision_sha256(&pending))
+        {
+            anyhow::bail!("service access decision revision conflicts");
+        }
+        // Legacy state has no fingerprint. Keep its committed outcome; only a
+        // strictly newer decision can change it.
+        return Ok(false);
+    }
+    record.pending_access_decision = Some(pending);
     Ok(true)
+}
+
+fn home_services_access_decision_sha256(decision: &HomeServicesPendingAccessDecision) -> String {
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(decision).expect("bounded JSON decision"),
+    ))
+}
+
+fn home_services_activate_pending_decision(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    provider_registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+    state: &mut HomeServicesSelectionState,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    let Some(record) = state
+        .remote_offer_requests
+        .values()
+        .find(|record| record.request_id == request_id)
+    else {
+        return Ok(());
+    };
+    let Some(pending) = record.pending_access_decision.clone() else {
+        return Ok(());
+    };
+    let mut next = state.clone();
+    let next_record = next
+        .remote_offer_requests
+        .get_mut(&record.offer_id)
+        .expect("record came from state");
+    next_record.status = pending.decision.clone();
+    next_record.updated_at = pending.updated_at;
+    next_record.access_decision_sha256 = Some(home_services_access_decision_sha256(&pending));
+    next_record.installed_remote_exit_id = pending
+        .remote_exit
+        .as_ref()
+        .and_then(|exit| exit["id"].as_str())
+        .map(str::to_string);
+    next_record.remote_engine_grant = pending.remote_engine.clone();
+    next_record.pending_access_decision = None;
+    next.updated_at = now_ts();
+    if pending.remote_exit.is_none() && record.installed_remote_exit_id.is_none() {
+        home_save_services_selection_state(data_dir, context, &next)?;
+    } else {
+        let (previous_bytes, mut config) = home_services_read_exit_config(data_dir)?;
+        let exits = config
+            .as_object_mut()
+            .expect("validated config object")
+            .entry("remote_carrier_exits")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("Exit config grants must be an array"))?;
+        let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
+        let grant_id = home_services_remote_exit_grant_id(&record.request_id);
+        exits.retain(|exit| {
+            exit["id"].as_str() != Some(&id) && exit["grant_id"].as_str() != Some(&grant_id)
+        });
+        if let Some(exit) = pending.remote_exit {
+            exits.push(exit);
+        }
+        home_services_commit_exit_config(
+            data_dir,
+            provider_registry,
+            previous_bytes.as_deref(),
+            &config,
+            || home_save_services_selection_state(data_dir, context, &next),
+        )?;
+    }
+    *state = next;
+    Ok(())
+}
+
+fn home_services_read_exit_config(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(Option<Vec<u8>>, serde_json::Value)> {
+    let path = home_services_exit_provider_config_path(data_dir);
+    use std::io::Read as _;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((None, serde_json::json!({})))
+        }
+        Err(_) => anyhow::bail!("existing Exit config is unreadable"),
+    };
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("existing Exit config is unreadable"))?;
+    if bytes.len() > 1024 * 1024 {
+        anyhow::bail!("existing Exit config is too large");
+    }
+    let config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("existing Exit config is malformed"))?;
+    if !config.is_object() {
+        anyhow::bail!("existing Exit config must be an object");
+    }
+    Ok((Some(bytes), config))
+}
+
+fn home_services_stage_exit_config(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Exit config requires a parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    Ok(file)
+}
+
+fn home_services_refresh_exit_config(
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    config: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let request_id = hex::encode(Sha256::digest(serde_json::to_vec(config)?));
+    let request =
+        serde_json::json!({"op":"refresh_config", "request_id":request_id, "config":config});
+    let result = tokio::runtime::Handle::current().block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), registry.send_raw("exit", &request)).await
+    });
+    let response = result
+        .map_err(|_| anyhow::anyhow!("Exit provider acknowledgement timed out"))?
+        .map_err(|_| anyhow::anyhow!("Exit provider acknowledgement unavailable"))?;
+    if response["status"] != "ok"
+        || response["data"]["schema"] != "elastos.exit.config-ack/v1"
+        || response["data"]["request_id"] != request_id
+        || response["data"]["state"] != "applied"
+    {
+        anyhow::bail!("Exit provider did not acknowledge the requested configuration");
+    }
+    Ok(())
+}
+
+fn home_services_commit_exit_config(
+    data_dir: &std::path::Path,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+    previous_bytes: Option<&[u8]>,
+    config: &serde_json::Value,
+    save_selection: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let registry = registry.ok_or_else(|| anyhow::anyhow!("Exit provider is unavailable"))?;
+    let path = home_services_exit_provider_config_path(data_dir);
+    // Staging catches write failures before asking the provider to change state.
+    let staged = home_services_stage_exit_config(&path, &serde_json::to_vec_pretty(config)?)?;
+    let previous_config = previous_bytes
+        .map(serde_json::from_slice)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Err(error) = home_services_refresh_exit_config(registry, config) {
+        // A missing/malformed ACK may follow application. Retain the durable
+        // pending decision and explicitly report an unconfirmed compensation.
+        if home_services_refresh_exit_config(registry, &previous_config).is_err() {
+            anyhow::bail!("Exit activation and provider rollback remain unconfirmed");
+        }
+        return Err(error);
+    }
+    let mut replaced = false;
+    let committed = (|| {
+        staged
+            .persist(&path)
+            .map_err(|_| anyhow::anyhow!("Exit config replacement failed"))?;
+        replaced = true;
+        save_selection()
+    })();
+    if let Err(error) = committed {
+        let restored = if replaced {
+            match previous_bytes {
+                Some(bytes) => home_services_stage_exit_config(&path, bytes)
+                    .and_then(|file| file.persist(&path).map(|_| ()).map_err(Into::into)),
+                None => std::fs::remove_file(&path).map_err(Into::into),
+            }
+        } else {
+            Ok(())
+        };
+        let provider_restored = home_services_refresh_exit_config(registry, &previous_config);
+        if restored.is_err() || provider_restored.is_err() {
+            anyhow::bail!("Exit activation rollback remains unconfirmed");
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String {
@@ -2676,6 +3070,221 @@ fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String 
     }
 }
 
+pub(crate) fn authorize_home_service_exit(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    source: &iroh::PublicKey,
+    request: &serde_json::Value,
+    now: u64,
+) -> anyhow::Result<crate::carrier::BrowserExitGrant> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Exit authority scope is unavailable"
+    );
+    let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+        .ok_or_else(|| anyhow::anyhow!("Exit signing identity unavailable"))?;
+    let mut authorized = None;
+    for principal in principals {
+        let context = HomeLaunchTokenContext {
+            principal_id: principal.principal_id,
+            proof_binding_id: Some(principal.proof_binding_id),
+            session_id: String::new(),
+            grant_id: String::new(),
+        };
+        let state = home_services_requests_state(data_dir, &context)?;
+        for record in state.requests.values().filter(|record| {
+            request["grant_id"].as_str()
+                == Some(home_services_remote_exit_grant_id(&record.request_id).as_str())
+        }) {
+            anyhow::ensure!(
+                record.authenticated_request
+                    && record.status == "approved"
+                    && record.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
+                    && record.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
+                    && home_services_local_exit_shared(data_dir, &context)?,
+                "Exit grant is not active"
+            );
+            let profile = load_profile_authority_for_context(data_dir, &context)?
+                .ok_or_else(|| anyhow::anyhow!("Exit profile authority unavailable"))?;
+            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+                data_dir,
+                &context.principal_id,
+                &home_browser_localhost_root(&context),
+                network.clone(),
+                &profile,
+                &local_did,
+            )?;
+            anyhow::ensure!(
+                store.snapshot()?.contacts().iter().any(
+                    |contact| crate::carrier::did_to_public_key(
+                        contact.remote_presence_device_did()
+                    ) == Some(*source)
+                        && record.requester_did.as_deref()
+                            == Some(contact.remote_presence_device_did())
+                ),
+                "Exit requester is no longer an accepted contact"
+            );
+            let grant = crate::carrier::BrowserExitGrant {
+                provider_principal_id: context.principal_id.clone(),
+                requester_principal_id: record
+                    .requester_principal_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Exit requester principal required"))?,
+                requester_endpoint: record
+                    .requester_peer_id
+                    .parse::<iroh::PublicKey>()
+                    .ok()
+                    .ok_or_else(|| anyhow::anyhow!("Exit requester identity invalid"))?,
+                grant_id: home_services_remote_exit_grant_id(&record.request_id),
+                max_active_streams: record.exit_max_active_streams.unwrap_or(4),
+                max_active_streams_per_principal: record
+                    .exit_max_active_streams_per_principal
+                    .unwrap_or(2),
+                revision: record.updated_at,
+                expires_at: record
+                    .grant_expires_at
+                    .ok_or_else(|| anyhow::anyhow!("Exit grant expiry required"))?,
+            };
+            grant.validate(source, request, now)?;
+            anyhow::ensure!(authorized.is_none(), "Exit grant ownership is ambiguous");
+            authorized = Some(grant);
+        }
+    }
+    authorized.ok_or_else(|| anyhow::anyhow!("Exit grant was not issued by this Runtime"))
+}
+
+/// Cancellation can retire only the authenticated requester's generation. A
+/// denied/expired decision still identifies that requester, without restoring
+/// permission to prepare, launch or use an Engine.
+pub(crate) fn authorize_home_engine_preparation_cancellation(
+    data_dir: &std::path::Path,
+    source: &iroh::PublicKey,
+    request: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Engine cancellation authority scope unavailable"
+    );
+    let mut matched = false;
+    for principal in principals {
+        let context = HomeLaunchTokenContext {
+            principal_id: principal.principal_id,
+            proof_binding_id: Some(principal.proof_binding_id),
+            session_id: String::new(),
+            grant_id: String::new(),
+        };
+        let state = home_services_requests_state(data_dir, &context)?;
+        for record in state
+            .requests
+            .values()
+            .filter(|r| request["grant_id"] == crate::carrier::engine_grant_id(&r.request_id))
+        {
+            anyhow::ensure!(
+                !matched
+                    && record.authenticated_request
+                    && matches!(record.status.as_str(), "approved" | "denied")
+                    && record.service_uri == crate::carrier::ENGINE_SERVICE_URI
+                    && record.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+                    && record.grant_scope.as_deref()
+                        == Some(crate::carrier::browser_engine_binding::EXECUTION_SCOPE)
+                    && record.requester_peer_id == source.to_string()
+                    && record.requester_principal_id.as_deref() == request["principal_id"].as_str(),
+                "Engine cancellation requester does not own the retained service decision"
+            );
+            matched = true;
+        }
+    }
+    anyhow::ensure!(
+        matched,
+        "Engine cancellation has no retained service decision"
+    );
+    Ok(())
+}
+
+pub(crate) fn authorize_home_service_engine(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    source: &iroh::PublicKey,
+    request: &serde_json::Value,
+    now: u64,
+) -> anyhow::Result<crate::carrier::BrowserEngineGrant> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Engine authority scope is unavailable"
+    );
+    let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+        .ok_or_else(|| anyhow::anyhow!("Engine signing identity unavailable"))?;
+    let mut authorized = None;
+    for principal in principals {
+        let context = HomeLaunchTokenContext {
+            principal_id: principal.principal_id,
+            proof_binding_id: Some(principal.proof_binding_id),
+            session_id: String::new(),
+            grant_id: String::new(),
+        };
+        let state = home_services_requests_state(data_dir, &context)?;
+        for record in state.requests.values().filter(|record| {
+            request["grant_id"].as_str()
+                == Some(crate::carrier::engine_grant_id(&record.request_id).as_str())
+        }) {
+            anyhow::ensure!(
+                record.authenticated_request
+                    && record.status == "approved"
+                    && record.service_uri == crate::carrier::ENGINE_SERVICE_URI
+                    && record.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+                    && home_services_local_engine_shared(data_dir, &context)?,
+                "Engine grant is not active"
+            );
+            let profile = load_profile_authority_for_context(data_dir, &context)?
+                .ok_or_else(|| anyhow::anyhow!("Engine profile authority unavailable"))?;
+            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+                data_dir,
+                &context.principal_id,
+                &home_browser_localhost_root(&context),
+                network.clone(),
+                &profile,
+                &local_did,
+            )?;
+            anyhow::ensure!(
+                store.snapshot()?.contacts().iter().any(
+                    |contact| crate::carrier::did_to_public_key(
+                        contact.remote_presence_device_did()
+                    ) == Some(*source)
+                        && record.requester_did.as_deref()
+                            == Some(contact.remote_presence_device_did())
+                ),
+                "Engine requester is no longer an accepted contact"
+            );
+            let grant = crate::carrier::BrowserEngineGrant {
+                execution_allowed: record.grant_scope.as_deref()
+                    == Some(crate::carrier::browser_engine_binding::EXECUTION_SCOPE),
+                provider_principal_id: context.principal_id.clone(),
+                requester_principal_id: record
+                    .requester_principal_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Engine requester principal required"))?,
+                requester_endpoint: record
+                    .requester_peer_id
+                    .parse::<iroh::PublicKey>()
+                    .ok()
+                    .ok_or_else(|| anyhow::anyhow!("Engine requester identity invalid"))?,
+                grant_id: crate::carrier::engine_grant_id(&record.request_id),
+                revision: record.updated_at,
+                expires_at: record
+                    .grant_expires_at
+                    .ok_or_else(|| anyhow::anyhow!("Engine grant expiry required"))?,
+            };
+            grant.validate(source, request, now)?;
+            anyhow::ensure!(authorized.is_none(), "Engine grant ownership is ambiguous");
+            authorized = Some(grant);
+        }
+    }
+    authorized.ok_or_else(|| anyhow::anyhow!("Engine grant was not issued by this Runtime"))
+}
+
 fn home_services_remote_exit_grant_id(request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
     format!("services-remote-exit-grant-{}", hex::encode(&digest[..8]))
@@ -2685,12 +3294,11 @@ fn home_services_exit_provider_config_path(data_dir: &std::path::Path) -> std::p
     data_dir.join("config/exit-provider.json")
 }
 
-fn home_services_install_remote_exit_grant(
-    data_dir: &std::path::Path,
+fn home_services_remote_exit_grant(
     context: &HomeLaunchTokenContext,
     record: &HomeServicesRemoteOfferRequestRecord,
     payload: &serde_json::Value,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<serde_json::Value> {
     let grant = payload
         .get("remote_exit_grant")
         .filter(|grant| {
@@ -2709,30 +3317,41 @@ fn home_services_install_remote_exit_grant(
     let provider_peer_id = home_services_payload_text(grant, "peer_did", 256)
         .or_else(|| home_services_payload_text(payload, "provider_peer_id", 256))
         .ok_or_else(|| anyhow::anyhow!("approved Browser Exit grant is missing a provider peer"))?;
+    if provider_peer_id != record.target_peer_id {
+        anyhow::bail!(
+            "approved Browser Exit grant provider endpoint differs from the requested contact"
+        );
+    }
+    let revision = payload["created_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit grant revision required"))?;
+    let expires_at = grant["expires_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit grant expiry required"))?;
+    if grant["grant_id"].as_str()
+        != Some(home_services_remote_exit_grant_id(&record.request_id).as_str())
+        || expires_at <= now_ts()
+        || expires_at <= revision
+        || expires_at - revision > crate::carrier::EXIT_GRANT_TTL_SECS
+    {
+        anyhow::bail!("approved Browser Exit grant is expired or invalid");
+    }
     let id = home_services_remote_exit_id(&record.service_display_name, &record.request_id);
     let grant_id = home_services_remote_exit_grant_id(&record.request_id);
-    let path = home_services_exit_provider_config_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter(|value| value.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if config.get("schema").is_none() {
-        config["schema"] = serde_json::json!("elastos.browser.local-exit.config/v1");
-    }
-    let mut exits = config
-        .get("remote_carrier_exits")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    exits.retain(|exit| {
-        exit.get("id").and_then(serde_json::Value::as_str) != Some(id.as_str())
-            && exit.get("grant_id").and_then(serde_json::Value::as_str) != Some(grant_id.as_str())
-    });
-    exits.push(serde_json::json!({
+    let max_active_streams = grant["max_active_streams"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit stream limit required"))?;
+    let max_active_streams_per_principal = grant["max_active_streams_per_principal"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Exit principal stream limit required"))?;
+    anyhow::ensure!(
+        max_active_streams > 0
+            && max_active_streams <= crate::carrier::EXIT_GRANT_MAX_STREAMS as u64
+            && max_active_streams_per_principal > 0
+            && max_active_streams_per_principal <= max_active_streams,
+        "Exit stream limits are invalid"
+    );
+    Ok(serde_json::json!({
         "id": &id,
         "grant_id": &grant_id,
         "peer_did": provider_peer_id,
@@ -2742,47 +3361,150 @@ fn home_services_install_remote_exit_grant(
         "allowed_hosts": ["*"],
         "allowed_schemes": ["tcp", "tls"],
         "allowed_ports": [80, 443],
-        "max_active_streams": 4,
-        "max_active_streams_per_principal": 2,
-    }));
-    config["remote_carrier_exits"] = serde_json::Value::Array(exits);
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
-    Ok(id)
+        "expires_at": expires_at,
+        "max_active_streams": max_active_streams,
+        "max_active_streams_per_principal": max_active_streams_per_principal,
+    }))
 }
 
-fn home_services_remove_remote_exit_grant(
+fn home_services_remote_engine_grant(
+    context: &HomeLaunchTokenContext,
+    record: &HomeServicesRemoteOfferRequestRecord,
+    payload: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let grant = &payload["remote_engine_grant"];
+    let revision = payload["created_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Engine grant revision required"))?;
+    let expiry = grant["expires_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Engine grant expiry required"))?;
+    let ticket = home_services_payload_text(
+        grant,
+        "connect_ticket",
+        HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES,
+    )
+    .ok_or_else(|| anyhow::anyhow!("Engine Carrier ticket required"))?;
+    anyhow::ensure!(
+        grant["schema"] == "elastos.service.remote-engine-grant/v1"
+            && grant["grant_id"].as_str()
+                == Some(crate::carrier::engine_grant_id(&record.request_id).as_str())
+            && grant["peer_did"].as_str() == Some(&record.target_peer_id)
+            && grant["operations"]
+                == crate::carrier::browser_engine_binding::operations(
+                    record.grant_scope.as_deref()
+                )
+            && expiry > now_ts()
+            && expiry > revision
+            && expiry - revision <= crate::carrier::ENGINE_GRANT_TTL_SECS,
+        "Engine grant is expired or does not match the requested service"
+    );
+    record.target_peer_id.parse::<iroh::PublicKey>()?;
+    Ok(
+        serde_json::json!({"schema":"elastos.service.remote-engine-grant/v1",
+        "id":format!("remote-engine-{}", hex::encode(&Sha256::digest(record.request_id.as_bytes())[..8])),
+        "grant_id":grant["grant_id"],"peer_did":record.target_peer_id,"connect_ticket":ticket,
+        "principal_id":context.principal_id,"operations":grant["operations"],"expires_at":expiry}),
+    )
+}
+
+pub(in crate::api::gateway) fn home_services_remote_engine_grants(
     data_dir: &std::path::Path,
-    installed_id: &str,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let state = home_services_selection_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let mut grants = Vec::new();
+    for record in state.remote_offer_requests.values() {
+        if record.status == "approved"
+            && record.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+            && state.remote_offer_ids.contains(&record.offer_id)
+            && contacts
+                .contacts
+                .values()
+                .any(|contact| contact.peer_id == record.target_peer_id)
+            && record
+                .pending_access_decision
+                .as_ref()
+                .is_none_or(|pending| pending.decision == "approved")
+        {
+            if let Some(grant) = &record.remote_engine_grant {
+                anyhow::ensure!(
+                    grant["principal_id"].as_str() == Some(&context.principal_id),
+                    "Engine grant owner changed"
+                );
+                grants.push(grant.clone());
+            }
+        }
+    }
+    anyhow::ensure!(
+        grants.len() <= 4,
+        "Too many approved Engine services for a bounded observation"
+    );
+    Ok(grants)
+}
+
+/// Runtime receive authority comes from the current durable principal and
+/// verified Profile/contact store. An app launch token is not a background lease.
+/// Use the same request and decision validators as the foreground Services path.
+pub(crate) fn sync_runtime_services_mailboxes(
+    data_dir: &std::path::Path,
+    discovery_service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    provider_registry: &elastos_runtime::provider::ProviderRegistry,
+    round: usize,
 ) -> anyhow::Result<()> {
-    let path = home_services_exit_provider_config_path(data_dir);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "Services principal scope is unavailable"
+    );
+    if principals.is_empty() {
         return Ok(());
+    }
+    let principal = &principals[round % principals.len()];
+    let context = HomeLaunchTokenContext {
+        principal_id: principal.principal_id.clone(),
+        proof_binding_id: Some(principal.proof_binding_id.clone()),
+        session_id: String::new(),
+        grant_id: String::new(),
     };
-    let mut config: serde_json::Value = serde_json::from_str(&raw)?;
-    let Some(exits) = config
-        .get("remote_carrier_exits")
-        .and_then(serde_json::Value::as_array)
-    else {
+    if load_configured_contact_authority_for_context(data_dir, &context, Some(discovery_service))?
+        .is_none()
+    {
         return Ok(());
-    };
-    let filtered = exits
-        .iter()
-        .filter(|exit| exit.get("id").and_then(serde_json::Value::as_str) != Some(installed_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    config["remote_carrier_exits"] = serde_json::Value::Array(filtered);
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
-    Ok(())
+    }
+    // Keep requests and decisions independent: an unavailable incoming request
+    // path must not prevent a previously issued decision from being applied.
+    let requests = home_services_sync_access_requests(data_dir, &context, Some(discovery_service));
+    let decisions = home_services_sync_access_decisions(
+        data_dir,
+        &context,
+        Some(discovery_service),
+        Some(provider_registry),
+    );
+    requests.and(decisions)
 }
 
 pub(super) fn home_services_sync_access_requests(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<()> {
-    if !home_services_local_exit_shared(data_dir, context)? {
+    let mutation_lock = home_services_mutation_lock(data_dir)?;
+    let _guard = mutation_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
+    if !home_services_local_exit_shared(data_dir, context)?
+        && !home_services_local_engine_shared(data_dir, context)?
+    {
         return Ok(());
     }
-    let contacts = home_services_peer_contacts_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     let known_peers = contacts
         .contacts
         .values()
@@ -2794,7 +3516,7 @@ pub(super) fn home_services_sync_access_requests(
     if known_peers.is_empty() {
         return Ok(());
     }
-    let runtime = services_attach_peer_runtime_blocking(data_dir)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
     services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
     services_gossip_join_known_peers_blocking(
         &runtime,
@@ -2802,10 +3524,7 @@ pub(super) fn home_services_sync_access_requests(
         &known_peers.iter().cloned().collect::<Vec<_>>(),
     )?;
     let recv = services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_recv",
         serde_json::json!({
             "topic": HOME_SERVICES_REQUESTS_TOPIC,
@@ -2826,12 +3545,22 @@ pub(super) fn home_services_sync_access_requests(
     let mut state = home_services_requests_state(data_dir, context)?;
     let mut changed = false;
     for message in messages {
-        let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
+        let Ok(payload) = crate::carrier::verify_service_message(&message, "requester_peer_id")
+        else {
             continue;
         };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
+        if !contacts.contacts.values().any(|contact| {
+            payload
+                .get("requester_peer_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(contact.peer_id.as_str())
+                && payload
+                    .get("requester_did")
+                    .and_then(serde_json::Value::as_str)
+                    == contact.did.as_deref()
+        }) {
             continue;
-        };
+        }
         changed |= home_services_merge_access_request(
             &mut state,
             &known_peers,
@@ -2894,9 +3623,7 @@ fn home_services_merge_access_request(
     let Some(service_kind) = home_services_payload_text(payload, "service_kind", 128) else {
         return false;
     };
-    if service_uri != HOME_BROWSER_EXIT_PEER_SERVICE_URI
-        || service_kind != HOME_REMOTE_EXIT_SERVICE_KIND
-    {
+    if !home_services_supported_request(&service_kind, &service_uri) {
         return false;
     }
     let handle = clean_services_peer_payload_handle(payload);
@@ -2906,16 +3633,19 @@ fn home_services_merge_access_request(
     let created_at = payload
         .get("created_at")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(now);
-    let existing_status = state
-        .requests
-        .get(&request_id)
-        .map(|request| request.status.clone());
-    let status = match existing_status.as_deref() {
-        Some("approved") | Some("denied") => existing_status.unwrap_or_default(),
-        _ => "pending".to_string(),
-    };
+        .unwrap_or(0);
+    if created_at == 0
+        || created_at > now.saturating_add(30)
+        || now.saturating_sub(created_at) > crate::carrier::EXIT_GRANT_TTL_SECS
+        || state.requests.contains_key(&request_id)
+    {
+        // Request IDs bind an immutable, authenticated requester and scope.
+        // A replay cannot change a previously approved record or its revision.
+        return false;
+    }
+    let status = "pending".to_string();
     let record = HomeServiceAccessRequestRecord {
+        grant_scope: home_services_payload_text(payload, "grant_scope", 128),
         request_id: request_id.clone(),
         offer_id: home_services_payload_text(payload, "offer_id", 256).unwrap_or_default(),
         service_uri,
@@ -2928,8 +3658,16 @@ fn home_services_merge_access_request(
         requester_display_name,
         requester_handle: handle,
         created_at,
-        updated_at: now,
+        updated_at: state
+            .requests
+            .get(&request_id)
+            .map(|previous| previous.updated_at.max(now))
+            .unwrap_or(now),
         status,
+        authenticated_request: true,
+        grant_expires_at: None,
+        exit_max_active_streams: None,
+        exit_max_active_streams_per_principal: None,
     };
     let changed = state
         .requests
@@ -2978,6 +3716,8 @@ pub(super) fn append_home_service_access_notifications(
         if existing_ids.contains(&id) {
             continue;
         }
+        let engine_request = request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+            && request.service_uri == crate::carrier::ENGINE_SERVICE_URI;
         notifications.unread_count += 1;
         notifications.attention_count += 1;
         notifications.entries.push(HomeNotificationEntrySummary {
@@ -2985,13 +3725,21 @@ pub(super) fn append_home_service_access_notifications(
             source_app: SERVICES_CAPSULE_ID.to_string(),
             kind: "service_access_request".to_string(),
             title: format!(
-                "{} requests your Browser Exit Node",
-                request.requester_display_name
+                "{} requests your {}",
+                request.requester_display_name,
+                if engine_request { "Browser Engine" } else { "Browser Exit Node" }
             ),
-            body: format!(
-                "{} wants to use {}. Approval records your intent; Browser access still requires an installed remote Exit grant.",
-                request.requester_display_name, request.service_display_name
-            ),
+            body: if engine_request {
+                format!(
+                    "{} wants to use {}. Approval allows the requested Browser Engine operations through your Runtime.",
+                    request.requester_display_name, request.service_display_name
+                )
+            } else {
+                format!(
+                    "{} wants to use {}. Approval records your intent; Browser access still requires an installed remote Exit grant.",
+                    request.requester_display_name, request.service_display_name
+                )
+            },
             action_ref: Some(HomeNotificationActionSummary {
                 app: SERVICES_CAPSULE_ID.to_string(),
                 action_id: format!("service-approve-request:{}", request.request_id),
@@ -3006,22 +3754,31 @@ pub(super) fn append_home_service_access_notifications(
 pub(super) fn approve_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, request_id, "approved")
+    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "approved")
 }
 
 pub(super) fn deny_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, request_id, "denied")
+    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "denied")
 }
 
 fn home_services_mark_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
     request_id: &str,
     status: &str,
 ) -> anyhow::Result<String> {
@@ -3029,30 +3786,72 @@ fn home_services_mark_access_request(
     if !home_services_request_id_is_valid(request_id) {
         anyhow::bail!("service request id is invalid");
     }
+    let mutation_lock = home_services_mutation_lock(data_dir)?;
+    let _guard = mutation_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     let mut state = home_services_requests_state(data_dir, context)?;
     let Some(request) = state.requests.get(request_id).cloned() else {
         anyhow::bail!("service request not found");
     };
-    home_services_send_access_decision(data_dir, context, &request, status).map_err(|err| {
+    // Decisions in the same clock second still need distinct, ordered revisions.
+    let revision = now_ts().max(request.updated_at.saturating_add(1));
+    if revision
+        > now_ts().saturating_add(
+            elastos_common::collaboration_protocol::MAX_COLLABORATION_CLOCK_SKEW_SECS,
+        )
+    {
+        anyhow::bail!("service access decision clock is ahead; retry later");
+    }
+    if !matches!(status, "approved" | "denied") || !request.authenticated_request {
+        anyhow::bail!("service request requires an authenticated requester");
+    }
+    if status == "approved" {
+        let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+        if !contacts.contacts.values().any(|contact| {
+            contact.peer_id == request.requester_peer_id && contact.did == request.requester_did
+        }) || !home_services_request_shared(data_dir, context, &request)?
+        {
+            anyhow::bail!("service request person or shared offer is no longer available");
+        }
+    }
+    let mut request = request;
+    request.status = status.to_string();
+    request.updated_at = revision;
+    request.grant_expires_at = (status == "approved")
+        .then(|| revision.saturating_add(crate::carrier::EXIT_GRANT_TTL_SECS));
+    if request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI {
+        let limit = (status == "approved").then_some(crate::carrier::EXIT_GRANT_MAX_STREAMS);
+        request.exit_max_active_streams = limit;
+        request.exit_max_active_streams_per_principal = limit;
+    }
+    state
+        .requests
+        .insert(request_id.to_string(), request.clone());
+    state.updated_at = revision;
+    // The provider owns revocation even when the requester cannot receive gossip.
+    home_save_services_requests_state(data_dir, context, &state)?;
+    home_services_send_access_decision(
+        data_dir,
+        context,
+        discovery_service,
+        &request,
+        status,
+        revision,
+    )
+    .map_err(|err| {
         if profile_required_message(&err).is_some() {
             err
         } else {
             err.context("service access request delivery failed")
         }
     })?;
-    let Some(request) = state.requests.get_mut(request_id) else {
-        anyhow::bail!("service request not found");
-    };
-    request.status = status.to_string();
-    request.updated_at = now_ts();
     let requester = request.requester_display_name.clone();
-    state.updated_at = request.updated_at;
-    home_save_services_requests_state(data_dir, context, &state)?;
     Ok(match status {
         "approved" => format!(
-            "Approved Browser Exit request from {requester}. A private remote Exit grant was sent to the requester."
+            "Approved service request from {requester}. A private scoped grant was sent to the requester."
         ),
-        "denied" => format!("Denied Browser Exit request from {requester}."),
+        "denied" => format!("Denied service request from {requester}."),
         _ => "Updated service request.".to_string(),
     })
 }
@@ -3290,7 +4089,14 @@ async fn home_realtime_snapshot(
     {
         home_state.people = HomePeopleSummary::default();
     }
-    if apply_services_peer_authority(&state.data_dir, context, &mut home_state.services).is_err() {
+    if apply_services_peer_authority(
+        &state.data_dir,
+        context,
+        state.collaboration_discovery_service.as_ref(),
+        &mut home_state.services,
+    )
+    .is_err()
+    {
         home_state.services = HomeServicesSummary::default();
     }
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
@@ -4542,38 +5348,40 @@ fn home_services_peer_contacts_path(
 fn home_services_peer_contacts_state(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<HomeServicesPeerContactsState> {
-    let path = home_services_peer_contacts_path(data_dir, context)?;
-    if !path.is_file() {
-        return Ok(default_home_services_peer_contacts_state(context));
-    }
-    let principal_id = home_browser_principal_id(context);
-    let localhost_root = home_browser_localhost_root(context);
-    let bytes = match crate::auth::read_principal_root_object(
-        data_dir,
-        &principal_id,
-        &localhost_root,
-        &home_services_peer_contacts_uri(context),
-        &path,
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_principal_root_state(&err) => {
-            return Ok(default_home_services_peer_contacts_state(context));
-        }
-        Err(err) if is_missing_principal_root_state_file(&err) => {
-            return Ok(default_home_services_peer_contacts_state(context));
-        }
-        Err(err) => return Err(err),
+    let mut state = default_home_services_peer_contacts_state(context);
+    let Some(authority) =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?
+    else {
+        return Ok(state);
     };
-    let state: HomeServicesPeerContactsState = serde_json::from_slice(&bytes)?;
-    if state.schema != HOME_SERVICES_PEER_CONTACTS_SCHEMA {
-        anyhow::bail!("unsupported Services peer contacts schema");
-    }
-    if state.principal_id != principal_id {
-        anyhow::bail!("Services peer contacts principal mismatch");
-    }
-    if state.localhost_root != localhost_root {
-        anyhow::bail!("Services peer contacts root mismatch");
+    // A contact permits a request. The provider's separate approval grants use.
+    // Delivery follows the endpoint in the current verified Profile chain;
+    // legacy peer files remain migration evidence, never contact authority.
+    for contact in authority.store.snapshot()?.contacts() {
+        let endpoint_did = contact.remote_presence_device_did();
+        let peer_id = crate::carrier::did_to_public_key(endpoint_did)
+            .ok_or_else(|| {
+                anyhow::anyhow!("service offer contact has no verified Carrier endpoint")
+            })?
+            .to_string();
+        let contact_id = home_people_contact_id(contact.remote_profile_did());
+        state.contacts.insert(
+            contact_id.clone(),
+            HomeServicesPeerContactRecord {
+                contact_id,
+                peer_id,
+                did: Some(endpoint_did.to_string()),
+                display_name: contact.remote_display_name().to_string(),
+                handle: contact.remote_handle().map(str::to_string),
+                added_at: contact.added_at(),
+                updated_at: contact.added_at(),
+                source: "accepted_profile_contact".to_string(),
+            },
+        );
     }
     Ok(state)
 }
@@ -4629,30 +5437,37 @@ fn home_services_local_device_did(data_dir: &std::path::Path) -> anyhow::Result<
 
 fn services_attach_peer_runtime_blocking(
     data_dir: &std::path::Path,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
 ) -> anyhow::Result<ServicesPeerRuntimeBlocking> {
-    let coords = load_home_runtime_coords(data_dir)
-        .ok_or_else(|| anyhow::anyhow!("local ElastOS service is not running"))?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?;
-    let token = services_attach_client_token_blocking(&client, &coords)
-        .ok_or_else(|| anyhow::anyhow!("failed to attach to local ElastOS service"))?;
-    let cap = services_request_attached_capability_blocking(
-        &client,
-        &coords.api_url,
-        &token,
-        "elastos://peer/*",
-        "message",
-    )
-    .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
-    let response = services_peer_provider_request_blocking(
-        &client,
-        &coords.api_url,
-        &token,
-        &cap,
-        "get_ticket",
-        serde_json::json!({}),
-    )?;
+    let transport = if let Some(service) = discovery_service {
+        ServicesPeerTransportBlocking::Runtime(service.clone())
+    } else {
+        let coords = load_home_runtime_coords(data_dir)
+            .ok_or_else(|| anyhow::anyhow!("local ElastOS service is not running"))?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let token = services_attach_client_token_blocking(&client, &coords)
+            .ok_or_else(|| anyhow::anyhow!("failed to attach to local ElastOS service"))?;
+        let cap = services_request_attached_capability_blocking(
+            &client,
+            &coords.api_url,
+            &token,
+            "elastos://peer/*",
+            "message",
+        )
+        .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
+        ServicesPeerTransportBlocking::Attached {
+            client,
+            api_url: coords.api_url,
+            client_token: token,
+            peer_cap: cap,
+        }
+    };
+    let response =
+        services_peer_provider_request_blocking(&transport, "get_ticket", serde_json::json!({}))?;
     let peer_id = response
         .get("data")
         .and_then(|data| data.get("node_id"))
@@ -4669,10 +5484,7 @@ fn services_attach_peer_runtime_blocking(
         .filter(|value| value.len() <= HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES)
         .ok_or_else(|| anyhow::anyhow!("Carrier peer provider did not return a bounded ticket"))?;
     Ok(ServicesPeerRuntimeBlocking {
-        client,
-        api_url: coords.api_url,
-        client_token: token,
-        peer_cap: cap,
+        transport,
         peer_id,
         connect_ticket,
     })
@@ -4684,10 +5496,7 @@ fn services_peer_gossip_join_blocking(
     mode: &str,
 ) -> anyhow::Result<()> {
     match services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_join",
         serde_json::json!({ "topic": topic, "mode": mode }),
     ) {
@@ -4706,10 +5515,7 @@ fn services_gossip_join_known_peers_blocking(
         return Ok(());
     }
     services_peer_provider_request_blocking(
-        &runtime.client,
-        &runtime.api_url,
-        &runtime.client_token,
-        &runtime.peer_cap,
+        &runtime.transport,
         "gossip_join_peers",
         serde_json::json!({ "topic": topic, "peers": peers }),
     )
@@ -4780,20 +5586,27 @@ fn services_request_attached_capability_blocking(
 }
 
 fn services_peer_provider_request_blocking(
-    client: &reqwest::blocking::Client,
-    api: &str,
-    client_token: &str,
-    peer_cap: &str,
+    transport: &ServicesPeerTransportBlocking,
     op: &str,
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    let response = client
-        .post(format!("{api}/api/provider/peer/{op}"))
-        .header(AUTHORIZATION, format!("Bearer {client_token}"))
-        .header("X-Capability-Token", peer_cap)
-        .json(&body)
-        .send()?;
-    let body: serde_json::Value = response.json()?;
+    let body: serde_json::Value = match transport {
+        ServicesPeerTransportBlocking::Runtime(service) => {
+            service.request_services_peer_blocking(op, body)?
+        }
+        ServicesPeerTransportBlocking::Attached {
+            client,
+            api_url: api,
+            client_token,
+            peer_cap,
+        } => client
+            .post(format!("{api}/api/provider/peer/{op}"))
+            .header(AUTHORIZATION, format!("Bearer {client_token}"))
+            .header("X-Capability-Token", peer_cap)
+            .json(&body)
+            .send()?
+            .json()?,
+    };
     if body.get("status").and_then(|status| status.as_str()) == Some("error") {
         anyhow::bail!(
             "{}",
