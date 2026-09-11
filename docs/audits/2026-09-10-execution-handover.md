@@ -40,17 +40,22 @@ and left unused. Official installation receipts were refreshed after manifest
 changes. Automated test gateways are stopped; only isolated human-test Homes
 remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
 
-The current next action is the history-preserving integration of model, Assistant
-and UI work. The user identified lost behavior from earlier extractions. The full
-`6972e165` donor merge preserves current recovery/session/shutdown repairs and
-includes storage/window source with separate installed gates. Follow with Sash's
-original shelf and latest committed URUX work, then Irzhy's dependency-ordered
-installed-proof, authority-cutover and follow-up branches. The
-[preservation check](2026-09-11-integration-preservation.md) maps source, missing
-features, target checks and known contradictions. Keep both Assistant workspace
-stores intact. Reuse existing Qwen artifacts in a fresh test-owned Home for the
-Marketplace, reply, cancellation and restart journey. Current user Homes stay
-preserved and installed model acceptance remains pending.
+The full model donor `6972e165` is merged by `b318bfda`. Sash's shelf history
+is reconciled by `37c82d4f` after full behavior comparison. The active Irzhy
+foundation intake is `617796a9` (PR60, which replaced PR57). Finish its source
+gates, then freeze further intake for one installed Qwen journey in a fresh
+test-owned Mac Home. Reuse the existing signed model package and engine. Prove
+catalog visibility and normal cancel before a large transfer, then preparation,
+selection, reply, stop and restart/reuse. Carrier cold delivery retains its
+separate Required gate. Existing user Homes stay preserved.
+
+The [preservation check](2026-09-11-integration-preservation.md) accounts for all
+13 Irzhy and Sash PRs created or updated in September. It records original
+history, adopted behavior, explicit differences and remaining proof. URUX,
+Irzhy authority cutover and the Required follow-up work enter after this installed
+checkpoint, in dependency order. Keep both Assistant workspace stores intact;
+one visible Assistant requires full history and draft preservation. Integrated
+UI and model acceptance remains pending.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

@@ -2450,10 +2450,15 @@ pub async fn publish_directory_via_provider(
         .await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContentPublishRequirements {
     min_replicas: u32,
     require_live_multi_peer_proof: bool,
+    /// Availability policy name recorded in the signed availability receipt
+    /// (`ensure_network_availability` reads it as `availability_policy`).
+    /// Callers that verify the receipt against a named policy must set it;
+    /// otherwise the provider records its `network_default`.
+    availability_policy: Option<String>,
 }
 
 impl ContentPublishRequirements {
@@ -2467,14 +2472,31 @@ impl ContentPublishRequirements {
         Ok(Self {
             min_replicas,
             require_live_multi_peer_proof,
+            availability_policy: None,
         })
     }
 
-    fn to_json(self) -> Value {
+    pub(crate) fn with_availability_policy(mut self, policy: &str) -> anyhow::Result<Self> {
+        let policy = policy.trim();
+        if policy.is_empty() {
+            anyhow::bail!("content publish availability policy must not be empty");
+        }
+        self.availability_policy = Some(policy.to_string());
+        Ok(self)
+    }
+
+    fn to_json(&self) -> Value {
         json!({
             "min_replicas": self.min_replicas,
             "require_live_multi_peer_proof": self.require_live_multi_peer_proof,
         })
+    }
+
+    fn apply_to_publish_request(&self, request: &mut Value) {
+        request["availability_requirements"] = self.to_json();
+        if let Some(policy) = &self.availability_policy {
+            request["availability_policy"] = Value::String(policy.clone());
+        }
     }
 }
 
@@ -2597,7 +2619,7 @@ async fn publish_directory_via_provider_impl(
         request["publisher_did"] = Value::String(publisher_did.to_string());
     }
     if let Some(requirements) = requirements {
-        request["availability_requirements"] = requirements.to_json();
+        requirements.apply_to_publish_request(&mut request);
     }
     if !links.is_empty() {
         request["links"] = Value::Array(

@@ -15,6 +15,7 @@ use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, WalletProviderOperationV2, WalletProviderRequestV2,
     WalletProviderResponseV2, WalletResultV2,
 };
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
@@ -691,6 +692,32 @@ impl<'a> RuntimeReleaseCoordinator<'a> {
     }
 }
 
+/// Extracts the canonical rights signature result from a Wallet `ok` payload.
+/// The Wallet answers a `RequestProtectedContentRightsSignature` in one of
+/// two shapes: the bare result (a signer that completes inline), or the
+/// approval envelope it replays for an exact managed request once the
+/// principal approved it (`approval_request` + `signed_result`, with
+/// `requires_approval` false). Both carry the same result; a still-pending
+/// envelope (no `signed_result`) yields nothing.
+pub fn wallet_rights_signature_result(
+    data: &Value,
+) -> Option<ProtectedContentRightsSignatureResultV1> {
+    if let Ok(result) =
+        serde_json::from_value::<ProtectedContentRightsSignatureResultV1>(data.clone())
+    {
+        return Some(result);
+    }
+    if data.get("approval_request").is_none()
+        || data.get("requires_approval").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    serde_json::from_value::<ProtectedContentRightsSignatureResultV1>(
+        data.get("signed_result")?.clone(),
+    )
+    .ok()
+}
+
 pub(crate) fn validate_wallet_rights_signature(
     wallet_request: &WalletProviderRequestV2,
     wallet_response: &WalletProviderResponseV2,
@@ -715,10 +742,8 @@ pub(crate) fn validate_wallet_rights_signature(
         return Err(RuntimeReleaseCoordinatorError::WalletAuthority);
     }
     let result = match &wallet_response.result {
-        WalletResultV2::Ok { data } => {
-            serde_json::from_value::<ProtectedContentRightsSignatureResultV1>(data.clone())
-                .map_err(|_| RuntimeReleaseCoordinatorError::WalletAuthority)?
-        }
+        WalletResultV2::Ok { data } => wallet_rights_signature_result(data)
+            .ok_or(RuntimeReleaseCoordinatorError::WalletAuthority)?,
         WalletResultV2::Error { .. } => {
             return Err(RuntimeReleaseCoordinatorError::WalletAuthority)
         }
@@ -1458,6 +1483,35 @@ mod tests {
         )
     }
 
+    #[test]
+    fn wallet_rights_signature_result_accepts_bare_and_replayed_approval_shapes() {
+        let result = json!({
+            "schema": "elastos.wallet.protected-content-rights-signature-result/v1",
+            "account_id": "wallet:eip155:20:0x00000000000000000000000000000000000000aa",
+            "signer": "0x00000000000000000000000000000000000000aa",
+            "wallet_signed_rights_request_hex": "00",
+        });
+        let bare = super::wallet_rights_signature_result(&result);
+        let replayed = super::wallet_rights_signature_result(&json!({
+            "approval_request": { "request_id": "wallet-request:1", "status": "completed" },
+            "requires_approval": false,
+            "signature": null,
+            "signed_result": result,
+            "signature_receipt": { "request_id": "wallet-request:1" },
+        }));
+        let pending = super::wallet_rights_signature_result(&json!({
+            "approval_request": { "request_id": "wallet-request:1", "status": "pending" },
+            "requires_approval": true,
+            "signature": null,
+        }));
+        assert!(bare.is_some(), "bare result must decode");
+        assert_eq!(
+            bare, replayed,
+            "replayed approval envelope carries the same result"
+        );
+        assert!(pending.is_none(), "a pending approval carries no signature");
+    }
+
     fn owner_only_root(temp: &tempfile::TempDir) -> PathBuf {
         let parent = temp.path().join("owner-only-parent");
         create_owner_only_directory(&parent);
@@ -2124,6 +2178,109 @@ mod tests {
             Err(RuntimeReleaseCoordinatorError::ProviderSelection)
         );
         assert_eq!(r1.request_count(), 0);
+        assert_eq!(c1.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_completes_on_exact_resume_with_one_unreachable_node() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_root(&temp);
+        let operation = signed_runtime_release_operation(0x42);
+        let (wallet_request, wallet_response) = wallet_request_response(&operation);
+        // Node 1 is the unreachable node: it errors on both evaluate_rights and
+        // release_contribution. Dispatch order follows sorted node public keys
+        // (not insertion order), which places node 2 before node 1 here, so
+        // node 2's decision is collected and persisted before dispatch hits the
+        // dead node and fails closed.
+        let r1 = FakeRightsProvider::new(vec![Err(RuntimeProviderCallError::NoExactResult)]);
+        let r2 = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 2, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let r3 = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 3, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let c1 = FakeCustodyProvider::new(vec![Err(RuntimeProviderCallError::NoExactResult)]);
+        let c2 = FakeCustodyProvider::new(vec![Ok(CustodyProviderResponseV1::new_contribution(
+            &signed_node_contribution(&operation, 2),
+        )
+        .unwrap())]);
+        let c3 = FakeCustodyProvider::new(vec![Ok(CustodyProviderResponseV1::new_contribution(
+            &signed_node_contribution(&operation, 3),
+        )
+        .unwrap())]);
+        let runtime = coordinator(
+            &root,
+            vec![
+                selected(&r1, &c1, 1),
+                selected(&r2, &c2, 2),
+                selected(&r3, &c3, 3),
+            ],
+        );
+
+        // Act 1: InitialDispatch. Node 1 is unreachable (evaluate_rights
+        // errors), so the fail-closed dispatch path stops there without ever
+        // reaching node 3 or dispatching to custody, yielding a non-terminal
+        // partial (offer: None).
+        let first = runtime
+            .release(
+                &wallet_request,
+                &wallet_response,
+                operation.clone(),
+                NOW + 6,
+            )
+            .await
+            .unwrap();
+        let operation_hash = match first {
+            RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                operation_hash,
+                reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+            } => operation_hash,
+            other => panic!("unexpected first outcome: {other:?}"),
+        };
+        assert_eq!(r1.request_count(), 1);
+        assert_eq!(r2.request_count(), 1);
+        assert_eq!(r3.request_count(), 0);
+        assert_eq!(c1.request_count(), 0);
+        assert_eq!(c2.request_count(), 0);
+        assert_eq!(c3.request_count(), 0);
+        let persisted_after_initial_dispatch = RuntimeReleaseJournal::new(root.clone())
+            .load(operation_hash)
+            .unwrap();
+        // Node 2's decision, collected before dispatch hit the dead node, is
+        // durably persisted so the resume below does not need to re-collect it.
+        assert_eq!(
+            persisted_after_initial_dispatch
+                .replayable_rights_decisions()
+                .len(),
+            1
+        );
+
+        // Act 2: ExactResume with the same dead node 1 skips it and completes
+        // at threshold using nodes 2 and 3.
+        let resumed = runtime.resume_exact(operation_hash, NOW + 6).await.unwrap();
+        match resumed {
+            RuntimeReleaseCoordinatorOutcome::Terminal(
+                RuntimeReleaseTerminalResult::ContributionsReady {
+                    signed_node_contributions,
+                },
+            ) => assert_eq!(signed_node_contributions.len(), 2),
+            other => panic!("unexpected resumed outcome: {other:?}"),
+        }
+        let persisted = RuntimeReleaseJournal::new(root)
+            .load(operation_hash)
+            .unwrap();
+        assert!(matches!(
+            persisted.terminal_result(),
+            Some(RuntimeReleaseTerminalResult::ContributionsReady { .. })
+        ));
+        assert_eq!(r2.request_count(), 1);
+        assert_eq!(r3.request_count(), 1);
+        assert_eq!(c2.request_count(), 1);
+        assert_eq!(c3.request_count(), 1);
+        // The dead node never contributed: it never obtains a persisted rights
+        // decision, so custody is never dispatched to it at all.
         assert_eq!(c1.request_count(), 0);
     }
 

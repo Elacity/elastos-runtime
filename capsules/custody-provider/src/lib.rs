@@ -143,6 +143,22 @@ pub fn load_state_from_root(
     })
 }
 
+/// Reads only the trusted Runtime issuer a provisioned state root was bound
+/// to, without touching the node's secrets. A custody host uses it to point
+/// every plane that verifies signed Runtime operations (the chain
+/// rights-evidence plane) at the same issuer the custody plane trusts.
+pub fn load_trusted_runtime_issuer(
+    root: &Path,
+) -> Result<RuntimeOperationIssuerKeyV1, CustodyProviderStateRootError> {
+    let root = normalize_root_path(root)?;
+    let paths = CustodyProviderStatePaths::derive(root);
+    validate_existing_path_components(&paths.root)?;
+    validate_owner_only_directory(&paths.root)?;
+    let issuer_bytes = read_hex32_file(&paths.trusted_runtime_issuer)?;
+    RuntimeOperationIssuerKeyV1::new(*issuer_bytes)
+        .map_err(|_| CustodyProviderStateRootError::MissingOrUnsafe)
+}
+
 pub fn provision_state_root(
     root: &Path,
     expected_runtime_issuer: RuntimeOperationIssuerKeyV1,

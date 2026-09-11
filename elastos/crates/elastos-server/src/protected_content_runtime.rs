@@ -55,11 +55,12 @@ use elastos_protected_content_runtime::{
     RuntimeMediaPreparationState, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
     RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence,
     RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
-    RuntimePreparedRecipientCancelResult, RuntimeProtectedContentPurchaseIntent,
-    RuntimePurchaseEffectAuthority, RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator,
-    RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseJournalError,
-    RuntimeReleaseTerminalResult, RuntimeSelectedProvider, RuntimeVerifiedContentAvailability,
-    RuntimeVerifiedPurchaseEffect, RuntimeViewerSession, RuntimeViewerSessionCloseResult,
+    RuntimePreparedRecipient, RuntimePreparedRecipientCancelResult,
+    RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
+    RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
+    RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
+    RuntimeSelectedProvider, RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
+    RuntimeViewerSession, RuntimeViewerSessionCloseResult,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
@@ -148,6 +149,42 @@ pub(crate) const RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody decrypt provider is unavailable";
 pub(crate) const RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody viewer release approval is unavailable";
+/// The Wallet holds the viewer release rights-signature request as a pending
+/// managed approval; the caller approves it in the Wallet and re-issues the
+/// identical open, which resumes the persisted release.
+pub(crate) const RUNTIME_CUSTODY_OPEN_PENDING_MESSAGE: &str =
+    "Runtime custody viewer release is pending exact Wallet approval";
+
+/// Fail-closed mapping for the viewer release path: logs the cause and source
+/// line at warn and keeps the stable message outermost while carrying the
+/// cause chain (surfaced as the library error `detail`).
+macro_rules! release_unavailable {
+    () => {
+        |error| {
+            tracing::warn!(
+                line = line!(),
+                error = ?error,
+                "Runtime custody viewer release failed closed"
+            );
+            anyhow::anyhow!("{:?}", error)
+                .context(format!("{}:{}", file!(), line!()))
+                .context(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE)
+        }
+    };
+}
+
+macro_rules! release_unavailable_missing {
+    () => {
+        || {
+            tracing::warn!(
+                line = line!(),
+                "Runtime custody viewer release failed closed"
+            );
+            anyhow::anyhow!("{}:{}", file!(), line!())
+                .context(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE)
+        }
+    };
+}
 pub(crate) const RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE: &str =
     "Runtime custody mint requires cleanup reconciliation";
 pub(crate) const RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE: &str =
@@ -1476,7 +1513,11 @@ pub fn derive_protected_content_runtime_issuer(
         .map_err(|_| anyhow::anyhow!("active Runtime operation issuer is invalid"))
 }
 
-pub(crate) fn inactive_custody_state_root(data_dir: &Path) -> std::path::PathBuf {
+/// The provisioned state root an inactive custody provider is hosted from.
+///
+/// `elastos protected-content-config provision-custody-node` creates it; a
+/// custody host reads it to fail closed before spawning anything.
+pub fn inactive_custody_state_root(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(INACTIVE_CUSTODY_ROOT)
 }
 
@@ -2618,7 +2659,15 @@ pub(crate) async fn invoke_json_provider_with_transport(
             transport,
         })
         .await
-        .map_err(|_| format!("{target} provider {op} invocation failed"))?;
+        .map_err(|error| {
+            tracing::warn!(
+                %target,
+                %op,
+                error = %error,
+                "provider invocation failed"
+            );
+            format!("{target} provider {op} invocation failed: {error}")
+        })?;
     let status = response
         .get("status")
         .and_then(Value::as_str)
@@ -2628,7 +2677,23 @@ pub(crate) async fn invoke_json_provider_with_transport(
             .get("data")
             .cloned()
             .ok_or_else(|| format!("{target} provider {op} response is missing data")),
-        "error" => Err(format!("{target} provider {op} rejected the request")),
+        "error" => {
+            // Keep the provider's own code/message: this string travels back
+            // to the caller (over Carrier for a committee member) and is the
+            // only trace of why a node refused.
+            let code = response
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let message = response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            tracing::warn!(%target, %op, %code, %message, "provider rejected the request");
+            Err(format!(
+                "{target} provider {op} rejected the request: {code}: {message}"
+            ))
+        }
         _ => Err(format!(
             "{target} provider {op} response has unsupported status"
         )),
@@ -2708,14 +2773,19 @@ pub async fn publish_and_verify_protected_content_availability(
     protected_content_dir: &Path,
     media_identity: &CencFmp4MediaIdentityV1,
     requirement: &RuntimeContentAvailabilityRequirement,
-    now_unix_seconds: u64,
+    now_unix_seconds: impl Fn() -> u64,
 ) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
     validate_protected_content_availability_requirement(requirement)?;
     verify_protected_content_directory(protected_content_dir, media_identity)?;
+    // The receipt is verified against `requirement.policy()` below, and the
+    // content plane records whatever `availability_policy` the publish
+    // request names (its own `network_default` otherwise), so the policy has
+    // to travel with the publish request.
     let publish_requirements = crate::content::ContentPublishRequirements::new(
         requirement.minimum_replicas(),
         PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF,
-    )?;
+    )?
+    .with_availability_policy(requirement.policy())?;
     let content_cid = crate::content::publish_directory_via_provider_with_kind_and_requirements(
         registry,
         protected_content_dir,
@@ -2729,6 +2799,11 @@ pub async fn publish_and_verify_protected_content_availability(
     let manifest = crate::content::fetch_content_object_manifest(registry, &content_cid).await?;
     verify_protected_content_manifest_and_files(registry, &content_cid, &manifest, media_identity)
         .await?;
+    // The receipt's `checked_at` is stamped when the replication round
+    // finishes, which can be well over the future-skew allowance after this
+    // function was entered (three-node replication takes tens of seconds),
+    // so the freshness reference is sampled now, not by the caller.
+    let now_unix_seconds = now_unix_seconds();
     verify_protected_content_receipt(
         &content_cid,
         &manifest,
@@ -2750,6 +2825,38 @@ fn validate_protected_content_availability_requirement(
     Ok(())
 }
 
+/// Re-observes availability for `content_cid` through the content plane's
+/// `ensure` (local pin + Carrier replica proofs, signed into a new receipt
+/// bound to the requirement's policy, object identity and publisher), then
+/// returns that receipt. Nothing is republished.
+async fn refresh_content_availability_receipt(
+    registry: &ProviderRegistry,
+    content_cid: &str,
+    requirement: &RuntimeContentAvailabilityRequirement,
+) -> anyhow::Result<Vec<u8>> {
+    let response = registry
+        .send_raw(
+            CONTENT_PROVIDER_ID,
+            &json!({
+                "op": "ensure",
+                "cid": content_cid,
+                "availability_requirements": {
+                    "min_replicas": requirement.minimum_replicas(),
+                    "require_live_multi_peer_proof": PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF,
+                },
+                "availability_policy": requirement.policy(),
+                "object_did": requirement.expected_object_identity(),
+                "publisher_did": requirement.expected_publisher_did(),
+            }),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("protected content ensure is unavailable: {error}"))?;
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        anyhow::bail!("protected content ensure is invalid");
+    }
+    fetch_content_availability_receipt(registry, content_cid).await
+}
+
 async fn fetch_content_availability_receipt(
     registry: &ProviderRegistry,
     content_cid: &str,
@@ -2760,7 +2867,7 @@ async fn fetch_content_availability_receipt(
             &json!({ "op": "status", "cid": content_cid }),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("protected content status is unavailable"))?;
+        .map_err(|error| anyhow::anyhow!("protected content status is unavailable: {error}"))?;
     if response.get("status").and_then(Value::as_str) != Some("ok") {
         anyhow::bail!("protected content status is invalid");
     }
@@ -3127,37 +3234,60 @@ fn validate_runtime_media_staging_root(staging_root: &Path) -> anyhow::Result<()
     )
 }
 
-fn source_media_digest(path: &Path) -> anyhow::Result<Digest32> {
-    let file = open_runtime_media_source_file(path)?;
-    let metadata = file
+/// Reads the creator's source object for media preparation through the
+/// principal-root object path. A protected root (recovery activated) stores
+/// every object as an encrypted `elastos.principal-root.object/v1` envelope,
+/// which a raw file copy would hand to the media provider as ciphertext; an
+/// unprotected root passes through unchanged. The whole object is held in
+/// memory because a protected object is one AES-GCM envelope and cannot be
+/// streamed; MEDIA_PROVIDER_MAX_INPUT_BYTES bounds the plaintext.
+fn read_runtime_media_source(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    source_file_path: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    const MESSAGE: &str = "Runtime custody media preparation input is invalid";
+    let source = open_runtime_media_source_file(source_file_path)?;
+    let stored_len = source
         .metadata()
-        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
-    if metadata.len() == 0 || metadata.len() > MEDIA_PROVIDER_MAX_INPUT_BYTES {
-        anyhow::bail!("Runtime custody media preparation input is invalid");
+        .map_err(|error| anyhow::Error::new(error).context(MESSAGE))?
+        .len();
+    drop(source);
+    // A protected envelope carries base64 ciphertext plus metadata, so the
+    // stored file may exceed the plaintext bound by a constant factor.
+    if stored_len == 0 || stored_len > MEDIA_PROVIDER_MAX_INPUT_BYTES.saturating_mul(2) {
+        return Err(
+            anyhow::anyhow!("stored source length {stored_len} is out of bounds").context(MESSAGE),
+        );
     }
-    let mut source = std::io::Read::take(file, MEDIA_PROVIDER_MAX_INPUT_BYTES + 1);
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
-        if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(read as u64)
-            .ok_or_else(|| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
-        if total > MEDIA_PROVIDER_MAX_INPUT_BYTES {
-            anyhow::bail!("Runtime custody media preparation input is invalid");
-        }
-        hasher.update(&buffer[..read]);
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let bytes = crate::auth::read_principal_root_object(
+        data_dir,
+        principal_id,
+        &localhost_root,
+        object_uri,
+        source_file_path,
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            %object_uri,
+            error = ?error,
+            "runtime custody media preparation: source object is unreadable"
+        );
+        error.context(MESSAGE)
+    })?;
+    if bytes.is_empty() || bytes.len() as u64 > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+        return Err(
+            anyhow::anyhow!("source plaintext length {} is out of bounds", bytes.len())
+                .context(MESSAGE),
+        );
     }
-    if total != metadata.len() {
-        anyhow::bail!("Runtime custody media preparation input is invalid");
-    }
-    Ok(Digest32::new(hasher.finalize().into()))
+    Ok(bytes)
+}
+
+fn runtime_media_source_digest(bytes: &[u8]) -> Digest32 {
+    Digest32::new(sha2::Sha256::digest(bytes).into())
 }
 
 fn reset_runtime_media_operation_root(operation_root: &Path) -> anyhow::Result<()> {
@@ -3177,16 +3307,18 @@ fn reset_runtime_media_operation_root(operation_root: &Path) -> anyhow::Result<(
     Ok(())
 }
 
-fn copy_runtime_media_provider_input_file(
-    source_file_path: &Path,
+/// Stages the already-read source bytes as the media provider's input file.
+/// The digest is re-checked here so the staged file is provably the bytes the
+/// preparation record was keyed on.
+fn stage_runtime_media_provider_input(
+    source_bytes: &[u8],
     destination_path: &Path,
     expected_digest: Digest32,
 ) -> anyhow::Result<()> {
-    let source = open_runtime_media_source_file(source_file_path)?;
-    let metadata = source
-        .metadata()
-        .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
-    if metadata.len() == 0 || metadata.len() > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+    if source_bytes.is_empty()
+        || source_bytes.len() as u64 > MEDIA_PROVIDER_MAX_INPUT_BYTES
+        || runtime_media_source_digest(source_bytes) != expected_digest
+    {
         anyhow::bail!("Runtime custody media preparation input is invalid");
     }
     let mut destination = fs::OpenOptions::new()
@@ -3197,34 +3329,12 @@ fn copy_runtime_media_provider_input_file(
     #[cfg(unix)]
     fs::set_permissions(destination_path, fs::Permissions::from_mode(0o600))
         .map_err(|_| runtime_media_private_state_error(String::new()))?;
-    let mut source = std::io::Read::take(source, MEDIA_PROVIDER_MAX_INPUT_BYTES + 1);
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|_| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
-        if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(read as u64)
-            .ok_or_else(|| anyhow::anyhow!("Runtime custody media preparation input is invalid"))?;
-        if total > MEDIA_PROVIDER_MAX_INPUT_BYTES {
-            anyhow::bail!("Runtime custody media preparation input is invalid");
-        }
-        destination
-            .write_all(&buffer[..read])
-            .map_err(|_| runtime_media_private_state_error(String::new()))?;
-        hasher.update(&buffer[..read]);
-    }
+    destination
+        .write_all(source_bytes)
+        .map_err(|_| runtime_media_private_state_error(String::new()))?;
     destination
         .sync_all()
         .map_err(|_| runtime_media_private_state_error(String::new()))?;
-    if total != metadata.len() || Digest32::new(hasher.finalize().into()) != expected_digest {
-        anyhow::bail!("Runtime custody media preparation input is invalid");
-    }
     Ok(())
 }
 
@@ -3584,7 +3694,13 @@ async fn prepare_runtime_custody_library_source(
     source: &RuntimeCustodyLibrarySourceInput,
 ) -> anyhow::Result<RuntimeLibraryMediaPreparation> {
     let staging_root = runtime_media_staging_root(data_dir);
-    let source_object_digest = source_media_digest(&source.source_file_path)?;
+    let source_bytes = read_runtime_media_source(
+        data_dir,
+        &source.principal_id,
+        &source.object_uri,
+        &source.source_file_path,
+    )?;
+    let source_object_digest = runtime_media_source_digest(&source_bytes);
     let expected = RuntimeMediaPreparationRecord::new(
         &source.principal_id,
         &source.object_uri,
@@ -3618,8 +3734,8 @@ async fn prepare_runtime_custody_library_source(
             validate_runtime_media_staging_root(&staging_root)?;
             let operation_root = staging_root.join(hex::encode(expected.operation_id().as_bytes()));
             reset_runtime_media_operation_root(&operation_root)?;
-            if let Err(error) = copy_runtime_media_provider_input_file(
-                &source.source_file_path,
+            if let Err(error) = stage_runtime_media_provider_input(
+                &source_bytes,
                 &operation_root.join(MEDIA_PROVIDER_INPUT_FILE_NAME),
                 source_object_digest,
             ) {
@@ -3697,8 +3813,8 @@ async fn prepare_runtime_custody_library_source(
     }
     validate_runtime_media_staging_root(&staging_root)?;
     reset_runtime_media_operation_root(&operation_root)?;
-    if let Err(error) = copy_runtime_media_provider_input_file(
-        &source.source_file_path,
+    if let Err(error) = stage_runtime_media_provider_input(
+        &source_bytes,
         &operation_root.join(MEDIA_PROVIDER_INPUT_FILE_NAME),
         source_object_digest,
     ) {
@@ -3884,6 +4000,11 @@ pub(crate) async fn publish_runtime_custody_library_object(
     let protected =
         protect_runtime_custody_media(&registry, &mint_journal, &composition, &input, &mint_intent)
             .await?;
+    tracing::debug!(
+        request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+        segments = protected.encrypted_segments.len(),
+        "runtime custody publish: media protected"
+    );
     let policy = resolve_runtime_rights_policy(
         registry.as_ref(),
         protected.media_identity.encrypted_content(),
@@ -3891,7 +4012,14 @@ pub(crate) async fn publish_runtime_custody_library_object(
         RightsActionV1::View,
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Runtime custody rights policy is unavailable"))?;
+    .map_err(|error| {
+        tracing::warn!(%error, "Runtime custody rights policy resolution failed");
+        error.context("Runtime custody rights policy is unavailable")
+    })?;
+    tracing::debug!(
+        request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+        "runtime custody publish: rights policy resolved"
+    );
     let mint_draft = RuntimeMintDraft::new(
         &protected.init_segment,
         &protected.encrypted_segments,
@@ -3927,6 +4055,11 @@ pub(crate) async fn publish_runtime_custody_library_object(
             if mint_id == mint_draft.mint_id() => {}
         _ => anyhow::bail!("Runtime custody mint failed"),
     }
+    tracing::debug!(
+        mint_id = %hex::encode(mint_draft.mint_id().as_bytes()),
+        nodes = mint_draft.nodes().len(),
+        "runtime custody publish: custody provisioned"
+    );
     let content_id = runtime_protected_content_id(mint_draft.encrypted_content())?;
     let publisher_profile_did = load_runtime_custody_profile_did(data_dir, &input.principal_id)?;
     let requirement = RuntimeContentAvailabilityRequirement::new(
@@ -3945,10 +4078,25 @@ pub(crate) async fn publish_runtime_custody_library_object(
         staging.path(),
         mint_draft.media_identity(),
         &requirement,
-        crate::auth::now_ts(),
+        crate::auth::now_ts,
     )
     .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
+    .map_err(|error| {
+        // The caller sees the fail-closed message; the verifier's actual
+        // reason travels as the cause chain (and the operator log).
+        tracing::warn!(
+            mint_id = %hex::encode(mint_draft.mint_id().as_bytes()),
+            %error,
+            "Runtime custody content availability verification failed"
+        );
+        error.context(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE)
+    })?;
+    tracing::debug!(
+        mint_id = %hex::encode(mint_draft.mint_id().as_bytes()),
+        content_id = %content_id,
+        replicas = evidence.observed_replicas(),
+        "runtime custody publish: content availability verified"
+    );
     match coordinator
         .record_content_availability(&mint_draft, &requirement, evidence.clone())
         .map_err(|_| anyhow::anyhow!("Runtime custody availability record failed"))?
@@ -4812,10 +4960,15 @@ async fn verify_runtime_portable_media(
     decoded: &DecodedRuntimePortableAsset,
     now_unix_seconds: u64,
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
+    // The caller samples its clock before the fresh ensure; walking a dead
+    // candidate's connect timeouts can take longer than the receipt's
+    // future-skew allowance, so a receipt stamped at completion would read
+    // as "in the future". Verify against the later of the two clocks (a
+    // fixed test clock ahead of wall time is preserved).
+    let now_unix_seconds = now_unix_seconds.max(crate::auth::now_ts());
     let trusted_receipt_signer_did =
         crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
             .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
-    let receipt = fetch_content_availability_receipt(registry, &package.content_cid).await?;
     let requirement = RuntimeContentAvailabilityRequirement::new(
         trusted_receipt_signer_did,
         &package.content_id,
@@ -4825,6 +4978,12 @@ async fn verify_runtime_portable_media(
         PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
         PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
     )?;
+    // "Fresh" is a new observation, not the receipt stored at mint time:
+    // that one is older than the freshness window for every purchase made
+    // more than a minute after the mint. Ask the content plane to ensure the
+    // CID again under the same bindings, then read the receipt it produced.
+    let receipt =
+        refresh_content_availability_receipt(registry, &package.content_cid, &requirement).await?;
     let manifest =
         crate::content::fetch_content_object_manifest(registry, &package.content_cid).await?;
     let (init, segments) = verify_protected_content_manifest_and_files(
@@ -4840,7 +4999,8 @@ async fn verify_runtime_portable_media(
         &receipt,
         &decoded.media_identity,
         &requirement,
-        now_unix_seconds,
+        // Re-sampled: the refresh above may have walked dead-candidate timeouts.
+        now_unix_seconds.max(crate::auth::now_ts()),
     )?;
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
@@ -4851,7 +5011,8 @@ async fn verify_runtime_portable_media(
         &composition.signed_pool,
         &composition.signed_epoch,
         &composition.signed_committee_authorization,
-        now_unix_seconds,
+        // Re-sampled: the refresh above may have walked dead-candidate timeouts.
+        now_unix_seconds.max(crate::auth::now_ts()),
         &configured_nodes,
     )?;
     let draft = RuntimeMintDraft::new(
@@ -5077,8 +5238,73 @@ struct RuntimeCustodyViewerRecord {
     lifecycle_status: RuntimeCustodyViewerLifecycleStatus,
     pending_close_result: Option<RuntimeCustodyOpenPendingCloseResult>,
     pending_cancel_result: Option<RuntimeCustodyOpenPendingCancelResult>,
+    /// Set while the viewer release waits on the Wallet's managed approval of
+    /// the rights-signature request; absent for earlier records.
+    #[serde(default)]
+    pending_release: Option<RuntimeCustodyPendingRelease>,
     created_at: u64,
     updated_at: u64,
+}
+
+/// Everything a resumed open needs to replay the exact rights-signature
+/// request against the recipient the decrypt provider still holds under the
+/// viewer session handle. The recipient private key never leaves the decrypt
+/// provider; only its public identity is persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RuntimeCustodyPendingRelease {
+    wallet_request_hex: String,
+    approval_request_id: String,
+    recipient_public_key_hex: String,
+    recipient_encryption_suite_id: String,
+    recipient_key_id_hex: String,
+}
+
+impl RuntimeCustodyPendingRelease {
+    fn new(
+        wallet_request: &[u8],
+        approval_request_id: &str,
+        prepared: &RuntimePreparedRecipient,
+    ) -> Self {
+        Self {
+            wallet_request_hex: hex::encode(wallet_request),
+            approval_request_id: approval_request_id.to_string(),
+            recipient_public_key_hex: hex::encode(prepared.recipient_public_key().as_bytes()),
+            recipient_encryption_suite_id: prepared
+                .recipient_identity()
+                .encryption_suite_id()
+                .to_string(),
+            recipient_key_id_hex: hex::encode(prepared.recipient_identity().key_id().as_bytes()),
+        }
+    }
+
+    fn wallet_request(&self) -> anyhow::Result<Vec<u8>> {
+        decode_hex_bytes(&self.wallet_request_hex).map_err(release_unavailable!())
+    }
+
+    fn recipient_public_key(&self) -> anyhow::Result<RecipientPublicKeyBytesV1> {
+        let bytes =
+            decode_hex_bytes(&self.recipient_public_key_hex).map_err(release_unavailable!())?;
+        RecipientPublicKeyBytesV1::new(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(release_unavailable!())?,
+        )
+        .map_err(release_unavailable!())
+    }
+
+    fn recipient_identity(&self) -> anyhow::Result<RecipientKeyIdentityV1> {
+        let key_id: [u8; 32] = decode_hex_bytes(&self.recipient_key_id_hex)
+            .map_err(release_unavailable!())?
+            .as_slice()
+            .try_into()
+            .map_err(release_unavailable!())?;
+        RecipientKeyIdentityV1::new(
+            self.recipient_encryption_suite_id.clone(),
+            Digest32::new(key_id),
+        )
+        .map_err(release_unavailable!())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5135,6 +5361,7 @@ impl RuntimeCustodyViewerRecord {
             lifecycle_status: RuntimeCustodyViewerLifecycleStatus::OpenPending,
             pending_close_result: None,
             pending_cancel_result: None,
+            pending_release: None,
             created_at: input.now,
             updated_at: input.now,
         };
@@ -5171,6 +5398,7 @@ impl RuntimeCustodyViewerRecord {
             lifecycle_status: RuntimeCustodyViewerLifecycleStatus::Active,
             pending_close_result: None,
             pending_cancel_result: None,
+            pending_release: None,
             created_at: now,
             updated_at: now,
         })
@@ -5238,15 +5466,29 @@ impl RuntimeCustodyViewerRecord {
         now >= self.expires_at
     }
 
+    /// Media parts are released strictly in order: part 0 is the init
+    /// segment (no `segment_index`), part n+1 is segment n. The stable
+    /// message stays; the detail names the expected and requested parts.
     fn require_media_part_index(&self, segment_index: Option<u32>) -> anyhow::Result<()> {
+        const MESSAGE: &str = "Runtime custody viewer media part is invalid";
         let requested = match segment_index {
-            Some(index) => index
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?,
+            Some(index) => index.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("segment index {index} overflows the media part sequence")
+                    .context(MESSAGE)
+            })?,
             None => 0,
         };
         if requested != self.next_media_part_index {
-            anyhow::bail!("Runtime custody viewer media part is invalid");
+            tracing::warn!(
+                requested_part = requested,
+                next_part = self.next_media_part_index,
+                "runtime custody viewer: media part requested out of order"
+            );
+            return Err(anyhow::anyhow!(
+                "requested media part {requested} (segment_index {segment_index:?}) but the next part is {} (part 0 is the init segment, part n+1 is segment n)",
+                self.next_media_part_index
+            )
+            .context(MESSAGE));
         }
         Ok(())
     }
@@ -5537,6 +5779,7 @@ pub(crate) async fn verify_fresh_runtime_custody_availability(
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     let expected_mint_id = hex::encode(mint_id.as_bytes());
     if listing.package.mint_id != expected_mint_id {
+        tracing::warn!(line = line!(), "Runtime custody purchase denied before buy");
         anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
     let decoded = listing.package.decode_and_validate()?;
@@ -5548,7 +5791,14 @@ pub(crate) async fn verify_fresh_runtime_custody_availability(
         now_unix_seconds,
     )
     .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))
+    .map_err(|error| {
+        tracing::warn!(
+            mint_id = %expected_mint_id,
+            error = ?error,
+            "runtime custody fresh availability failed closed"
+        );
+        error.context(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE)
+    })
 }
 
 pub(crate) async fn open_runtime_custody_viewer(
@@ -5591,7 +5841,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     let (Some(launch_id), Some(proof_binding_id), Some(session_id), Some(grant_id)) =
         (launch_id, proof_binding_id, session_id, grant_id)
     else {
-        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        return Err(release_unavailable_missing!()());
     };
     let runtime_session_binding = derive_runtime_custody_session_binding(
         &input.principal_id,
@@ -5602,6 +5852,11 @@ pub(crate) async fn open_runtime_custody_viewer(
         grant_id,
         mint_id,
     )?;
+    // An open-pending record that still waits on the Wallet approval of its
+    // rights-signature request is resumed for the same runtime session
+    // (same prepared recipient, same wallet request) instead of being torn
+    // down and re-prepared, which would orphan the pending approval.
+    let mut resumed_pending_release: Option<RuntimeCustodyViewerRecord> = None;
     if let Some(record) =
         load_runtime_custody_viewer_record(data_dir, &input.principal_id, mint_id)?
     {
@@ -5627,6 +5882,17 @@ pub(crate) async fn open_runtime_custody_viewer(
                     session.viewer_session_handle(),
                     session.expires_at(),
                 );
+            }
+            RuntimeCustodyViewerLifecycleStatus::OpenPending
+                if record.pending_release.is_some()
+                    && record.matches_runtime_session_binding(&runtime_session_binding)
+                    && !record.is_expired(viewer_now) =>
+            {
+                tracing::debug!(
+                    mint_id = %hex::encode(mint_id.as_bytes()),
+                    "runtime custody open: resuming viewer release pending Wallet approval"
+                );
+                resumed_pending_release = Some(record);
             }
             RuntimeCustodyViewerLifecycleStatus::Active
                 if !record.matches_runtime_session_binding(&runtime_session_binding)
@@ -5680,40 +5946,68 @@ pub(crate) async fn open_runtime_custody_viewer(
         fetch_runtime_custody_open_media(registry.as_ref(), &purchase.cid, draft.media_identity())
             .await?;
     let now = crate::auth::now_ts();
-    let audit_request_id = runtime_open_audit_id(&input.principal_id, mint_id, now);
     let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
-    let prepared = match prepare_recipient(
-        &decrypt,
-        &buy,
-        runtime_session_binding,
-        audit_request_id,
-        runtime_issuer,
-        now.saturating_sub(5),
-        now + 60,
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
-    };
-    let open_pending =
-        RuntimeCustodyViewerRecord::from_open_pending(RuntimeCustodyOpenPendingInput {
-            principal_id: &input.principal_id,
-            profile_did: &profile_did,
-            mint_id,
-            content_id: &purchase.content_id,
-            runtime_session_binding,
-            audit_request_id: prepared.audit_request_id(),
-            viewer_session_handle: *prepared.prepared_recipient_handle(),
-            expires_at: prepared.expires_at(),
-            now: crate::auth::now_ts(),
-        })?;
-    if let Err(error) =
-        persist_runtime_custody_viewer_record(data_dir, &input.principal_id, mint_id, &open_pending)
-    {
-        let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
-        return Err(error);
-    }
+    let (prepared, mut open_pending, audit_request_id, replay_wallet_request) =
+        if let Some(record) = resumed_pending_release {
+            let pending = record
+                .pending_release
+                .clone()
+                .ok_or_else(release_unavailable_missing!())?;
+            let audit_request_id = RuntimeReleaseAuditIdV1::new(record.audit_request_id()?)
+                .map_err(release_unavailable!())?;
+            let prepared = RuntimePreparedRecipient::from_persisted_parts(
+                audit_request_id.digest(),
+                record.viewer_session_handle_bytes()?,
+                buy.binding_for_session(runtime_session_binding)
+                    .map_err(release_unavailable!())?,
+                buy.action(),
+                runtime_issuer,
+                record.expires_at,
+                pending.recipient_public_key()?,
+                pending.recipient_identity()?,
+            )
+            .map_err(release_unavailable!())?;
+            let replay = pending.wallet_request()?;
+            (prepared, record, audit_request_id, Some(replay))
+        } else {
+            let audit_request_id = runtime_open_audit_id(&input.principal_id, mint_id, now);
+            let prepared = match prepare_recipient(
+                &decrypt,
+                &buy,
+                runtime_session_binding,
+                audit_request_id,
+                runtime_issuer,
+                now.saturating_sub(5),
+                now + 60,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
+            };
+            let open_pending =
+                RuntimeCustodyViewerRecord::from_open_pending(RuntimeCustodyOpenPendingInput {
+                    principal_id: &input.principal_id,
+                    profile_did: &profile_did,
+                    mint_id,
+                    content_id: &purchase.content_id,
+                    runtime_session_binding,
+                    audit_request_id: prepared.audit_request_id(),
+                    viewer_session_handle: *prepared.prepared_recipient_handle(),
+                    expires_at: prepared.expires_at(),
+                    now: crate::auth::now_ts(),
+                })?;
+            if let Err(error) = persist_runtime_custody_viewer_record(
+                data_dir,
+                &input.principal_id,
+                mint_id,
+                &open_pending,
+            ) {
+                let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+                return Err(error);
+            }
+            (prepared, open_pending, audit_request_id, None)
+        };
     let (release_wallet_request, release_wallet_response, signed_rights) =
         match invoke_runtime_release_wallet(
             registry.as_ref(),
@@ -5728,12 +6022,46 @@ pub(crate) async fn open_runtime_custody_viewer(
                 mint_id,
                 runtime_session_binding,
             },
+            replay_wallet_request.as_deref(),
             now,
         )
         .await
         {
-            Ok(bundle) => bundle,
-            Err(_) => {
+            Ok(RuntimeReleaseWalletOutcome::Signed {
+                request_bytes,
+                response_bytes,
+                signed_rights,
+            }) => (request_bytes, response_bytes, *signed_rights),
+            Ok(RuntimeReleaseWalletOutcome::PendingApproval {
+                request_bytes,
+                approval_request_id,
+            }) => {
+                // First pending answer: remember the exact request and the
+                // recipient identity so the next open replays it; the prepared
+                // recipient stays alive in the decrypt provider until the
+                // record expires.
+                if open_pending.pending_release.is_none() {
+                    open_pending.pending_release = Some(RuntimeCustodyPendingRelease::new(
+                        &request_bytes,
+                        &approval_request_id,
+                        &prepared,
+                    ));
+                    open_pending.updated_at = crate::auth::now_ts();
+                    persist_runtime_custody_viewer_record(
+                        data_dir,
+                        &input.principal_id,
+                        mint_id,
+                        &open_pending,
+                    )?;
+                }
+                return Err(anyhow::anyhow!(
+                    "{}:{}: approval_request_id={approval_request_id}",
+                    file!(),
+                    line!()
+                )
+                .context(RUNTIME_CUSTODY_OPEN_PENDING_MESSAGE));
+            }
+            Err(error) => {
                 let _ = settle_runtime_custody_viewer_cleanup(
                     data_dir,
                     registry.clone(),
@@ -5743,7 +6071,9 @@ pub(crate) async fn open_runtime_custody_viewer(
                     open_pending.clone(),
                 )
                 .await;
-                anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+                // Every release wallet error already carries the stable message
+                // outermost with its cause chain; pass it through unchanged.
+                return Err(error);
             }
         };
     let policy = match resolve_runtime_rights_policy(
@@ -5773,7 +6103,7 @@ pub(crate) async fn open_runtime_custody_viewer(
         signed_rights
             .request()
             .request_hash()
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?,
+            .map_err(release_unavailable!())?,
         RightsActionV1::View,
         prepared.recipient_identity().clone(),
         now.saturating_sub(5),
@@ -5791,7 +6121,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 open_pending.clone(),
             )
             .await;
-            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+            return Err(release_unavailable_missing!()());
         }
     };
     let evidence_request = match RightsEvaluationEvidenceRequestV1::new(
@@ -5809,7 +6139,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 open_pending.clone(),
             )
             .await;
-            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+            return Err(release_unavailable_missing!()());
         }
     };
     let localhost_root = crate::auth::principal_localhost_root(&input.principal_id);
@@ -5843,7 +6173,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 open_pending.clone(),
             )
             .await;
-            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+            return Err(release_unavailable_missing!()());
         }
     };
     let selected = vec![
@@ -5865,7 +6195,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     ];
     let coordinator =
         RuntimeReleaseCoordinator::new(runtime_release_journal(data_dir), runtime_issuer, selected)
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?
+            .map_err(release_unavailable!())?
             .with_response_clock(crate::auth::now_ts);
     let contributions = match coordinator
         .release(
@@ -5881,7 +6211,14 @@ pub(crate) async fn open_runtime_custody_viewer(
                 signed_node_contributions,
             },
         )) => signed_node_contributions,
-        Ok(RuntimeReleaseCoordinatorOutcome::Nonterminal { operation_hash, .. }) => {
+        Ok(RuntimeReleaseCoordinatorOutcome::Nonterminal {
+            operation_hash,
+            reason,
+        }) => {
+            tracing::debug!(
+                ?reason,
+                "runtime custody open: release nonterminal, resuming exact operation"
+            );
             match coordinator
                 .resume_exact(operation_hash, crate::auth::now_ts())
                 .await
@@ -5891,7 +6228,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                         signed_node_contributions,
                     },
                 )) => signed_node_contributions,
-                _ => {
+                other => {
                     let _ = settle_runtime_custody_viewer_cleanup(
                         data_dir,
                         registry.clone(),
@@ -5901,11 +6238,13 @@ pub(crate) async fn open_runtime_custody_viewer(
                         open_pending.clone(),
                     )
                     .await;
-                    anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+                    return Err(release_unavailable!()(format!(
+                        "release resume did not yield contributions: {other:?}"
+                    )));
                 }
             }
         }
-        _ => {
+        other => {
             let _ = settle_runtime_custody_viewer_cleanup(
                 data_dir,
                 registry.clone(),
@@ -5915,7 +6254,9 @@ pub(crate) async fn open_runtime_custody_viewer(
                 open_pending.clone(),
             )
             .await;
-            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+            return Err(release_unavailable!()(format!(
+                "release did not yield contributions: {other:?}"
+            )));
         }
     };
     let receipt_now = crate::auth::now_ts();
@@ -5937,7 +6278,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 open_pending.clone(),
             )
             .await;
-            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+            return Err(release_unavailable_missing!()());
         }
     };
     let expected_terminal_issuer =
@@ -6858,25 +7199,67 @@ struct RuntimeReleaseWalletInvocation<'a> {
     runtime_session_binding: RuntimeSessionBindingV1,
 }
 
-async fn invoke_runtime_release_wallet(
-    registry: &ProviderRegistry,
+/// What the Wallet answered to the viewer release rights-signature request.
+#[derive(Debug)]
+enum RuntimeReleaseWalletOutcome {
+    /// The exact wallet request/response pair and the verified signed rights.
+    Signed {
+        request_bytes: Vec<u8>,
+        response_bytes: Vec<u8>,
+        /// Boxed: the signed rights request dwarfs the pending arm.
+        signed_rights: Box<WalletSignedRightsRequestV1>,
+    },
+    /// A managed account needs the principal's explicit approval first; the
+    /// exact request must be replayed once the approval is completed.
+    PendingApproval {
+        request_bytes: Vec<u8>,
+        approval_request_id: String,
+    },
+}
+
+/// Builds the exact wallet rights-signature request for this open, or
+/// decodes the persisted one when a pending release is being resumed (the
+/// rights request is bound to the recipient identity, so a resumed release
+/// must replay byte-identical bytes for the Wallet to return its stored
+/// result).
+fn runtime_release_wallet_request(
     buy: &elastos_protected_content_runtime::RuntimeBuyReceipt,
     recipient: &RecipientKeyIdentityV1,
-    invocation: RuntimeReleaseWalletInvocation<'_>,
+    invocation: &RuntimeReleaseWalletInvocation<'_>,
+    replay_request: Option<&[u8]>,
     now: u64,
-) -> anyhow::Result<(Vec<u8>, Vec<u8>, WalletSignedRightsRequestV1)> {
+) -> anyhow::Result<(WalletProviderRequestV2, RightsRequestV1)> {
+    if let Some(bytes) = replay_request {
+        let wallet_request =
+            WalletProviderRequestV2::decode_at(bytes, now).map_err(release_unavailable!())?;
+        let WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            canonical_rights_request_hex,
+            ..
+        } = &wallet_request.operation
+        else {
+            return Err(release_unavailable_missing!()());
+        };
+        let rights_request = RightsRequestV1::from_canonical_bytes(
+            &decode_hex_bytes(canonical_rights_request_hex).map_err(release_unavailable!())?,
+        )
+        .map_err(release_unavailable!())?;
+        if rights_request.recipient() != recipient {
+            return Err(release_unavailable_missing!()());
+        }
+        return Ok((wallet_request, rights_request));
+    }
     let mut replay_nonce = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut replay_nonce);
     let rights_request = RightsRequestV1::new(
         buy.binding_for_session(invocation.runtime_session_binding)
-            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?,
+            .map_err(release_unavailable!())?,
         buy.action(),
         recipient.clone(),
         now.saturating_sub(5),
         now + 180,
         ReplayNonce16::new(replay_nonce),
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    .map_err(release_unavailable!())?;
     let mut request_entropy = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut request_entropy);
     let context = VerifiedWalletInvocationContext::new(
@@ -6890,7 +7273,7 @@ async fn invoke_runtime_release_wallet(
             hex::encode(invocation.mint_id.as_bytes())
         ),
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    .map_err(release_unavailable!())?;
     let wallet_request = WalletProviderRequestV2::new(
         &context,
         format!("wallet-request:{}", hex::encode(request_entropy)),
@@ -6898,13 +7281,28 @@ async fn invoke_runtime_release_wallet(
         now.saturating_add(MAX_INVOCATION_TTL_SECS),
         WalletProviderOperationV2::RequestProtectedContentRightsSignature {
             account_id: invocation.account_id.to_string(),
-            canonical_rights_request_hex: hex::encode(rights_request.canonical_bytes().map_err(
-                |_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
-            )?),
+            canonical_rights_request_hex: hex::encode(
+                rights_request
+                    .canonical_bytes()
+                    .map_err(release_unavailable!())?,
+            ),
             reason: "Open protected content".to_string(),
         },
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    .map_err(release_unavailable!())?;
+    Ok((wallet_request, rights_request))
+}
+
+async fn invoke_runtime_release_wallet(
+    registry: &ProviderRegistry,
+    buy: &elastos_protected_content_runtime::RuntimeBuyReceipt,
+    recipient: &RecipientKeyIdentityV1,
+    invocation: RuntimeReleaseWalletInvocation<'_>,
+    replay_request: Option<&[u8]>,
+    now: u64,
+) -> anyhow::Result<RuntimeReleaseWalletOutcome> {
+    let (wallet_request, rights_request) =
+        runtime_release_wallet_request(buy, recipient, &invocation, replay_request, now)?;
     let response = registry
         .invoke_provider(ProviderInvocation {
             source: RUNTIME_PROVIDER_ID.to_string(),
@@ -6920,45 +7318,98 @@ async fn invoke_runtime_release_wallet(
             transport: ProviderInvocationTransport::Local,
         })
         .await
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+        .map_err(release_unavailable!())?;
     if response.get("status").and_then(Value::as_str) != Some("ok") {
-        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        let code = response
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("wallet rights signature request rejected");
+        return Err(release_unavailable!()(format!(
+            "wallet rights signature request rejected: {code}: {message}"
+        )));
     }
     let data = response
         .get("data")
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    let request_bytes = serde_json::to_vec(&wallet_request)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    let response_bytes = serde_json::to_vec(data)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    let signed_rights = wallet_signed_rights_from_bytes(&request_bytes, &response_bytes)
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    if signed_rights.request() != &rights_request {
-        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        .ok_or_else(release_unavailable_missing!())?;
+    let request_bytes = serde_json::to_vec(&wallet_request).map_err(release_unavailable!())?;
+    let response_bytes = serde_json::to_vec(data).map_err(release_unavailable!())?;
+    // A managed account answers with its approval record until the principal
+    // approves it in the Wallet; the exact request is then replayed.
+    let payload = data
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .unwrap_or(data);
+    if payload
+        .get("requires_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let approval_request_id = payload
+            .get("approval_request")
+            .and_then(|approval| approval.get("request_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(release_unavailable_missing!())?
+            .to_string();
+        tracing::debug!(
+            %approval_request_id,
+            "runtime custody open: viewer release awaits exact Wallet approval"
+        );
+        return Ok(RuntimeReleaseWalletOutcome::PendingApproval {
+            request_bytes,
+            approval_request_id,
+        });
     }
-    Ok((request_bytes, response_bytes, signed_rights))
+    let signed_rights = wallet_signed_rights_from_bytes(&request_bytes, &response_bytes)
+        .map_err(release_unavailable!())?;
+    if signed_rights.request() != &rights_request {
+        return Err(release_unavailable!()(
+            "wallet signed a rights request other than the one issued",
+        ));
+    }
+    Ok(RuntimeReleaseWalletOutcome::Signed {
+        request_bytes,
+        response_bytes,
+        signed_rights: Box::new(signed_rights),
+    })
 }
 
+/// Decodes the Wallet's signed rights result from the exact request/response
+/// pair, naming the step that failed so a live failure is diagnosable.
 fn wallet_signed_rights_from_bytes(
     wallet_request_bytes: &[u8],
     wallet_response_bytes: &[u8],
-) -> Option<WalletSignedRightsRequestV1> {
+) -> Result<WalletSignedRightsRequestV1, String> {
     let now = crate::auth::now_ts();
     let request =
         elastos_wallet_contract::WalletProviderRequestV2::decode_at(wallet_request_bytes, now)
-            .ok()?;
+            .map_err(|err| format!("wallet request does not decode: {err:?}"))?;
     let response = elastos_wallet_contract::WalletProviderResponseV2::decode_for_request(
         wallet_response_bytes,
         &request,
     )
-    .ok()?;
+    .map_err(|err| format!("wallet response is not bound to the request: {err:?}"))?;
     let data = match response.result {
         elastos_wallet_contract::WalletResultV2::Ok { data } => data,
-        _ => return None,
+        elastos_wallet_contract::WalletResultV2::Error { code, message } => {
+            return Err(format!("wallet answered an error: {code}: {message}"));
+        }
     };
-    let hex_value = data.get("wallet_signed_rights_request_hex")?.as_str()?;
-    let bytes = decode_hex_bytes(hex_value).ok()?;
-    WalletSignedRightsRequestV1::from_canonical_bytes(&bytes).ok()
+    let result = elastos_protected_content_runtime::wallet_rights_signature_result(&data)
+        .ok_or_else(|| {
+            let keys = data
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            format!("wallet result carries no rights signature (keys: {keys})")
+        })?;
+    let bytes = decode_hex_bytes(&result.wallet_signed_rights_request_hex)
+        .map_err(|err| format!("signed rights hex is invalid: {err}"))?;
+    WalletSignedRightsRequestV1::from_canonical_bytes(&bytes)
+        .map_err(|err| format!("signed rights bytes are not canonical: {err:?}"))
 }
 
 fn sign_runtime_terminal_receipt(
@@ -6970,11 +7421,11 @@ fn sign_runtime_terminal_receipt(
 ) -> anyhow::Result<SignedTerminalReceiptV1> {
     let authenticated = operation
         .verify(operation.statement().runtime_operation_issuer(), now)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+        .map_err(release_unavailable!())?;
     let node_set = epoch
         .statement()
         .node_set()
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+        .map_err(release_unavailable!())?;
     let refs = contributions
         .iter()
         .map(|contribution| {
@@ -6983,7 +7434,7 @@ fn sign_runtime_terminal_receipt(
                 .map(|verified| NodeContributionRefV1::from(&verified))
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+        .map_err(release_unavailable!())?;
     let contribution_issued_at = contributions
         .iter()
         .map(|contribution| contribution.statement().issued_at())
@@ -7000,7 +7451,7 @@ fn sign_runtime_terminal_receipt(
         .min(release.expires_at())
         .min(issued_at.saturating_add(30));
     if expires_at <= issued_at {
-        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        return Err(release_unavailable_missing!()());
     }
     let statement = TerminalReceiptStatementV1::new(
         authenticated.release_request_hash(),
@@ -7012,17 +7463,19 @@ fn sign_runtime_terminal_receipt(
         issued_at,
         expires_at,
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    .map_err(release_unavailable!())?;
     SignedTerminalReceiptV1::new(
         statement.clone(),
         device_key
-            .sign(&statement.canonical_bytes().map_err(|_| {
-                anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE)
-            })?)
+            .sign(
+                &statement
+                    .canonical_bytes()
+                    .map_err(release_unavailable!())?,
+            )
             .to_bytes()
             .to_vec(),
     )
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
+    .map_err(release_unavailable!())
 }
 
 async fn fetch_runtime_custody_open_media(
@@ -7112,23 +7565,20 @@ pub(crate) fn load_runtime_custody_profile_did(
         principal_id,
         &localhost_root,
     )?
-    .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    .ok_or_else(release_unavailable_missing!())?;
     Ok(profile.document().profile_did.clone())
 }
 
 fn profile_identity_from_did(profile_did: &str) -> anyhow::Result<ProfileIdentityV1> {
-    let key = crate::crypto::decode_did_key(profile_did)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    ProfileIdentityV1::from_public_key_bytes(key.to_bytes())
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
+    let key = crate::crypto::decode_did_key(profile_did).map_err(release_unavailable!())?;
+    ProfileIdentityV1::from_public_key_bytes(key.to_bytes()).map_err(release_unavailable!())
 }
 
 fn update_length_prefixed_session_field(
     hasher: &mut sha2::Sha256,
     value: &[u8],
 ) -> anyhow::Result<()> {
-    let encoded_len = u32::try_from(value.len())
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let encoded_len = u32::try_from(value.len()).map_err(release_unavailable!())?;
     hasher.update(encoded_len.to_be_bytes());
     hasher.update(value);
     Ok(())
@@ -7144,7 +7594,7 @@ fn derive_runtime_custody_session_binding(
     mint_id: Digest32,
 ) -> anyhow::Result<RuntimeSessionBindingV1> {
     if !valid_runtime_viewer_launch_id(launch_id) {
-        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        return Err(release_unavailable_missing!()());
     }
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"elastos.protected-content.runtime-session-binding.v2");
@@ -7157,7 +7607,7 @@ fn derive_runtime_custody_session_binding(
     update_length_prefixed_session_field(&mut hasher, grant_id.as_bytes())?;
     update_length_prefixed_session_field(&mut hasher, mint_id.as_bytes())?;
     RuntimeSessionBindingV1::new(Digest32::new(hasher.finalize().into()))
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
+        .map_err(release_unavailable!())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,0 +1,98 @@
+# 3-node custody-host harness (ELACITY-2298 installed e2e proof, Task 6).
+#
+# Three independent processes of the Task 5/5b `elastos-custody-host` image,
+# each one an isolated `elastos run custody-provider --with
+# availability-provider --with ipfs-provider --carrier-addr 0.0.0.0:4433`
+# instance, simulating three real custody shard-holders reachable only over
+# Carrier (never Local) -- per the topology ruling in
+# .superpowers/memory/elacity-2298-topology-requirement.md.
+#
+# The three services are byte-identical apart from the two labels that
+# protected_content_config.rs's require_distinct() checks must see distinct
+# across the pool (CUSTODY_OPERATOR, CUSTODY_FAILURE_DOMAIN) and the host
+# port each one's Carrier endpoint is published on. CUSTODY_TRUSTED_RUNTIME_ISSUER
+# is the one value all three must agree on (the host client's own runtime
+# issuer) and is supplied via .env, written by up.sh from
+# `elastos protected-content-config show-runtime-issuer`.
+#
+# Build context is the repo root: entrypoint.sh's fail-closed env-var checks
+# require CUSTODY_TRUSTED_RUNTIME_ISSUER/CUSTODY_OPERATOR/CUSTODY_FAILURE_DOMAIN
+# only on first boot (provisioning), never on restart -- see entrypoint.sh.
+
+x-custody-host: &custody-host
+  build:
+    context: ../..
+    dockerfile: deploy/custody-host/Dockerfile
+  image: elastos-custody-host:latest
+  environment: &custody-host-env
+    CUSTODY_TRUSTED_RUNTIME_ISSUER: ${CUSTODY_TRUSTED_RUNTIME_ISSUER:?set by up.sh from 'elastos protected-content-config show-runtime-issuer'}
+    # elastos_server::server_infra::availability_provider_config_from_env reads
+    # this directly; `--with availability-provider` fails closed without it
+    # (see entrypoint.sh). Not a real replication target in this harness --
+    # only its presence/shape is validated at Init, never dialed.
+    ELASTOS_AVAILABILITY_ENSURE_URL: ${ELASTOS_AVAILABILITY_ENSURE_URL:-https://replica.invalid/ensure}
+    # elastos-server's tracing init reads the standard `RUST_LOG`
+    # (tracing_subscriber::EnvFilter::from_default_env(), NOT a custom
+    # ELASTOS_LOG -- elastos/crates/elastos-server/src/main.rs:1220-1226).
+    # That call also always layers in a hardcoded `elastos=info` baseline
+    # directive (main.rs:1224), so a bare `RUST_LOG=debug` would not reliably
+    # out-rank it for the `elastos`-binary-crate targets; the live container
+    # logs show both the `elastos::*` (binary, e.g. provider_host) and
+    # `elastos_server::*` (library, e.g. carrier) target namespaces, so both
+    # are named explicitly. Old dkms harness precedent: quorum nodes
+    # defaulted to trace; debug is the default here instead because trace is
+    # very chatty for long-lived soak runs -- override per-deployment via
+    # CUSTODY_NODE_LOG without editing this file.
+    RUST_LOG: ${CUSTODY_NODE_LOG:-elastos=debug,elastos_server=debug}
+  # Named-volume state persists across `up.sh down`; only `up.sh destroy`
+  # removes it, so a restart re-enters entrypoint.sh's zero-env branch.
+  restart: unless-stopped
+  # up.sh rewrites the client's host-loopback RPC URLs to host.docker.internal
+  # for the nodes. Docker Desktop resolves that name on its own; a Linux
+  # engine (CI runner, bare server) does not, and every RPC dial from a node
+  # would fail on name resolution. `host-gateway` is the engine's own alias
+  # for the host, so this is correct on both.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  custody-a:
+    <<: *custody-host
+    environment:
+      <<: *custody-host-env
+      CUSTODY_OPERATOR: op-a
+      CUSTODY_FAILURE_DOMAIN: fd-a
+    volumes:
+      - custody-a-data:/home/custody/.local/share/elastos
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:14431:4433/udp"
+
+  custody-b:
+    <<: *custody-host
+    environment:
+      <<: *custody-host-env
+      CUSTODY_OPERATOR: op-b
+      CUSTODY_FAILURE_DOMAIN: fd-b
+    volumes:
+      - custody-b-data:/home/custody/.local/share/elastos
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:14432:4433/udp"
+
+  custody-c:
+    <<: *custody-host
+    environment:
+      <<: *custody-host-env
+      CUSTODY_OPERATOR: op-c
+      CUSTODY_FAILURE_DOMAIN: fd-c
+    volumes:
+      - custody-c-data:/home/custody/.local/share/elastos
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:14433:4433/udp"
+
+volumes:
+  custody-a-data:
+  custody-b-data:
+  custody-c-data:

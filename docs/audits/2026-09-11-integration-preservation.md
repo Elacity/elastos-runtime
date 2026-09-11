@@ -105,3 +105,52 @@ preserves later model and authority repairs. It adds no new UI claim.
 
 This disposition is limited to the shelf branch. `923193bb` is not an ancestor
 of URUX `5e546ef4`; URUX remains separate work with the feature checks above.
+
+## September contributor PR coverage
+
+The GitHub inventory includes every PR by `irzhywau` and `SashaMIT` created or
+updated since September 1, read September 11. Nine were created this month and
+four older PRs were updated. This is source accounting; combined installed
+compatibility remains an independent gate.
+
+| PR | Disposition |
+| --- | --- |
+| [51](https://github.com/Elacity/elastos-runtime/pull/51) | Development-to-main release PR; base source already in candidate; final release gate remains |
+| [52](https://github.com/Elacity/elastos-runtime/pull/52) | Irzhy provisioning, original head already in ancestry |
+| [54](https://github.com/Elacity/elastos-runtime/pull/54) | Sash first-run/chrome/Documents/Library/icons, original head already in ancestry |
+| [55](https://github.com/Elacity/elastos-runtime/pull/55) | Sash shelf, complete original changes present; ancestry reconciled by37c82d4f |
+| [57](https://github.com/Elacity/elastos-runtime/pull/57) / [60](https://github.com/Elacity/elastos-runtime/pull/60) | Same Irzhy source617796a9;57 closed in favor of60; one foundation merge in progress |
+| [58](https://github.com/Elacity/elastos-runtime/pull/58) | Published integration prefix already in ancestry; later local donor merged byb318bfda |
+| [59](https://github.com/Elacity/elastos-runtime/pull/59) | Authority cutover25ab205e, queued after foundation and installed checkpoint |
+| [62](https://github.com/Elacity/elastos-runtime/pull/62) | Follow-up06179578, queued after59; Required repairs and Optional additions retain D2 |
+| [38](https://github.com/Elacity/elastos-runtime/pull/38) | Older release updated this month; original head in base ancestry |
+| [26](https://github.com/Elacity/elastos-runtime/pull/26) | Nonogram source adopted by1fd30b38; ROM/license/SVG byte-identical, viewer/storage/packaging and launch test retained. Old icon removal superseded by supported icon schema and assets. Original ancestry remains separate |
+| [23](https://github.com/Elacity/elastos-runtime/pull/23) | Older URUX source; visual feature gaps listed above remain pending |
+| [19](https://github.com/Elacity/elastos-runtime/pull/19) | CI/setup behavior largely retained or reworked. Final plain-pipe CLI check retained. Original macOS Clippy/test steps now run in Linux jobs; named feature push triggers replaced by PR/manual/main/tag triggers. These differences remain explicit for CI policy review |
+
+First-principles review narrowed the next operation: finish the active foundation
+merge and its startup/lifecycle gates, then freeze further branch intake for one
+installed Qwen journey. Carrier peer discovery supports Required cold delivery;
+the current local model preparation still uses local Content. Later J5/URUX
+source enters against a named missing behavior after this installed checkpoint.
+
+## Foundation merge verification
+
+The resolved `617796a9` source retains current model redirect handling and
+provider shutdown ownership. Independent review found that an explicit occupied
+Carrier bind address silently selected another address. The new regression test
+reproduced this behavior; both explicit-bind error paths now return an error that
+names the requested address. Default automatic selection retains its existing
+behavior. A missing `anyhow::Context` import was repaired after the first compile
+failure. The independent scoped review accepts these resolutions.
+
+On Mac, the explicit bind test, six Carrier cleanup cases, peer-store startup,
+three availability cases, 17 provider bridge cases, four bounded Content cases,
+five model startup cases, six provider-host argument cases, unknown-provider
+rejection and approval-authority purchase completion pass. Two startup fixtures
+remain ignored. Provider-host missing-provisioning proof requires the dedicated
+custody binary fixture: its first run failed with that missing input, before
+product execution. Full provider-host and J5 installed proof remains pending.
+Home entropy, format and protected-content static/harness checks pass. These
+results establish source behavior; current human Homes retain their earlier
+installed candidate.

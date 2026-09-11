@@ -116,6 +116,19 @@ impl RuntimeWalletAuthority {
     pub(super) fn from_verified_context(context: VerifiedWalletInvocationContext) -> Self {
         Self { context }
     }
+
+    /// The authority a persisted transaction effect was created under, rebuilt
+    /// from the effect's own binding. A Wallet approval is bound to the exact
+    /// launch that raised it (principal, session, proof binding, grant, actor,
+    /// launch); once the Runtime restarts, the caller completing the effect
+    /// holds a fresh launch, and the Wallet rightly refuses to attach the
+    /// validated Chain outcome under that new binding. Completing the effect's
+    /// own projection under its original binding is the only legitimate use.
+    pub(in crate::api) fn from_persisted_transaction_authority(
+        context: VerifiedWalletInvocationContext,
+    ) -> Self {
+        Self { context }
+    }
 }
 
 #[derive(Clone, Copy)]

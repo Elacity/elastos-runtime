@@ -29,6 +29,10 @@ struct MockProtectedContentPurchaseFixture {
     native_purchase: bool,
     access_mode: MockProtectedContentPurchaseAccessMode,
     listing_quantity: String,
+    /// When set, `isApprovedForAll(creator, gateway)` answers false until a
+    /// `setApprovalForAll` transaction has been completed, so the creator
+    /// tail must raise the operator-approval effect.
+    creator_operator_unapproved: bool,
 }
 
 #[derive(Clone)]
@@ -43,6 +47,7 @@ impl Default for MockProtectedContentPurchaseFixture {
             native_purchase: false,
             access_mode: MockProtectedContentPurchaseAccessMode::Allow,
             listing_quantity: MOCK_PROTECTED_CONTENT_LISTING_QUANTITY.to_string(),
+            creator_operator_unapproved: false,
         }
     }
 }
@@ -294,6 +299,13 @@ fn mock_protected_content_purchase_fixture(
 fn reset_mock_protected_content_purchase_fixture() {
     *mock_protected_content_purchase_fixture().lock().unwrap() =
         MockProtectedContentPurchaseFixture::default();
+}
+
+fn set_mock_protected_content_creator_operator_unapproved() {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .creator_operator_unapproved = true;
 }
 
 fn set_mock_protected_content_purchase_native() {
@@ -695,6 +707,15 @@ impl Provider for MockChainProvider {
                     "signed": false
                 }
             })),
+            Some("describe_protected_content_market_source") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.chain.protected-content-market-source/v1",
+                    "network": required_test_str(request, "network")?,
+                    "authority_gateway_contract": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                    "evidence_rpc_sources": 2
+                }
+            })),
             Some("describe_protected_content_creator_mint_source") => Ok(json!({
                 "status": "ok",
                 "data": {
@@ -921,7 +942,25 @@ impl Provider for MockChainProvider {
                         .get("block")
                         .and_then(|value| value.as_str())
                         .unwrap_or("latest"),
-                    "result": "0x0000000000000000000000000000000000000000000000000000000000000042"
+                    "result": if required_test_str(request, "data")?.starts_with("0xe985e9c5") {
+                        // isApprovedForAll(owner, operator): the copies live on the
+                        // operative, so only a probe aimed there can report the
+                        // approval; the fixture may withhold it. Any other contract
+                        // (the asset ledger included) knows nothing about it.
+                        if mock_protected_content_purchase_fixture()
+                            .lock()
+                            .unwrap()
+                            .creator_operator_unapproved
+                            || !required_test_str(request, "to")?
+                                .eq_ignore_ascii_case(MOCK_PROTECTED_CONTENT_OPERATIVE)
+                        {
+                            "0x0000000000000000000000000000000000000000000000000000000000000000"
+                        } else {
+                            "0x0000000000000000000000000000000000000000000000000000000000000001"
+                        }
+                    } else {
+                        "0x0000000000000000000000000000000000000000000000000000000000000042"
+                    }
                 }
             })),
             Some("estimate_gas") => Ok(json!({
@@ -1388,7 +1427,9 @@ impl Provider for TwoRuntimeContentProvider {
         self.requests.lock().unwrap().push(request.clone());
         match request.get("op").and_then(Value::as_str) {
             Some("publish") => self.publish(request),
-            Some("status") => self.status(required_test_str(request, "cid")?),
+            // `ensure` re-observes a published CID under the caller's bindings
+            // and answers with the same availability shape as `status`.
+            Some("status" | "ensure") => self.status(required_test_str(request, "cid")?),
             Some("fetch") => {
                 let cid = required_test_str(request, "cid")?;
                 let path = required_test_str(request, "path")?;
@@ -1458,7 +1499,7 @@ impl Provider for MockContentProvider {
                     request.get("op").and_then(|value| value.as_str()),
                     request.get("path").and_then(|value| value.as_str()),
                 ) {
-                    (Some("status"), _) => {
+                    (Some("status" | "ensure"), _) => {
                         return Ok(json!({
                             "status": "ok",
                             "data": {
@@ -1628,7 +1669,7 @@ impl Provider for MockContentProvider {
                     }
                 }
             })),
-            (Some("status"), _, _) => Ok(json!({
+            (Some("status" | "ensure"), _, _) => Ok(json!({
                 "status": "ok",
                 "data": {
                     "cid": TEST_CIDV1,
@@ -4429,6 +4470,27 @@ struct MockBitcoinChallenge {
     consumed: bool,
 }
 
+/// The authority binding the mock wallet stores on an approval and requires
+/// again when a validated Chain outcome is attached. It hashes the same six
+/// authority fields as the real wallet (`wallet_authority_binding` in
+/// capsules/wallet-provider), so a caller holding a newer launch of the same
+/// session is refused exactly as it is live; the session binding alone would
+/// let that case through.
+fn mock_wallet_authority_binding(
+    authority: &elastos_wallet_contract::WalletAuthorityV2,
+) -> String {
+    let bytes = serde_json::to_vec(&json!({
+        "principal_id": authority.principal_id,
+        "session_id": authority.session_id,
+        "proof_binding_id": authority.proof_binding_id,
+        "grant_id": authority.grant_id,
+        "actor": authority.actor,
+        "launch_id": authority.launch_id,
+    }))
+    .expect("authority binding json");
+    format!("0x{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
 #[async_trait::async_trait]
 impl Provider for MockWalletProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -4602,7 +4664,7 @@ impl Provider for MockWalletProvider {
                     "op": "request_signature",
                     "request_id": wallet_request.request_id,
                     "wallet_request_sha256": wallet_request.request_sha256,
-                    "authority_binding": wallet_request.session_binding,
+                    "authority_binding": mock_wallet_authority_binding(&wallet_request.authority),
                     "principal_id": wallet_request.authority.principal_id,
                     "session_id": wallet_request.authority.session_id,
                     "launch_id": wallet_request.authority.launch_id,
@@ -4632,6 +4694,7 @@ impl Provider for MockWalletProvider {
                     "session_id": wallet_request.authority.session_id,
                     "launch_id": wallet_request.authority.launch_id,
                     "capsule_id": wallet_request.authority.actor,
+                    "authority_binding": mock_wallet_authority_binding(&wallet_request.authority),
                     "outcome": outcome,
                 }),
                 WalletProviderOperationV2::ListApprovals { include_resolved } => json!({
@@ -5061,6 +5124,22 @@ impl MockWalletProvider {
                 approval.get("intent").and_then(Value::as_str) == Some("transaction_intent")
             })
             .and_then(|approval| approval.get("request_id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+    }
+
+    /// The `to` address of the newest pending or completed transaction
+    /// approval, as the wallet was asked to sign it.
+    async fn latest_transaction_approval_to(&self) -> Option<String> {
+        let approvals = self.approvals.lock().await;
+        approvals
+            .iter()
+            .rev()
+            .find(|approval| {
+                approval.get("intent").and_then(Value::as_str) == Some("transaction_intent")
+            })
+            .and_then(|approval| approval.get("payload"))
+            .and_then(|payload| payload.get("to"))
+            .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     }
 
@@ -6354,6 +6433,17 @@ impl MockWalletProvider {
                         "status": "error",
                         "code": "projection_failed",
                         "message": "simulated Wallet Chain outcome projection failure"
+                    }));
+                }
+                // The real wallet binds the outcome to the approval's ORIGINAL authority
+                // (validate_chain_outcome_target): a later launch must not attach it.
+                if approval.get("authority_binding").and_then(|value| value.as_str())
+                    != request.get("authority_binding").and_then(|value| value.as_str())
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "chain_outcome_conflict",
+                        "message": "validated Chain outcome authority does not match the approval"
                     }));
                 }
                 if approval.get("status").and_then(|value| value.as_str()) != Some("completed") {

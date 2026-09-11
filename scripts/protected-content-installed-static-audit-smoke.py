@@ -27,7 +27,13 @@ REQUIRED = (
     "custody-provider",
     "protected-content-decrypt-provider",
 )
-ALL_COMPONENTS = (*REQUIRED, "kubo", "ipfs-provider", *PROVISIONAL)
+CUSTODY_HOST_REQUIRED = (
+    "custody-provider",
+    "availability-provider",
+    "ipfs-provider",
+    "chain-provider",
+)
+ALL_COMPONENTS = (*REQUIRED, "kubo", "ipfs-provider", "availability-provider", *PROVISIONAL)
 
 
 def sha256(data):
@@ -169,7 +175,7 @@ class Fixture:
         write_json(self.data / "components.json", manifest(self.binary_bytes), 0o600)
         for name, data in self.binary_bytes.items():
             write_file(self.data / "bin" / name, data, 0o755)
-        for name in (*REQUIRED, "ipfs-provider"):
+        for name in (*REQUIRED, "ipfs-provider", "availability-provider"):
             write_file(self.source / "elastos/target/release" / name, self.binary_bytes[name], 0o755)
         write_file(self.runtime, self.runtime_bytes, 0o755)
         write_file(self.source / "elastos/target/release/elastos", self.runtime_bytes, 0o755)
@@ -299,6 +305,20 @@ def main():
         if not {"kubo", "ipfs-provider"}.issubset(home_required):
             raise AssertionError(home_receipt)
 
+        custody_host_receipt = fixture.audit(True, role="custody-host")
+        custody_host_required = set(
+            (custody_host_receipt.get("canonical_installation") or {}).get("required") or []
+        )
+        if custody_host_required != set(CUSTODY_HOST_REQUIRED):
+            raise AssertionError(custody_host_receipt)
+        custody_host_operator = custody_host_receipt.get("operator_configuration") or {}
+        # The slim role settles releases through its own chain evidence, so
+        # the chain config is demanded; the 2-of-3 composition never is.
+        if custody_host_operator.get("chain_config") is not True:
+            raise AssertionError(custody_host_receipt)
+        if "custody_composition" in custody_host_operator:
+            raise AssertionError(custody_host_receipt)
+
         media = fixture.data / "bin/media-provider"
         media_bytes = media.read_bytes()
         media.write_bytes(b"mismatch\n")
@@ -337,6 +357,30 @@ def main():
             "chain_config",
         )
         chain.chmod(0o600)
+
+        # custody-host does not provision the custody composition; broken
+        # permissions there must not fail the slim role's operator check,
+        # unlike custody-node above. Its chain config IS demanded (release
+        # settlement needs chain rights evidence), so breaking that fails
+        # the slim role exactly like custody-node.
+        custody_composition = fixture.data / "protected-content/custody-composition.json"
+        custody_composition.chmod(0o640)
+        custody_host_unaffected = fixture.audit(True, role="custody-host")
+        custody_host_unaffected_operator = (
+            custody_host_unaffected.get("operator_configuration") or {}
+        )
+        if custody_host_unaffected_operator.get("chain_config") is not True or (
+            "custody_composition" in custody_host_unaffected_operator
+        ):
+            raise AssertionError(custody_host_unaffected)
+        chain.chmod(0o640)
+        require_finding(
+            fixture.audit(False, role="custody-host"),
+            "operator_configuration_prerequisites",
+            "chain_config",
+        )
+        chain.chmod(0o600)
+        custody_composition.chmod(0o600)
 
         manifest_path = fixture.data / "components.json"
         installed_manifest = json.loads(manifest_path.read_text())

@@ -11,6 +11,7 @@ mod home_cmd;
 mod identity_cmd;
 mod init_cmd;
 mod node_cmd;
+mod provider_host;
 mod publish;
 mod release_cmd;
 mod room_cmd;
@@ -84,15 +85,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Power-user path: run an arbitrary capsule from a local directory or IPFS CID
+    /// Power-user path: run an arbitrary capsule from a local directory or IPFS
+    /// CID, or host a native provider (e.g. `custody-provider`) standalone
     Run {
-        /// Path to capsule directory (or use --cid for IPFS)
+        /// Capsule directory, or a native provider name or binary path
         #[arg(required_unless_present = "cid")]
         path: Option<PathBuf>,
 
         /// IPFS CID of the capsule to run
         #[arg(long, conflicts_with = "path")]
         cid: Option<String>,
+
+        /// Additional native provider to host, by name or binary path (repeatable)
+        #[arg(long = "with", value_name = "NAME_OR_PATH")]
+        with: Vec<String>,
+
+        /// Carrier bind address for a native provider host
+        #[arg(long, value_name = "ADDR")]
+        carrier_addr: Option<String>,
 
         /// Arguments to pass to the capsule (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1258,9 +1268,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run {
             path,
             cid,
+            with,
+            carrier_addr,
             capsule_args,
         } => {
-            return run_cmd::run_capsule(path, cid, capsule_args).await;
+            return run_cmd::run_capsule(path, cid, with, carrier_addr, capsule_args).await;
         }
 
         Commands::Serve {

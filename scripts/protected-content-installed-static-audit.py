@@ -45,6 +45,14 @@ ROLE_REQUIRED = {
         "custody-provider",
         "protected-content-decrypt-provider",
     ),
+    "custody-host": (
+        "custody-provider",
+        "availability-provider",
+        "ipfs-provider",
+        # A committee member settles every release through its own chain
+        # rights evidence, so the chain plane is part of the slim role.
+        "chain-provider",
+    ),
 }
 ACTIVE_PROOF_PREREQUISITES = (
     "runtime_config_acceptance",
@@ -524,17 +532,25 @@ def audit_media(data_root, findings):
 
 def audit_operator_config(data_root, role, findings):
     protected = data_root / "protected-content"
-    requirements = (
-        (protected / "chain-provider.json", "chain_config"),
-        (protected / "custody-composition.json", "custody_composition"),
-    )
     facts = {}
+    # custody-host is a slim shard-holder container: it never composes the
+    # 2-of-3 custody pool, so custody-composition.json is not provisioned
+    # onto it and must not be demanded. It DOES settle every release through
+    # its own chain rights evidence, so the chain config is required there
+    # too (synced from /shared by its entrypoint).
+    if role == "custody-host":
+        requirements = ((protected / "chain-provider.json", "chain_config"),)
+    else:
+        requirements = (
+            (protected / "chain-provider.json", "chain_config"),
+            (protected / "custody-composition.json", "custody_composition"),
+        )
     for path, name in requirements:
         present = owner_only(path, limit=MAX_CONFIG_BYTES)
         facts[name] = present
         if not present:
             findings.config(name)
-    if role == "custody-node":
+    if role in ("custody-node", "custody-host"):
         state = owner_only(protected / "custody-provider/inactive", directory=True)
         facts["custody_state"] = state
         if not state:
