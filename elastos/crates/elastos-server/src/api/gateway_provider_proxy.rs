@@ -1753,12 +1753,62 @@ pub(super) async fn gateway_provider_proxy(
         )
             .into_response();
     }
+    let mut remote_model_grants = Vec::new();
     if scheme == "model" {
         request =
             match normalize_model_provider_request(&op, &request, &context, &launch_capsule_id) {
                 Ok(value) => value,
                 Err((status, message)) => return (status, message).into_response(),
             };
+        // Approved remote model grants route runs to the granting Runtime. A
+        // grant lookup failure keeps the local path; it cannot widen authority.
+        remote_model_grants = super::gateway_model_remote::consumer_grants(
+            &state.data_dir,
+            &context,
+            state.collaboration_discovery_service.as_ref(),
+        )
+        .unwrap_or_default();
+        if !remote_model_grants.is_empty() && op != "offers_list" {
+            match super::gateway_model_remote::route_run_operation(
+                Arc::clone(&registry),
+                &state.data_dir,
+                &remote_model_grants,
+                &context,
+                &launch_capsule_id,
+                &op,
+                &request,
+                crate::auth::now_ts(),
+            )
+            .await
+            {
+                Ok(Some(mut remote_response)) => {
+                    if let Err(err) = project_model_provider_response(&op, &mut remote_response) {
+                        return gateway_provider_error_response(
+                            &scheme,
+                            anyhow::anyhow!(
+                                "remote model service returned an invalid typed response: {err}"
+                            ),
+                        );
+                    }
+                    return (StatusCode::OK, Json(remote_response)).into_response();
+                }
+                Ok(None) => {}
+                Err(super::gateway_model_remote::RemoteRouteError::Transport(message)) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "code": super::gateway_model_remote::TRANSPORT_INTERRUPTED,
+                            "message": format!("remote model service unreachable: {message}"),
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(err) => {
+                    return gateway_provider_error_response(&scheme, anyhow::anyhow!("{err}"));
+                }
+            }
+        }
     } else {
         request["op"] = serde_json::Value::String(op.clone());
     }
@@ -1957,6 +2007,16 @@ pub(super) async fn gateway_provider_proxy(
         }
     };
     if scheme == "model" {
+        if op == "offers_list" && !remote_model_grants.is_empty() {
+            super::gateway_model_remote::append_remote_offers(
+                &registry,
+                &remote_model_grants,
+                &context,
+                &launch_capsule_id,
+                &mut response,
+            )
+            .await;
+        }
         if let Err(err) = project_model_provider_response(&op, &mut response) {
             return gateway_provider_error_response(
                 &scheme,

@@ -76,6 +76,8 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_model_remote.rs"]
+mod gateway_model_remote;
 #[path = "gateway_model_service.rs"]
 mod gateway_model_service;
 pub(crate) use gateway_model_service::{

@@ -3492,6 +3492,52 @@ fn home_services_remote_model_grant(
     }))
 }
 
+/// Approved remote model grants this principal may route model operations
+/// through. The Runtime that issued a grant still decides every operation.
+pub(in crate::api::gateway) fn home_services_remote_model_grants(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let state = home_services_selection_state(data_dir, context)?;
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let mut grants = Vec::new();
+    for record in state.remote_offer_requests.values() {
+        if record.status == "approved"
+            && record.service_kind == super::MODEL_SERVICE_KIND
+            && state.remote_offer_ids.contains(&record.offer_id)
+            && contacts
+                .contacts
+                .values()
+                .any(|contact| contact.peer_id == record.target_peer_id)
+            && record
+                .pending_access_decision
+                .as_ref()
+                .is_none_or(|pending| pending.decision == "approved")
+        {
+            if let Some(grant) = &record.remote_model_grant {
+                anyhow::ensure!(
+                    grant["principal_id"].as_str() == Some(&context.principal_id),
+                    "model grant owner changed"
+                );
+                if grant["expires_at"]
+                    .as_u64()
+                    .is_some_and(|expiry| expiry > now_ts())
+                {
+                    grants.push(grant.clone());
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        grants.len() <= 4,
+        "Too many approved model services for a bounded observation"
+    );
+    Ok(grants)
+}
+
 /// Destination authority for a remote model operation. The grant must have
 /// been issued by this Runtime, stay approved and shared, and the requester
 /// must still be an accepted contact whose device key matches the Carrier
