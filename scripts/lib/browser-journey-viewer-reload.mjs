@@ -38,7 +38,8 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
 }) {
   const started = clock.now();
   const evidence = { schema: "elastos.browser.journey-viewer-reload/v1", ok: false,
-    requests: [], samples: [], dropped_requests: 0, observer: { stopped: false } };
+    requests: [], samples: [], dropped_requests: 0, observer: { stopped: false },
+    started_monotonic_ms: started };
   let phase = "baseline", stop, failure, forbidden = false, original, initialViewer;
   let newDocument, newVideo, bytesRequired, initialReceipt, input, receiptSequence;
   const interruptions = new Set();
@@ -77,8 +78,8 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
   function record(event) {
     if (event?.source_matches !== true) return;
     const navigation = event.kind === "navigation" && event.phase === "commit";
-    if (!navigation && (!["opening", "closing", "renewal", "probe", "status", "heartbeat", "signaling"].includes(event.kind) ||
-      !["request", "response", "failed"].includes(event.phase))) return;
+    if (!navigation && (!["opening", "closing", "renewal", "probe", "status", "summary", "heartbeat", "signaling"].includes(event.kind) ||
+      !["request", "headers", "response", "failed"].includes(event.phase))) return;
     if (["opening", "closing"].includes(event.kind)) {
       forbidden = true;
       for (const interrupt of interruptions) interrupt();

@@ -2433,6 +2433,7 @@ async function observeControlledBrowserRequests(page, appFrame, token, record,
       : /^\/api\/apps\/browser\/open(?:\/|$)/.test(url.pathname) && req.method() === "POST" ? "opening"
       : /\/pages\/[^/]+\/close$/.test(url.pathname) ? "closing"
       : /\/pages\/[^/]+\/status$/.test(url.pathname) ? "status"
+      : recordNavigation && url.pathname === "/api/apps/browser/summary" && url.searchParams.get("browser_instance") === instance ? "summary"
       : /\/pages\/[^/]+\/heartbeat$/.test(url.pathname) ? "heartbeat"
       : recordNavigation && /\/pages\/[^/]+\/webrtc$/.test(url.pathname) ? "signaling" : null;
     if (!kind) return;
@@ -2452,6 +2453,7 @@ async function observeControlledBrowserRequests(page, appFrame, token, record,
       record({ ...event, phase: "response", status: res.status() });
       return;
     }
+    record({ ...event, phase: "headers", status: res.status() });
     const pending = res.json().then(body => browserViewerSignalMetadata(body), () => ({}))
       .then(details => record({ ...event, ...details, phase: "response", status: res.status() }))
       .finally(() => pendingResponses.delete(pending));
@@ -2595,26 +2597,54 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
   const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
   const runtimeOrigin = new URL(appFrame.url()).origin;
   assert(instance, "Viewer reload requires the current Browser instance");
+  const stateObservation = { clock: "performance.now", steps: [], dropped_steps: 0 };
+  let sampleId = 0;
   try {
-    return await diagnoseBrowserViewerReload({
+    const evidence = await diagnoseBrowserViewerReload({
       expectedUrl, readReceipt,
-      readState: async ({ signal }) => {
+      readState: async ({ signal, deadlineMs }) => {
+        const sample = ++sampleId;
+        const step = async (name, action) => {
+          const row = { sample, step: name, start_ms: performance.now(), deadline_ms: deadlineMs };
+          if (stateObservation.steps.length < 64) stateObservation.steps.push(row);
+          else stateObservation.dropped_steps++;
+          const finish = outcome => {
+            if (row.end_ms === undefined) { row.end_ms = performance.now(); row.outcome = outcome; }
+          };
+          const aborted = () => finish("aborted");
+          signal.addEventListener("abort", aborted, { once: true });
+          try {
+            if (signal.aborted) { aborted(); throw new Error("Viewer reload observation canceled"); }
+            const result = await action(() => { if (row.end_ms === undefined) row.headers_ms = performance.now(); });
+            if (signal.aborted) throw new Error("Viewer reload observation canceled");
+            finish("complete");
+            return result;
+          } catch (error) { finish(signal.aborted ? "aborted" : "failed"); throw error; }
+          finally { signal.removeEventListener("abort", aborted); }
+        };
         const headers = { Origin: "null", "x-elastos-home-token": token };
-        const response = await fetch(new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin),
-          { headers, signal });
-        assert(response.ok, "Viewer reload Runtime summary failed");
-        const { sessions } = await response.json();
+        const { sessions } = await step("runtime_summary", async headersReceived => {
+          const response = await fetch(new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin),
+            { headers, signal });
+          headersReceived();
+          assert(response.ok, "Viewer reload Runtime summary failed");
+          return response.json();
+        });
         const pageId = sessions?.recoverable_page?.page_id;
         let page_status = null;
         if (pageId) {
-          const status = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin), { headers, signal });
-          if (status.ok) page_status = await status.json();
-          else assert(status.status === 404, "Viewer reload Runtime page status failed");
+          page_status = await step("remote_page_status", async headersReceived => {
+            const status = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin), { headers, signal });
+            headersReceived();
+            if (status.ok) return status.json();
+            assert(status.status === 404, "Viewer reload Runtime page status failed");
+            return null;
+          });
         }
         let visible = { viewer: null, video: null };
         try {
           // Read the document identity and media in one execution context.
-          visible = await appFrame.evaluate(readBrowserViewerReloadDocument);
+          visible = await step("viewer_document_metrics", () => appFrame.evaluate(readBrowserViewerReloadDocument));
         } catch (error) {
           if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) throw error;
         }
@@ -2630,8 +2660,10 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
         .pressSequentially(suffix, { timeout: Math.ceil(timeoutMs) }),
       observeRequests: (record, { signal }) => observeControlledBrowserRequests(page, appFrame, token, record, { recordNavigation: true, signal }),
     });
+    return { ...evidence, state_observation: stateObservation };
   } catch (error) {
-    error.details = { ...error.details, viewer_reload: error.evidence || { ok: false, failure: "probe_setup_or_observation_failed" } };
+    error.details = { ...error.details, viewer_reload: { ...(error.evidence || { ok: false, failure: "probe_setup_or_observation_failed" }),
+      state_observation: stateObservation } };
     throw error;
   }
 }

@@ -322,7 +322,7 @@ for (const stage of ['status', 'attachment']) for (const closeState of ['in-flig
     const before = h.calls.length;
     if (outcome === 'failure') wait.reject(new Error('late close-time failure')); else wait.resolve();
     assert.equal(await pending, true);
-    assert.equal(attaches, stage === 'attachment' ? 1 : 0);
+    assert.equal(attaches, 1); // Both requests started before close began.
     assert.equal(h.calls.length, before); assert.deepEqual(h.failures, []);
     assert.equal(h.state.currentPage.display_session.display_generation, 'display:' + '1'.repeat(32));
     assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
@@ -333,4 +333,49 @@ test('cleanup for a different owner leaves this viewer eligible', async () => {
   const h = harness();
   h.state.pendingHomeWindowCloseDelivery = { owner: { page_id: 'other', generation: 7, runtime_cleanup: { schema: 'elastos.browser.cleanup-handle/v1', id: 'old-cleanup' } } };
   await h.restore(summary()); assert.equal(h.calls.some(row => row[0] === 'connect'), true);
+});
+
+test('restore starts attachment while fresh status is pending and publishes only after both validate', async () => {
+  const h = harness(), status = deferred(), attachment = deferred(), fetch = h.state.fetchJson, started = [];
+  h.state.fetchJson = async (path, options) => {
+    started.push(path.endsWith('/status') ? 'status' : 'attachment');
+    await (path.endsWith('/status') ? status.promise : attachment.promise);
+    return fetch(path, options);
+  };
+  const pending = h.restore(summary());
+  try {
+    assert.deepEqual(started, ['status', 'attachment']);
+    attachment.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.calls.some(row => ['publish', 'connect'].includes(row[0])), false);
+  } finally { status.resolve(); attachment.resolve(); await pending; }
+  assert.equal(h.calls.filter(row => row[0] === 'connect').length, 1);
+});
+
+for (const field of ['schema', 'page_id', 'direct_network']) test(`invalid concurrent status ${field} cannot publish or connect`, async () => {
+  const h = harness(), fetch = h.state.fetchJson;
+  h.state.fetchJson = async (path, options) => {
+    const result = await fetch(path, options);
+    if (path.endsWith('/status')) result[field] = 'invalid';
+    return result;
+  };
+  await assert.rejects(h.restore(summary()));
+  assert.equal(h.calls.some(row => ['publish', 'connect'].includes(row[0])), false);
+  assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
+});
+
+test('attachment failure while status is pending cannot publish after late valid status', async () => {
+  const h = harness(), status = deferred(), fetch = h.state.fetchJson;
+  h.state.fetchJson = async (path, options) => {
+    if (path.endsWith('/webrtc')) throw new Error('attachment failed');
+    await status.promise;
+    return fetch(path, options);
+  };
+  const pending = h.restore(summary());
+  // Release in the next turn so both old and new scheduling finish without a test hang.
+  setImmediate(() => status.resolve());
+  await assert.rejects(pending, /attachment failed/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.some(row => ['publish', 'connect'].includes(row[0])), false);
+  assert.equal(h.state.currentPage.display_session.display_generation, 'display:' + '1'.repeat(32));
 });
