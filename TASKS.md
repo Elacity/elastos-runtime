@@ -20,12 +20,12 @@ owns the verification recipes and monitoring decisions; [state.md](state.md)
 owns source, installed and public facts.
 
 Session handover: [2026-09-10 execution handover](docs/audits/2026-09-10-execution-handover.md).
-The combined automated installed checkpoint passes; AUTH-01 needs the required
-user-operated passkey check in the prepared isolated Homes. See
-[its report](docs/audits/2026-09-11-first-checkpoint.md). Broader execution and
-recurring monitoring remain paused; continue only on request. After the
-current J1 repairs, prioritize the two visible Home assistants (one reported
-outdated), the model loading failure, and the Browser loading failure. Reproduce
+The combined automated installed checkpoint passes; AUTH-01 retains its full
+human verdict. Anders accepted the visible review repairs and authorized continued
+development on `feat/0.7.1-website-execution`, published at `00003b6f`. See
+[the checkpoint report](docs/audits/2026-09-11-first-checkpoint.md). C3/J3 is now
+active; recurring monitoring stays paused. Prioritize the two visible Home
+assistants, the model loading failure, and then the Browser loading failure. Reproduce
 on the installed artifact before donor integration. Preserve user drafts and
 identity while converging on the intended single assistant. The closeout review removed five fully preserved branch names (75 to 70);
 24 other merged-tip candidates retain historical reflog work. Reconcile donors
@@ -44,7 +44,7 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 | C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
 | J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Human passkey proof pending / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Both targets pass installed browser recovery/reload/retry, complete owned shutdown/restart, full Home setup/media reuse and Carrier cleanup/reuse. User-review account label, Recovery/Advanced spacing and cross-port session isolation are repaired on `1e320578`; shared-browser Mac/Linux proof passes. Next: AUTH-01 final user acceptance on the updated preserved Homes; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
 | J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
-| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Planned / model and Content owners | J1 parent; acceptance steps 1, 2, 3 and 5 in section 6 of the approved plan. Hosted/Codex adapters are Optional before freeze; remote inference and Jetson are Later. |
+| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Active / coordinator owns source, builds and tests; independent review | Continue on the published website branch. Current installed Home has zero offers; All models opens empty Settings, and Apps lists Assistant plus Home Agent. Integrate the verified engine/model bootstrap first, then the corrected local provider, catalog/admission and diagnostic core from donor `6972e165`. Preserve current recovery, sessions, media reuse and shutdown. J1 storage/window changes are independent of the first model diagnostic. Prove normal controls and one bounded test-owned Home preparation attempt before large transfers. Complete acceptance steps 1, 2, 3 and 5 in section 6; hosted/Codex remains Optional, remote inference and Jetson Later. |
 | J4 / C4 | Browser works in the two agreed placements | Planned / Browser owner | Retain canonical B01-B16 on the Browser branch; Mac A/A/A and Linux Home/Exit with Mac Engine A/B/A, including reload. Full claimed-role proof remains C6. |
 | J5 | Protect, list, buy, play and close controlled video | Planned / protected-content owner | Review PR60 then PR59 against final callers. The focused PR62 video preparation repair entered C1 after actual media dependency testing exposed its blocker. Full PR60/PR59 integration and J5 acceptance remain Required; extensions enter by readiness before freeze. |
 | C5 | Assemble and freeze the reviewed candidate | Planned / coordinator | Reviewed required source; exact optional task list. Optional work cannot delay freeze. |

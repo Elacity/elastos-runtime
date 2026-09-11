@@ -6,8 +6,11 @@ spacing and session collisions between localhost Homes. Both targets pass the
 shared-browser reload/refresh/sign-out check and show the exact restored name.
 [The checkpoint report](2026-09-11-first-checkpoint.md) separates current
 follow-up proof from reused lifecycle/media receipts. The two isolated Homes
-preserve the user's restored data and await final AUTH-01 acceptance. Broader
-execution and recurring monitoring remain paused. Full J1–J5 and D1–D6 stay intact.
+preserve the user's restored data and retain the full AUTH-01 human gate. Anders
+accepted the visible repairs, published the branch at `00003b6f`, and resumed
+C3/J3 on that branch. Recurring monitoring stays paused. Full J1–J5 and D1–D6
+acceptance remains intact; the existing branch replaces the proposed extra J1/J3
+working branch names under the user's latest instruction.
 
 ## Resume here
 
@@ -23,10 +26,10 @@ local operator ledger and current checkpoint. Resolve their directory with
 Use `feat/0.7.1-website-execution`, based on the user-selected
 `origin/upstream/0.7.1-dev` at `6c61c990`. Preserve the integration and Browser
 donors. Before edits, recheck HEAD/tree, dirt, fetched divergence and target
-receipts. Runtime source matches the installed candidate; closeout documentation may
-follow it. A new source commit alone does not require rebuilding every component.
+receipts. The installed checkpoint remains `1e320578`; newer J3 source has its
+own verification and awaits installation. Rebuild only affected components.
 
-The reviewed code candidate is `1e320578b6b8a77753c4b5ef8fab51c12ea3d9e2`, tree
+The installed checkpoint code is `1e320578b6b8a77753c4b5ef8fab51c12ea3d9e2`, tree
 `44b08f00907c02dd3fe3bb2d3ed8e79e1bb76788`, 54 ahead / zero behind dev `6c61c990`.
 Closeout documentation follows that candidate. The default checkout contains
 unrelated dirty donor work; use the website checkout explicitly.
@@ -37,12 +40,17 @@ and left unused. Official installation receipts were refreshed after manifest
 changes. Automated test gateways are stopped; only isolated human-test Homes
 remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
 
-The next action is final user acceptance on the updated candidate. Reload the
-existing Homes and sign in if requested; the restored data remains in place.
-Confirm the original Profile DID/name and independent sessions in both tabs. Retain wrong-password/retry and reload → sign-in →
-System continuation checks. Reuse automated receipts; another build requires a
-relevant source change. Public staging needs exact-candidate review and approval.
-Final installer stamping and signing follow C5 source freeze.
+The next action is the bounded local model diagnostic on the same branch.
+The installed Mac Home currently has zero offers; All models opens empty Settings,
+and Apps lists Assistant and Home Agent. Integrate the verified bootstrap and
+corrected local provider/catalog/admission core from donor `6972e165`, preserving
+current recovery, sessions, shutdown and media reuse. Storage/window changes can
+retain their separate J1 gate during this diagnostic. The full donor merge preview
+has 14 conflicted files, so account for copied fixes before intake. Preserve
+existing user Homes and perform the diagnostic in a test-owned Home. Keep the
+historical donor preparation failure's cause unknown until direct proof resolves it.
+Public staging needs exact-candidate review and approval. Final installer stamping
+and signing follow C5 source freeze.
 
 ## Earlier preview evidence
 
@@ -78,7 +86,10 @@ installed Carrier cleanup/reuse pass. The report retains first failures, source
 proof boundaries and exact artifact hashes. Automated acceptance passes; the
 wider J1 app matrix and human qualification remain separate.
 
-## Remaining goals, in priority order
+## Remaining acceptance and goals
+
+The active C3/J3 step above and TASKS.md own execution order. These remaining
+obligations retain their release gates while that source intake proceeds.
 
 1. **Finish J1:** finish the checkpoint’s user-operated passkey proof;
    prove restored Profile/name, returning sign-in, Desktop/Terminal and shared

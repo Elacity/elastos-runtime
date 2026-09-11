@@ -2,6 +2,22 @@
 
 Last updated: 2026-09-11 UTC
 
+- `feat/0.7.1-website-execution` is published for review at `00003b6f`, tree
+  `7d816617`, 55 ahead and zero behind development `6c61c990`. Anders chose
+  continued development on this branch. Notion now records the publication,
+  installed checkpoint and active C3/J3 intake; recurring monitoring stays paused.
+  The current Mac Home shows zero model offers; All models opens empty Settings,
+  and the app launcher lists both Assistant and Home Agent. This is an earlier
+  setup gap than the donor's historical preparation failure, whose cause remains
+  unknown. The integration donor retains its source and preservation role.
+
+- The first J3 bootstrap slice integrates donor `c95cf4c9` with the current
+  media setup call sites. Small artifact fixtures and all 56 Runtime setup
+  tests pass on Mac ARM64; the basic repository gate passes. This is source
+  verification. Installed Homes remain `1e320578`; local provider/admission
+  integration and the bounded preparation diagnostic follow. See the
+  [bootstrap report](docs/audits/2026-09-11-j3-bootstrap.md).
+
 - User-review follow-up `1e320578` is installed in the two isolated human
   Homes. System displays the restored Profile name for an unnamed current
   passkey, and Recovery/Advanced spacing is repaired. Mac and Linux stay
@@ -21,7 +37,7 @@ Last updated: 2026-09-11 UTC
   [The report](docs/audits/2026-09-11-first-checkpoint.md) binds source, hashes,
   receipts and evidence limits. AUTH-01 retains its pending human passkey
   verdict; isolated Homes are prepared. Automated test services are stopped,
-  broader execution and recurring monitoring are paused. Existing user previews
+  C3/J3 execution has resumed and recurring monitoring stays paused. Existing user previews
   and public stage retain `d790a48e`; public live remains unchanged.
 
 - J1 identity foundation integrates registration RP/origin binding and atomic,
