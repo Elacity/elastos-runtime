@@ -668,7 +668,7 @@ function positionFloatingMenu(menu, btn, { minWidth = 280, maxWidth = 360, prefe
   menu.hidden = false;
   menu.removeAttribute("inert");
   menu.setAttribute("aria-hidden", "false");
-  const menuH = menu.getBoundingClientRect().height || 220;
+  const menuH = menu.offsetHeight || 220;
   let top = rect.top - menuH - 10;
   if (top < 12) {
     top = Math.min(window.innerHeight - menuH - 12, rect.bottom + 10);
@@ -755,12 +755,6 @@ function buildInstalledModelRows(host, emptyText) {
       host.append(row);
     }
   }
-  if (!host.children.length) {
-    const empty = document.createElement("p");
-    empty.className = "agent-model-menu-empty";
-    empty.textContent = emptyText;
-    host.append(empty);
-  }
   for (const model of liveContentModels()) {
     const row = document.createElement("button");
     row.type = "button"; row.className = "agent-model-option";
@@ -770,6 +764,12 @@ function buildInstalledModelRows(host, emptyText) {
     row.setAttribute("role", "option");
     row.setAttribute("aria-selected", String((liveContentChoice() == null || liveContentChoice() === model.cid) && selectedLiveOffer()?.offerId === model.offerId));
     host.append(row);
+  }
+  if (!host.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "agent-model-menu-empty";
+    empty.textContent = emptyText;
+    host.append(empty);
   }
   for (const [action, label] of [["refresh-models", "Refresh models"], ["open-models", "Open Models"]]) {
     const button = document.createElement("button");
@@ -786,6 +786,14 @@ function renderModelMenu() {
     return;
   }
   buildInstalledModelRows(listHost, "No model offer on this Home yet.");
+  if (modelMenuOpen()) {
+    const anchor = modelMenuAnchor || modelBtnEl();
+    positionFloatingMenu(modelMenuEl(), anchor, {
+      minWidth: 230,
+      maxWidth: 280,
+      preferRight: anchor === modelBtnEl(),
+    });
+  }
 }
 
 function openModelMenu(anchor = null) {

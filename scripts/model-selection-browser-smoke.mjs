@@ -9,7 +9,7 @@ import { chromium, brave } from "./system-uiux-fixture.mjs";
 const root = resolve(new URL("../", import.meta.url).pathname);
 const cid = `bafybei${"a".repeat(52)}`;
 const offer = (id, title) => ({ id, title, operation: "text.generate", input_modalities: ["text/plain"], output_modalities: ["text/plain"] });
-let offers, rows, failed = false;
+let offers, rows, failed = false, responseDelay = 0;
 const calls = [], errors = [];
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://fixture");
@@ -27,7 +27,10 @@ const server = createServer(async (req, res) => {
       let body = ""; for await (const chunk of req) body += chunk;
       const input = body ? JSON.parse(body) : null;
       calls.push({ path: url.pathname, input });
-      if (url.pathname.endsWith("offers_list")) { json({ offers }, failed ? 503 : 200); return; }
+      if (url.pathname.endsWith("offers_list")) {
+        if (responseDelay) await new Promise(resolve => setTimeout(resolve, responseDelay));
+        json({ offers }, failed ? 503 : 200); return;
+      }
       if (url.pathname === "/api/capsules/catalog") { json({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: rows }); return; }
       if (url.pathname.endsWith("workspace")) {
         if (req.method === "PUT") { json({ ...input, revision: input.if_revision + 1 }); return; }
@@ -87,6 +90,38 @@ try {
     const menu = agent ? frame.locator("#agent-model-menu") : frame.locator("#assistant-offer-select");
     assert.equal(await menu.getByRole("option", { name: "Prepared model", exact: true }).count(), 1);
     assert.equal(await menu.getByRole("option", { name: "Hosted service", exact: true }).count(), 1);
+    if (agent) {
+      offers = [offer("chosen", "Prepared model")];
+      await menu.getByRole("button", { name: "Refresh models", exact: true }).click();
+      const selected = menu.locator(`[data-model-cid="${cid}"][aria-selected="true"]`);
+      await selected.waitFor({ state: "visible" });
+      assert.equal(await menu.getByRole("option").count(), 1);
+      assert.equal(await menu.locator(".agent-model-menu-empty").count(), 0,
+        "A ready content model must replace the empty state");
+      await frame.locator("#agent-model-picker").click();
+      assert.equal(await frame.locator("#agent-model-picker").getAttribute("aria-expanded"), "false");
+      await frame.locator("#agent-model-picker").click();
+      responseDelay = 150;
+      offers = [offer("chosen", "Prepared model"), offer("extra-a", "Another service"), offer("extra-b", "Third service")];
+      await menu.getByRole("button", { name: "Refresh models", exact: true }).click();
+      await selected.waitFor({ state: "visible" });
+      await menu.getByRole("option", { name: "Third service", exact: true }).waitFor();
+      responseDelay = 0;
+      const geometry = await menu.evaluate(async element => {
+        await Promise.all(element.getAnimations().map(animation => animation.finished));
+        const rect = element.getBoundingClientRect();
+        const anchor = document.querySelector("#agent-model-picker").getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right,
+          gap: anchor.top - rect.bottom, viewportWidth: innerWidth, viewportHeight: innerHeight };
+      });
+      assert.ok(geometry.gap >= 9 && geometry.top >= 0 && geometry.left >= 0
+        && geometry.right <= geometry.viewportWidth && geometry.bottom <= geometry.viewportHeight,
+      `Refreshed model menu overlaps its picker or viewport: ${JSON.stringify(geometry)}`);
+      await frame.locator("#agent-model-picker").click();
+      assert.equal(await frame.locator("#agent-model-picker").getAttribute("aria-expanded"), "false");
+      assert.equal(await draft.inputValue(), "Keep my draft");
+      await frame.locator("#agent-model-picker").click();
+    }
     offers = [offer("hosted", "Hosted service")]; rows = [];
     await (agent ? menu : frame).getByRole("button", { name: "Refresh models", exact: true }).click();
     await menu.getByRole("option", { name: "Prepared model", exact: true }).waitFor({ state: "detached" });
