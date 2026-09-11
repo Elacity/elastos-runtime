@@ -54,12 +54,15 @@ history, adopted behavior, explicit differences and remaining proof. URUX,
 Irzhy authority cutover and the Required follow-up work enter after this installed
 checkpoint, in dependency order. Keep both Assistant workspace stores intact;
 one visible Assistant requires full history and draft preservation. Integrated
-UI and model acceptance remains pending. The first Mac candidate shows trusted
-Qwen in both catalog surfaces and passes Use/cancel/retry. Runtime `2b95b382` passes the earlier snapshot contention failure and prepares
-over 812 MB before deliberate cancellation. An active sample identifies repeated
-identity-directory sync during authority checks. The existing-only reader repair
-keeps creation/recovery durability; its installed check is next. The preservation
-check and private checkpoint bind the source tests and installation receipts.
+UI and model acceptance remains pending. Installed Mac Runtime `ab993a99` completes
+exact Qwen preparation and admission; the package hashes match and the activation
+record binds the reviewed engine and weights. The Marketplace view stops polling
+at admission before dispatch readiness arrives. A bounded polling repair passes
+rendered regression checks in both Marketplace and System; it awaits installation.
+Continue with a fresh readiness observation, actual Assistant reply, stop, reload
+and restart/reuse. Preserve the admitted package and reuse the Runtime binary.
+Linux J3 requires additional disk headroom before its installed proof. The
+preservation check and private checkpoint bind these receipts and remaining work.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

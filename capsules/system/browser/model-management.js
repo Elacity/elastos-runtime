@@ -131,7 +131,9 @@
       }
       function schedule() {
         clearTimeout(timer);
-        if (!show() || busy || message || !active(model?.model_runtime.preparation)) return;
+        const runtime = model?.model_runtime, preparation = runtime?.preparation;
+        const pending = active(preparation) || (preparation && runtime.admitted && !runtime.dispatch_ready);
+        if (!show() || busy || message || !pending) return;
         if (polls >= 120) { message = "Preparation is still pending. Refresh to check its status."; render(); return; }
         timer = setTimeout(poll, 1500);
       }

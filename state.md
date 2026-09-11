@@ -16,13 +16,15 @@ Assistant consolidation, original UI parity and installed Qwen proof remain open
 
 The isolated Mac J3 installation verifies signed Qwen catalog visibility in
 System and Marketplace, Use/cancel/retry, local package reuse and owned
-shutdown/restart. Runtime `2b95b382` passes the earlier snapshot-lock failure
-and prepares over 812 MB before a deliberate UI cancellation. Active profiling
-finds repeated identity-directory sync during authority checks. The existing-only
-reader repair preserves creation/recovery durability and passes identity source
-checks. Installed admission, reply and restart/reuse remain pending. Human Homes
-retain their existing candidate; Linux has no new J3 result. The integration
-check records the failure, repair and proof limits.
+shutdown/restart. Installed Runtime `ab993a99` completes preparation and admission
+of the exact 6,169,366,387-byte Qwen package. The admitted weight hash matches the
+reviewed package; Runtime activation records the exact model offer. Marketplace
+stops polling at admission and can retain a stale unavailable message. A reproduced
+browser regression now passes with continued bounded readiness polling in both
+Marketplace and System. This UI repair awaits installation. Reply, stop, reload
+and restart/reuse remain pending. Human Homes retain their existing candidate.
+Linux J3 needs additional disk headroom before model preparation and build margin;
+its previews and data remain preserved. The integration check records proof limits.
 
 Last updated: 2026-09-11 UTC
 

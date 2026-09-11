@@ -209,3 +209,29 @@ corrupt credentials and unsafe paths fail. The identity suite passes 54 tests;
 an added portable existing-reader test and all nine Home-token authority cases
 also pass. Whitespace, Home entropy and both Rust format gates pass. Installed
 performance and admission remain pending until the affected Runtime is rebuilt.
+
+
+## Installed admission and readiness polling
+
+Mac Runtime `ab993a99` completes the same preparation operation after the observer
+reopens Home. The admitted package contains 6,169,366,387 content bytes plus its
+727-byte object index. The weight SHA-256 is
+`d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43`.
+The activation record binds this package and the reviewed native engine. Existing
+Homes and preview services retain their earlier artifacts.
+
+The installed Marketplace view receives admitted status before activation finishes,
+then stops polling. Runtime later records successful activation while that view
+still says the offer is unavailable. The rendered regression reproduces the stale
+status. The shared helper now polls admitted content until dispatch readiness,
+using the existing polling limit and visibility guards. Cancel eligibility stays
+with active preparation. Both Marketplace and System pass transitions with both
+activation-flag values, unchanged Use count, absent Cancel after admission, and
+polling stopped at ready. Independent diff review finds no blocking issue; Home
+entropy, whitespace and both Rust format gates pass. UI installation and the
+actual reply/lifecycle journey remain pending.
+
+Linux capacity preflight leaves an additional 13.4 GB needed for the same local
+package import and reserved preparation space, before build margin, while keeping
+the required ten-percent free-space floor. Linux model proof is pending; its
+existing source checkout, public service and previews were read only.

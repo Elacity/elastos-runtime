@@ -12,6 +12,8 @@ const operation = "model-operation-1";
 const calls = [];
 let phase = "unprepared";
 let kept = false;
+let activationPending = false;
+let dispatchPending = false;
 let failure = false;
 let delayStatus = null;
 let delayUse = null;
@@ -27,11 +29,11 @@ const fixtureErrors = [];
 function preparation() {
   return phase === "unprepared" ? null : { operation_id: operation, cid: selectedCid, state: phase,
     total_bytes: 1024, completed_bytes: phase === "capacity_pending" ? 0 : ["admitted", "reclaimed"].includes(phase) ? 1024 : 256,
-    cancel_requested: false, admitted: phase === "admitted", activation_pending: false };
+    cancel_requested: false, admitted: phase === "admitted", activation_pending: activationPending };
 }
 function runtime() {
-  return { admitted: phase === "admitted", kept, dispatch_ready: phase === "admitted",
-    offer_id: malformedRuntime ? "wrong" : phase === "admitted" ? `model:${"b".repeat(64)}` : null, preparation: preparation() };
+  return { admitted: phase === "admitted", kept, dispatch_ready: phase === "admitted" && !dispatchPending,
+    offer_id: malformedRuntime ? "wrong" : phase === "admitted" && !dispatchPending ? `model:${"b".repeat(64)}` : null, preparation: preparation() };
 }
 function catalog() {
   return { schema: "elastos.capsules.catalog/v1", model_catalog_state: trust, capsules: [
@@ -146,8 +148,16 @@ try {
     await frame.getByRole("button", { name: "Retry", exact: true }).waitFor();
     await frame.getByRole("button", { name: "Retry", exact: true }).click();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
-    phase = "admitted";
+    phase = "admitted"; activationPending = app === "marketplace"; dispatchPending = true;
+    await frame.getByText("Prepared. The model offer is unavailable.", { exact: true }).waitFor();
+    const activationUses = calls.filter(c => c.method === "content.use").length;
+    assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "admitted content is not cancellable");
+    activationPending = false; dispatchPending = false;
     await frame.locator("[data-model-management] p").filter({ hasText: /^Ready to use$/ }).waitFor();
+    assert.equal(calls.filter(c => c.method === "content.use").length, activationUses, "activation readiness uses status without another Use");
+    const readyStatuses = calls.filter(c => c.method === "content.status").length;
+    await page.waitForTimeout(1750);
+    assert.equal(calls.filter(c => c.method === "content.status").length, readyStatuses, "ready state stops polling");
     await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
     await frame.locator('[data-model-management] input:enabled:checked').waitFor();
     await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
