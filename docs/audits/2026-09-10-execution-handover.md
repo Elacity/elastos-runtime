@@ -8,9 +8,10 @@ shared-browser reload/refresh/sign-out check and show the exact restored name.
 follow-up proof from reused lifecycle/media receipts. The two isolated Homes
 preserve the user's restored data and retain the full AUTH-01 human gate. Anders
 accepted the visible repairs, published the branch at `00003b6f`, and resumed
-C3/J3 on that branch. Recurring monitoring stays paused. Full J1–J5 and D1–D6
-acceptance remains intact; the existing branch replaces the proposed extra J1/J3
-working branch names under the user's latest instruction.
+C3/J3 on that branch. The combined checkpoint is now published through the
+existing integration branch in [draft PR64](https://github.com/Elacity/elastos-runtime/pull/64).
+The website refs and checkout are retired after remote protection and ownership
+checks. Recurring monitoring stays paused. Full J1–J5 and D1–D6 acceptance remains intact.
 
 ## Resume here
 
@@ -23,12 +24,15 @@ local operator ledger and current checkpoint. Resolve their directory with
 `git rev-parse --path-format=absolute --git-common-dir`; read
 `development-loop-current.md` there. A linked worktree's `.git` is a file.
 
-Use the explicit website checkout on `feat/0.7.1-website-execution`, based on
-the user-selected `origin/upstream/0.7.1-dev` at `6c61c990`. The default checkout
-contains unrelated dirty donor work. Preserve all 70 branches and 12 worktrees.
-Before edits, recheck HEAD/tree, dirt, fetched divergence and process ownership.
-Published review remains `00003b6f`; subsequent integration and Assistant work is
-local. Closeout documentation follows the code candidate.
+Use the existing integration checkout on `feat/0.7.1-integration`, based on
+user-selected `origin/upstream/0.7.1-dev` at `6c61c990`. Resolve its exact local
+path from the private checkpoint. Reviewed source `06bf4e0f`, tree `4483f403`,
+is published in draft PR64 with this documentation-only closeout. Both website
+heads remain ancestors of the verified remote integration ref. The default
+checkout contains unrelated dirty donor work. Preserve the remaining 69 branches
+and 11 worktrees. Before edits, recheck HEAD/tree, dirt, fetched divergence and
+process ownership. [The team report](2026-09-11-team-sync.md) and
+[contributor review](2026-09-11-contributor-review.md) are the shareable closeout.
 
 The current installed candidate is `3c2f9a80012ff510449998f0b423a21c47ad2a98`,
 tree `6be3ed9cde01c6dea8850ebd6ac381c5f03a9480`. Runtime built/installed SHA-256
@@ -70,7 +74,7 @@ Required gates. Confirmed backend cancellation remains distinct from the accepte
 honest unknown result. Recurring monitoring remains paused; Jetson is deferred.
 
 Further public deployment requires review and approval of the exact candidate.
-The seed's existing GitHub credentials remain available for a future authorized
+The private publication record owns the verified route for a future authorized
 push. Required installation manifests and receipts are current; final installer
 stamping, packaging and signing follow C5 source freeze and the release gate.
 
@@ -119,12 +123,12 @@ obligations retain their release gates while that source intake proceeds.
 2. **Deliver the public preview:** approve and deploy the reviewed storefront
    and seed Runtime, preserve existing accounts, then verify public artifacts.
    Public signed installer delivery remains a separate gate.
-3. **One current Home assistant and working local AI (J3):** Anders reports two
-   Home assistants, one outdated, and a model that does not load. Reproduce on
-   the actual installed path, map both surfaces to their source/donor owners,
-   preserve drafts/data, and converge on the intended single experience.
-   Prove model Get, local reply, stop, restart/reuse and removal through the
-   canonical typed Model and Content/Carrier contracts.
+3. **Complete the local AI journey (J3):** one Assistant and real Qwen replies
+   now pass the bounded Mac checkpoint. Next prove exact Marketplace-to-Assistant
+   handoff and safe removal, then cold Content/Carrier delivery. Preserve drafts,
+   model identity and run ownership. Full human/Linux acceptance, confirmed
+   cancellation, cold transfer integrity/retry and shared regressions keep their
+   existing gates; the earlier duplicate/loading diagnostics remain historical.
 4. **Working Browser (J4):** Anders reports that Browser does not load. Start
    with that installed failure, then integrate the canonical Browser work and
    prove the agreed Mac-local and Linux Home/Exit with Mac Engine placements.
@@ -150,7 +154,8 @@ and reflog revisions remain reachable from retained refs, with an exact restorat
 map in the private cleanup receipt. Another 24 merged-tip candidates retain
 historical reflog work and need review before removal.
 
-All 12 worktrees remain. The active website checkout is clean after the checkpoint closeout commit; the
+The authorized publication retirement leaves 11 worktrees and 69 branches.
+The active integration checkout owns further work; the
 root documentation, Browser maturity and Home URUX worktrees contain preserved
 dirty work. The detached Browser build is contained in `fix/browser-maturity`.
 Three historical backup refs and the clean review/build worktrees retain their
@@ -162,7 +167,7 @@ owning journey. Preserve semantic conflict resolutions, especially provider
 bounds/lifecycle, Documents `if_revision`, Profile authority and the single
 components cutover. Compare history as well as tree bytes before retiring a
 ref. The next session must not declare the whole repository clean based only on
-the website worktree. Keep at least 10% free disk space.
+the integration worktree. Keep at least 10% free disk space.
 
 Runtime owns authority, networking and lifecycle; signed Profile authority owns
 identity/name; Content/Carrier owns model delivery. Remove obsolete surfaces

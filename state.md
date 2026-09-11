@@ -1,5 +1,31 @@
 # State
 
+## Current publication checkpoint — 2026-09-11
+
+`feat/0.7.1-integration` is the active working/review branch. Reviewed source
+`06bf4e0f11e602733e8eef861b835184ae683504`, tree
+`4483f403a85d1ac27b4568f7b8cb4cf1a8a4e546`, is published in
+[draft PR64](https://github.com/Elacity/elastos-runtime/pull/64) against
+`upstream/0.7.1-dev` at `6c61c990`. This single documentation closeout adds the
+[team report](docs/audits/2026-09-11-team-sync.md) and
+[contributor review](docs/audits/2026-09-11-contributor-review.md).
+The PR records the final documentation commit; product code remains the reviewed
+checkpoint. Remote ancestry protects both website heads (`00003b6f` and
+`06bf4e0f`). The website refs and redundant checkout are removed; 69 local branches
+and 11 worktrees remain with their donor/history preservation gates. Main, dev,
+contributor PRs and installed services retain their prior identities.
+
+The Mac Home retains installed code `3c2f9a80` and Runtime SHA-256
+`1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666`.
+This publication reused prior product evidence and ran the four basic source
+gates; it performed no build, installation, restart or deployment.
+Full J1 to J5 and D1 to D6 acceptance remains open under the approved plan.
+The bounded publication/cleanup run stops here; broader execution and monitoring
+stay paused. Next implementation: exact Marketplace-to-Assistant handoff and
+safe removal, then cold Content/Carrier delivery.
+
+## Installed and source evidence
+
 The September 11 integration now uses the full donor history. The combined source
 preserves current recovery, cookie and shutdown code while adding model admission,
 provider lifecycle, storage and window behavior. Focused source and rendered
@@ -41,14 +67,11 @@ failures, repairs, independent review and the remaining full J3 gates.
 
 Last updated: 2026-09-11 UTC
 
-- `feat/0.7.1-website-execution` is published for review at `00003b6f`, tree
-  `7d816617`, 55 ahead and zero behind development `6c61c990`. Anders chose
-  continued development on this branch. Notion now records the publication,
-  installed checkpoint and active C3/J3 intake; recurring monitoring stays paused.
-  The current Mac Home shows zero model offers; All models opens empty Settings,
-  and the app launcher lists both Assistant and Home Agent. This is an earlier
-  setup gap than the donor's historical preparation failure, whose cause remains
-  unknown. The integration donor retains its source and preservation role.
+- Historical publication `00003b6f`, tree `7d816617`, was the website/recovery
+  review checkpoint. The later local integration donor and Assistant/model
+  repairs are now included in published integration. The original zero-offer
+  and duplicate-Assistant observations are superseded by the bounded installed
+  Mac results above; their original diagnostics and receipts remain historical.
 
 - The first J3 bootstrap slice integrates donor `c95cf4c9` with the current
   media setup call sites. Small artifact fixtures and all 56 Runtime setup
