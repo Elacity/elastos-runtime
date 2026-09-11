@@ -1312,11 +1312,7 @@ pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
         return Some(did);
     }
 
-    let device_key = data_dir.join("identity").join("device.key");
-    if !device_key.exists() {
-        return None;
-    }
-    elastos_identity::load_or_create_did(data_dir)
+    elastos_identity::load_existing_did(data_dir)
         .ok()
         .map(|(_signing_key, did)| did)
         .filter(|did| !did.trim().is_empty())

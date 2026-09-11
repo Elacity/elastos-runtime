@@ -55,9 +55,11 @@ Irzhy authority cutover and the Required follow-up work enter after this install
 checkpoint, in dependency order. Keep both Assistant workspace stores intact;
 one visible Assistant requires full history and draft preservation. Integrated
 UI and model acceptance remains pending. The first Mac candidate shows trusted
-Qwen in both catalog surfaces and passes Use/cancel/retry. Its full preparation
-fails on inventory snapshot contention after about 3 MB; the current repair and
-next installed experiment are recorded in the preservation check and checkpoint.
+Qwen in both catalog surfaces and passes Use/cancel/retry. Runtime `2b95b382` passes the earlier snapshot contention failure and prepares
+over 812 MB before deliberate cancellation. An active sample identifies repeated
+identity-directory sync during authority checks. The existing-only reader repair
+keeps creation/recovery durability; its installed check is next. The preservation
+check and private checkpoint bind the source tests and installation receipts.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

@@ -14,14 +14,15 @@ in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
 Assistant consolidation, original UI parity and installed Qwen proof remain open.
 
 
-The first isolated Mac J3 installation at `dd21d8bd` verifies signed Qwen catalog
-visibility in System and Marketplace, Use/cancel/retry, local package reuse and
-owned shutdown/restart. Full preparation stops on snapshot-lock contention after
-about 3 MB. A source regression reproduces the error; bounded snapshot locking
-and exact-caller revalidation pass the focused source gates. Model admission and reply
-remain pending. Human Homes retain their existing candidate, and Linux has no new
-J3 installed result. The integration check records the failure and proof limits.
-
+The isolated Mac J3 installation verifies signed Qwen catalog visibility in
+System and Marketplace, Use/cancel/retry, local package reuse and owned
+shutdown/restart. Runtime `2b95b382` passes the earlier snapshot-lock failure
+and prepares over 812 MB before a deliberate UI cancellation. Active profiling
+finds repeated identity-directory sync during authority checks. The existing-only
+reader repair preserves creation/recovery durability and passes identity source
+checks. Installed admission, reply and restart/reuse remain pending. Human Homes
+retain their existing candidate; Linux has no new J3 result. The integration
+check records the failure, repair and proof limits.
 
 Last updated: 2026-09-11 UTC
 

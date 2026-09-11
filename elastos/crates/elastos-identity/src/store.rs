@@ -165,6 +165,15 @@ pub fn load_or_create_did(data_dir: &Path) -> anyhow::Result<(ed25519_dalek::Sig
     Ok((signing_key, did))
 }
 
+/// Read the existing device identity for authority checks. Initialization and
+/// recovery own creation and durability; this path only validates current files.
+pub fn load_existing_did(data_dir: &Path) -> anyhow::Result<(ed25519_dalek::SigningKey, String)> {
+    let files = IdentityFiles::open_existing(data_dir)?;
+    let key = read_device_key(&files)?
+        .ok_or_else(|| anyhow::anyhow!("identity device.key is missing"))?;
+    Ok(derive_did(&key))
+}
+
 /// Load the locally persisted DID nickname, if present.
 pub fn load_nickname(data_dir: &Path) -> anyhow::Result<Option<String>> {
     let device_key = load_or_create_device_key(data_dir)?;
@@ -263,6 +272,23 @@ pub fn device_key_path(data_dir: &Path) -> PathBuf {
 /// with 0600 permissions on Unix.
 pub fn load_or_create_device_key(data_dir: &Path) -> anyhow::Result<Zeroizing<[u8; 32]>> {
     let files = IdentityFiles::open(data_dir)?;
+    if let Some(key) = read_device_key(&files)? {
+        files.sync()?;
+        Ok(key)
+    } else {
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(key.as_mut());
+        files.replace(
+            c"device.key",
+            key.as_ref(),
+            #[cfg(test)]
+            None,
+        )?;
+        Ok(key)
+    }
+}
+
+fn read_device_key(files: &IdentityFiles) -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
     if let Some(bytes) = files.read(c"device.key")? {
         let bytes = Zeroizing::new(bytes);
         if bytes.len() != 32 {
@@ -278,21 +304,12 @@ pub fn load_or_create_device_key(data_dir: &Path) -> anyhow::Result<Zeroizing<[u
                 anyhow::anyhow!("identity credentials cannot be verified with device.key")
             })?;
         }
-        files.sync()?;
-        Ok(key)
+        Ok(Some(key))
     } else {
         if files.read(c"credentials.json")?.is_some() {
             anyhow::bail!("identity credentials exist but device.key is missing");
         }
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::thread_rng().fill_bytes(key.as_mut());
-        files.replace(
-            c"device.key",
-            key.as_ref(),
-            #[cfg(test)]
-            None,
-        )?;
-        Ok(key)
+        Ok(None)
     }
 }
 
@@ -834,6 +851,73 @@ mod tests {
         stale.update_sign_count("credential", 4);
         assert!(stale.save().is_err());
         assert!(stale.get_credentials().is_empty());
+    }
+
+    #[test]
+    fn existing_did_reads_current_identity_without_creating_missing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(load_existing_did(&missing).is_err());
+        assert!(!missing.exists());
+        assert!(load_existing_did(dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let (_, expected) = load_or_create_did(dir.path()).unwrap();
+        let key = std::fs::read(device_key_path(dir.path())).unwrap();
+        assert_eq!(load_existing_did(dir.path()).unwrap().1, expected);
+        std::fs::remove_file(device_key_path(dir.path())).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert!(!device_key_path(dir.path()).exists());
+        let files = IdentityFiles::open(dir.path()).unwrap();
+        files.replace(c"device.key", &key, None).unwrap();
+        drop(files);
+        std::fs::remove_file(dir.path().join("identity/identity.lock")).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert!(!dir.path().join("identity/identity.lock").exists());
+        assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), key);
+    }
+
+    #[test]
+    fn existing_did_revalidates_key_and_credentials_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::new(dir.path()).unwrap();
+        store.add_credential(persistence_credential("credential", 0));
+        store.save().unwrap();
+        let expected = load_existing_did(dir.path()).unwrap().1;
+        let key = std::fs::read(device_key_path(dir.path())).unwrap();
+        let credentials = std::fs::read(&store.path).unwrap();
+        for invalid in [vec![0; 32], vec![0; 33], vec![]] {
+            std::fs::write(device_key_path(dir.path()), &invalid).unwrap();
+            assert!(load_existing_did(dir.path()).is_err());
+            assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), invalid);
+            assert_eq!(std::fs::read(&store.path).unwrap(), credentials);
+        }
+        std::fs::write(device_key_path(dir.path()), &key).unwrap();
+        assert_eq!(load_existing_did(dir.path()).unwrap().1, expected);
+        std::fs::write(&store.path, b"corrupt").unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert_eq!(std::fs::read(&store.path).unwrap(), b"corrupt");
+        assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_did_preserves_private_descriptor_checks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_did(dir.path()).unwrap();
+        let key = device_key_path(dir.path());
+        let bytes = std::fs::read(&key).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = dir.path().join("key-alias");
+        std::fs::hard_link(&key, &alias).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        std::fs::remove_file(&key).unwrap();
+        symlink(&alias, &key).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert_eq!(std::fs::read(&alias).unwrap(), bytes);
     }
 
     #[test]

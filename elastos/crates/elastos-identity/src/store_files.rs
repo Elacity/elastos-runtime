@@ -32,26 +32,43 @@ pub(super) use portable::IdentityFiles;
 #[cfg(unix)]
 impl IdentityFiles {
     pub(super) fn open(data_dir: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(data_dir)?;
+        Self::open_mode(data_dir, true)
+    }
+
+    pub(super) fn open_existing(data_dir: &Path) -> anyhow::Result<Self> {
+        Self::open_mode(data_dir, false)
+    }
+
+    fn open_mode(data_dir: &Path, create: bool) -> anyhow::Result<Self> {
+        if create {
+            std::fs::create_dir_all(data_dir)?;
+        }
         let root = File::options()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(data_dir)?;
         validate_owner(&root.metadata()?)?;
-        if unsafe { libc::mkdirat(root.as_raw_fd(), c"identity".as_ptr(), 0o700) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(error.into());
+        if create {
+            if unsafe { libc::mkdirat(root.as_raw_fd(), c"identity".as_ptr(), 0o700) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            } else {
+                root.sync_all()?;
             }
-        } else {
-            root.sync_all()?;
         }
         let directory = open_at(&root, c"identity", libc::O_RDONLY | libc::O_DIRECTORY)?;
         validate_owner(&directory.metadata()?)?;
         let lock = match open_at(
             &directory,
             c"identity.lock",
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR
+                | if create {
+                    libc::O_CREAT | libc::O_EXCL
+                } else {
+                    0
+                },
         ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -200,11 +217,21 @@ mod portable {
 
     impl IdentityFiles {
         pub(crate) fn open(data_dir: &Path) -> anyhow::Result<Self> {
+            Self::open_mode(data_dir, true)
+        }
+
+        pub(crate) fn open_existing(data_dir: &Path) -> anyhow::Result<Self> {
+            Self::open_mode(data_dir, false)
+        }
+
+        fn open_mode(data_dir: &Path, create: bool) -> anyhow::Result<Self> {
             let directory = data_dir.join("identity");
-            std::fs::create_dir_all(&directory)?;
+            if create {
+                std::fs::create_dir_all(&directory)?;
+            }
             let path = directory.join("identity.lock");
             let lock = match File::options()
-                .create_new(true)
+                .create_new(create)
                 .read(true)
                 .write(true)
                 .open(&path)
@@ -273,6 +300,23 @@ mod portable {
             }
             result
         }
+    }
+
+    #[test]
+    fn portable_existing_reader_requires_state_without_creating_it() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(IdentityFiles::open_existing(root.path()).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let files = IdentityFiles::open(root.path()).unwrap();
+        files.replace(c"device.key", &[7; 32], None).unwrap();
+        drop(files);
+        let files = IdentityFiles::open_existing(root.path()).unwrap();
+        assert_eq!(files.read(c"device.key").unwrap().unwrap(), vec![7; 32]);
+        drop(files);
+        let lock = root.path().join("identity/identity.lock");
+        std::fs::remove_file(&lock).unwrap();
+        assert!(IdentityFiles::open_existing(root.path()).is_err());
+        assert!(!lock.exists());
     }
 
     #[test]

@@ -119,7 +119,7 @@ compatibility remains an independent gate.
 | [52](https://github.com/Elacity/elastos-runtime/pull/52) | Irzhy provisioning, original head already in ancestry |
 | [54](https://github.com/Elacity/elastos-runtime/pull/54) | Sash first-run/chrome/Documents/Library/icons, original head already in ancestry |
 | [55](https://github.com/Elacity/elastos-runtime/pull/55) | Sash shelf, complete original changes present; ancestry reconciled by37c82d4f |
-| [57](https://github.com/Elacity/elastos-runtime/pull/57) / [60](https://github.com/Elacity/elastos-runtime/pull/60) | Same Irzhy source617796a9;57 closed in favor of60; one foundation merge in progress |
+| [57](https://github.com/Elacity/elastos-runtime/pull/57) / [60](https://github.com/Elacity/elastos-runtime/pull/60) | Same Irzhy source617796a9;57 closed in favor of60; foundation merged by `dd21d8bd` |
 | [58](https://github.com/Elacity/elastos-runtime/pull/58) | Published integration prefix already in ancestry; later local donor merged byb318bfda |
 | [59](https://github.com/Elacity/elastos-runtime/pull/59) | Authority cutover25ab205e, queued after foundation and installed checkpoint |
 | [62](https://github.com/Elacity/elastos-runtime/pull/62) | Follow-up06179578, queued after59; Required repairs and Optional additions retain D2 |
@@ -190,3 +190,22 @@ concurrent reservation accounting and failure diagnostics with real Home grant
 revalidation. Repository whitespace, Home entropy and both Rust format gates pass.
 The independent review confirms bounded snapshot waiting and preserved worker
 exclusion. The next operation rebuilds Runtime only for the same test Home.
+
+
+## Existing-identity read repair
+
+Installed Mac Runtime `2b95b382` passes the previous snapshot failure point and
+prepares 812,801,875 bytes under normal UI status polling. Marketplace cancellation
+then stops the bounded experiment without JavaScript errors. The operation remains
+unadmitted. A sample taken while preparation advances identifies repeated identity
+directory sync during every small Content read's Home authority validation.
+
+Gateway validation now uses an existing-only identity reader. It requires the
+current root, directory, lock and key, retains descriptor/permission checks and
+credential decryption, and performs no durability write. Initialization and
+recovery retain their existing durable sync and replacement behavior. Independent
+review confirms this separation. Missing state creates nothing; changed keys,
+corrupt credentials and unsafe paths fail. The identity suite passes 54 tests;
+an added portable existing-reader test and all nine Home-token authority cases
+also pass. Whitespace, Home entropy and both Rust format gates pass. Installed
+performance and admission remain pending until the affected Runtime is rebuilt.
