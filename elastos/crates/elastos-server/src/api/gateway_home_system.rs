@@ -3486,6 +3486,7 @@ fn home_services_remote_model_grant(
         "peer_did": record.target_peer_id,
         "connect_ticket": ticket,
         "principal_id": context.principal_id,
+        "service_display_name": record.service_display_name,
         "offer_scope": "local_engines",
         "operations": grant["operations"],
         "expires_at": expiry,

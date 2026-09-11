@@ -139,6 +139,7 @@ pub(crate) struct ConsumerModelGrant {
     pub grant_id: String,
     pub peer_did: String,
     pub connect_ticket: String,
+    pub display_name: String,
     pub expires_at: u64,
 }
 
@@ -148,6 +149,10 @@ impl ConsumerModelGrant {
             grant_id: grant["grant_id"].as_str()?.to_string(),
             peer_did: grant["peer_did"].as_str()?.to_string(),
             connect_ticket: grant["connect_ticket"].as_str()?.to_string(),
+            display_name: grant["service_display_name"]
+                .as_str()
+                .unwrap_or("a contact's AI model")
+                .to_string(),
             expires_at: grant["expires_at"].as_u64()?,
         })
     }
@@ -336,6 +341,7 @@ pub(crate) async fn append_remote_offers(
                     offer["remote_service"] = json!({
                         "grant_id": grant.grant_id,
                         "peer_did": grant.peer_did,
+                        "display_name": grant.display_name,
                         "expires_at": grant.expires_at,
                     });
                     if let Some(Value::Array(target)) = response.pointer_mut("/data/offers") {

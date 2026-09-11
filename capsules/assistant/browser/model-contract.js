@@ -39,7 +39,10 @@ export function textOfferRows(offers) {
     offerId: offer.id,
     operation: offer.operation,
     label: offer.title,
-    detail: "Model offer · this Home",
+    detail:
+      typeof offer.remote_service?.display_name === "string" && offer.remote_service.display_name.trim() !== ""
+        ? `Model offer · via ${offer.remote_service.display_name.trim()}`
+        : "Model offer · this Home",
     streamOutput: offer.stream_output === true,
   }));
 }
