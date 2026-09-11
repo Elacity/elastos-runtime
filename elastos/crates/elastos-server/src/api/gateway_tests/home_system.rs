@@ -385,7 +385,7 @@ async fn test_home_entry_serves_browser_surface() {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .all(|value| !value.starts_with(&format!("{HOME_SESSION_COOKIE}="))),
+            .all(|value| !value.starts_with(HOME_SESSION_COOKIE)),
         "Home index should not auto-mint a local Home session cookie"
     );
     assert_eq!(
@@ -418,11 +418,18 @@ async fn test_home_entry_serves_browser_surface() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["authority"]["signed_in"], false);
 
-    let valid_cookie = format!("{}={}", HOME_SESSION_COOKIE, home_app_token(dir.path()));
+    let cookie_name = home_session_cookie_name(
+        test_browser_request("localhost:61180", "http://localhost:61180")
+            .body(Body::empty())
+            .unwrap()
+            .headers(),
+    )
+    .unwrap();
+    let valid_cookie = format!("{}={}", cookie_name, home_app_token(dir.path()));
     let existing_session = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/home/")
                 .header(COOKIE, valid_cookie)
                 .body(Body::empty())
@@ -437,7 +444,7 @@ async fn test_home_entry_serves_browser_surface() {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .all(|value| !value.starts_with(&format!("{HOME_SESSION_COOKIE}="))),
+            .all(|value| !value.starts_with(HOME_SESSION_COOKIE)),
         "valid Home session cookie should not be replaced"
     );
 
@@ -4746,7 +4753,19 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
-                .header(COOKIE, format!("{}={home_token}", HOME_SESSION_COOKIE))
+                .header(
+                    COOKIE,
+                    format!(
+                        "{}={home_token}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap()
+                    ),
+                )
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
                 .unwrap(),
@@ -5428,7 +5447,17 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .uri("/api/apps/home/summary")
                 .header(
                     COOKIE,
-                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                    format!(
+                        "{}={}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap(),
+                        authority.home_token
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -5451,7 +5480,17 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .uri("/api/apps/home/active-shell")
                 .header(
                     COOKIE,
-                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                    format!(
+                        "{}={}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap(),
+                        authority.home_token
+                    ),
                 )
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"active":"home-gui"}"#))
@@ -5470,7 +5509,17 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .uri("/api/apps/home/active-shell")
                 .header(
                     COOKIE,
-                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                    format!(
+                        "{}={}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap(),
+                        authority.home_token
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),

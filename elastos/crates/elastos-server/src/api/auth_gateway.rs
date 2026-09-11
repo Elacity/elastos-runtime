@@ -482,7 +482,9 @@ pub async fn full_recovery_bundle_import(
             let mut http_response = Json(response).into_response();
             if let Some(home_token) = home_token {
                 let secure = super::gateway::request_uses_tls(&headers);
-                if let Ok(cookie) = home_session_cookie_header_for_token(&home_token, secure) {
+                if let Ok(cookie) =
+                    home_session_cookie_header_for_token(&headers, &home_token, secure)
+                {
                     http_response.headers_mut().append(SET_COOKIE, cookie);
                 }
             }
@@ -508,7 +510,9 @@ pub async fn passkey_revoke(
             let mut http_response = Json(response).into_response();
             if clear_current_cookie {
                 let secure = super::gateway::request_uses_tls(&headers);
-                if let Ok(cookie) = super::gateway::home_session_clear_cookie_header(secure) {
+                if let Ok(cookie) =
+                    super::gateway::home_session_clear_cookie_header(&headers, secure)
+                {
                     http_response.headers_mut().append(SET_COOKIE, cookie);
                 }
             }
@@ -544,7 +548,8 @@ pub async fn refresh_session(State(state): State<GatewayState>, headers: HeaderM
     match refresh_session_inner(&state, &headers) {
         Ok(response) => {
             let secure = super::gateway::request_uses_tls(&headers);
-            let cookie = home_session_cookie_header_for_token(&response.home_token, secure);
+            let cookie =
+                home_session_cookie_header_for_token(&headers, &response.home_token, secure);
             let mut http_response = Json(response).into_response();
             if let Ok(cookie) = cookie {
                 http_response.headers_mut().append(SET_COOKIE, cookie);
@@ -706,7 +711,7 @@ pub async fn sign_out_session(State(state): State<GatewayState>, headers: Header
         Ok(response) => Json(response).into_response(),
         Err(err) => auth_error_response(err),
     };
-    if let Ok(cookie) = super::gateway::home_session_clear_cookie_header(secure) {
+    if let Ok(cookie) = super::gateway::home_session_clear_cookie_header(&headers, secure) {
         http_response.headers_mut().append(SET_COOKIE, cookie);
     }
     http_response
@@ -4158,7 +4163,7 @@ fn passkey_proof_binding_id(credential: &StoredCredential) -> String {
 
 fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyResponse) -> Response {
     let secure = super::gateway::request_uses_tls(headers);
-    let cookie = home_session_cookie_header_for_token(&response.home_token, secure);
+    let cookie = home_session_cookie_header_for_token(headers, &response.home_token, secure);
     let mut http_response = Json(response).into_response();
     if let Ok(cookie) = cookie {
         http_response.headers_mut().append(SET_COOKIE, cookie);
@@ -4970,17 +4975,13 @@ mod tests {
     }
 
     fn home_session_cookie_headers(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
+        let mut headers = home_token_headers(token);
+        headers.remove("x-elastos-home-token");
+        let name = super::super::gateway::home_session_cookie_name(&headers).unwrap();
         headers.insert(
             axum::http::header::COOKIE,
-            HeaderValue::from_str(&format!(
-                "{}={token}",
-                super::super::gateway::HOME_SESSION_COOKIE
-            ))
-            .unwrap(),
+            format!("{name}={token}").parse().unwrap(),
         );
-        headers.insert("host", HeaderValue::from_static("localhost:61180"));
-        headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
         headers
     }
 
@@ -7509,8 +7510,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(cookies.iter().any(|value| {
-            value.starts_with("home-session=")
-                && !value.starts_with("home-session=;")
+            value.starts_with("home-session-")
+                && !value.contains("=;")
                 && value.contains("Secure")
                 && !value.contains(&current.home_token)
         }));
@@ -8677,7 +8678,7 @@ mod tests {
             axum::http::header::COOKIE,
             HeaderValue::from_str(&format!(
                 "{}={}",
-                super::super::gateway::HOME_SESSION_COOKIE,
+                super::super::gateway::home_session_cookie_name(&headers).unwrap(),
                 refreshed.home_token
             ))
             .unwrap(),
@@ -8722,6 +8723,11 @@ mod tests {
             HeaderValue::from_static("https://elastos.elacitylabs.com"),
         );
 
+        let name = super::super::gateway::home_session_cookie_name(&headers).unwrap();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("{name}={}", grant.home_token).parse().unwrap(),
+        );
         let response = sign_out_session(State(state), headers).await;
         let cookies: Vec<_> = response
             .headers()
@@ -8732,7 +8738,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(cookies.iter().any(|value| {
-            value.starts_with("home-session=;")
+            value.starts_with("home-session-")
+                && value.contains("=;")
                 && value.contains("Max-Age=0")
                 && value.contains("Secure")
         }));
