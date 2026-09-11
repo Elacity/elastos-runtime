@@ -199,6 +199,10 @@ impl std::fmt::Display for RemoteRouteError {
     }
 }
 
+/// The wire request for the granting Runtime: the typed fields the local
+/// normalizer accepted, with the local binding replaced by the grant facts.
+/// `request_id` lives inside the local binding after normalization, so it is
+/// lifted back to the top level where the destination's typed structs expect it.
 fn typed_request(
     normalized: &Value,
     context: &HomeLaunchTokenContext,
@@ -207,7 +211,13 @@ fn typed_request(
 ) -> Value {
     let mut request = normalized.clone();
     if let Some(object) = request.as_object_mut() {
-        object.remove("runtime_binding");
+        if let Some(request_id) = object
+            .remove("runtime_binding")
+            .and_then(|binding| binding.get("request_id").cloned())
+            .filter(Value::is_string)
+        {
+            object.insert("request_id".to_string(), request_id);
+        }
         object.insert(
             "remote_model".to_string(),
             json!({
@@ -480,10 +490,11 @@ mod tests {
         };
         let normalized = json!({
             "op": "runs_create", "offer_id": "remote:g:qwen", "operation": "chat", "input": {"x": 1},
-            "runtime_binding": { "principal_id": "seed-principal", "grant_id": "launch-grant" }
+            "runtime_binding": { "principal_id": "seed-principal", "grant_id": "launch-grant", "request_id": "req-7" }
         });
         let request = typed_request(&normalized, &context, "assistant", "g");
         assert!(request.get("runtime_binding").is_none());
+        assert_eq!(request["request_id"], "req-7");
         assert_eq!(request["remote_model"]["grant_id"], "g");
         assert_eq!(request["remote_model"]["principal_id"], "seed-principal");
         assert_eq!(request["remote_model"]["capsule_id"], "assistant");

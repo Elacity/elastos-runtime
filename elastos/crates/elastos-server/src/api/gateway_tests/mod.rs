@@ -860,6 +860,7 @@ mod model;
 mod recovery;
 #[cfg(unix)]
 mod remote_engine;
+mod remote_model;
 mod room;
 mod site_publication;
 mod wallet;

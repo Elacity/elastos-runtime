@@ -6694,7 +6694,10 @@ fn carrier_provider_public_invoke_error(index: usize, err: &anyhow::Error) -> St
         error = %format_args!("{err:#}"),
         "Carrier provider invocation failed"
     );
-    format!("ticket[{index}] invoke failed")
+    match err.downcast_ref::<CarrierProviderDecision>() {
+        Some(decision) => format!("ticket[{index}] {}", decision.code),
+        None => format!("ticket[{index}] invoke failed"),
+    }
 }
 
 #[async_trait::async_trait]
@@ -6912,6 +6915,42 @@ fn carrier_provider_invoke_message(
     })
 }
 
+/// A destination Runtime's decision, carried as one fixed token. The
+/// destination chose the token from a bounded set, so passing it through
+/// leaks no path, address or backend text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CarrierProviderDecision {
+    pub code: &'static str,
+}
+
+const CARRIER_PROVIDER_DECISION_CODES: [&str; 7] = [
+    "denied",
+    "rate_limited",
+    "offer_unavailable",
+    "provider_failure",
+    "invalid_provider_invocation",
+    "unauthorized_provider_target",
+    "provider_registry_unavailable",
+];
+
+impl CarrierProviderDecision {
+    fn from_response(response: &serde_json::Value) -> Option<Self> {
+        let code = response.get("code").and_then(serde_json::Value::as_str)?;
+        CARRIER_PROVIDER_DECISION_CODES
+            .iter()
+            .find(|known| **known == code)
+            .map(|known| Self { code: known })
+    }
+}
+
+impl std::fmt::Display for CarrierProviderDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code)
+    }
+}
+
+impl std::error::Error for CarrierProviderDecision {}
+
 fn carrier_provider_invoke_result(response: serde_json::Value) -> Result<serde_json::Value> {
     if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
         return Ok(response
@@ -6922,8 +6961,12 @@ fn carrier_provider_invoke_result(response: serde_json::Value) -> Result<serde_j
     let message = response
         .get("error")
         .and_then(|value| value.as_str())
-        .unwrap_or("Carrier provider invocation failed");
-    anyhow::bail!(message.to_string())
+        .unwrap_or("Carrier provider invocation failed")
+        .to_string();
+    match CarrierProviderDecision::from_response(&response) {
+        Some(decision) => Err(anyhow::Error::new(decision).context(message)),
+        None => anyhow::bail!(message),
+    }
 }
 
 impl CarrierClient {
@@ -8338,6 +8381,27 @@ mod tests {
         assert_eq!(invoke, "ticket[3] invoke failed");
         assert!(!invoke.contains("10.0.0.8"));
         assert!(!invoke.contains("root cause"));
+
+        let decision = carrier_provider_invoke_result(serde_json::json!({
+            "ok": false,
+            "code": "denied",
+            "error": "model grant is not active for /Users/owner/private",
+        }))
+        .unwrap_err();
+        let public = carrier_provider_public_invoke_error(0, &decision);
+        assert_eq!(public, "ticket[0] denied");
+        assert!(!public.contains("/Users/owner"));
+
+        let unknown_code = carrier_provider_invoke_result(serde_json::json!({
+            "ok": false,
+            "code": "backend_exploded_at_/tmp/x",
+            "error": "boom",
+        }))
+        .unwrap_err();
+        assert_eq!(
+            carrier_provider_public_invoke_error(1, &unknown_code),
+            "ticket[1] invoke failed"
+        );
     }
 
     #[test]

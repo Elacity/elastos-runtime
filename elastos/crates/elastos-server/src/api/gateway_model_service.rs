@@ -388,11 +388,13 @@ pub(crate) async fn invoke(
     };
     let now = crate::auth::now_ts();
 
-    // A fresh local request: only the fields the typed contract accepts.
+    // A fresh local request: only the fields the typed contract accepts. The
+    // normalizer takes the operation as a parameter and sets `op` itself.
     let mut local = request.clone();
     let local_object = local.as_object_mut().expect("request is an object");
     local_object.remove("remote_model");
     local_object.remove("_runtime_invocation");
+    local_object.remove("op");
 
     let (context, indexed_run) = match operation {
         "offers_list" | "runs_create" => {
@@ -576,7 +578,6 @@ pub(crate) async fn cancel_grant_runs(
         }
         let context = remote_context(&record.remote_principal_id, grant_id);
         let request = json!({
-            "op": "runs_cancel",
             "run_id": run_id,
             "request_id": format!("revoke:{}", record.request_id),
         });
