@@ -1125,6 +1125,19 @@ async fn cleanup_stale_home_terminal_sessions(now_ms: u64) {
     close_home_terminal_cleanup_targets(cleanup).await;
 }
 
+pub(super) async fn shutdown_home_terminal_sessions() {
+    let sessions = home_terminal_sessions()
+        .lock()
+        .await
+        .drain()
+        .map(|(_, session)| session)
+        .collect::<Vec<_>>();
+    for session in sessions {
+        close_home_terminal_session_handle(session.clone(), "gateway stopped").await;
+        let _ = session.child.lock().await.wait().await;
+    }
+}
+
 async fn close_home_terminal_cleanup_targets(targets: Vec<HomeTerminalCleanupTarget>) {
     for target in targets {
         close_home_terminal_session_handle(target.session, target.message).await;

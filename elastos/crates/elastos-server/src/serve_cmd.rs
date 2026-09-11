@@ -12,6 +12,7 @@ pub async fn run_serve(
     capsule: Option<PathBuf>,
     cid: Option<String>,
 ) -> anyhow::Result<()> {
+    crate::runtime_control::watch_gateway_owner()?;
     let data_dir = crate::default_data_dir();
     let subordinate_host = std::env::var("ELASTOS_ALLOW_SUBORDINATE_RUNTIME_HOST")
         .ok()

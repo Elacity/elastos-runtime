@@ -5,6 +5,9 @@ use std::time::Duration;
 use crate::local_http::LoopbackHttpBaseUrl;
 use sha2::Digest;
 
+pub(crate) mod gateway_children;
+pub use gateway_children::watch_gateway_owner;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeCoords {
     pub api_url: String,
@@ -1243,6 +1246,9 @@ async fn ensure_managed_runtime(
         Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
         None => false,
     };
+    let gateway_owner = subordinate_gateway_host
+        .then(|| gateway_children::Owner::read(data_dir))
+        .transpose()?;
     let child_home_dir =
         subordinate_gateway_host.then(|| managed_runtime_child_home_dir(data_dir, runtime_kind));
     if let Some(child_home_dir) = child_home_dir.as_ref() {
@@ -1365,14 +1371,31 @@ async fn ensure_managed_runtime(
             );
         }
     }
-    let mut child = child
+    if let Some(owner) = gateway_owner.as_ref() {
+        owner.configure(&mut child)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child.process_group(0);
+    }
+    // Registration and owner retirement share a cross-process lock. There is no
+    // await between acquiring this lock and publishing the complete child record.
+    let ownership_lock = gateway_owner
+        .as_ref()
+        .map(|owner| owner.lock_start())
+        .transpose()?;
+    let child = child
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start runtime: {}", e))?;
+    let mut child =
+        gateway_children::StartingChild::new(child, gateway_owner.as_ref(), &coords_path)?;
+    drop(ownership_lock);
 
     if runtime_notices_enabled() {
         eprintln!(
             "Runtime started (pid {}). Log: {}",
-            child.id(),
+            child.child.id(),
             log_path.display()
         );
     }
@@ -1383,6 +1406,7 @@ async fn ensure_managed_runtime(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(status) = child
+            .child
             .try_wait()
             .map_err(|e| anyhow::anyhow!("Failed to check runtime status: {}", e))?
         {
@@ -1400,6 +1424,7 @@ async fn ensure_managed_runtime(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Some(coords) = managed_runtime_ready(&coords_path, expected_version).await {
             terminate_sibling_managed_runtime_children(runtime_kind, coords.pid);
+            child.ready();
             drop(start_guard);
             return Ok(coords);
         }

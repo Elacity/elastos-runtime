@@ -1200,6 +1200,11 @@ async fn main() -> anyhow::Result<()> {
                 libc::setpgid(0, 0);
             }
 
+            // Gateway shutdown owns draining and awaiting separate child groups.
+            // Its two-second HTTP drain must finish before the host lock is released.
+            let gateway_lifecycle = argv.first().is_some_and(|arg| arg == "gateway")
+                || (matches!(argv.first().map(String::as_str), None | Some("home"))
+                    && argv.iter().any(|arg| arg == "--browser"));
             tokio::spawn(async move {
                 let mut sigint =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -1216,7 +1221,12 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     libc::kill(0, libc::SIGTERM);
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(if gateway_lifecycle {
+                    10
+                } else {
+                    2
+                }))
+                .await;
                 // Force kill if still alive
                 unsafe {
                     libc::kill(0, libc::SIGKILL);

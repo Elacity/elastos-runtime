@@ -103,6 +103,7 @@ async fn start_gateway_server_with_shutdown(
         None => None,
     };
     let gateway_api_url = trusted_gateway_api_url(addr)?;
+    let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let state = GatewayState {
         provider_registry,
         collaboration_chat_product_port: collaboration.chat_product_port,
@@ -159,6 +160,12 @@ async fn start_gateway_server_with_shutdown(
     }
     browser_lifecycle_reconciler.cancel();
     let reconciliation_result = browser_lifecycle_reconciler.join().await;
+    // Finish any synchronous spawn/registration before retiring this owner or
+    // closing a Terminal which may be the launcher in that critical section.
+    let ownership_lock = managed_owner
+        .as_ref()
+        .map(|owner| owner.lock())
+        .transpose()?;
     let local_control_result = async {
         if let Some(control) = gateway_local_control {
             control.shutdown().await?;
@@ -166,9 +173,14 @@ async fn start_gateway_server_with_shutdown(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    super::gateway_home_terminal::shutdown_home_terminal_sessions().await;
+    let managed_shutdown_result =
+        crate::runtime_control::gateway_children::shutdown(managed_owner).await;
+    drop(ownership_lock);
     serve_result?;
     reconciliation_result.map_err(anyhow::Error::msg)?;
     local_control_result?;
+    managed_shutdown_result?;
     Ok(())
 }
 
@@ -358,6 +370,21 @@ mod trusted_gateway_tests {
             .unwrap()
             .unwrap();
         assert_eq!(home, format!("http://{addr}/home/"));
+        let owner = crate::runtime_control::gateway_children::Owner::read(&data).unwrap();
+        let managed_coords_path = data.join("runtime-coords-home.json");
+        let (mut managed, managed_helper_pid) =
+            crate::runtime_control::gateway_children::test_child(&owner, &managed_coords_path)
+                .await;
+        let managed_pid = managed.child.id();
+        managed.ready();
+        drop(managed);
+        let unrelated = crate::api::server::HostHelperProcess {
+            name: "unrelated runtime fixture",
+            child: std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        };
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -402,6 +429,17 @@ mod trusted_gateway_tests {
         streaming.write_all(b"{").await.unwrap();
         let coords_path = data.join("gateway-runtime-coords.json");
         assert!(coords_path.is_file());
+        let coords: crate::runtime_control::RuntimeCoords =
+            serde_json::from_slice(&std::fs::read(&coords_path).unwrap()).unwrap();
+        let control_addr = coords.api_url.strip_prefix("http://").unwrap();
+        let mut control_stream = tokio::net::TcpStream::connect(control_addr).await.unwrap();
+        control_stream.write_all(format!("POST /api/auth/attach HTTP/1.1\r\nHost: {control_addr}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n").as_bytes()).await.unwrap();
+        let length =
+            tokio::time::timeout(Duration::from_secs(2), control_stream.read(&mut interim))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(String::from_utf8_lossy(&interim[..length]).starts_with("HTTP/1.1 100 Continue"));
 
         stop_tx.send(()).unwrap();
         let mut server = server;
@@ -412,6 +450,14 @@ mod trusted_gateway_tests {
             panic!("gateway shutdown waited for a client stream to close");
         }
         stopped.unwrap().unwrap().unwrap();
+        let control_closed =
+            tokio::time::timeout(Duration::from_secs(1), control_stream.read(&mut interim))
+                .await
+                .unwrap();
+        assert!(matches!(control_closed, Ok(0)) || control_closed.is_err());
+        assert_eq!(unsafe { libc::kill(managed_pid as i32, 0) }, -1);
+        assert_eq!(unsafe { libc::kill(managed_helper_pid as i32, 0) }, -1);
+        assert_eq!(unsafe { libc::kill(unrelated.child.id() as i32, 0) }, 0);
         let closed = tokio::time::timeout(Duration::from_secs(1), streaming.read(&mut interim))
             .await
             .expect("shutdown must close the held client connection");
