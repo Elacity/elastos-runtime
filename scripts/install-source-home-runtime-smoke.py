@@ -282,6 +282,116 @@ def test_installed_mismatch(temp_root):
         raise AssertionError("mismatch failure left a staged file")
 
 
+def test_source_capsule_archive_metadata(temp_root):
+    installer = load_installer()
+    source = temp_root / "metadata-source"
+    data = temp_root / "metadata-installed"
+    built = temp_root / "metadata-build/elastos"
+    initialize_source(source)
+    initialize_data(data)
+    write(built, b"runtime-before-metadata-check\n", 0o700)
+    invoke(source, data, built)
+    write(built, b"runtime-after-metadata-check\n", 0o700)
+    components = data / "components.json"
+    archive = {
+        "cid": "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi",
+        "checksum": "sha256:" + "a" * 64,
+        "size": 123,
+        "release_path": "capsules/system.tar.gz",
+        "strategy": "download",
+    }
+    source_record = {"strategy": "source-build", "install_path": "capsules/system"}
+
+    def manifest(mappings, *, genuine_archive=False):
+        return {
+            "capsules": {"system": {
+                "cid": archive["cid"] if genuine_archive else "",
+                "sha256": "a" * 64 if genuine_archive else "",
+                "entrypoint_sha256": "b" * 64,
+                "install_path": "capsules/system",
+            }},
+            "external": {
+                "system": {"install_path": "capsules/system", "platforms": mappings},
+                # Unrelated native release metadata remains outside this check.
+                "native-provider": {"platforms": {"*": archive}},
+            },
+        }
+
+    def check_case(value, platform="linux-amd64", failure=None):
+        payload = value if isinstance(value, bytes) else json.dumps(value).encode()
+        write(components, payload)
+        before = snapshot(data)
+        args = SimpleNamespace(source_root=source, data_dir=data, built_runtime=built, platform=platform)
+        staged = []
+
+        def track_stage(runtime, parent):
+            staged.append(True)
+            return installer.stage_runtime(runtime, parent)
+
+        try:
+            if installer.PLATFORM_RE.fullmatch(platform):
+                receipt = installer.install(args, runtime_stager=track_stage)
+            else:
+                # The installer CLI accepts canonical platform spellings. Exercise
+                # the reverse underscore alias at its metadata-selection boundary.
+                receipt = {"components_sha256": installer.source_components_hash(components, platform)}
+        except installer.InstallError as error:
+            if str(error) != failure:
+                raise AssertionError(f"unexpected metadata failure: {error}") from error
+            if staged or snapshot(data) != before:
+                raise AssertionError("metadata rejection staged or changed an installed artifact")
+        else:
+            if failure:
+                raise AssertionError(f"installer accepted invalid metadata: {failure}")
+            if receipt["components_sha256"] != sha256(components):
+                raise AssertionError("validated components bytes differ from receipt hash")
+
+    # Reproduces the source System/Marketplace launch failure before replacing
+    # either the previous Runtime or its canonical success receipt.
+    check_case(manifest({"*": archive}), failure="source_capsule_archive_identity")
+    check_case(manifest({"linux-amd64": source_record, "*": archive, "darwin-arm64": archive}))
+    check_case(manifest({"*": archive}, genuine_archive=True))
+    for platform, alias in installer.PLATFORM_ALIASES.items():
+        check_case(manifest({alias: archive, "*": source_record}), platform, "source_capsule_archive_identity")
+        check_case(manifest({alias: source_record, "*": archive}), platform)
+        check_case(manifest({platform: {}, alias: archive, "*": archive}), platform)
+    check_case(manifest({"linux-amd64": {"install_path": None}, "*": archive}))
+    for selected_path in ("", "capsules/other"):
+        check_case(manifest({"linux-amd64": {"install_path": selected_path}}), failure="source_capsule_install_path")
+    for field, value in (("cid", archive["cid"]), ("checksum", archive["checksum"]), ("size", 1), ("url", "https://example.invalid/archive"), ("release_path", "archive.tar")):
+        check_case(manifest({"*": {**source_record, field: value}}), failure="source_capsule_archive_identity")
+    check_case(manifest({"linux-amd64": []}), failure="components_shape")
+    check_case(manifest({"*": {"size": True}}), failure="components_shape")
+    for malformed in (b"{", b"[]", b'{"capsules":null}', b'{"capsules":{},"capsules":{}}', b'{"number":NaN}', b'\xff'):
+        check_case(malformed, failure="components_shape" if malformed in (b"[]", b'{"capsules":null}') else "components_json")
+    check_case(b" " * (installer.MAX_COMPONENTS_BYTES + 1), failure="unsafe_artifact")
+
+    # The exact bytes validated above also own the receipt hash. A metadata
+    # change during Runtime staging must stop before receipt invalidation.
+    write(components, json.dumps(manifest({"*": source_record})).encode())
+    runtime_before = snapshot(data)["bin/elastos"]
+    receipt_before = snapshot(data)[RECEIPT.as_posix()]
+
+    def change_metadata(runtime, parent):
+        staged = installer.stage_runtime(runtime, parent)
+        write(components, json.dumps(manifest({"*": archive})).encode())
+        return staged
+
+    args = SimpleNamespace(source_root=source, data_dir=data, built_runtime=built, platform="linux-amd64")
+    try:
+        installer.install(args, runtime_stager=change_metadata)
+    except installer.InstallError as error:
+        if str(error) != "components_changed":
+            raise AssertionError(f"unexpected changed-metadata failure: {error}") from error
+    else:
+        raise AssertionError("installer accepted metadata changed after validation")
+    after = snapshot(data)
+    if after["bin/elastos"] != runtime_before or after[RECEIPT.as_posix()] != receipt_before:
+        raise AssertionError("changed metadata replaced the Runtime or receipt")
+    if any(path.name.startswith(".source-home-install.") for path in data.rglob("*")):
+        raise AssertionError("changed metadata left a staged artifact")
+
+
 def test_post_runtime_receipt_failure(temp_root):
     installer = load_installer()
     source = temp_root / "publication-source"
@@ -605,6 +715,7 @@ def main():
         fixture.mkdir(mode=0o700)
         test_good_dirty_and_rerun(fixture)
         test_installed_mismatch(fixture)
+        test_source_capsule_archive_metadata(fixture)
         test_post_runtime_receipt_failure(fixture)
         test_runtime_publication_restores_pair(fixture)
         test_unsafe_destinations(fixture)
