@@ -27,14 +27,15 @@ local operator ledger and current checkpoint. Resolve their directory with
 Use the existing integration checkout on `feat/0.7.1-integration`, based on
 user-selected `origin/upstream/0.7.1-dev` at `6c61c990`. Resolve its exact local
 path from the private checkpoint. Reviewed source `06bf4e0f`, tree `4483f403`,
-is published in draft PR64 with this documentation-only closeout. Both website
+is published in draft PR64. Public deployment uses descendant `25966622`, tree
+`419bdba6`, with reconciled dependency locks and locked setup builds. Both website
 heads remain ancestors of the verified remote integration ref. The default
 checkout contains unrelated dirty donor work. Preserve the remaining 69 branches
 and 11 worktrees. Before edits, recheck HEAD/tree, dirt, fetched divergence and
 process ownership. [The team report](2026-09-11-team-sync.md) and
 [contributor review](2026-09-11-contributor-review.md) are the shareable closeout.
 
-The current installed candidate is `3c2f9a80012ff510449998f0b423a21c47ad2a98`,
+The current Mac installed candidate is `3c2f9a80012ff510449998f0b423a21c47ad2a98`,
 tree `6be3ed9cde01c6dea8850ebd6ac381c5f03a9480`. Runtime built/installed SHA-256
 is `1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666`.
 It preserves the accepted one-Assistant consolidation and adds pending Keep
@@ -51,7 +52,7 @@ Anders confirms Assistant works. His enrolled account, Profile and conversation
 data are preserved. Normal browser controls show the new System and Marketplace
 Models views with Qwen available on the device. The earlier System/Marketplace
 metadata repair and installer guard `822c4e3d` remain in place. Original recovery
-human Homes retain `1e320578`; existing public stage remains `d790a48e`. The private
+human Homes retain `1e320578`; the older private stage retains `d790a48e`. The private
 checkpoint records current process/port ownership; the old Linux preview tunnel
 was absent on this resume and was left unchanged. Original recovery, retry,
 reload, media reuse and Carrier cleanup receipts retain their exact earlier
@@ -73,9 +74,12 @@ dedicated provider-host/J5 proof and full J1–J5 retain their dependency order 
 Required gates. Confirmed backend cancellation remains distinct from the accepted
 honest unknown result. Recurring monitoring remains paused; Jetson is deferred.
 
-Further public deployment requires review and approval of the exact candidate.
-The private publication record owns the verified route for a future authorized
-push. Required installation manifests and receipts are current; final installer
+The user-authorized public preview deployment is complete at `25966622`.
+[Its proof](2026-09-11-public-preview.md) records preserved account/user data,
+zero migrated roots/objects, installed/running parity and public HTTPS hashes.
+Anders confirmed existing-account sign-in and saved work. The temporary stage
+and bounded deployment rollback are removed. Browser Engine and custody configuration
+remain separate J4/J5 work. Required installation manifests and receipts are current; final installer
 stamping, packaging and signing follow C5 source freeze and the release gate.
 
 ## Earlier preview evidence
@@ -93,8 +97,8 @@ stamping, packaging and signing follow C5 source freeze and the release gate.
 - Recovery export smoke `49a62db1` uses the loaded foreground System window.
   Earlier failures were retained: static controls and restored covered windows
   made the test click the wrong surface. The final actual export passes.
-- Public deployment has a concrete staged package and preservation plan.
-  Public live remains unchanged; deployment requires explicit approval.
+- The earlier staged package supported the later authorized public deployment
+  recorded above. Its older source and test receipts remain historical evidence.
 
 ## Current repairs and acceptance limits
 
@@ -120,9 +124,9 @@ obligations retain their release gates while that source intake proceeds.
 1. **Finish J1:** finish the checkpoint’s user-operated passkey proof;
    prove restored Profile/name, returning sign-in, Desktop/Terminal and shared
    app behavior. Complete remaining setup, save-conflict and window work.
-2. **Deliver the public preview:** approve and deploy the reviewed storefront
-   and seed Runtime, preserve existing accounts, then verify public artifacts.
-   Public signed installer delivery remains a separate gate.
+2. **Complete public delivery:** preview deployment and its bounded human
+   sign-in/saved-work check are complete. Public signed installer delivery
+   follows the frozen-candidate release gate.
 3. **Complete the local AI journey (J3):** one Assistant and real Qwen replies
    now pass the bounded Mac checkpoint. Next prove exact Marketplace-to-Assistant
    handoff and safe removal, then cold Content/Carrier delivery. Preserve drafts,

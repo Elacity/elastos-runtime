@@ -1,28 +1,39 @@
 # State
 
-## Current publication checkpoint — 2026-09-11
+## Current public preview and review checkpoint, 2026-09-11
 
-`feat/0.7.1-integration` is the active working/review branch. Reviewed source
-`06bf4e0f11e602733e8eef861b835184ae683504`, tree
-`4483f403a85d1ac27b4568f7b8cb4cf1a8a4e546`, is published in
-[draft PR64](https://github.com/Elacity/elastos-runtime/pull/64) against
-`upstream/0.7.1-dev` at `6c61c990`. This single documentation closeout adds the
-[team report](docs/audits/2026-09-11-team-sync.md) and
-[contributor review](docs/audits/2026-09-11-contributor-review.md).
-The PR records the final documentation commit; product code remains the reviewed
-checkpoint. Remote ancestry protects both website heads (`00003b6f` and
-`06bf4e0f`). The website refs and redundant checkout are removed; 69 local branches
-and 11 worktrees remain with their donor/history preservation gates. Main, dev,
-contributor PRs and installed services retain their prior identities.
+`feat/0.7.1-integration` is the active working/review branch in
+[draft PR64](https://github.com/Elacity/elastos-runtime/pull/64), based on
+`upstream/0.7.1-dev` at `6c61c990`. Product checkpoint `06bf4e0f` preserves
+both website heads and the reviewed contributor histories. The redundant website
+refs and checkout are removed; the remaining donor/history gates still apply.
 
-The Mac Home retains installed code `3c2f9a80` and Runtime SHA-256
+Public website and Home now run `259666222f12b21283131cc7926ba7d0c1a52e99`,
+tree `419bdba6a09ed37e8176ddfda9c22c1a270f6054`. This extends the publication
+closeout with reconciled dependency locks and `--locked` setup builds.
+All 25 required Linux manifests passed locked offline checks, and the cached
+Linux source-home build completed. Application source retains the reviewed behavior.
+
+The authorized deployment at 17:42 UTC passed installed integrity, 573 artifact
+file comparisons, running Runtime parity and public website/Home/Services/Assistant
+hash checks. `/apps/home/` redirects to `/home/`. Account records, keys, user files
+and provider settings match the preserved state. Migration and restart receipts
+report zero migrated roots/objects. An owner-only identity directory and Runtime's
+empty identity lock are the recorded metadata changes. Anders confirmed existing-account sign-in and saved work. The temporary stage
+and bounded deployment rollback are removed.
+The configured Browser Engine is unavailable and inactive custody remains unconfigured.
+See [public preview proof](docs/audits/2026-09-11-public-preview.md).
+
+Mac checkpoint Homes retain installed code `3c2f9a80` and Runtime SHA-256
 `1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666`.
-This publication reused prior product evidence and ran the four basic source
-gates; it performed no build, installation, restart or deployment.
-Full J1 to J5 and D1 to D6 acceptance remains open under the approved plan.
-The bounded publication/cleanup run stops here; broader execution and monitoring
-stay paused. Next implementation: exact Marketplace-to-Assistant handoff and
-safe removal, then cold Content/Carrier delivery.
+Main/dev and contributor PRs retain their prior identities. Full J1 to J5 and
+D1 to D6 acceptance remains open. The [team report](docs/audits/2026-09-11-team-sync.md)
+and [contributor review](docs/audits/2026-09-11-contributor-review.md) cover
+5 to 11 September. Next implementation: exact Marketplace-to-Assistant handoff
+and safe removal, then cold Content/Carrier delivery. Recurring monitoring stays paused.
+
+Earlier dated records below retain their original artifacts and verdicts. This
+checkpoint owns the current public installation status.
 
 ## Installed and source evidence
 

@@ -25,8 +25,9 @@ human verdict. The reviewed combined source `06bf4e0f` is published through
 `feat/0.7.1-integration` in [draft PR64](https://github.com/Elacity/elastos-runtime/pull/64).
 The website checkpoint and later donor history are protected there; the redundant
 website refs and checkout are retired. The active integration checkout is named
-in the private checkpoint. This documentation-only closeout preserves product
-code, installed Homes and acceptance criteria. The [team report](docs/audits/2026-09-11-team-sync.md)
+in the private checkpoint. Public preview `25966622` is now deployed with
+verified artifacts and preserved account/user data; Anders confirmed existing-account
+sign-in and saved work. Mac Homes retain their tested candidate. The [team report](docs/audits/2026-09-11-team-sync.md)
 and [contributor review](docs/audits/2026-09-11-contributor-review.md) describe
 included work and remaining gates. C3/J3 pauses after the bounded Mac checkpoint
 and publication. Next: exact Marketplace-to-Assistant handoff and safe removal,
@@ -40,10 +41,10 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 
 | ID | Outcome | Status / owner | Required input and next proof |
 | --- | --- | --- | --- |
-| C1-site | A useful, truthful public storefront | Revised design in user review / coordinator | Centered introduction, platform tabs, first-use cards, product explanation and feature status follow the design reference. Inside Home explains local AI, Browser and protected publishing. A single 0.7.1 availability label replaces old release and Mac preparation copy. Copy feedback and permission fallback pass isolated browser checks; the control remains disabled until the 0.7.1 installer is served and verified. Desktop/mobile checks pass; user review and public approval remain open. |
-| C1-home | Human Home entry at `/home/` | Source accepted / coordinator | Route, assets, auth and manifest checks pass. W2's empty-migration receipt and private-directory repairs pass Mac/Linux source smokes. Installed sign-out and shortcut migration remain C1-seed. |
+| C1-site | A useful, truthful public storefront | Public preview deployed / coordinator | New storefront and canonical Home link pass public HTTPS hash and browser checks at `25966622`. Confirm team review. Installer control stays disabled until signed 0.7.1 delivery is served and verified. |
+| C1-home | Human Home entry at `/home/` | Public route verified / coordinator | Public `/home/` and legacy redirect pass; the new sign-in screen renders without console errors. Anders confirmed existing-account sign-in and saved work. Full J1 sign-out/shortcut acceptance remains open. |
 | C1-proof | The execution loop handles a real reviewed slice | Accepted for source review and monitoring / coordinator | Independent source/rendered review, nine process cases and actual recurring monitor delivery pass. Continue through installed and public proof under C1-seed. |
-| C1-seed | Seed serves the reviewed local candidate and storefront | Private working build verified / coordinator | Runtime d790a48e and storefront pass artifact parity, account/sign-in/System and actual Profile-inclusive Recovery Kit export. Clean private preview is available. Public stage is prepared; explicit approval, existing-account proof and full journey acceptance remain open. |
+| C1-seed | Seed serves the reviewed local candidate and storefront | Bounded deployment accepted / coordinator | Authorized `25966622` deployment passes integrity, 573 artifact comparisons, running/served hashes and zero-migration guards. Account/user-file hashes are preserved. Anders confirmed existing-account sign-in and saved work; the temporary stage and deployment rollback are removed. Full journeys, Browser/protected-video target configuration and signed delivery retain their gates. |
 | C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
 | J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Human passkey proof pending / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Both targets pass installed browser recovery/reload/retry, complete owned shutdown/restart, full Home setup/media reuse and Carrier cleanup/reuse. User-review account label, Recovery/Advanced spacing and cross-port session isolation are repaired on `1e320578`; shared-browser Mac/Linux proof passes. Next: AUTH-01 final user acceptance on the updated preserved Homes; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
 | J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
@@ -63,8 +64,8 @@ Immediate preview delivery: the fixed d790 candidate passed Mac installation
 and seed export; the user also installed it. The observed shutdown,
 duplicate-download and kit-first recovery repairs now pass source checks.
 The combined automated installed checks pass. AUTH-01 needs a user-operated
-passkey on the prepared matching artifacts; preserve its pending verdict. Preserve all user test Homes. The public deployment
-package is prepared and awaits approval plus target checks. Jetson is deferred
+passkey on the prepared matching artifacts; preserve its pending verdict. Preserve all user test Homes. The public preview is deployed and Anders confirmed existing-account
+sign-in and saved work. Jetson is deferred
 at the user's request. Wider J2–J5 work and final three-platform assembly remain
 required for release; unchanged artifacts retain their evidence.
 
