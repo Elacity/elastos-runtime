@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${ELASTOS_BROWSER_RUNTIME_FETCH_PROXY_URL:-}" ]]; then
+  echo "Set ELASTOS_BROWSER_RUNTIME_FETCH_PROXY_URL to the existing Runtime proxy before this target proof." >&2
+  exit 2
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
 container_name="elastos-current-selkies-smoke-$$"
@@ -165,6 +170,7 @@ fi
 cdp_port="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).port)' "$tmp_dir/fake-cdp-ready.json")"
 
 scripts/browser-selkies-target-preflight.sh \
+  --runtime-fetch-proxy-url "$ELASTOS_BROWSER_RUNTIME_FETCH_PROXY_URL" \
   --out-dir "$tmp_dir/preflight" \
   --control-socket "$tmp_dir/preflight/control.sock" \
   --selkies-ws-url "ws://127.0.0.1:$port/webrtc/signaling" \

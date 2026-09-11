@@ -177,6 +177,12 @@ access policy.
   end-to-end cryptography remain above Carrier, and compatibility transports
   stay provider-internal
 
+The target [storage and access contract](docs/STORAGE_AND_ACCESS.md) applies
+these constraints to encrypted private objects, protected use, explicit export,
+revocation, and recovery. Its
+[implementation guide](docs/OBJECT_PROTECTION_IMPLEMENTATION.md) keeps storage,
+rights evidence, and key mechanisms replaceable behind Runtime authority.
+
 ## 16. UI surfaces must not be authority
 
 Opening a page and holding a capability are different things.

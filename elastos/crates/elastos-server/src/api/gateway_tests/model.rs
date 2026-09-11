@@ -206,12 +206,18 @@ async fn assistant_cannot_invoke_unsupported_model_operation() {
     let app = gateway_router(model_test_state(dir.path(), provider.clone()).await);
     let token = issue_home_launch_token(dir.path(), "assistant").unwrap();
 
-    let response = app
-        .oneshot(post_model(token, "offer_get", json!({})))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    for operation in ["offer_get", "init"] {
+        let response = app
+            .clone()
+            .oneshot(post_model(
+                token.clone(),
+                operation,
+                json!({"config":{"extra":{"offers":[]}}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
     assert!(provider.requests.lock().await.is_empty());
 }
 
@@ -645,6 +651,57 @@ async fn assistant_workspace_round_trip_and_restart_preserve_exact_workspace() {
     assert_eq!(response_json(loaded).await, stored_json);
     assert_eq!(stored_json["sessions"][0]["pinned"], true);
     assert_eq!(stored_json["sessions"][1]["pinned"], false);
+}
+
+#[tokio::test]
+async fn assistant_workspace_content_selection_pair_round_trip_and_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+    let cid = format!("bafybei{}", "a".repeat(52));
+    for invalid in [
+        "not-a-cid".to_string(),
+        cid.to_uppercase(),
+        format!("{cid} "),
+        format!("bafybei{}b", "a".repeat(51)),
+    ] {
+        let mut request = sample_workspace_put(0);
+        request["selected_model_cid"] = json!(invalid);
+        let response = app
+            .clone()
+            .oneshot(put_assistant_workspace(token.clone(), request))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+    }
+    let mut partial = sample_workspace_put(0);
+    partial["selected_model_cid"] = json!(cid);
+    partial.as_object_mut().unwrap().remove("selected_offer_id");
+    assert!(app
+        .clone()
+        .oneshot(put_assistant_workspace(token.clone(), partial))
+        .await
+        .unwrap()
+        .status()
+        .is_client_error());
+    let mut request = sample_workspace_put(0);
+    request["selected_model_cid"] = json!(cid);
+    let saved = app
+        .oneshot(put_assistant_workspace(token.clone(), request))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = response_json(saved).await;
+    assert_eq!(saved["selected_model_cid"], cid);
+    assert_eq!(saved["selected_offer_id"], "offer:sample-model");
+    let restarted = gateway_router(test_state(dir.path()));
+    let loaded = restarted
+        .oneshot(get_assistant_workspace(token))
+        .await
+        .unwrap();
+    assert_eq!(response_json(loaded).await, saved);
 }
 
 #[tokio::test]

@@ -44,7 +44,7 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 | C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
 | J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Human passkey proof pending / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Both targets pass installed browser recovery/reload/retry, complete owned shutdown/restart, full Home setup/media reuse and Carrier cleanup/reuse. User-review account label, Recovery/Advanced spacing and cross-port session isolation are repaired on `1e320578`; shared-browser Mac/Linux proof passes. Next: AUTH-01 final user acceptance on the updated preserved Homes; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
 | J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
-| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Active / coordinator owns source, builds and tests; independent review | Continue on the published website branch. Current installed Home has zero offers; All models opens empty Settings, and Apps lists Assistant plus Home Agent. Integrate the verified engine/model bootstrap first, then the corrected local provider, catalog/admission and diagnostic core from donor `6972e165`. Preserve current recovery, sessions, media reuse and shutdown. J1 storage/window changes are independent of the first model diagnostic. Prove normal controls and one bounded test-owned Home preparation attempt before large transfers. Complete acceptance steps 1, 2, 3 and 5 in section 6; hosted/Codex remains Optional, remote inference and Jetson Later. |
+| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Active / coordinator owns source, builds and tests; independent review | Continue on the published website branch. Current installed Home has zero offers; All models opens empty Settings, and Apps lists Assistant plus Home Agent. Bootstrap is accepted. Merge the complete corrected donor `6972e165` with history and behavior preservation, then reconcile Sash shelf/URUX and Irzhy installed-proof → authority-cutover → follow-up branches. Track every adapted or pending feature in [the preservation check](docs/audits/2026-09-11-integration-preservation.md). Preserve current recovery, sessions, media reuse and shutdown. The full merge includes storage/window source; retain their separate installed J1 acceptance. Prove normal controls and one bounded test-owned Home preparation attempt before large transfers. Complete acceptance steps 1, 2, 3 and 5 in section 6; hosted/Codex remains Optional, remote inference and Jetson Later. |
 | J4 / C4 | Browser works in the two agreed placements | Planned / Browser owner | Retain canonical B01-B16 on the Browser branch; Mac A/A/A and Linux Home/Exit with Mac Engine A/B/A, including reload. Full claimed-role proof remains C6. |
 | J5 | Protect, list, buy, play and close controlled video | Planned / protected-content owner | Review PR60 then PR59 against final callers. The focused PR62 video preparation repair entered C1 after actual media dependency testing exposed its blocker. Full PR60/PR59 integration and J5 acceptance remain Required; extensions enter by readiness before freeze. |
 | C5 | Assemble and freeze the reviewed candidate | Planned / coordinator | Reviewed required source; exact optional task list. Optional work cannot delay freeze. |
@@ -89,7 +89,7 @@ integration. Required failures stay open until the relevant proof passes.
 
 ## Later
 
-### Deferred source integration
+### Retained source integration
 
 The August 31 source-merge scope leaves these items open. Their donor work is
 preserved; an older implementation is not evidence that it fits current contracts.
@@ -101,7 +101,7 @@ preserved; an older implementation is not evidence that it fits current contract
 - [ ] Review the retained native-component interoperability design as a
   separate proposal. COMO adoption needs its own feasibility and isolation proof.
 - [ ] Adapt advanced Assistant workflows under
-  [Deferred Sash UIUX work](#deferred-sash-uiux-work).
+  [Sash UIUX integration](#sash-uiux-integration).
 - [ ] Resolve legacy-auth migration under
   [Operator and audit hardening](#operator-and-audit-hardening), preserving
   historical audit evidence and existing identity state.
@@ -179,14 +179,14 @@ preserved; an older implementation is not evidence that it fits current contract
   offline, and the People state machine reserves `blocked` beside the removed
   states. Unblock clears the flag locally with nothing to re-announce.
 
-#### Deferred Sash UIUX work
+#### Sash UIUX integration
 
 - [ ] Add a People-owned ambient indication while opt-in discovery is active,
   without giving Home read access to People's private discovery state.
 - [ ] Define a typed, attributed capsule-rendered compact panel surface only if
   the product needs app-owned controls inside system chrome. This is future
   surface work, not a migration shortcut.
-- [ ] Add advanced Assistant workflows only after typed Runtime contracts and
+- [ ] Restore the intended Sash Assistant workflows with explicit preservation of existing features and workspaces. Establish typed Runtime contracts and
   accepted product scope exist for them: desktop attachment, knowledge/citation
   and search flows, rich media preview/open, and advanced Studio
   inputs/workflows.

@@ -6,6 +6,7 @@
    Tip: home-20260814a */
 
 import { getHomeGuiLaunchToken } from "./harness-host.js";
+import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
 import { yieldToBrowser, YIELD_EVENT_SLICE, YIELD_MS } from "./agent-stream-qos.js";
 import {
   eligibleTextOffers,
@@ -83,9 +84,11 @@ let liveState = {
   checkedAt: 0,
   /** Live model rows (from advertised model offers). */
   models: [],
+  catalogModels: [],
 };
 
 let probePromise = null;
+let probeEpoch = 0;
 
 export function getLiveInferenceState() {
   return { ...liveState, models: liveState.models.slice() };
@@ -97,12 +100,27 @@ function chatOfferRows(offers) {
   return textOfferRows(eligibleTextOffers(offers));
 }
 
-/* The offer a turn runs on: the one picked in the model menu when it is still
-   advertised, else the first the provider lists. */
+/* An existing choice stays exact. Only a workspace with no choice uses the
+   initial first advertised offer; later absence never substitutes another. */
 let selectedLiveOfferId = "";
+let selectedContentCid = null;
 
-export function selectLiveOffer(offerId) {
+export function selectLiveOffer(offerId, modelCid = null) {
   selectedLiveOfferId = typeof offerId === "string" ? offerId : "";
+  selectedContentCid = modelCid;
+  if (!liveState.checking) {
+    liveState.live = Boolean(currentChoice(liveState.models, liveState.catalogModels));
+  }
+}
+
+export function liveContentChoice() { return selectedContentCid; }
+export function liveContentModels() {
+  return readyModelChoices(liveState.catalogModels || [], liveState.models.map(m => ({ ...m, id: m.offerId })));
+}
+function currentChoice(models, content) {
+  // Initial empty workspace may use the first offer. An existing choice stays exact.
+  const id = selectedLiveOfferId || (selectedContentCid == null ? models[0]?.offerId : "");
+  return selectedModelOffer(models.map(m => ({ ...m, id: m.offerId })), id, selectedContentCid, content || []);
 }
 
 export function liveOfferChoice() {
@@ -110,8 +128,8 @@ export function liveOfferChoice() {
 }
 
 export function selectedLiveOffer() {
-  const models = liveState.models;
-  return models.find((m) => m.offerId === selectedLiveOfferId) || models[0] || null;
+  if (!liveState.live || liveState.checking) return null;
+  return currentChoice(liveState.models, liveState.catalogModels);
 }
 
 /** Cached offers_list — model menu + Configure panel + probe share it. */
@@ -125,37 +143,41 @@ export async function fetchModelOffers({ force = false } = {}) {
   if (!force && offersPromise) {
     return offersPromise;
   }
-  offersPromise = (async () => {
+  const request = (async () => {
     const data = await modelRunCall("offers_list");
-    offersCache = data;
+    if (offersPromise === request) offersCache = data;
     return data;
   })()
-    .catch((error) => {
-      console.warn("model offers fetch failed", error);
-      return offersCache;
-    })
     .finally(() => {
-      offersPromise = null;
+      if (offersPromise === request) offersPromise = null;
     });
-  return offersPromise;
+  offersPromise = request;
+  return request;
 }
 
 /**
- * Truth probe: live when the model-provider answers ping AND advertises at
- * least one text→text offer. Conservative on failure — preview is the honest
- * default (§AL.3).
+ * A current successful offers read must contain the exact chosen text offer.
+ * Refresh ownership applies only to readiness, never to accepted run settlement.
  */
 export async function probeLiveInference({ force = false } = {}) {
   const now = Date.now();
   if (!force && (liveState.checking || now - liveState.checkedAt < PROBE_TTL_MS)) {
     return probePromise ? probePromise.then(getLiveInferenceState) : getLiveInferenceState();
   }
+  const epoch = ++probeEpoch;
   liveState.checking = true;
+  liveState.live = false;
   probePromise = (async () => {
     try {
       /* Reachability and offers in one call: the 0.7.1 model-provider contract
          is offers_list / runs_*; it has no ping. */
-      const offers = await fetchModelOffers({ force: true });
+      const [offers, content] = await Promise.all([
+        fetchModelOffers({ force: true }),
+        fetch(new URL("/api/capsules/catalog", window.location.href).href, {
+          headers: { "x-elastos-home-token": getHomeGuiLaunchToken() },
+        }).then(async response => response.ok ? catalogModels(await response.json()) : []).catch(() => []),
+      ]);
+      if (epoch !== probeEpoch) return;
       const models = chatOfferRows(offers);
       if (!models.length) {
         liveState = {
@@ -166,19 +188,22 @@ export async function probeLiveInference({ force = false } = {}) {
           reason: "no-model-offers",
           checkedAt: Date.now(),
           models: [],
+          catalogModels: content,
         };
         return;
       }
       liveState = {
-        live: true,
+        live: Boolean(currentChoice(models, content)),
         checking: false,
-        model: models[0].label,
+        model: currentChoice(models, content)?.label || "Chosen model unavailable",
         endpointState: "model-offers",
         reason: "ready",
         checkedAt: Date.now(),
         models,
+        catalogModels: content,
       };
     } catch (error) {
+      if (epoch !== probeEpoch) return;
       liveState = {
         live: false,
         checking: false,
@@ -187,9 +212,10 @@ export async function probeLiveInference({ force = false } = {}) {
         reason: String(error?.code || error?.message || "unreachable"),
         checkedAt: Date.now(),
         models: [],
+        catalogModels: [],
       };
     } finally {
-      probePromise = null;
+      if (epoch === probeEpoch) probePromise = null;
     }
   })();
   await probePromise;
@@ -258,17 +284,24 @@ export function compileLiveContext({
   return compiled;
 }
 
-let liveContractRunId = null;
 let liveStreamEpoch = 0;
+let activeRun = null;
 
 export function abortLiveChatStream() {
-  liveStreamEpoch += 1;
-  if (liveContractRunId) {
-    const runId = liveContractRunId;
-    liveContractRunId = null;
-    /* fire-and-forget: best-effort cancel of the contract run */
-    modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() }).catch(() => {});
-  }
+  const run = activeRun;
+  if (!run) return Promise.resolve();
+  run.cancelRequested = true;
+  if (run.cancelPromise) return run.cancelPromise;
+  run.patch({ state: TurnState.CANCEL_PENDING, completedAt: null });
+  if (!run.id) return Promise.resolve();
+  const runId = run.id;
+  run.cancelPromise = modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })
+    .catch(() => {
+      if (activeRun === run) {
+        run.patch({ state: TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+      }
+    });
+  return run.cancelPromise;
 }
 
 /* Detach the UI from the in-flight run WITHOUT cancelling it. The model contract
@@ -277,8 +310,13 @@ export function abortLiveChatStream() {
    uses this so a long generation isn't killed; explicit Stop still uses
    abortLiveChatStream (runs_cancel). */
 export function detachLiveChatStream() {
+  activeRun?.patch({ state: TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
   liveStreamEpoch += 1;
-  liveContractRunId = null;
+  activeRun = null;
+}
+
+export function unresolvedModelTurn(turn) {
+  return Boolean(turn?.providerRunId || turn?.createRequestId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
 }
 
 export async function modelRunCall(op, body = {}) {
@@ -286,6 +324,7 @@ export async function modelRunCall(op, body = {}) {
   if (!token) {
     const error = new Error("missing home launch token in Home GUI shell");
     error.code = "missing-home-launch-token";
+    error.preDispatchRefusal = true;
     throw error;
   }
   const res = await fetch(
@@ -321,7 +360,7 @@ function newRequestId() {
  * Stream a chat turn through the typed model contract: runs_create on the
  * selected text offer, then runs_events cursor-poll by after_sequence.
  * onDelta({ reasoningDelta, contentDelta, done, seq }) is called as text_delta
- * events arrive; Stop = abortLiveChatStream() (fires runs_cancel).
+ * events arrive; Stop requests cancellation and keeps reading Runtime settlement.
  * Full strings are joined once after unlock — not on every poll.
  */
 export async function streamChatViaContract(
@@ -329,6 +368,7 @@ export async function streamChatViaContract(
   {
     onDelta,
     onAccepted,
+    onState,
     maxTokens = DEFAULT_LIVE_MAX_TOKENS,
     requestedEffort = "medium",
     contextManifest = null,
@@ -336,7 +376,8 @@ export async function streamChatViaContract(
     inputParts = [],
   } = {},
 ) {
-  abortLiveChatStream();
+  detachLiveChatStream();
+  const epoch = liveStreamEpoch;
   if (contextManifest) {
     assertProviderPayloadUnchanged(messages, contextManifest.providerPayloadHash);
   }
@@ -363,43 +404,72 @@ export async function streamChatViaContract(
       }),
     );
   turnStorePut(turn);
+  const patch = (fields) => {
+    const next = turnStorePatch(turn.turnId, fields) || turn;
+    onState?.(next);
+    return next;
+  };
+  const run = { id: null, patch, cancelRequested: false, cancelPromise: null };
+  activeRun = run;
+  if (turn.createRequestId && !turn.providerRunId) {
+    activeRun = null;
+    throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
+  }
   /* The typed text input has no sampling knobs; the offer's policy owns them.
      maxTokens shaped the context budget upstream and stays on the manifest. */
   void clampLiveMaxTokens(maxTokens);
   const offer = selectedLiveOffer();
-  if (!offer) {
+  if (!offer && !turn.providerRunId) {
+    activeRun = null;
     throw contractError("no_model_offers", "no text model offer on this Home");
   }
-  const created = await modelRunCall(
-    "runs_create",
-    textRunCreateBody({ offer, messages, requestId: newRequestId() }),
-  );
-  const runId = String(created?.run_id || "");
-  if (!runId) {
-    throw contractError("no_run_id", "contract returned no run id");
+  const resuming = Boolean(turn.providerRunId);
+  let created;
+  let runId;
+  const createRequestId = resuming ? null : newRequestId();
+  if (!resuming) patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
+  try {
+    created = resuming
+      ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
+      : await modelRunCall("runs_create", textRunCreateBody({ offer, messages, requestId: createRequestId }));
+    runId = typeof created?.run_id === "string" ? created.run_id : "";
+    if (!runId || runId.trim() !== runId || runId.length > 80 || (resuming && runId !== turn.providerRunId)) {
+      throw contractError("no_run_id", "contract returned no run id");
+    }
+  } catch (error) {
+    if (activeRun === run) activeRun = null;
+    if (!resuming) {
+      const refused = error.preDispatchRefusal === true;
+      patch({ state: refused ? TurnState.FAILED : TurnState.SETTLEMENT_UNKNOWN,
+        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null });
+      if (!refused) throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
+    }
+    throw error;
   }
-  let afterSequence = Number.isInteger(Number(created?.sequence_cursor))
+  if (resuming && activeRun !== run) {
+    return { detached: true, turnManifest: turn };
+  }
+  let afterSequence = !resuming && Number.isInteger(Number(created?.sequence_cursor))
     ? Number(created.sequence_cursor)
     : 0;
-  liveContractRunId = runId;
-  turnStorePatch(turn.turnId, {
+  run.id = runId;
+  patch({
     providerRunId: runId,
     state: TurnState.SUBMITTED,
   });
-  turnStorePatch(turn.turnId, { state: TurnState.STREAMING });
-  onAccepted?.({ run_id: runId, turnId: turn.turnId });
+  patch({ state: activeRun === run ? TurnState.STREAMING : TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+  if (activeRun === run) onAccepted?.({ run_id: runId, turnId: turn.turnId });
+  if (run.cancelRequested && activeRun === run) void abortLiveChatStream();
 
-  const epoch = liveStreamEpoch;
   let seq = 0;
   let streamedChars = 0;
   const emit = (reasoningDelta, contentDelta, done = false) =>
     onDelta?.({ reasoningDelta, contentDelta, done, seq });
   const finish = (extra = {}) => {
-    const next =
-      turnStorePatch(turn.turnId, {
-        state: extra.aborted ? TurnState.STOPPED : TurnState.COMPLETED,
-        completedAt: Date.now(),
-      }) || turn;
+    const next = extra.detached ? turn : patch({
+      state: extra.settlementUnknown ? TurnState.SETTLEMENT_UNKNOWN : extra.aborted ? TurnState.STOPPED : TurnState.COMPLETED,
+      completedAt: Date.now(),
+    });
     return {
       usage: null,
       latencyMs: Date.now() - startedAt,
@@ -415,24 +485,24 @@ export async function streamChatViaContract(
 
   try {
     for (;;) {
-      if (epoch !== liveStreamEpoch || liveContractRunId !== runId) {
-        return finish({ aborted: true });
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
       }
       const page = await modelRunCall("runs_events", {
         run_id: runId,
         request_id: newRequestId(),
         after_sequence: afterSequence,
       });
-      if (epoch !== liveStreamEpoch || liveContractRunId !== runId) {
-        return finish({ aborted: true });
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
       }
       const applied = applyRunEventsPage(page, afterSequence);
       afterSequence = applied.nextCursor;
       let eventsInSlice = 0;
       let sliceStart = Date.now();
       for (const delta of applied.textDeltas) {
-        if (epoch !== liveStreamEpoch || liveContractRunId !== runId) {
-          return finish({ aborted: true });
+        if (epoch !== liveStreamEpoch || activeRun !== run) {
+          return finish({ detached: true });
         }
         seq += 1;
         streamedChars += delta.length;
@@ -444,7 +514,10 @@ export async function streamChatViaContract(
           sliceStart = Date.now();
         }
       }
-      const terminal = applied.terminal;
+      if (epoch !== liveStreamEpoch || activeRun !== run) {
+        return finish({ detached: true });
+      }
+      const terminal = applied.terminal || (!applied.hasMore && resuming ? created.terminal : null);
       if (terminal) {
         if (terminal.status === "completed") {
           /* A provider that did not stream settles with the whole text once. */
@@ -458,6 +531,10 @@ export async function streamChatViaContract(
         if (terminal.status === "cancelled") {
           return finish({ aborted: true });
         }
+        if (terminal.status === "settlement_unknown") {
+          return finish({ settlementUnknown: true });
+        }
+        patch({ state: TurnState.FAILED, completedAt: Date.now() });
         const detail = terminal.error && typeof terminal.error === "object" ? terminal.error : {};
         throw contractError(
           String(detail.code || terminal.status || "run_failed"),
@@ -470,8 +547,8 @@ export async function streamChatViaContract(
       await new Promise((resolve) => setTimeout(resolve, CONTRACT_POLL_MS));
     }
   } finally {
-    if (liveContractRunId === runId) {
-      liveContractRunId = null;
+    if (activeRun === run) {
+      activeRun = null;
     }
   }
 }

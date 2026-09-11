@@ -1,10 +1,12 @@
 import { BUTTON_BITS, gamepadMask as readGamepadMask } from "./gba-input.js";
+import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
 
 const VIEWER_ID = "gba-emulator";
 const MAX_ROM_BYTES = 64 * 1024 * 1024;
 const query = new URLSearchParams(window.location.search);
 const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 const homeParentOrigin = query.get("home_origin") || "";
+const homeNavigation = createHomeNavigationClient({ homeToken, homeOrigin: homeParentOrigin });
 if (homeToken && homeParentOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
 }
@@ -16,6 +18,7 @@ const canvas = document.getElementById("canvas");
 const emptyState = document.getElementById("drop-zone");
 const installedGames = document.getElementById("rom-library-list");
 const status = document.getElementById("status");
+const saveRecoveryButton = document.getElementById("btn-save-recovery");
 const pauseButton = document.getElementById("btn-pause");
 const fastForwardButton = document.getElementById("btn-ff");
 const volume = document.getElementById("volume-slider");
@@ -50,6 +53,8 @@ let saveTimer = 0;
 let activeSaveName = "";
 let activeRomId = "";
 let activeStorageCapsule = VIEWER_ID;
+let saveSession = null;
+let openSequence = 0;
 const touchPointers = new Map();
 
 function launchHeaders() {
@@ -219,37 +224,141 @@ function statePath(slot) {
   return `/data/states/${stateName(slot)}`;
 }
 
-async function restoreSave(name, capsule) {
-  const response = await fetch(saveUrl(name, capsule), { headers: launchHeaders() });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`Saved game data is unavailable (${response.status}).`);
-  return new Uint8Array(await response.arrayBuffer());
+function responseRevision(response) {
+  const revision = response.headers.get("etag");
+  if (!/^"[0-9a-f]{64}"$/.test(revision || "")) throw new Error("Saved data has no valid revision.");
+  return revision;
+}
+
+async function readStoredData(url) {
+  const response = await fetch(url, { headers: launchHeaders() });
+  if (response.status === 404) return { url, revision: null, bytes: null };
+  if (!response.ok) throw new Error("Saved data is unavailable. Keep the current game open.");
+  const revision = responseRevision(response);
+  return { url, revision, bytes: new Uint8Array(await response.arrayBuffer()) };
+}
+
+function assertSaveSession(session) {
+  if (!session || session !== saveSession) throw new Error("The game changed before saving finished.");
+  if (session.blocked) throw new Error(session.blocked);
+}
+
+function stopSaving(session, message) {
+  session.blocked = message;
+  if (session === saveSession) {
+    window.clearInterval(saveTimer);
+    showStatus(message, true);
+    saveRecoveryButton.hidden = false;
+    saveRecoveryButton.textContent = "Check saved data";
+  }
+  return new Error(message);
+}
+
+// One in-flight operation per live game; revisions belong to its captured paths.
+function withSaveSession(session, operation) {
+  const result = session.pending.then(() => {
+    assertSaveSession(session);
+    return operation();
+  });
+  session.pending = result.catch(() => {});
+  return result;
+}
+
+async function writeStoredData(session, record, bytes, keepalive = false) {
+  assertSaveSession(session);
+  if (!record) throw new Error("Read this save successfully before saving. The live game is unchanged.");
+  session.failedWrite = { record, bytes, uncertain: true };
+  let response;
+  try {
+    response = await fetch(record.url, {
+      method: "PUT",
+      headers: { ...launchHeaders(), ...(record.revision === null
+        ? { "If-None-Match": "*" } : { "If-Match": record.revision }) },
+      body: bytes,
+      keepalive,
+    });
+  } catch {
+    throw stopSaving(session, "Save result is uncertain. Keep this game open; automatic saving stopped.");
+  }
+  if (response.status === 412) {
+    session.failedWrite.uncertain = false;
+    throw stopSaving(session, "Saved data changed in another window. This game is still running; automatic saving stopped.");
+  }
+  if (!response.ok) throw stopSaving(session, "Save was not confirmed. Keep this game open; automatic saving stopped.");
+  try {
+    const revision = responseRevision(response);
+    assertSaveSession(session);
+    record.revision = revision;
+    record.bytes = bytes;
+    session.failedWrite = null;
+  } catch {
+    throw stopSaving(session, "Save result is uncertain. Keep this game open; automatic saving stopped.");
+  }
+}
+
+function sameSavedBytes(left, right) {
+  return left?.length === right?.length && left?.every((byte, index) => byte === right[index]);
+}
+
+async function recoverSave() {
+  const session = saveSession;
+  const failed = session?.failedWrite;
+  if (!failed || saveRecoveryButton.disabled) return;
+  saveRecoveryButton.disabled = true;
+  try {
+    await session.pending;
+    const current = await readStoredData(failed.record.url);
+    if (session !== saveSession || session.failedWrite !== failed) return;
+    if (failed.uncertain && sameSavedBytes(current.bytes, failed.bytes)) {
+      Object.assign(failed.record, current);
+    } else if (failed.uncertain && current.revision === failed.record.revision) {
+      // The exact pre-write version remains. A conditional retry is safe and uses current live progress.
+      Object.assign(failed.record, current);
+    } else {
+      if (!current.bytes?.length) throw new Error("Saved data is unavailable. Your current game is unchanged.");
+      if (!window.confirm("Saved data differs from this game. Discard current progress and load the stored save?")) return;
+      // Read again after the user decision; the same game/path still owns this action.
+      const selected = await readStoredData(failed.record.url);
+      if (session !== saveSession || session.failedWrite !== failed) return;
+      if (!selected.bytes?.length) throw new Error("Saved data is unavailable. Your current game is unchanged.");
+      if (failed.record === session.save) {
+        session.engine.FS.writeFile(session.savePath, selected.bytes);
+        if (!session.engine.loadGame(session.romPath, session.savePath)) throw new Error("The stored game could not be loaded.");
+      } else {
+        const slot = [1, 2, 3].find((value) => session.states[value] === failed.record);
+        if (!slot) return;
+        session.engine.FS.writeFile(session.statePaths[slot], selected.bytes);
+        if (!session.engine.loadState(slot)) throw new Error("The stored state could not be loaded.");
+      }
+      Object.assign(failed.record, selected);
+      if (!paused) session.engine.resumeGame();
+    }
+    session.failedWrite = null;
+    session.blocked = "";
+    saveRecoveryButton.hidden = true;
+    showStatus("Saved data checked. Automatic saving resumed.");
+    startSaveLifecycle();
+  } catch (error) {
+    if (session === saveSession) showStatus(error.message, true);
+  } finally {
+    if (session === saveSession) saveRecoveryButton.disabled = false;
+  }
 }
 
 async function persistSave(keepalive = false) {
-  if (!engine || !gameLoaded || !activeSaveName) return;
-  const bytes = engine.getSave();
-  if (!bytes?.length) return;
-  const response = await fetch(saveUrl(activeSaveName), {
-    method: "PUT",
-    headers: launchHeaders(),
-    body: bytes,
-    keepalive,
+  const session = saveSession;
+  if (!session || !gameLoaded) return;
+  return withSaveSession(session, async () => {
+    const bytes = session.engine.getSave();
+    if (bytes?.length) await writeStoredData(session, session.save, new Uint8Array(bytes), keepalive);
   });
-  if (!response.ok) throw new Error(`Saved game data could not be stored (${response.status}).`);
 }
 
-async function readState(slot) {
-  const response = await fetch(stateUrl(slot), { headers: launchHeaders() });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`State ${slot} is unavailable (${response.status}).`);
-  return new Uint8Array(await response.arrayBuffer());
-}
-
-async function waitForState(slot) {
+async function waitForState(session, slot) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
+    assertSaveSession(session);
     try {
-      const bytes = engine.FS.readFile(statePath(slot));
+      const bytes = session.engine.FS.readFile(session.statePaths[slot]);
       if (bytes?.length) return bytes;
     } catch {
       // mGBA creates the state file asynchronously.
@@ -260,36 +369,51 @@ async function waitForState(slot) {
 }
 
 async function saveState(slot) {
-  if (!engine?.saveState(slot)) throw new Error(`State ${slot} could not be saved.`);
-  const response = await fetch(stateUrl(slot), {
-    method: "PUT",
-    headers: launchHeaders(),
-    body: await waitForState(slot),
+  const session = saveSession;
+  assertSaveSession(session);
+  return withSaveSession(session, async () => {
+    if (!session.states[slot]) throw new Error(`State ${slot} could not be read. Saving is unavailable.`);
+    try { session.engine.FS.unlink(session.statePaths[slot]); } catch { /* A new slot has no local file. */ }
+    if (!session.engine.saveState(slot)) throw new Error(`State ${slot} could not be saved.`);
+    await writeStoredData(session, session.states[slot], new Uint8Array(await waitForState(session, slot)));
+    assertSaveSession(session);
+    setSlotState(slot, true);
+    showStatus(`State ${slot} saved`);
   });
-  if (!response.ok) throw new Error(`State ${slot} could not be stored (${response.status}).`);
-  setSlotState(slot, true);
-  showStatus(`State ${slot} saved`);
 }
 
 async function loadState(slot) {
-  const bytes = await readState(slot);
-  if (!bytes?.length) {
-    setSlotState(slot, false);
-    throw new Error(`State ${slot} is empty.`);
-  }
-  engine.FS.writeFile(statePath(slot), bytes);
-  if (!engine.loadState(slot)) throw new Error(`State ${slot} could not be loaded.`);
-  setSlotState(slot, true);
-  showStatus(`State ${slot} loaded`);
+  const session = saveSession;
+  assertSaveSession(session);
+  return withSaveSession(session, async () => {
+    const record = await readStoredData(session.stateUrls[slot]);
+    assertSaveSession(session);
+    if (!record.bytes?.length) {
+      setSlotState(slot, false);
+      throw new Error(`State ${slot} is empty.`);
+    }
+    session.engine.FS.writeFile(session.statePaths[slot], record.bytes);
+    if (!session.engine.loadState(slot)) throw new Error(`State ${slot} could not be loaded.`);
+    session.states[slot] = record;
+    setSlotState(slot, true);
+    showStatus(`State ${slot} loaded`);
+  });
 }
 
-async function refreshStateSlots() {
+async function refreshStateSlots(session = saveSession) {
   await Promise.all(
     [1, 2, 3].map(async (slot) => {
       try {
-        setSlotState(slot, Boolean((await readState(slot))?.length));
+        const record = await readStoredData(session.stateUrls[slot]);
+        assertSaveSession(session);
+        session.states[slot] = record;
+        setSlotState(slot, Boolean(record.bytes?.length));
       } catch {
-        setSlotState(slot, false);
+        if (session === saveSession) {
+          setSlotState(slot, false);
+          document.getElementById(`slot-status${slot}`).textContent = "Unavailable";
+          document.getElementById(`btn-save${slot}`).disabled = true;
+        }
       }
     }),
   );
@@ -302,11 +426,9 @@ function startSaveLifecycle() {
 
 async function openGame(request, title = "GBA Emulator") {
   if (!homeToken) throw new Error("Open GBA from Home or Library.");
-  await persistSave().catch(console.warn);
-  if (engine && gameLoaded) engine.pauseGame();
-  gameLoaded = false;
-  setGameControlsEnabled(false);
-  for (let slot = 1; slot <= 3; slot += 1) setSlotState(slot, false);
+  const sequence = ++openSequence;
+  const previous = saveSession;
+  if (previous) assertSaveSession(previous);
   showStatus("Starting game");
 
   const [{ bytes, fileName }, module] = await Promise.all([readGame(request), loadEngine()]);
@@ -315,14 +437,38 @@ async function openGame(request, title = "GBA Emulator") {
   const saveName = `${romId}.sav`;
   const savePath = `/data/saves/${saveName}`;
   const storageCapsule = storageCapsuleForRequest(request);
-  const saved = await restoreSave(saveName, storageCapsule);
-  if (saved?.length) module.FS.writeFile(savePath, saved);
+  let saved = await readStoredData(saveUrl(saveName, storageCapsule));
+  if (sequence !== openSequence) return;
+  // Preserve the live game when the final save is refused or uncertain.
+  if (previous) {
+    previous.engine.pauseGame();
+    try { await persistSave(); } catch (error) {
+      if (!paused) previous.engine.resumeGame();
+      throw error;
+    }
+  }
+  if (sequence !== openSequence) {
+    if (previous === saveSession && previous && !paused) previous.engine.resumeGame();
+    return;
+  }
+  if (previous && saved.url === previous.save.url) saved = { ...previous.save };
+  if (saved.bytes?.length) module.FS.writeFile(savePath, saved.bytes);
+  else { try { module.FS.unlink(savePath); } catch { /* First save has no local file. */ } }
   module.FS.writeFile(romPath, bytes);
-  if (!module.loadGame(romPath, savePath)) throw new Error("The GBA engine rejected this game.");
+  if (!module.loadGame(romPath, savePath)) {
+    if (previous === saveSession && previous && !paused) previous.engine.resumeGame();
+    throw new Error("The GBA engine rejected this game.");
+  }
 
   activeSaveName = saveName;
   activeRomId = romId;
   activeStorageCapsule = storageCapsule;
+  saveSession = { engine: module, romPath, savePath, save: saved, states: {}, statePaths: {}, stateUrls: {}, pending: Promise.resolve(), blocked: "", failedWrite: null };
+  saveRecoveryButton.hidden = true;
+  for (let slot = 1; slot <= 3; slot += 1) {
+    saveSession.statePaths[slot] = statePath(slot);
+    saveSession.stateUrls[slot] = stateUrl(slot);
+  }
   gameLoaded = true;
   paused = false;
   fastForward = false;
@@ -330,6 +476,7 @@ async function openGame(request, title = "GBA Emulator") {
   module.setVolume(0);
   module.setFastForwardMultiplier(1);
   module.resumeGame();
+  homeNavigation.setQuery(request.capsule ? { capsule: request.capsule } : { objectUri: request.objectUri });
   emptyState.hidden = true;
   powerLed.classList.remove("off");
   setGameControlsEnabled(true);
@@ -337,7 +484,9 @@ async function openGame(request, title = "GBA Emulator") {
   fastForwardButton.classList.remove("active");
   document.title = `${title || fileName} - GBA Emulator - ElastOS`;
   showStatus("");
-  await refreshStateSlots();
+  const session = saveSession;
+  await refreshStateSlots(session);
+  if (session !== saveSession || sequence !== openSequence) return;
   startSaveLifecycle();
   startInputLoop();
   canvas.focus({ preventScroll: true });
@@ -406,6 +555,7 @@ function clearInput() {
 
 function bindInput() {
   window.addEventListener("keydown", (event) => {
+    if (event.target === saveRecoveryButton) return;
     const stateShortcut = {
       F1: [saveState, 1],
       F2: [saveState, 2],
@@ -427,6 +577,7 @@ function bindInput() {
     enableSound().catch(() => {});
   });
   window.addEventListener("keyup", (event) => {
+    if (event.target === saveRecoveryButton) return;
     const button = KEY_BUTTONS[event.code];
     if (!button) return;
     event.preventDefault();
@@ -479,6 +630,7 @@ pauseButton.addEventListener("click", () => {
   syncPauseButton();
   if (paused) persistSave().catch((error) => showStatus(error.message, true));
 });
+saveRecoveryButton.addEventListener("click", () => { recoverSave().catch(() => {}); });
 fastForwardButton.addEventListener("click", () => {
   if (!engine || !gameLoaded) return;
   enableSound().catch(() => {});
@@ -532,4 +684,6 @@ const launch = requestedGame();
 if (launch) {
   const title = query.get("name") || query.get("capsule") || fileNameFromUri(launch.objectUri);
   openGame(launch, title).catch((error) => showStatus(error.message || String(error), true));
+} else {
+  homeNavigation.setQuery({});
 }

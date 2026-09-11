@@ -17,6 +17,7 @@ import {
   abortLiveChatStream,
   detachLiveChatStream,
   selectedLiveOffer,
+  unresolvedModelTurn,
 } from "./agent-live.js";
 import { stampMessageNode, contentHash, newTurnId, createTurnManifest, turnStorePut, turnStorePatch, turnStoreGet, TurnState, cheapTurnSnapshot, resolveReasoningPolicy } from "./agent-context.js";
 import { setAgentComposerProcessing } from "./agent-shelf.js";
@@ -510,7 +511,13 @@ function renderMarkdownBlocks(raw) {
 export function formatStreamError(err) {
   const code = err?.code || "";
   if (code === "aborted") {
-    return "Stopped";
+    return "Run status unavailable.";
+  }
+  if (code === "run_not_found") {
+    return "Run record is unavailable. Start a new chat.";
+  }
+  if (code === "run_acceptance_unknown") {
+    return "Run acceptance is unknown. Start a new chat.";
   }
   if (code === "missing-home-launch-token") {
     return "Live unavailable — Home launch token missing (unlock Home and reopen Agent)";
@@ -542,6 +549,33 @@ export function setStreamStatus(label, { tone = "idle" } = {}) {
   el.hidden = !text;
   el.dataset.tone = tone;
   el.textContent = text;
+}
+
+function showRunSettlement(turn, detail = turn?.error === "run_not_found"
+  ? formatStreamError({ code: "run_not_found" })
+  : "Run status unavailable. Check status or start a new chat.") {
+  if (!unresolvedModelTurn(turn)) {
+    setStreamStatus("Outcome unknown");
+    return;
+  }
+  if (!turn.providerRunId) {
+    setStreamStatus(formatStreamError({ code: "run_acceptance_unknown" }), { tone: "error" });
+    return;
+  }
+  setStreamStatus(detail, { tone: "error" });
+  const el = document.querySelector("[data-agent-stream-status]");
+  if (!el) return;
+  const sessionId = ctx.activeSessionId;
+  const generation = ctx.streamGeneration;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Check status";
+  button.addEventListener("click", () => {
+    if (generation !== ctx.streamGeneration || sessionId !== ctx.activeSessionId) return;
+    button.disabled = true;
+    void startLiveTurnForPrompt("", { resumeTurn: turn });
+  });
+  el.append(" ", button);
 }
 
 export function ensureJumpToLatest() {
@@ -844,6 +878,11 @@ export function renderActiveSession() {
   host.syncTruthStrip?.();
   setStreamStatus("");
   updateJumpToLatestVisibility();
+  if (!ctx.turnBusy && unresolvedModelTurn(session.lastTurn)) {
+    void startLiveTurnForPrompt("", { resumeTurn: session.lastTurn });
+  } else if (session.lastTurn?.state === TurnState.SETTLEMENT_UNKNOWN) {
+    showRunSettlement(session.lastTurn);
+  }
 }
 
 export function appendThinkingBlock(text, { streaming = false, open = false } = {}) {
@@ -1308,36 +1347,31 @@ export function regenerateLastAgentTurn() {
   return true;
 }
 
-/** Transport + generation bump only. UI reconciles afterward (Stop is P0). */
+/** Request cancellation; keep the stream attached until Runtime settles it. */
 export function abortAgentStreamNow() {
-  abortLiveChatStream();
-  clearStreamTimer();
-  if (!ctx) {
-    return;
-  }
-  ctx.streamGeneration += 1;
+  return abortLiveChatStream();
 }
 
 export function stopAgentStream({ keepPartial = true, drainQueue = false, cancelRun = true } = {}) {
   /* cancelRun=false = navigation detach: leave the server-side run alive, just stop
      consuming its events. Explicit Stop (default) still fires runs_cancel. */
   if (cancelRun) {
-    abortLiveChatStream();
-  } else {
-    detachLiveChatStream();
+    return abortLiveChatStream();
   }
+  const detachedSession = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const canon = getLiveTurnCanonical();
+  detachLiveChatStream();
   clearStreamTimer();
   ctx.streamGeneration += 1;
+  const detachedGeneration = ctx.streamGeneration;
   ctx.turnBusy = false;
   setAgentComposerProcessing(false);
   host.setComposerGeometrySuspended?.(false);
   setStreamStatus("");
   const thinking = host.streamEl()?.querySelector(".agent-thinking.is-streaming");
   const streaming = host.streamEl()?.querySelector(".agent-msg-agent.is-streaming");
-  /* Reconcile after abort returns. Join + persist on the next frame so Stop
-     never blocks on a multi-megabyte string. Keep the streamed plain text. */
+  /* Retain the detached session's partial text without changing the new view. */
   const reconcile = () => {
-    const canon = getLiveTurnCanonical();
     const thinkingText = String(
       canon.reasoning ||
         thinking?.dataset.mdSource ||
@@ -1347,12 +1381,18 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
     const raw = String(
       canon.answer || streaming?.querySelector(".agent-msg-body")?.dataset.mdSource || "",
     ).trim();
+    if (keepPartial && (raw || thinkingText)) {
+      commitAgentReply(detachedSession, raw || thinkingText, thinkingText, {
+        partial: true, turn: detachedSession?.lastTurn,
+      });
+    }
+    if (ctx.streamGeneration !== detachedGeneration) return;
     if (thinking) {
       finishThinkingBlock(thinking, Number(thinking.dataset.startedAt) || Date.now());
       if (thinking.dataset.block === "progress") {
         const label = thinking.querySelector(".agent-progress-label");
         if (label) {
-          label.textContent = "Stopped";
+          label.textContent = "Run detached";
         }
       }
     }
@@ -1373,13 +1413,11 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
       if (regen) {
         regen.disabled = false;
       }
-      persistPartialAgentReply(raw, thinkingText);
       if (!streaming.querySelector(".agent-msg-stopped")) {
         const note = document.createElement("div");
         note.className = "agent-msg-stopped";
         note.innerHTML =
-          `<span>Stopped</span>` +
-          `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
+          `<span>Run detached.</span>`;
         streaming.append(note);
       }
       return;
@@ -1398,9 +1436,21 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
 export const NO_MODEL_OFFER_STATUS =
   "No model offer on this Home — install a model provider (Store · Services) to chat";
 
+export function canSubmitNewTurn() {
+  const turn = ctx.sessions.find((s) => s.id === ctx.activeSessionId)?.lastTurn;
+  if (!unresolvedModelTurn(turn)) return true;
+  showRunSettlement(turn);
+  return false;
+}
+
 /** One decision point (one canonical path): a turn runs on the typed model
  *  contract or it does not run. Nothing here invents a reply. */
 export function startTurnForPrompt(userText) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (unresolvedModelTurn(session?.lastTurn)) {
+    if (!ctx.turnBusy) void startLiveTurnForPrompt("", { resumeTurn: session.lastTurn });
+    return;
+  }
   if (getLiveInferenceState().live) {
     void startLiveTurnForPrompt(userText);
     return;
@@ -1409,7 +1459,6 @@ export function startTurnForPrompt(userText) {
   void probeLiveInference({ force: true }).then(() => {
     if (getLiveInferenceState().live) {
       setStreamStatus("");
-      void startLiveTurnForPrompt(userText);
     }
   });
 }
@@ -1601,9 +1650,13 @@ function scheduleIdleWork(fn) {
   window.setTimeout(() => invoke(false), 32);
 }
 
-/** Live turn: contract runs_events → scheduled DOM. Stop aborts the run. */
-async function startLiveTurnForPrompt(userText) {
-  abortLiveChatStream();
+/** Live turn: contract runs_events → scheduled DOM. Stop requests cancellation. */
+async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
+  if (resumeTurn && !resumeTurn.providerRunId) {
+    showRunSettlement(resumeTurn);
+    return;
+  }
+  detachLiveChatStream();
   clearStreamTimer();
   const generation = (ctx.streamGeneration += 1);
   ctx.turnBusy = true;
@@ -2188,10 +2241,10 @@ async function startLiveTurnForPrompt(userText) {
 
   try {
     const lastUser = [...(session?.messages || [])].reverse().find((m) => m.role === "user");
-    const turnId = newTurnId();
+    const turnId = resumeTurn?.turnId || newTurnId();
     const reasoning = resolveReasoningPolicy(ctx.reasoningEffort || "medium");
     let turn = turnStorePut(
-      createTurnManifest({
+      resumeTurn || createTurnManifest({
         turnId,
         inputParts: Array.isArray(lastUser?.parts) ? lastUser.parts : [],
         reasoning,
@@ -2213,24 +2266,28 @@ async function startLiveTurnForPrompt(userText) {
     persistTurn(turn);
     let compiled;
     try {
-      turnStorePatch(turnId, { state: TurnState.COMPILING_CONTEXT });
-      persistTurn(turnStoreGet(turnId) || turn);
-      compiled = compileLiveContext({
-        session,
-        systemPrompt: ctx.systemPrompt,
-        notes: ctx.agentNotes,
-        maxTokens: ctx.maxTokens,
-      });
-      persistTurn(
-        turnStorePatch(turnId, {
-          state: TurnState.READY,
-          contextManifestId: compiled.manifest.id,
-          semanticContextHash: compiled.manifest.semanticContextHash,
-          providerPayloadHash: compiled.manifest.providerPayloadHash,
-          estimatedInputTokens: compiled.manifest.estimatedInputTokens,
-          transcriptChars: compiled.manifest.transcriptChars,
-        }),
-      );
+      if (resumeTurn) {
+        compiled = { messages: [], manifest: null };
+      } else {
+        turnStorePatch(turnId, { state: TurnState.COMPILING_CONTEXT });
+        persistTurn(turnStoreGet(turnId) || turn);
+        compiled = compileLiveContext({
+          session,
+          systemPrompt: ctx.systemPrompt,
+          notes: ctx.agentNotes,
+          maxTokens: ctx.maxTokens,
+        });
+        persistTurn(
+          turnStorePatch(turnId, {
+            state: TurnState.READY,
+            contextManifestId: compiled.manifest.id,
+            semanticContextHash: compiled.manifest.semanticContextHash,
+            providerPayloadHash: compiled.manifest.providerPayloadHash,
+            estimatedInputTokens: compiled.manifest.estimatedInputTokens,
+            transcriptChars: compiled.manifest.transcriptChars,
+          }),
+        );
+      }
     } catch (err) {
       persistTurn(
         turnStorePatch(turnId, {
@@ -2247,6 +2304,12 @@ async function startLiveTurnForPrompt(userText) {
       contextManifest: compiled.manifest,
       turnManifest: turn,
       inputParts: Array.isArray(lastUser?.parts) ? lastUser.parts : [],
+      onState: (next) => {
+        persistTurn(next);
+        if (generation !== ctx.streamGeneration) return;
+        if (next.state === TurnState.CANCEL_PENDING) setStreamStatus("Cancel requested. Waiting for Runtime.");
+        if (next.state === TurnState.SETTLEMENT_UNKNOWN) showRunSettlement(next);
+      },
       onAccepted: ({ run_id } = {}) => {
           persistTurn(turnStoreGet(turnId));
           if (!timings.t1) {
@@ -2348,6 +2411,14 @@ async function startLiveTurnForPrompt(userText) {
     );
     timings.t5 = Date.now();
     if (generation !== ctx.streamGeneration) {
+      return;
+    }
+    if (result.detached || result.settlementUnknown) {
+      const partial = materializeCanonical();
+      commitAgentReply(session, partial.answer, partial.reasoning, { partial: true, turn: result.turnManifest });
+      answerRow?.classList.remove("is-streaming");
+      progress.dispatch({ type: "GENERATION_ERROR", text: "Settlement unknown" });
+      showRunSettlement(result.turnManifest);
       return;
     }
     /* Unlock before joining the canonical string. */
@@ -2563,31 +2634,16 @@ async function startLiveTurnForPrompt(userText) {
     const partial = materializeCanonical();
     const partialAnswer = String(partial.answer || "").trim();
     const partialThinking = String(partial.reasoning || "").trim();
-    if (err?.code === "aborted") {
-      if (liveTurn?.turnId) {
-        const stopped = turnStorePatch(liveTurn.turnId, {
-          state: TurnState.STOPPED,
-          completedAt: Date.now(),
-        });
-        if (session) {
-          session.lastTurn = cheapTurnSnapshot(stopped || liveTurn);
-        }
-      }
-      progress.dispatch({ type: "GENERATION_STOPPED" });
-      if (partialAnswer || partialThinking) {
-        persistPartialAgentReply(partialAnswer || partialThinking, partialThinking);
-      }
-      return;
-    }
     const honest = formatStreamError(err);
-    if (liveTurn?.turnId && liveTurn.state !== TurnState.FAILED) {
+    if (liveTurn?.turnId && !liveTurn.completedAt && ![TurnState.FAILED, TurnState.COMPLETED, TurnState.STOPPED].includes(liveTurn.state)) {
       const failed = turnStorePatch(liveTurn.turnId, {
-        state: TurnState.FAILED,
+        state: unresolvedModelTurn(liveTurn) ? TurnState.SETTLEMENT_UNKNOWN : TurnState.FAILED,
         error: String(err?.code || honest).slice(0, 120),
-        completedAt: Date.now(),
+        completedAt: unresolvedModelTurn(liveTurn) ? null : Date.now(),
       });
       if (session) {
         session.lastTurn = cheapTurnSnapshot(failed || liveTurn);
+        host.persistAgentWorkspaceSoon?.();
       }
     }
     progress.dispatch({ type: "GENERATION_ERROR", text: honest });
@@ -2600,18 +2656,21 @@ async function startLiveTurnForPrompt(userText) {
       if (answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
         const note = document.createElement("div");
         note.className = "agent-msg-stopped";
-        note.innerHTML =
-          `<span>${escapeHtml(honest)}. Continue?</span>` +
-          `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
+        note.innerHTML = unresolvedModelTurn(liveTurn)
+          ? `<span>${escapeHtml(honest)}</span>`
+          : `<span>${escapeHtml(honest)}. Continue?</span>` +
+            `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
         answerRow.append(note);
       }
-      setStreamStatus(honest, { tone: "error" });
+      if (unresolvedModelTurn(liveTurn)) showRunSettlement(liveTurn, honest);
+      else setStreamStatus(honest, { tone: "error" });
       return;
     }
-    setStreamStatus(honest, { tone: "error" });
+    if (unresolvedModelTurn(liveTurn)) showRunSettlement(liveTurn, honest);
+    else setStreamStatus(honest, { tone: "error" });
     progressEl?.remove();
     answerRow?.remove();
-    void probeLiveInference({ force: true });
+    if (!liveTurn?.providerRunId && !unresolvedModelTurn(liveTurn)) void probeLiveInference({ force: true });
     return;
   } finally {
     longTaskObserver?.disconnect();
@@ -2667,7 +2726,7 @@ async function startLiveTurnForPrompt(userText) {
       if (status === "Generating…" || status === "Thinking…" || status === "Connecting…") {
         setStreamStatus("");
       }
-      if (state.phase !== "finalizing") {
+      if (state.phase !== "finalizing" && !unresolvedModelTurn(session?.lastTurn)) {
         window.requestAnimationFrame(() => drainFollowUpQueue());
       }
     }

@@ -1175,6 +1175,7 @@ mod tests {
         let mut supervisor = crate::supervisor::Supervisor::new(
             temp.path().to_path_buf(),
             crate::setup::ComponentsManifest {
+                model_catalog: None,
                 external: std::collections::HashMap::new(),
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),

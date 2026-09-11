@@ -121,6 +121,7 @@ pub(super) async fn home_launch(
 
     Ok(Json(HomeLaunchResponse {
         target: target_summary.target,
+        window_policy: target_summary.window_policy,
         title: target_summary.title,
         route,
         attach_kind: target_summary.attach_kind,
@@ -240,6 +241,7 @@ pub(super) fn home_targets_from_catalog(
         .filter_map(|capsule| {
             Some(HomeTargetSummary {
                 target: capsule.launch_target.clone()?,
+                window_policy: capsule.window_policy,
                 title: capsule.title.clone(),
                 description: capsule.description.clone(),
                 route: capsule.route.clone()?,
@@ -290,6 +292,7 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
                     || (app.role != CapsuleRole::Shell && is_home_visible_target(&app.name))
             })
             .map(|app| HomeTargetSummary {
+                window_policy: app.window_policy,
                 route: format!("/apps/{}/", app.name),
                 title: app_shell_title(&app.name),
                 description: app_shell_description(&app.name, app.description),
@@ -314,6 +317,7 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
             let icon =
                 capsule_icon_variants(&capsule.name, &capsule.entrypoint, capsule.icon.as_deref());
             HomeTargetSummary {
+                window_policy: capsule.window_policy,
                 route: format!("/apps/{}/?capsule={}", capsule.viewer, capsule.name),
                 title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
                 description: viewer_object_shell_description(

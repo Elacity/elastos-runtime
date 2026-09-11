@@ -10,11 +10,13 @@ import {
   bindShelfAttachHost,
   getComposerDraft,
   applyComposerDraft,
+  syncAgentSendButton,
 } from "./agent-shelf.js";
 import {
   shellState,
   desktopObjects,
   postToHome,
+  openModelsFromAgent,
 } from "./harness-host.js";
 import {
   agentStageId,
@@ -61,6 +63,7 @@ import {
   stopAgentStream,
   abortAgentStreamNow,
   startTurnForPrompt,
+  canSubmitNewTurn,
   deleteMessageAt,
   beginEditUserMessage,
   cancelEditUserMessage,
@@ -76,6 +79,8 @@ import {
   probeLiveInference,
   selectLiveOffer,
   selectedLiveOffer,
+  liveContentChoice,
+  liveContentModels,
 } from "./agent-live.js";
 import {
   bindAgentSessions,
@@ -701,6 +706,7 @@ function closeModelMenu() {
 }
 
 function syncModelTrigger() {
+  syncAgentSendButton();
   const btn = modelBtnEl();
   if (!btn) {
     return;
@@ -718,21 +724,22 @@ function syncModelTrigger() {
   }
   btn.title = offer
     ? `${offer.label} — model offer on this Home`
-    : "No model offer on this Home yet — install a model service from Store";
+    : "Chosen model unavailable. Open Models to prepare a model, or choose another offer.";
 }
 
 function buildInstalledModelRows(host, emptyText) {
   host.replaceChildren();
   /* Rows are the advertised model offers — nothing else is inference. */
   const liveInference = getLiveInferenceState();
-  if (liveInference.live) {
+  if (!liveInference.checking) {
     const activeOffer = selectedLiveOffer();
     for (const model of liveInference.models) {
+      if (liveContentModels().some(content => content.offerId === model.offerId)) continue;
       const row = document.createElement("button");
       row.type = "button";
       row.className = "agent-model-option is-live";
       row.setAttribute("role", "option");
-      const on = activeOffer?.offerId === model.offerId;
+      const on = activeOffer?.offerId === model.offerId && liveContentChoice() == null;
       row.setAttribute("aria-selected", on ? "true" : "false");
       row.classList.toggle("is-active", on);
       row.dataset.liveOfferId = model.offerId;
@@ -753,6 +760,22 @@ function buildInstalledModelRows(host, emptyText) {
     empty.className = "agent-model-menu-empty";
     empty.textContent = emptyText;
     host.append(empty);
+  }
+  for (const model of liveContentModels()) {
+    const row = document.createElement("button");
+    row.type = "button"; row.className = "agent-model-option";
+    row.dataset.liveOfferId = model.offerId; row.dataset.modelCid = model.cid;
+    row.textContent = model.title;
+    row.title = model.cid;
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", String((liveContentChoice() == null || liveContentChoice() === model.cid) && selectedLiveOffer()?.offerId === model.offerId));
+    host.append(row);
+  }
+  for (const [action, label] of [["refresh-models", "Refresh models"], ["open-models", "Open Models"]]) {
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "agent-model-option";
+    button.dataset.modelAction = action; button.textContent = label;
+    host.append(button);
   }
 }
 
@@ -877,7 +900,7 @@ export function showAgentHarness({
 } = {}) {
   const harness = harnessEl();
   if (!harness) {
-    return;
+    return false;
   }
 
   /* Already open (e.g. Agent button while harness visible) — keep room, optional send. */
@@ -896,6 +919,7 @@ export function showAgentHarness({
   }
 
   if (prompt) {
+    if (!canSubmitNewTurn()) return false;
     const session = ensureSessionForPrompt(prompt);
     session.messages.push(
       makeUserSessionMessage(prompt, { displayText: displayText || prompt, parts, session }),
@@ -987,6 +1011,7 @@ export function showAgentHarness({
   if (!fromShelf) {
     shelfComposerInput()?.focus({ preventScroll: true });
   }
+  return true;
 }
 
 /** Generation-safe settle after Home breathe — menubar edge-reveal only then. */
@@ -1059,8 +1084,7 @@ export function hideAgentHarness({ syncStage = true } = {}) {
   scheduleHarnessTeardown(motionGen);
 }
 export function stopAgentHarnessStream() {
-  stopAgentStream({ keepPartial: true, drainQueue: true });
-  setStreamStatus("");
+  return stopAgentStream({ keepPartial: true, drainQueue: true });
 }
 
 function compactUserParts(parts) {
@@ -1110,16 +1134,17 @@ export function sendToAgentHarness(prompt, opts = {}) {
   if (!modelText) {
     if (active) {
       stopAgentStream({ keepPartial: true });
-      turnBusy = false;
     }
-    return;
+    return false;
   }
+  if (!turnBusy && !selectedLiveOffer()) return false;
   if (active) {
     /* While a turn streams, queue follow-ups instead of cutting the answer. */
     if (turnBusy) {
       enqueueFollowUp(modelText, { displayText, parts });
-      return;
+      return true;
     }
+    if (!canSubmitNewTurn()) return false;
     closeHarnessPage();
     const session = ensureSessionForPrompt(modelText);
     if (session.title === "New chat" || session.messages.length === 0) {
@@ -1132,9 +1157,9 @@ export function sendToAgentHarness(prompt, opts = {}) {
     clearEmptyState();
     appendMessage("user", displayText, { parts, modelText });
     startTurnForPrompt(modelText);
-    return;
+    return true;
   }
-  showAgentHarness({ prompt: modelText, displayText, parts });
+  return showAgentHarness({ prompt: modelText, displayText, parts });
 }
 
 function renderDesktopAttachOptions(menu) {
@@ -1560,10 +1585,21 @@ export function bindAgentHarness() {
       closeHarnessPage();
       return;
     }
+    const modelAction = event.target.closest?.("[data-model-action]")?.dataset.modelAction;
+    if (modelAction) {
+      event.preventDefault();
+      if (modelAction === "open-models") openModelsFromAgent();
+      else {
+        const refresh = probeLiveInference({ force: true });
+        syncTruthStrip(); renderModelMenu();
+        void refresh.then(() => { syncTruthStrip(); renderModelMenu(); });
+      }
+      return;
+    }
     const liveOpt = event.target.closest?.(".agent-model-option[data-live-offer-id]");
     if (liveOpt?.dataset.liveOfferId) {
       event.preventDefault();
-      selectLiveOffer(liveOpt.dataset.liveOfferId);
+      selectLiveOffer(liveOpt.dataset.liveOfferId, liveOpt.dataset.modelCid ?? null);
       syncTruthStrip();
       renderHarnessPage();
       persistAgentWorkspaceSoon();
@@ -1587,7 +1623,7 @@ export function bindAgentHarness() {
     const sessionBtn = event.target.closest?.(".agent-harness-session-btn");
     if (sessionBtn) {
       event.preventDefault();
-      stopAgentStream({ keepPartial: true });
+      stopAgentStream({ keepPartial: true, cancelRun: false });
       activeSessionId = sessionBtn.closest(".agent-harness-session")?.dataset.sessionId || null;
       renderSessions();
       renderActiveSession();

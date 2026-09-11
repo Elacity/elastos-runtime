@@ -31,17 +31,32 @@ agent principal and session.
 
 ElastOS has one typed model-provider contract: `offers_list`, `runs_create`,
 `runs_get`, `runs_events`, and `runs_cancel`. A Runtime can use a configured
-offer backed by a local engine or a hosted API. Local and remote service use are
-placements of the same capability, not separate public model APIs, providers,
-or journals.
+offer backed by a local engine or a hosted API. Backend placement and consumer
+placement are independent:
+
+| Backend | Same-Runtime use | Granted cross-Runtime use |
+| --- | --- | --- |
+| Local engine | Operator-configured local inference | Share the selected local capability after remote acceptance |
+| Hosted API | Operator-configured hosted inference | Share after remote acceptance and upstream terms, privacy, and cost review |
+
+Both consumption paths use the existing model operations and service-offer
+contract. Cross-Runtime model use remains planned work. Carrier currently
+excludes `model` from its provider target allowlist. `RuntimeCreateBinding` and
+`RuntimeAccessBinding` describe local-channel authority and carry no
+authenticated remote issuer.
 
 An operator explicitly selects a configured capability for publication under
 Runtime policy. The owning Runtime publishes it as an
 `elastos.service.offer/v1` service and owns grants, quotas, selection, audit,
-and routing. The destination Runtime authorizes each remote request
-independently. Carrier authenticates and transports the route that Runtime
-selects; it does not grant model authority. Hosted credentials and local model
-artifacts stay inside their owning boundaries.
+and routing. Before reusing provider invocation for remote model work, the
+destination Runtime must verify the signed offer and grant, then map the
+authenticated source Runtime and consumer principal, capsule, and run into
+destination-owned authority. Adding an allowlist entry alone cannot establish
+this binding. Carrier authenticates and transports the route that Runtime
+selects; the destination grants model authority. Publication advertises the
+selected capability. Destination-owned grants authorize its use. The host Home,
+workspace, and other runs retain their separate access rules. Hosted credentials
+and local model artifacts stay inside their owning boundaries.
 
 The owning Runtime DID signs the service offer, which names the admitted
 provider capability and contains only bounded capability and policy facts. The
@@ -50,7 +65,7 @@ credentials, process details, and topology stay inside the model provider. A
 model artifact is separate immutable content. Its canonical package identity
 is the CID of the complete manifest-and-payload closure. Engine, component, and
 payload hashes are verification facts rather than package identities. Runtime
-installs the package through the content provider path described in
+prepares and admits the package through the planned content provider path in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 A hosted web API is a provider-internal HTTPS interoperability edge on the
@@ -147,6 +162,12 @@ Cancellation is a request to stop backend work and settle the request as
 If the backend cannot confirm cancellation, the request enters reconciliation
 rather than being reported as safely cancelled.
 
+The managed local engine and hosted Chat Completions and Responses adapters
+settle cancellation as `settlement_unknown` once dispatch may have happened.
+Closing an HTTP stream does not confirm that the backend stopped. Their terminal
+result and events remain durable across replay and restart without redispatch.
+Installed cancellation and backend-stop proof remain open.
+
 Interrupting the presentation layer does not cancel provider work by itself.
 The Agent Host can reconnect to the same request ID and recover durable events.
 After an Agent Host or Runtime restart, the session journal must distinguish:
@@ -198,9 +219,73 @@ policy. Credentials start in the current owner-only provider config. Secret
 indirection can use an existing secure service when one is available; it does
 not require a new secret store.
 
+## Local content selection and retention
+
+The current closeout includes the complete path from trusted model discovery
+to a real local reply for one verified Qwen package. Runtime source now verifies
+the bounded signed catalog metadata described in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md#implemented-catalog-metadata-profile).
+Source includes bounded local Content preparation, verified package admission,
+admitted-artifact offer binding and native Qwen reply/reuse fixture proof.
+System and Marketplace project model preparation; installed Use has failed
+before admission, with its exact cause still unknown. These facts do not prove
+cold peer delivery or the complete installed journey.
+
+The intended flow uses Marketplace for model discovery/details and Open into
+Home Agent, with exact CID selection through the existing Home handoff. System
+manages the same model records and local storage. Assistant and Home Agent
+keep their existing pickers and typed run lifecycle. These are projections of
+one Runtime catalog, admission inventory and offer binding, not separate model
+stores. A model remains identifiable by complete-closure CID even when its
+bytes are not local.
+
+Selecting a model may ask Runtime to prepare it under current authority. The
+person sees availability, Preparing/progress, Ready or actionable failure,
+offline and incompatibility states. Preparation can be cancelled or retried.
+The accepted behavior is that Use retains the selected local model for reliable
+repeated use. System owns explicit storage removal, with active-run protection,
+recoverability evidence, and warning/consent for possible loss of the sole copy.
+Current Keep/release fixtures describe the older implementation; this adaptation
+and its installed proof remain open. Remote inference is a separately selected
+service. The same inventory distinguishes retention, admission and readiness,
+while catalog identity stays visible. A local pin alone
+proves neither trust nor engine readiness. There is no user GGUF download,
+file-picker or private
+path configuration step in this product flow.
+
+Runtime validates signed publisher/catalog and package facts, resource policy,
+engine compatibility and content integrity before deriving a private verified
+artifact descriptor for the model provider. Source supports operator offers and
+admitted-content binding through the existing ProviderRegistry and run journal,
+while preserving other configured capabilities. An idle-safe provider refresh
+can expose the newly admitted local offer; a busy
+or unknown-settlement run prevents destructive reconfiguration and removal.
+Content preparation status is distinct from a dispatched model run.
+
+Existing `offers_list`, `runs_create`, `runs_get`, `runs_events` and `runs_cancel`
+remain the inference contract. Runtime binds the selected package and offer to
+the exact admitted descriptor; the provider revalidates it before inference.
+Preparation failure never changes the selected model to an available substitute.
+Drafts and existing runs survive selection, progress, cancel, retry and restart.
+The ordinary explicit Send/run action dispatches once only when that selected
+model and provider are ready.
+
+Bounded transfer and manifest/inventory limits are in
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+The single execution queue and proof dependencies are in
+[Builder-only execution](../TASKS.md#builder-only-execution).
+Fresh-install acceptance must prove the compatible engine and its verified
+libraries are available, then select the real signed catalog entry with no
+pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact
+package size, publisher trust, license/provenance and availability deployment
+are prerequisites. Small signed fixtures prove rejection and lifecycle behavior,
+not a production catalog or real inference. Code, tests, manifests and docs go
+to Git review; model bytes and private publisher keys stay outside Git.
+
 ## Staged delivery path
 
-Implement and prove the path in this order:
+Local-engine and hosted-API acceptance are separate tracks. Each backend must
+pass installed lifecycle tests before it can be shared:
 
 1. Evaluate Qwen3.5-9B Q4_K_M as the stable Mac baseline and PrismML Bonsai 8B
    Q1 as an experimental low-memory comparison on an M5 Mac with 24 GB of
@@ -212,20 +297,37 @@ Implement and prove the path in this order:
    shutdown, restart, and orphan cleanup. Consider MLX only if the common
    engine path proves insufficient.
 3. Prove hosted inference locally. Use the current OpenAI-compatible Chat
-   Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok. Add
-   one provider-internal OpenAI Responses API adapter.
-4. Add optional service publication after local lifecycle and hosted paths pass.
-   Publish only an operator-selected configured capability with a signed offer
-   and principal-scoped grant.
-5. Prove remote inference with a full Runtime on Jetson, then publish a signed
-   service offer and route the granted operation through Carrier. Design a
-   smaller provider host only after the full Runtime path establishes its need.
+   Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok.
+   Prove the existing provider-internal OpenAI Responses API adapter separately.
+4. Prove optional sharing of the accepted Mac local model with another Runtime.
+   This requires signed offer and grant admission plus bounded Carrier ingress;
+   hosted credentials and a Jetson deployment are separate acceptance tracks.
+5. Prove hosted sharing only after upstream terms and resale policy permit it,
+   with owner-enforced cost and rate limits. Later, prove a full destination
+   Runtime on Jetson before considering a smaller provider host.
 
 Installed acceptance covers Brave inference, ordered streaming, reconnect,
 cancellation, one terminal result, restart, engine crash and orphan cleanup,
 secret and endpoint redaction, and explicit paid provider choice. Remote proof
-also covers disconnect and reconnect. Model output and tool proposals remain
-untrusted and cannot authorize effects.
+uses two Runtime identities and two principals. It covers:
+
+- signed offer admission and explicit host-owned grant, revoke, expiry, and
+  denial before backend dispatch;
+- rejection of forged `runtime_binding` fields and isolation of identical
+  principal strings issued by different Runtimes;
+- scoped create, get, events, and cancel, including access denial for other
+  runs and the host Home and workspace;
+- prompt and event privacy, bounded capacity, queues, tokens, time, and usage;
+- disconnect and reconnect without redispatch, restart with unknown settlement,
+  and service withdrawal; and
+- consumer consent to prompt transfer, separately from operator consent to
+  compute use or credential charges, with honest provenance and backend facts.
+
+These checks extend the existing service offer and model operations rather
+than introducing a separate sharing API, store, or journal. A content CID
+identifies an immutable package; a signed service offer identifies an available
+capability. Model output and tool proposals remain untrusted and cannot
+authorize effects.
 
 ## Conformance requirements
 

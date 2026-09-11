@@ -5,6 +5,7 @@
   "description": "Browse websites with your chosen Browser Engine and Exit Node",
   "author": "elastos",
   "role": "app",
+  "window_policy": "hybrid",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",

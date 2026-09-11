@@ -153,6 +153,8 @@ export const TurnState = {
   READY: "ready",
   SUBMITTED: "submitted",
   STREAMING: "streaming",
+  CANCEL_PENDING: "cancel_pending",
+  SETTLEMENT_UNKNOWN: "settlement_unknown",
   STOPPED: "stopped",
   COMPLETED: "completed",
   FAILED: "failed",
@@ -889,6 +891,7 @@ export function createTurnManifest({
   return {
     turnId: String(turnId || newTurnId()),
     providerRunId: null,
+    createRequestId: null,
     state: TurnState.CREATED,
     inputParts: inputParts.slice(0, 16).map((p) => ({
       id: String(p.id || ""),
@@ -929,6 +932,7 @@ export function cheapTurnSnapshot(turn) {
   return {
     turnId: String(turn.turnId || "").slice(0, 80),
     providerRunId: turn.providerRunId ? String(turn.providerRunId).slice(0, 80) : null,
+    createRequestId: turn.createRequestId ? String(turn.createRequestId).slice(0, 80) : null,
     state: String(turn.state || "").slice(0, 24),
     contextManifestId: String(turn.contextManifestId || "").slice(0, 16),
     semanticContextHash: String(turn.semanticContextHash || "").slice(0, 16),

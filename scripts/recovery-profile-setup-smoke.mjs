@@ -152,4 +152,75 @@ assert.equal(home.holdHomeSetupAct("chat-room"), false);
 assert(read("capsules/people/browser/people.js").includes('window.top.postMessage({ type: "home:refresh-summary", homeToken }, homeParentOrigin);'));
 assert(system.includes("renderRecoveryProfileSetup(identity);"));
 assert(system.includes("notifyHomeSummaryChanged();"));
+
+// Independent Save acknowledgement/cancellation cases adapted from
+// 6972e165:scripts/recovery-profile-setup-smoke.mjs; keep Profile creation above.
+context.renderRecoveryProfileSetup({ profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" } });
+vm.runInContext(functionSource(system, "exportFullRecoveryBundle"), context);
+let activeSaveDocument = true;
+let dispatchedExports = 0;
+context.requestPasskeyStepUp = async () => {
+  activeSaveDocument = false;
+  return "step-up";
+};
+context.fetchJson = async (url) => {
+  if (url === "/api/auth/recovery/status") return status;
+  assert.equal(url, "/api/auth/recovery/full-export");
+  dispatchedExports += 1;
+  return { included: { people_identity: true } };
+};
+context.refreshSystemSummary = async () => { throw new Error("summary failed"); };
+outcomes.length = 0;
+assert.equal(await context.onRecoveryDownload({ isActive: () => activeSaveDocument }), false);
+assert.equal(dispatchedExports, 0, "document lost during passkey verification cannot dispatch export");
+assert(!outcomes.includes("download"));
+assert(outcomes.some((outcome) => outcome.text === "Recovery Kit save was cancelled."));
+assert.equal(input.readOnly, false, "cancel restores Profile-name editing");
+assert.equal(context.recoveryDownloadButton.disabled, false, "cancel permits an explicit retry");
+
+activeSaveDocument = true;
+context.requestPasskeyStepUp = async () => "step-up";
+outcomes.length = 0;
+assert.equal(await context.onRecoveryDownload({ isActive: () => activeSaveDocument }), true);
+assert.equal(dispatchedExports, 1);
+assert(outcomes.includes("download"));
+assert(outcomes.includes("refresh-home"));
+assert(!outcomes.some((outcome) => outcome.kind === "error"), "summary failure after download retains successful acknowledgement");
+assert.equal(input.readOnly, false);
+assert.equal(context.recoveryDownloadButton.disabled, false);
+
+// Independent Later persistence case adapted from the same donor smoke.
+// Exercise the current hide/sync functions without its older import-only flow.
+const laterSummary = { authority: { signed_in: true }, identity: {
+  profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" },
+  recovery_readiness: { schema: "elastos.recovery.readiness/v1", status: "setup_required" },
+} };
+const reminders = [];
+let savedLayout;
+let reopenedSheets = 0;
+const later = vm.createContext({
+  PROFILE_READINESS_SCHEMA: "elastos.profile.readiness/v1",
+  RECOVERY_READINESS_SCHEMA: "elastos.recovery.readiness/v1",
+  SETUP_REMINDER_ID: "setup",
+  shellState: { currentSummary: laterSummary, shellLayoutState: {} },
+  sheet: { hidden: false, inert: false, setAttribute() {} },
+  finishedHideTimer: null, dismissedThisSession: false, drag: null,
+  restoreSetupSheetOverlay() {},
+  showSetupSheet: () => { reopenedSheets += 1; },
+  rememberChromeNotification: (item) => reminders.push(item),
+  saveShellLayoutState: () => { savedLayout = { ...later.shellState.shellLayoutState }; },
+});
+vm.runInContext(["typedReadinessStatus", "homeSetupStatus", "homeRecoveryStatus", "setupFinished", "homeSetupNeedsAct", "setupSheetOpen", "rememberSetupReminder", "hideSetupSheet", "syncSetupSheet"].map((name) => functionSource(setup, name)).join("\n"), later);
+later.hideSetupSheet({ restoreFocus: false });
+assert.equal(savedLayout.setupReminderDismissed, true, "Later persists its dismissal");
+assert.equal(later.sheet.hidden, true);
+assert.equal(later.sheet.inert, true);
+later.shellState.shellLayoutState = { ...savedLayout };
+later.dismissedThisSession = false;
+reminders.length = 0;
+later.syncSetupSheet(null, laterSummary);
+assert.equal(reopenedSheets, 0, "Later stays a quiet reminder after reload");
+assert.equal(reminders.length, 1);
+assert.equal(laterSummary.identity.recovery_readiness.status, "setup_required", "dismissal preserves the pending Recovery Kit requirement");
+assert(read("capsules/home-gui/browser/shell-core.js").includes("setupReminderDismissed: stored?.setupReminderDismissed === true"));
 console.log("PASS combined Profile and Recovery Kit setup smoke");

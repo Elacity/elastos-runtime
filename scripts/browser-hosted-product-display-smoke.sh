@@ -18,6 +18,9 @@ Browser Engine Adapter can launch a webrtc_remote_display session that reports:
   direct_network = false
 
 The current Playwright/CDP proof is expected to fail this gate.
+Set ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_BIN and its matching
+ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_SHA256 to reuse a verified fixture binary.
+Otherwise this script builds the adapter. Fake signaling proves only the fixture.
 USAGE
 }
 
@@ -54,11 +57,28 @@ fi
 
 cd "$repo_root"
 
-cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml
-adapter_bin="${CARGO_TARGET_DIR:-capsules/browser-engine-adapter/target}/debug/browser-engine-adapter"
+adapter_bin="${ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_BIN:-}"
+if [[ -z "$adapter_bin" ]]; then
+  cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml
+  adapter_bin="${CARGO_TARGET_DIR:-capsules/browser-engine-adapter/target}/debug/browser-engine-adapter"
+elif [[ "$adapter_bin" != /* || ! -x "$adapter_bin" || -z "${ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_SHA256:-}" ]]; then
+  echo "fixture binary override requires an absolute executable and its SHA-256" >&2
+  exit 1
+fi
 
-request_json="$(CONFIG_PATH="$adapter_config" node - <<'NODE'
+CONFIG_PATH="$adapter_config" ADAPTER_BIN="$adapter_bin" node - <<'NODE'
 const fs = require("node:fs");
+const { createHash, randomUUID } = require("node:crypto");
+const { spawn } = require("node:child_process");
+const { createInterface } = require("node:readline");
+const { once } = require("node:events");
+const { isDeepStrictEqual } = require("node:util");
+if (process.env.ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_BIN) {
+  const hash = createHash("sha256").update(fs.readFileSync(process.env.ADAPTER_BIN)).digest("hex");
+  if (hash !== process.env.ELASTOS_TEST_BROWSER_ENGINE_ADAPTER_SHA256) {
+    throw new Error("fixture adapter binary checksum mismatch");
+  }
+}
 const config = JSON.parse(fs.readFileSync(process.env.CONFIG_PATH, "utf8"));
 const adapter = config.adapters?.[0];
 if (adapter?.kind === "selkies_gstreamer" || adapter?.display_modes?.includes("webrtc_remote_display")) {
@@ -95,52 +115,27 @@ const browserProfile = {
   disk_path: "/tmp/elastos-browser-hosted-product-display/BrowserProfiles/default/profile.ext4",
   reset: "whole_profile",
 };
-console.log(JSON.stringify({ op: "init", config }));
-console.log(JSON.stringify({
+const generation = `hosted-product-display-smoke-${randomUUID()}`;
+const principal = "person:local:hosted-product-display-smoke";
+const launchRequest = {
   op: "launch",
   url: "https://example.com/",
   stream_session: streamSession,
+  lifecycle_generation: generation,
   profile: browserProfile,
-  principal_id: "person:local:hosted-product-display-smoke",
+  principal_id: principal,
   reason: "verify hosted product display session",
   display_mode: "webrtc_remote_display",
   guarantee_level: "operator_rbi",
   viewport: { width: 1280, height: 720 },
-}));
-console.log(JSON.stringify({ op: "shutdown" }));
-NODE
-)"
-
-output="$(
-  printf '%s\n' "$request_json" \
-    | "$adapter_bin"
-)"
-
-result="$(
-  OUTPUT="$output" node - <<'NODE'
-const lines = process.env.OUTPUT
-  .split(/\r?\n/)
-  .map((line) => line.trim())
-  .filter(Boolean)
-  .map((line) => JSON.parse(line));
+};
 
 function fail(message, payload) {
-  if (payload !== undefined) {
-    console.error(JSON.stringify(payload, null, 2));
-  }
+  if (payload !== undefined) console.error(JSON.stringify(payload, null, 2));
   throw new Error(message);
 }
 
-const launch = lines.find((line) => line.status === "ok" && line.data?.schema === "elastos.browser.engine.page/v1")
-  || lines.find((line) => line.status === "error");
-
-if (!launch) {
-  fail("browser-engine-adapter did not return a launch result", lines);
-}
-if (launch.status !== "ok") {
-  fail(`hosted product display unavailable: ${launch.code || "error"} ${launch.message || ""}`, launch);
-}
-
+function validateDisplay(launch) {
 const session = launch.data.display_session || {};
 if (session.schema !== "elastos.browser.display-session/v1") {
   fail("display session schema is not elastos.browser.display-session/v1", session);
@@ -186,7 +181,7 @@ if (session.network_mode !== "runtime_net_only" || launch.data.network_mode !== 
   fail("hosted product display must remain runtime_net_only", { launch: launch.data, session });
 }
 
-console.log(JSON.stringify({
+return {
   ok: true,
   page_id: launch.data.page_id,
   display_backend: session.display_backend || null,
@@ -194,22 +189,76 @@ console.log(JSON.stringify({
   audio: session.audio,
   video: session.video,
   direct_network: false,
-}));
-NODE
-)"
+};
+}
 
-page_id="$(RESULT="$result" node -e 'const result=JSON.parse(process.env.RESULT); process.stdout.write(result.page_id || "");')"
-if [[ -n "$page_id" ]]; then
-  close_json="$(CONFIG_PATH="$adapter_config" PAGE_ID="$page_id" node - <<'NODE'
-const fs = require("node:fs");
-const config = JSON.parse(fs.readFileSync(process.env.CONFIG_PATH, "utf8"));
-console.log(JSON.stringify({ op: "init", config }));
-console.log(JSON.stringify({ op: "close_page", page_id: process.env.PAGE_ID }));
-console.log(JSON.stringify({ op: "shutdown" }));
+async function run() {
+  const child = spawn(process.env.ADAPTER_BIN, [], { stdio: ["pipe", "pipe", "inherit"] });
+  const exited = once(child, "close");
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  const deadline = setTimeout(() => child.kill("SIGKILL"), 120000);
+  let cleanup;
+  let result;
+  let failure;
+  function recordFailure(error) {
+    if (failure) console.error(error);
+    else failure = error;
+  }
+  async function request(payload) {
+    child.stdin.write(JSON.stringify(payload) + "\n");
+    const line = await lines.next();
+    if (line.done) fail(`adapter exited before ${payload.op} response`);
+    const response = JSON.parse(line.value);
+    if (response.status !== "ok") fail(`adapter ${payload.op} failed`, response);
+    return response.data;
+  }
+  try {
+    await request({ op: "init", config });
+    try {
+      const data = await request(launchRequest);
+      cleanup = data?.runtime_cleanup;
+      if (data?.schema !== "elastos.browser.engine.page/v1" ||
+          cleanup?.page_id !== data.page_id || cleanup?.generation !== generation ||
+          cleanup?.stream_id !== streamSession.stream_id || cleanup?.principal_id !== principal) {
+        fail("launch did not return the exact cleanup binding", data);
+      }
+      result = validateDisplay({ data });
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      try {
+        if (cleanup) {
+          const closed = await request({ op: "close_page", page_id: cleanup.page_id,
+            principal_id: principal, runtime_cleanup: cleanup });
+          if (closed?.schema !== "elastos.browser.engine-cleanup-result/v2" ||
+              !isDeepStrictEqual(closed.binding, cleanup) || closed.generation !== generation ||
+              closed.page_id !== cleanup.page_id || closed.terminal !== true ||
+              !["page_absent", "child_absent", "vm_absent", "route_absent", "socket_absent"]
+                .every((effect) => closed.effects?.[effect] === true)) {
+            fail("adapter close did not prove exact terminal cleanup", closed);
+          }
+        }
+      } catch (error) {
+        recordFailure(error);
+      } finally {
+        try {
+          await request({ op: "shutdown" });
+        } catch (error) {
+          recordFailure(error);
+        } finally {
+          child.stdin.end();
+          const [code, signal] = await exited;
+          if (code !== 0 || signal) recordFailure(new Error(`adapter shutdown failed: ${code}/${signal}`));
+        }
+      }
+    }
+    if (failure) throw failure;
+    console.log(JSON.stringify({ ...result, cleanup_terminal: true, shutdown: true }));
+  } finally {
+    clearTimeout(deadline);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  }
+}
+run().catch((error) => { console.error(error); process.exitCode = 1; });
 NODE
-)"
-  printf '%s\n' "$close_json" \
-    | "$adapter_bin" >/dev/null || true
-fi
-
-printf '%s\n' "$result"

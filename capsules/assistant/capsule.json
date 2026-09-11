@@ -5,6 +5,7 @@
   "description": "Assistant capsule for typed model access through Runtime authorization.",
   "author": "elastos",
   "role": "app",
+  "window_policy": "single",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
@@ -53,6 +54,15 @@
           "audit": "full",
           "resource": "elastos://model/*",
           "operation": "runs_cancel"
+        },
+        {
+          "id": "content.retention",
+          "description": "Keep or release a model on this device",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "retention"
         }
       ]
     }

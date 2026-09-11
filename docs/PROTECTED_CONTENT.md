@@ -1,5 +1,12 @@
 # Protected content
 
+The target [storage and access contract](STORAGE_AND_ACCESS.md) extends the
+object model to private storage, controlled sharing, groups, devices, and
+agents. The [implementation guide](OBJECT_PROTECTION_IMPLEMENTATION.md) defines
+how to replace or supplement dKMS/dDRM mechanisms while preserving Runtime
+authority and existing object formats. These are staged design instructions;
+the provider sequence below retains its own source and installed acceptance gates.
+
 Protected content is Runtime-mediated. Library and Marketplace own the creator
 and buyer experience, and `elacity-player` owns video presentation. Runtime
 owns authority, durable operations, provider selection, Wallet and Chain

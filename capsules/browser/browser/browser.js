@@ -119,6 +119,8 @@ let browserAuthorityRenewalRetryTimer = 0;
 let browserAuthorityRenewalAttempts = 0;
 let lastRequestedUrl = DEFAULT_URL;
 let lastLibraryFilePickerRequestId = "";
+const libraryPickerDocumentNonce = crypto.randomUUID();
+let libraryPickerRequest = null;
 let browserSummary = null;
 let browserSummaryPromise = null;
 let runtimeOpenInFlight = 0;
@@ -1064,13 +1066,14 @@ async function fetchPageStatus({
 
 function handleFileChooserFromStatus(status) {
   const chooser = status?.file_chooser;
-  if (chooser?.pending !== true || !chooser.request_id) {
+  if (chooser?.pending !== true || !chooser.request_id || !currentPage?.page_id) {
     return;
   }
-  if (chooser.request_id === lastLibraryFilePickerRequestId) {
+  if (chooser.request_id === lastLibraryFilePickerRequestId && libraryPickerRequest?.pageId === currentPage.page_id) {
     return;
   }
   lastLibraryFilePickerRequestId = chooser.request_id;
+  libraryPickerRequest = { requestId: chooser.request_id, pageId: currentPage?.page_id, consumed: false };
   showStatus("Choose a Library item for Browser.");
   openLibraryFilePicker();
 }
@@ -1087,6 +1090,8 @@ function openLibraryFilePicker() {
       type: "home:open-target",
       homeToken: launchToken,
       target: "library",
+      requestId: libraryPickerRequest?.requestId,
+      documentNonce: libraryPickerDocumentNonce,
       query: {
         mode: "attach",
         returnTarget: "browser",
@@ -1117,33 +1122,44 @@ async function base64FromBlob(blob) {
 }
 
 async function handleLibraryFilePickerSelection(payload) {
+  const request = libraryPickerRequest;
+  if (!request || request.consumed || payload?.requestId !== request.requestId ||
+      payload?.documentNonce !== libraryPickerDocumentNonce ||
+      !payload?.pickerId || !payload?.deliveryId || currentPage?.page_id !== request.pageId) return false;
+  request.consumed = true;
   if (!payload?.blob || typeof payload.blob.arrayBuffer !== "function") {
     showStatus("Library did not return file bytes for Browser.", { sticky: true });
-    return;
+    return false;
   }
   if (payload.blob.size > LIBRARY_FILE_PICKER_MAX_BYTES) {
     showStatus("Browser file picker accepts Library items up to 16 MiB.", {
       sticky: true,
     });
-    return;
+    return false;
   }
   const fileName = fileNameFromLibraryPayload(payload);
+  const contentBase64 = await base64FromBlob(payload.blob);
+  if (libraryPickerRequest !== request || currentPage?.page_id !== request.pageId) return false;
   showStatus(`Inserting ${fileName}...`);
-  await sendBrowserInput(
+  const response = await sendBrowserInput(
     {
       type: "file_upload",
+      request_id: request.requestId,
       file_name: fileName,
       mime_type:
         typeof payload.mimeType === "string" && payload.mimeType
           ? payload.mimeType
           : payload.blob.type || "application/octet-stream",
-      content_base64: await base64FromBlob(payload.blob),
+      content_base64: contentBase64,
       object_uri: typeof payload.objectUri === "string" ? payload.objectUri : "",
     },
     { history: "replace" },
   );
+  if (libraryPickerRequest !== request || currentPage?.page_id !== request.pageId ||
+      response?.accepted !== true || response?.file_upload?.request_id !== request.requestId) return false;
   lastLibraryFilePickerRequestId = "";
   showStatus(`Inserted ${fileName}.`);
+  return true;
 }
 
 function schedulePageStatusRefresh({
@@ -1365,10 +1381,11 @@ async function sendBrowserInput(
       focusRemoteInput();
     }
   } else {
+    const inputPageId = currentPage.page_id;
     let response;
     try {
       response = await fetchJson(
-        `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/input`,
+        `/api/apps/browser/pages/${encodeURIComponent(inputPageId)}/input`,
         {
           method: "POST",
           body: { event },
@@ -1379,6 +1396,10 @@ async function sendBrowserInput(
         return;
       }
       throw error;
+    }
+    if (event?.type === "file_upload" &&
+        (currentPage?.page_id !== inputPageId || libraryPickerRequest?.requestId !== event.request_id)) {
+      throw new Error("The Browser file request changed. Check the page before trying again.");
     }
     handleFileChooserFromStatus(response);
     syncViewFromResponse(response);
@@ -1396,6 +1417,7 @@ async function sendBrowserInput(
     if (response?.accepted !== true && !response?.actual_url && !response?.file_chooser) {
       throw new Error("Browser could not send that input.");
     }
+    return response;
   }
 }
 
@@ -1431,6 +1453,13 @@ window.addEventListener("message", (event) => {
   }
   handleLibraryFilePickerSelection(payload).catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
+    return false;
+  }).then((accepted) => {
+    window.top.postMessage({
+      type: "home:picker-accepted", homeToken: launchToken,
+      pickerId: payload.pickerId, requestId: payload.requestId,
+      documentNonce: payload.documentNonce, deliveryId: payload.deliveryId, accepted,
+    }, homeParentOrigin);
   });
 });
 

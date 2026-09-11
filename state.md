@@ -1,5 +1,14 @@
 # State
 
+The September 11 integration now uses the full donor history. The combined source
+preserves current recovery, cookie and shutdown code while adding model admission,
+provider lifecycle, storage and window behavior. Focused source and rendered
+fixtures pass; installed human Homes remain `1e320578`. Sash shelf/URUX and Irzhy's
+protected-content stack have explicit source order and feature-preservation gates
+in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
+Assistant consolidation, original UI parity and installed Qwen proof remain open.
+
+
 Last updated: 2026-09-11 UTC
 
 - `feat/0.7.1-website-execution` is published for review at `00003b6f`, tree
@@ -15,7 +24,7 @@ Last updated: 2026-09-11 UTC
   media setup call sites. Small artifact fixtures and all 56 Runtime setup
   tests pass on Mac ARM64; the basic repository gate passes. This is source
   verification. Installed Homes remain `1e320578`; local provider/admission
-  integration and the bounded preparation diagnostic follow. See the
+  source is now in the full donor merge. The installed diagnostic follows. See the
   [bootstrap report](docs/audits/2026-09-11-j3-bootstrap.md).
 
 - User-review follow-up `1e320578` is installed in the two isolated human
@@ -434,8 +443,9 @@ unchained audit history. Current signed-checkpoint policy owns compatibility;
 retaining those donors does not mean their behavior is in the candidate.
 
 The reviewed content-distribution, Recovery/Profile and WSL-first documents
-are included. The catalog currently projects installed capsules; signed network
-discovery, Home Get and model-content packaging remain planned work. WSL
+are included. The combined source projects installed capsules and a verified signed model
+catalog. Local Content preparation and admission are implemented; ordinary cold
+Carrier delivery and the Marketplace-to-Assistant handoff remain open. WSL
 packaging and native Windows support also remain unproved product targets.
 
 Runtime owns authenticated principal and session authority, capability
@@ -739,12 +749,11 @@ complete. Installed proof and the atomic authority cutover remain open.
   boundary.
 - A missing installed components manifest or model-provider entry leaves the
   provider unconfigured and unavailable. Runtime does not select a fallback.
-- The current localhost installation has no
-  `providers/model-provider/config.json`, so the provider reports an honest
-  zero-offer state. The current provider can call an OpenAI-compatible Chat
-  Completions backend. It does not yet own a local engine lifecycle, implement
-  a provider-internal OpenAI Responses API adapter, or publish a remote model
-  service.
+- The preserved human-test installations still report zero offers. The combined
+  source now owns the bounded local llama lifecycle, verified model admission,
+  restart reconciliation and provider-internal Chat Completions/Responses adapters.
+  Model-provider source verification passes 204 unit and five process tests;
+  paid hosted calls and installed Qwen acceptance retain their separate gates.
 - The current source does not integrate the Codex SDK. Codex remains a later
   agent-execution adapter behind typed agent operations and explicit
   filesystem, network, tool, and approval grants. It is not a model offer.
@@ -795,7 +804,7 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Home Shell Truth
 
-- `/apps/home/` remains the Home front door. The current internal shell model is
+- `/home/` is the Home front door; `/apps/home/` remains a compatible old entry. The current internal shell model is
   `home-shell-host` for host lifecycle, `home-gui` for the desktop projection,
   and `home-cli` for the command projection.
 - `home` remains the installed host/front-door bridge id for `/apps/home/`;

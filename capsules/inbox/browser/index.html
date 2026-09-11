@@ -620,7 +620,63 @@
       filterButtons: [...document.querySelectorAll(".summary-card[data-filter]")],
     };
 
+    configureInboxWindowSelection();
     announceHomeChrome();
+
+    function configureInboxWindowSelection() {
+      if (presentation !== "window" || !state.homeToken || window.parent === window.top) return;
+      const homeToken = state.homeToken;
+      const documentNonce = window.crypto.randomUUID();
+      let active = true;
+      let busy = false;
+      let lastSequence = 0;
+      window.addEventListener("pagehide", () => {
+        active = false;
+        window.parent.postMessage({ type: "home:app-unloading", homeToken, documentNonce }, "*");
+      }, { once: true });
+      window.addEventListener("message", async (event) => {
+        const data = event.data;
+        if (!active || event.source !== window.parent || event.origin !== "null"
+          || homeToken !== state.homeToken || !data || data.homeToken !== homeToken
+          || typeof data.requestId !== "string" || !/^[a-zA-Z0-9-]{1,64}$/.test(data.requestId)) return;
+        if (data.type === "elastos.inbox.window-ready.request/v1"
+          && hasExactKeys(data, ["type", "homeToken", "requestId"])) {
+          window.parent.postMessage({ type: "elastos.inbox.window-ready.result/v1",
+            homeToken, documentNonce, requestId: data.requestId }, "*");
+          return;
+        }
+        if (data.type !== "elastos:inbox-chrome-command" || data.cmd !== "select-notification"
+          || !hasExactKeys(data, ["type", "cmd", "homeToken", "requestId", "documentNonce", "sequence", "expiresAt", "query"])
+          || data.documentNonce !== documentNonce || !Number.isSafeInteger(data.sequence)
+          || data.sequence <= lastSequence || !Number.isSafeInteger(data.expiresAt)
+          || data.expiresAt <= Date.now() || data.expiresAt > Date.now() + 15000) return;
+        lastSequence = data.sequence;
+        const current = () => active && homeToken === state.homeToken && Date.now() < data.expiresAt;
+        let ok = false;
+        let failureCopy = "Finish the current review, then open this request again.";
+        if (!busy && !elements.refresh.disabled && data.query && typeof data.query === "object"
+          && !Array.isArray(data.query) && hasExactKeys(data.query, ["notification_id"])
+          && typeof data.query.notification_id === "string" && /^[a-zA-Z0-9:._-]{1,256}$/.test(data.query.notification_id)) {
+          busy = true;
+          try {
+            const payload = await api("/api/apps/inbox/summary");
+            if (current() && !elements.refresh.disabled) {
+              state.entries = Array.isArray(payload.notifications?.entries) ? payload.notifications.entries : [];
+              state.requestedSelectionId = data.query.notification_id;
+              state.selectedId = "";
+              setFilter("all");
+              ok = true;
+            }
+          } catch (_error) {
+            failureCopy = "Could not open this request. Refresh Inbox and try again.";
+          } finally { busy = false; }
+        }
+        if (current() && !ok) setStatus(failureCopy);
+        if (active) window.parent.postMessage({ type: "elastos.inbox.window.result/v1",
+          homeToken, documentNonce, requestId: data.requestId, ok }, "*");
+      });
+      window.parent.postMessage({ type: "home:app-ready", homeToken, documentNonce }, "*");
+    }
 
     function showLocked() {
       elements.lockedShell.classList.remove("hidden");

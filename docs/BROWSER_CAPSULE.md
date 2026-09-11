@@ -655,12 +655,17 @@ capture, and Runtime Exit proxying.
 
 `scripts/browser-selkies-target-preflight.sh` is the operator gate for such a
 target. It does not launch Selkies or Chromium; given an already-running Selkies
-WebSocket endpoint and private loopback CDP endpoint, it starts the ElastOS
+WebSocket endpoint, private loopback CDP endpoint and explicit
+`--runtime-fetch-proxy-url`, it starts the ElastOS
 control bridge and runs the hosted product-display preflight through
 `browser-engine-adapter`. Passing this gate means the target can return a typed
-`product_compositor` session with audio/video and engine-offer signaling. It
-does not by itself prove long-session durability, YouTube quality, or direct
-network denial inside the browser process.
+`product_compositor` session with declared audio/video and engine-offer signaling,
+then exact generation-bound terminal cleanup and adapter Shutdown. The control
+service validates the existing Runtime proxy field. Fake signaling proves the
+fixture contract; media quality, real Exit routing, direct-network denial and
+long-session durability remain target tests. The current-wheel and real-Chromium
+wrappers require `ELASTOS_BROWSER_RUNTIME_FETCH_PROXY_URL` before starting their
+target work.
 
 Real Selkies targets often protect the signaling endpoint with Basic auth. The
 preflight must be given those credentials explicitly with

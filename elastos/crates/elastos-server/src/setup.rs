@@ -34,6 +34,42 @@ pub struct ComponentsManifest {
     pub capsules: HashMap<String, CapsuleEntry>,
 
     pub profiles: HashMap<String, Profile>,
+
+    /// Operator-pinned signed model catalog. Absence keeps installed inventory
+    /// unchanged; catalog entries cannot supply their own trust configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ModelCatalogConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogConfig {
+    pub head_cid: String,
+    pub publisher_dids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_use: Option<ModelLocalUseConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLocalUseConfig {
+    #[serde(deserialize_with = "deserialize_model_local_use_budget")]
+    pub max_cache_bytes: u64,
+    #[serde(deserialize_with = "deserialize_model_local_use_budget")]
+    pub max_model_memory_bytes: u64,
+}
+
+fn deserialize_model_local_use_budget<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(serde::de::Error::custom(
+            "model local-use budget is out of range",
+        ));
+    }
+    Ok(value)
 }
 
 /// A setup-materialized component.
@@ -1356,6 +1392,92 @@ fn local_model_engine_receipt_args<'a>(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("llama-server bundle binary path is missing"))?,
     ))
+}
+
+#[cfg(unix)]
+#[derive(PartialEq)]
+pub(crate) struct LocalModelEngineIdentity {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub receipt_sha256: String,
+}
+
+#[cfg(unix)]
+pub(crate) fn local_model_engine_receipt_identity(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+) -> anyhow::Result<LocalModelEngineIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let component = manifest
+        .external
+        .get("llama-server")
+        .ok_or_else(|| anyhow::anyhow!("local model engine is unavailable"))?;
+    let platform = detect_platform();
+    let info = component
+        .platforms
+        .get(&platform)
+        .ok_or_else(|| anyhow::anyhow!("local model engine platform is unavailable"))?;
+    let install_path = resolve_install_path(component, Some(info))
+        .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
+    let relative = Path::new(install_path);
+    anyhow::ensure!(
+        !install_path.is_empty()
+            && install_path.len() <= 4096
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "local model engine install path is invalid"
+    );
+    let mut bundle = data_dir.canonicalize()?;
+    for part in relative.components() {
+        bundle.push(part.as_os_str());
+        let metadata = fs::symlink_metadata(&bundle)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o022 == 0,
+            "model engine parent is not protected"
+        );
+    }
+    anyhow::ensure!(
+        bundle.canonicalize()? == bundle,
+        "local model engine bundle is aliased"
+    );
+    let (version, archive, binary) = local_model_engine_receipt_args(component, info)?;
+    let (sha256, receipt_sha256) =
+        local_model_engine_receipt::identity(&bundle, version, &platform, archive, binary)?;
+    let path = bundle.join(binary);
+    anyhow::ensure!(
+        path.canonicalize()? == path,
+        "local model engine executable is aliased"
+    );
+    Ok(LocalModelEngineIdentity {
+        path,
+        sha256,
+        receipt_sha256,
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn verified_local_model_engine(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+) -> anyhow::Result<LocalModelEngineIdentity> {
+    let identity = local_model_engine_receipt_identity(data_dir, manifest)?;
+    let component = manifest.external.get("llama-server").unwrap();
+    let platform = detect_platform();
+    let info = component.platforms.get(&platform).unwrap();
+    let (version, archive, binary) = local_model_engine_receipt_args(component, info)?;
+    let bundle = data_dir
+        .canonicalize()?
+        .join(resolve_install_path(component, Some(info)).unwrap());
+    local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
+    anyhow::ensure!(
+        local_model_engine_receipt_identity(data_dir, manifest)? == identity
+            && compute_sha256_checksum(&identity.path)? == identity.sha256,
+        "model engine changed during verification"
+    );
+    Ok(identity)
 }
 
 fn extracted_bundle_cache_stale_reason(
@@ -4141,6 +4263,7 @@ mod tests {
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"object-provider").unwrap();
         let manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -4229,11 +4352,13 @@ mod tests {
         ));
 
         let old_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -4259,11 +4384,13 @@ mod tests {
         let mut old_component = new_component.clone();
         old_component.capsule_metadata = None;
         let old_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
             capsules: HashMap::new(),
             profiles: HashMap::new(),
@@ -4496,6 +4623,7 @@ mod tests {
             platforms,
         };
         let manifest = ComponentsManifest {
+            model_catalog: None,
             external: HashMap::new(),
             capsules: HashMap::new(),
             profiles: HashMap::new(),

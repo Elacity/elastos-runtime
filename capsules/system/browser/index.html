@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
 <script src="./elastos-theme.js"></script>
+<script src="./model-management.js"></script>
+<link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <link rel="stylesheet" href="./style.css?v=system-20260819f">
@@ -55,6 +57,10 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5.5 6.5v5c0 4.2 2.7 7.2 6.5 8.5 3.8-1.3 6.5-4.3 6.5-8.5v-5L12 3.5z"/></svg>
           </span>
           <span class="settings-sidebar-text">Security</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="models">
+          <span class="settings-sidebar-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.2"/></svg></span>
+          <span class="settings-sidebar-text">Models</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="catalog">
           <span class="settings-sidebar-icon" aria-hidden="true">
@@ -214,7 +220,7 @@
                 <div class="pc2-card-row pc2-card-row-stack">
                   <div>
                     <div class="pc2-card-label">Recovery Kit</div>
-                    <div class="pc2-card-sublabel">Save your Profile, Home data recovery, and built-in Wallet recovery keys in one kit. Add a password when saving funds.</div>
+                    <div class="pc2-card-sublabel">Save your Profile, Home recovery authority, and included Wallet keys in one kit. Keep your files backed up separately. Add a password when saving funds.</div>
                   </div>
                   <span class="pc2-card-value system-value-muted" data-field="recovery-status">Not set</span>
                 </div>
@@ -290,6 +296,10 @@
           </section>
         </section>
 
+        <section class="settings-content" data-settings="models" aria-labelledby="models-title">
+          <h1 id="models-title">Models</h1>
+          <div data-model-management hidden></div>
+        </section>
         <section class="settings-content" data-settings="catalog" aria-labelledby="catalog-title">
           <div class="catalog-toolbar">
             <div>

@@ -138,6 +138,25 @@ impl ProviderCoordinator {
                 if init.op != "init" {
                     return Err(ProviderFault::invalid_request("invalid init request op"));
                 }
+                if let Some(provider) = self.provider.as_mut() {
+                    let execution_owned = provider.adapters().retains_execution().await;
+                    let workers = provider.adapters().retained_worker_ids();
+                    let refresh = provider.plan_refresh(init.config, execution_owned, &workers)?;
+                    provider.begin_retirement(&refresh);
+                    if let Some(id) = &refresh.retire_offer {
+                        provider
+                            .adapters()
+                            .close_local_model_offer(id)
+                            .await
+                            .map_err(|_| {
+                                ProviderFault::selection_unavailable(
+                                    "model retirement closure unconfirmed",
+                                )
+                            })?;
+                    }
+                    provider.apply_refresh(refresh);
+                    return self.status_response();
+                }
                 let adapter = LiveAdapterExecutor::new(self.handle.clone(), self.update_tx.clone());
                 let mut provider = ModelProviderState::from_init(init.config, adapter)?;
                 provider.settle_active_local_text_runs_unknown()?;
@@ -243,6 +262,18 @@ impl ProviderCoordinator {
                     let _ = acknowledge.send(WorkerApplyAck::Rejected);
                     return;
                 }
+                match provider.run_deadline_expired(run_id.as_str()) {
+                    Ok(true) => {
+                        let _ = acknowledge.send(WorkerApplyAck::TimedOut);
+                        return;
+                    }
+                    Err(err) => {
+                        err.log();
+                        let _ = acknowledge.send(WorkerApplyAck::Rejected);
+                        return;
+                    }
+                    Ok(false) => {}
+                }
                 let ack =
                     match provider.apply_worker_reconcile_result(run_id.as_str(), guard, result) {
                         Ok(()) => WorkerApplyAck::Applied,
@@ -253,7 +284,11 @@ impl ProviderCoordinator {
                     };
                 let _ = acknowledge.send(ack);
             }
-            WorkerUpdate::Exited { run_id, generation } => {
+            WorkerUpdate::Exited {
+                run_id,
+                generation,
+                timed_out,
+            } => {
                 let Some(record) = provider
                     .adapters()
                     .remove_worker_if_current(run_id.as_str(), generation)
@@ -261,6 +296,12 @@ impl ProviderCoordinator {
                     return;
                 };
                 provider.adapters().await_worker_record(record).await;
+                if timed_out {
+                    if let Err(err) = provider.settle_local_text_run_timeout(run_id.as_str()) {
+                        err.log();
+                    }
+                    return;
+                }
                 if let Err(err) = provider.settle_local_text_run_unknown(run_id.as_str()) {
                     err.log();
                 }
@@ -288,6 +329,9 @@ impl ProviderCoordinator {
             }
         }
         provider.adapters().shutdown_workers().await;
+        if let Err(fault) = provider.adapters().shutdown_local_llama().await {
+            eprintln!("[model-provider] local engine closure unconfirmed: {fault:?}");
+        }
         while let Ok(update) = self.updates.try_recv() {
             self.handle_update(update).await;
         }
@@ -298,16 +342,19 @@ impl ProviderCoordinator {
 mod tests {
     use super::*;
     use crate::adapters::serialize_local_text_backend_state;
-    use crate::config::{AdapterConfig, ConfiguredOffer, OfferPolicy};
+    use crate::config::{
+        AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings, OfferPolicy,
+    };
     use crate::contract::{
-        model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding, RUN_EVENT_SCHEMA,
-        RUN_OUTPUT_TEXT_SCHEMA,
+        model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding,
+        BACKEND_REPORT_SCHEMA, RUN_EVENT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
     };
     use crate::journal::{deterministic_run_id, RunJournal, StoredRun};
     use elastos_model_contract::{RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA};
     use serde_json::{json, Value};
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
@@ -335,6 +382,7 @@ mod tests {
     struct TestServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
+        request_active: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
         join: Option<thread::JoinHandle<()>>,
     }
@@ -419,6 +467,8 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_active = Arc::new(AtomicBool::new(false));
+        let request_active_clone = Arc::clone(&request_active);
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let shutdown_clone = Arc::clone(&shutdown);
@@ -451,6 +501,7 @@ mod tests {
                 };
                 let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
+                request_active_clone.store(true, Ordering::SeqCst);
                 write_response(&mut stream, &action);
                 if let Some(release) = action.hold_open {
                     while !release.load(Ordering::Relaxed)
@@ -465,11 +516,13 @@ mod tests {
                         }
                     }
                 }
+                request_active_clone.store(false, Ordering::SeqCst);
             }
         });
         TestServer {
             base_url,
             requests,
+            request_active,
             shutdown,
             join: Some(join),
         }
@@ -591,8 +644,82 @@ mod tests {
                 api_url: format!("{base_url}/chat"),
                 api_key: Some("sentinel-openai-key".to_string()),
                 model: "sentinel-model".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
+        }
+    }
+
+    fn responses_text_offer(base_url: &str) -> ConfiguredOffer {
+        ConfiguredOffer {
+            id: "responses-text".to_string(),
+            title: "Responses Text".to_string(),
+            adapter: AdapterConfig::OpenAiResponsesText {
+                api_url: format!("{base_url}/responses"),
+                api_key: Some("sentinel-responses-key".to_string()),
+                model: "sentinel-responses-model".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
+            },
+            ..local_text_offer(base_url)
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_llama_offer(root: &str, mode: &str) -> (ConfiguredOffer, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = Path::new(root);
+        std::fs::create_dir_all(root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (engine, model, events) = crate::test_support::write_fake_llama_server(&root, mode);
+        (
+            ConfiguredOffer {
+                adapter: AdapterConfig::LocalLlamaCppText {
+                    engine: LocalArtifactConfig {
+                        sha256: crate::test_support::sha256_file(&engine),
+                        path: engine.to_string_lossy().into_owned(),
+                    },
+                    model: LocalArtifactConfig {
+                        sha256: crate::test_support::sha256_file(&model),
+                        path: model.to_string_lossy().into_owned(),
+                    },
+                    settings: LocalLlamaSettings {
+                        context_size: 256,
+                        parallel: 1,
+                        threads: 1,
+                        batch_threads: 1,
+                        gpu_layers: 0,
+                        health_timeout_ms: 2_000,
+                        shutdown_timeout_ms: 250,
+                        enable_thinking: false,
+                    },
+                },
+                ..local_text_offer("http://unused.invalid")
+            },
+            events,
+            root.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_llama_events(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fake_llama_event(path: &Path, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fake_llama_events(path).iter().any(|line| line == expected) {
+            assert!(
+                Instant::now() < deadline,
+                "missing fake llama event {expected}"
+            );
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -727,6 +854,503 @@ mod tests {
         assert_eq!(response["status"], "ok");
     }
 
+    #[test]
+    fn model_refresh_init_reuses_coordinator_and_rejects_identity_or_offer_changes() {
+        let root = temp_root("refresh");
+        let operator = local_text_offer("https://example.invalid");
+        let mut added = operator.clone();
+        added.id = "admitted".into();
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![operator.clone()]);
+        let wrong_root = temp_root("refresh-wrong-root");
+        for (field, value) in [
+            ("base_path", json!(wrong_root)),
+            ("allowed_paths", json!(["different"])),
+            ("read_only", json!(true)),
+            ("encryption_key", json!("different")),
+        ] {
+            let mut request = init_request(&root, vec![operator.clone(), added.clone()]);
+            request.value["config"][field] = value;
+            assert_eq!(provider.request(request).unwrap()["status"], "error");
+        }
+        let mut wrong_journal = init_request(&root, vec![operator.clone(), added.clone()]);
+        wrong_journal.value["config"]["extra"]["journal_dir"] =
+            json!(format!("{wrong_root}/journal"));
+        assert_eq!(provider.request(wrong_journal).unwrap()["status"], "error");
+        assert!(!Path::new(&wrong_root).join("journal").exists());
+        let mut tampered = operator.clone();
+        tampered.enabled = false;
+        assert_eq!(
+            provider
+                .request(init_request(&root, vec![tampered]))
+                .unwrap()["status"],
+            "error"
+        );
+        let mut invalid = added.clone();
+        invalid.policy.concurrency_limit = 0;
+        assert_eq!(
+            provider
+                .request(init_request(&root, vec![operator.clone(), invalid]))
+                .unwrap()["status"],
+            "error"
+        );
+        let offers = vec![operator, added];
+        for _ in 0..2 {
+            assert_eq!(
+                provider
+                    .request(init_request(&root, offers.clone()))
+                    .unwrap()["data"]["offers_ready"],
+                2
+            );
+        }
+        let actual = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op":"offers_list"}),
+        );
+        assert_eq!(actual["data"]["offers"].as_array().unwrap().len(), 2);
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn model_refresh_is_serialized_with_create_and_preserves_active_run() {
+        let (stalled, release, started) = stalled_sse_action();
+        let server = start_server(vec![stalled]);
+        let offer = local_text_offer(&server.base_url);
+        let mut added = offer.clone();
+        added.id = "admitted".into();
+        let root = temp_root("refresh-create-race");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+        let input = text_input("active");
+        let binding = create_binding("request:refresh-active", &offer, &input);
+        // Both requests enter the real serialized command channel without a
+        // separate Status check. Either ordering preserves the active binding.
+        let create = spawn_request(
+            &provider,
+            ProviderEnvelope {
+                operation: ProviderOperation::RunsCreate,
+                value: json!({"op":"runs_create", "offer_id":offer.id,
+                "operation":offer.operation, "input":input, "runtime_binding":binding}),
+            },
+        );
+        let refresh = spawn_request(
+            &provider,
+            init_request(&root, vec![offer.clone(), added.clone()]),
+        );
+        let created = create.recv_timeout(FIXTURE_EVENT_TIMEOUT).unwrap().unwrap();
+        assert_eq!(created["status"], "ok");
+        let refreshed = refresh
+            .recv_timeout(FIXTURE_EVENT_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert!(refreshed["status"] == "ok" || refreshed["code"] == "selection_unavailable");
+        wait_for_flag(&started);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let before = load_run(&root, run_id);
+        assert_eq!(
+            before.execution_binding_hash,
+            offer.execution_binding_hash().unwrap()
+        );
+        if refreshed["status"] == "error" {
+            assert_eq!(
+                provider
+                    .request(init_request(&root, vec![offer.clone(), added]))
+                    .unwrap()["code"],
+                "selection_unavailable"
+            );
+        }
+        // Identical Init is safe even with an active worker.
+        let same = if refreshed["status"] == "ok" {
+            let mut second = offer.clone();
+            second.id = "admitted".into();
+            vec![offer, second]
+        } else {
+            vec![offer]
+        };
+        assert_eq!(
+            provider.request(init_request(&root, same)).unwrap()["status"],
+            "ok"
+        );
+        assert_eq!(
+            load_run(&root, run_id).execution_binding_hash,
+            before.execution_binding_hash
+        );
+        release.store(true, Ordering::Relaxed);
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinator_retires_exact_admitted_offer_preserving_operator_and_terminal_run() {
+        let root = temp_root("retire-admitted-offer");
+        let (mut admitted, events, root) = local_llama_offer(&root, "healthy");
+        admitted.id = "chosen-local-content".into();
+        let server = start_server(vec![sse_action(
+            &[json!({"choices":[{"delta":{"content":"operator survives"}}]}).to_string()],
+            true,
+        )]);
+        let mut operator = local_text_offer(&server.base_url);
+        // The ID spelling is not provenance, including for an operator offer.
+        operator.id = format!("model:{}", "b".repeat(64));
+        let admission = json!({
+            "offer_id": admitted.id,
+        });
+        let mut provider = ProviderCoordinatorHandle::start();
+        let mut initial = init_request(&root, vec![operator.clone(), admitted.clone()]);
+        initial.value["config"]["extra"]["runtime_admitted_offers"] = json!([admission]);
+        let initialized = provider.request(initial).unwrap();
+        assert_eq!(
+            initialized["status"], "ok",
+            "Runtime admission projection rejected: {initialized}"
+        );
+
+        let input = text_input("retained result");
+        let binding = create_binding("request:retirement-history", &admitted, &input);
+        let created = create_run(&provider, &admitted, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(terminal["data"]["status"], "completed");
+        assert_eq!(
+            terminal["data"]["terminal"]["output"]["text"],
+            "reply:retained result"
+        );
+        let pid: i32 = fake_llama_events(&events)
+            .iter()
+            .find_map(|line| line.strip_prefix("start:")?.parse().ok())
+            .unwrap();
+
+        let retire = || {
+            let mut request = init_request(&root, vec![operator.clone()]);
+            request.value["config"]["extra"]["runtime_admitted_offers"] = json!([]);
+            request
+        };
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            // Drop every withdrawal reply, including the first effectful one.
+            // A terminal journal result can precede the worker's exit update.
+            let (respond_to, lost_reply) = oneshot::channel();
+            drop(lost_reply);
+            provider
+                .requests
+                .blocking_send(CoordinatorCommand::Request {
+                    envelope: retire(),
+                    respond_to,
+                })
+                .unwrap();
+            // The same channel orders this read after the withdrawal.
+            let listed = send_request(
+                &provider,
+                ProviderOperation::OffersList,
+                json!({"op":"offers_list"}),
+            );
+            assert_eq!(listed["status"], "ok");
+            if listed["data"]["offers"] == json!([operator.summary()]) {
+                break;
+            }
+            assert_eq!(listed["data"]["offers"].as_array().unwrap().len(), 2);
+            assert!(
+                Instant::now() < deadline,
+                "retirement did not settle: {listed}"
+            );
+            thread::yield_now();
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "retired engine still alive"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let events_after_close = fake_llama_events(&events);
+        assert_eq!(provider.request(retire()).unwrap()["status"], "ok");
+        assert_eq!(fake_llama_events(&events), events_after_close);
+        let listed = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op":"offers_list"}),
+        );
+        assert_eq!(listed["data"]["offers"], json!([operator.summary()]));
+        assert_eq!(
+            get_run(&provider, run_id, &access_binding(&binding))["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        let new_binding = create_binding("request:retired-new", &admitted, &input);
+        assert_eq!(
+            create_run(&provider, &admitted, &new_binding, &input)["status"],
+            "error"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+
+        let operator_input = text_input("operator check");
+        let operator_binding = create_binding(
+            "request:operator-after-retirement",
+            &operator,
+            &operator_input,
+        );
+        let operator_run = create_run(&provider, &operator, &operator_binding, &operator_input);
+        let operator_terminal = wait_for_terminal(
+            &provider,
+            operator_run["data"]["run_id"].as_str().unwrap(),
+            &access_binding(&operator_binding),
+        );
+        assert_eq!(
+            operator_terminal["data"]["terminal"]["output"]["text"],
+            "operator survives"
+        );
+        provider.shutdown_on_eof();
+
+        let mut restarted = ProviderCoordinatorHandle::start();
+        assert_eq!(restarted.request(retire()).unwrap()["status"], "ok");
+        assert_eq!(
+            get_run(&restarted, run_id, &access_binding(&binding))["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        restarted.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_retirement_close_error_preserves_ownership_and_other_offers() {
+        async fn request(
+            coordinator: &mut ProviderCoordinator,
+            envelope: ProviderEnvelope,
+        ) -> Value {
+            let (respond_to, response) = oneshot::channel();
+            assert!(
+                !coordinator
+                    .handle_command(CoordinatorCommand::Request {
+                        envelope,
+                        respond_to
+                    })
+                    .await
+            );
+            response.await.unwrap()
+        }
+        async fn finish_workers(coordinator: &mut ProviderCoordinator) {
+            let deadline = tokio::time::Instant::now() + FIXTURE_EVENT_TIMEOUT;
+            while !coordinator
+                .provider
+                .as_ref()
+                .unwrap()
+                .adapters()
+                .retained_worker_ids()
+                .is_empty()
+            {
+                let update = tokio::time::timeout_at(deadline, coordinator.updates.recv())
+                    .await
+                    .expect("worker did not settle")
+                    .expect("worker updates closed");
+                coordinator.handle_update(update).await;
+            }
+        }
+        let root = temp_root("retirement-close-error");
+        let (admitted, events, root) = local_llama_offer(&root, "healthy");
+        let server = start_server(vec![sse_action(
+            &[json!({"choices":[{"delta":{"content":"operator unaffected"}}]}).to_string()],
+            true,
+        )]);
+        let mut operator = local_text_offer(&server.base_url);
+        operator.id = "operator".into();
+        let (update_tx, updates) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
+        let (_request_tx, requests) = mpsc::channel(REQUEST_CHANNEL_CAPACITY);
+        let mut coordinator = ProviderCoordinator {
+            provider: None,
+            handle: tokio::runtime::Handle::current(),
+            requests,
+            updates,
+            update_tx,
+        };
+        let initial = || {
+            let mut init = init_request(&root, vec![admitted.clone(), operator.clone()]);
+            init.value["config"]["extra"]["runtime_admitted_offers"] = json!([{
+                "offer_id":admitted.id,
+            }]);
+            init
+        };
+        assert_eq!(request(&mut coordinator, initial()).await["status"], "ok");
+        let input = text_input("retained result");
+        let binding = create_binding("request:close-error-history", &admitted, &input);
+        let create = |offer: &ConfiguredOffer, binding: &RuntimeCreateBinding| ProviderEnvelope {
+            operation: ProviderOperation::RunsCreate,
+            value: json!({
+                "op":"runs_create", "offer_id":offer.id, "operation":offer.operation,
+                "input":input, "runtime_binding":binding,
+            }),
+        };
+        let created = request(&mut coordinator, create(&admitted, &binding)).await;
+        assert_eq!(created["status"], "ok");
+        finish_workers(&mut coordinator).await;
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let history = || ProviderEnvelope {
+            operation: ProviderOperation::RunsGet,
+            value: json!({
+                "op":"runs_get", "run_id":run_id, "runtime_binding":access_binding(&binding),
+            }),
+        };
+        let terminal = request(&mut coordinator, history()).await;
+        assert_eq!(terminal["data"]["status"], "completed");
+        let pid: i32 = fake_llama_events(&events)
+            .iter()
+            .find_map(|line| line.strip_prefix("start:")?.parse().ok())
+            .unwrap();
+        // The same real ECHILD injection as the engine-owner test. Reap the
+        // exact fixture child outside Tokio; the coordinator must retain uncertainty.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if result == pid {
+                break;
+            }
+            assert_eq!(result, 0);
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let retire = || init_request(&root, vec![operator.clone()]);
+        let failed = request(&mut coordinator, retire()).await;
+        assert_eq!(failed["code"], "selection_unavailable");
+        assert_eq!(failed["message"], "model offer is not available");
+        assert!(
+            coordinator
+                .provider
+                .as_ref()
+                .unwrap()
+                .adapters()
+                .retains_execution()
+                .await
+        );
+        assert_eq!(
+            request(&mut coordinator, initial()).await["code"],
+            "selection_unavailable"
+        );
+        let fresh = create_binding("request:close-error-new", &admitted, &input);
+        assert_eq!(
+            request(&mut coordinator, create(&admitted, &fresh)).await["code"],
+            "selection_unavailable"
+        );
+        let listed = request(
+            &mut coordinator,
+            ProviderEnvelope {
+                operation: ProviderOperation::OffersList,
+                value: json!({"op":"offers_list"}),
+            },
+        )
+        .await;
+        assert_eq!(listed["data"]["offers"], json!([operator.summary()]));
+        assert_eq!(
+            request(&mut coordinator, history()).await["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        let operator_binding = create_binding("request:operator-close-error", &operator, &input);
+        let other = request(&mut coordinator, create(&operator, &operator_binding)).await;
+        assert_eq!(other["status"], "ok");
+        finish_workers(&mut coordinator).await;
+        let other = request(&mut coordinator, ProviderEnvelope { operation: ProviderOperation::RunsGet, value: json!({
+            "op":"runs_get", "run_id":other["data"]["run_id"], "runtime_binding":access_binding(&operator_binding),
+        }) }).await;
+        assert_eq!(
+            other["data"]["terminal"]["output"]["text"],
+            "operator unaffected"
+        );
+        // ECHILD cannot confirm the original owner's close, so retries stay pending.
+        let retried = request(&mut coordinator, retire()).await;
+        assert_eq!(retried["code"], "selection_unavailable");
+        assert_eq!(retried["message"], "model offer is not available");
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        assert!(
+            coordinator
+                .provider
+                .as_ref()
+                .unwrap()
+                .adapters()
+                .retains_execution()
+                .await
+        );
+        assert_eq!(
+            request(&mut coordinator, history()).await["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        coordinator.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coordinator_retirement_races_create_without_unowned_execution() {
+        let root = temp_root("retirement-create-race");
+        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let mut provider = ProviderCoordinatorHandle::start();
+        let mut init = init_request(&root, vec![offer.clone()]);
+        init.value["config"]["extra"]["runtime_admitted_offers"] = json!([{
+            "offer_id": offer.id,
+        }]);
+        assert_eq!(provider.request(init).unwrap()["status"], "ok");
+        let input = text_input("stall");
+        let binding = create_binding("request:retirement-race", &offer, &input);
+        let create = ProviderEnvelope {
+            operation: ProviderOperation::RunsCreate,
+            value: json!({
+                "op":"runs_create", "offer_id":offer.id, "operation":offer.operation,
+                "input":input, "runtime_binding":binding,
+            }),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let dispatch = |request| {
+            let barrier = Arc::clone(&barrier);
+            let requests = provider.requests.clone();
+            thread::spawn(move || {
+                let (respond_to, response) = oneshot::channel();
+                barrier.wait();
+                requests
+                    .blocking_send(CoordinatorCommand::Request {
+                        envelope: request,
+                        respond_to,
+                    })
+                    .unwrap();
+                response.blocking_recv().unwrap()
+            })
+        };
+        let create = dispatch(create);
+        let retirement = dispatch(init_request(&root, vec![]));
+        barrier.wait();
+        let created = create.join().unwrap();
+        let retired = retirement.join().unwrap();
+        if retired["status"] == "ok" {
+            assert_eq!(created["code"], "selection_unavailable");
+            assert!(fake_llama_events(&events).is_empty());
+        } else {
+            assert_eq!(retired["code"], "selection_unavailable");
+            assert_eq!(created["status"], "ok");
+            wait_for_fake_llama_event(&events, "request:stall");
+            assert_eq!(
+                provider.request(init_request(&root, vec![])).unwrap()["code"],
+                "selection_unavailable"
+            );
+            assert_eq!(
+                fake_llama_events(&events)
+                    .iter()
+                    .filter(|event| event.starts_with("start:"))
+                    .count(),
+                1
+            );
+        }
+        provider.shutdown_on_eof();
+    }
+
     fn create_run(
         provider: &ProviderCoordinatorHandle,
         offer: &ConfiguredOffer,
@@ -811,7 +1435,16 @@ mod tests {
         run_id: &str,
         binding: &RuntimeAccessBinding,
     ) -> Value {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        wait_for_terminal_with_timeout(provider, run_id, binding, WAIT_TIMEOUT)
+    }
+
+    fn wait_for_terminal_with_timeout(
+        provider: &ProviderCoordinatorHandle,
+        run_id: &str,
+        binding: &RuntimeAccessBinding,
+        timeout: Duration,
+    ) -> Value {
+        let deadline = Instant::now() + timeout;
         loop {
             let response = get_run(provider, run_id, binding);
             let status = response["data"]["status"].as_str().unwrap();
@@ -911,6 +1544,7 @@ mod tests {
                     "offer_id": offer.id,
                     "operation": offer.operation,
                 }),
+                backend_report: None,
                 terminal: false,
             },
             RunEvent {
@@ -918,6 +1552,7 @@ mod tests {
                 sequence: 2,
                 kind: "dispatched".to_string(),
                 data: json!({ "offer_id": offer.id }),
+                backend_report: None,
                 terminal: false,
             },
         ];
@@ -1823,7 +2458,12 @@ mod tests {
     #[test]
     fn artifact_status_redirect_preserves_active_state_and_private_location_stays_hidden() {
         let redirect_target = "http://127.0.0.1:9/private-status";
-        let server = start_server(vec![redirect_action(redirect_target.to_string())]);
+        // Initial get plus the two public reads may each reach the next poll.
+        let server = start_server(
+            (0..3)
+                .map(|_| redirect_action(redirect_target.to_string()))
+                .collect(),
+        );
         let offer = artifact_offer_with_cancel_timeout(&server.base_url, 1_000);
         let root = temp_root("artifact-status-redirect");
         let input = artifact_input("status");
@@ -1862,6 +2502,11 @@ mod tests {
         assert_no_private_leakage(&public, &["private-status", "127.0.0.1:9", "Location"]);
 
         provider.shutdown_on_eof();
+        let requests = server.requests.lock().unwrap();
+        assert!((1..=3).contains(&requests.len()));
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("GET /status?job_id=job-123 HTTP/1.1\r\n")));
     }
 
     #[test]
@@ -2524,6 +3169,449 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_streams_concurrent_runs_reuses_child_and_guards_refresh() {
+        let root = temp_root("local-llama-stream");
+        let (offer, events, root) = local_llama_offer(&root, "healthy");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let first_input = text_input("one");
+        let first_binding = create_binding("request:local-one", &offer, &first_input);
+        let first = create_run(&provider, &offer, &first_binding, &first_input);
+        let second_input = text_input("two");
+        let second_binding = create_binding("request:local-two", &offer, &second_input);
+        let second = create_run(&provider, &offer, &second_binding, &second_input);
+        let first_run_id = first["data"]["run_id"].as_str().unwrap();
+        let second_run_id = second["data"]["run_id"].as_str().unwrap();
+        let first_terminal =
+            wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding));
+        let second_terminal =
+            wait_for_terminal(&provider, second_run_id, &access_binding(&second_binding));
+        assert_eq!(
+            first_terminal["data"]["terminal"]["output"]["text"],
+            "reply:one"
+        );
+        assert_eq!(
+            second_terminal["data"]["terminal"]["output"]["text"],
+            "reply:two"
+        );
+        assert!(first_terminal["data"]["terminal"]
+            .get("backend_report")
+            .is_none());
+        let lines = fake_llama_events(&events);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        assert!(lines.iter().any(|line| line == "request:one"));
+        assert!(lines.iter().any(|line| line == "request:two"));
+
+        let repeated_init = provider
+            .request(init_request(&root, vec![offer.clone()]))
+            .unwrap();
+        assert_eq!(repeated_init["status"], "ok");
+        let mut added = offer.clone();
+        added.id = "additional-local".into();
+        let changed = provider
+            .request(init_request(&root, vec![offer.clone(), added]))
+            .unwrap();
+        assert_eq!(
+            changed["status"], "error",
+            "idle cached engine still owns model bytes"
+        );
+        assert_eq!(changed["code"], "selection_unavailable");
+        let mut tampered = offer.clone();
+        if let AdapterConfig::LocalLlamaCppText { model, .. } = &mut tampered.adapter {
+            model.sha256 = format!("sha256:{}", "0".repeat(64));
+        }
+        assert_eq!(
+            provider
+                .request(init_request(&root, vec![tampered]))
+                .unwrap()["status"],
+            "error"
+        );
+
+        let offers = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op":"offers_list"}),
+        );
+        assert!(offers["data"]["offers"][0].get("hosted").is_none());
+        let public = serde_json::to_string(&json!({
+            "first": first_terminal,
+            "second": second_terminal,
+            "offers": offers,
+        }))
+        .unwrap();
+        for private in [
+            "127.0.0.1",
+            "/bin/fake-llama-server",
+            "/models/fake.gguf",
+            "fake.events",
+        ] {
+            assert!(
+                !public.contains(private),
+                "public model data leaked {private}"
+            );
+        }
+        let runs = Path::new(&root).join("providers/model-provider/runs");
+        for entry in std::fs::read_dir(runs).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            let durable = String::from_utf8(bytes).unwrap();
+            assert!(!durable.contains("127.0.0.1"));
+            assert!(!durable.contains("fake-llama-server"));
+            assert!(!durable.contains("fake.gguf"));
+        }
+
+        provider.shutdown_on_eof();
+        wait_for_fake_llama_event(&events, "term");
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| *line == "term")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_cancel_with_active_backend_settles_unknown_without_redispatch() {
+        let root = temp_root("local-llama-cancel");
+        let (offer, events, root) = local_llama_offer(&root, "active_after_disconnect");
+        let active = events.with_extension("active");
+        let release = events.with_extension("release");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("stall");
+        let binding = create_binding("request:local-cancel", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        wait_for_fake_llama_event(&events, "request:stall");
+        let cancelled = cancel_run(&provider, run_id, &access_binding(&binding));
+        assert_eq!(cancelled["data"]["status"], "reconciling");
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        wait_for_fake_llama_event(&events, "disconnected:stall");
+        assert!(active.exists(), "backend work outlives the HTTP consumer");
+        assert!(!release.exists());
+        assert_eq!(terminal["data"]["status"], "settlement_unknown");
+        let run = load_run(&root, run_id);
+        assert_eq!(run.status, crate::contract::RunStatus::SettlementUnknown);
+        assert_eq!(run.events.last().unwrap().kind, "settlement_unknown");
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind.as_str(),
+                    "completed" | "failed" | "cancelled" | "settlement_unknown"
+                ))
+                .count(),
+            1
+        );
+        let page = events_page(&provider, run_id, &access_binding(&binding), 0);
+        for _ in 0..2 {
+            assert_eq!(
+                cancel_run(&provider, run_id, &access_binding(&binding))["data"]["terminal"],
+                terminal["data"]["terminal"]
+            );
+            assert_eq!(
+                get_run(&provider, run_id, &access_binding(&binding))["data"]["terminal"],
+                terminal["data"]["terminal"]
+            );
+            assert_eq!(
+                create_run(&provider, &offer, &binding, &input)["data"]["run_id"],
+                run_id
+            );
+            assert_eq!(
+                events_page(&provider, run_id, &access_binding(&binding), 0)["data"]["events"],
+                page["data"]["events"]
+            );
+        }
+        assert!(active.exists());
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| *line == "request:stall")
+                .count(),
+            1
+        );
+        std::fs::write(&release, b"release").unwrap();
+        wait_for_fake_llama_event(&events, "work_stopped:stall");
+        assert!(!active.exists());
+
+        let later_input = text_input("later");
+        let later_binding = create_binding("request:local-later", &offer, &later_input);
+        let later = create_run(&provider, &offer, &later_binding, &later_input);
+        let later_run_id = later["data"]["run_id"].as_str().unwrap();
+        let completed = wait_for_terminal(&provider, later_run_id, &access_binding(&later_binding));
+        assert_eq!(completed["data"]["status"], "completed");
+        assert_eq!(
+            completed["data"]["terminal"]["output"]["text"],
+            "reply:later"
+        );
+        assert_eq!(
+            cancel_run(&provider, later_run_id, &access_binding(&later_binding))["data"]
+                ["terminal"],
+            completed["data"]["terminal"]
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
+        provider.shutdown_on_eof();
+        let settled_events = fake_llama_events(&events);
+        let mut restarted = ProviderCoordinatorHandle::start();
+        init_provider(&restarted, &root, vec![offer.clone()]);
+        assert_eq!(
+            create_run(&restarted, &offer, &binding, &input)["data"]["run_id"],
+            run_id
+        );
+        assert_eq!(
+            get_run(&restarted, run_id, &access_binding(&binding))["data"]["terminal"],
+            terminal["data"]["terminal"]
+        );
+        assert_eq!(
+            cancel_run(&restarted, run_id, &access_binding(&binding))["data"]["status"],
+            "settlement_unknown"
+        );
+        assert_eq!(
+            events_page(&restarted, run_id, &access_binding(&binding), 0)["data"]["events"],
+            page["data"]["events"]
+        );
+        assert_eq!(fake_llama_events(&events), settled_events);
+        restarted.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_deadline_expires_without_polling_before_late_output() {
+        let root = temp_root("local-llama-no-poll-deadline");
+        let (mut offer, _events, root) = local_llama_offer(&root, "slow_health");
+        offer.policy.runtime_ms_limit = 150;
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("late");
+        let binding = create_binding("request:local-no-poll-deadline", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let run = loop {
+            let run = load_run(&root, run_id);
+            if run.status.is_terminal() {
+                break run;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not settle without polling"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(run.status, crate::contract::RunStatus::Failed);
+        assert_eq!(run.error.as_ref().unwrap().code, "backend_timeout");
+        assert!(run.output.is_none());
+
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_deadline_holds_capacity_until_worker_stops() {
+        let root = temp_root("local-llama-timeout-capacity");
+        let (mut offer, events, root) = local_llama_offer(&root, "timeout_ignore_term");
+        offer.policy.concurrency_limit = 1;
+        offer.policy.runtime_ms_limit = 2_000;
+        let AdapterConfig::LocalLlamaCppText { settings, .. } = &mut offer.adapter else {
+            unreachable!();
+        };
+        settings.health_timeout_ms = 5_000;
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let first_input = text_input("first");
+        let first_binding = create_binding("request:local-timeout-first", &offer, &first_input);
+        let first = create_run(&provider, &offer, &first_binding, &first_input);
+        let first_run_id = first["data"]["run_id"].as_str().unwrap();
+        wait_for_fake_llama_event(&events, "term_ignored");
+        assert_eq!(
+            get_run(&provider, first_run_id, &access_binding(&first_binding))["data"]["status"],
+            "running"
+        );
+
+        let blocked_input = text_input("blocked");
+        let blocked_binding =
+            create_binding("request:local-timeout-blocked", &offer, &blocked_input);
+        let blocked = create_run(&provider, &offer, &blocked_binding, &blocked_input);
+        assert_eq!(
+            blocked["data"]["terminal"]["error"]["code"],
+            "selection_unavailable"
+        );
+
+        assert_eq!(
+            wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding))["data"]
+                ["terminal"]["error"]["code"],
+            "backend_timeout"
+        );
+        let next_input = text_input("next");
+        let next_binding = create_binding("request:local-timeout-next", &offer, &next_input);
+        let next = create_run(&provider, &offer, &next_binding, &next_input);
+        assert_eq!(next["data"]["status"], "running");
+
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_crash_fails_once_and_restarts_on_later_run() {
+        let root = temp_root("local-llama-crash");
+        let (offer, events, root) = local_llama_offer(&root, "crash_once");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let crash_input = text_input("crash");
+        let crash_binding = create_binding("request:local-crash", &offer, &crash_input);
+        let crashed = create_run(&provider, &offer, &crash_binding, &crash_input);
+        let crash_run_id = crashed["data"]["run_id"].as_str().unwrap();
+        let failed = wait_for_terminal(&provider, crash_run_id, &access_binding(&crash_binding));
+        assert_eq!(failed["data"]["status"], "failed");
+        assert_eq!(
+            failed["data"]["terminal"]["error"]["message"],
+            "model backend transport was interrupted"
+        );
+        let serialized = serde_json::to_string(&failed).unwrap();
+        assert!(!serialized.contains("127.0.0.1"));
+        assert!(!serialized.contains("fake.gguf"));
+
+        let retry_input = text_input("after-crash");
+        let retry_binding = create_binding("request:local-restart", &offer, &retry_input);
+        let retry = create_run(&provider, &offer, &retry_binding, &retry_input);
+        let retry_run_id = retry["data"]["run_id"].as_str().unwrap();
+        assert_eq!(
+            wait_for_terminal(&provider, retry_run_id, &access_binding(&retry_binding))["data"]
+                ["terminal"]["output"]["text"],
+            "reply:after-crash"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            2
+        );
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires ELASTOS_MODEL_EVAL_ROOT and real local model artifacts"]
+    fn opt_in_local_llama_evaluation_root_smoke() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let evaluation_root = std::fs::canonicalize(
+            std::env::var("ELASTOS_MODEL_EVAL_ROOT")
+                .expect("set ELASTOS_MODEL_EVAL_ROOT for the opt-in local llama smoke"),
+        )
+        .unwrap();
+        let engine = std::fs::canonicalize(evaluation_root.join("bin/llama-server")).unwrap();
+        let model = std::fs::canonicalize(
+            std::env::var_os("ELASTOS_MODEL_EVAL_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| evaluation_root.join("models/Bonsai-8B-Q1_0.gguf")),
+        )
+        .unwrap();
+        assert!(engine.is_file() && engine.starts_with(&evaluation_root));
+        assert!(model.is_file() && model.starts_with(&evaluation_root));
+        let journal = crate::test_support::temp_root_path(
+            "model-provider-execution",
+            "installed-llama-journal",
+        );
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut offer = local_text_offer("http://unused.invalid");
+        offer.policy.inline_output_bytes_limit = 64;
+        offer.policy.runtime_ms_limit = 60_000;
+        offer.adapter = AdapterConfig::LocalLlamaCppText {
+            engine: LocalArtifactConfig {
+                sha256: crate::test_support::sha256_file(&engine),
+                path: engine.to_string_lossy().into_owned(),
+            },
+            model: LocalArtifactConfig {
+                sha256: crate::test_support::sha256_file(&model),
+                path: model.to_string_lossy().into_owned(),
+            },
+            settings: LocalLlamaSettings {
+                context_size: 4_096,
+                parallel: 1,
+                threads: 8,
+                batch_threads: 8,
+                gpu_layers: 99,
+                health_timeout_ms: 120_000,
+                shutdown_timeout_ms: 5_000,
+                enable_thinking: false,
+            },
+        };
+        let mut provider = ProviderCoordinatorHandle::start();
+        let init = provider
+            .request(ProviderEnvelope {
+                operation: ProviderOperation::Init,
+                value: json!({
+                    "op": "init",
+                    "config": {
+                        "base_path": evaluation_root,
+                        "extra": {
+                            "provider_id": "model-provider",
+                            "journal_dir": journal,
+                            "offers": [offer.clone()],
+                        }
+                    }
+                }),
+            })
+            .unwrap();
+        assert_eq!(init["status"], "ok");
+        let input = text_input("Reply with exactly one word: ready.");
+        let binding = create_binding("request:installed-local-llama", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let started = get_run(&provider, run_id, &access_binding(&binding));
+        assert_eq!(started["data"]["status"], "running");
+        let terminal = wait_for_terminal_with_timeout(
+            &provider,
+            run_id,
+            &access_binding(&binding),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            terminal["data"]["status"], "completed",
+            "terminal response: {terminal:#}"
+        );
+        let output = &terminal["data"]["terminal"]["output"];
+        let text = output["text"].as_str().unwrap_or_default().trim();
+        let answer = text
+            .strip_suffix('.')
+            .or_else(|| text.strip_suffix('!'))
+            .or_else(|| text.strip_suffix('?'))
+            .unwrap_or(text);
+        assert!(
+            answer.eq_ignore_ascii_case("ready"),
+            "terminal response: {terminal:#}"
+        );
+        assert!(
+            serde_json::to_vec(output).unwrap().len() as u64
+                <= offer.policy.inline_output_bytes_limit,
+            "terminal response: {terminal:#}"
+        );
+        provider.shutdown_on_eof();
+    }
+
     #[test]
     fn text_stream_deltas_are_ordered_and_terminal_output_is_exact() {
         let server = start_server(vec![sse_action(
@@ -2567,45 +3655,519 @@ mod tests {
             vec!["prepared", "dispatched", "text_delta", "output"]
         );
         assert_eq!(events[2]["data"], json!({"text":"hello world"}));
+        let unknown_report = json!({
+            "schema": BACKEND_REPORT_SCHEMA,
+            "resolved_model": {"status": "unknown"},
+            "usage": {"status": "unknown"},
+            "cost": {"status": "unknown"},
+        });
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            unknown_report
+        );
+        assert_eq!(events.last().unwrap()["backend_report"], unknown_report);
 
         provider.shutdown_on_eof();
     }
 
     #[test]
-    fn local_cancel_returns_promptly_and_settles_cancelled() {
-        let (stalled, release, stalled_started) = stalled_sse_action();
-        let server = start_server(vec![stalled]);
+    fn hosted_stream_reports_and_durably_replays_backend_evidence() {
+        let server = start_server(vec![sse_action(
+            &[
+                json!({
+                    "model": "resolved-model",
+                    "choices": [{"delta": {"content": "ready"}}],
+                })
+                .to_string(),
+                json!({
+                    "model": "resolved-model",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 1,
+                        "total_tokens": 8,
+                        "cost": 0.0125,
+                        "cost_unit": "backend-credit",
+                    },
+                })
+                .to_string(),
+            ],
+            true,
+        )]);
         let offer = local_text_offer(&server.base_url);
-        let root = temp_root("cancel");
+        let root = temp_root("hosted-report-replay");
         let mut provider = ProviderCoordinatorHandle::start();
         init_provider(&provider, &root, vec![offer.clone()]);
 
-        let input = text_input("cancel me");
-        let binding = create_binding("request:cancel", &offer, &input);
-        let create_response = create_run(&provider, &offer, &binding, &input);
-        let run_id = create_response["data"]["run_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        wait_for_flag(&stalled_started);
-
-        let started = Instant::now();
-        let cancel_response = cancel_run(&provider, &run_id, &access_binding(&binding));
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "local cancel must return promptly, took {:?}",
-            started.elapsed()
+        let offers = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op": "offers_list"}),
         );
-        assert_eq!(cancel_response["data"]["status"], "reconciling");
-
+        assert_eq!(
+            offers["data"]["offers"][0]["hosted"],
+            json!({
+                "placement": "hosted",
+                "backend_provider_label": "Fixture Provider",
+                "selection_mode": "pinned",
+                "requested_selector": "sentinel-model",
+                "privacy_policy_ref": "fixture:privacy:v1",
+                "terms_ref": "fixture:terms:v1",
+                "provider_request_policy": "single_dispatch_no_retry",
+                "upstream_routing_fallback_assertion": "operator_asserted_disabled",
+            })
+        );
+        let input = text_input("reply ready");
+        let binding = create_binding("request:hosted-report", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
         let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
-        assert_eq!(terminal["data"]["status"], "cancelled");
-        let run = load_run(&root, &run_id);
-        assert_eq!(run.status, crate::contract::RunStatus::Cancelled);
-        assert_eq!(run.events.last().unwrap().kind, "cancelled");
+        let expected_report = json!({
+            "schema": BACKEND_REPORT_SCHEMA,
+            "resolved_model": {"status": "reported", "value": "resolved-model"},
+            "usage": {
+                "status": "reported",
+                "value": {"input_tokens": 7, "output_tokens": 1, "total_tokens": 8},
+            },
+            "cost": {
+                "status": "reported",
+                "value": {"value": "0.0125", "unit": "backend-credit"},
+            },
+        });
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "ready"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            expected_report
+        );
+        let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
+        assert_eq!(page["data"]["has_more"], false);
+        assert_eq!(
+            page["data"]["events"].as_array().unwrap().last().unwrap()["backend_report"],
+            expected_report
+        );
+        assert_no_private_leakage(
+            &[offers.to_string(), terminal.to_string(), page.to_string()],
+            &[server.base_url.as_str(), "sentinel-openai-key"],
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
 
-        release.store(true, Ordering::Relaxed);
         provider.shutdown_on_eof();
+        let mut restarted = ProviderCoordinatorHandle::start();
+        init_provider(&restarted, &root, vec![offer]);
+        assert_eq!(
+            get_run(&restarted, &run_id, &access_binding(&binding))["data"]["terminal"]
+                ["backend_report"],
+            expected_report
+        );
+        let replayed_page = events_page(&restarted, &run_id, &access_binding(&binding), 0);
+        assert_eq!(replayed_page["data"]["events"], page["data"]["events"]);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        restarted.shutdown_on_eof();
+    }
+
+    #[test]
+    fn responses_stream_reports_and_durably_replays_backend_evidence() {
+        let server = start_server(vec![sse_action(
+            &[
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "do-not-emit",
+                })
+                .to_string(),
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "hello",
+                })
+                .to_string(),
+                json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "name": "private-tool"},
+                })
+                .to_string(),
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": " world",
+                })
+                .to_string(),
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "model": "resolved-responses-model",
+                        "usage": {
+                            "input_tokens": 7,
+                            "output_tokens": 2,
+                            "total_tokens": 9,
+                            "cost": 0.25,
+                            "cost_unit": "USD",
+                        },
+                    },
+                })
+                .to_string(),
+            ],
+            false,
+        )]);
+        let offer = responses_text_offer(&server.base_url);
+        let root = temp_root("responses-report-replay");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let offers = send_request(
+            &provider,
+            ProviderOperation::OffersList,
+            json!({"op": "offers_list"}),
+        );
+        assert_eq!(
+            offers["data"]["offers"][0]["hosted"]["requested_selector"],
+            "sentinel-responses-model"
+        );
+        assert_eq!(
+            offers["data"]["offers"][0]["hosted"]["provider_request_policy"],
+            "single_dispatch_no_retry"
+        );
+
+        let input = text_input("hello world");
+        let binding = create_binding("request:responses-report", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
+        let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
+        let expected_report = json!({
+            "schema": BACKEND_REPORT_SCHEMA,
+            "resolved_model": {"status": "reported", "value": "resolved-responses-model"},
+            "usage": {
+                "status": "reported",
+                "value": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
+            },
+            "cost": {"status": "unknown"},
+        });
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "hello world"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            expected_report
+        );
+        let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
+        let events = page["data"]["events"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["prepared", "dispatched", "text_delta", "output"]
+        );
+        assert_eq!(events[2]["data"], json!({"text": "hello world"}));
+        assert_eq!(events.last().unwrap()["backend_report"], expected_report);
+        assert_no_private_leakage(
+            &[offers.to_string(), terminal.to_string(), page.to_string()],
+            &[
+                server.base_url.as_str(),
+                "sentinel-responses-key",
+                "do-not-emit",
+                "private-tool",
+            ],
+        );
+        let request = server.requests.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(request.starts_with("post /responses http/1.1\r\n"));
+        assert!(request.contains("content-type: application/json\r\n"));
+        assert!(request.contains("authorization: bearer sentinel-responses-key\r\n"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        provider.shutdown_on_eof();
+        let mut restarted = ProviderCoordinatorHandle::start();
+        init_provider(&restarted, &root, vec![offer]);
+        let replayed = get_run(&restarted, &run_id, &access_binding(&binding));
+        assert_eq!(replayed["data"]["terminal"], terminal["data"]["terminal"]);
+        let replayed_page = events_page(&restarted, &run_id, &access_binding(&binding), 0);
+        assert_eq!(replayed_page["data"]["events"], page["data"]["events"]);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        restarted.shutdown_on_eof();
+    }
+
+    #[test]
+    fn responses_terminal_failures_are_generic_and_not_retried() {
+        let terminal_types = ["response.failed", "response.incomplete", "error"];
+        let actions = terminal_types
+            .iter()
+            .map(|event_type| {
+                sse_action(
+                    &[json!({
+                        "type": event_type,
+                        "error": {"message": "private failure detail"},
+                    })
+                    .to_string()],
+                    false,
+                )
+            })
+            .collect();
+        let server = start_server(actions);
+        let offer = responses_text_offer(&server.base_url);
+        let root = temp_root("responses-terminal-failures");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        for (index, event_type) in terminal_types.iter().enumerate() {
+            let input = text_input(event_type);
+            let binding = create_binding(
+                &format!("request:responses-terminal-{index}"),
+                &offer,
+                &input,
+            );
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap();
+            let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+            assert_eq!(terminal["data"]["status"], "failed");
+            assert_eq!(
+                terminal["data"]["terminal"]["error"],
+                json!({
+                    "class": "backend_failed",
+                    "code": "backend_failed",
+                    "message": "model backend failed",
+                })
+            );
+            assert!(terminal["data"]["terminal"]["output"].is_null());
+            assert_eq!(
+                terminal["data"]["terminal"]["backend_report"],
+                serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+            );
+            assert_no_private_leakage(&[terminal.to_string()], &["private failure detail"]);
+            assert_eq!(server.requests.lock().unwrap().len(), index + 1);
+        }
+
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn responses_stream_requires_completed_instead_of_done_or_eof() {
+        let server = start_server(vec![
+            sse_action(
+                &[json!({
+                    "type": "response.output_text.delta",
+                    "delta": "partial",
+                })
+                .to_string()],
+                false,
+            ),
+            sse_action(&[], true),
+        ]);
+        let offer = responses_text_offer(&server.base_url);
+        let root = temp_root("responses-missing-completed");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        for (index, prompt) in ["eof", "done"].iter().enumerate() {
+            let input = text_input(prompt);
+            let binding = create_binding(
+                &format!("request:responses-missing-completed-{index}"),
+                &offer,
+                &input,
+            );
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap();
+            let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+            assert_eq!(terminal["data"]["status"], "failed");
+            assert_eq!(
+                terminal["data"]["terminal"]["error"]["class"],
+                "response_malformed"
+            );
+            assert!(terminal["data"]["terminal"]["output"].is_null());
+            assert_eq!(server.requests.lock().unwrap().len(), index + 1);
+        }
+
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn conflicting_hosted_stream_facts_become_unknown_without_changing_text() {
+        let server = start_server(vec![sse_action(
+            &[
+                json!({
+                    "model": "resolved-a",
+                    "choices": [{"delta": {"content": "safe"}}],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 1,
+                        "total_tokens": 8,
+                        "cost": 0.1,
+                        "cost_unit": "backend-credit",
+                    },
+                })
+                .to_string(),
+                json!({
+                    "model": "resolved-b",
+                    "choices": [{"delta": {"content": " output"}}],
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 1,
+                        "total_tokens": 9,
+                        "cost": 0.2,
+                        "cost_unit": "backend-credit",
+                    },
+                })
+                .to_string(),
+            ],
+            true,
+        )]);
+        let offer = local_text_offer(&server.base_url);
+        let root = temp_root("hosted-conflicting-facts");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("safe output");
+        let binding = create_binding("request:conflicting-facts", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "safe output"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn malformed_optional_hosted_facts_are_unknown_and_backend_failure_is_not_retried() {
+        let server = start_server(vec![
+            sse_action(
+                &[json!({
+                    "model": "m".repeat(crate::config::MAX_MODEL_BYTES + 1),
+                    "choices": [{"delta": {"content": "safe"}}],
+                    "usage": {
+                        "prompt_tokens": "invalid",
+                        "cost": -0.5,
+                    },
+                })
+                .to_string()],
+                true,
+            ),
+            ResponseAction {
+                status_line: "503 Service Unavailable",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: br#"{"error":"unavailable"}"#.to_vec(),
+                stalled_prefix: None,
+                stalled_suffix: None,
+                hold_open: None,
+                stalled_body_started: None,
+                stalled_response_entered: None,
+            },
+        ]);
+        let offer = local_text_offer(&server.base_url);
+        let root = temp_root("hosted-optional-facts");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![offer.clone()]);
+
+        let input = text_input("safe");
+        let binding = create_binding("request:malformed-facts", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(
+            terminal["data"]["terminal"]["output"],
+            json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "safe"})
+        );
+        assert_eq!(
+            terminal["data"]["terminal"]["backend_report"],
+            serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        let input = text_input("fail once");
+        let binding = create_binding("request:backend-failure", &offer, &input);
+        let created = create_run(&provider, &offer, &binding, &input);
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let failed = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+        assert_eq!(failed["data"]["status"], "failed");
+        assert_eq!(
+            failed["data"]["terminal"]["backend_report"],
+            serde_json::to_value(crate::contract::BackendReport::unknown()).unwrap()
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        provider.shutdown_on_eof();
+    }
+
+    #[test]
+    fn responses_and_chat_cancel_with_active_backend_settle_unknown() {
+        for (label, responses) in [("chat", false), ("responses", true)] {
+            let (stalled, release, stalled_started) = stalled_sse_action();
+            let server = start_server(vec![stalled]);
+            let offer = if responses {
+                responses_text_offer(&server.base_url)
+            } else {
+                local_text_offer(&server.base_url)
+            };
+            let root = temp_root(&format!("cancel-{label}"));
+            let mut provider = ProviderCoordinatorHandle::start();
+            init_provider(&provider, &root, vec![offer.clone()]);
+
+            let input = text_input("cancel me");
+            let binding = create_binding(&format!("request:cancel-{label}"), &offer, &input);
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap().to_string();
+            wait_for_flag(&stalled_started);
+
+            let started = Instant::now();
+            let cancel_response = cancel_run(&provider, &run_id, &access_binding(&binding));
+            assert!(
+                started.elapsed() < PROMPT_RETURN_BOUND,
+                "hosted cancel must return promptly, took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(cancel_response["data"]["status"], "reconciling");
+
+            let terminal = wait_for_terminal(&provider, &run_id, &access_binding(&binding));
+            assert!(!release.load(Ordering::Relaxed));
+            assert!(server.request_active.load(Ordering::SeqCst));
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            assert_eq!(terminal["data"]["status"], "settlement_unknown");
+            let run = load_run(&root, &run_id);
+            assert_eq!(run.status, crate::contract::RunStatus::SettlementUnknown);
+            assert_eq!(run.events.last().unwrap().kind, "settlement_unknown");
+            assert_eq!(
+                run.events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind.as_str(),
+                        "completed" | "failed" | "cancelled" | "settlement_unknown"
+                    ))
+                    .count(),
+                1
+            );
+            let page = events_page(&provider, &run_id, &access_binding(&binding), 0);
+            assert_eq!(
+                cancel_run(&provider, &run_id, &access_binding(&binding))["data"]["status"],
+                "settlement_unknown"
+            );
+            provider.shutdown_on_eof();
+
+            let mut restarted = ProviderCoordinatorHandle::start();
+            init_provider(&restarted, &root, vec![offer.clone()]);
+            assert_eq!(
+                get_run(&restarted, &run_id, &access_binding(&binding))["data"]["terminal"],
+                terminal["data"]["terminal"]
+            );
+            assert_eq!(
+                events_page(&restarted, &run_id, &access_binding(&binding), 0)["data"]["events"],
+                page["data"]["events"]
+            );
+            assert_eq!(
+                create_run(&restarted, &offer, &binding, &input)["data"]["run_id"],
+                run_id
+            );
+            assert!(server.request_active.load(Ordering::SeqCst));
+            assert!(!release.load(Ordering::Relaxed));
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            release.store(true, Ordering::Relaxed);
+            restarted.shutdown_on_eof();
+        }
     }
 
     #[test]
@@ -2735,6 +4297,7 @@ mod tests {
                 sequence: 1,
                 kind: "prepared".to_string(),
                 data: json!({}),
+                backend_report: None,
                 terminal: false,
             },
             RunEvent {
@@ -2742,6 +4305,7 @@ mod tests {
                 sequence: 2,
                 kind: "dispatched".to_string(),
                 data: json!({"offer_id": offer.id}),
+                backend_report: None,
                 terminal: false,
             },
         ];
@@ -2785,6 +4349,7 @@ mod tests {
                 "offer_id": offer.id,
                 "operation": offer.operation,
             }),
+            backend_report: None,
             terminal: false,
         }];
         run.next_sequence = 2;
@@ -2907,6 +4472,7 @@ mod tests {
                 WorkerUpdate::Exited {
                     run_id: update_run_id,
                     generation,
+                    ..
                 } => {
                     assert_eq!(update_run_id, &run_id);
                     assert_eq!(*generation, 1);

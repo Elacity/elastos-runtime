@@ -7,6 +7,9 @@ const MAX_REQUEST_FRAME_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_FRAME_BYTES: usize = MAX_REQUEST_FRAME_BYTES;
 
 pub fn run_main() {
+    if let Some(success) = crate::local_llama::run_internal_guard_if_requested() {
+        std::process::exit(if success { 0 } else { 1 });
+    }
     if let Err(err) = run_stdio() {
         eprintln!("[model-provider] fatal stdio failure: {err}");
         let response = error_response("provider_failed", "model provider failed");

@@ -5027,6 +5027,115 @@ async fn test_home_launch_validates_shell_targets() {
 }
 
 #[tokio::test]
+async fn test_window_policy_survives_discovery_catalog_and_home_launch() {
+    for policy in ["single", "multiple", "hybrid"] {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, role) in [("window-app", "app"), ("window-viewer", "viewer")] {
+            write_test_browser_capsule(dir.path(), name, role, "Window policy fixture", None);
+            let path = dir.path().join("capsules").join(name).join("capsule.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest["runtime_abi"] = json!("elastos.runtime-projection/v1");
+            manifest["bus_contract"] = json!("elastos.runtime-projection/v1");
+            manifest["execution"] = json!("web-projection");
+            manifest["projections"] = json!(["web"]);
+            manifest["window_policy"] = json!(policy);
+            std::fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        }
+        write_test_browser_capsule(dir.path(), "window-absent", "app", "No policy", None);
+        write_test_viewer_capsule(
+            dir.path(),
+            "window-content",
+            "window-viewer",
+            "data.bin",
+            "Content",
+        );
+        let discovered = crate::api::browser_capsules::list_launchable_browser_capsules(dir.path());
+        for name in ["window-app", "window-viewer"] {
+            let capsule = discovered
+                .iter()
+                .find(|capsule| capsule.name == name)
+                .unwrap();
+            assert_eq!(serde_json::to_value(capsule.window_policy).unwrap(), policy);
+        }
+        let content = crate::api::browser_capsules::resolve_viewer_bound_capsule(
+            dir.path(),
+            "window-content",
+            "window-viewer",
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(content.window_policy).unwrap(), policy);
+        let catalog = capsule_catalog_summary(dir.path());
+        let targets = home_targets_from_catalog(&catalog);
+        let catalog = serde_json::to_value(catalog).unwrap();
+        for target in ["window-app", "window-viewer", "window-content"] {
+            let summary = catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|capsule| capsule["name"] == target)
+                .unwrap();
+            assert_eq!(summary["window_policy"], policy, "catalog {target}");
+            let summary = targets.iter().find(|entry| entry.target == target).unwrap();
+            assert_eq!(
+                serde_json::to_value(summary).unwrap()["window_policy"],
+                policy
+            );
+            let direct = home_launch_target(dir.path(), target).unwrap();
+            assert_eq!(
+                serde_json::to_value(direct).unwrap()["window_policy"],
+                policy
+            );
+        }
+        let absent = catalog["capsules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capsule| capsule["name"] == "window-absent")
+            .unwrap();
+        assert!(absent.get("window_policy").is_none());
+        let app = gateway_router(test_state(dir.path()));
+        for target in [
+            "window-app",
+            "window-viewer",
+            "window-content",
+            "window-absent",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/apps/home/launch")
+                        .header(HOST, "localhost:61180")
+                        .header("origin", "http://localhost:61180")
+                        .header("sec-fetch-site", "same-origin")
+                        .header("x-elastos-home-token", home_app_token(dir.path()))
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({"target": target}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "launch {target}");
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if target == "window-absent" {
+                assert!(payload.get("window_policy").is_none());
+            } else {
+                assert_eq!(payload["window_policy"], policy, "launch {target}");
+            }
+            if target == "window-content" {
+                assert_eq!(payload["viewer"], "window-viewer");
+                assert_isolated_launch_route(payload["route"].as_str().unwrap(), "window-viewer");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let dir = tempfile::tempdir().unwrap();
     write_test_browser_capsule(

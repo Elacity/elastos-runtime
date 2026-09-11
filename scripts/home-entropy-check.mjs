@@ -189,6 +189,7 @@ function listMarkdownFiles(dir = repoRootPath) {
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -214,6 +215,7 @@ function listTextFiles(dir) {
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -446,6 +448,7 @@ function listFilesRecursive(dir) {
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -465,6 +468,7 @@ function isTestOrGeneratedPath(path) {
   const name = parts.at(-1)?.toLowerCase() || "";
   return (
     parts.includes("target") ||
+    parts.includes("target-build") ||
     parts.includes("tests") ||
     parts.includes("test") ||
     parts.includes("__tests__") ||
@@ -2691,7 +2695,7 @@ assert(
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
     !shellStyle.includes(".home-people-") &&
-    shellWindows.includes('"people",') &&
+    JSON.parse(peopleCapsule).window_policy === "single" &&
     shellJs.includes('people: new Set(["chat-room", "system"])') &&
     homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
   "People must be a standalone app capsule while Home remains only its launch and message host",
@@ -3585,18 +3589,30 @@ assert(
     !fileExists("capsules/gba-engine-provider"),
   "GBA ROM and save access must use generic Runtime viewer routes without a host engine provider",
 );
+const guardedDocumentsProvider = documentsProvider.replace(/objects\s*\.\s*(read|write)\s*\(/g, "objects.$1(");
 assertProtectedPrincipalRootAccessor(
-  documentsProvider,
+  guardedDocumentsProvider,
   "fn documents_load_body(",
-  "read_principal_root_object(",
+  "objects.read(",
   "Documents body reads",
 );
 assertProtectedPrincipalRootAccessor(
-  documentsProvider,
+  guardedDocumentsProvider,
   "fn documents_write_body(",
-  "write_principal_root_object(",
+  "objects.write(",
   "Documents body writes",
 );
+for (const entry of ["documents_load_document", "documents_save_local", "documents_create_local", "documents_save_as_local", "documents_import_chat_attachment_local", "documents_delete_local", "documents_export_publish", "documents_finish_publish", "documents_unpublish_local", "documents_load_summary"]) {
+  assert(sourceBlock(documentsProvider, `fn ${entry}(`, entry).includes("PrincipalRootObjectMutation::acquire(data_dir)?"),
+    `${entry} must share the principal-root mutation guard`);
+}
+const documentObjectGuard = sourceBlock(runtimeAuth, "impl<'a> PrincipalRootObjectMutation<'a>", "Documents object guard");
+assert(documentObjectGuard.includes("principal_root_object_mutation_lock()") &&
+  documentObjectGuard.includes("validate_principal_root_object_binding(") &&
+  documentObjectGuard.includes("validate_principal_root_object_path(") &&
+  documentObjectGuard.includes("read_principal_root_object_locked(") &&
+  documentObjectGuard.includes("write_principal_root_object_locked("),
+  "Documents guard must retain authenticated principal-root reads and writes");
 assertProtectedPrincipalRootAccessor(
   gatewayApi,
   "fn home_browser_state(\n",
@@ -4408,7 +4424,7 @@ assertProtectedPrincipalRootAccessor(
 assertProtectedPrincipalRootAccessor(
   viewerGatewayApi,
   "pub async fn viewer_storage_put(",
-  "write_principal_root_object(",
+  "write_principal_root_object_if_revision(",
   "Viewer/content storage writes",
 );
 assert(
@@ -5839,12 +5855,13 @@ assert(
     archiveManager.includes('title: "File"') &&
     archiveManager.includes('title: "Edit"') &&
     archiveManager.includes('return event.origin === "null" && event.source === window.parent;') &&
-    !archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveManager.includes("acceptLibraryPickerObject(data)") &&
     archiveBehaviorSmoke.includes("archive-product-behavior-smoke: OK") &&
     archiveLayoutSmoke.includes("archive-product-layout-smoke: OK") &&
     justfile.includes("node scripts/archive-product-behavior-smoke.mjs") &&
     justfile.includes("node scripts/archive-product-layout-smoke.mjs"),
-  "Archive must use the shared UI tokens, the accepted Home top-out or trusted-parent-in boundary, and dedicated source or browser smokes wired into the normal UIUX gate",
+  "Archive must keep parent-owned menus separate from exact Home picker delivery and retain the shared UI tokens and dedicated smokes",
 );
 assert(
     archiveManagerManifest.includes('"name": "archive-manager"') &&
@@ -5873,7 +5890,8 @@ assert(
     archiveManager.includes('returnTarget: "archive-manager"') &&
     archiveManager.includes('archive:open-library-object') &&
     archiveManager.includes("async function openLibraryObject(object)") &&
-    archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
+    archiveManager.includes('requestId: libraryPickerRequest.id') &&
+    !archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
     archiveManager.includes("Extract selected") &&
     archiveManager.includes("Extract all") &&
     archiveManager.includes("Select visible") &&
@@ -6016,7 +6034,7 @@ assert(
     shellSurface.includes("function canRevealDesktopObject(object)") &&
     homeShellRegressionSmoke.includes("desktop object without capability metadata opened instead of failing closed") &&
     homeShellRegressionSmoke.includes("desktop object actions without capability metadata reached Runtime") &&
-    shellSurface.includes('openTarget("library", { query: { uri: object.uri } })') &&
+    shellSurface.includes('openTarget("library", { ...options, query: { uri: object.uri } })') &&
     shellSurface.includes("desktopObjectViewer(object)") &&
     shellSurface.includes('openTarget(viewer,') &&
     shellSurface.includes('objectUri: object.uri') &&
@@ -7865,7 +7883,7 @@ assert(
 assert(
   system.includes('id="recovery-password"') &&
     system.includes("Download Recovery Kit") &&
-    system.includes("Save your Profile, Home data recovery, and built-in Wallet recovery keys in one kit.") &&
+    system.includes("Save your Profile, Home recovery authority, and included Wallet keys in one kit.") &&
     system.includes('id="recovery-profile-name"') &&
     systemJs.includes("intent.profile_display_name = name;") &&
     systemJs.includes("download_password") &&
@@ -7886,7 +7904,7 @@ assert(
     recoveryKitLiveSmoke.includes(
       "elastos.full-recovery-bundle.import.response/v2",
     ),
-  "System Recovery Kit download must be the full recover-everything path: data root plus built-in Wallet keys with optional password wrapping",
+  "System Recovery Kit export requires an existing Profile and preserves root authority, included Wallet keys, optional password wrapping and audited import",
 );
 assert(
     system.includes('id="recovery-import"') &&
@@ -10646,8 +10664,10 @@ assert(
     rememberWindowRestoreBounds(entry.node);
     return;
   }`) &&
-    shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"])') &&
-    !shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["browser"])') &&
+    shellWindows.includes('targetById(summary, targetId)?.window_policy === "single"') &&
+    !shellWindows.includes('SINGLE_SESSION_TARGETS') &&
+    [JSON.parse(peopleCapsule), inboxCapsuleManifest, walletCapsuleManifest, systemCapsuleManifest]
+      .every(manifest => manifest.window_policy === "single") &&
     shellWindows.includes("export function normalizeRestorableSession") &&
     shellWindows.includes("withBrowserInstanceQuery(options)") &&
     shellWindows.includes("activateTargetGroup(targetId)") &&
@@ -10665,11 +10685,11 @@ assert(
     ) &&
     shellWindowGeometry.includes("node.dataset.browserMaximized") &&
     shellWindowGeometry.includes("browserAspectResizeBounds"),
-  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, keep true singleton handling scoped to People, and must not install generic iframe auto-fit observers that fight the remote display during resize",
+  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, follow manifest-owned window policy, and keep generic iframe auto-fit observers outside the remote display resize path",
 );
 assert(
-  shellWindows.includes("query: normalizedLaunchQuery(entry.launchQuery)") &&
-    shellWindows.includes("query: restorableLaunchQuery(targetId, item)") &&
+  shellWindows.includes("query: restorableLaunchQuery(entry.targetId, { query: entry.launchQuery })") &&
+    shellWindows.includes("const query = restorableLaunchQuery(targetId, item)") &&
     shellWindows.includes('if (targetId === "browser" && !query.browser_instance)') &&
     shellWindows.includes('const launchQuery = targetId === "browser"') &&
     shellWindows.includes("withBrowserInstanceQuery({ query: options.query }).query") &&

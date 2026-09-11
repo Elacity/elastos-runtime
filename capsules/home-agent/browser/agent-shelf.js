@@ -7,6 +7,7 @@ import { registerEscapeHandler } from "./shell-popovers.js";
 import { sendToAgentHarness, stopAgentHarnessStream, abortAgentStreamNow } from "./agent-send.js";
 import { DICTATION_HYPOTHESIS_CAP } from "./agent-context.js";
 import { desktopStageId, setActiveStage } from "./harness-host.js";
+import { selectedLiveOffer } from "./agent-live.js";
 
 let bound = false;
 let persistComposerDraft = null;
@@ -75,7 +76,7 @@ export function syncAgentSendButton(input = composerInput()) {
   }
   const hasText = hasMeaningfulComposerContent(input);
   btn.dataset.mode = "send";
-  btn.disabled = !hasText;
+  btn.disabled = !hasText || !selectedLiveOffer();
   btn.setAttribute("aria-label", "Send");
   btn.title = hasText ? "Send" : "Enter a message to send";
 }
@@ -236,25 +237,29 @@ export async function sendAgentComposerMessage() {
     return;
   }
 
-  const prompt = input.value.trim();
+  const submittedText = input.value;
+  const prompt = submittedText.trim();
   if (!hasMeaningfulComposerContent(input)) {
     return;
   }
 
   const parts = composerParts.slice();
+  const submittedParts = new Map(parts.map((part) => [part, JSON.stringify(part)]));
   const modelText = compilePartsForModel(parts, prompt);
   const displayText = displayTextForParts(parts, prompt);
 
-  input.value = "";
-  autosizeComposer(input);
-  clearComposerAttachments();
-  closeAttachMenu();
-  persistComposerDraft?.();
-
-  await sendToAgentHarness(modelText, {
+  const accepted = await sendToAgentHarness(modelText, {
     displayText,
     parts,
   });
+  if (accepted !== true) return false;
+  if (input.value === submittedText) input.value = "";
+  composerParts = composerParts.filter((part) => submittedParts.get(part) !== JSON.stringify(part));
+  autosizeComposer(input);
+  renderComposerAttachments();
+  closeAttachMenu();
+  persistComposerDraft?.();
+  return true;
 }
 
 /* The composer face. Home owns the Shelf morph: it grows its own pill to this

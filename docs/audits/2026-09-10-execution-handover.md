@@ -40,15 +40,17 @@ and left unused. Official installation receipts were refreshed after manifest
 changes. Automated test gateways are stopped; only isolated human-test Homes
 remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
 
-The next action is the bounded local model diagnostic on the same branch.
-The installed Mac Home currently has zero offers; All models opens empty Settings,
-and Apps lists Assistant and Home Agent. Integrate the verified bootstrap and
-corrected local provider/catalog/admission core from donor `6972e165`, preserving
-current recovery, sessions, shutdown and media reuse. Storage/window changes can
-retain their separate J1 gate during this diagnostic. The full donor merge preview
-has 14 conflicted files, so account for copied fixes before intake. Preserve
-existing user Homes and perform the diagnostic in a test-owned Home. Keep the
-historical donor preparation failure's cause unknown until direct proof resolves it.
+The current next action is the history-preserving integration of model, Assistant
+and UI work. The user identified lost behavior from earlier extractions. The full
+`6972e165` donor merge preserves current recovery/session/shutdown repairs and
+includes storage/window source with separate installed gates. Follow with Sash's
+original shelf and latest committed URUX work, then Irzhy's dependency-ordered
+installed-proof, authority-cutover and follow-up branches. The
+[preservation check](2026-09-11-integration-preservation.md) maps source, missing
+features, target checks and known contradictions. Keep both Assistant workspace
+stores intact. Reuse existing Qwen artifacts in a fresh test-owned Home for the
+Marketplace, reply, cancellation and restart journey. Current user Homes stay
+preserved and installed model acceptance remains pending.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

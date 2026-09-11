@@ -55,6 +55,9 @@ const technicalInspectStatusNode = document.querySelector("#technical-inspect-st
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const frameHomeToken = readLaunchToken();
+const models = window.ElastosModelManagement.create({
+  root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
+});
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
 const HOME_GUI_SHELL_ID = "home-gui";
@@ -89,10 +92,9 @@ const ACCENT_VALUES = new Set([
 ]);
 const DEFAULT_COPY_LABEL = "Copy";
 const COPIED_LABEL = "Copied";
-if (frameHomeToken && homeParentOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeParentOrigin);
-}
 let apiHomeToken = frameHomeToken;
+let initialRecoveryState = null;
+const recoveryDocumentNonce = window.crypto.randomUUID();
 let chainNetworks = [];
 let chainStatusById = new Map();
 let chainLifecycleById = new Map();
@@ -147,6 +149,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
+  models: ["models", "use", "keep", "preparation"],
   about: ["about", "device", "version", "source", "network", "did"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
@@ -169,7 +172,6 @@ async function boot() {
     document.querySelector("#system-locked").hidden = false;
     return;
   }
-  homeClipboard.start();
   configureSettingsTabs();
   configureSettingsSearch();
   activateSettingsTab(requestedSettingsTab || "account");
@@ -183,14 +185,101 @@ async function boot() {
   configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
-  await refreshSystemSummary();
-  await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
-  await refreshAccountList().catch(() => {});
-  await refreshRecoveryStatus();
+  initialRecoveryState = (async () => {
+    await refreshSystemSummary();
+    await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
+    await refreshAccountList().catch(() => {});
+    await refreshRecoveryStatus();
+  })();
+  configureHomeRecoverySave();
+  // Clipboard announces app-ready to top Home; share that same bound-handler
+  // readiness with the opaque shell that owns this window.
+  if (homeClipboard.start() && window.parent !== window.top) {
+    window.parent.postMessage({ type: "home:app-ready", homeToken: frameHomeToken,
+      documentNonce: recoveryDocumentNonce }, "*");
+  }
+  await initialRecoveryState;
   await refreshChainNetworks();
   await refreshCapsuleCatalog().catch((error) => {
     console.error("catalog refresh failed", error);
     showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
+  });
+}
+
+function configureHomeRecoverySave() {
+  let lastSequence = 0;
+  let busy = false;
+  let active = true;
+  const reply = (data, ok) => {
+    if (active) window.parent.postMessage({ type: "elastos.system.window.result/v1",
+      homeToken: frameHomeToken, documentNonce: recoveryDocumentNonce,
+      requestId: data.requestId, ok: ok === true }, "*");
+  };
+  // The opaque Home shell and current token bind this document's requests.
+  window.addEventListener("pagehide", () => {
+    active = false;
+    if (window.parent !== window && window.parent !== window.top) {
+      window.parent.postMessage({ type: "home:app-unloading", homeToken: frameHomeToken,
+        documentNonce: recoveryDocumentNonce }, "*");
+    }
+  }, { once: true });
+  window.addEventListener("message", async (event) => {
+    const data = event.data;
+    if (!active || window.parent === window.top || event.source !== window.parent
+      || event.origin !== "null" || !frameHomeToken || frameHomeToken !== apiHomeToken
+      || !data || data.homeToken !== frameHomeToken
+      || typeof data.requestId !== "string" || !/^[a-zA-Z0-9-]{1,64}$/.test(data.requestId)) return;
+    if (data.type === "elastos.system.window-ready.request/v1"
+      && hasExactKeys(data, ["type", "homeToken", "requestId"])) {
+      try { await initialRecoveryState; } catch (_error) { return; }
+      if (active && frameHomeToken === apiHomeToken) {
+        window.parent.postMessage({ type: "elastos.system.window-ready.result/v1",
+          homeToken: frameHomeToken, documentNonce: recoveryDocumentNonce,
+          requestId: data.requestId }, "*");
+      }
+      return;
+    }
+    if (data.type !== "elastos.system.window.request/v1"
+      || !hasExactKeys(data, ["type", "homeToken", "requestId", "documentNonce", "sequence", "action", "query"])
+      || data.documentNonce !== recoveryDocumentNonce
+      || !Number.isSafeInteger(data.sequence) || data.sequence <= lastSequence) return;
+    // A high-water mark rejects replay with constant memory, including busy requests.
+    lastSequence = data.sequence;
+    if (busy) {
+      reply(data, false);
+      return;
+    }
+    busy = true;
+    let ok = false;
+    try {
+      await initialRecoveryState;
+      if (active && frameHomeToken === apiHomeToken) {
+        const query = data.query;
+        if (data.action === "save" && hasExactKeys(query, [])) {
+          activateSettingsTab("security");
+          recoveryDownloadButton?.focus();
+          ok = await onRecoveryDownload({ isActive: () => active && frameHomeToken === apiHomeToken });
+        } else if (data.action === "navigate" && query && typeof query === "object"
+          && !Array.isArray(query)
+          && Object.keys(query).every(key => key === "settings" || key === "recovery")
+          && typeof query.settings === "string"
+          && normalizedRequestedSettingsTab(query.settings) === query.settings
+          && query.settings !== ""
+          && (query.recovery === undefined || (query.recovery === "import" && query.settings === "security"))) {
+          activateSettingsTab(query.settings);
+          if (query.settings === "security") {
+            (query.recovery === "import" ? recoveryImportInput
+              : (recoveryProfileRequired ? recoveryProfileName : recoveryDownloadButton))?.focus();
+          }
+          ok = true;
+        }
+      }
+    } catch (_error) {
+      showRecoveryNote("System could not complete the request. Refresh System and try again.", "error");
+    } finally {
+      busy = false;
+    }
+    reply(data, ok);
   });
 }
 
@@ -217,6 +306,7 @@ function activateSettingsTab(settings) {
   if (!tab) {
     return;
   }
+  models.setVisible(tab === "models");
   for (const item of document.querySelectorAll(".settings-sidebar-item")) {
     item.classList.toggle("active", item.dataset.settings === tab);
   }
@@ -2260,7 +2350,7 @@ function setRecoveryStatus(status) {
   const protectedRoot = status && status.protection_configured === true;
   if (configured && downloadAvailable) {
     showRecoveryStatus("", "success");
-    showRecoveryNote("Downloads Home data recovery plus built-in Wallet recovery keys after passkey verification.", "muted");
+    showRecoveryNote("Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.", "muted");
     setRecoveryButton("Download Recovery Kit", false);
     return;
   }
@@ -2280,9 +2370,10 @@ function setRecoveryStatus(status) {
   setRecoveryButton("Create Recovery Kit", false);
 }
 
-async function onRecoveryDownload() {
-  if (!hasShellAccess() || !recoveryDownloadButton || recoveryDownloadButton.disabled || recoveryExportBusy) {
-    return;
+async function onRecoveryDownload(options = {}) {
+  const isActive = typeof options?.isActive === "function" ? options.isActive : () => true;
+  if (!hasShellAccess() || recoveryProfileStatus === "unavailable" || !recoveryDownloadButton || recoveryDownloadButton.disabled || recoveryExportBusy) {
+    return false;
   }
   clearRecoveryPending();
   recoveryExportBusy = true;
@@ -2294,7 +2385,9 @@ async function onRecoveryDownload() {
     const status = await fetchJson("/api/auth/recovery/status", {
       headers: shellHeaders(),
     });
-    const bundle = await exportFullRecoveryBundle(status);
+    if (!isActive()) return false;
+    const bundle = await exportFullRecoveryBundle(status, isActive);
+    if (!isActive()) return false;
     downloadRecoveryKit(bundle);
     if (recoveryPasswordInput) {
       recoveryPasswordInput.value = "";
@@ -2312,10 +2405,12 @@ async function onRecoveryDownload() {
     await refreshSystemSummary().catch(() => {
       showRecoveryNote("Recovery Kit downloaded. Store it offline. Refresh System to update setup status.", "success");
     });
+    return true;
   } catch (error) {
     showRecoveryStatus("Not set", "error");
     showRecoveryNote(String(error.message || error), "error");
     setRecoveryButton("Download Recovery Kit", false);
+    return false;
   } finally {
     recoveryExportBusy = false;
     if (recoveryProfileName) recoveryProfileName.readOnly = false;
@@ -2459,7 +2554,7 @@ function recoveryImportPlan(status, imported, options = {}) {
   throw new Error("Unsupported Recovery Kit file.");
 }
 
-async function exportFullRecoveryBundle(status) {
+async function exportFullRecoveryBundle(status, isActive = () => true) {
   if (recoveryProfileStatus === "unavailable") {
     throw new Error("Profile setup could not be checked. Refresh System and try again.");
   }
@@ -2482,6 +2577,7 @@ async function exportFullRecoveryBundle(status) {
     "auth.full-recovery-bundle.export",
     intent,
   );
+  if (!isActive()) throw new Error("Recovery Kit save was cancelled.");
   return fetchJson("/api/auth/recovery/full-export", {
     method: "POST",
     headers: shellHeaders({ "content-type": "application/json" }),
@@ -3210,6 +3306,7 @@ function normalizeAppearanceHex(value) {
 }
 
 function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const actual = Object.keys(value).sort();
   const expected = [...expectedKeys].sort();
   return actual.length === expected.length
