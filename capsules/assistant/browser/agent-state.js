@@ -2,7 +2,7 @@
    turns cost, which projects exist. Persisted through the capsule workspace.
    Nothing here invents a model, a tool or a reply. */
 
-const MAX_USAGE_TURNS = 200;
+const cloneRecord = (value) => JSON.parse(JSON.stringify(value));
 
 let reasoningVisibleStore = true;
 let usageTurns = [];
@@ -84,35 +84,18 @@ export function noteLiveTurnUsage({
     source: omitted ? "estimated" : "live",
     omitted,
   });
-  if (usageTurns.length > MAX_USAGE_TURNS) {
-    usageTurns = usageTurns.slice(-MAX_USAGE_TURNS);
-  }
   return usageTurns[usageTurns.length - 1];
 }
 
 export function getUsageLedger() {
-  return usageTurns.map((t) => ({ ...t }));
+  return cloneRecord(usageTurns);
 }
 
 export function applyUsageLedger(rawTurns) {
   if (!Array.isArray(rawTurns)) {
     return;
   }
-  usageTurns = rawTurns
-    .filter((t) => t && typeof t === "object")
-    .map((t) => ({
-      at: Number(t.at) || Date.now(),
-      day: String(t.day || "").slice(0, 10),
-      tokens: Math.max(0, Math.round(Number(t.tokens) || 0)),
-      promptTokens: t.promptTokens == null ? null : Math.round(Number(t.promptTokens) || 0),
-      completionTokens:
-        t.completionTokens == null ? null : Math.round(Number(t.completionTokens) || 0),
-      latencyMs: Math.max(0, Math.round(Number(t.latencyMs) || 0)),
-      model: String(t.model || "live").slice(0, 80),
-      source: t.source === "estimated" ? "estimated" : "live",
-      omitted: Boolean(t.omitted),
-    }))
-    .slice(-MAX_USAGE_TURNS);
+  usageTurns = cloneRecord(rawTurns);
 }
 
 function readProjectStore() {
@@ -124,7 +107,7 @@ function writeProjectStore(projects) {
 }
 
 export function listProjects() {
-  return readProjectStore().map((p) => ({ ...p }));
+  return cloneRecord(readProjectStore());
 }
 
 export function createProject(title) {
@@ -153,18 +136,7 @@ export function removeProject(projectId) {
 
 /** Replace the in-memory project list (host session restore). */
 export function replaceProjects(projects) {
-  const next = Array.isArray(projects)
-    ? projects
-        .filter((p) => p && typeof p === "object" && typeof p.id === "string" && p.title)
-        .map((p) => ({
-          id: String(p.id).slice(0, 80),
-          title: String(p.title).trim().slice(0, 48),
-          rootRef: p.rootRef && typeof p.rootRef === "object" ? p.rootRef : null,
-          createdAt: Number(p.createdAt) || Date.now(),
-        }))
-        .filter((p) => p.title)
-        .slice(0, 40)
-    : [];
+  const next = Array.isArray(projects) ? cloneRecord(projects) : [];
   writeProjectStore(next);
   return listProjects();
 }

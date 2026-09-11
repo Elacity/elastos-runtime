@@ -13,7 +13,12 @@ pub(super) async fn home_launch(
             )
         })?;
 
-    let target = req.target.trim();
+    // Old Home bookmarks launch the canonical app. Normalize before package
+    // resolution and token creation; existing run actor bindings stay intact.
+    let target = match req.target.trim() {
+        "home-agent" => "assistant",
+        target => target,
+    };
     if target.is_empty() || target == HOME_CAPSULE_ID {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -286,7 +291,7 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
     let mut targets: Vec<_> =
         crate::api::browser_capsules::list_launchable_browser_capsules(data_dir)
             .into_iter()
-            .filter(|app| app.name != HOME_CAPSULE_ID)
+            .filter(|app| app.name != HOME_CAPSULE_ID && app.name != "home-agent")
             .filter(|app| {
                 !visible_only
                     || (app.role != CapsuleRole::Shell && is_home_visible_target(&app.name))
@@ -344,7 +349,10 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
 pub(super) fn is_home_visible_target(name: &str) -> bool {
     !matches!(
         name,
-        WALLET_METAMASK_CAPSULE_ID | WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID
+        WALLET_METAMASK_CAPSULE_ID
+            | WALLET_UNISAT_CAPSULE_ID
+            | WALLET_WALLETCONNECT_CAPSULE_ID
+            | "home-agent"
     )
 }
 

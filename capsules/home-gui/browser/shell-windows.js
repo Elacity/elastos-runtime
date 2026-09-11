@@ -349,7 +349,7 @@ const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.documents.window-close.result/v1";
 const OPAQUE_CAPSULE_ORIGIN = "null";
-const HOME_AGENT_TARGET_ID = "home-agent";
+const HOME_AGENT_TARGET_ID = "assistant";
 const MAX_SESSION_WINDOWS = 24;
 function isSingleWindowTarget(targetId, summary = shellState.currentSummary) {
   return targetById(summary, targetId)?.window_policy === "single";
@@ -516,6 +516,7 @@ function persistBrowserSession() {
 
 export function snapshotBrowserSession() {
   return {
+    ...(Object.hasOwn(shellState.homeBrowserState?.session || {}, "agent") ? {agent: structuredClone(shellState.homeBrowserState.session.agent)} : {}),
     root_shell: currentRootShellSessionId(),
     windows: persistedBrowserSessionEntries(),
     desktops: [...(Array.isArray(shellState.extraDesktops) ? shellState.extraDesktops : [])],
@@ -593,7 +594,7 @@ export function normalizeRestorableSession(summary, storedSession, options = {})
     const targetId = typeof item?.target === "string" ? item.target : "";
     if (
       !targetId ||
-      targetId === HOME_AGENT_TARGET_ID ||
+      targetId === HOME_AGENT_TARGET_ID || targetId === "home-agent" ||
       (isSingleWindowTarget(targetId, summary) && seenTargets.has(targetId)) ||
       !targetById(summary, targetId)
     ) {
@@ -1581,8 +1582,8 @@ export function openTarget(targetId, options = {}) {
   if (windowHooks?.holdHomeSetupAct?.(targetId) === true) {
     return;
   }
-  if (targetId === HOME_AGENT_TARGET_ID) {
-    showAssistantFace();
+  if (targetId === HOME_AGENT_TARGET_ID || targetId === "home-agent") {
+    showAssistantFace(normalizedLaunchQuery(options.query));
     return;
   }
   // Launching from a fullscreen Space returns to a Desktop first, so the new
@@ -1657,7 +1658,7 @@ export function handleTaskbarTargetClick(targetId) {
   if (windowHooks?.holdHomeSetupAct?.(targetId) === true) {
     return;
   }
-  if (targetId === HOME_AGENT_TARGET_ID) {
+  if (targetId === HOME_AGENT_TARGET_ID || targetId === "home-agent") {
     showAssistantFace();
     return;
   }
@@ -1823,6 +1824,11 @@ async function createBrowserTargetWindow(targetId, options = {}) {
 }
 
 export function attachAuthorizedTarget(launched) {
+  if (launched?.target === HOME_AGENT_TARGET_ID || launched?.target === "home-agent") {
+    const query = Object.fromEntries(new URL(launched.route, window.location.href).searchParams);
+    showAssistantFace(query, launched);
+    return Promise.resolve(null);
+  }
   let query = {};
   const policy = targetById(shellState.currentSummary, launched?.target)?.window_policy;
   if (policy === "hybrid" || policy === "multiple" || launched?.target === "browser" || launched?.target === "library") {

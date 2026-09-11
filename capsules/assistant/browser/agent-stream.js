@@ -554,6 +554,14 @@ export function setStreamStatus(label, { tone = "idle" } = {}) {
 function showRunSettlement(turn, detail = turn?.error === "run_not_found"
   ? formatStreamError({ code: "run_not_found" })
   : "Run status unavailable. Check status or start a new chat.") {
+  if (turn?.attachmentAllowed === false) {
+    setStreamStatus("History copy. The original run ID is preserved; outcome unknown.");
+    return;
+  }
+  if (turn?.actorCapsule && turn.actorCapsule !== "assistant") {
+    setStreamStatus("Outcome unknown. This run belongs to the previous Home Agent. Its original IDs are preserved.");
+    return;
+  }
   if (!unresolvedModelTurn(turn)) {
     setStreamStatus("Outcome unknown");
     return;
@@ -844,8 +852,9 @@ export function renderActiveSession() {
   host.clearEmptyState();
   session.messages.forEach((msg, index) => {
     if (msg.role === "grant") {
-      /* Grant cards belonged to the URUX tool preview; sessions that still
-         carry one show nothing for it. */
+      // Historical grant records are visible records, with authority retained
+      // by Runtime. Rendering them does not recreate an approval action.
+      appendMessage("grant", msg.text || JSON.stringify(msg, null, 2), {msgIndex: index});
     } else {
       if (msg.role === "agent" && (msg.progress?.milestones?.length || msg.thinking)) {
         if (msg.progress?.milestones?.length) {
@@ -1113,6 +1122,10 @@ export function appendMessage(
     row.dataset.msgIndex = String(msgIndex);
   }
 
+  if (!["user", "agent"].includes(role)) {
+    const label = document.createElement("small");
+    label.textContent = String(role); row.append(label);
+  }
   const body = document.createElement("div");
   body.className = "agent-msg-body";
   if (role === "agent") {
@@ -1652,7 +1665,7 @@ function scheduleIdleWork(fn) {
 
 /** Live turn: contract runs_events → scheduled DOM. Stop requests cancellation. */
 async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
-  if (resumeTurn && !resumeTurn.providerRunId) {
+  if (resumeTurn && (resumeTurn.attachmentAllowed === false || resumeTurn.actorCapsule && resumeTurn.actorCapsule !== "assistant" || !resumeTurn.providerRunId)) {
     showRunSettlement(resumeTurn);
     return;
   }

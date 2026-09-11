@@ -356,7 +356,7 @@ export function getComposerDraft() {
     text: String(input?.value || ""),
     parts: composerParts.map((p) => ({
       ...p,
-      text: String(p.text || "").slice(0, MAX_PASTE_CHARS),
+      text: String(p.text || ""),
     })),
   };
 }
@@ -366,7 +366,7 @@ export function applyComposerDraft(raw) {
     return;
   }
   composerParts = Array.isArray(raw.parts)
-    ? raw.parts.filter((p) => p && typeof p === "object").slice(0, 16)
+    ? raw.parts.filter((p) => p && typeof p === "object")
     : [];
   const input = composerInput();
   if (input && typeof raw.text === "string") {

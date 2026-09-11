@@ -24,6 +24,8 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
 
     let mut capsules = crate::api::capsule_inventory::list_active_capsule_manifests(data_dir)
         .into_iter()
+        // Assistant owns new launches even while a retired app tree remains.
+        .filter(|manifest| manifest.name != "home-agent")
         // A directory or component entry cannot authenticate model content.
         .filter(|manifest| manifest.model_content.is_none())
         .map(|manifest| {

@@ -616,7 +616,6 @@ APP_CAPSULES=(
     archive-manager
     inbox
     assistant
-    home-agent
     wallet
     wallet-metamask
     wallet-unisat
@@ -634,6 +633,7 @@ APP_CAPSULES_JSON="$(printf '%s\n' "${APP_CAPSULES[@]}" | python3 -c 'import jso
 RETIRED_SOURCE_HOME_CAPSULES=(
     chat-wasm
     gba-engine-provider
+    home-agent
 )
 
 RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(

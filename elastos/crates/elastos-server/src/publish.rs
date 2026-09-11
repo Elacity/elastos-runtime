@@ -38,13 +38,12 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "archive-manager",
     "inbox",
     "assistant",
-    "home-agent",
     "elacity-player",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
 const DEMO_PUBLISH_CAPSULES: &[&str] =
     &["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"];
-const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat"];
+const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
 const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
     "localhost-provider",
@@ -75,7 +74,6 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "archive-manager",
     "inbox",
     "assistant",
-    "home-agent",
     "elacity-player",
 ];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];

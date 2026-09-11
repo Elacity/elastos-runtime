@@ -13,7 +13,7 @@ changes. The proposed full old-URUX-tip merge is superseded by review of concret
 remaining behavior differences. The remaining protected-content stack retains
 its source order and feature-preservation gates
 in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
-Assistant consolidation, original UI parity and full cross-platform J3 acceptance remain open.
+The approved Assistant consolidation now passes source and rendered preservation checks; its installed proof is next. Original UI parity beyond this slice and full cross-platform J3 acceptance remain open. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md).
 
 
 The isolated Mac J3 installation runs Runtime `fbf1a4b0` with matching build,
@@ -872,36 +872,23 @@ complete. Installed proof and the atomic authority cutover remain open.
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init
   test passes with the Runtime envelope in source tests.
-- Assistant is a standalone first-party capsule with its own protected
-  workspace. Its tested Chat, Build, and Studio behavior uses typed model
-  offers and runs. Transcript copy goes only through the trusted Home
-  Clipboard path.
-- Home Agent is the Home-owned Agent face. Home GUI owns the Shelf transition
-  to its composer, Agent Space, and `launchHomeTarget`. `home-agent` owns
-  sessions, transcript, composer, and settings. Runtime owns the protected,
-  revisioned workspace and model-proxy binding.
-- Home Agent uses the typed `offers_list`, `runs_create`, `runs_events`, and
-  `runs_cancel` operations. Its Home message contract is pinned. The source has
-  one Shelf and one Home-owned Agent face, and the Agent room stays in the
-  Space ring. Fixes `450db538` and `900d7e5c` keep activation, message routing,
-  and saved layout upgrades on that canonical path without a duplicate generic
-  window.
-- Runtime accepts one opaque, bounded workspace envelope for this local
-  contract. Typed document schemas remain future work when a cross-authority
-  operation needs them.
-- Assistant model messages render a self-contained safe markdown subset with
-  escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
-  inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
-  source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
-  records observed UI behavior separately; configured model-run and advanced
-  workflow acceptance remain open.
-- Home Agent is the canonical Home-integrated Agent surface. Standalone
-  Assistant remains installed while the product inventories and tests its
-  distinct working behavior. It can remain as an explicitly scoped optional
-  app, or its useful behavior can move before removal. Future Home Agent tools,
-  Library reads, web search, Studio, Usage, and sampling controls require their
-  typed Runtime operations first. The zero-offer Home Agent state is installed
-  proof of honest absence, not configured inference.
+- Assistant is the canonical first-party capsule for Sash’s Agent Space,
+  conversation UI and composer, with Chat, Build and Studio controls. Home GUI
+  owns shelf motion and the frame; Runtime owns protected workspace v2 and model
+  authority. Legacy Home Agent launches resolve to Assistant before token creation.
+- Source installers retire the old Home Agent capsule tree while retaining its
+  protected workspace. Migration preserves all three old stores, full records,
+  editable drafts and exact run identities. Concurrent edits retain both versions.
+- Typed model controls retain exact CID/offer selection. Studio saves request
+  identity before create and keeps per-session drafts, run cursors and output
+  history. Historical foreign runs and copied sessions retain their original
+  identities without acquiring authority. Copy uses trusted Home Clipboard.
+- The source and rendered preservation gates pass. Installed canonical Assistant
+  and actual Qwen proof are pending on the frozen Mac candidate. Earlier installed
+  Home Agent and standalone Assistant observations above remain historical target
+  receipts. Advanced tools, Library reads, search and broader Studio capabilities
+  retain their typed-contract gates.
+
 
 ## System Truth
 

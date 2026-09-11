@@ -44,6 +44,8 @@ use url::form_urlencoded;
 
 #[path = "gateway_assistant.rs"]
 mod gateway_assistant;
+#[path = "gateway_assistant_workspace_v2.rs"]
+mod gateway_assistant_workspace_v2;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
 #[path = "gateway_capsule_catalog.rs"]
@@ -702,6 +704,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 .put(gateway_assistant::assistant_workspace_put)
                 .layer(DefaultBodyLimit::max(
                     gateway_assistant::ASSISTANT_WORKSPACE_MAX_BYTES,
+                )),
+        )
+        .route(
+            "/api/apps/assistant/workspace-v2",
+            get(gateway_assistant_workspace_v2::get)
+                .put(gateway_assistant_workspace_v2::put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_assistant_workspace_v2::MAX_BYTES,
                 )),
         )
         .route(

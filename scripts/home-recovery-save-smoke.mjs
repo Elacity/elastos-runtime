@@ -36,7 +36,7 @@ function hostFixture({ invalid = false, fail = false, ordinary = false } = {}) {
   const hooks = { holdHomeSetupAct: () => false };
   const context = vm.createContext({
     pendingSystemRecoverySave: null, SYSTEM_APP_ID: "system", shellState: state,
-    HOME_AGENT_TARGET_ID: "home-agent", windowHooks: hooks,
+    HOME_AGENT_TARGET_ID: "assistant", windowHooks: hooks,
     requireWindowHooks: () => hooks,
     targetById: () => target,
     pendingWindowLaunches: new Map(), ignoreRepeatedAction: () => false,

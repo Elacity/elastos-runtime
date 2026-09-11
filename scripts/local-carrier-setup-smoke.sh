@@ -141,7 +141,6 @@ for capsule in \
     home-gui \
     archive-manager \
     assistant \
-    home-agent \
     browser \
     system \
     services \
@@ -204,7 +203,6 @@ LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
-HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent" \
 ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
@@ -324,7 +322,6 @@ browser_capsules = {
     "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
-    "home-agent": pathlib.Path(os.environ["HOME_AGENT_CAPSULE_DIR"]),
     "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
@@ -527,7 +524,7 @@ for installed in \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
     "${DATA_DIR}/capsules/archive-manager/browser/index.html" \
-    "${DATA_DIR}/capsules/home-agent/browser/index.html" \
+    "${DATA_DIR}/capsules/assistant/browser/index.html" \
     "${DATA_DIR}/capsules/wallet/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-metamask/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-unisat/browser/index.html" \

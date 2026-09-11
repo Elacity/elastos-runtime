@@ -386,6 +386,7 @@ function initialState(homeToken) {
     copyingTranscript: false,
     studioProgress: null,
     studioResult: null,
+    studioHistory: [],
     pollTimer: 0,
     saveTimer: 0,
     saving: false,
@@ -407,9 +408,20 @@ export function createAssistantApp({
   sourceWindow = globalThis.window,
   homeClipboardClientFactory = createHomeClipboardClient,
   onStateChange = () => {},
+  studioOnly = false,
+  studioState = null,
+  studioSessionId = "",
+  beforeRunCreate = async () => true,
 } = {}) {
   const state = initialState(homeToken);
+  if (studioOnly && studioState) {
+    for (const key of ["studioDraft", "selectedStudioOfferId", "studioProgress", "studioResult", "studioHistory", "activeRun"]) {
+      if (studioState[key] !== undefined) state[key] = structuredClone(studioState[key]);
+    }
+  }
   let offersEpoch = 0;
+  let disposed = false;
+  let pollInFlight = false;
   const homeClipboard = homeClipboardClientFactory({
     targetId: "assistant",
     homeOrigin,
@@ -490,6 +502,14 @@ export function createAssistantApp({
   }
 
   function notify() {
+    if (disposed) return;
+    if (state.activeRun?.mode === MODE_STUDIO) {
+      const run = structuredClone(state.activeRun);
+      const index = state.studioHistory.findIndex(item =>
+        (run.createRequestId && item.createRequestId === run.createRequestId) || (run.runId && item.runId === run.runId));
+      if (index < 0) state.studioHistory.push(run);
+      else state.studioHistory[index] = { ...state.studioHistory[index], ...run };
+    }
     onStateChange(snapshot());
   }
 
@@ -909,8 +929,7 @@ export function createAssistantApp({
 
   function setDraft(text) {
     if (state.activeMode === MODE_STUDIO) {
-      state.studioDraft = boundedText(text, MAX_MESSAGE_CONTENT_BYTES);
-      state.studioResult = null;
+      state.studioDraft = String(text ?? "");
       notify();
       return;
     }
@@ -924,7 +943,6 @@ export function createAssistantApp({
     if (state.offersLoading || state.workspaceLoading || state.offersError || !selectedModelOffer(offers, nextOfferId, modelCid, state.models)) return;
     if (state.activeMode === MODE_STUDIO) {
       state.selectedStudioOfferId = nextOfferId || null;
-      state.studioResult = null;
       notify();
       return;
     }
@@ -1075,14 +1093,27 @@ export function createAssistantApp({
   function stopPollingUnavailable(run, message) {
     clearPollTimer();
     if (state.activeRun === run && !run?.terminal) {
+      run.status = "settlement_unknown";
       state.statusMessage = message;
       notify();
     }
   }
 
-  async function pollRun(run = state.activeRun, immediateDepth = 0) {
+  async function pollRun(run = state.activeRun) {
+    if (pollInFlight) return;
+    pollInFlight = true;
+    try { await pollRunPage(run); }
+    finally { pollInFlight = false; }
+  }
+
+  async function pollRunPage(run = state.activeRun, immediateDepth = 0) {
+    if (disposed) return;
     if (!run || run.terminal) {
       clearPollTimer();
+      return;
+    }
+    if (!run.runId || (run.actorCapsule && run.actorCapsule !== "assistant") || run.attachmentAllowed === false) {
+      stopPollingUnavailable(run, "Outcome unknown. The original request and run identity are preserved.");
       return;
     }
     if (immediateDepth >= MAX_IMMEDIATE_EVENT_PAGES) {
@@ -1091,11 +1122,19 @@ export function createAssistantApp({
       }, POLL_DELAY_MS);
       return;
     }
-    const { response, payload } = await requestJson("/api/provider/model/runs_events", {
-      run_id: run.runId,
-      request_id: cryptoRef.randomUUID(),
-      after_sequence: run.afterSequence,
-    });
+    let response, payload;
+    try {
+      ({ response, payload } = await requestJson("/api/provider/model/runs_events", {
+        run_id: run.runId,
+        request_id: cryptoRef.randomUUID(),
+        after_sequence: run.afterSequence,
+      }));
+    } catch {
+      run.status = "settlement_unknown";
+      stopPollingUnavailable(run, "Connection lost. The run outcome is unknown. Check its status before starting another run.");
+      return;
+    }
+    if (disposed) return;
     if (!response.ok || payload?.status === "error") {
       run.pollErrorCount += 1;
       if (
@@ -1146,7 +1185,7 @@ export function createAssistantApp({
       return;
     }
     if (page.has_more) {
-      await pollRun(run, immediateDepth + 1);
+      await pollRunPage(run, immediateDepth + 1);
       return;
     }
     state.pollTimer = setTimeoutFn(() => {
@@ -1157,7 +1196,7 @@ export function createAssistantApp({
   async function sendDraft() {
     const promptSource =
       state.activeMode === MODE_STUDIO ? state.studioDraft : state.draft;
-    const prompt = boundedText(promptSource.trim(), MAX_MESSAGE_CONTENT_BYTES);
+    const prompt = state.activeMode === MODE_STUDIO ? String(promptSource).trim() : boundedText(promptSource.trim(), MAX_MESSAGE_CONTENT_BYTES);
     const offer = selectedOffer();
     if (!prompt || !offer || state.offersLoading || state.offersError || state.workspaceLoading || (state.activeRun && !state.activeRun.terminal)) {
       notify();
@@ -1182,17 +1221,49 @@ export function createAssistantApp({
       notify();
       return false;
     }
-    const { response, payload } = await requestJson("/api/provider/model/runs_create", {
+    const createRequestId = cryptoRef.randomUUID();
+    // Reserve the request identity synchronously, before either persistence or
+    // network work can yield. A second click observes this pending run.
+    const pendingRun = {
+      runId: "", createRequestId, sessionId: isStudio ? studioSessionId : session?.id || "",
+      actorCapsule: "assistant", mode: isStudio ? MODE_STUDIO : session.mode,
+      prompt, draft: promptSource, offerId: offer.id, operation: offer.operation, mediaLabel: offer.mediaLabel || "",
+      afterSequence: 0, outputText: "", terminal: false, cancelRequested: false,
+      status: "submitting", output: null, error: null, progress: null,
+      pollErrorCount: 0, pollDeadlineAt: nowFn() + MAX_POLL_ERROR_WINDOW_MS,
+    };
+    state.activeRun = pendingRun;
+    notify();
+    let savedBeforeCreate = true;
+    try { if (isStudio) savedBeforeCreate = await beforeRunCreate(structuredClone(pendingRun)); }
+    catch { savedBeforeCreate = false; }
+    if (!savedBeforeCreate) {
+      pendingRun.status = "not_sent";
+      pendingRun.terminal = true;
+      state.statusMessage = "Save the conversation before sending this request.";
+      notify();
+      return false;
+    }
+    let response, payload;
+    try {
+      ({ response, payload } = await requestJson("/api/provider/model/runs_create", {
       offer_id: offer.id,
       operation: offer.operation,
-      request_id: cryptoRef.randomUUID(),
+      request_id: createRequestId,
       input: {
         schema: inputSchema,
         prompt,
       },
-    });
+      }));
+    } catch {
+      pendingRun.status = "settlement_unknown";
+      state.statusMessage = "The create response was lost. Outcome unknown; the original request ID is preserved.";
+      notify();
+      return false;
+    }
     if (!response.ok || payload?.status === "error") {
       state.statusMessage = readStatusMessage(payload, "Model provider unavailable.");
+      pendingRun.status = "settlement_unknown";
       if (session) {
         markWorkspaceDirty();
       }
@@ -1202,16 +1273,17 @@ export function createAssistantApp({
     const runView = parseRunView(payload);
     const runId = runView?.run_id;
     if (typeof runId !== "string" || !runId) {
-      state.statusMessage = "Model provider unavailable.";
+      pendingRun.status = "settlement_unknown";
+      state.statusMessage = "The create response has no run ID. Outcome unknown; the original request ID is preserved.";
       notify();
       return false;
     }
     if (isStudio) {
-      state.studioDraft = "";
+      if (state.studioDraft === promptSource) state.studioDraft = "";
     }
-    state.activeRun = {
+    Object.assign(pendingRun, {
       runId,
-      sessionId: session?.id || "",
+      sessionId: isStudio ? studioSessionId : session?.id || "",
       mode: isStudio ? MODE_STUDIO : session.mode,
       mediaLabel: offer.mediaLabel || "",
       afterSequence: parseCursorValue(runView.sequence_cursor) ?? 0,
@@ -1224,7 +1296,7 @@ export function createAssistantApp({
       progress: null,
       pollErrorCount: 0,
       pollDeadlineAt: nowFn() + MAX_POLL_ERROR_WINDOW_MS,
-    };
+    });
     if (session) {
       updateStreamingMessage(session.id, runId, "");
       markWorkspaceDirty();
@@ -1238,15 +1310,24 @@ export function createAssistantApp({
 
   async function stopRun() {
     const run = state.activeRun;
-    if (!run || run.terminal || run.cancelRequested) {
+    if (!run || !run.runId || run.terminal || run.cancelRequested ||
+        (run.actorCapsule && run.actorCapsule !== "assistant") || run.attachmentAllowed === false) {
       return false;
     }
     run.cancelRequested = true;
     notify();
-    const { response, payload } = await requestJson("/api/provider/model/runs_cancel", {
+    let response, payload;
+    try {
+      ({ response, payload } = await requestJson("/api/provider/model/runs_cancel", {
       run_id: run.runId,
       request_id: cryptoRef.randomUUID(),
-    });
+      }));
+    } catch {
+      run.status = "settlement_unknown";
+      state.statusMessage = "The stop response was lost. The run outcome is unknown.";
+      notify();
+      return false;
+    }
     if (!response.ok || payload?.status === "error") {
       state.statusMessage = readStatusMessage(payload, "Model provider unavailable.");
       notify();
@@ -1260,10 +1341,22 @@ export function createAssistantApp({
   }
 
   async function initialize() {
-    if (homeToken) {
+    if (homeToken && !studioOnly) {
       homeClipboard.start();
     }
-    await Promise.all([loadOffers(), loadWorkspace()]);
+    if (studioOnly) {
+      state.workspaceLoading = false;
+      state.activeMode = MODE_STUDIO;
+      await loadOffers();
+      if (state.activeRun && !state.activeRun.terminal) {
+        state.activeRun.pollErrorCount = 0;
+        state.activeRun.pollDeadlineAt = nowFn() + MAX_POLL_ERROR_WINDOW_MS;
+        void pollRun(state.activeRun);
+      }
+      notify();
+    } else {
+      await Promise.all([loadOffers(), loadWorkspace()]);
+    }
   }
 
   async function copyTranscript() {
@@ -1324,6 +1417,15 @@ export function createAssistantApp({
     copyTranscript,
     sendDraft,
     stopRun,
+    resumeRun() {
+      clearPollTimer();
+      if (state.activeRun) {
+        state.activeRun.pollErrorCount = 0;
+        state.activeRun.pollDeadlineAt = nowFn() + MAX_POLL_ERROR_WINDOW_MS;
+      }
+      return pollRun(state.activeRun);
+    },
+    dispose() { disposed = true; clearPollTimer(); },
     updateRenameValue(value) {
       state.renameValue = boundedText(value, MAX_SESSION_TITLE_BYTES);
       notify();

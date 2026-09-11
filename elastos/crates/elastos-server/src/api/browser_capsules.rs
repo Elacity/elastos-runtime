@@ -92,6 +92,9 @@ pub async fn serve_home_asset(
 }
 
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
+    if app == "home-agent" {
+        return Redirect::to(&format!("{HOME_ROUTE}#")).into_response();
+    }
     Redirect::permanent(&format!("/apps/{app}/")).into_response()
 }
 
@@ -100,6 +103,11 @@ pub async fn serve_browser_app_index(
     headers: axum::http::HeaderMap,
     AxumPath(app): AxumPath<String>,
 ) -> Response {
+    // Old bookmarks return to the owning Home. Its launch path issues a fresh
+    // Assistant token; an old Home Agent token keeps its original actor scope.
+    if app == "home-agent" {
+        return Redirect::to(&format!("{HOME_ROUTE}#")).into_response();
+    }
     serve_browser_capsule_path(&state.data_dir, &headers, &app, None).await
 }
 
@@ -108,6 +116,13 @@ pub async fn serve_browser_app_asset(
     headers: axum::http::HeaderMap,
     AxumPath((app, path)): AxumPath<(String, String)>,
 ) -> Response {
+    if app == "home-agent" {
+        return if path == "index.html" {
+            Redirect::to(&format!("{HOME_ROUTE}#")).into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
     serve_browser_capsule_path(&state.data_dir, &headers, &app, Some(&path)).await
 }
 

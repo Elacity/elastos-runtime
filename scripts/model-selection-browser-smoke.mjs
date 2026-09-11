@@ -9,7 +9,7 @@ import { chromium, brave } from "./system-uiux-fixture.mjs";
 const root = resolve(new URL("../", import.meta.url).pathname);
 const cid = `bafybei${"a".repeat(52)}`;
 const offer = (id, title) => ({ id, title, operation: "text.generate", input_modalities: ["text/plain"], output_modalities: ["text/plain"] });
-let offers, rows, failed = false, responseDelay = 0;
+let offers, rows, workspace, failed = false, responseDelay = 0;
 const calls = [], errors = [];
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://fixture");
@@ -32,11 +32,13 @@ const server = createServer(async (req, res) => {
         json({ offers }, failed ? 503 : 200); return;
       }
       if (url.pathname === "/api/capsules/catalog") { json({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: rows }); return; }
-      if (url.pathname.endsWith("workspace")) {
-        if (req.method === "PUT") { json({ ...input, revision: input.if_revision + 1 }); return; }
-        json(url.pathname.includes("home-agent")
-          ? { schema: "elastos.home-agent.workspace/v1", revision: 0, document: { v: 1, liveOfferId: "chosen", selectedModelCid: cid, composerDraft: { text: "Keep my draft", parts: [] } } }
-          : { schema: "elastos.assistant.workspace/v1", revision: 0, sessions: [], draft: "Keep my draft", selected_offer_id: "chosen", selected_model_cid: cid }); return;
+      if (url.pathname === "/api/apps/assistant/workspace-v2") {
+        if (req.method === "PUT") {
+          assert.equal(input.schema, "elastos.assistant.workspace/v2");
+          if (input.if_revision !== workspace.revision) { json({ error: "revision conflict" }, 409); return; }
+          workspace = { schema: input.schema, revision: workspace.revision + 1, document: input.document };
+        }
+        json(workspace); return;
       }
       throw new Error(`Unexpected operation ${url.pathname}`);
     }
@@ -51,7 +53,14 @@ const server = createServer(async (req, res) => {
 server.listen(0, "127.0.0.1"); await once(server, "listening");
 const browser = await chromium.launch({ executablePath: brave, headless: true });
 try {
-  for (const app of ["assistant", "home-agent"]) {
+  // The retired standalone renderer's disabled-select/CID/controller behavior
+  // remains covered in assistant-shell-smoke.mjs. Render the canonical UI here.
+  {
+    const app = "assistant";
+    workspace = { schema: "elastos.assistant.workspace/v2", revision: 0, document: {
+      v: 1, liveOfferId: "chosen", selectedModelCid: cid, sessions: [],
+      composerDraft: { text: "Keep my draft", parts: [] },
+    } };
     offers = [offer("chosen", "Prepared model"), offer("hosted", "Hosted service")]; failed = false;
     rows = [{ source: "signed-model-catalog", role: "content", installed: false, launchable: false, cid,
       title: "Prepared model", signature_state: "catalog-signature-verified", model_runtime: { admitted: true, dispatch_ready: true, offer_id: "chosen" } }];
@@ -59,16 +68,20 @@ try {
     const pageErrors = []; page.on("pageerror", error => pageErrors.push(String(error)));
     await page.goto(`http://127.0.0.1:${server.address().port}/?app=${app}`);
     const frame = page.frameLocator("iframe");
-    const agent = app === "home-agent";
-    const draft = frame.locator(agent ? "#agent-composer-input" : "#assistant-composer-input");
-    const send = frame.locator(agent ? "#agent-composer-send" : "#assistant-send");
+    const draft = frame.locator("#agent-composer-input");
+    const send = frame.locator("#agent-composer-send");
     await draft.filter({ visible: true }).waitFor({ timeout: 5000 });
-    await frame.locator(`${agent ? "#agent-composer-send" : "#assistant-send"}:enabled`).waitFor();
+    await frame.locator("#agent-composer-send:enabled").waitFor();
     assert.equal(await draft.inputValue(), "Keep my draft");
-    if (!agent) {
+    {
       for (const width of [680, 420]) {
         await page.setViewportSize({ width, height: 800 });
-        const controls = await frame.locator('[data-action="refresh-models"], [data-action="open-models"]').evaluateAll(buttons => buttons.map(button => {
+        await frame.locator("#agent-model-picker").click();
+        await frame.locator("#agent-model-menu").waitFor({ state: "visible" });
+        await frame.locator("#agent-model-menu").evaluate(async element => {
+          await Promise.all(element.getAnimations().map(animation => animation.finished));
+        });
+        const controls = await frame.locator('#agent-model-menu [data-model-action="refresh-models"], #agent-model-menu [data-model-action="open-models"]').evaluateAll(buttons => buttons.map(button => {
           const rect = button.getBoundingClientRect();
           return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
             width: rect.width, height: rect.height, viewportWidth: innerWidth, viewportHeight: innerHeight,
@@ -83,14 +96,15 @@ try {
         const [a, b] = controls;
         assert.ok(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top,
           `Assistant model controls overlap at ${width}px`);
+        await frame.locator("#agent-model-picker").click();
       }
       await page.setViewportSize({ width: 1100, height: 800 });
     }
-    if (agent) await frame.locator("#agent-model-picker").click();
-    const menu = agent ? frame.locator("#agent-model-menu") : frame.locator("#assistant-offer-select");
+    await frame.locator("#agent-model-picker").click();
+    const menu = frame.locator("#agent-model-menu");
     assert.equal(await menu.getByRole("option", { name: "Prepared model", exact: true }).count(), 1);
     assert.equal(await menu.getByRole("option", { name: "Hosted service", exact: true }).count(), 1);
-    if (agent) {
+    {
       offers = [offer("chosen", "Prepared model")];
       await menu.getByRole("button", { name: "Refresh models", exact: true }).click();
       const selected = menu.locator(`[data-model-cid="${cid}"][aria-selected="true"]`);
@@ -123,20 +137,20 @@ try {
       await frame.locator("#agent-model-picker").click();
     }
     offers = [offer("hosted", "Hosted service")]; rows = [];
-    await (agent ? menu : frame).getByRole("button", { name: "Refresh models", exact: true }).click();
+    await menu.getByRole("button", { name: "Refresh models", exact: true }).click();
     await menu.getByRole("option", { name: "Prepared model", exact: true }).waitFor({ state: "detached" });
     assert.equal(await send.isDisabled(), true);
     assert.equal(await draft.inputValue(), "Keep my draft");
-    if (agent) await menu.getByRole("option", { name: "Hosted service", exact: true }).click();
-    else await menu.selectOption("hosted");
+    await menu.getByRole("option", { name: "Hosted service", exact: true }).click();
     assert.equal(await send.isEnabled(), true);
     assert.equal(await draft.inputValue(), "Keep my draft");
     failed = true;
-    if (agent) await frame.locator("#agent-model-picker").click();
-    await (agent ? menu : frame).getByRole("button", { name: "Refresh models", exact: true }).click();
-    await frame.locator(`${agent ? "#agent-composer-send" : "#assistant-send"}:disabled`).waitFor();
-    if (!agent) assert.equal(await menu.isDisabled(), true);
-    await (agent ? menu : frame).getByRole("button", { name: "Open Models", exact: true }).click();
+    await frame.locator("#agent-model-picker").click();
+    await menu.getByRole("button", { name: "Refresh models", exact: true }).click();
+    await frame.locator("#agent-composer-send:disabled").waitFor();
+    await menu.locator('[role="option"][aria-selected="true"]').waitFor({ state: "detached" });
+    assert.equal(await menu.locator('[role="option"][aria-selected="true"]').count(), 0, "failed refresh leaves no selectable current model");
+    await menu.getByRole("button", { name: "Open Models", exact: true }).click();
     const message = await page.waitForFunction(() => window.messages.find(m => m.type === "home:open-target"));
     assert.deepEqual(await message.jsonValue(), { type: "home:open-target", homeToken: "fixture", target: "system", query: { settings: "models" } });
     assert.equal(await draft.inputValue(), "Keep my draft");
@@ -145,5 +159,5 @@ try {
   }
   assert.equal(calls.filter(call => call.path.endsWith("runs_create")).length, 0);
   assert.deepEqual(errors, []);
-  console.log("PASS Assistant/Home Agent model selection browser smoke");
+  console.log("PASS canonical Assistant model selection browser smoke");
 } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }

@@ -76,7 +76,6 @@ DEFAULT_CAPSULES=(
     archive-manager
     inbox
     assistant
-    home-agent
     elacity-player
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
@@ -110,7 +109,6 @@ REQUIRED_SUPPORTED_CAPSULES=(
     archive-manager
     inbox
     assistant
-    home-agent
     elacity-player
 )
 SUPPORT_BINARY_ASSETS=(
@@ -1018,7 +1016,6 @@ build_platform_independent_direct_assets() {
         gba-nonogram \
         chat-room \
         assistant \
-        home-agent \
         elacity-player; do
         if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
             archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"

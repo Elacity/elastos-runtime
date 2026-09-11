@@ -26,8 +26,11 @@ local operator ledger and current checkpoint. Resolve their directory with
 Use `feat/0.7.1-website-execution`, based on the user-selected
 `origin/upstream/0.7.1-dev` at `6c61c990`. Preserve the integration and Browser
 donors. Before edits, recheck HEAD/tree, dirt, fetched divergence and target
-receipts. The installed checkpoint remains `1e320578`; newer J3 source has its
-own verification and awaits installation. Rebuild only affected components.
+receipts. Human preview Homes remain `1e320578`; the separate Mac J3 Home has
+accepted Runtime `fbf1a4b0` Qwen proof. The approved one-Assistant source now passes
+preservation and rendered checks. Install its frozen candidate next, as recorded
+in [the convergence check](2026-09-11-assistant-convergence.md). The affected
+Runtime build has passed; reuse providers, engine and model data.
 
 The installed checkpoint code is `1e320578b6b8a77753c4b5ef8fab51c12ea3d9e2`, tree
 `44b08f00907c02dd3fe3bb2d3ed8e79e1bb76788`, 54 ahead / zero behind dev `6c61c990`.

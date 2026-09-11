@@ -868,25 +868,34 @@ for (const [token, value] of new Map([
 }
 
 const assistantIndex = read("capsules/assistant/browser/index.html");
-const assistantScript = read("capsules/assistant/browser/assistant.js");
-const assistantStyle = read("capsules/assistant/browser/style.css");
+const assistantController = read("capsules/assistant/browser/assistant.js");
+const assistantEntry = read("capsules/assistant/browser/home-agent.js");
+const assistantWorkspace = read("capsules/assistant/browser/harness-host.js");
+const assistantModes = read("capsules/assistant/browser/assistant-modes.js");
+const assistantScript = [assistantController, assistantEntry, assistantWorkspace, assistantModes,
+  read("capsules/assistant/browser/agent-live.js")].join("\n");
+const assistantStyle = ["style.css", "home-agent.css", "agent-harness.css", "assistant-modes.css"]
+  .map(name => read(`capsules/assistant/browser/${name}`)).join("\n");
+const assistantWorkspaceGateway = read("elastos/crates/elastos-server/src/api/gateway_assistant_workspace_v2.rs");
 const assistantGateway = read(
   "elastos/crates/elastos-server/src/api/gateway_assistant.rs",
 );
 const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
 
 assert(
-  assistantIndex.includes('<script type="module" src="./assistant.js"></script>'),
-  "Assistant must boot through its capsule-owned browser shell",
+  assistantIndex.includes('<script type="module" src="./home-agent.js"></script>') &&
+    assistantEntry.includes('from "./assistant-modes.js"') &&
+    assistantModes.includes('from "./assistant.js"') && assistantModes.includes("studioOnly: true"),
+  "Assistant boots the Sash shell and uses the typed controller for Studio",
 );
 assert(
   !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
   "Assistant must not add browser-owned persistence",
 );
 assert(
-  assistantScript.includes("/api/apps/assistant/workspace") &&
-    !assistantScript.includes("workspace.json") &&
-    !assistantScript.includes("session.agent"),
+  assistantWorkspace.includes('const WORKSPACE_URL = "/api/apps/assistant/workspace-v2"') &&
+    !assistantWorkspace.includes("workspace.json") &&
+    !assistantWorkspace.includes("session.agent"),
   "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
 );
 assert(
@@ -923,17 +932,27 @@ assert(
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
-    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+    // SVG namespace identifiers inside local data images are not endpoints.
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`.replaceAll("http://www.w3.org/2000/svg", "svg-namespace"),
   ),
   "Assistant capsule source must not expose backend endpoints, topology, or credentials",
 );
 assert(
-  (gatewaySource.match(/\/api\/apps\/assistant\/workspace/g) || []).length === 1,
-  "Assistant workspace must expose exactly one dedicated Runtime route",
+  (gatewaySource.match(/"\/api\/apps\/assistant\/workspace-v2"/g) || []).length === 1 &&
+    (gatewaySource.match(/"\/api\/apps\/assistant\/workspace"/g) || []).length === 1,
+  "Assistant has one canonical v2 route and retains the legacy workspace route",
+);
+assert(
+  assistantWorkspaceGateway.includes('const SCHEMA: &str = "elastos.assistant.workspace/v2"') &&
+    assistantWorkspaceGateway.includes("MAX_BYTES: usize = 8 * 1024 * 1024") &&
+    assistantWorkspaceGateway.includes('const RELATIVE_PATH: &str = ".AppData/ElastOS/Assistant/workspace-v2.json"') &&
+    assistantWorkspaceGateway.includes("read_principal_root_object(") &&
+    assistantWorkspaceGateway.includes("write_protected_principal_root_object("),
+  "Canonical Assistant uses bounded v2 storage under the protected principal root",
 );
 assert(
   (assistantGateway.match(/elastos\.assistant\.workspace\/v1/g) || []).length >= 1,
-  "Assistant workspace must use one bounded v1 schema",
+  "Legacy Assistant reads retain their v1 schema",
 );
 assert(
   (assistantGateway.match(
@@ -944,7 +963,7 @@ assert(
     ) || []).length === 1 &&
     (assistantGateway.match(/fn assistant_workspace_uri\(/g) || []).length === 1 &&
     (assistantGateway.match(/\.AppData\/ElastOS\/Assistant\/workspace\.json/g) || []).length === 0,
-  "Assistant workspace must use exactly one protected principal-root file",
+  "Legacy Assistant retains its exact protected workspace file for adoption",
 );
 assert(
   assistantGateway.includes("read_principal_root_object(") &&
@@ -953,7 +972,7 @@ assert(
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
-    assistantGateway,
+    `${assistantGateway}\n${assistantWorkspaceGateway}`,
   ),
   "Assistant workspace route must not encode backend endpoints, topology, or credentials",
 );
@@ -11426,7 +11445,7 @@ assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
     gatewayApi.includes("fn home_launch_target") &&
     gatewayApi.includes("fn is_home_visible_target") &&
-    gatewayApi.includes(
+    gatewayApi.replace(/\s+/g, " ").includes(
       "WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID",
     ) &&
     gatewayTests.includes(

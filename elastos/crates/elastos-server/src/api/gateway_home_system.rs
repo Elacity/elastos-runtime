@@ -3640,7 +3640,8 @@ pub(super) async fn home_browser_state_update(
     };
     match home_save_browser_state(&state.data_dir, &context, input) {
         Ok(state) => Json(state).into_response(),
-        Err(err) => home_error_response(err),
+        Err(err) => gateway_assistant_workspace_v2::migration_error_response(&err)
+            .unwrap_or_else(|| home_error_response(err)),
     }
 }
 
@@ -4405,8 +4406,10 @@ fn is_missing_principal_root_state_file(err: &anyhow::Error) -> bool {
 fn home_save_browser_state(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    input: HomeBrowserStateUpdate,
+    mut input: HomeBrowserStateUpdate,
 ) -> anyhow::Result<HomeBrowserStateSummary> {
+    let _migration_guard = gateway_assistant_workspace_v2::mutation_guard()?;
+    gateway_assistant_workspace_v2::preserve_legacy_home_agent(data_dir, context, &mut input)?;
     let mut state = home_browser_state(data_dir, context)?;
     if let Some(layout) = input.layout {
         state.layout = layout;
@@ -4895,16 +4898,20 @@ fn sanitize_home_session_targets(
     known_targets: &BTreeSet<String>,
 ) -> Option<serde_json::Value> {
     let session_object = session.as_object_mut()?;
-    let windows = session_object
+    let retains_agent = session_object.contains_key("agent");
+    let Some(windows) = session_object
         .get_mut("windows")
-        .and_then(|value| value.as_array_mut())?;
+        .and_then(|value| value.as_array_mut())
+    else {
+        return retains_agent.then_some(session);
+    };
     windows.retain(|window| {
         window
             .get("target")
             .and_then(|target| target.as_str())
             .is_some_and(|target| known_targets.contains(target))
     });
-    if windows.is_empty() {
+    if windows.is_empty() && !retains_agent {
         return None;
     }
     Some(session)

@@ -2,13 +2,26 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 
-globalThis.window = { location: { href: "http://home.invalid/apps/home-agent/", hash: "#home_token=fixture" } };
-const live = await import("../capsules/home-agent/browser/agent-live.js");
-const { turnStoreGet } = await import("../capsules/home-agent/browser/agent-context.js");
-const { recoverStalePersistedTurn } = await import("../capsules/home-agent/browser/agent-stream-qos.js");
-const controller = await import("../capsules/home-agent/browser/agent-stream.js");
-const workspace = await import("../capsules/home-agent/browser/agent-workspace.js");
-const sessions = await import("../capsules/home-agent/browser/agent-sessions.js");
+function fixtureWindow(location) {
+  // Use real event delivery for workspace/session and beforeunload listeners.
+  // Older Node versions need the browser's CustomEvent detail field supplied.
+  globalThis.CustomEvent ??= class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      this.detail = options.detail ?? null;
+    }
+  };
+  return Object.assign(new EventTarget(), {
+    location, setTimeout, clearTimeout, setInterval, clearInterval,
+  });
+}
+globalThis.window = fixtureWindow({ href: "http://home.invalid/apps/assistant/", hash: "#home_token=fixture" });
+const live = await import("../capsules/assistant/browser/agent-live.js");
+const { turnStoreGet } = await import("../capsules/assistant/browser/agent-context.js");
+const { recoverStalePersistedTurn } = await import("../capsules/assistant/browser/agent-stream-qos.js");
+const controller = await import("../capsules/assistant/browser/agent-stream.js");
+const workspace = await import("../capsules/assistant/browser/agent-workspace.js");
+const sessions = await import("../capsules/assistant/browser/agent-sessions.js");
 const defer = () => { let resolve, reject; const promise = new Promise((r, e) => { resolve = r; reject = e; }); return { promise, resolve, reject }; };
 const terminal = (kind) => ({ events: [{ sequence: 1, kind, terminal: true, data: kind === "output" ? { schema: "elastos.model.output.text/v1", text: "Done" } : {} }], next_cursor: 1, has_more: false });
 
@@ -97,12 +110,12 @@ test("Agent selection pair roundtrips with drafts; invalid pair blocks hydration
   }
   assert.equal(workspace.applyAgentWorkspaceSnapshot(saved), true);
   live.selectLiveOffer("other");
-  assert.equal(workspace.getAgentWorkspaceSnapshot().selectedModelCid, undefined);
+  assert.equal(workspace.getAgentWorkspaceSnapshot().selectedModelCid, null);
   live.selectLiveOffer("");
 });
 
 test("nested Agent Models intent registers top Home with exact origin and leaves draft alone", async () => {
-  const { openModelsFromAgent } = await import("../capsules/home-agent/browser/harness-host.js");
+  const { openModelsFromAgent } = await import("../capsules/assistant/browser/harness-host.js");
   const prior = { href: window.location.href, top: window.top };
   const messages = [];
   window.top = { postMessage: (message, origin) => messages.push({ message, origin }) };
@@ -306,10 +319,11 @@ for (const mode of ["lost_response", "invalid_json", "missing_run_id", "invalid_
 test("missing local launch token is proved refused before fetch", () => {
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
-    globalThis.window = { location: { hash: "", href: "http://home.invalid/apps/home-agent/" } };
+    const fixtureWindow = ${fixtureWindow.toString()};
+    globalThis.window = fixtureWindow({ hash: "", href: "http://home.invalid/apps/assistant/" });
     let calls = 0;
     globalThis.fetch = async () => { calls += 1; throw new Error("unexpected fetch"); };
-    const { modelRunCall } = await import(${JSON.stringify(new URL("../capsules/home-agent/browser/agent-live.js", import.meta.url).href)});
+    const { modelRunCall } = await import(${JSON.stringify(new URL("../capsules/assistant/browser/agent-live.js", import.meta.url).href)});
     await assert.rejects(modelRunCall("runs_create", {}),
       (error) => error.code === "missing-home-launch-token" && error.preDispatchRefusal === true);
     assert.equal(calls, 0);
@@ -322,7 +336,7 @@ function controllerFixture() {
     createElement: () => ({ addEventListener(type, callback) { this[type] = callback; } }),
     getElementById: () => null, addEventListener() {}, removeEventListener() {} };
   Object.assign(window, { setTimeout, clearTimeout, setInterval, clearInterval,
-    requestAnimationFrame: () => 1, cancelAnimationFrame() {}, addEventListener() {}, removeEventListener() {} });
+    requestAnimationFrame: () => 1, cancelAnimationFrame() {} });
   const ctx = { activeSessionId: "one", sessions: [{ id: "one", messages: [] }, { id: "two", messages: [] }],
     streamGeneration: 0, turnBusy: true, streamTimer: 0, followUpQueue: [] };
   controller.bindAgentStream(ctx, { streamEl: () => null, titleEl: () => null });
@@ -367,7 +381,10 @@ test("hydrated workspace uses the controller resume path and retains a real deni
   ctx.turnBusy = false;
   workspace.bindAgentWorkspaceStore({
     getSessions: () => ctx.sessions, setSessions: (value) => { ctx.sessions = value; },
-    setWorkspaceHydrated() {}, setSessionMode() {}, setActiveSessionId: (value) => { ctx.activeSessionId = value; },
+    getActiveSessionId: () => ctx.activeSessionId,
+    getSessionMode: () => ctx.sessionMode || "chat",
+    setSessionMode: (value) => { ctx.sessionMode = value; },
+    setWorkspaceHydrated() {}, setActiveSessionId: (value) => { ctx.activeSessionId = value; },
   });
   workspace.applyAgentWorkspaceSnapshot({ v: 1, activeSessionId: "one", sessions: [{ id: "one", messages: [],
     lastTurn: { turnId: "saved-controller", providerRunId: "saved-runtime-run", state: "streaming" } }] });
@@ -435,9 +452,9 @@ test("actual composer preserves draft for missing runs and unknown acceptance un
   Object.assign(window, { innerHeight: 800, matchMedia: () => ({ matches: true }) });
   globalThis.requestAnimationFrame = window.requestAnimationFrame;
   globalThis.cancelAnimationFrame = window.cancelAnimationFrame;
-  const harness = await import("../capsules/home-agent/browser/agent-harness.js");
-  const shelf = await import("../capsules/home-agent/browser/agent-shelf.js");
-  const bridge = await import("../capsules/home-agent/browser/agent-send.js");
+  const harness = await import("../capsules/assistant/browser/agent-harness.js");
+  const shelf = await import("../capsules/assistant/browser/agent-shelf.js");
+  const bridge = await import("../capsules/assistant/browser/agent-send.js");
   bridge.registerAgentHarnessApi({ sendToAgentHarness: harness.sendToAgentHarness });
   const calls = [];
   globalThis.fetch = async (url, init) => {

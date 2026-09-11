@@ -819,6 +819,14 @@ function toggleModelMenu() {
   }
 }
 
+export function setAssistantMode(mode) {
+  sessionMode = mode === "studio" ? "studio" : mode === "build" ? "build" : "chat";
+  const session = sessions.find((item) => item.id === activeSessionId);
+  if (session) session.mode = sessionMode;
+  syncSessionModeUi();
+  persistAgentWorkspaceSoon();
+}
+
 function syncSessionModeUi() {
   const harness = harnessEl();
   harness?.setAttribute("data-session-mode", sessionMode);
@@ -1631,10 +1639,7 @@ export function bindAgentHarness() {
     const sessionBtn = event.target.closest?.(".agent-harness-session-btn");
     if (sessionBtn) {
       event.preventDefault();
-      stopAgentStream({ keepPartial: true, cancelRun: false });
-      activeSessionId = sessionBtn.closest(".agent-harness-session")?.dataset.sessionId || null;
-      renderSessions();
-      renderActiveSession();
+      selectSession(sessionBtn.closest(".agent-harness-session")?.dataset.sessionId);
       if (isNarrowHarness()) {
         closeHarnessDrawer();
       }

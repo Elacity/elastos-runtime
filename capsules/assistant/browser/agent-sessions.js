@@ -7,7 +7,7 @@ import {
   listProjects,
   createProject,
 } from "./agent-state.js";
-import { persistAgentWorkspaceSoon } from "./agent-workspace.js";
+import { persistAgentWorkspaceSoon, captureActiveSessionState, restoreSessionState, serializeSessionForPersist } from "./agent-workspace.js";
 import { closeHarnessPage } from "./agent-configure.js";
 import {
   renderActiveSession,
@@ -65,8 +65,8 @@ export function touchSession(session) {
   persistAgentWorkspaceSoon();
 }
 
-export function exportActiveSessionMarkdown() {
-  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+export function exportActiveSessionMarkdown(sessionId = ctx.activeSessionId) {
+  const session = ctx.sessions.find((s) => s.id === sessionId);
   if (!session) {
     return;
   }
@@ -90,27 +90,16 @@ export function exportActiveSessionMarkdown() {
   URL.revokeObjectURL(url);
 }
 
-export function exportActiveSessionJson() {
-  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+export function exportActiveSessionJson(sessionId = ctx.activeSessionId) {
+  captureActiveSessionState();
+  const session = ctx.sessions.find((s) => s.id === sessionId);
   if (!session) {
     return;
   }
   const payload = {
     schema: "elastos.home.agent.session/v1",
     exportedAt: Date.now(),
-    session: {
-      id: session.id,
-      title: session.title,
-      group: session.group,
-      mode: session.mode || ctx.sessionMode,
-      pinned: Boolean(session.pinned),
-      projectId: session.projectId || null,
-      archived: Boolean(session.archived),
-      tags: Array.isArray(session.tags) ? session.tags.slice(0, 6) : [],
-      forkedFrom: session.forkedFrom || null,
-      updatedAt: session.updatedAt || Date.now(),
-      messages: session.messages || [],
-    },
+    session: serializeSessionForPersist(session),
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], {
     type: "application/json;charset=utf-8",
@@ -145,26 +134,34 @@ export function importSessionsFromJsonText(raw) {
     window.alert("Import failed — no sessions found");
     return 0;
   }
+  if (incoming.some((session) => !session || typeof session !== "object" || Array.isArray(session) ||
+      (session.title !== undefined && typeof session.title !== "string") ||
+      (session.messages !== undefined && (!Array.isArray(session.messages) ||
+        session.messages.some((message) => !message || typeof message !== "object" || Array.isArray(message)))))) {
+    window.alert("Import failed — invalid conversation records");
+    return 0;
+  }
   let added = 0;
+  captureActiveSessionState();
   for (const src of incoming) {
     if (!src || typeof src !== "object") {
       continue;
     }
-    const id = `s-import-${Date.now()}-${added}`;
+    const id = `s-import-${globalThis.crypto.randomUUID()}`;
     ctx.sessions = [
       {
+        ...JSON.parse(JSON.stringify(src)),
         id,
-        title: String(src.title || "Imported chat").slice(0, 64),
+        importedFromId: src.id ?? null,
+        title: String(src.title || "Imported chat"),
         group: src.group || "Today",
         mode: src.mode || "chat",
         pinned: Boolean(src.pinned),
         projectId: src.projectId || null,
         archived: Boolean(src.archived),
-        tags: Array.isArray(src.tags)
-          ? src.tags.map((t) => String(t || "").trim().slice(0, 24)).filter(Boolean).slice(0, 6)
-          : [],
-        forkedFrom: src.forkedFrom ? String(src.forkedFrom).slice(0, 80) : null,
-        updatedAt: Number(src.updatedAt) || Date.now(),
+        tags: Array.isArray(src.tags) ? src.tags : [],
+        forkedFrom: src.forkedFrom ?? null,
+        updatedAt: src.updatedAt ?? Date.now(),
         messages: Array.isArray(src.messages) ? src.messages : [],
       },
       ...ctx.sessions,
@@ -172,10 +169,7 @@ export function importSessionsFromJsonText(raw) {
     added += 1;
   }
   if (added) {
-    ctx.activeSessionId = ctx.sessions[0]?.id || ctx.activeSessionId;
-    renderSessions();
-    renderActiveSession();
-    persistAgentWorkspaceSoon();
+    selectSession(ctx.sessions[0]?.id);
   }
   return added;
 }
@@ -542,16 +536,24 @@ export function selectSession(sessionId) {
   if (!sessionId || !ctx.sessions.some((s) => s.id === sessionId)) {
     return;
   }
+  captureActiveSessionState();
   stopAgentStream({ keepPartial: true, cancelRun: false });
   closeHarnessPage();
   ctx.activeSessionId = sessionId;
+  restoreSessionState(ctx.sessions.find((s) => s.id === sessionId));
+  host.syncTruthStrip?.();
   renderSessions();
   renderActiveSession();
   persistAgentWorkspaceSoon();
 }
 
 export function newChat() {
-  stopAgentStream({ keepPartial: false, cancelRun: false });
+  captureActiveSessionState();
+  const previous = ctx.sessions.find(session => session.id === ctx.activeSessionId);
+  const recoveryDraft = previous?.lastTurn && !previous.lastTurn.completedAt &&
+    !["completed", "failed", "stopped"].includes(previous.lastTurn.state)
+    ? structuredClone(previous.composerDraft || {text: "", parts: []}) : null;
+  stopAgentStream({ keepPartial: true, cancelRun: false });
   closeHarnessPage();
   ctx.followUpQueue = [];
   try {
@@ -561,21 +563,27 @@ export function newChat() {
   }
   host.refreshHarnessDomCache?.();
   const blank = ctx.sessions.find(
-    (s) => s.title === "New chat" && !(s.messages && s.messages.length),
+    (s) => s.title === "New chat" && !s.archived && !s.lastTurn && !(s.messages && s.messages.length) &&
+      !s.composerDraft?.text && !s.composerDraft?.parts?.length,
   );
   if (blank) {
     ctx.sessions = [blank, ...ctx.sessions.filter((s) => s.id !== blank.id)];
     ctx.activeSessionId = blank.id;
   } else {
     const session = {
-      id: `s-${Date.now()}`,
+      id: `s-${globalThis.crypto.randomUUID()}`,
       title: "New chat",
       group: "Today",
+      mode: ctx.sessionMode === "build" ? "build" : "chat",
       messages: [],
     };
     ctx.sessions = [session, ...ctx.sessions];
     ctx.activeSessionId = session.id;
   }
+  const current = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (recoveryDraft && current) current.composerDraft = recoveryDraft;
+  restoreSessionState(current);
+  host.syncTruthStrip?.();
   renderSessions();
   renderActiveSession();
   shelfComposerInput()?.focus({ preventScroll: true });
@@ -602,6 +610,7 @@ export function renameSession(sessionId) {
 
 /** Wave 7.02 — copy chat into a new session (host-persisted; no Capsule authority). */
 export function forkSession(sessionId) {
+  captureActiveSessionState();
   const source = ctx.sessions.find((s) => s.id === sessionId);
   if (!source) {
     return;
@@ -612,35 +621,22 @@ export function forkSession(sessionId) {
   globalThis.crypto.getRandomValues(forkBytes);
   const forkSuffix = Array.from(forkBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   const forked = {
+    ...serializeSessionForPersist(source),
     id: `s-${Date.now()}-${forkSuffix}`,
-    title: `${baseTitle.slice(0, 54)} (fork)`.slice(0, 64),
+    title: `${baseTitle} (fork)`,
     group: "Today",
     pinned: false,
     archived: false,
     projectId: source.projectId || null,
-    mode: source.mode === "build" ? "build" : "chat",
-    tags: Array.isArray(source.tags) ? source.tags.slice(0, 6) : [],
+    mode: source.mode || "chat",
     forkedFrom: source.id,
     updatedAt: Date.now(),
-    messages: Array.isArray(source.messages)
-      ? source.messages.map((m) => {
-          if (!m || typeof m !== "object") {
-            return null;
-          }
-          if (m.role === "grant") {
-            return null;
-          }
-          return {
-            role: m.role === "user" || m.role === "agent" ? m.role : "agent",
-            text: m.text || "",
-            ...(m.thinking ? { thinking: m.thinking } : {}),
-            ...(m.partial ? { partial: true } : {}),
-          };
-        }).filter(Boolean)
-      : [],
+    ...(source.lastTurn ? { lastTurn: { ...serializeSessionForPersist(source).lastTurn, attachmentAllowed: false } } : {}),
   };
   ctx.sessions = [forked, ...ctx.sessions];
   ctx.activeSessionId = forked.id;
+  restoreSessionState(forked);
+  host.syncTruthStrip?.();
   renderSessions();
   renderActiveSession();
   persistAgentWorkspaceSoon();
@@ -670,7 +666,10 @@ export function editSessionTags(sessionId) {
 export function deleteSession(sessionId) {
   ctx.sessions = ctx.sessions.filter((s) => s.id !== sessionId);
   if (ctx.activeSessionId === sessionId) {
+    stopAgentStream({ keepPartial: true, cancelRun: false });
     ctx.activeSessionId = ctx.sessions[0]?.id || null;
+    restoreSessionState(ctx.sessions.find((s) => s.id === ctx.activeSessionId));
+    host.syncTruthStrip?.();
     renderActiveSession();
   }
   renderSessions();
@@ -820,8 +819,12 @@ export function runSessionAction(action) {
   if (action === "archive") {
     session.archived = !session.archived;
     if (session.archived && ctx.activeSessionId === id) {
+      captureActiveSessionState();
+      stopAgentStream({ keepPartial: true, cancelRun: false });
       ctx.activeSessionId =
         ctx.sessions.find((s) => !s.archived && s.id !== id)?.id || null;
+      restoreSessionState(ctx.sessions.find((s) => s.id === ctx.activeSessionId));
+      host.syncTruthStrip?.();
       renderActiveSession();
     }
     renderSessions();
@@ -829,13 +832,11 @@ export function runSessionAction(action) {
     return;
   }
   if (action === "export") {
-    ctx.activeSessionId = id;
-    exportActiveSessionMarkdown();
+    exportActiveSessionMarkdown(id);
     return;
   }
   if (action === "export-json") {
-    ctx.activeSessionId = id;
-    exportActiveSessionJson();
+    exportActiveSessionJson(id);
     return;
   }
   if (action === "import-json") {

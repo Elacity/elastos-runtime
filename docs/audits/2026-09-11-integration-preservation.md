@@ -381,3 +381,13 @@ must survive independently of presentation/context limits. Resolve concurrent
 409 saves and lossless history before installing the combined Assistant. Original
 URUX modules remain implementation evidence for confirmed gaps. Independent
 re-review accepts this corrected route; all 70 branches and 12 worktrees remain.
+
+## Canonical Assistant preservation
+
+The approved consolidation moves the integrated Sash Agent UI to `assistant`
+and carries the existing typed Studio controller with it. The old Home Agent
+source remains in Git history. Protected legacy stores remain intact, and v2
+adoption preserves all three stores before the installed app retires.
+[The convergence check](2026-09-11-assistant-convergence.md) records behavior,
+review findings and the remaining installed gate. This is a named preservation
+repair on the integrated source, not another extraction of URUX history.

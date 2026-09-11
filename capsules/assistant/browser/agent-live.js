@@ -316,7 +316,7 @@ export function detachLiveChatStream() {
 }
 
 export function unresolvedModelTurn(turn) {
-  return Boolean(turn?.providerRunId || turn?.createRequestId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
+  return turn?.attachmentAllowed !== false && (!turn?.actorCapsule || turn.actorCapsule === "assistant") && Boolean(turn?.providerRunId || turn?.createRequestId) && !turn.completedAt && ![TurnState.COMPLETED, TurnState.FAILED, TurnState.STOPPED].includes(turn.state);
 }
 
 export async function modelRunCall(op, body = {}) {

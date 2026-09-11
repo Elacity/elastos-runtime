@@ -1,3 +1,7 @@
+import { selectLiveOffer } from "./agent-live.js";
+import { selectSession, renderSessions } from "./agent-sessions.js";
+import { validModelCid } from "./model-selection.js";
+import { bindAssistantModes } from "./assistant-modes.js";
 /* Home Agent — capsule entry.
 
    Boots the harness exactly as Home GUI did (bind Shelf, bind harness) and
@@ -26,7 +30,7 @@ import {
   applyAgentWorkspaceSnapshot,
 } from "./agent-harness.js";
 import { handleShellEscape } from "./shell-popovers.js";
-import { postToHome, loadAgentWorkspace } from "./harness-host.js";
+import { postToHome, loadAgentWorkspace, bindWorkspaceApply, scheduleAgentWorkspacePersist } from "./harness-host.js";
 
 const HOME_MESSAGE_TYPES = new Set(["home-agent:open", "home-agent:shelf-handover", "home-agent:close"]);
 
@@ -36,6 +40,15 @@ function fromHome(event) {
 
 function taskbarEl() {
   return document.querySelector(".taskbar");
+}
+
+function applyLaunchQuery(query = {}) {
+  if (query.model_cid && validModelCid(query.model_cid)) {
+    selectLiveOffer(typeof query.offer_id === "string" ? query.offer_id : "", query.model_cid);
+    scheduleAgentWorkspacePersist();
+  }
+  if (query.session_id) selectSession(query.session_id);
+  if (["chat", "build", "studio"].includes(query.mode)) window.dispatchEvent(new CustomEvent("assistant:session-selected", {detail: {mode: query.mode}}));
 }
 
 function raiseRoom() {
@@ -112,6 +125,7 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (message.type === "home-agent:open") {
+    applyLaunchQuery(message.query);
     if (!agentShelfFaceActive() || !agentHarnessActive()) {
       raiseRoom();
     }
@@ -158,10 +172,23 @@ if (taskbar && typeof ResizeObserver === "function") {
    replaced. An unreachable Runtime still gets a ready room; it just starts empty
    and does not write until the workspace has been read. */
 loadAgentWorkspace()
-  .then((snapshot) => {
-    applyAgentWorkspaceSnapshot(snapshot);
+  .then(async (snapshot) => {
+    bindWorkspaceApply(document => {
+      if (applyAgentWorkspaceSnapshot(document) === false) return false;
+      renderSessions();
+      if (agentHarnessActive()) showAgentHarness({syncStage: false});
+      return true;
+    });
+    if (applyAgentWorkspaceSnapshot(snapshot) === false) throw new Error("Unsupported workspace document");
+    await bindAssistantModes(snapshot || {});
+    applyLaunchQuery(Object.fromEntries(new URL(location.href).searchParams));
+    scheduleAgentWorkspacePersist();
   })
-  .catch(() => {})
+  .catch(() => {
+    const notice = document.querySelector("#assistant-workspace-notice");
+    notice.hidden = false;
+    notice.textContent = "Your workspace could not be loaded. Reload to retry; existing work is unchanged.";
+  })
   .finally(() => {
     postToHome({ type: "home-agent:ready" });
   });

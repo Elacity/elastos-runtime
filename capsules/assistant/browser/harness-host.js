@@ -1,3 +1,4 @@
+import { migrateLegacyWorkspaces, mergeWorkspaceDocuments } from "./workspace-transition.js";
 /* Host seam for the Home Agent capsule.
 
    The harness was written inside Home GUI and imported a handful of shell
@@ -89,8 +90,8 @@ export function syncSpacePager() {}
    capsule owns the document's shape; the Runtime owns where it lives, who may
    read it and how large it may be. */
 
-const WORKSPACE_URL = "/api/apps/home-agent/workspace";
-const WORKSPACE_SCHEMA = "elastos.home-agent.workspace/v1";
+const WORKSPACE_URL = "/api/apps/assistant/workspace-v2";
+const WORKSPACE_SCHEMA = "elastos.assistant.workspace/v2";
 const PERSIST_DEBOUNCE_MS = 400;
 
 let snapshotFn = null;
@@ -99,6 +100,24 @@ let persistInFlight = null;
 let persistDirty = false;
 let workspaceRevision = null;
 let lastSnapshot = null;
+let migrationRevision = null;
+let applySnapshotFn = null;
+let canApplySnapshot = () => true;
+let mergeDeferred = false;
+export function bindWorkspaceMergeGuard(fn) { canApplySnapshot = fn; }
+let persistError = null;
+let conflictNotice = null;
+window.addEventListener("beforeunload", event => {
+  if (persistDirty || persistInFlight || persistError) {
+    event.preventDefault(); event.returnValue = "";
+  }
+});
+export function bindWorkspaceApply(fn) { applySnapshotFn = fn; }
+export function workspaceSaveError() { return persistError; }
+function reportSave(error) {
+  persistError = error;
+  window.dispatchEvent(new CustomEvent("assistant:workspace-save", {detail: {error: error || conflictNotice}}));
+}
 
 export function bindAgentWorkspaceSnapshot(getSnapshot) {
   snapshotFn = typeof getSnapshot === "function" ? getSnapshot : null;
@@ -107,12 +126,13 @@ export function bindAgentWorkspaceSnapshot(getSnapshot) {
 /** GET the saved workspace; null when the Runtime has none or is unreachable. */
 export async function loadAgentWorkspace() {
   const saved = await fetchJson(WORKSPACE_URL, { method: "GET" });
-  if (!saved || saved.schema !== WORKSPACE_SCHEMA) {
-    return null;
+  if (!saved || saved.schema !== WORKSPACE_SCHEMA || !Number.isInteger(saved.revision)) {
+    throw new Error("Unsupported workspace response");
   }
   workspaceRevision = Number.isInteger(saved.revision) ? saved.revision : 0;
-  const document = saved.document && typeof saved.document === "object" ? saved.document : null;
-  lastSnapshot = document && Object.keys(document).length ? document : null;
+  migrationRevision = saved.migration_revision ?? null;
+  const document = saved.legacy ? migrateLegacyWorkspaces(saved.legacy) : saved.document;
+  lastSnapshot = document && Object.keys(document).length ? structuredClone(document) : null;
   return lastSnapshot;
 }
 
@@ -125,7 +145,7 @@ export function scheduleAgentWorkspacePersist() {
   }, PERSIST_DEBOUNCE_MS);
 }
 
-async function persistAgentWorkspaceNow() {
+export async function persistAgentWorkspaceNow() {
   if (persistInFlight) {
     return persistInFlight;
   }
@@ -134,6 +154,7 @@ async function persistAgentWorkspaceNow() {
        race the load and the Runtime would refuse it (revision) anyway. */
     return null;
   }
+  if (mergeDeferred && !canApplySnapshot()) return null;
   let snap;
   try {
     snap = snapshotFn?.();
@@ -143,30 +164,58 @@ async function persistAgentWorkspaceNow() {
   if (!snap || typeof snap !== "object") {
     return null;
   }
+  snap = structuredClone(snap);
   persistDirty = false;
   persistInFlight = (async () => {
     try {
+      const sentRevision = workspaceRevision;
       const saved = await fetchJson(WORKSPACE_URL, {
         method: "PUT",
-        body: JSON.stringify({ schema: WORKSPACE_SCHEMA, if_revision: workspaceRevision, document: snap }),
+        body: JSON.stringify({ schema: WORKSPACE_SCHEMA, if_revision: workspaceRevision, document: snap, ...(migrationRevision ? {migration_revision: migrationRevision} : {}) }),
       });
-      if (saved && Number.isInteger(saved.revision)) {
+      if (!saved || saved.schema !== WORKSPACE_SCHEMA || saved.revision !== sentRevision + 1 || !saved.document || typeof saved.document !== "object") {
+        throw new Error("Invalid workspace save acknowledgement");
+      }
+      if (saved) {
         workspaceRevision = saved.revision;
         lastSnapshot = snap;
+        migrationRevision = null;
+        reportSave(null);
+        return true;
       }
     } catch (error) {
+      reportSave("Your changes are still open here. Workspace save failed; retry before closing.");
       if (error?.status === 409) {
-        /* Another frame of this capsule wrote first: take its revision, then
-           write ours on top on the next change. */
+        if (!canApplySnapshot()) {
+          mergeDeferred = true;
+          reportSave("This window has unsaved changes. Finish the current run, then select this message to merge and save both windows.");
+          return;
+        }
         try {
           const current = await fetchJson(WORKSPACE_URL, { method: "GET" });
-          if (current && Number.isInteger(current.revision)) {
-            workspaceRevision = current.revision;
+          if (!current || !Number.isInteger(current.revision)) return;
+          const remote = current.legacy ? migrateLegacyWorkspaces(current.legacy) : current.document;
+          // Include edits made while this request was in flight. Retain same-session
+          // conflicts as visible copies instead of overwriting either writer.
+          const local = snapshotFn?.() || snap;
+          const merged = mergeWorkspaceDocuments(lastSnapshot || {}, local, remote || {});
+          if (!applySnapshotFn) return;
+          if (!canApplySnapshot()) {
+            mergeDeferred = true;
+            reportSave("Finish the current run, then select this message to merge and save both windows.");
+            return;
           }
+          if (applySnapshotFn(merged.document) === false) throw new Error("Workspace merge could not be applied");
+          mergeDeferred = false;
+          workspaceRevision = current.revision;
+          migrationRevision = current.migration_revision ?? null;
+          lastSnapshot = structuredClone(remote || {});
+          persistDirty = true;
+          if (merged.conflicts.length) conflictNotice = "Changes from both windows were kept. Review the conflict copies.";
+          reportSave(null);
         } catch {
-          /* stays at the old revision; the next PUT reports again */
+          // Keep local work and the original revision; an explicit retry can recover.
         }
-        persistDirty = true;
       }
     } finally {
       persistInFlight = null;
@@ -176,6 +225,17 @@ async function persistAgentWorkspaceNow() {
     }
   })();
   return persistInFlight;
+}
+
+/** Flush the latest state before dispatching a new externally owned run. */
+export async function flushAgentWorkspace() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (workspaceRevision === null || (mergeDeferred && !canApplySnapshot())) return false;
+    await persistAgentWorkspaceNow();
+    if (persistError) return false;
+    if (JSON.stringify(lastSnapshot) === JSON.stringify(snapshotFn?.())) return true;
+  }
+  return false;
 }
 
 /* ---- messaging ------------------------------------------------------------- */
