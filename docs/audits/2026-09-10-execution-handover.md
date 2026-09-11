@@ -59,8 +59,11 @@ exact Qwen preparation and admission; the package hashes match and the activatio
 record binds the reviewed engine and weights. The Marketplace view stops polling
 at admission before dispatch readiness arrives. A bounded polling repair passes
 rendered regression checks in both Marketplace and System; it awaits installation.
-Continue with a fresh readiness observation, actual Assistant reply, stop, reload
-and restart/reuse. Preserve the admitted package and reuse the Runtime binary.
+A fresh view confirms readiness, but Assistant receives a catalog read denial
+before dispatch. The explicit consumer allowlist repair passes scoped authority
+regressions. Rebuild Runtime only, install both reviewed repairs, then prove the
+actual Assistant reply, stop, reload and restart/reuse. Preserve the admitted
+package and reuse provider artifacts.
 Linux J3 requires additional disk headroom before its installed proof. The
 preservation check and private checkpoint bind these receipts and remaining work.
 Public staging needs exact-candidate review and approval. Final installer stamping

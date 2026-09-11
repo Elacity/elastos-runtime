@@ -21,7 +21,9 @@ of the exact 6,169,366,387-byte Qwen package. The admitted weight hash matches t
 reviewed package; Runtime activation records the exact model offer. Marketplace
 stops polling at admission and can retain a stale unavailable message. A reproduced
 browser regression now passes with continued bounded readiness polling in both
-Marketplace and System. This UI repair awaits installation. Reply, stop, reload
+Marketplace and System. A fresh view confirms the exact model ready. Assistant then receives a catalog
+read denial before dispatch; the explicit consumer allowlist repair passes scoped
+authority regressions. These two repairs await installation. Reply, stop, reload
 and restart/reuse remain pending. Human Homes retain their existing candidate.
 Linux J3 needs additional disk headroom before model preparation and build margin;
 its previews and data remain preserved. The integration check records proof limits.

@@ -409,6 +409,8 @@ fn capsule_catalog_allowed_apps(data_dir: &std::path::Path) -> Vec<String> {
         HOME_CAPSULE_ID.to_string(),
         MARKETPLACE_CAPSULE_ID.to_string(),
         SYSTEM_CAPSULE_ID.to_string(),
+        "assistant".to_string(),
+        "home-agent".to_string(),
     ]);
     for capsule in capsule_catalog_summary(data_dir).capsules {
         if capsule.role == CapsuleRole::Shell && capsule.launchable {

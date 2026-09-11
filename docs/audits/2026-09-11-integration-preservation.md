@@ -235,3 +235,22 @@ Linux capacity preflight leaves an additional 13.4 GB needed for the same local
 package import and reserved preparation space, before build margin, while keeping
 the required ten-percent free-space floor. Linux model proof is pending; its
 existing source checkout, public service and previews were read only.
+
+
+## Model consumer catalog access
+
+A fresh installed Marketplace view shows the admitted Qwen model ready, with
+matching CID and offer. The first Assistant check then stops before dispatch:
+Home Agent receives HTTP 403 for the catalog read and can show only the offer,
+without its content identity. Standalone Assistant uses the same catalog route.
+The original read allowlist includes Home, Marketplace, System and shells, but
+omits both model consumers.
+
+The repair adds the two existing consumers to that explicit read allowlist.
+Existing token, origin, session and invocation checks retain their ownership.
+The regression first reproduces the denial, then passes 30 cases across both
+consumers and the three affected read routes: valid authority succeeds; missing,
+expired, unrelated-app and wrong-origin authority fail. Existing Home Agent run
+binding and unrelated-capsule model rejection also pass. Independent source
+review finds no blocking issue. The next installation changes Runtime and the
+two readiness-polling assets; the admitted package and providers are reused.
