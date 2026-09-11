@@ -955,7 +955,9 @@ export function appendProgressBlock() {
   details.hidden = true;
   const summary = document.createElement("summary");
   summary.className = "agent-thinking-summary agent-progress-summary";
-  summary.title = "Show activity";
+  summary.addEventListener("click", (event) => {
+    if (details.dataset.disclosure !== "true") event.preventDefault();
+  });
   const chevron = document.createElement("span");
   chevron.className = "agent-thinking-chevron";
   chevron.setAttribute("aria-hidden", "true");
@@ -1013,7 +1015,7 @@ function appendProgressItem(list, { className, glyph, text }) {
   list.append(li);
 }
 
-function paintProgressView(el, progress, { reasoning = "", reasoningVisible = false } = {}) {
+export function paintProgressView(el, progress, { reasoning = "", reasoningVisible = false } = {}) {
   if (!el || !progress) {
     return;
   }
@@ -1032,35 +1034,50 @@ function paintProgressView(el, progress, { reasoning = "", reasoningVisible = fa
   if (label && label.textContent !== nextLabel) {
     label.textContent = nextLabel;
   }
+  // The summary owns the current activity; the disclosure owns distinct history.
+  const milestones = (progress.milestones || []).filter(
+    (milestone) => milestone.text?.trim() && milestone.text.trim() !== nextLabel.trim(),
+  );
+  const showRaw = Boolean(reasoningVisible && reasoning.trim());
+  const hasDisclosure = milestones.length > 0 || showRaw;
+  el.dataset.disclosure = String(hasDisclosure);
+  if (!hasDisclosure) el.open = false;
+  const summary = el.querySelector("summary");
+  if (summary) {
+    summary.tabIndex = hasDisclosure ? 0 : -1;
+    if (hasDisclosure) {
+      summary.removeAttribute("aria-disabled");
+      summary.title = showRaw ? "Show activity and reasoning" : "Show completed activity";
+    } else {
+      summary.setAttribute("aria-disabled", "true");
+      summary.removeAttribute("title");
+    }
+  }
   const list = el.querySelector(".agent-progress-milestones");
   if (list) {
-    const currentBit = live && progress.current ? `|${progress.current.key}:${progress.current.text}` : "";
-    const keys = `${(progress.milestones || []).map((m) => m.key).join("|")}${currentBit}`;
+    const keys = JSON.stringify(milestones);
     if (list.dataset.keys !== keys) {
       list.dataset.keys = keys;
       list.replaceChildren();
-      for (const m of progress.milestones || []) {
+      for (const m of milestones) {
         appendProgressItem(list, {
           className: m.kind === "finding" ? "is-finding" : "is-done",
           glyph: progressGlyph(m.phase, m.kind),
           text: m.text,
         });
       }
-      if (live && progress.current && progress.current.kind !== "finding") {
-        appendProgressItem(list, {
-          className: "is-current",
-          glyph: progressGlyph(progress.current.phase, progress.current.kind),
-          text: progress.current.text,
-        });
-      }
     }
+    list.hidden = milestones.length === 0;
   }
   const raw = el.querySelector(".agent-progress-raw");
   if (raw) {
-    const showRaw = Boolean(reasoningVisible && reasoning);
     raw.hidden = !showRaw;
     if (showRaw) {
-      raw.dataset.mdSource = reasoning;
+      // Actual model reasoning stays plain text, including during streaming.
+      if (raw.dataset.mdSource !== reasoning) {
+        raw.dataset.mdSource = reasoning;
+        raw.textContent = reasoning;
+      }
     }
   }
 }
@@ -1755,7 +1772,6 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   let sawFirstToken = false;
   let stickToBottom = true;
   let answerNotifiedAt = 0;
-  let reasoningRendered = false;
   let hiddenBuffered = false;
   let progressEl = null;
   let revealTimer = 0;
@@ -1808,24 +1824,11 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       }
       if (!progressEl && next.revealed) {
         progressEl = appendProgressBlock();
-        progressEl?.addEventListener("toggle", () => {
-          pauseFollow();
-          if (!progressEl.open || reasoningRendered || !state.complete) {
-            return;
-          }
-          reasoningRendered = true;
-          const raw = progressEl.querySelector(".agent-progress-raw");
-          if (raw && ctx.reasoningVisible) {
-            const thinking = getReasoning();
-            raw.textContent = thinking;
-            raw.dataset.mdSource = thinking;
-            raw.hidden = false;
-          }
-        });
+        progressEl?.addEventListener("toggle", () => pauseFollow());
       }
       paintProgressView(progressEl, next, {
-        reasoning: "",
-        reasoningVisible: false,
+        reasoning: ctx.reasoningVisible ? getReasoning() : "",
+        reasoningVisible: ctx.reasoningVisible,
       });
     },
   });
@@ -2380,6 +2383,11 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
                     progress.dispatch({ type: "REVEAL" });
                   },
                 });
+                // A reasoning delta need not change the current progress phase.
+                paintProgressView(progressEl, progress.getState(), {
+                  reasoning: ctx.reasoningVisible ? getReasoning() : "",
+                  reasoningVisible: ctx.reasoningVisible,
+                });
               }, 0);
             }
           }
@@ -2477,6 +2485,10 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
 
     progress.dispatch({
       type: stoppedEarly ? "GENERATION_STOPPED" : "GENERATION_DONE",
+    });
+    paintProgressView(progressEl, progress.getState(), {
+      reasoning: thinking,
+      reasoningVisible: ctx.reasoningVisible,
     });
     const progressSnap = snapshotProgress(progress.getState());
     if (progressEl && !progressSnap?.milestones?.length && !thinking) {

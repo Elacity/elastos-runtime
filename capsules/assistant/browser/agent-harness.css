@@ -1597,6 +1597,17 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   -webkit-text-fill-color: currentColor;
 }
 
+/* A lone current activity is a status line, with no empty disclosure. */
+.agent-progress[data-disclosure="false"] .agent-progress-summary {
+  cursor: default;
+}
+
+.agent-progress[data-disclosure="false"] .agent-thinking-chevron,
+.agent-progress[data-disclosure="false"] .agent-progress-trace,
+.agent-progress-milestones[hidden] {
+  display: none;
+}
+
 .agent-progress-trace {
   min-width: 0;
 }
