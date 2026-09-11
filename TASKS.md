@@ -20,7 +20,10 @@ owns the verification recipes and monitoring decisions; [state.md](state.md)
 owns source, installed and public facts.
 
 Session handover: [2026-09-10 execution handover](docs/audits/2026-09-10-execution-handover.md).
-Anders requested closeout at 49% weekly usage; resume only on request. After the
+The combined automated installed checkpoint passes; AUTH-01 needs the required
+user-operated passkey check in the prepared isolated Homes. See
+[its report](docs/audits/2026-09-11-first-checkpoint.md). Broader execution and
+recurring monitoring remain paused; continue only on request. After the
 current J1 repairs, prioritize the two visible Home assistants (one reported
 outdated), the model loading failure, and the Browser loading failure. Reproduce
 on the installed artifact before donor integration. Preserve user drafts and
@@ -39,7 +42,7 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 | C1-proof | The execution loop handles a real reviewed slice | Accepted for source review and monitoring / coordinator | Independent source/rendered review, nine process cases and actual recurring monitor delivery pass. Continue through installed and public proof under C1-seed. |
 | C1-seed | Seed serves the reviewed local candidate and storefront | Private working build verified / coordinator | Runtime d790a48e and storefront pass artifact parity, account/sign-in/System and actual Profile-inclusive Recovery Kit export. Clean private preview is available. Public stage is prepared; explicit approval, existing-account proof and full journey acceptance remain open. |
 | C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
-| J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Paused after source acceptance / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Next: rebuild affected outputs once and verify these repairs together on matching installed artifacts; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
+| J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Human passkey proof pending / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Both targets pass installed browser recovery/reload/retry, complete owned shutdown/restart, full Home setup/media reuse and Carrier cleanup/reuse. Next: AUTH-01 user-operated passkey on the prepared candidate; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
 | J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
 | J3 / C3 | Obtain a model through Content/Carrier and use it locally | Planned / model and Content owners | J1 parent; acceptance steps 1, 2, 3 and 5 in section 6 of the approved plan. Hosted/Codex adapters are Optional before freeze; remote inference and Jetson are Later. |
 | J4 / C4 | Browser works in the two agreed placements | Planned / Browser owner | Retain canonical B01-B16 on the Browser branch; Mac A/A/A and Linux Home/Exit with Mac Engine A/B/A, including reload. Full claimed-role proof remains C6. |
@@ -56,7 +59,8 @@ the final signed platform packages after the source freeze.
 Immediate preview delivery: the fixed d790 candidate passed Mac installation
 and seed export; the user also installed it. The observed shutdown,
 duplicate-download and kit-first recovery repairs now pass source checks.
-Verify them together on matching installed artifacts. Preserve both user test Homes. The public deployment
+The combined automated installed checks pass. AUTH-01 needs a user-operated
+passkey on the prepared matching artifacts; preserve its pending verdict. Preserve all user test Homes. The public deployment
 package is prepared and awaits approval plus target checks. Jetson is deferred
 at the user's request. Wider J2–J5 work and final three-platform assembly remain
 required for release; unchanged artifacts retain their evidence.

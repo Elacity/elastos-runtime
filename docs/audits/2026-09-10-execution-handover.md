@@ -1,9 +1,11 @@
 # ElastOS 0.7.1 execution handover
 
-Session closeout requested by Anders on 2026-09-10 after 49% of the weekly
-allowance was used. Anders then requested a handover review and safe branch
-cleanup. That closeout work is complete; product execution remains paused until
-Anders resumes it. The full five-journey release mission remains open.
+The combined automated checkpoint passes on Mac ARM64 and Linux x86_64.
+[The checkpoint report](2026-09-11-first-checkpoint.md) records the target results,
+repairs and remaining human prerequisite. AUTH-01 keeps its pending verdict
+until a user-operated passkey proves the flow. Fresh isolated Homes are ready;
+their private URLs and receipts are in the current checkpoint. Broader execution
+and recurring monitoring remain paused. Full J1–J5 and D1–D6 acceptance stays intact.
 
 ## Resume here
 
@@ -22,27 +24,25 @@ donors. Before edits, recheck HEAD/tree, dirt, fetched divergence and target
 receipts. Local source is ahead of installed artifacts. A new source commit
 alone does not require rebuilding every component.
 
-The closeout review started from clean source `3f789db1`, tree
-`a8ca58bad7c36b8b4e441e700b5286b06a14d50c`, 48 ahead and zero behind the
-fetched dev base. Subsequent closeout edits affect documentation only. The
-private checkpoint records the final handover commit. Use this checkout
-explicitly: the default repository checkout contains unrelated dirty donor work.
+The reviewed code candidate is `f21d285ec93e91b6a6b0ab0221e311668ecf77bf`, tree
+`3a51a2562f011506678152d00453ccf420e2da41`, 51 ahead / zero behind dev `6c61c990`.
+Closeout documentation follows that candidate. The default checkout contains
+unrelated dirty donor work; use the website checkout explicitly.
 
-First execution checkpoint: read the source-repair receipts, select one combined
-working candidate, rebuild only affected outputs, and prove kit-first Recover
-with the original Profile DID/name plus prompt shutdown on matching installed
-artifacts. The private Mac assembly helper is pinned to the older candidate;
-review and update its explicit source input before using it. Preserve both user
-test Homes, keys and the private publisher. Revalidate process IDs and port
-ownership before restarting anything. This working build precedes the final
-release assembly after C5. Capture bounded diagnostics on the first test failure.
+One owner built the Runtime once per platform for the revised candidate and
+reused unchanged verified artifacts. The old pinned assembly helper was reviewed
+and left unused. Official installation receipts were refreshed after manifest
+changes. Automated test gateways are stopped; only isolated human-test Homes
+remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
 
-The public deployment stage also contains the older `d790a48e` candidate. Replace
-the staged artifacts with the selected candidate, then refresh their receipt and
-preservation plan before seeking deployment approval. Product development and
-recurring monitors stay paused during this closeout review.
+The next action is the required human passkey check on the exact candidate.
+Use Recover, select an existing kit, finish passkey consent and verify the
+original Profile DID/name. Retain wrong-password/retry and reload → sign-in →
+System continuation checks. Reuse automated receipts; another build requires a
+relevant source change. Public staging needs exact-candidate review and approval.
+Final installer stamping and signing follow C5 source freeze.
 
-## Delivered and verified
+## Earlier preview evidence
 
 - Storefront design/content follows the supplied reference. Its launch path is
   `/home/`. The private seed serves product candidate `d790a48e`.
@@ -52,7 +52,8 @@ recurring monitors stay paused during this closeout review.
 - Linux seed source/installed/served parity and actual Recovery export pass.
   A clean seed Home is available separately from automated test identities.
 - Carrier transfer cleanup is committed as `4e62b6db`; six focused lifecycle
-  tests pass. It awaits the combined installed test build.
+  tests pass. Installed success/error/timeout cleanup and endpoint reuse now pass; exact
+  internal cases retain their separate source evidence in the checkpoint report.
 - Recovery export smoke `49a62db1` uses the loaded foreground System window.
   Earlier failures were retained: static controls and restored covered windows
   made the test click the wrong surface. The final actual export passes.
@@ -61,38 +62,23 @@ recurring monitors stay paused during this closeout review.
 
 ## Current repairs and acceptance limits
 
-The kit-first recovery source opens the file picker when Recover is selected,
-then performs required passkey setup and imports through Runtime. Profile DID
-and exact name are checked by recovery tests and the Home summary. File/password
-state stays in memory. Wrong encrypted passwords are checked by the server after
-passkey setup. A reload clears this memory; sign-in/System recovery is still the
-resumption path and needs a coherent follow-up. Installed recovery acceptance
-remains open. Notion now states the intended order: Create stores the protected
-Profile and display name before exporting a complete Recovery Kit; Recover opens
-kit selection first and restores the existing Profile. Refresh an earlier kit
-when later Profile changes require it. The journey workbook's AUTH-01 wording
-still needs the same correction before its next run; retain its pending verdict.
+Recover opens kit selection first. Both installed targets restore the original
+Profile DID/name, preserve existing identity data after a wrong password, and
+complete browser retry and reload/sign-in/System continuation. `a45164cf` fixes
+completed-kit retry after a fresh sign-in while retaining strict token binding.
+AUTH-01 is corrected and remains pending its user-operated authenticator.
 
-Installed `d790a48e` still has the reported slow shutdown and duplicate media-tool
-download behavior. Source repair `a8b8f54d` closes active connections before
-releasing data-root ownership and proves EOF/reset, child reaping and safe
-restart. Repair `f8824ee4` distinguishes tool archives from capsules while
-preserving archive CID/checksum validation. Their next gate is combined installed
-verification.
-
-Closeout source acceptance: recovery `67572db1` passes enrollment edge cases,
-six viewport checks, encrypted fresh-machine and real-enrollment recovery
-checks with exact Profile DID/name and Home summary assertions. Media-tool
-reuse `f8824ee4` passes seven setup/cache checks. Gateway connection closure
-passes five isolated tests in 2.03 seconds, including EOF/reset, child reaping
-and safe reuse. The combined run's fixture failure came from concurrent PATH
-mutation by setup tests; isolate environment-mutating tests in future runs.
-All three repairs passed source review. They are not installed merely
-because source checks pass. Preserve both of Anders's Mac test Homes and keys.
+Full Home shutdown exposed detached managed children after the earlier API-only
+pass. `f21d285e` repairs ownership and awaited cleanup. Both targets now close
+three held connections, stop all owned descendants, remove coordinates, release
+the port and restart the same Home. Full Home setup twice, media integrity and
+installed Carrier cleanup/reuse pass. The report retains first failures, source
+proof boundaries and exact artifact hashes. Automated acceptance passes; the
+wider J1 app matrix and human qualification remain separate.
 
 ## Remaining goals, in priority order
 
-1. **Finish J1:** verify the current recovery/shutdown/install repairs together;
+1. **Finish J1:** finish the checkpoint’s user-operated passkey proof;
    prove restored Profile/name, returning sign-in, Desktop/Terminal and shared
    app behavior. Complete remaining setup, save-conflict and window work.
 2. **Deliver the public preview:** approve and deploy the reviewed storefront
@@ -129,7 +115,7 @@ and reflog revisions remain reachable from retained refs, with an exact restorat
 map in the private cleanup receipt. Another 24 merged-tip candidates retain
 historical reflog work and need review before removal.
 
-All 12 worktrees remain. The active website checkout is clean at handoff; the
+All 12 worktrees remain. The active website checkout is clean after the checkpoint closeout commit; the
 root documentation, Browser maturity and Home URUX worktrees contain preserved
 dirty work. The detached Browser build is contained in `fix/browser-maturity`.
 Three historical backup refs and the clean review/build worktrees retain their

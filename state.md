@@ -1,6 +1,20 @@
 # State
 
-Last updated: 2026-09-10 UTC
+Last updated: 2026-09-11 UTC
+
+- The combined automated J1/C2 checkpoint passes on Mac ARM64 and Linux
+  x86_64 installed candidate `f21d285e`. Browser recovery restores the original
+  Profile DID/name and covers wrong-password data preservation, retry and
+  reload/sign-in/System continuation. `a45164cf` repairs completed-kit retry
+  after a new sign-in; `f21d285e` repairs managed child ownership at shutdown.
+  Both targets close three held connections, all owned descendants and their
+  coordinates, release the port and restart the same Home. Full Home setup
+  repetition, media integrity and installed Carrier cleanup/reuse pass.
+  [The report](docs/audits/2026-09-11-first-checkpoint.md) binds source, hashes,
+  receipts and evidence limits. AUTH-01 retains its pending human passkey
+  verdict; isolated Homes are prepared. Automated test services are stopped,
+  broader execution and recurring monitoring are paused. Existing user previews
+  and public stage retain `d790a48e`; public live remains unchanged.
 
 - J1 identity foundation integrates registration RP/origin binding and atomic,
   conflict-safe identity persistence from donors `145fec2b` and `eb25f747`.
@@ -26,7 +40,8 @@ Last updated: 2026-09-10 UTC
 - Mac testing exposed unclosed download connections, slow gateway shutdown
   and duplicate media-tool installation. Carrier repair `4e62b6db` passes six
   focused lifecycle tests and basic repository gates. Gateway connection closure passes five isolated tests; media setup reuse
-  passes seven setup/cache checks. These repairs await combined installed verification.
+  passes seven setup/cache checks. The combined installed checkpoint now has the scoped results above; full
+  journey acceptance remains pending.
   Recovery source `67572db1` enters kit selection before passkey setup;
   exact Profile DID/name restoration, Home summary and retry checks pass. The installed preview retains its earlier recovery flow.
 
