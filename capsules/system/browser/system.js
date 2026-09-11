@@ -100,6 +100,7 @@ let technicalInspectEntries = [];
 let technicalSelectedId = "";
 let registeredProviderSchemes = new Set();
 let currentAccess = {};
+let currentProfileName = "";
 let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
@@ -291,6 +292,8 @@ function renderRecoveryProfileSetup(identity) {
 
 function renderSystemSummary(systemSummary) {
   const identity = systemSummary.identity || {};
+  currentProfileName = identity.profile?.schema === "elastos.profile-summary/v1"
+    ? readText(identity.profile.display_name) : "";
   renderRecoveryProfileSetup(identity);
   const appearance = parseAppearance(systemSummary.appearance);
   const authority = systemSummary.authority || {};
@@ -2076,7 +2079,8 @@ function accountRow(passkey, listState = {}) {
 
   const title = document.createElement("strong");
   const role = passkeyRoleLabel(passkey.role);
-  const label = readText(passkey.display_name) || (passkey.current ? "Current account" : "Account");
+  const label = readText(passkey.display_name)
+    || (passkey.current ? currentProfileName || "Current account" : "Account");
   title.textContent = label;
 
   nameWrap.append(title);
@@ -2407,6 +2411,7 @@ async function submitRecoveryImport(body, terminalRetryToken = "") {
     apiHomeToken = readText(response.home_token);
   }
   await refreshRecoveryStatus();
+  await refreshSystemSummary();
   await refreshAccountList();
   notifyHomeSummaryChanged();
   if (recoveryImportIsComplete(response)) {
