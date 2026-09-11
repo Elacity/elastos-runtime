@@ -54,20 +54,21 @@ history, adopted behavior, explicit differences and remaining proof. URUX,
 Irzhy authority cutover and the Required follow-up work enter after this installed
 checkpoint, in dependency order. Keep both Assistant workspace stores intact;
 one visible Assistant requires full history and draft preservation. Integrated
-UI and model acceptance remains pending. Installed Mac Runtime `ab993a99` completes
-exact Qwen preparation and admission; the package hashes match and the activation
-record binds the reviewed engine and weights. The Marketplace view stops polling
-at admission before dispatch readiness arrives. A bounded polling repair passes
-rendered regression checks in both Marketplace and System; it awaits installation.
-A fresh view confirms readiness. The Assistant catalog read denial is repaired
-in installed Runtime `f72810fb`, with matching hashes and both UI asset manifests
-refreshed. Cold restart then fails model startup because the admitted package
-verifier's local IPFS backend is idle. The source repair prepares that backend
-before hashing; 23 related tests pass and four environment tests remain separate.
-Rebuild Runtime only for this repair, preserve the admitted package, then prove
-exact selection, actual reply, stop, reload and restart/reuse. Linux needs
-additional disk headroom and a reviewed startup profile. The private checkpoint
-owns current processes and receipts; user Homes remain preserved.
+UI and full model acceptance remain pending. Installed Mac Runtime `fbf1a4b0`
+now passes exact Qwen admission, cold startup, selection, an actual typed reply
+and saved conversation. Reply, draft and exact CID/offer survive reload with zero
+implicit dispatches. Stop returns an honest unknown outcome, as permitted by J3
+Step 5; confirmed backend cancellation remains separate. The native adapter
+intentionally records unknown when stream closure cannot prove backend stop.
+Owned shutdown closes all 29 processes including the engine, a held HTTP connection
+and the listener. The same installed Home restarts, produces a second real reply
+and restores the original draft. All six package files, protected files and prior
+message hashes match; measured reuse receives zero Bitswap payload and makes zero
+Content mutations. Independent review accepts this bounded Mac milestone. Current manifests and receipts bind all changed artifacts;
+providers, engine and the admitted package are reused. The model menu has stale
+empty-state copy and overlaps its picker; retain those UI repairs before acceptance.
+Linux needs additional disk headroom and a reviewed startup profile. The private
+checkpoint owns current processes and receipts; user Homes remain preserved.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

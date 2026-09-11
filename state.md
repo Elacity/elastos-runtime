@@ -14,18 +14,26 @@ in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
 Assistant consolidation, original UI parity and installed Qwen proof remain open.
 
 
-The isolated Mac J3 installation verifies signed Qwen catalog visibility in
-System and Marketplace, Use/cancel/retry, exact local package admission and a
-fresh ready view. Runtime `f72810fb` and the readiness UI repair are installed
-with matching build/install/served hashes and refreshed manifests. The catalog
-consumer repair passes scoped authority tests. Cold restart then exposes a missing
-IPFS readiness step before package hashing, leaving the model provider unavailable.
-The regression reproduces this failure; the readiness repair passes 23 related
-startup/integrity/activation/retirement tests, with four environment tests ignored.
-Its installed check is next. Reply, stop, reload and restart/reuse remain pending.
+The isolated Mac J3 installation runs Runtime `fbf1a4b0` with matching build,
+installed and served hashes and current manifests. Signed catalog visibility,
+Use/cancel/retry, exact local package admission, cold startup, exact model
+selection, an actual Qwen reply and its saved conversation pass. Reply and unsent
+draft survive reload with the same CID/offer and zero implicit dispatches.
+Explicit Stop returns `settlement_unknown`; the UI says “Outcome unknown” and
+keeps that result after reload. This passes the approved honest-unknown alternative;
+confirmed backend cancellation remains unproven. The native adapter deliberately
+preserves this distinction when HTTP stream closure cannot confirm backend stop.
+
+Owned shutdown closes all 29 processes, including the model engine, closes a held
+HTTP connection and releases the port. The same installed Home restarts and produces a second real reply. All six package
+files keep their hashes, sizes, inodes and modification times; protected files and
+prior message hashes match. The original unsent draft is restored. There are zero
+Content mutations and zero Bitswap payload bytes received during measured reuse. Two model-menu UI
+gaps are recorded: stale empty-state copy and overlap with the picker button.
 Human Homes retain their existing candidate. Linux J3 requires additional disk
-headroom and a reviewed target startup profile; its previews and data are preserved.
-The integration check records the failure, repair and proof limits.
+headroom and a reviewed target startup profile. Its previews and data are preserved.
+The [integration check](docs/audits/2026-09-11-integration-preservation.md) records
+failures, repairs, independent review and the remaining full J3 gates.
 
 Last updated: 2026-09-11 UTC
 

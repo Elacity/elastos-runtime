@@ -274,7 +274,40 @@ the current worker guard. Integrity checks and package identity remain mandatory
 The startup module passes 23 tests, including cold success, readiness failure,
 unchanged package/configuration, no new Content reads, identity, activation and
 retirement. Four native/environment cases remain ignored in that source run.
-Independent review finds no blocking issue. The installed cold restart must still
-advertise the same offer without another Use or model transfer, before reply and
-lifecycle acceptance. The Runtime startup profile currently accepts Mac ARM64;
+Independent review finds no blocking issue. Installed Runtime `fbf1a4b0` now
+advertises the same offer after cold startup without another Use or model transfer. The Runtime startup profile currently accepts Mac ARM64;
 Linux needs its reviewed profile and target proof as well as disk headroom.
+
+
+## Installed reply, reload and Stop
+
+The Mac test Home runs Runtime `fbf1a4b0`, source tree `7087ce4c`, with matching
+built and installed SHA-256 `b53127c3429b6f4d4a368cbd808d0f39fec70bbebf205c5a416865dc53bda54f`.
+The current installation receipt binds reused providers, engine and capsule assets.
+The exact admitted Qwen content selects its recorded offer, starts a native engine
+and answers “Qwen is ready.” through the typed run contract. The saved conversation
+acknowledgment binds that reply to the same run, offer, CID and principal. Reload
+preserves the completed reply and an exact unsent test draft without implicit runs.
+
+Explicit Stop returns `reconciling`, followed by terminal `settlement_unknown`.
+The UI shows “Outcome unknown” and preserves it after reload. This passes the honest
+unknown alternative in the approved J3 Step 5; it does not prove backend cancellation.
+Independent review confirms the intentional local/hosted stream-closure policy and
+the existing native cancellation regression. Owned shutdown separately closes all
+29 processes, including the engine and its guard, the held HTTP connection and port.
+The same installed Home restarts and produces a second typed reply. Its saved
+acknowledgment binds the new run to the same principal, CID and offer. The original
+draft is restored at workspace revision 13; both prior conversations retain their
+message hashes. All six admitted files match by SHA-256, size, inode and modification
+time across shutdown, restart and final observation. Their total is 6,169,367,114
+bytes, including the 727-byte object metadata file. Protected identity files match.
+There are zero Content mutations and zero Bitswap payload bytes received during
+the measured restart/reuse interval. Independent review accepts this bounded
+Mac milestone; workbook E-109 records its scope.
+
+Private raw reports preserve the first test failures: selection checks ran before
+asynchronous model refresh settled, then an expanded menu intercepted the picker.
+The harness now checks stored CID/offer, waits for the exact selected row and uses
+the supported Escape dismissal. The product menu still shows stale “No model” text
+above a ready model and can overlap its button; these remain explicit UI repair work.
+Full J3, Linux target proof, one Assistant and original URUX parity remain pending.
