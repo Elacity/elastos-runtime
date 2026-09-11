@@ -1784,6 +1784,54 @@ async fn test_full_recovery_bundle_returns_tokens_when_outcome_audit_needs_retry
     assert_eq!(repeated["wallet_restore"]["status"], "complete");
     assert_eq!(repeated["runtime_audit"]["status"], "complete");
 
+    let (new_session_status, new_session_repeat) = import_raw_full_recovery_bundle(
+        &import_app,
+        &cross_session_token,
+        incomplete["principal_id"].as_str().unwrap(),
+        incomplete["localhost_root"].as_str().unwrap(),
+        &bundle,
+        false,
+    )
+    .await;
+    assert_eq!(new_session_status, StatusCode::OK, "{new_session_repeat}");
+    assert_eq!(new_session_repeat["runtime_audit"]["status"], "complete");
+
+    let (old_retry_status, _) = import_raw_full_recovery_bundle_with_terminal_retry(
+        &import_app,
+        &cross_session_token,
+        incomplete["principal_id"].as_str().unwrap(),
+        incomplete["localhost_root"].as_str().unwrap(),
+        &bundle,
+        false,
+        Some(&terminal_retry_token),
+    )
+    .await;
+    assert_eq!(old_retry_status, StatusCode::FORBIDDEN);
+
+    let unrelated = passkey_authority_with_name_role(
+        dir.path(),
+        Some("unrelated"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    for (token, root) in [
+        (
+            unrelated.system_token.as_str(),
+            incomplete["localhost_root"].as_str().unwrap(),
+        ),
+        (cross_session_token.as_str(), "localhost://wrong-root"),
+    ] {
+        let (status, response) = import_raw_full_recovery_bundle(
+            &import_app,
+            token,
+            incomplete["principal_id"].as_str().unwrap(),
+            root,
+            &bundle,
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    }
+
     let requests = wallet_provider.requests.lock().await;
     let import_count = decode_recorded_wallet_requests(&requests)
         .iter()

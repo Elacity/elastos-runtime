@@ -1445,7 +1445,7 @@ async fn full_recovery_bundle_import_inner(
         && (input.principal_id != bundle_principal || input.localhost_root != bundle_root)
     {
         anyhow::bail!(
-            "full recovery bundle belongs to another account; use account recovery to attach it"
+            "full recovery bundle account/root binding mismatch; use account recovery to attach it"
         );
     }
     let expected_wallet_count = recovery_set.keys.len();
@@ -1511,12 +1511,18 @@ async fn full_recovery_bundle_import_inner(
             &state.data_dir,
             &completed_audit_id,
         )? {
-            validate_recovery_terminal_retry_event(
+            let principal = require_active_passkey_principal_for_context(state, &context)?;
+            if principal.principal_id != input.principal_id
+                || principal.localhost_root != input.localhost_root
+            {
+                anyhow::bail!("completed recovery principal/root binding mismatch");
+            }
+            // The signed local receipt records the original session. A later
+            // authenticated session can read its result without repeating import.
+            validate_completed_recovery_outcome(
                 &completed_event,
                 &completed_audit_id,
                 bundle_principal,
-                context.proof_binding_id.as_deref(),
-                &context.session_id,
                 expected_wallet_count,
                 &bundle_sha256,
             )?;
@@ -2193,6 +2199,28 @@ fn validate_recovery_terminal_retry_event(
     expected_wallet_count: usize,
     bundle_sha256: &str,
 ) -> anyhow::Result<()> {
+    validate_completed_recovery_outcome(
+        event,
+        expected_event_id,
+        principal_id,
+        expected_wallet_count,
+        bundle_sha256,
+    )?;
+    if event.proof_binding_id.as_deref() != proof_binding_id
+        || event.session_id.as_deref() != Some(session_id)
+    {
+        anyhow::bail!("Recovery terminal retry evidence binding mismatch");
+    }
+    Ok(())
+}
+
+fn validate_completed_recovery_outcome(
+    event: &RuntimeAuditEventV1,
+    expected_event_id: &str,
+    principal_id: &str,
+    expected_wallet_count: usize,
+    bundle_sha256: &str,
+) -> anyhow::Result<()> {
     let reason_matches = ["imported", "reassigned"].iter().any(|root_status| {
         event.reason
             == full_recovery_outcome_audit_reason(
@@ -2208,8 +2236,6 @@ fn validate_recovery_terminal_retry_event(
         || event.schema != RuntimeAuditEventV1::SCHEMA
         || event.event_type != "auth.full_recovery_bundle.imported"
         || event.principal_id.as_deref() != Some(principal_id)
-        || event.proof_binding_id.as_deref() != proof_binding_id
-        || event.session_id.as_deref() != Some(session_id)
         || event.challenge_id.is_some()
         || event.capsule_id.is_some()
         || event.result != "ok"
