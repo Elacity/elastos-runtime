@@ -50,9 +50,10 @@ separate Required gate. Existing user Homes stay preserved.
 
 The [preservation check](2026-09-11-integration-preservation.md) accounts for all
 13 Irzhy and Sash PRs created or updated in September. It records original
-history, adopted behavior, explicit differences and remaining proof. URUX,
-Irzhy authority cutover and the Required follow-up work enter after this installed
-checkpoint, in dependency order. Keep both Assistant workspace stores intact;
+history, adopted behavior, explicit differences and remaining proof. Adapted
+URUX/UIUX already entered through Irzhy reconstruction; compare remaining UI
+differences against that baseline. Irzhy authority cutover and Required follow-up
+work retain their dependency order. Keep both Assistant workspace stores intact;
 one visible Assistant requires full history and draft preservation. Integrated
 UI and full model acceptance remain pending. Installed Mac Runtime `fbf1a4b0`
 now passes exact Qwen admission, cold startup, selection, an actual typed reply
@@ -68,10 +69,13 @@ Content mutations. Independent review accepts this bounded Mac milestone. Curren
 providers, engine and the admitted package are reused. The model menu repair `8f28b6e3` passes installed refresh, placement, normal close
 and workspace-preservation checks. A stale copied archive identity was corrected
 in source-install metadata; the bounded stamper repair prevents recurrence.
-Next, merge/reconcile original URUX before client consolidation. Preserve the
+The original URUX full-merge proposal is superseded: the UIUX candidate
+`8b547590` entered through reconstruction `7dd1780b` and Irzhy merge `985fdffc`,
+followed by newer Sash dock/lock changes. Next, verify concrete remaining UI
+differences and preserve all Assistant workspaces before consolidation. Preserve the
 legacy `homeBrowserState.session.agent` object as well as both current workspace
 stores. Repair concurrent saves and durable history limits on the combined clients.
-The preview reports 79 conflicts; the checkout is unchanged by that preview.
+The 79-conflict preview remains historical; no actual URUX merge was started.
 Linux needs additional disk headroom and a reviewed startup profile. The private
 checkpoint owns current processes and receipts; user Homes remain preserved.
 Public staging needs exact-candidate review and approval. Final installer stamping

@@ -59,7 +59,7 @@ content-to-consumer handoff. Keep full J1–J5 and D1–D6 acceptance intact.
 | --- | --- | --- |
 | Integration `6972e165` | 51 donor commits after shared development base | Full merge, preserving current kit-first recovery, scoped sessions and shutdown; source verification passed; installed acceptance pending |
 | Sash shelf `923193bb` | Original four-commit series; adapted current series retains three equivalent patches and matching initial capsule tree | Merge ancestry after integration; retain later capsule-bound handoff checks |
-| Sash URUX `5e546ef4` | 34 commits outside current ancestry; earlier local `d04c9df5` has protected dirty work | Merge latest committed source, reconcile layout and typed authority; retain current approved Create/Recover order |
+| Sash URUX `5e546ef4` | Original tip has separate ancestry; adapted UIUX candidate `8b547590` entered through Irzhy reconstruction `7dd1780b` and merge `985fdffc` | Existing adaptations and later Sash changes are already included. Review concrete remaining behavior differences; a full old-tip merge is superseded. Preserve the dirty donor and current recovery/model contracts. |
 | Irzhy installed proof `617796a9` | Hello, provider hosting, peer seeding, availability, proof harness | First protected-content merge; current media extraction is byte-identical but other features remain missing |
 | Irzhy authority cutover `25ab205e` | Runtime authority cutover and unused API removal | Follow installed-proof merge; check removed APIs against combined model callers |
 | Irzhy follow-up `06179578` | Lifecycle wiring, Creator and non-media objects | Follow authority cutover; reader/audio and full J5 proof remain open |
@@ -104,7 +104,8 @@ verification. Thus this merge records already-integrated original history and
 preserves later model and authority repairs. It adds no new UI claim.
 
 This disposition is limited to the shelf branch. `923193bb` is not an ancestor
-of URUX `5e546ef4`; URUX remains separate work with the feature checks above.
+of URUX `5e546ef4`. Its separate ancestry does not establish missing UI work;
+the adaptation and later Sash changes are accounted for below.
 
 ## September contributor PR coverage
 
@@ -125,7 +126,7 @@ compatibility remains an independent gate.
 | [62](https://github.com/Elacity/elastos-runtime/pull/62) | Follow-up06179578, queued after59; Required repairs and Optional additions retain D2 |
 | [38](https://github.com/Elacity/elastos-runtime/pull/38) | Older release updated this month; original head in base ancestry |
 | [26](https://github.com/Elacity/elastos-runtime/pull/26) | Nonogram source adopted by1fd30b38; ROM/license/SVG byte-identical, viewer/storage/packaging and launch test retained. Old icon removal superseded by supported icon schema and assets. Original ancestry remains separate |
-| [23](https://github.com/Elacity/elastos-runtime/pull/23) | Older URUX source; visual feature gaps listed above remain pending |
+| [23](https://github.com/Elacity/elastos-runtime/pull/23) | Older URUX source; substantial adapted UI already entered through the UIUX/reconstruction chain, with newer Sash replacements. Only verified behavior gaps remain for reconciliation. |
 | [19](https://github.com/Elacity/elastos-runtime/pull/19) | CI/setup behavior largely retained or reworked. Final plain-pipe CLI check retained. Original macOS Clippy/test steps now run in Linux jobs; named feature push triggers replaced by PR/manual/main/tag triggers. These differences remain explicit for CI policy review |
 
 First-principles review narrowed the next operation: finish the active foundation
@@ -339,20 +340,44 @@ precedence, other-platform preservation, repeated stamping and failure before
 mutation. Conflicting install paths fail with metadata and sidecars unchanged.
 Independent source review and all four basic repository gates pass. Final installer packaging and signing remain separate.
 
-## Next integration dependency
+## Corrected URUX integration status
 
-Independent comparison of `8f28b6e3` and original URUX `5e546ef4` changes the next
-source order: merge and reconcile URUX before client consolidation. URUX stores
-its harness in Home GUI and its workspace in `homeBrowserState.session.agent`.
-Current clients use separate protected Assistant and Home Agent stores. Preserve
-all three possible state locations; URUX also carries Workbench open/tab state,
-tool mode, temperature and grant records absent from the current snapshot.
+The user's September 11 history check corrects the proposed full URUX merge.
+Both the active website branch and `feat/0.7.1-integration@6972e165` already contain
+`feat/0.7-uiux-candidate@8b547590`, reconstruction `7dd1780b`, and Irzhy's
+`985fdffc` merge into `upstream/0.7-dev`. PR59 and PR62 also contain that chain.
+The original `5e546ef4` tip has separate ancestry because the UI was adapted.
+Its absence from the ancestry is insufficient evidence that its behavior is absent.
+The 79-conflict preview is historical analysis; the blanket merge recommendation
+is superseded. No actual URUX merge was started.
 
-The incoming serializer still limits history to 24 messages and 4,000 characters.
-Treat those as presentation/context limits when repairing durable persistence.
-Keep current Runtime authority, exact Qwen CID/offer/run semantics, recovery and
-menu fixes. Reconcile original UI behavior into the admitted capsule structure;
-activate one writer for each object. Repair 409 handling and lossless storage on
-the resulting clients before installing the combined Assistant and exposing one
-entry point. A source merge preview reports 79 conflicts; it has not modified the
-checkout. The 70 branches and 12 worktrees remain preserved.
+| Already integrated behavior | Source evidence |
+| --- | --- |
+| Shared theme/fonts, shell chrome, Control Centre, Exposé, keyboard, rails and stages | `b3aa6767`, through the UIUX candidate and reconstruction chain |
+| Lock face, desktop defaults, Apps/Shelf and recovery setup | `3b483d9c`, `ec2b2f0c`, `e75cc76f`, `6df58755`, followed by current recovery repairs |
+| Newer Sash dock width/reorder, dock-width Apps face, stationary icons and slot arrival | `f175b707`, `8c39c89d`, `05ff77be`, `c9a4a661`; these supersede older choreography |
+| URUX lock appearance on current Home authority | Sash `b26f5ee4` |
+| Capsule-owned Home Agent harness | Sash `77498557`, original history reconciled by `37c82d4f`; later model and workspace repairs retained |
+| Standalone Assistant Chat/Build/Studio | `77e647a9`, `9b37e3c7`, through the UIUX/reconstruction chain |
+
+Next, compare the existing integrated behavior with the intended user experience
+and restore confirmed gaps. Richer Workbench/Studio UI and the generic Viewer rail
+remain separate from current implementations. Pager/window-switcher template
+nodes are absent despite retained JS/CSS. Agent Space's exclusion from Mission
+Control is an explicit later choice, requiring a product disposition rather than
+an assumption that code was lost. Preserve newer Sash motion and current typed
+Runtime authority, recovery, Qwen selection and lifecycle behavior.
+
+The Home Agent capsule commit explicitly removed Workbench, Studio and other
+controls whose Runtime operations were unavailable. Standalone Assistant has
+Chat/Build/Studio under the typed contract. Account for both implementations
+before deciding how to expose one Assistant; their existence is not evidence of
+complete original feature parity.
+
+Preserve all three possible state locations: legacy
+`homeBrowserState.session.agent`, protected Home Agent and protected Assistant.
+Carry the raw legacy object through unrelated shell saves; history and drafts
+must survive independently of presentation/context limits. Resolve concurrent
+409 saves and lossless history before installing the combined Assistant. Original
+URUX modules remain implementation evidence for confirmed gaps. Independent
+re-review accepts this corrected route; all 70 branches and 12 worktrees remain.
