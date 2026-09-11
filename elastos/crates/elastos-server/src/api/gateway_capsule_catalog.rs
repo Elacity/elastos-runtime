@@ -453,6 +453,48 @@ fn resolve_capsule_affordance(
     })
 }
 
+#[cfg(unix)]
+fn revalidate_preparation_caller_method(
+    data_dir: &std::path::Path,
+    request: &CapsuleInterfaceInvokeRequest,
+    expected_method: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use crate::api::capsule_inventory::{
+        installed_capsules_root, installed_external_component_names, load_capsule_manifest,
+    };
+
+    let capsule_name = request.capsule.trim();
+    // Match the installed catalog's membership and manifest validation while
+    // reading only this caller's descriptor, without rebuilding presentation.
+    anyhow::ensure!(
+        installed_external_component_names(data_dir)
+            .is_some_and(|names| names.contains(capsule_name)),
+        "preparation caller is no longer installed"
+    );
+    let manifest = load_capsule_manifest(
+        &installed_capsules_root(data_dir).join(capsule_name),
+        capsule_name,
+    )
+    .filter(|manifest| manifest.model_content.is_none())
+    .ok_or_else(|| anyhow::anyhow!("preparation caller manifest is unavailable"))?;
+    let method = manifest
+        .interfaces
+        .iter()
+        .find(|interface| interface.id == request.interface.trim())
+        .and_then(|interface| {
+            interface
+                .methods
+                .iter()
+                .find(|method| method.id == request.method.trim())
+        })
+        .ok_or_else(|| anyhow::anyhow!("preparation method is unavailable"))?;
+    anyhow::ensure!(
+        serde_json::to_value(method)? == *expected_method,
+        "preparation method changed"
+    );
+    Ok(())
+}
+
 fn affordance_invocation_policy(
     method: &CapsuleAffordanceDescriptor,
 ) -> Result<(), (StatusCode, &'static str, &'static str)> {
@@ -534,12 +576,11 @@ async fn dispatch_capsule_affordance(
                             current == expected_context,
                             "preparation authority changed"
                         );
-                        let current = resolve_capsule_affordance(&data, &guard_request)?;
-                        anyhow::ensure!(
-                            serde_json::to_value(&current.method)? == expected_method,
-                            "preparation method changed"
-                        );
-                        Ok(())
+                        revalidate_preparation_caller_method(
+                            &data,
+                            &guard_request,
+                            &expected_method,
+                        )
                     });
                     owner.invoke(
                         &state.data_dir,
@@ -1469,6 +1510,91 @@ mod tests {
         assert_eq!(resolved.capsule, "marketplace");
         assert_eq!(resolved.interface_id, "elastos.marketplace.catalog");
         assert_eq!(resolved.method.id, "catalog.list");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_caller_method_revalidation_preserves_current_membership_and_descriptor() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let original: serde_json::Value = serde_json::from_slice(
+            &fs::read(repo.join("capsules/marketplace/capsule.json")).unwrap(),
+        )
+        .unwrap();
+        let request = CapsuleInterfaceInvokeRequest {
+            request_id: "preparation-revalidation".into(),
+            capsule: "marketplace".into(),
+            interface: "elastos.marketplace.catalog".into(),
+            method: "content.use".into(),
+            input: serde_json::json!({}),
+        };
+        for change in [
+            "unchanged",
+            "inactive",
+            "missing_install_path",
+            "missing_manifest",
+            "invalid_manifest",
+            "wrong_name",
+            "missing_interface",
+            "missing_method",
+            "changed_method",
+        ] {
+            let data = tempfile::tempdir().unwrap();
+            write_capsule_json(data.path(), "marketplace", original.clone());
+            let expected = serde_json::to_value(
+                resolve_capsule_affordance(data.path(), &request)
+                    .unwrap()
+                    .method,
+            )
+            .unwrap();
+            revalidate_preparation_caller_method(data.path(), &request, &expected).unwrap();
+            let manifest_path = data.path().join("capsules/marketplace/capsule.json");
+            let mut manifest = original.clone();
+            match change {
+                "unchanged" => {}
+                "inactive" | "missing_install_path" => {
+                    let path = data.path().join("components.json");
+                    let mut components: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    if change == "inactive" {
+                        components["external"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("marketplace");
+                    } else {
+                        components["external"]["marketplace"]["install_path"] =
+                            serde_json::json!("capsules/absent");
+                    }
+                    fs::write(path, serde_json::to_vec(&components).unwrap()).unwrap();
+                }
+                "missing_manifest" => fs::remove_file(&manifest_path).unwrap(),
+                _ => {
+                    match change {
+                        "invalid_manifest" => manifest["schema"] = serde_json::json!("invalid"),
+                        "wrong_name" => manifest["name"] = serde_json::json!("system"),
+                        "missing_interface" => manifest["interfaces"] = serde_json::json!([]),
+                        "missing_method" => {
+                            manifest["interfaces"][0]["methods"] = serde_json::json!([]);
+                        }
+                        "changed_method" => {
+                            let method = manifest["interfaces"][0]["methods"]
+                                .as_array_mut()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|method| method["id"] == "content.use")
+                                .unwrap();
+                            method["resource"] = serde_json::json!("elastos://changed/*");
+                        }
+                        _ => unreachable!(),
+                    }
+                    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+                }
+            }
+            assert_eq!(
+                revalidate_preparation_caller_method(data.path(), &request, &expected).is_ok(),
+                change == "unchanged",
+                "{change}"
+            );
+        }
     }
 
     #[tokio::test]

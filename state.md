@@ -14,6 +14,15 @@ in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
 Assistant consolidation, original UI parity and installed Qwen proof remain open.
 
 
+The first isolated Mac J3 installation at `dd21d8bd` verifies signed Qwen catalog
+visibility in System and Marketplace, Use/cancel/retry, local package reuse and
+owned shutdown/restart. Full preparation stops on snapshot-lock contention after
+about 3 MB. A source regression reproduces the error; bounded snapshot locking
+and exact-caller revalidation pass the focused source gates. Model admission and reply
+remain pending. Human Homes retain their existing candidate, and Linux has no new
+J3 installed result. The integration check records the failure and proof limits.
+
+
 Last updated: 2026-09-11 UTC
 
 - `feat/0.7.1-website-execution` is published for review at `00003b6f`, tree

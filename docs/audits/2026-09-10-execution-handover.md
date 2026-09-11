@@ -41,10 +41,9 @@ changes. Automated test gateways are stopped; only isolated human-test Homes
 remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
 
 The full model donor `6972e165` is merged by `b318bfda`. Sash's shelf history
-is reconciled by `37c82d4f` after full behavior comparison. The active Irzhy
-foundation intake is `617796a9` (PR60, which replaced PR57). Finish its source
-gates, then freeze further intake for one installed Qwen journey in a fresh
-test-owned Mac Home. Reuse the existing signed model package and engine. Prove
+is reconciled by `37c82d4f` after full behavior comparison. Irzhy
+foundation `617796a9` (PR60, which replaced PR57) is merged by `dd21d8bd`. Further
+intake is frozen for one installed Qwen journey in a fresh test-owned Mac Home. Reuse the existing signed model package and engine. Prove
 catalog visibility and normal cancel before a large transfer, then preparation,
 selection, reply, stop and restart/reuse. Carrier cold delivery retains its
 separate Required gate. Existing user Homes stay preserved.
@@ -55,7 +54,10 @@ history, adopted behavior, explicit differences and remaining proof. URUX,
 Irzhy authority cutover and the Required follow-up work enter after this installed
 checkpoint, in dependency order. Keep both Assistant workspace stores intact;
 one visible Assistant requires full history and draft preservation. Integrated
-UI and model acceptance remains pending.
+UI and model acceptance remains pending. The first Mac candidate shows trusted
+Qwen in both catalog surfaces and passes Use/cancel/retry. Its full preparation
+fails on inventory snapshot contention after about 3 MB; the current repair and
+next installed experiment are recorded in the preservation check and checkpoint.
 Public staging needs exact-candidate review and approval. Final installer stamping
 and signing follow C5 source freeze.
 

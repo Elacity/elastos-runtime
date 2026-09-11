@@ -154,3 +154,39 @@ product execution. Full provider-host and J5 installed proof remains pending.
 Home entropy, format and protected-content static/harness checks pass. These
 results establish source behavior; current human Homes retain their earlier
 installed candidate.
+
+## First installed model result
+
+The Mac test candidate `dd21d8bd` uses newly built Runtime, model-provider and
+ipfs-provider binaries, with unchanged inputs retained under their prior
+receipts. Required manifests and installation receipts bind the source, hashes,
+installed paths and running processes. Five served app assets match the installed
+files. Existing human Homes retain `1e320578`; Linux has no new J3 result.
+
+System and Marketplace both show the same signed Qwen package, verified publisher
+and enabled Use control. Use, cancellation, Retry and a second cancellation pass
+on the same test account. The first UI error was Playwright's service-worker
+blocking script accessing a property denied to sandboxed frames. Removing that
+injected harness script gives an error-free interaction run. The test Home closes
+its owned processes and a held HTTP connection, then restarts successfully.
+
+The retained Qwen package imports locally in 16.354 seconds with the expected
+6,170,940,070-byte CAR hash and package CID. Network download is zero. Actual
+Marketplace preparation then fails after 3,039,059 bytes with an inventory
+`WouldBlock` error. This is a source defect: a short status snapshot can abort
+progress. The regression test reproduces it. The bounded repair waits up to one
+second for snapshot transactions while preserving immediate duplicate-worker
+rejection. Revalidation also resolves only the current caller's active manifest
+and exact method, retaining fresh Home authority checks. Installed admission,
+reply and restart/reuse remain pending until the repaired Runtime passes.
+
+The early throughput estimate is provisional. Process samples taken after the
+terminal failure show idle processes and establish no preparation performance
+claim. The next experiment uses terminal state and progress together.
+
+The repair passes the reproduced short-snapshot case, the nine caller descriptor
+and membership cases, existing affordance resolution, process-safe lock expiry,
+concurrent reservation accounting and failure diagnostics with real Home grant
+revalidation. Repository whitespace, Home entropy and both Rust format gates pass.
+The independent review confirms bounded snapshot waiting and preserved worker
+exclusion. The next operation rebuilds Runtime only for the same test Home.

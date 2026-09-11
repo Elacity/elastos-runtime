@@ -5,6 +5,7 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context as _};
 
@@ -129,8 +130,18 @@ impl Inventory {
             libc::O_RDWR | if create { libc::O_CREAT } else { 0 },
         )?;
         check_file(&lock.metadata()?, 0)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("preparation inventory busy");
+        // Snapshot readers and progress writers share this short transaction
+        // lock. Ordinary contention must not terminate the preparation worker.
+        // Keep the wait bounded; the separate worker lock still rejects a
+        // competing preparation immediately.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if error.kind() != std::io::ErrorKind::WouldBlock || remaining.is_zero() {
+                return Err(error).context("preparation inventory busy");
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
         }
         let result = Self {
             data_path: data_path.into(),

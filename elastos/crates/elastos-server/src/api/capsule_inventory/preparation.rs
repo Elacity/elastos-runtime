@@ -7928,6 +7928,35 @@ server.serve_forever()
     }
 
     #[test]
+    fn model_preparation_progress_waits_for_a_short_status_snapshot() {
+        let (root, cid) = fixture();
+        let record = reserve(
+            root.path(),
+            &caller(&context(), &method("use")),
+            "status-contention",
+            &cid,
+        )
+        .unwrap();
+        let snapshot = Inventory::open(root.path(), false).unwrap();
+        assert_eq!(snapshot.load().unwrap().records, vec![record.clone()]);
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(snapshot);
+        });
+        let update = update_operation(root.path(), &record.operation_id, |record| {
+            record.activation_pending = true;
+        });
+        reader.join().unwrap();
+        update.expect("a short status snapshot must not fail preparation progress");
+        let mut expected = record.clone();
+        expected.activation_pending = true;
+        assert_eq!(
+            load_operation(root.path(), &record.operation_id).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn model_preparation_process_worker() {
         let Some(path) = std::env::var_os("ELASTOS_TEST_PREPARATION_LOCK_ROOT") else {
             return;
