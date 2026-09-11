@@ -1871,8 +1871,8 @@ dependencies = [
  "wasm-encoder 0.236.1",
  "wasmparser 0.236.1",
  "x-wing",
- "zip",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

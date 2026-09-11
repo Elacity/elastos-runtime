@@ -329,14 +329,14 @@ build_browser_vm_guest_helper() {
             echo "rust-lld not found in $rust_sysroot; Browser VM guest helper cross-build is unavailable" >&2
             exit 1
         fi
-        env "$linker_env=$linker" "$CARGO_BIN" build --quiet \
+        env "$linker_env=$linker" "$CARGO_BIN" build --locked --quiet \
             --manifest-path "$manifest" \
             --target "$rust_target" \
             --release
         return
     fi
 
-    "$CARGO_BIN" build --quiet \
+    "$CARGO_BIN" build --locked --quiet \
         --manifest-path "$manifest" \
         --target "$rust_target" \
         --release
@@ -1805,11 +1805,11 @@ if ! grep -Eq '^[[:space:]]*trusted_keys[[:space:]]*=' "${CONFIG_TOML}"; then
 fi
 
 echo "[setup-source-home] build runtime server"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
 verify_collaboration_startup_config_input
 if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
-    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
+    "$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
 fi
 build_browser_vm_guest_helpers
 
@@ -1831,13 +1831,13 @@ source_home_binary_manifest_path() {
 }
 
 echo "[setup-source-home] build native provider binaries"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
+"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
 source_home_binary_names | while IFS= read -r provider; do
-    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
+    "$CARGO_BIN" build --locked --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
 done
 
 echo "[setup-source-home] build Home CLI native renderer"
-"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
+"$CARGO_BIN" build --locked --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
 
 echo "[setup-source-home] build app WASM capsules"
 for capsule in "${APP_CAPSULES[@]}"; do
