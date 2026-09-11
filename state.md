@@ -2,7 +2,15 @@
 
 Last updated: 2026-09-11 UTC
 
-- The combined automated J1/C2 checkpoint passes on Mac ARM64 and Linux
+- User-review follow-up `1e320578` is installed in the two isolated human
+  Homes. System displays the restored Profile name for an unnamed current
+  passkey, and Recovery/Advanced spacing is repaired. Mac and Linux stay
+  signed in together in one browser cookie jar through reload/refresh;
+  signing out of Mac leaves Linux signed in. Current source, artifact,
+  process and served-file receipts pass. Restored user data is preserved.
+  AUTH-01 awaits final user acceptance. See the checkpoint report below.
+
+- The original combined automated J1/C2 checkpoint passes on Mac ARM64 and Linux
   x86_64 installed candidate `f21d285e`. Browser recovery restores the original
   Profile DID/name and covers wrong-password data preservation, retry and
   reload/sign-in/System continuation. `a45164cf` repairs completed-kit retry

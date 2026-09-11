@@ -1,11 +1,13 @@
 # ElastOS 0.7.1 execution handover
 
-The combined automated checkpoint passes on Mac ARM64 and Linux x86_64.
-[The checkpoint report](2026-09-11-first-checkpoint.md) records the target results,
-repairs and remaining human prerequisite. AUTH-01 keeps its pending verdict
-until a user-operated passkey proves the flow. Fresh isolated Homes are ready;
-their private URLs and receipts are in the current checkpoint. Broader execution
-and recurring monitoring remain paused. Full J1–J5 and D1–D6 acceptance stays intact.
+The original combined automated checkpoint passes on Mac ARM64 and Linux x86_64.
+User-review follow-up `1e320578` repairs the restored account label, Security
+spacing and session collisions between localhost Homes. Both targets pass the
+shared-browser reload/refresh/sign-out check and show the exact restored name.
+[The checkpoint report](2026-09-11-first-checkpoint.md) separates current
+follow-up proof from reused lifecycle/media receipts. The two isolated Homes
+preserve the user's restored data and await final AUTH-01 acceptance. Broader
+execution and recurring monitoring remain paused. Full J1–J5 and D1–D6 stay intact.
 
 ## Resume here
 
@@ -21,11 +23,11 @@ local operator ledger and current checkpoint. Resolve their directory with
 Use `feat/0.7.1-website-execution`, based on the user-selected
 `origin/upstream/0.7.1-dev` at `6c61c990`. Preserve the integration and Browser
 donors. Before edits, recheck HEAD/tree, dirt, fetched divergence and target
-receipts. Local source is ahead of installed artifacts. A new source commit
-alone does not require rebuilding every component.
+receipts. Runtime source matches the installed candidate; closeout documentation may
+follow it. A new source commit alone does not require rebuilding every component.
 
-The reviewed code candidate is `f21d285ec93e91b6a6b0ab0221e311668ecf77bf`, tree
-`3a51a2562f011506678152d00453ccf420e2da41`, 51 ahead / zero behind dev `6c61c990`.
+The reviewed code candidate is `1e320578b6b8a77753c4b5ef8fab51c12ea3d9e2`, tree
+`44b08f00907c02dd3fe3bb2d3ed8e79e1bb76788`, 54 ahead / zero behind dev `6c61c990`.
 Closeout documentation follows that candidate. The default checkout contains
 unrelated dirty donor work; use the website checkout explicitly.
 
@@ -35,9 +37,9 @@ and left unused. Official installation receipts were refreshed after manifest
 changes. Automated test gateways are stopped; only isolated human-test Homes
 remain for AUTH-01. Existing user previews and public stage retain `d790a48e`.
 
-The next action is the required human passkey check on the exact candidate.
-Use Recover, select an existing kit, finish passkey consent and verify the
-original Profile DID/name. Retain wrong-password/retry and reload → sign-in →
+The next action is final user acceptance on the updated candidate. Reload the
+existing Homes and sign in if requested; the restored data remains in place.
+Confirm the original Profile DID/name and independent sessions in both tabs. Retain wrong-password/retry and reload → sign-in →
 System continuation checks. Reuse automated receipts; another build requires a
 relevant source change. Public staging needs exact-candidate review and approval.
 Final installer stamping and signing follow C5 source freeze.
@@ -66,7 +68,7 @@ Recover opens kit selection first. Both installed targets restore the original
 Profile DID/name, preserve existing identity data after a wrong password, and
 complete browser retry and reload/sign-in/System continuation. `a45164cf` fixes
 completed-kit retry after a fresh sign-in while retaining strict token binding.
-AUTH-01 is corrected and remains pending its user-operated authenticator.
+AUTH-01 is corrected and remains pending final user acceptance.
 
 Full Home shutdown exposed detached managed children after the earlier API-only
 pass. `f21d285e` repairs ownership and awaited cleanup. Both targets now close

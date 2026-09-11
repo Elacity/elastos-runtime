@@ -1,11 +1,64 @@
 # J1/C2 combined installed checkpoint
 
 The combined automated checkpoint passes on Mac ARM64 and Linux x86_64.
-AUTH-01 remains `Blocked prerequisite` because its required user-operated
-passkey check is pending. Fresh isolated Homes are ready for that check. The
-coordinator stops here; broader execution and recurring monitoring remain
-paused. Mission R2, J1–J5, D1–D6 and the release gates retain their acceptance.
-Jetson remains deferred.
+User-review follow-up repairs are installed. AUTH-01 remains `Blocked prerequisite`
+until final user acceptance is recorded. The isolated Homes preserve the user's
+restored data. Broader execution and recurring monitoring remain paused.
+Mission R2, J1–J5, D1–D6 and release gates retain their acceptance; Jetson is deferred.
+
+## Follow-up from user review
+
+Candidate `1e320578b6b8a77753c4b5ef8fab51c12ea3d9e2`, tree
+`44b08f00907c02dd3fe3bb2d3ed8e79e1bb76788`, repairs three reported defects.
+It is 54 ahead / zero behind the fetched development ref; later closeout
+commits change documentation only.
+
+- System uses the restored Profile name when the current passkey has no local
+  label. Explicit private labels remain intact; other accounts do not borrow
+  the current Profile name.
+- Recovery status and notes have space around them. The Advanced object count
+  and Refresh button have space above the inspection list. Rendered checks
+  pass at 980 and 420 pixels. The relevant earlier URUX spacing rules were
+  also present in the donor; this is not established as a later regression.
+- Home session cookies use a normalized destination Host/port name. One Brave
+  context keeps Mac and Linux signed in through alternating cookie-only reloads
+  and refreshes. Signing out of Mac leaves Linux signed in and refreshable.
+  Both installed Accounts views show the exact restored name.
+
+Nine launch-token tests, 62 session tests and the recovery-cookie response test
+pass. Strict token conflict, duplicate-header and origin checks remain intact.
+Legacy unscoped cookies remain untouched and are ignored by this candidate.
+An active header session can refresh into its scoped cookie; an old cookie-only
+session needs one sign-in. Recovery retains the agreed reload/sign-in/System
+continuation. This change adds no recovery UX decision.
+
+Each platform built Runtime once for this follow-up. System browser assets were
+copied and their archive, component descriptor and canonical installation
+receipt updated. Provider/WASM artifacts were reused. Built/installed hashes:
+
+| Target | Runtime SHA-256 |
+| --- | --- |
+| Mac ARM64 | `2e77411c5bf36baf9539513b0e1b58245f496e6ff43b96fbb7b5700284d57d0f` |
+| Linux x86_64 | `1d35431216541111524f61a9ad44768371d75d67d84f656eaa1907a311ec3162` |
+
+Current process, manifest and served Home/System identities pass on both human
+Homes. Artifact replacement preserved eight Mac and seven Linux identity/user
+files byte for byte. Both Homes restarted. The updated Runtime also passes
+owned shutdown with three held connections on each automated target (Mac
+6.229 seconds; Linux 6.202 seconds). Carrier
+and media implementations are unchanged; their prior scoped receipts below
+are reused, not represented as fresh tests of this binary.
+
+The first Linux installation attempt exposed Cargo's hard-linked build output;
+a single-link verified input copy satisfied the canonical installer. Browser
+harness corrections followed explicit recovery confirmation, frame retirement,
+completed receipts and the foreground System window. Diagnostics are retained
+under private `user-feedback` evidence. The candidate stayed fixed throughout
+installed tests. AUTH-01 remains pending final user acceptance; broader work
+and monitoring stay paused. At the 30-minute follow-up, shared weekly usage
+was 58% → 60%; credits were unchanged.
+
+## Original combined checkpoint evidence
 
 ## Candidate and review
 
