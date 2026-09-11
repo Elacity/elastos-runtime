@@ -65,8 +65,13 @@ and the listener. The same installed Home restarts, produces a second real reply
 and restores the original draft. All six package files, protected files and prior
 message hashes match; measured reuse receives zero Bitswap payload and makes zero
 Content mutations. Independent review accepts this bounded Mac milestone. Current manifests and receipts bind all changed artifacts;
-providers, engine and the admitted package are reused. The model menu has stale
-empty-state copy and overlaps its picker; retain those UI repairs before acceptance.
+providers, engine and the admitted package are reused. The model menu repair `8f28b6e3` passes installed refresh, placement, normal close
+and workspace-preservation checks. A stale copied archive identity was corrected
+in source-install metadata; the bounded stamper repair prevents recurrence.
+Next, merge/reconcile original URUX before client consolidation. Preserve the
+legacy `homeBrowserState.session.agent` object as well as both current workspace
+stores. Repair concurrent saves and durable history limits on the combined clients.
+The preview reports 79 conflicts; the checkout is unchanged by that preview.
 Linux needs additional disk headroom and a reviewed startup profile. The private
 checkpoint owns current processes and receipts; user Homes remain preserved.
 Public staging needs exact-candidate review and approval. Final installer stamping

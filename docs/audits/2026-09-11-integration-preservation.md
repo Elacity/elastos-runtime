@@ -311,3 +311,48 @@ The harness now checks stored CID/offer, waits for the exact selected row and us
 the supported Escape dismissal. The product menu still shows stale “No model” text
 above a ready model and can overlap its button; these remain explicit UI repair work.
 Full J3, Linux target proof, one Assistant and original URUX parity remain pending.
+
+
+## Model menu and source-install metadata
+
+Source `8f28b6e3` repairs the ready-content empty message and menu placement after
+asynchronous refresh. The rendered regression first reproduces both faults, then
+passes with draft/CID preservation and normal picker clicks. Independent review
+accepts the small change to Sash's existing placement logic and styles.
+
+The installed Mac check verifies one exact Qwen row, zero empty-state paragraphs,
+a 10 px picker gap after opening and two refreshes, normal picker-close behavior,
+and an unchanged complete workspace after reload. The source, installed and served
+JavaScript SHA-256 is `6b12a07c6c6291373176bb47262a6886ed697d9f280cca5b8032355023fb906a`;
+Runtime remains the reused `fbf1a4b0` build. The update preserves 756 other files.
+
+The first launch exposed copied release-cache metadata: the new source asset
+record had no archive identity, while the external component and sidecars named an
+older archive. Correcting that source installation restores launch without an
+archive download. Keep the managed external entry and install paths, exact source
+entrypoint/browser hashes and installation receipt. Release archive identity is
+assigned at the release gate. The durable stamper repair clears stale archive
+fields only for selected source capsules on the current platform after parity
+checks; unrelated releases and native providers remain intact. Its regression
+covers stale identity, all six Runtime platform aliases, explicit empty-map
+precedence, other-platform preservation, repeated stamping and failure before
+mutation. Conflicting install paths fail with metadata and sidecars unchanged.
+Independent source review and all four basic repository gates pass. Final installer packaging and signing remain separate.
+
+## Next integration dependency
+
+Independent comparison of `8f28b6e3` and original URUX `5e546ef4` changes the next
+source order: merge and reconcile URUX before client consolidation. URUX stores
+its harness in Home GUI and its workspace in `homeBrowserState.session.agent`.
+Current clients use separate protected Assistant and Home Agent stores. Preserve
+all three possible state locations; URUX also carries Workbench open/tab state,
+tool mode, temperature and grant records absent from the current snapshot.
+
+The incoming serializer still limits history to 24 messages and 4,000 characters.
+Treat those as presentation/context limits when repairing durable persistence.
+Keep current Runtime authority, exact Qwen CID/offer/run semantics, recovery and
+menu fixes. Reconcile original UI behavior into the admitted capsule structure;
+activate one writer for each object. Repair 409 handling and lossless storage on
+the resulting clients before installing the combined Assistant and exposing one
+entry point. A source merge preview reports 79 conflicts; it has not modified the
+checkout. The 70 branches and 12 worktrees remain preserved.

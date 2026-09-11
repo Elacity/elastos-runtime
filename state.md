@@ -7,11 +7,11 @@ fixtures pass; installed human Homes remain `1e320578`. Full model history is
 merged by `b318bfda`, and Sash shelf ancestry is reconciled by `37c82d4f`. Irzhy
 foundation `617796a9` retains current lifecycle fixes after a reproduced explicit
 Carrier bind defect was repaired. Its focused source checks pass; dedicated
-provider-host and J5 installed proof remains pending. Further intake pauses for
-the installed Qwen checkpoint. URUX and the remaining protected-content stack
+provider-host and J5 installed proof remains pending. The bounded installed Qwen checkpoint now passes on Mac. Original URUX is the
+next source intake; it and the remaining protected-content stack
 have explicit source order and feature-preservation gates
 in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
-Assistant consolidation, original UI parity and installed Qwen proof remain open.
+Assistant consolidation, original UI parity and full cross-platform J3 acceptance remain open.
 
 
 The isolated Mac J3 installation runs Runtime `fbf1a4b0` with matching build,
@@ -28,8 +28,10 @@ Owned shutdown closes all 29 processes, including the model engine, closes a hel
 HTTP connection and releases the port. The same installed Home restarts and produces a second real reply. All six package
 files keep their hashes, sizes, inodes and modification times; protected files and
 prior message hashes match. The original unsent draft is restored. There are zero
-Content mutations and zero Bitswap payload bytes received during measured reuse. Two model-menu UI
-gaps are recorded: stale empty-state copy and overlap with the picker button.
+Content mutations and zero Bitswap payload bytes received during measured reuse. The two model-menu gaps are repaired by `8f28b6e3` and pass installed checks: zero
+stale empty copy, a 10 px gap after refresh, normal picker close and unchanged
+workspace after reload. A copied release-cache metadata mismatch was captured
+and corrected as a source installation; the stamper regression prevents recurrence.
 Human Homes retain their existing candidate. Linux J3 requires additional disk
 headroom and a reviewed target startup profile. Its previews and data are preserved.
 The [integration check](docs/audits/2026-09-11-integration-preservation.md) records
