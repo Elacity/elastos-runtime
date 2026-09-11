@@ -91,3 +91,17 @@ Independent resolved-source review found a missing test group. The retained
 recovery smoke now includes donor-derived Later persistence and real Save
 cancellation/boolean acknowledgement, alongside all current kit-first and
 Profile-create assertions. The combined smoke passes.
+
+## Original Sash shelf ancestry
+
+Independent comparison accepts recording `923193bb` with the current source
+content preserved. Three original commits are patch-equivalent to the adopted
+series. The fourth, `239c6cb7`, has the exact `home-agent` capsule tree of adopted
+`77498557`: `c03166c4489f6773792c38c337f7ccb5e714f6ce`. Its component/profile,
+source-home and release-packaging changes are also present. The three remaining
+Carrier smoke hunks were added by `450db538`, with stronger installed-asset
+verification. Thus this merge records already-integrated original history and
+preserves later model and authority repairs. It adds no new UI claim.
+
+This disposition is limited to the shelf branch. `923193bb` is not an ancestor
+of URUX `5e546ef4`; URUX remains separate work with the feature checks above.
