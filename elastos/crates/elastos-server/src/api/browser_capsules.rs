@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
@@ -12,7 +12,7 @@ use super::capsule_inventory::{
 };
 use super::gateway::{
     capsule_icon_variants, content_type, ensure_wallet_connector_configured, request_uses_tls,
-    validate_file_path, GatewayState,
+    validate_file_path, GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
@@ -46,6 +46,7 @@ struct BrowserCapsule {
 #[derive(Clone, Debug)]
 pub(crate) struct LaunchableBrowserCapsule {
     pub name: String,
+    pub window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub description: Option<String>,
     pub role: CapsuleRole,
     /// Capsule-relative entrypoint, the anchor icon routes resolve against.
@@ -57,6 +58,8 @@ pub(crate) struct LaunchableBrowserCapsule {
 #[derive(Clone, Debug)]
 pub(crate) struct ViewerBoundCapsule {
     pub name: String,
+    /// Window behavior belongs to the resolved executable viewer.
+    pub window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub description: Option<String>,
     pub viewer: String,
     pub entrypoint: String,
@@ -65,7 +68,33 @@ pub(crate) struct ViewerBoundCapsule {
     pub icon: Option<String>,
 }
 
+pub async fn redirect_home_root(RawQuery(query): RawQuery) -> Response {
+    let route = match query {
+        Some(query) => format!("{HOME_ROUTE}?{query}"),
+        None => HOME_ROUTE.to_string(),
+    };
+    Redirect::permanent(&route).into_response()
+}
+
+pub async fn serve_home_index(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, None).await
+}
+
+pub async fn serve_home_asset(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, Some(&path)).await
+}
+
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
+    if app == "home-agent" {
+        return Redirect::to(&format!("{HOME_ROUTE}#")).into_response();
+    }
     Redirect::permanent(&format!("/apps/{app}/")).into_response()
 }
 
@@ -74,6 +103,11 @@ pub async fn serve_browser_app_index(
     headers: axum::http::HeaderMap,
     AxumPath(app): AxumPath<String>,
 ) -> Response {
+    // Old bookmarks return to the owning Home. Its launch path issues a fresh
+    // Assistant token; an old Home Agent token keeps its original actor scope.
+    if app == "home-agent" {
+        return Redirect::to(&format!("{HOME_ROUTE}#")).into_response();
+    }
     serve_browser_capsule_path(&state.data_dir, &headers, &app, None).await
 }
 
@@ -82,6 +116,13 @@ pub async fn serve_browser_app_asset(
     headers: axum::http::HeaderMap,
     AxumPath((app, path)): AxumPath<(String, String)>,
 ) -> Response {
+    if app == "home-agent" {
+        return if path == "index.html" {
+            Redirect::to(&format!("{HOME_ROUTE}#")).into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
     serve_browser_capsule_path(&state.data_dir, &headers, &app, Some(&path)).await
 }
 
@@ -256,6 +297,7 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
             capsule.manifest.name.clone(),
             LaunchableBrowserCapsule {
                 name: capsule.manifest.name,
+                window_policy: capsule.manifest.window_policy,
                 description: capsule.manifest.description,
                 role: capsule.manifest.role,
                 entrypoint: capsule.manifest.entrypoint,
@@ -268,6 +310,13 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
 }
 
 pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<ViewerBoundCapsule> {
+    let Ok(viewer_capsule) = resolve_browser_capsule(data_dir, viewer) else {
+        return Vec::new();
+    };
+    if viewer_capsule.manifest.role != CapsuleRole::Viewer {
+        return Vec::new();
+    }
+    let window_policy = viewer_capsule.manifest.window_policy;
     let mut capsules = BTreeMap::new();
     let installed_root = installed_capsules_root(data_dir);
     for manifest in list_active_capsule_manifests(data_dir) {
@@ -276,7 +325,6 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
             || manifest.capsule_type != CapsuleType::Data
             || manifest.viewer.as_deref() != Some(viewer)
             || !dir.join(&manifest.entrypoint).is_file()
-            || !is_launchable_viewer_capsule(data_dir, viewer)
         {
             continue;
         }
@@ -284,6 +332,7 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
             manifest.name.clone(),
             ViewerBoundCapsule {
                 name: manifest.name,
+                window_policy,
                 description: manifest.description,
                 viewer: viewer.to_string(),
                 entrypoint: manifest.entrypoint,
@@ -320,14 +369,16 @@ pub(crate) fn resolve_viewer_bound_capsule(
 ) -> Option<ViewerBoundCapsule> {
     let candidate = installed_active_capsule_dir(data_dir, name)?;
     let manifest = load_capsule_manifest(&candidate, name)?;
+    let viewer_capsule = resolve_browser_capsule(data_dir, viewer).ok()?;
     if manifest.role == CapsuleRole::Content
         && manifest.capsule_type == CapsuleType::Data
         && manifest.viewer.as_deref() == Some(viewer)
         && candidate.join(&manifest.entrypoint).is_file()
-        && is_launchable_viewer_capsule(data_dir, viewer)
+        && viewer_capsule.manifest.role == CapsuleRole::Viewer
     {
         return Some(ViewerBoundCapsule {
             name: manifest.name,
+            window_policy: viewer_capsule.manifest.window_policy,
             description: manifest.description,
             viewer: viewer.to_string(),
             entrypoint: manifest.entrypoint,
@@ -867,6 +918,7 @@ mod tests {
             "/apps/browser/settings/?view=privacy#home_token=secret"
         );
         assert!(canonical_browser_capsule_route("https://example.test/apps/browser/").is_err());
+        assert!(canonical_browser_capsule_route(HOME_ROUTE).is_err());
     }
 
     #[tokio::test]

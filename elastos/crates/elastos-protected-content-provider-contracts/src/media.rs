@@ -1700,7 +1700,15 @@ fn validate_clear_stsd_v1(
     if child_start > entry_off + entry_h.size {
         return Err(ContractError::InvalidField("init_segment_bytes"));
     }
-    if !scan_boxes(data, child_start, entry_off + entry_h.size)?.is_empty() {
+    // A real sample entry carries its codec configuration as child boxes
+    // (`avcC` is mandatory for AVC; encoders also add `colr`, `pasp`, `btrt`,
+    // `esds` for AAC). They must scan cleanly and are preserved verbatim by
+    // the protect rewrite, which appends `sinf` after them; a clear entry
+    // that already carries `sinf` is not clear and is rejected.
+    if scan_boxes(data, child_start, entry_off + entry_h.size)?
+        .iter()
+        .any(|(_, h)| h.box_type == *b"sinf")
+    {
         return Err(ContractError::InvalidField("init_segment_bytes"));
     }
     Ok(ValidatedClearFmp4TrackLayoutV1 {
@@ -2534,12 +2542,22 @@ mod tests {
     }
 
     fn make_clear_sample_entry(handler_type: &[u8; 4]) -> Vec<u8> {
+        make_clear_sample_entry_with_children(handler_type, &[])
+    }
+
+    fn make_clear_sample_entry_with_children(
+        handler_type: &[u8; 4],
+        children: &[Vec<u8>],
+    ) -> Vec<u8> {
         let (fourcc, fixed) = match handler_type {
             b"vide" => (b"avc1", VISUAL_SAMPLE_ENTRY_FIXED_BYTES),
             b"soun" => (b"mp4a", AUDIO_SAMPLE_ENTRY_FIXED_BYTES),
             _ => panic!("unsupported handler"),
         };
-        let content = vec![0u8; fixed];
+        let mut content = vec![0u8; fixed];
+        for child in children {
+            content.extend_from_slice(child);
+        }
         make_box(fourcc, &content)
     }
 
@@ -2572,6 +2590,18 @@ mod tests {
     }
 
     fn make_clear_trak(track_id: u32, handler_type: &[u8; 4]) -> Vec<u8> {
+        make_clear_trak_with_entry(
+            track_id,
+            handler_type,
+            make_clear_sample_entry(handler_type),
+        )
+    }
+
+    fn make_clear_trak_with_entry(
+        track_id: u32,
+        handler_type: &[u8; 4],
+        entry: Vec<u8>,
+    ) -> Vec<u8> {
         let mut tkhd_payload = vec![0u8; 12];
         tkhd_payload[8..12].copy_from_slice(&track_id.to_be_bytes());
         let tkhd = make_fullbox(b"tkhd", 0, 0, &tkhd_payload);
@@ -2580,7 +2610,6 @@ mod tests {
         hdlr_payload.extend_from_slice(handler_type);
         let hdlr = make_fullbox(b"hdlr", 0, 0, &hdlr_payload);
 
-        let entry = make_clear_sample_entry(handler_type);
         let mut stsd_payload = vec![0u8; 4];
         stsd_payload.extend_from_slice(&1u32.to_be_bytes());
         stsd_payload.extend_from_slice(&entry);
@@ -2645,8 +2674,11 @@ mod tests {
     }
 
     fn valid_clear_init_segment() -> Vec<u8> {
+        clear_init_segment_with_traks([make_clear_trak(1, b"vide"), make_clear_trak(2, b"soun")])
+    }
+
+    fn clear_init_segment_with_traks(traks: [Vec<u8>; 2]) -> Vec<u8> {
         let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso6");
-        let traks = [make_clear_trak(1, b"vide"), make_clear_trak(2, b"soun")];
         let mut mvex_content = Vec::new();
         mvex_content.extend_from_slice(&make_trex(1));
         mvex_content.extend_from_slice(&make_trex(2));
@@ -3145,6 +3177,82 @@ mod tests {
         assert_eq!(segment_layout.samples().len(), 1);
         assert_eq!(segment_layout.samples()[0].mdat_offset(), 0);
         assert_eq!(segment_layout.samples()[0].sample_size(), 11);
+    }
+
+    #[test]
+    fn clear_media_session_layout_keeps_codec_config_children_through_protect_round_trip() {
+        // Real encoders emit codec configuration inside the sample entry
+        // (`avcC` is mandatory for AVC; ffmpeg also adds `colr`). The clear
+        // validator must accept them, the protect rewrite must keep them and
+        // append `sinf` after them, and the clear rewrite must restore the
+        // original bytes exactly.
+        let avcc = make_box(b"avcC", &[0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x00]);
+        let colr = make_box(b"colr", b"nclx\0\x01\0\x01\0\x01\0");
+        let esds = make_fullbox(b"esds", 0, 0, &[0x03, 0x00]);
+        let clear_init = clear_init_segment_with_traks([
+            make_clear_trak_with_entry(
+                1,
+                b"vide",
+                make_clear_sample_entry_with_children(b"vide", &[avcc.clone(), colr.clone()]),
+            ),
+            make_clear_trak_with_entry(
+                2,
+                b"soun",
+                make_clear_sample_entry_with_children(b"soun", &[esds]),
+            ),
+        ]);
+        let session = ValidatedClearFmp4MediaSessionLayoutV1::new(&clear_init).unwrap();
+        assert_eq!(session.track_ids(), &[1, 2]);
+
+        let protected_init = session
+            .rewrite_protected_init(&clear_init, [0x55; 16])
+            .unwrap();
+        let clear_segment = valid_clear_segment(1, b"clear-video");
+        let protected_segment = session
+            .validate_segment(&clear_segment)
+            .unwrap()
+            .rewrite_protected_segment(&clear_segment, &[b"encrypted!!".to_vec()], &[[0x11; 8]])
+            .unwrap();
+        let protected_layout = CencFmp4MediaIdentityV1::validate_structure(
+            &protected_init,
+            std::slice::from_ref(&protected_segment),
+        )
+        .unwrap();
+        assert_eq!(protected_layout.protected_track_ids(), &[1, 2]);
+
+        // The video entry now reads encv, still carries avcC + colr, and has
+        // sinf appended after them.
+        let (fourcc, entry_off, entry_size, fixed) = sample_entry_info(&protected_init, 0);
+        assert_eq!(fourcc, *b"encv");
+        let children: Vec<[u8; 4]> = scan_boxes(
+            &protected_init,
+            entry_off + 8 + fixed,
+            entry_off + entry_size,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, h)| h.box_type)
+        .collect();
+        assert_eq!(children, vec![*b"avcC", *b"colr", *b"sinf"]);
+
+        let restored = protected_layout
+            .rewrite_clear_init(&protected_init)
+            .unwrap();
+        assert_eq!(restored, clear_init);
+    }
+
+    #[test]
+    fn clear_media_session_layout_rejects_sample_entry_that_already_carries_sinf() {
+        let sinf = make_sinf(b"avc1");
+        let init = clear_init_segment_with_traks([
+            make_clear_trak_with_entry(
+                1,
+                b"vide",
+                make_clear_sample_entry_with_children(b"vide", &[sinf]),
+            ),
+            make_clear_trak(2, b"soun"),
+        ]);
+        assert!(ValidatedClearFmp4MediaSessionLayoutV1::new(&init).is_err());
     }
 
     #[test]

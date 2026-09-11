@@ -1,0 +1,14 @@
+.assistant-modes { display:flex; align-items:center; gap:6px; padding:12px 20px; flex-wrap:wrap; }
+.assistant-modes button, #assistant-studio button, #assistant-studio select { color:var(--text); background:var(--panel); border:1px solid var(--hairline); border-radius:9px; padding:8px 14px; font:inherit; }
+.assistant-modes button[aria-pressed="true"] { background:var(--brand); color:#151515; }
+#assistant-copy-conversation { margin-left:auto; }
+#assistant-workspace-notice { margin:4px 20px; padding:10px; border:1px solid var(--hairline); border-radius:8px; cursor:pointer; }
+#assistant-studio { padding:20px; overflow:auto; max-height:calc(100vh - 150px); }
+#assistant-studio label { display:block; margin:16px 0 8px; }
+#studio-draft { display:block; box-sizing:border-box; width:100%; color:var(--text); background:var(--panel); border:1px solid var(--hairline); border-radius:14px; padding:16px; font:inherit; resize:vertical; margin-bottom:12px; }
+#studio-result { white-space:pre-wrap; overflow-wrap:anywhere; }
+#studio-history { padding:0; list-style:none; }
+#studio-history li { margin:16px 0; padding:12px; border:1px solid var(--hairline); border-radius:12px; }
+#studio-history p, #studio-history pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+body[data-assistant-mode="studio"] .agent-harness-stream-viewport, body[data-assistant-mode="studio"] .taskbar { visibility:hidden; pointer-events:none; }
+body[data-assistant-mode="studio"] .agent-harness-stream-viewport { display:none; }

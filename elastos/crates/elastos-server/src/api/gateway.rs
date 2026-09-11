@@ -44,6 +44,8 @@ use url::form_urlencoded;
 
 #[path = "gateway_assistant.rs"]
 mod gateway_assistant;
+#[path = "gateway_assistant_workspace_v2.rs"]
+mod gateway_assistant_workspace_v2;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
 #[path = "gateway_capsule_catalog.rs"]
@@ -116,6 +118,8 @@ pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
+#[cfg(test)]
+pub(super) use gateway_home_token::home_session_cookie_name;
 pub(super) use gateway_home_token::HomeLaunchTokenContext;
 pub(crate) use gateway_home_token::RuntimeWalletAuthority;
 pub(super) use gateway_home_token::{
@@ -165,6 +169,7 @@ pub(crate) use gateway_room::{
 pub(crate) use gateway_server::advertised_gateway_urls;
 pub use gateway_server::start_gateway_server;
 pub(crate) use gateway_server::start_gateway_server_with_collaboration_context;
+pub(crate) use gateway_server::start_gateway_server_with_ready;
 pub use gateway_server::GatewayCollaborationContext;
 use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
@@ -399,7 +404,7 @@ const WALLET_CONNECTOR_CAPSULE_IDS: &[&str] = &[
 pub(crate) const HOME_CAPSULE_ID: &str = "home";
 pub(crate) const HOME_GUI_SHELL_ID: &str = "home-gui";
 pub(crate) const HOME_CLI_SHELL_ID: &str = "home-cli";
-const HOME_ROUTE: &str = "/apps/home/";
+pub(super) const HOME_ROUTE: &str = "/home/";
 pub(crate) const WALLETCONNECT_CONFIG_SCHEMA: &str = "elastos.walletconnect.connector/v1";
 pub(crate) const WALLETCONNECT_CONFIG_PATH: &str =
     "ElastOS/SystemServices/WalletConnect/config.json";
@@ -702,6 +707,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 )),
         )
         .route(
+            "/api/apps/assistant/workspace-v2",
+            get(gateway_assistant_workspace_v2::get)
+                .put(gateway_assistant_workspace_v2::put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_assistant_workspace_v2::MAX_BYTES,
+                )),
+        )
+        .route(
             "/api/apps/home-agent/workspace",
             get(gateway_home_agent::home_agent_workspace_get)
                 .put(gateway_home_agent::home_agent_workspace_put)
@@ -972,7 +985,9 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/capsules/contracts/audit", get(capsule_contract_audit))
         .route(
             "/api/capsules/interfaces/invoke",
-            post(capsule_interface_invoke),
+            post(capsule_interface_invoke).layer(Extension(
+                gateway_capsule_catalog::ModelPreparationOwner::default(),
+            )),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/services/summary", get(services_summary))
@@ -1110,6 +1125,20 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/viewers/:viewer/storage/:capsule/:scope/:name",
             get(super::viewer_gateway::viewer_storage_get)
                 .put(super::viewer_gateway::viewer_storage_put),
+        )
+        .route("/home", get(super::browser_capsules::redirect_home_root))
+        .route(HOME_ROUTE, get(super::browser_capsules::serve_home_index))
+        .route(
+            "/home/*path",
+            get(super::browser_capsules::serve_home_asset),
+        )
+        .route(
+            "/apps/home",
+            get(super::browser_capsules::redirect_home_root),
+        )
+        .route(
+            "/apps/home/",
+            get(super::browser_capsules::redirect_home_root),
         )
         .route(
             "/apps/:app",
@@ -1293,11 +1322,7 @@ pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
         return Some(did);
     }
 
-    let device_key = data_dir.join("identity").join("device.key");
-    if !device_key.exists() {
-        return None;
-    }
-    elastos_identity::load_or_create_did(data_dir)
+    elastos_identity::load_existing_did(data_dir)
         .ok()
         .map(|(_signing_key, did)| did)
         .filter(|did| !did.trim().is_empty())

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
+
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 TARGET_ADDR="${ELASTOS_OPERATOR_TARGET_ADDR:-127.0.0.1:33100}"
 SRC_HOME="$(mktemp -d /tmp/elastos-public-operator-src-XXXXXX)"

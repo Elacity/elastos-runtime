@@ -7,6 +7,7 @@ import {
   renewHomeGuiBrowserWindowAuthority,
   restoreHomeGuiSession,
   setHomeGuiMenuManifest,
+  handleHomeGuiHomeNavigation,
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
@@ -173,6 +174,10 @@ function handleGuiCommand(message) {
       typeof message.homeToken === "string" ? message.homeToken.trim() : "",
       message.menus,
     );
+  }
+  if (command === "navigation-hint") {
+    if (!hasExactKeys(message, ["type", "command", "homeToken", "navigation"])) return false;
+    return handleHomeGuiHomeNavigation(message.homeToken, message.navigation);
   }
   if (command === "show-desktop") {
     showHomeGuiDesktop();

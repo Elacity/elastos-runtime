@@ -40,7 +40,7 @@ import {
 } from "./home-agent-message-contract.js?v=home-20260813a";
 
 const FACE_ID = "assistant-face";
-const TARGET_ID = "home-agent";
+const TARGET_ID = "assistant";
 /* Dock row clears just before the stretch. */
 const EXIT_MS = 90;
 /* The room begins breathing in at this share of the stretch. */
@@ -65,6 +65,9 @@ let spaceEl = null;
 let frame = null;
 let frameReady = false;
 let launching = false;
+let launchQuery = {};
+let authorizedLaunch = null;
+let retirementGeneration = 0;
 let spaceHideTimer = 0;
 let closing = false;
 /* The Space the user came from; the ring returns there when the room closes. */
@@ -223,7 +226,7 @@ function markFrameReady() {
   frame?.classList.add("is-ready");
   deps.pushUiPreferencesToFrameWindow(frame?.contentWindow);
   if (assistantSpaceActive()) {
-    postToFrame({ type: "home-agent:open" });
+    postToFrame({ type: "home-agent:open", query: launchQuery });
     if (taskbarEl()?.classList.contains("is-assistant-handover")) {
       postToFrame({ type: "home-agent:shelf-handover", on: true });
     }
@@ -248,6 +251,7 @@ async function mountAssistantFrame() {
     return;
   }
   launching = true;
+  const mountGeneration = retirementGeneration;
   frameReady = false;
   const block = document.querySelector("#assistant-space-error");
   if (block) {
@@ -256,7 +260,10 @@ async function mountAssistantFrame() {
   frame.hidden = false;
   frame.classList.remove("is-ready");
   try {
-    const launched = await deps.launchHomeTarget(TARGET_ID, {});
+    const admitted = authorizedLaunch;
+    authorizedLaunch = null;
+    const launched = admitted || await deps.launchHomeTarget(TARGET_ID, launchQuery);
+    if (mountGeneration !== retirementGeneration) return;
     if (launched.attach_kind !== "iframe") {
       throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
     }
@@ -278,11 +285,12 @@ async function mountAssistantFrame() {
     frame.src = route.href;
     frame.dataset.route = route.href;
   } catch (error) {
+    if (mountGeneration !== retirementGeneration) return;
     frame.hidden = true;
     frameReady = false;
     showSpaceError(error);
   } finally {
-    launching = false;
+    if (mountGeneration === retirementGeneration) launching = false;
   }
 }
 
@@ -298,7 +306,7 @@ function openAssistantSpace() {
   document.body.classList.add("assistant-space-active");
   spaceEl.classList.add("is-visible");
   void mountAssistantFrame();
-  postToFrame({ type: "home-agent:open" });
+  postToFrame({ type: "home-agent:open", query: launchQuery });
 }
 
 function closeAssistantSpace({ instant = false } = {}) {
@@ -329,6 +337,10 @@ function closeAssistantSpace({ instant = false } = {}) {
 
 /* Host retires the GUI surface (sign-out, lock): drop the session with it. */
 export function retireAssistantSpace() {
+  retirementGeneration += 1;
+  authorizedLaunch = null;
+  launchQuery = {};
+  launching = false;
   hideAssistantFace({ instant: true });
   const taskbar = taskbarEl();
   if (taskbar) {
@@ -400,7 +412,14 @@ export function syncAssistantFaceAvailability(summary) {
   }
 }
 
-export function showAssistantFace() {
+export function showAssistantFace(query = {}, launched = null) {
+  if (launched?.target === TARGET_ID && !frame?.dataset.route) authorizedLaunch = launched;
+  launchQuery = Object.fromEntries(Object.entries(query).filter(([key, value]) =>
+    ["model_cid", "offer_id", "mode", "session_id"].includes(key) && typeof value === "string"));
+  if (assistantFaceActive()) {
+    postToFrame({ type: "home-agent:open", query: launchQuery });
+    return;
+  }
   const taskbar = taskbarEl();
   if (!taskbar || !deps || assistantFaceActive() || toggleEl()?.hidden) {
     return;

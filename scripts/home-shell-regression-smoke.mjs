@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import vm from "node:vm";
+import { exerciseNavigationConsumers, navigationClientFixture } from "./home-navigation-consumers-smoke.mjs";
 
 const moduleVersion = "home-20260813a";
 const savedStatePatches = [];
@@ -467,6 +469,10 @@ const summary = {
   },
 };
 
+for (const target of summary.targets) {
+  const manifest = JSON.parse(readFileSync(new URL(`../capsules/${target.target}/capsule.json`, import.meta.url), "utf8"));
+  if (manifest.window_policy) target.window_policy = manifest.window_policy;
+}
 shellCore.initializeShellLayout(summary);
 document.body.dataset.homeShell = "desktop";
 shellCore.shellState.currentSummary = summary;
@@ -591,7 +597,7 @@ assert(
 const upgradedLayoutSummary = {
   authority: { signed_in: true },
   targets: [
-    { target: "home-agent", title: "Home Agent", route: "/apps/home-agent/" },
+    { target: "assistant", title: "Assistant", route: "/apps/assistant/" },
     { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
   ],
   browser_state: {
@@ -607,7 +613,7 @@ const upgradedLayoutSummary = {
 
 shellCore.initializeShellLayout(upgradedLayoutSummary);
 assert(
-  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["home-agent"]),
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktopHidden) === JSON.stringify(["assistant"]),
   "newly installed target became visible on an existing desktop",
   shellCore.shellState.shellLayoutState,
 );
@@ -1011,20 +1017,18 @@ assert(
 );
 assert(
   homeGuiTemplate.includes('id="setup-sheet"') &&
-    homeGuiTemplate.includes("Save a Recovery Kit, then create your Profile.") &&
+    homeGuiTemplate.includes("Create your Profile and save a complete Recovery Kit in System.") &&
     homeGuiTemplate.includes('id="setup-sheet-recovery"') &&
-    homeGuiTemplate.includes('id="setup-sheet-profile"') &&
-    homeGuiTemplate.indexOf('id="setup-sheet-step-recovery"') <
-      homeGuiTemplate.indexOf('id="setup-sheet-step-profile"'),
-  "Home setup sheet must keep the Recovery-first order and the bounded setup actions",
+    !homeGuiTemplate.includes('id="setup-sheet-profile"'),
+  "Home setup must use one System action for Profile and complete recovery",
 );
 assert(
   homeSetupSheetScript.includes('const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";') &&
     homeSetupSheetScript.includes('const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";') &&
-    homeSetupSheetScript.includes('openTarget("system", { query: { settings: "security" } });') &&
-    homeSetupSheetScript.includes('openTarget("people");') &&
+    homeSetupSheetScript.includes("saved = await openSystemRecoverySave();") &&
+    !homeSetupSheetScript.includes('openTarget("people");') &&
     homeSetupSheetScript.includes('const SETUP_HOLD_TARGETS = new Set(["chat-room"]);') &&
-    homeSetupSheetScript.includes('return status !== "ready" && status !== "signed_out";') &&
+    homeSetupSheetScript.includes('return status !== "signed_out" && !setupFinished(summary);') &&
     !homeSetupSheetScript.includes("principal_id") &&
     !homeSetupSheetScript.includes("credential_id") &&
     !homeSetupSheetScript.includes("localStorage") &&
@@ -1033,16 +1037,13 @@ assert(
     !homeSetupSheetScript.includes("createInitialProfile") &&
     !homeSetupSheetScript.includes("skip") &&
     !homeSetupSheetScript.includes("fallback"),
-  "Home setup must use typed Runtime readiness only, hold Chat only, and open System or People without local fallback state",
+  "Home setup must use typed Runtime readiness only, hold Chat only, and open System without local fallback state",
 );
 assert(
-  homeSetupSheetScript.includes('recoveryButton.textContent = unavailable') &&
-    homeSetupSheetScript.includes('? "Open System"') &&
-    homeSetupSheetScript.includes('profileButton.disabled = unavailable || profileReady || !recoveryReady || !targetById(summary, "people");') &&
-    homeSetupSheetScript.includes('const next = unavailable || homeRecoveryStatus(shellState.currentSummary) !== "ready"') &&
-    homeSetupSheetScript.includes('? recoveryButton') &&
-    homeSetupSheetScript.includes(': profileButton;'),
-  "Unavailable setup state must route only to System and must not enable Profile",
+  homeSetupSheetScript.includes(': profileReady ? "Save Recovery Kit" : "Finish setup";') &&
+    homeSetupSheetScript.includes('recoveryButton.disabled = recoveryActBusy || complete || !targetById(summary, "system");') &&
+    homeSetupSheetScript.includes('recoveryButton : closeButton)?.focus();'),
+  "Setup must focus its one admitted System action",
 );
 assert(
   homeSetupSheetScript.includes('rememberChromeNotification({') &&
@@ -1132,17 +1133,18 @@ const restoredWithHomeAgent = shellWindows.normalizeRestorableSession(
     ...summary,
     targets: [
       ...summary.targets,
-      { target: "home-agent", title: "Home Agent", route: "/apps/home-agent/" },
+      { target: "home-agent", title: "Legacy Home Agent", route: "/apps/home-agent/" },
+      { target: "assistant", title: "Assistant", route: "/apps/assistant/" },
     ],
   },
   {
     root_shell: "home-gui",
-    windows: [{ target: "home-agent", active: true }],
+    windows: [{ target: "home-agent", active: true }, { target: "assistant", active: false }],
   },
 );
 assert(
   restoredWithHomeAgent.length === 0,
-  "Home Agent was restored as a normal browser window",
+  "canonical Assistant or its legacy alias was restored as a normal browser window",
   restoredWithHomeAgent,
 );
 
@@ -1187,6 +1189,7 @@ assert(
 );
 
 const restoredBrowserLaunches = [];
+let heldLaunch = null;
 shellWindows.configureWindowHooks({
   clearIdentitySurface: () => {},
   hideLauncher: () => {},
@@ -1197,12 +1200,14 @@ shellWindows.configureWindowHooks({
   syncMenubar: () => {},
   launchTarget: async (target, query) => {
     restoredBrowserLaunches.push({ target, query: { ...query } });
-    if (restoredBrowserLaunches.length === 2) {
+    const launchOrdinal = restoredBrowserLaunches.length;
+    if (heldLaunch) await heldLaunch;
+    if (launchOrdinal === 2) {
       throw new Error("simulated Browser authority renewal failure");
     }
-    const launchToken = restoredBrowserLaunches.length === 1
+    const launchToken = launchOrdinal === 1
       ? "browser-window-close-token"
-      : `browser-window-renewed-token-${restoredBrowserLaunches.length}`;
+      : `browser-window-renewed-token-${launchOrdinal}`;
     const routeBase = target === "browser" ? "/apps/browser/" : `/apps/${target}/`;
     const title = ({
       people: "People",
@@ -1215,7 +1220,7 @@ shellWindows.configureWindowHooks({
       target,
       title,
       route:
-        `${routeBase}?browser_instance=${encodeURIComponent(query.browser_instance || "")}` +
+        `${routeBase}?${new URLSearchParams(query)}` +
         `#home_token=${launchToken}`,
       attach_kind: "iframe",
       launch_status: "launched",
@@ -1223,11 +1228,13 @@ shellWindows.configureWindowHooks({
   },
 });
 
+shellWindows.openTarget("assistant");
+shellWindows.handleTaskbarTargetClick("assistant");
 shellWindows.openTarget("home-agent");
 shellWindows.handleTaskbarTargetClick("home-agent");
 assert(
   restoredBrowserLaunches.length === 0 && shellCore.shellState.windows.size === 0,
-  "Home Agent activation created a normal browser window or launch",
+  "Assistant or legacy alias activation created a normal browser window or launch",
   { launches: restoredBrowserLaunches, windows: [...shellCore.shellState.windows.keys()] },
 );
 
@@ -2152,4 +2159,685 @@ assert(
   requests.slice(objectActionRequestCount),
 );
 
+const simpleSingleApps = [
+  "assistant", "marketplace", "services",
+  "wallet-metamask", "wallet-unisat", "wallet-walletconnect",
+];
+const simpleTargets = simpleSingleApps.map((source) => {
+  const manifest = JSON.parse(readFileSync(new URL(`../capsules/${source}/capsule.json`, import.meta.url), "utf8"));
+  // Keep the complete metadata-driven window-policy test. Assistant's owned
+  // face and its legacy alias are checked separately above.
+  const target = source === "assistant" ? "single-policy-fixture" : source;
+  assert(manifest.window_policy === "single", `${target} must declare its single-window policy`);
+  return { target, title: target, route: `/apps/${target}/`, window_policy: manifest.window_policy };
+});
+shellCore.shellState.currentSummary = { ...summary, targets: [...summary.targets, ...simpleTargets] };
+for (const target of simpleTargets) {
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  const before = restoredBrowserLaunches.length;
+  shellWindows.openTarget(target.target);
+  shellWindows.openTarget(target.target);
+  // A separate admitted entry point must share the in-flight creation too.
+  const concurrent = shellWindows.attachAuthorizedTarget({
+    ...target, attach_kind: "iframe", launch_status: "launched",
+    route: `${target.route}#home_token=must-not-replace-current-launch`,
+  });
+  await concurrent;
+  await new Promise(setImmediate);
+  assert(restoredBrowserLaunches.length === before + 1 && shellCore.shellState.windows.size === 1,
+    `${target.target}: concurrent Open created duplicate launches or frames`);
+  const entry = [...shellCore.shellState.windows.values()][0];
+  const frame = entry.node.querySelector(".window-frame");
+  const route = frame.dataset.route;
+  const draft = frame.querySelector("input");
+  const frameWindow = { document: { draft } };
+  frame.contentWindow = frameWindow;
+  draft.value = "intentional unsaved draft";
+  assert(route.includes("#home_token=") && !route.includes("must-not-replace"),
+    `${target.target}: concurrent entry replaced launch authority`);
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  shellWindows.openTarget(target.target);
+  await new Promise(setImmediate);
+  assert(restoredBrowserLaunches.length === before + 1 && shellCore.shellState.windows.size === 1 &&
+    shellCore.shellState.windows.get(entry.id) === entry &&
+    entry.node.querySelector(".window-frame") === frame && frame.contentWindow === frameWindow &&
+    frame.dataset.route === route && draft.value === "intentional unsaved draft",
+    `${target.target}: repeated Open changed the frame, token or draft`);
+  assert(!shellWindows.supportsMenuNewWindow(target.target), `${target.target}: New Window is offered`);
+  const stored = { root_shell: "home-gui", windows: [
+    { target: target.target, x: 23 }, { target: target.target, x: 99 },
+  ] };
+  const normalized = shellWindows.normalizeRestorableSession(shellCore.shellState.currentSummary, stored);
+  assert(normalized.length === 1 && normalized[0].x === 23,
+    `${target.target}: restore did not retain exactly the first saved window`);
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellCore.shellState.browserContextId = "browser:0123456789abcdef0123456789abcdef";
+  shellCore.shellState.homeBrowserState.session = { ...stored, browser_context_id: shellCore.shellState.browserContextId };
+  await shellWindows.restoreShellSession();
+  assert(restoredBrowserLaunches.length === before + 2 && shellCore.shellState.windows.size === 1,
+    `${target.target}: restore launched duplicate windows`);
+  for (const source of ["desktop", "taskbar", "launcher"]) {
+    shellSurface.openDesktopContextMenu(80, 80, { kind: "target", targetId: target.target, source });
+    const open = shellCore.desktopContextMenu.children.find((item) => item.dataset.contextAction === "open-target");
+    assert(open?.textContent === `Open ${target.title}`,
+      `${target.target}: ${source} context menu offers a misleading New Window`);
+    shellSurface.hideDesktopContextMenu();
+  }
+  // Policy comes from the Runtime projection, not a product-name set in Home.
+  delete target.window_policy;
+  assert(shellWindows.supportsMenuNewWindow(target.target) &&
+    shellWindows.normalizeRestorableSession(shellCore.shellState.currentSummary, stored).length === 2,
+    `${target.target}: Home hardcodes single status without projected metadata`);
+  await shellWindows.attachAuthorizedTarget({ ...target, attach_kind: "iframe", launch_status: "launched" });
+  assert(shellCore.shellState.windows.size === 2,
+    `${target.target}: launcher still imposes single status without Runtime projection`);
+  target.window_policy = "single";
+}
+const ownedAssistant = JSON.parse(readFileSync(new URL("../capsules/assistant/capsule.json", import.meta.url), "utf8"));
+assert(ownedAssistant.window_policy === "single", "canonical Assistant declares its single-instance policy");
+console.log("[home-shell-regression] single-window consumers: 6 PASS");
+const hybridContentQueries = {
+  "chat-room": { conversation_id: "conversation:fixture-one" },
+  documents: { doc: "did:key:fixture-document" },
+  "archive-manager": { objectUri: "localhost://fixture/Documents/one.zip" },
+  "gba-emulator": { objectUri: "localhost://fixture/Documents/one.gba" },
+};
+const hybridTargets = ["browser", "library", ...Object.keys(hybridContentQueries)].map((target) => {
+  const manifest = JSON.parse(readFileSync(new URL(`../capsules/${target}/capsule.json`, import.meta.url), "utf8"));
+  assert(manifest.window_policy === "hybrid", `${target} must declare hybrid policy`);
+  return { target, title: target, route: `/apps/${target}/`, window_policy: manifest.window_policy };
+});
+shellCore.shellState.currentSummary = { ...summary, targets: hybridTargets };
+const settleOpen = () => new Promise(setImmediate);
+const openHybrid = async (target, options = {}) => {
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  shellWindows.openTarget(target, options);
+  await settleOpen();
+};
+for (const target of hybridTargets) {
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  const before = restoredBrowserLaunches.length;
+  shellWindows.openTarget(target.target);
+  shellWindows.openTarget(target.target);
+  await settleOpen();
+  const first = [...shellCore.shellState.windows.values()][0];
+  assert(first && shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === before + 1,
+    `${target.target}: concurrent defaults did not coalesce`);
+  const frame = first.node.querySelector(".window-frame");
+  const route = frame.dataset.route;
+  frame.contentWindow = { draft: "keep editing" };
+  const frameWindow = frame.contentWindow;
+  await openHybrid(target.target);
+  assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === before + 1 &&
+    first.node.querySelector(".window-frame") === frame && frame.dataset.route === route &&
+    frame.contentWindow === frameWindow && frameWindow.draft === "keep editing",
+    `${target.target}: ordinary Open replaced current frame/draft/authority`);
+  await openHybrid(target.target, { newWindow: true });
+  assert(shellCore.shellState.windows.size === 2 && restoredBrowserLaunches.length === before + 2,
+    `${target.target}: explicit New Window was reused`);
+  const second = [...shellCore.shellState.windows.values()][1];
+  const secondRoute = second.node.querySelector(".window-frame").dataset.route;
+  assert(new URL(secondRoute, window.location.href).hash !== new URL(route, window.location.href).hash,
+    `${target.target}: independent windows shared a launch token`);
+  if (target.target === "browser") {
+    assert(first.launchQuery.browser_instance !== second.launchQuery.browser_instance,
+      "Browser New Window shared its instance");
+  }
+  const query = hybridContentQueries[target.target] || (target.target === "browser"
+    ? { url: "https://example.invalid/hybrid", browser_engine_id: "fixture-engine" }
+    : { uri: "localhost://fixture/Documents", objectUri: "localhost://fixture/Documents/a.txt", action: "properties" });
+  await openHybrid(target.target, { query });
+  assert(shellCore.shellState.windows.size === 3, `${target.target}: startup query was discarded by reuse`);
+  const queryLaunch = restoredBrowserLaunches.at(-1);
+  for (const [key, value] of Object.entries(query)) {
+    assert(queryLaunch.query[key] === value, `${target.target}: changed startup selector ${key}`);
+  }
+  const routed = [...shellCore.shellState.windows.values()][2];
+  if (hybridContentQueries[target.target]) {
+    const routedFrame = routed.node.querySelector(".window-frame");
+    routedFrame.contentWindow = { currentSelection: "changed inside capsule after launch" };
+    const liveFrame = routedFrame.contentWindow;
+    await openHybrid(target.target);
+    assert(shellCore.shellState.activeWindowId === routed.id && shellCore.shellState.windows.size === 3 &&
+      routedFrame.contentWindow === liveFrame && liveFrame.currentSelection === "changed inside capsule after launch",
+      `${target.target}: default Open inferred edited content from stale launch navigation`);
+  }
+  if (target.target === "library") {
+    await openHybrid("library");
+    assert(shellCore.shellState.activeWindowId === routed.id && shellCore.shellState.windows.size === 3,
+      "Library default did not reuse an existing URI-launched browse window");
+  }
+  const authorizedQuery = hybridContentQueries[target.target] ? { ...hybridContentQueries[target.target] } : target.target === "browser"
+    ? { browser_instance: "browser:approved-instance", url: "https://example.invalid/approved" }
+    : { mode: "attach", returnTarget: "browser", objectUri: "localhost://fixture/Documents/a.txt" };
+  if (!hybridContentQueries[target.target]) {
+    Object.assign(authorizedQuery, { home_token: "query-not-for-restore", unknown: "not-for-restore", chooser_request_id: "expired" });
+  }
+  const approvedRoute = `${target.route}?${new URLSearchParams(authorizedQuery)}#home_token=approved-${target.target}`;
+  const approved = await shellWindows.attachAuthorizedTarget({
+    ...target, route: approvedRoute, attach_kind: "iframe", launch_status: "launched",
+  });
+  assert(shellCore.shellState.windows.size === 4 && approved.node.querySelector(".window-frame").dataset.route === approvedRoute,
+    `${target.target}: authorized semantic launch was reused or rewritten`);
+  for (const [key, value] of Object.entries(authorizedQuery)) {
+    assert(approved.launchQuery[key] === value, `${target.target}: approved route selector lost before restore: ${key}`);
+  }
+  if (target.target === "library") {
+    await openHybrid("library");
+    assert(shellCore.shellState.activeWindowId === routed.id, "Library reused a picker instead of browse");
+  }
+  const stored = shellWindows.snapshotBrowserSession();
+  const expectedRestoredCount = target.target === "library" ? 3 : 4;
+  assert(stored.windows.length === expectedRestoredCount,
+    `${target.target}: snapshot retained an ephemeral picker`);
+  assert(stored.windows.every((saved) => !saved.query.action),
+    `${target.target}: snapshot retained a one-shot action`);
+  assert(stored.windows.every((saved) => !saved.query.home_token && !saved.query.home_origin &&
+    !saved.query.unknown && !saved.query.chooser_request_id), `${target.target}: snapshot retained authority or unknown fields`);
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellCore.shellState.homeBrowserState.session = { ...stored, browser_context_id: shellCore.shellState.browserContextId };
+  const beforeRestore = restoredBrowserLaunches.length;
+  await shellWindows.restoreShellSession();
+  assert(shellCore.shellState.windows.size === expectedRestoredCount && restoredBrowserLaunches.length === beforeRestore + expectedRestoredCount,
+    `${target.target}: hybrid restore collapsed independent windows`);
+  for (const saved of stored.windows) {
+    assert(restoredBrowserLaunches.slice(beforeRestore).some((launch) =>
+      Object.entries(saved.query).every(([key, value]) => launch.query[key] === value)),
+    `${target.target}: restore changed a saved selector`);
+  }
+}
+// A Library picker alone is never the destination for ordinary browse Open.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await shellWindows.attachAuthorizedTarget({
+  target: "library", title: "Library", attach_kind: "iframe", launch_status: "launched",
+  route: "/apps/library/?mode=archive-open&returnTarget=archive-manager#home_token=archive-picker",
+});
+await openHybrid("library");
+assert(shellCore.shellState.windows.size === 2,
+  "Library default Open reused the only picker instead of creating browse");
+console.log("[home-shell-regression] hybrid consumers: 6 PASS");
+for (const mode of ["attach", "archive-open", "archive-create"]) {
+  await shellWindows.attachAuthorizedTarget({
+    target: "library", title: "Library", attach_kind: "iframe", launch_status: "launched",
+    route: `/apps/library/?mode=${mode}&returnTarget=browser&chooser_request_id=expired#home_token=picker-${mode}`,
+  });
+  assert(shellWindows.snapshotBrowserSession().windows.every((item) => !item.query.mode && !item.query.returnTarget),
+    `Library snapshot retained ${mode} picker`);
+  const stalePicker = shellWindows.normalizeRestorableSession(shellCore.shellState.currentSummary, {
+    root_shell: "home-gui", windows: [{ target: "library", query: { mode, returnTarget: "browser", chooser: "stale" } }],
+  });
+  assert(stalePicker.length === 0, `Library restored stale ${mode} picker`);
+}
+for (const action of ["empty-trash", "download"]) {
+  const unsafeQuery = { uri: "localhost://fixture/Documents", objectUri: "localhost://fixture/Documents/a.txt",
+    action, home_token: "stale", home_origin: "https://old.invalid", chooser_request_id: "stale", unknown: "value" };
+  const [safe] = shellWindows.normalizeRestorableSession(shellCore.shellState.currentSummary, {
+    root_shell: "home-gui", windows: [{ target: "library", query: unsafeQuery }],
+  });
+  assert(JSON.stringify(safe.query) === JSON.stringify({ uri: unsafeQuery.uri, objectUri: unsafeQuery.objectUri }),
+    `Library persisted one-shot ${action}, unknown fields or authority`);
+}
+const [safeBrowser] = shellWindows.normalizeRestorableSession(shellCore.shellState.currentSummary, {
+  root_shell: "home-gui", windows: [{ target: "browser", query: {
+    browser_instance: "browser:restore-fixture", url: "https://example.invalid/restore",
+    home_token: "stale", home_origin: "https://old.invalid", unknown: "value",
+  } }],
+});
+assert(JSON.stringify(safeBrowser.query) === JSON.stringify({ browser_instance: "browser:restore-fixture", url: "https://example.invalid/restore" }),
+  "Browser restore retained authority or unknown fields");
+const shellMenubar = await import(`../capsules/home-gui/browser/shell-menubar.js?v=${moduleVersion}`);
+const menuLaunches = [];
+shellMenubar.bindMenubar({
+  supportsNewWindow: shellWindows.supportsMenuNewWindow,
+  openTarget: (target, options) => { menuLaunches.push({ target, options }); shellWindows.openTarget(target, options); },
+});
+for (const target of hybridTargets) {
+  await openHybrid(target.target);
+  const beforeMenu = restoredBrowserLaunches.length;
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  shellMenubar.syncMenubar();
+  const fileMenu = document.querySelector("#toolbar-menubar").children[0].children[1];
+  const newWindow = fileMenu.children.find((row) => row.textContent === "New Window");
+  assert(newWindow, `${target.target}: File menu omitted New Window`);
+  newWindow.dispatch("click");
+  await settleOpen();
+  assert(menuLaunches.at(-1).options.newWindow === true && restoredBrowserLaunches.length === beforeMenu + 1,
+    `${target.target}: File New Window used ordinary Open`);
+  for (const source of ["desktop", "taskbar", "launcher"]) {
+    shellCore.shellState.recentUiAction = { key: "", at: 0 };
+    shellSurface.openDesktopContextMenu(80, 80, { kind: "target", targetId: target.target, source });
+    const action = shellCore.desktopContextMenu.children.find((row) => row.textContent === "New Window");
+    assert(action, `${target.target}: ${source} omitted New Window`);
+    const before = restoredBrowserLaunches.length;
+    shellSurface.handleContextAction(action.dataset.contextAction);
+    await settleOpen();
+    assert(restoredBrowserLaunches.length === before + 1, `${target.target}: ${source} New Window reused a frame`);
+    shellSurface.hideDesktopContextMenu();
+  }
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  let releaseLaunch;
+  heldLaunch = new Promise((resolve) => { releaseLaunch = resolve; });
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  const beforeRace = restoredBrowserLaunches.length;
+  shellWindows.openTarget(target.target);
+  shellWindows.openTarget(target.target, { newWindow: true });
+  shellWindows.openTarget(target.target, { newWindow: true });
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  shellWindows.openTarget(target.target);
+  assert(restoredBrowserLaunches.length === beforeRace + 3 && shellCore.shellState.windows.size === 0,
+    `${target.target}: pending default raced with explicit New Window`);
+  releaseLaunch();
+  heldLaunch = null;
+  await settleOpen();
+  assert(shellCore.shellState.windows.size === 3, `${target.target}: race lost an independent launch`);
+  const raced = [...shellCore.shellState.windows.values()];
+  assert(new Set(raced.map((entry) => new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash)).size === 3,
+    `${target.target}: racing windows shared a launch token`);
+  if (target.target === "browser") {
+    assert(new Set(raced.map((entry) => entry.launchQuery.browser_instance)).size === 3,
+      "racing Browser windows shared an instance");
+  }
+}
+console.log("[home-shell-regression] hybrid menu/context/race: PASS");
+const hybridFolder = { uri: "localhost://fixture/Documents", name: "Documents", kind: "directory", capabilities: ["open", "list"] };
+shellCore.shellState.currentSummary.desktop_objects = { objects: [hybridFolder] };
+for (const action of ["open-desktop-object", "open-desktop-object-new-window"]) {
+  shellCore.shellState.contextMenuTarget = { kind: "desktop-object", entryId: `object:${hybridFolder.uri}` };
+  shellCore.shellState.recentUiAction = { key: "", at: 0 };
+  const before = restoredBrowserLaunches.length;
+  shellSurface.handleContextAction(action);
+  await settleOpen();
+  assert(restoredBrowserLaunches.length === before + 1 && restoredBrowserLaunches.at(-1).query.uri === hybridFolder.uri,
+    `${action}: directory selector did not reach its independent Library launch`);
+}
+// Own File menus share the same bounded policy-derived blank-window command.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("documents");
+const menuEntry = [...shellCore.shellState.windows.values()][0];
+const menuTarget = hybridTargets.find((target) => target.target === "documents");
+const renderedMenus = () => document.querySelector("#toolbar-menubar").children;
+const renderedRows = () => renderedMenus().flatMap((menu) => menu.children[1].children);
+const blankRows = () => renderedRows().filter((row) => row.textContent === "New Window");
+for (const ownedMenus of [
+  [{ title: "File", items: [{ label: "Save", cmd: "file-save" }, { label: "Close Window", cmd: "__close-window" }] }],
+  [{ title: "File", items: [{ label: "New Window", cmd: "__new-window" }, { label: "New Window", cmd: "__new-window" }, { label: "Save", cmd: "file-save" }] }],
+]) {
+  shellMenubar.setMenuManifest(menuEntry.id, ownedMenus);
+  shellMenubar.syncMenubar();
+  assert(blankRows().length === 1 && renderedRows().some((row) => row.textContent === "Save"),
+    "Hybrid own File menu must retain Save and exactly one blank New Window");
+}
+const maxItems = Array.from({ length: 20 }, (_, index) => ({ label: `Item ${index}`, cmd: `item-${index}` }));
+shellMenubar.setMenuManifest(menuEntry.id, [{ title: "File", items: maxItems }]);
+assert(renderedMenus().length === 1 && renderedRows().length === 22 && blankRows().length === 1,
+  "Home must add only its command and separator to the bounded File input");
+assert(maxItems.every((item) => renderedRows().some((row) => row.textContent === item.label)),
+  "Home's command displaced a valid capsule File command");
+shellMenubar.setMenuManifest(menuEntry.id, Array.from({ length: 6 }, (_, index) => ({ title: `Menu ${index}`, items: maxItems })));
+assert(renderedMenus().length === 7 && renderedMenus()[0].children[0].textContent === "File" && blankRows().length === 1,
+  "Home must add only one File menu to the bounded six-menu input");
+assert(renderedMenus().slice(1).every((menu, index) => menu.children[0].textContent === `Menu ${index}` &&
+  menu.children[1].children.length === 20), "Home's File menu displaced valid capsule commands");
+for (const policy of ["single", "multiple", undefined]) {
+  menuTarget.window_policy = policy;
+  shellMenubar.setMenuManifest(menuEntry.id, [{ title: "File", items: [
+    { label: "New Window", cmd: "__new-window" }, { label: "Open selected", cmd: "selected-open" },
+  ] }]);
+  assert(blankRows().length === (policy ? 0 : 1), `${policy || "absent"}: reserved blank command visibility drifted`);
+  assert(renderedRows().some((row) => row.textContent === "Open selected"), "Capsule-owned selected command was removed");
+  assert(shellWindows.supportsMenuNewWindow("documents") === !policy, "Policy generic command support disagrees with menu");
+}
+menuTarget.window_policy = "hybrid";
+
+const playerManifest = JSON.parse(readFileSync(new URL("../capsules/elacity-player/capsule.json", import.meta.url), "utf8"));
+assert(playerManifest.window_policy === "multiple", "Player must keep independent selected sessions");
+const playerTarget = { target: "elacity-player", title: "Player", route: "/apps/elacity-player/", window_policy: playerManifest.window_policy };
+shellCore.shellState.currentSummary.targets.push(playerTarget);
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+const mintId = "ab".repeat(32);
+await openHybrid("elacity-player", { query: { mint_id: mintId } });
+await openHybrid("elacity-player", { query: { mint_id: mintId } });
+const playerEntries = [...shellCore.shellState.windows.values()];
+assert(playerEntries.length === 2 && playerEntries.every((entry) => entry.launchQuery.mint_id === mintId),
+  "Separate selected player launches reused or changed their mint identity");
+assert(new Set(playerEntries.map((entry) => new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash)).size === 2,
+  "Selected Player windows shared launch authority");
+shellMenubar.syncMenubar();
+assert(blankRows().length === 0 && renderedRows().some((row) => row.textContent === "Close Window"),
+  "Selected-only Player must keep Close without a blank New Window command");
+for (const source of ["desktop", "taskbar", "launcher"]) {
+  shellSurface.openDesktopContextMenu(80, 80, { kind: "target", targetId: "elacity-player", source });
+  assert(!shellCore.desktopContextMenu.children.some((row) => row.textContent === "New Window"),
+    `Player ${source} offered a blank New Window`);
+  shellSurface.hideDesktopContextMenu();
+}
+const playerSession = shellWindows.snapshotBrowserSession();
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+shellCore.shellState.homeBrowserState.session = { ...playerSession, browser_context_id: shellCore.shellState.browserContextId };
+await shellWindows.restoreShellSession();
+assert(shellCore.shellState.windows.size === 2 && [...shellCore.shellState.windows.values()].every((entry) => entry.launchQuery.mint_id === mintId),
+  "Restored selected Player windows collapsed or lost mint identity");
+
+const inventory = readdirSync(new URL("../capsules/", import.meta.url)).flatMap((name) => {
+  const path = new URL(`../capsules/${name}/capsule.json`, import.meta.url);
+  return existsSync(path) ? [JSON.parse(readFileSync(path, "utf8"))] : [];
+});
+assert(inventory.length === 40, "Update the exact capsule role/policy inventory when membership changes");
+for (const [policy, count] of [["single", 10], ["hybrid", 6], ["multiple", 1]]) {
+  assert(inventory.filter((manifest) => manifest.window_policy === policy).length === count, `${policy} inventory drift`);
+}
+for (const [role, count] of [["provider", 18], ["content", 2], ["shell", 2]]) {
+  const owned = inventory.filter((manifest) => manifest.role === role);
+  assert(owned.length === count && owned.every((manifest) => !manifest.window_policy), `${role} must retain its owned non-window role`);
+}
+assert(inventory.filter((manifest) => manifest.role === "app" && !manifest.window_policy).map((manifest) => manifest.name).sort().join(",") === "home",
+  "Home alone owns the app host role without a window policy");
+console.log("[home-shell-regression] all40 roles, own menus and selected Player: PASS");
+
+// A verified in-app selection must replace only that window's
+// persisted presentation selector, then restore through a fresh Runtime launch.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("documents", { query: { doc: "did:document-a" } });
+await openHybrid("documents", { query: { doc: "did:document-c" } });
+const documentWindows = [...shellCore.shellState.windows.values()];
+const originalDocumentTokens = documentWindows.map((entry) =>
+  new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash);
+const documentsSource = readFileSync(new URL("../capsules/documents/browser/index.html", import.meta.url), "utf8");
+const navigationFunction = (source, name) => {
+  const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
+  assert(start >= 0, `Documents function missing: ${name}`);
+  return source.slice(start, source.indexOf("\n}", start) + 2);
+};
+const documentFunction = (name) => navigationFunction(documentsSource, name);
+const savedB = { doc_did: "did:document-b", title: "Saved B", body: "Private saved body", revision: "b".repeat(64) };
+const selectionReads = [];
+const firstDocumentFrame = documentWindows[0].node.querySelector(".window-frame");
+firstDocumentFrame.contentWindow = {};
+const hostSource = readFileSync(new URL("../capsules/home/browser/home-shell-host.js", import.meta.url), "utf8");
+const guiSource = readFileSync(new URL("../capsules/home-gui/browser/home-gui.js", import.meta.url), "utf8");
+const guiShellSource = readFileSync(new URL("../capsules/home-gui/browser/home-gui-shell.js", import.meta.url), "utf8");
+const { isTrustedHomeGuiMessage } = await import(`../capsules/home-gui/browser/home-gui-authority.js`);
+const navigationRelayMessages = [];
+const guiFrameWindow = {};
+const hostWindow = { location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180" } };
+assert(!isTrustedHomeGuiMessage({ source: {}, origin: hostWindow.location.origin }, hostWindow, hostWindow.location.origin) &&
+  !isTrustedHomeGuiMessage({ source: hostWindow, origin: "null" }, hostWindow, hostWindow.location.origin),
+  "GUI must reject messages outside its exact Home parent/origin");
+const guiNavigation = vm.createContext({ shellState: shellCore.shellState, URL, URLSearchParams,
+  window, probeHomeNavigation: shellWindows.probeHomeNavigation,
+  acceptHomeNavigation: shellWindows.acceptHomeNavigation });
+vm.runInContext(["homeLaunchTokenFromRoute", "homeGuiWindowEntryForToken", "handleHomeGuiHomeNavigation"]
+  .map((name) => navigationFunction(guiSource, name)).join("\n"), guiNavigation);
+vm.runInContext(["hasExactKeys", "handleGuiCommand"].map((name) => navigationFunction(guiShellSource, name)).join("\n"), guiNavigation);
+guiFrameWindow.postMessage = (message, origin) => {
+  assert(origin === "*", "GUI recipient is an opaque frame");
+  assert(isTrustedHomeGuiMessage({ data: message, source: hostWindow, origin: hostWindow.location.origin },
+    hostWindow, hostWindow.location.origin), "GUI rejected actual Home-host relay provenance");
+  navigationRelayMessages.push(message);
+  guiNavigation.handleGuiCommand(message);
+};
+const navigationHost = vm.createContext({ window: hostWindow, URL, URLSearchParams,
+  OPAQUE_CAPSULE_ORIGIN: "null", OPAQUE_FRAME_TARGET: "*", WALLET_CONNECTOR_EFFECT_TYPE: "fixture-wallet",
+  shellState: { activeShellRootRoute: "/apps/home-gui/#home_token=gui-token" },
+  activeShellRoot: { dataset: { target: "home-gui" } },
+  activeShellFrame: { dataset: { route: "/apps/home-gui/#home_token=gui-token" }, contentWindow: guiFrameWindow },
+  launchedAppContexts: new Map(),
+});
+vm.runInContext(["hasExactMessageKeys", "homeLaunchTokenFromRoute", "homeMessageContext", "postToActiveShell", "relayHomeNavigation"]
+  .map((name) => navigationFunction(hostSource, name)).join("\n"), navigationHost);
+const navigationToken = new URLSearchParams(originalDocumentTokens[0].slice(1)).get("home_token");
+navigationHost.launchedAppContexts.set(navigationToken,
+  { targetId: "documents", origin: "null", source: firstDocumentFrame.contentWindow });
+function deliverNavigation(data, overrides = {}) {
+  const event = { data, source: firstDocumentFrame.contentWindow, origin: "null", ...overrides };
+  const context = navigationHost.homeMessageContext(event, data);
+  return context ? navigationHost.relayHomeNavigation(context, data) : false;
+}
+assert(hostSource.includes("relayHomeNavigation(context, data);"), "Host listener must use the tested relay");
+const documentApp = vm.createContext({
+  state: { current: { doc_did: "did:document-a" }, currentSessionId: 1, dirty: false, homeToken: navigationToken },
+  elements: { titleInput: { value: "A" }, editor: { value: "Body A" } },
+  documentSelectionSequence: 0, autosaveQueued: false, queuedSaveTarget: null,
+  saveRecovery: null, savedWorkingCopy: null,
+  clearAutosaveTimer() {}, upsertDocumentListItem() {}, renderDocumentsList() {},
+  renderCurrentDocument() {}, setStatus() {}, scheduleStatusClear() {},
+  baseName: (uri) => uri.split("/").pop(), base64ToUtf8: () => "Library text",
+  documentsProviderApi: async (op, payload) => {
+    selectionReads.push({ op, ...payload });
+    assert(op === "get" && payload.doc_did === savedB.doc_did, "Selection must read exact saved B");
+    return { document: { ...savedB } };
+  },
+  homeOrigin: "http://localhost:61180",
+  window: { parent: guiFrameWindow, top: { postMessage(data, origin) {
+    assert(origin === hostWindow.location.origin, "Documents navigation must target exact Home origin");
+    deliverNavigation(data);
+  } } },
+});
+vm.runInContext(["hasExactKeys", "updateDocumentsNavigation",
+  "resetPendingSaveIntent", "replaceCurrentDocument", "requireSavedWorkingCopy", "selectDocument", "loadLibraryObject"]
+  .map(documentFunction).join("\n"), documentApp);
+let documentClient = navigationClientFixture({ homeToken: navigationToken, homeOrigin: hostWindow.location.origin,
+  parent: guiFrameWindow, top: documentApp.window.top });
+documentApp.homeNavigation = documentClient.client;
+firstDocumentFrame.contentWindow.postMessage = (data, origin) => {
+  assert(origin === "*", "Documents recipient is an opaque frame");
+  documentClient.dispatch("message", { data, source: guiFrameWindow, origin: "null" });
+};
+guiNavigation.handleGuiCommand({ type: "home:gui-command", command: "navigation-hint", homeToken: navigationToken, navigation: null });
+assert(documentWindows[0].launchQuery.doc === "did:document-a", "Loading must retain the approved startup selector");
+await documentApp.selectDocument(savedB.doc_did);
+assert(selectionReads.length === 1 && documentApp.state.current.doc_did === savedB.doc_did,
+  "Fixture did not commit the real verified Documents selection");
+const validNavigation = () => ({ ...navigationRelayMessages.at(-1).navigation });
+const selectedHint = () => JSON.stringify(documentWindows[0].launchQuery);
+const selectedBHint = selectedHint();
+const initialBReport = validNavigation();
+for (const event of [{ source: {} }, { origin: "https://untrusted.invalid" }]) {
+  deliverNavigation({ ...initialBReport, sequence: 100, query: {} }, event);
+  assert(selectedHint() === selectedBHint, "Wrong source/origin changed the restore hint");
+}
+for (const invalid of [
+  { homeToken: "wrong-token" }, { documentNonce: "old-document" }, { requestId: "old-request" },
+  { sequence: initialBReport.sequence }, { sequence: -1 },
+  { query: { doc: "did:other", body: "private body" } }, { query: { intent: "new" } },
+  { query: { home_token: "forged" } }, { query: { route: "/api/private" } },
+  { query: { objectUri: "https://example.invalid/file" } },
+  ...["../secret", "./secret", "one\\two.md", "bad\u0000.md"]
+    .map((path) => ({ query: { objectUri: `localhost://fixture/Documents/${path}` } })),
+  { query: { objectUri: "localhost://user:pass@fixture/Documents/a.md" } },
+  { query: { objectUri: "localhost:///Documents/a.md" } },
+  { query: { objectUri: "localhost://fixture:8080/Documents/a.md" } },
+  { query: { doc: "did:" + "x".repeat(513) } }, { body: "unexpected field" },
+]) {
+  deliverNavigation({ ...initialBReport, sequence: 100, query: {}, ...invalid });
+  assert(selectedHint() === selectedBHint, `Invalid navigation changed restore: ${JSON.stringify(invalid)}`);
+}
+const validProbe = { type: "elastos.home.navigation.request/v1", homeToken: navigationToken,
+  requestId: documentWindows[0].homeNavigation.requestId };
+for (const event of [{ source: {} }, { origin: "https://untrusted.invalid" },
+  { data: { ...validProbe, homeToken: "wrong-token" } }]) {
+  const before = navigationRelayMessages.length;
+  documentClient.dispatch("message", { data: validProbe, source: guiFrameWindow, origin: "null", ...event });
+  assert(navigationRelayMessages.length === before, "Documents accepted an untrusted navigation probe");
+}
+// Reload renews the Home challenge even though WindowProxy and launch token persist.
+documentClient = navigationClientFixture({ homeToken: navigationToken, homeOrigin: hostWindow.location.origin,
+  parent: guiFrameWindow, top: documentApp.window.top });
+documentApp.homeNavigation = documentClient.client;
+shellWindows.probeHomeNavigation(documentWindows[0], true);
+deliverNavigation({ ...initialBReport, sequence: 100 });
+assert(selectedHint() === selectedBHint, "Old document response crossed a reload challenge");
+deliverNavigation({ ...validNavigation(), documentNonce: "old-document", sequence: 100, query: {} });
+assert(selectedHint() === selectedBHint, "Wrong current-document nonce changed restore");
+await documentApp.selectDocument(savedB.doc_did, { force: true });
+// Retiring or replacing the exact entry/frame/route rejects queued responses.
+const currentReport = validNavigation();
+const registeredDocument = navigationHost.launchedAppContexts.get(navigationToken);
+navigationHost.launchedAppContexts.delete(navigationToken);
+deliverNavigation({ ...currentReport, sequence: 100, query: {} });
+assert(selectedHint() === selectedBHint, "Retired Home app context accepted navigation");
+navigationHost.launchedAppContexts.set(navigationToken, registeredDocument);
+shellCore.shellState.windows.delete(documentWindows[0].id);
+deliverNavigation({ ...currentReport, sequence: 100, query: {} });
+assert(selectedHint() === selectedBHint, "Retired window accepted navigation");
+shellCore.shellState.windows.set(documentWindows[0].id, documentWindows[0]);
+const currentRoute = firstDocumentFrame.dataset.route;
+firstDocumentFrame.dataset.route = "/apps/documents/#home_token=replacement-token";
+deliverNavigation({ ...currentReport, sequence: 100, query: {} });
+assert(selectedHint() === selectedBHint, "Replaced route accepted navigation");
+firstDocumentFrame.dataset.route = currentRoute;
+const currentSource = firstDocumentFrame.contentWindow;
+firstDocumentFrame.contentWindow = {};
+deliverNavigation({ ...currentReport, sequence: 100, query: {} }, { source: currentSource });
+assert(selectedHint() === selectedBHint, "Replaced frame accepted an old document response");
+firstDocumentFrame.contentWindow = currentSource;
+documentClient.dispatch("pagehide");
+deliverNavigation({ ...currentReport, sequence: 100, query: {} });
+assert(selectedHint() === selectedBHint && !documentWindows[0].homeNavigation,
+  "An unloading document retained its navigation binding");
+documentClient.dispatch("pageshow");
+shellWindows.probeHomeNavigation(documentWindows[0], true);
+// A stale asynchronous selection cannot publish another document's identity.
+let finishStaleRead;
+const readGate = new Promise((resolve) => { finishStaleRead = resolve; });
+documentApp.documentsProviderApi = async (_op, payload) => {
+  if (payload.doc_did === "did:stale") await readGate;
+  return { document: { ...savedB, doc_did: payload.doc_did } };
+};
+const staleSelection = documentApp.selectDocument("did:stale");
+await documentApp.selectDocument(savedB.doc_did, { force: true });
+finishStaleRead();
+await staleSelection;
+assert(selectedHint() === selectedBHint, "Stale GET replaced the current saved selection hint");
+for (const name of ["My notes #one?.md", "My%20notes%23one.md", "%2e%2e.md", "one%2Ftwo.md", "100% notes.md"]) {
+  const libraryUri = `localhost://Users/fixture/Documents/${name}`;
+  documentApp.libraryObjectApi = async () => ({ object: { uri: libraryUri, revision: "verified-library-revision" }, data: "" });
+  await documentApp.loadLibraryObject(libraryUri);
+  assert(documentWindows[0].launchQuery.objectUri === libraryUri, "Literal Library filename identity changed");
+  const restoredLiteral = shellWindows.normalizeRestorableSession(shellCore.shellState.currentSummary,
+    shellWindows.snapshotBrowserSession()).find((item) => item.query?.objectUri);
+  assert(restoredLiteral?.query.objectUri === libraryUri, "Snapshot/restore changed literal Library identity");
+}
+let finishLibraryRead;
+const libraryReadGate = new Promise((resolve) => { finishLibraryRead = resolve; });
+documentApp.libraryObjectApi = async () => { await libraryReadGate; return { object: {
+  uri: "localhost://Users/fixture/Documents/late.md", revision: "verified-library-revision" }, data: "" }; };
+const staleLibrarySelection = documentApp.loadLibraryObject("localhost://Users/fixture/Documents/late.md");
+await documentApp.selectDocument(savedB.doc_did, { force: true });
+finishLibraryRead();
+await staleLibrarySelection;
+assert(selectedHint() === selectedBHint, "Late Library read replaced a newer saved document hint");
+documentApp.replaceCurrentDocument({ doc_did: "", title: "Unsaved draft", body: "Private draft" });
+assert(selectedHint() === "{}", "New draft resurrected the previous saved identity");
+documentApp.replaceCurrentDocument(null);
+assert(selectedHint() === "{}", "Cleared selection resurrected the previous saved identity");
+assert(!JSON.stringify(navigationRelayMessages).includes("Private draft") &&
+  !JSON.stringify(navigationRelayMessages).includes("Private saved body"), "Content bytes escaped into Home navigation");
+await documentApp.selectDocument(savedB.doc_did, { force: true });
+const afterDocumentSelection = shellWindows.snapshotBrowserSession();
+assert(!JSON.stringify(afterDocumentSelection).includes(navigationToken) &&
+  !JSON.stringify(afterDocumentSelection).includes("Private saved body") &&
+  !JSON.stringify(afterDocumentSelection).includes("documentNonce"), "Session store contains navigation authority or content bytes");
+const freshDocumentLaunches = restoredBrowserLaunches.length;
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+shellCore.shellState.homeBrowserState.session = { ...afterDocumentSelection,
+  browser_context_id: shellCore.shellState.browserContextId };
+await shellWindows.restoreShellSession();
+const restoredDocuments = [...shellCore.shellState.windows.values()];
+assert(restoredDocuments.length === 2 && restoredBrowserLaunches.length === freshDocumentLaunches + 2,
+  "Documents restore must independently reauthorize both windows");
+assert(restoredDocuments.every((entry) => !originalDocumentTokens.includes(
+  new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash)),
+  "Documents restore reused old launch authority");
+const restoredDocumentIds = restoredBrowserLaunches.slice(freshDocumentLaunches).map((launch) => launch.query.doc).sort();
+assert(restoredDocumentIds.join(",") === "did:document-b,did:document-c",
+  `Verified selection B was lost across restore: ${restoredDocumentIds.join(",")}`);
+console.log("[home-shell-regression] Documents current selection, exact relay, isolation and fresh restore: PASS");
+// Four consumers share this exact transport. Each owns two independent windows;
+// only the real settled selection in the first may change its restore selector.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+const consumerEntries = new Map();
+const startingQueries = {
+  library: { uri: "localhost://Users/fixture/Documents/A" },
+  "archive-manager": { objectUri: "localhost://Users/fixture/Documents/A.zip" },
+  "gba-emulator": { capsule: "gba-ucity" },
+  "chat-room": { conversation_id: "direct:sha256:conversation-a" },
+};
+for (const [target, query] of Object.entries(startingQueries)) {
+  await openHybrid(target, { query });
+  const entry = [...shellCore.shellState.windows.values()].at(-1);
+  consumerEntries.set(target, entry);
+  await openHybrid(target, { query });
+}
+const oldConsumerTokens = [...shellCore.shellState.windows.values()].map(entry =>
+  new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash);
+const consumerClients = new Map();
+const consumerReports = await exerciseNavigationConsumers(target => {
+  const entry = consumerEntries.get(target);
+  const frame = entry.node.querySelector(".window-frame");
+  const token = new URLSearchParams(new URL(frame.dataset.route, window.location.href).hash.slice(1)).get("home_token");
+  frame.contentWindow = {};
+  navigationHost.launchedAppContexts.set(token, { targetId: target, origin: "null", source: frame.contentWindow });
+  const fixture = navigationClientFixture({ homeToken: token, homeOrigin: hostWindow.location.origin,
+    parent: guiFrameWindow, top: { postMessage(data, origin) {
+      assert(origin === hostWindow.location.origin, "Consumer used an untrusted Home origin");
+      const context = navigationHost.homeMessageContext({ data, source: frame.contentWindow, origin: "null" }, data);
+      if (context) navigationHost.relayHomeNavigation(context, data);
+    } } });
+  frame.contentWindow.postMessage = data => fixture.dispatch("message", { data, source: guiFrameWindow, origin: "null" });
+  consumerClients.set(target, fixture);
+  guiNavigation.handleGuiCommand({ type: "home:gui-command", command: "navigation-hint", homeToken: token, navigation: null });
+  return fixture.client;
+});
+for (const [target, entry] of consumerEntries) {
+  assert(JSON.stringify(entry.launchQuery) === JSON.stringify(consumerReports.reports[target]), `${target} did not settle through the real Home relay`);
+  const before = JSON.stringify(entry.launchQuery);
+  const record = entry.homeNavigation;
+  const report = { type: "home:navigation-hint", homeToken: record.homeToken, requestId: record.requestId,
+    documentNonce: record.documentNonce, sequence: record.sequence + 1, phase: "state" };
+  for (const query of [{ body: "private" }, { intent: "extract" }, { requestId: "effect" },
+    { uri: "/host/path" }, { doc: "did:wrong-app" }, { capsule: "../../escape" }, { mode: "attach" }]) {
+    assert(!shellWindows.acceptHomeNavigation(entry, { ...report, query }), `${target} accepted a non-selector field`);
+  }
+  const oldTarget = entry.targetId;
+  entry.targetId = "documents";
+  assert(!shellWindows.acceptHomeNavigation(entry, { ...report, query: {} }), "Changed actor accepted an existing binding");
+  entry.targetId = oldTarget;
+  assert(JSON.stringify(entry.launchQuery) === before, "Wrong actor/effect altered selector");
+}
+await openHybrid("library", { query: { mode: "attach", returnTarget: "chat-room" } });
+const pickerEntry = [...shellCore.shellState.windows.values()].at(-1);
+assert(!shellWindows.probeHomeNavigation(pickerEntry), "Picker acquired a restore hint channel");
+const consumerSnapshot = shellWindows.snapshotBrowserSession();
+assert(consumerSnapshot.windows.length === 8, "Picker entered persistent restore state");
+const launchStart = restoredBrowserLaunches.length;
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+shellCore.shellState.homeBrowserState.session = { ...consumerSnapshot, browser_context_id: shellCore.shellState.browserContextId };
+await shellWindows.restoreShellSession();
+const freshConsumers = [...shellCore.shellState.windows.values()];
+assert(freshConsumers.length === 8 && restoredBrowserLaunches.length === launchStart + 8,
+  "Consumer windows must restore independently through fresh Runtime launches");
+assert(freshConsumers.every(entry => !oldConsumerTokens.includes(new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash)),
+  "A consumer reused its prior launch authority");
+for (const [target, original] of Object.entries(startingQueries)) {
+  const actual = freshConsumers.filter(entry => entry.targetId === target).map(entry => JSON.stringify(entry.launchQuery)).sort();
+  const expected = [JSON.stringify(original), JSON.stringify(consumerReports.reports[target])].sort();
+  assert(JSON.stringify(actual) === JSON.stringify(expected), `${target} lost current selection or changed the independent window`);
+}
+console.log("[home-shell-regression] Library/Archive/GBA/Chat settled selectors, stale/failed changes and fresh independent restore: PASS");
 console.log("[home-shell-regression] PASS");

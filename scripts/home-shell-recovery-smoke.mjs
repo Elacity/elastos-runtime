@@ -173,11 +173,11 @@ const summary = {
   active_shell: {
     active: "home-cli",
     candidates: [
-      { name: "home-gui", title: "Home GUI", role: "shell", launchable: true, route: "/apps/home/" },
+      { name: "home-gui", title: "Home GUI", role: "shell", launchable: true, route: "/home/" },
       { name: "home-cli", title: "Home CLI", role: "shell", launchable: true, route: "/apps/home-cli/" },
     ],
   },
-  app: { id: "home", route: "/apps/home/" },
+  app: { id: "home", route: "/home/" },
   appearance: {},
   browser_state: {
     principal_id: "principal:home-shell-recovery",
@@ -200,6 +200,7 @@ const summary = {
 
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
+  getElementById: id => elementForSelector(`#${id}`),
   activeElement: null,
   body: elementForSelector("body"),
   documentElement: elementForSelector("html"),
@@ -213,9 +214,10 @@ Object.defineProperty(globalThis, "navigator", {
   value: {},
 });
 globalThis.window = {
+  sessionStorage: { getItem: () => null },
   crypto: { randomUUID: () => "home-shell-recovery-smoke" },
   location: {
-    href: "http://localhost:61180/apps/home/",
+    href: "http://localhost:61180/home/",
     origin: "http://localhost:61180",
     reload() {},
   },
@@ -338,5 +340,11 @@ assert(
   "failed launch recovery did not drive Desktop activation with trusted Home host authority",
   requests,
 );
+
+delete window.location.reload;
+for (const listener of recoveryReload.listeners.get("click") || []) {
+  listener();
+}
+assert(window.location.href === "/home/", "recovery reload fallback did not return to Home", window.location.href);
 
 console.log("[home-shell-recovery] PASS");

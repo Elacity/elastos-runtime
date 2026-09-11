@@ -23,10 +23,12 @@
     appLoadError: null,
     mediaLoadError: null,
     mediaTruncated: false,
+    modelCatalogState: "unconfigured",
   };
 
   const pendingMediaBuys = new Set();
   let detailPreviousFocus = null;
+  let detailModels = null;
   let homeChromeReady = false;
   let lastHomeMenuManifestSignature = "";
 
@@ -46,6 +48,7 @@
   const categories = [
     { id: "apps", label: "Apps", icon: "package" },
     { id: "viewers", label: "Viewers", icon: "play" },
+    { id: "models", label: "Models", icon: "package" },
     { id: "content", label: "Content", icon: "document" },
     { id: "providers", label: "Services", icon: "server" },
     { id: "shells", label: "Home views", icon: "system" },
@@ -237,6 +240,17 @@
         throw new Error(catalogErrorMessage(interfacesResponse, interfaces));
       }
       const capsules = Array.isArray(catalog.capsules) ? catalog.capsules : [];
+      state.modelCatalogState = catalog.model_catalog_state || "unconfigured";
+      const modelCids = new Set();
+      for (const capsule of capsules.filter(item => item.source === "signed-model-catalog")) {
+        if (catalog.model_catalog_state !== "verified" || capsule.role !== "content" || capsule.installed !== false || capsule.launchable !== false ||
+            capsule.signature_state !== "catalog-signature-verified" || !/^bafybei[a-z2-7]{52}$/.test(capsule.cid) ||
+            typeof capsule.publisher_did !== "string" || !capsule.publisher_did.startsWith("did:") ||
+            !Number.isSafeInteger(capsule.content_size_bytes) || capsule.content_size_bytes <= 0 || modelCids.has(capsule.cid)) {
+          throw new Error("Model catalog verification is unavailable.");
+        }
+        modelCids.add(capsule.cid);
+      }
       const capsulesByName = new Map(capsules.map((capsule) => [String(capsule.name || ""), capsule]));
       const interfacesByCapsule = new Map();
       for (const entry of Array.isArray(interfaces.interfaces) ? interfaces.interfaces : []) {
@@ -290,9 +304,10 @@
   }
 
   function capsuleToApp(capsule, capsulesByName, interfaceEntries) {
+    const model = capsule.source === "signed-model-catalog";
     const role = String(capsule.role || "").toLowerCase();
     const installed = capsule.installed === true;
-    const launchable = Boolean(capsule.launchable && capsule.launch_target);
+    const launchable = !model && Boolean(capsule.launchable && capsule.launch_target);
     const dependencies = (Array.isArray(capsule.requires) ? capsule.requires : [])
       .map((entry) => {
         const dependency = capsulesByName.get(String(entry && entry.name || ""));
@@ -300,15 +315,17 @@
       })
       .filter(Boolean);
     return {
-      id: String(capsule.name || ""),
+      id: model ? `model:${capsule.cid}` : String(capsule.name || ""),
+      modelCid: model ? capsule.cid : null,
+      contentBytes: model ? capsule.content_size_bytes : null,
       name: publicTitle(capsule),
-      developer: String(capsule.author || "Unknown publisher"),
+      developer: String(model ? capsule.publisher_did : capsule.author || "Unknown publisher"),
       category: appCategory(capsule, role),
-      description: publicDescription(capsule),
+      description: model ? `${publicTitle(capsule)} model for Assistant.` : publicDescription(capsule),
       version: String(capsule.version || ""),
       installed,
       launchable,
-      launchTarget: String(capsule.launch_target || ""),
+      launchTarget: model ? "" : String(capsule.launch_target || ""),
       role,
       capsuleType: String(capsule.type || capsule.capsule_type || ""),
       trustState: String(capsule.trust_state || ""),
@@ -318,17 +335,18 @@
       iconRoute: catalogIconRoute(capsule),
       icon: appIcon(role),
       gradient: appGradient(role),
-      badges: appBadges(role, capsule, installed),
+      badges: model ? ["model"] : appBadges(role, capsule, installed),
       acceptedContent: acceptedContentLabels(capsule, capsulesByName, interfaceEntries),
       dependencies,
-      availableActions: executableActions(interfaceEntries),
-      viewerTitle: String(capsule.viewer_title || ""),
-      size: capsule.cid ? "Verified app" : "Local app",
+      availableActions: model ? [] : executableActions(interfaceEntries),
+      viewerTitle: model ? "Assistant" : String(capsule.viewer_title || ""),
+      size: model ? `${capsule.content_size_bytes.toLocaleString()} bytes` : capsule.cid ? "Verified app" : "Local app",
       sourceSummary: capsule.cid ? "SmartWeb" : "Local",
     };
   }
 
   function appCategory(capsule, role) {
+    if (capsule.source === "signed-model-catalog") return "models";
     const category = String(capsule.category || "").toLowerCase();
     const canonical = {
       apps: "apps",
@@ -599,6 +617,14 @@
   function renderCategorySections() {
     const apps = filteredByDestination();
     if (!apps.length) {
+      if (state.destination === "models" && !state.search) {
+        els.storeSections.innerHTML = emptyState(
+          state.modelCatalogState === "unavailable" ? "Models are unavailable" : "No models available",
+          state.modelCatalogState === "unavailable" ? "The model catalog could not be verified. Refresh to check again." : "Verified models on this Home will appear here.",
+          icons.package,
+        );
+        return;
+      }
       els.storeSections.innerHTML = emptyState(
         state.search ? "No results" : "No apps in this category",
         state.search ? "Try a different search." : "Choose another category from the sidebar.",
@@ -606,7 +632,7 @@
       );
       return;
     }
-    els.storeSections.innerHTML = renderSection(destinationTitle(state.destination), apps);
+    els.storeSections.innerHTML = renderSection(destinationTitle(state.destination), apps, { showHeading: false });
     bindAppActions(els.storeSections);
   }
 
@@ -620,7 +646,7 @@
       );
       return;
     }
-    els.storeSections.innerHTML = renderSection("Installed", installed);
+    els.storeSections.innerHTML = renderSection("Installed", installed, { showHeading: false });
     bindAppActions(els.storeSections);
   }
 
@@ -669,16 +695,16 @@
     });
   }
 
-  function renderSection(title, apps, { seeAllDestination } = {}) {
+  function renderSection(title, apps, { seeAllDestination, showHeading = true } = {}) {
     const seeAll = seeAllDestination && apps.length
       ? `<button type="button" class="store-see-all" data-action="see-all" data-destination="${escapeAttr(seeAllDestination)}">See All</button>`
       : "";
     return `
       <section class="store-section">
-        <div class="store-section-head">
+        ${showHeading ? `<div class="store-section-head">
           <h2 class="store-section-title">${escapeHtml(title)}</h2>
           ${seeAll}
-        </div>
+        </div>` : ""}
         <div class="store-row-grid">
           ${apps.map(renderAppRow).join("")}
         </div>
@@ -698,6 +724,7 @@
   }
 
   function rowSubtitle(app) {
+    if (app.modelCid) return app.description;
     if (!isFirstPartyPublisher(app.developer)) {
       return app.developer;
     }
@@ -795,6 +822,7 @@
   }
 
   function actionButton(app) {
+    if (app.modelCid) return `<button class="store-pill" type="button" data-action="model-detail" data-app="${escapeAttr(app.id)}">Details</button>`;
     if (!app.launchable) {
       return "";
     }
@@ -831,6 +859,8 @@
     if (!app) {
       return;
     }
+    detailModels?.destroy();
+    detailModels = null;
     detailPreviousFocus = document.activeElement;
     const openButton = app.launchable
       ? `<button class="modal-btn primary" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`
@@ -858,12 +888,12 @@
           </ul>
         </section>
         ${relationshipSection(app)}
-        <section class="modal-section">
+        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>` : `<section class="modal-section">
           <div class="modal-section-title">Available actions</div>
           <ul class="permissions-list">
             ${availableActionItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
           </ul>
-        </section>
+        </section>`}
         ${technicalDetails(app)}
       </div>
       <footer class="modal-footer">
@@ -875,6 +905,13 @@
       </footer>
     `;
     bindAppActions(els.detailContent);
+    if (app.modelCid) {
+      detailModels = window.ElastosModelManagement.create({
+        root: els.detailContent.querySelector("[data-model-management]"), capsule: "marketplace", token: homeToken,
+        buttonClass: "modal-btn secondary", cid: app.modelCid, compact: true,
+      });
+      detailModels.setVisible(true);
+    }
     els.detailModal.classList.add("active");
     const focusTarget = els.detailContent.querySelector(".modal-btn.primary")
       || els.detailContent.querySelector("[data-action='close-detail']");
@@ -882,6 +919,8 @@
   }
 
   function closeDetail() {
+    detailModels?.destroy();
+    detailModels = null;
     els.detailModal.classList.remove("active");
     const restore = detailPreviousFocus;
     detailPreviousFocus = null;
@@ -909,6 +948,7 @@
   }
 
   function statusItems(app) {
+    if (app.modelCid) return ["Publisher signature verified", "Assistant uses this model after preparation."];
     const items = [
       `Trust: ${trustLabel(app.trustState)}`,
       `Status: ${app.installed ? "Installed on this Home" : "Not installed on this Home"}`,
@@ -959,6 +999,7 @@
         </div>
         <ul class="permissions-list">
           <li><span class="permission-icon">${icons.check}</span>${escapeHtml(signatureLabel(app.signatureState))}</li>
+          ${app.modelCid ? `<li class="model-content-identity">Content ID: ${escapeHtml(app.modelCid)}</li><li>${app.contentBytes.toLocaleString()} bytes</li>` : ""}
           <li><span class="permission-icon">${icons.check}</span>${escapeHtml(packageLabel(app))}</li>
         </ul>
       </details>
@@ -966,6 +1007,7 @@
   }
 
   function packageLabel(app) {
+    if (app.modelCid) return "Verified publisher";
     if (app.trustState === "cid-with-manifest-signature") return "Verified";
     if (app.trustState === "local-manifest-signature") return "Signed local";
     if (app.installed) return "On this device";
@@ -986,6 +1028,7 @@
     const labels = {
       "manifest-signature-declared": "Manifest signature declared",
       "no-manifest-signature": "Manifest signature not declared",
+      "catalog-signature-verified": "Catalog publisher signature verified",
     };
     return labels[stateValue] || "Manifest signature status unavailable";
   }
@@ -1057,7 +1100,7 @@
         if (action !== "detail") {
           event.stopPropagation();
         }
-        if (action === "detail") {
+        if (action === "detail" || action === "model-detail") {
           if (target instanceof HTMLElement) {
             target.focus();
           }

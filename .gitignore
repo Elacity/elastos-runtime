@@ -90,8 +90,9 @@ archive/
 control_graph/
 control_graph_viewer/
 
-# Website deployment artifacts
-website/
+# Website deployment artifacts; the public site's source is versioned.
+website/*
+!website/elastos/
 
 # AI models
 models/

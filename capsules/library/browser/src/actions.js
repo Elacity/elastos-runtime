@@ -70,7 +70,7 @@ export function createLibraryActions({
       return;
     }
     if (isArchiveOpenMode()) {
-      deliverArchiveObject(object);
+      await deliverArchiveObject(object);
       return;
     }
     if (isRuntimeCustodyProtectedVideo(object)) {
@@ -151,18 +151,18 @@ export function createLibraryActions({
       if (state.returnTarget === "chat-room" && object.published && cid) {
         payload.publishedUri = "elastos://" + cid;
       }
-      if (deliverToTarget(state.returnTarget, payload)) {
+      if (await deliverToTarget(state.returnTarget, payload)) {
         setStatus(`Attached to ${targetLabel}.`);
-        window.setTimeout(closeSelf, 80);
+        closeSelf();
         return;
       }
-      setStatus(`Open ${targetLabel} from Home.`);
+      setStatus(`${targetLabel} did not confirm this item. Check it before trying again.`);
     } catch (error) {
       setStatus(error?.message || "Could not attach this Library item.");
     }
   }
 
-  function deliverArchiveObject(object) {
+  async function deliverArchiveObject(object) {
     if (!isArchiveObject(object)) {
       setStatus("Select a ZIP, tar, tar.gz, or tgz archive.");
       return false;
@@ -171,12 +171,9 @@ export function createLibraryActions({
       type: "archive:open-library-object",
       object: archiveLibraryObjectPayload(object),
     };
-    if (deliverToTarget("archive-manager", payload)) {
+    if (await deliverToTarget("archive-manager", payload)) {
       setStatus("Opening in Archive.");
-      window.setTimeout(closeSelf, 80);
-      return true;
-    }
-    if (openWithViewer(object, "archive-manager")) {
+      closeSelf();
       return true;
     }
     setStatus("Open Archive from Home, then choose this archive again.");

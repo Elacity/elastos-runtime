@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
+
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HOME_DIR="$(mktemp -d /tmp/elastos-home-frontdoor-XXXXXX)"
+SMOKE_TEMP_BASE="${CARGO_TARGET_DIR:-${ROOT}/target-build}"
+mkdir -p "$SMOKE_TEMP_BASE"
+HOME_DIR="$(mktemp -d "${SMOKE_TEMP_BASE}/elastos-home-frontdoor-XXXXXX")"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj}"
 SOURCE_HOME_CLI_DIR="$ROOT/capsules/home-cli"
@@ -142,7 +148,23 @@ cargo build --manifest-path "$ROOT/capsules/object-provider/Cargo.toml" --releas
 cargo build --manifest-path "$ROOT/capsules/content-block-graph-provider/Cargo.toml" --release >/dev/null
 
 echo "[home-frontdoor] build Home CLI renderer"
-cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli >/dev/null
+HOME_CLI_RENDERER=$(cargo build --locked --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli --message-format=json | python3 -c '
+import json, sys
+artifacts = [json.loads(line) for line in sys.stdin]
+paths = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact"
+         and item.get("target", {}).get("name") == "home-cli" and item.get("executable")]
+if len(paths) != 1:
+    raise SystemExit("expected one built Home CLI renderer")
+print(paths[0])')
+export HOME_CLI_RENDERER
+MEDIA_TOOLS_ARCHIVE=$(
+    cd "${ROOT}"
+    source scripts/publish-release.sh
+    TMPDIR="${HOME_DIR}/media-package"
+    mkdir -p "$TMPDIR"
+    build_packaged_media_tools_archive "$(host_platform)"
+)
+export MEDIA_TOOLS_ARCHIVE
 
 echo "[home-frontdoor] verify first-party runtime projection entrypoints"
 for capsule in \
@@ -227,6 +249,12 @@ for name, src in mapping.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
+media_info = platform_info("media-tools")
+media_archive = artifacts_dir / media_info["release_path"]
+shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
+media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
+media_info["size"] = media_archive.stat().st_size
+
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())
     entrypoint = capsule_manifest.get("entrypoint")
@@ -246,6 +274,11 @@ def write_capsule_archive(name, capsule_dir):
         browser_dir = capsule_dir / "browser"
         if browser_dir.is_dir():
             tar.add(browser_dir, arcname=f"{name}/browser")
+        if name == "home-cli":
+            renderer = pathlib.Path(os.environ["HOME_CLI_RENDERER"])
+            if not renderer.is_file() or renderer.is_symlink() or not os.access(renderer, os.X_OK):
+                raise SystemExit(f"missing built Home CLI renderer: {renderer}")
+            tar.add(renderer, arcname="home-cli/bin/home-cli")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -323,6 +356,8 @@ if [[ ! -d "$INSTALLED_HOME_CLI_DIR" ]]; then
     echo "[home-frontdoor] installed Home CLI capsule missing after setup: $INSTALLED_HOME_CLI_DIR" >&2
     exit 1
 fi
+test -x "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
 for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/home/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/home-cli/browser/index.html" \
@@ -569,5 +604,7 @@ run_home_case(
     ),
 )
 
-print("[home-frontdoor] OK")
 PY
+test -x "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
+echo "[home-frontdoor] OK"

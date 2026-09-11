@@ -28,7 +28,7 @@ const source = `${originalSource
   .replace(
     '"./vendor/katex/katex.mjs"',
     JSON.stringify(katexModuleUrl),
-  )}
+  ).replace('"./model-selection.js"', JSON.stringify(new URL("../capsules/_shared/model-selection.js", import.meta.url).href))}
 export { renderMarkdown, renderMessageBody, readHashParam, readQueryParam, readLaunchContext };
 `;
 const assistantModule = await import(
@@ -80,6 +80,9 @@ function createFetchFixture({
   cancelResponse = null,
   putStatuses = [],
   unavailable = false,
+  offersRead = null,
+  workspaceRead = null,
+  catalogRead = () => ({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "unconfigured", capsules: [] }),
 } = {}) {
   const fetchCalls = [];
   const savedBodies = [];
@@ -108,7 +111,11 @@ function createFetchFixture({
 
   async function fetchFn(url, init = {}) {
     fetchCalls.push([url, init]);
-    if (unavailable && url === "/api/provider/model/offers_list") {
+    if (url === "/api/capsules/catalog") {
+      assert.equal(init.method, "GET");
+      return jsonResponse(await catalogRead());
+    }
+    if ((typeof unavailable === "function" ? unavailable() : unavailable) && url === "/api/provider/model/offers_list") {
       return {
         ok: false,
         status: 503,
@@ -122,15 +129,17 @@ function createFetchFixture({
       };
     }
     if (url === "/api/provider/model/offers_list") {
+      const currentOffers = offersRead ? await offersRead() : offers;
       return {
         ok: true,
         status: 200,
         async json() {
-          return { status: "ok", data: { offers } };
+          return { status: "ok", data: { offers: currentOffers } };
         },
       };
     }
     if (url === "/api/apps/assistant/workspace" && init.method === "GET") {
+      if (workspaceRead) await workspaceRead();
       return {
         ok: true,
         status: 200,
@@ -162,6 +171,7 @@ function createFetchFixture({
         sessions: parsed.sessions,
         draft: parsed.draft,
         selected_offer_id: parsed.selected_offer_id,
+        ...(parsed.selected_model_cid != null ? { selected_model_cid: parsed.selected_model_cid } : {}),
       };
       return {
         ok: true,
@@ -335,6 +345,126 @@ async function buildApp(options = {}) {
       return timers.size;
     },
   };
+}
+
+{
+  const { app, fetch } = await buildApp({
+    offers: [offer("offer:other", "Other")],
+    workspace: { schema: "elastos.assistant.workspace/v1", revision: 0,
+      sessions: [], draft: "Keep my draft", selected_offer_id: "offer:chosen" },
+  });
+  assert.equal(app.snapshot().selectedOfferId, "offer:chosen", "missing saved choice cannot become the first other offer");
+  assert.equal(app.snapshot().sendDisabled, true);
+  assert.equal(await app.sendDraft(), false);
+  assert.equal(app.snapshot().draft, "Keep my draft");
+  assert.equal(fetch.fetchCalls.filter(([url]) => url.endsWith("runs_create")).length, 0);
+}
+
+{
+  const cid = `bafybei${"a".repeat(52)}`;
+  const mapped = offer("content-offer", "Prepared model");
+  const hosted = offer(`model:${"b".repeat(64)}`, "Hosted service");
+  const rows = [{ source: "signed-model-catalog", role: "content", installed: false, launchable: false,
+    cid, title: "Prepared model", signature_state: "catalog-signature-verified",
+    model_runtime: { admitted: true, dispatch_ready: true, offer_id: mapped.id } }];
+  let currentRows = rows, failed = false;
+  let currentOffers = [mapped, hosted];
+  let readOffers = () => currentOffers;
+  const fixture = await buildApp({ offersRead: () => readOffers(), unavailable: () => failed,
+    catalogRead: () => ({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: currentRows }),
+    workspace: { schema: "elastos.assistant.workspace/v1", revision: 0, sessions: [], draft: "Keep exact text",
+      selected_offer_id: mapped.id, selected_model_cid: cid },
+  });
+  const { app, fetch, posts, flushTimers } = fixture;
+  assert.equal(app.snapshot().selectedModelCid, cid);
+  assert.equal(app.snapshot().sendDisabled, false);
+  // Exercise the real renderer without a browser or a second controller implementation.
+  const oldDocument = globalThis.document;
+  class Node {
+    children = []; listeners = {}; value = "";
+    set innerHTML(value) { this.html = value; this.children = []; }
+    get innerHTML() { return this.html; }
+    append(node) { this.children.push(node); }
+    setAttribute() {}
+    addEventListener(type, fn) { this.listeners[type] = fn; }
+  }
+  const nodes = new Map();
+  const root = new Node();
+  root.querySelector = selector => { if (!nodes.has(selector)) nodes.set(selector, new Node()); return nodes.get(selector); };
+  globalThis.document = { createElement: () => new Node() };
+  const mounted = assistantModule.mountAssistantApp(root, app);
+  const select = nodes.get("#assistant-offer-select");
+  assert.deepEqual(select.children.map(option => option.textContent).sort(), ["Hosted service", "Prepared model"]);
+  assert.equal(select.children.find(option => option.selected).value, `content:${cid}`);
+  assert.equal(nodes.get("#assistant-send").disabled, false);
+  for (const unavailableRows of [[], [rows[0], rows[0]], [{ ...rows[0], model_runtime: { admitted: true, dispatch_ready: false, offer_id: null } }]]) {
+    currentRows = unavailableRows;
+    await app.refreshModels(); mounted.render();
+    assert.equal(nodes.get("#assistant-send").disabled, true);
+    assert.equal(await app.sendDraft(), false);
+    assert.equal(app.snapshot().selectedModelCid, cid);
+    assert.equal(app.snapshot().selectedOfferId, mapped.id);
+    assert.equal(app.snapshot().draft, "Keep exact text");
+  }
+  currentRows = rows; failed = true;
+  await app.refreshModels(); mounted.render();
+  assert.equal(select.disabled, true, "failed refresh leaves descriptive options disabled");
+  assert.equal(app.snapshot().sendDisabled, true);
+  assert.equal(await app.sendDraft(), false);
+  assert.equal(app.openModels(), true);
+  assert.deepEqual(posts.at(-1), { origin: "https://home.example", message: {
+    type: "home:open-target", homeToken: "token-1", target: "system", query: { settings: "models" },
+  } });
+  assert.equal(app.snapshot().draft, "Keep exact text");
+  failed = false;
+  let releaseOld;
+  readOffers = () => new Promise(resolve => { releaseOld = resolve; });
+  const stale = app.refreshModels();
+  mounted.render();
+  assert.equal(select.disabled, true, "pending refresh cannot accept a new selection");
+  readOffers = () => [hosted];
+  await app.refreshModels();
+  app.setSelectedOfferId(hosted.id);
+  releaseOld([mapped]); await stale;
+  mounted.render();
+  assert.equal(select.disabled, false, "current successful refresh enables selection");
+  assert.equal(app.snapshot().selectedOfferId, hosted.id);
+  assert.equal(app.snapshot().selectedModelCid, null);
+  assert.equal(app.snapshot().sendDisabled, false);
+  assert.equal(fetch.fetchCalls.filter(([url]) => url.endsWith("runs_create")).length, 0);
+  await flushTimers();
+  assert.equal(fetch.savedBodies.at(-1).selected_offer_id, hosted.id);
+  assert.equal(fetch.savedBodies.at(-1).selected_model_cid, undefined);
+  assert.equal(await app.sendDraft(), true);
+  const create = fetch.fetchCalls.find(([url]) => url.endsWith("runs_create"));
+  assert.equal(JSON.parse(create[1].body).offer_id, hosted.id);
+  assert.equal(JSON.parse(create[1].body).input.prompt, "Keep exact text");
+  const run = app.snapshot().activeRun.runId;
+  currentOffers = []; readOffers = () => currentOffers;
+  await app.refreshModels();
+  assert.equal(app.snapshot().activeRun.runId, run);
+  await app.stopRun();
+  assert.equal(JSON.parse(fetch.fetchCalls.find(([url]) => url.endsWith("runs_cancel"))[1].body).run_id, run);
+  globalThis.document = oldDocument;
+}
+
+for (const first of ["offers", "workspace"]) {
+  const pending = {};
+  const started = {};
+  const arrived = ["offers", "workspace"].map(key => new Promise(resolve => { started[key] = resolve; }));
+  const held = key => new Promise(resolve => { pending[key] = resolve; started[key](); });
+  const opening = buildApp({ offersRead: async () => { await held("offers"); return [offer("other", "Other")]; },
+    workspaceRead: () => held("workspace"),
+    workspace: { schema: "elastos.assistant.workspace/v1", revision: 1, sessions: [], draft: "Saved text", selected_offer_id: "saved" },
+  });
+  await Promise.all(arrived);
+  pending[first]();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  pending[first === "offers" ? "workspace" : "offers"]();
+  const { app } = await opening;
+  assert.equal(app.snapshot().selectedOfferId, "saved", `${first} first preserves saved choice`);
+  assert.equal(app.snapshot().draft, "Saved text");
+  assert.equal(app.snapshot().sendDisabled, true);
 }
 
 {
@@ -535,7 +665,8 @@ async function buildApp(options = {}) {
   assert.equal(posts[0].message.type, "home:app-ready");
   assert.equal(posts[0].message.homeToken, "token-1");
   assert.equal(fetch.fetchCalls[0][0], "/api/provider/model/offers_list");
-  assert.equal(fetch.fetchCalls[1][0], "/api/apps/assistant/workspace");
+  assert.equal(fetch.fetchCalls[1][0], "/api/capsules/catalog");
+  assert.equal(fetch.fetchCalls[2][0], "/api/apps/assistant/workspace");
   assert.equal(app.snapshot().statusMessage, "No model offers available.");
   app.setSessionMode("build");
   assert.equal(app.snapshot().currentMode, "build");

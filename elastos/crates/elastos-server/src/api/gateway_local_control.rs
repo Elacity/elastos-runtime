@@ -42,11 +42,23 @@ pub(crate) async fn start_gateway_local_control(
     let app = gateway_local_control_router(registry, session_registry, attach_secret.clone());
     let (shutdown, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        let connections = axum_server::Handle::new();
+        let server = axum_server::Server::<std::net::SocketAddr>::from_listener(listener)
+            .handle(connections.clone())
+            .serve(app.into_make_service());
+        tokio::pin!(server);
+        let result = tokio::select! {
+            result = &mut server => result,
+            _ = shutdown_rx => {
+                connections.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+                (&mut server).await
+            }
+        };
+        connections.shutdown();
+        while connections.connection_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+        result
     });
 
     let coords = crate::runtime_control::RuntimeCoords {

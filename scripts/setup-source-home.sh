@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -15,6 +16,7 @@ Configure tool paths with:
   ELASTOS_CARGO_BIN
   ELASTOS_NODE_BIN
   ELASTOS_DEBUGFS_BIN
+  SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR (directory containing ffmpeg and ffprobe)
   ELASTOS_COLLABORATION_STARTUP_MODE (configured|isolated)
   ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT
   ELASTOS_BROWSER_NATIVE_PROXY_BIN
@@ -327,14 +329,14 @@ build_browser_vm_guest_helper() {
             echo "rust-lld not found in $rust_sysroot; Browser VM guest helper cross-build is unavailable" >&2
             exit 1
         fi
-        env "$linker_env=$linker" "$CARGO_BIN" build --quiet \
+        env "$linker_env=$linker" "$CARGO_BIN" build --locked --quiet \
             --manifest-path "$manifest" \
             --target "$rust_target" \
             --release
         return
     fi
 
-    "$CARGO_BIN" build --quiet \
+    "$CARGO_BIN" build --locked --quiet \
         --manifest-path "$manifest" \
         --target "$rust_target" \
         --release
@@ -614,7 +616,6 @@ APP_CAPSULES=(
     archive-manager
     inbox
     assistant
-    home-agent
     wallet
     wallet-metamask
     wallet-unisat
@@ -632,6 +633,7 @@ APP_CAPSULES_JSON="$(printf '%s\n' "${APP_CAPSULES[@]}" | python3 -c 'import jso
 RETIRED_SOURCE_HOME_CAPSULES=(
     chat-wasm
     gba-engine-provider
+    home-agent
 )
 
 RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(
@@ -740,8 +742,25 @@ install_collaboration_startup_config() {
 }
 
 ensure_owner_only_data_dir() {
-    mkdir -p "${DATA_DIR}"
-    chmod 700 "${DATA_DIR}"
+    python3 - "${DATA_DIR}" <<'PY'
+import os
+import pathlib
+import sys
+
+data_dir = pathlib.Path(sys.argv[1])
+try:
+    for path in (data_dir, data_dir / "bin", data_dir / "receipts"):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(descriptor).st_uid != os.geteuid():
+                raise OSError("directory owner mismatch")
+            os.fchmod(descriptor, 0o700)
+        finally:
+            os.close(descriptor)
+except OSError:
+    raise SystemExit("source-home data, bin, and receipt directories must be owned directories")
+PY
 }
 
 capsule_entrypoint() {
@@ -846,6 +865,10 @@ install_app_capsules() {
         fi
         mkdir -p "${dest}/$(dirname "$entrypoint")"
         install -m 644 "$built_entrypoint" "${dest}/${entrypoint}"
+        if [[ "$capsule" == home-cli ]]; then
+            mkdir -p "${dest}/bin"
+            install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${dest}/bin/home-cli"
+        fi
     done
 }
 
@@ -1712,7 +1735,8 @@ prepare_media_provider_prerequisite() {
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${ROOT}/components.json" \
         "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
-        setup --with media-provider --prerequisites-only
+        setup --with media-provider --prerequisites-only \
+        --media-tools-dir "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}"
 }
 
 install_content_publish_backend() {
@@ -1757,6 +1781,16 @@ if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+[[ -n "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR:-}" ]] || {
+    echo "Set SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR to the reviewed directory containing ffmpeg and ffprobe." >&2
+    exit 1
+}
+for tool in ffmpeg ffprobe; do
+    [[ -x "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}/${tool}" ]] || {
+        echo "Source-home media tool is missing: ${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}/${tool}" >&2
+        exit 1
+    }
+done
 browser_vm_backup_retention >/dev/null
 require_minimum_free_space "${ROOT}"
 require_minimum_free_space "${DATA_DIR}"
@@ -1771,11 +1805,11 @@ if ! grep -Eq '^[[:space:]]*trusted_keys[[:space:]]*=' "${CONFIG_TOML}"; then
 fi
 
 echo "[setup-source-home] build runtime server"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
 verify_collaboration_startup_config_input
 if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
-    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
+    "$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
 fi
 build_browser_vm_guest_helpers
 
@@ -1797,13 +1831,13 @@ source_home_binary_manifest_path() {
 }
 
 echo "[setup-source-home] build native provider binaries"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
+"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
 source_home_binary_names | while IFS= read -r provider; do
-    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
+    "$CARGO_BIN" build --locked --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
 done
 
 echo "[setup-source-home] build Home CLI native renderer"
-"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
+"$CARGO_BIN" build --locked --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
 
 echo "[setup-source-home] build app WASM capsules"
 for capsule in "${APP_CAPSULES[@]}"; do
@@ -1832,7 +1866,6 @@ prepare_media_provider_prerequisite
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
-install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${DATA_DIR}/bin/home-cli"
 source_home_binary_names | while IFS= read -r provider; do
     install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}")" "${DATA_DIR}/bin/${provider}"
 done

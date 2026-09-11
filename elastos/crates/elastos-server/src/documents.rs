@@ -11,6 +11,7 @@ use elastos_runtime::provider::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const DOCUMENTS_SCHEMA: &str = "elastos.document/v2";
 const DOCUMENTS_DEFAULT_TITLE: &str = "Untitled";
@@ -29,6 +30,7 @@ pub struct DocumentsListItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentsDocumentView {
+    pub revision: String,
     pub doc_did: String,
     pub document_uri: String,
     pub title: String,
@@ -53,6 +55,7 @@ pub struct DocumentsCreateRequest {
 pub struct DocumentsSaveRequest {
     pub title: String,
     pub body: String,
+    pub if_revision: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +161,7 @@ enum DocumentsProviderRequest {
         doc_did: String,
         title: String,
         body: String,
+        if_revision: String,
     },
     SaveAs {
         principal_id: String,
@@ -331,6 +335,7 @@ impl DocumentsClient {
         doc_did: &str,
         title: &str,
         body: &str,
+        if_revision: &str,
     ) -> anyhow::Result<DocumentsDocumentView> {
         #[derive(Deserialize)]
         struct DocumentData {
@@ -343,6 +348,7 @@ impl DocumentsClient {
                 "doc_did": doc_did,
                 "title": title,
                 "body": body,
+                "if_revision": if_revision,
             }))
             .await?;
         Ok(serde_json::from_value::<DocumentData>(data)?.document)
@@ -468,8 +474,9 @@ fn handle_provider_request_inner(
             doc_did,
             title,
             body,
+            if_revision,
         } => Ok(json!({
-            "document": documents_save_local(data_dir, &principal_id, &doc_did, &title, &body)?,
+            "document": documents_save_local(data_dir, &principal_id, &doc_did, DocumentsSaveRequest { title, body, if_revision })?,
         })),
         DocumentsProviderRequest::SaveAs {
             principal_id,
@@ -577,7 +584,10 @@ async fn documents_unpublish_via_provider_plane(
     principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsUnpublishResponse> {
-    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let metadata = {
+        let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+        documents_load_metadata_for_principal(&objects, principal_id, doc_did)?
+    };
     let cid = metadata
         .latest_published_cid
         .clone()
@@ -899,7 +909,11 @@ fn documents_generate_did() -> String {
     did
 }
 
-fn documents_load_metadata(data_dir: &Path, doc_did: &str) -> anyhow::Result<DocumentsMetadata> {
+fn documents_load_metadata(
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
+    doc_did: &str,
+) -> anyhow::Result<DocumentsMetadata> {
+    let data_dir = objects.data_dir();
     let path = documents_metadata_path(data_dir, doc_did)?;
     let bytes =
         std::fs::read(&path).map_err(|err| anyhow!("document metadata not found: {err}"))?;
@@ -911,40 +925,45 @@ fn documents_load_metadata(data_dir: &Path, doc_did: &str) -> anyhow::Result<Doc
 }
 
 fn documents_load_metadata_for_principal(
-    data_dir: &Path,
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
     principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsMetadata> {
     documents_validate_principal_id(principal_id)?;
-    let metadata = documents_load_metadata(data_dir, doc_did)?;
+    let metadata = documents_load_metadata(objects, doc_did)?;
     if metadata.principal_id != principal_id {
         bail!("document does not belong to this principal");
     }
     Ok(metadata)
 }
 
-fn documents_save_metadata(data_dir: &Path, metadata: &DocumentsMetadata) -> anyhow::Result<()> {
+fn documents_save_metadata(
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
+    metadata: &DocumentsMetadata,
+) -> anyhow::Result<()> {
+    let data_dir = objects.data_dir();
     let path = documents_metadata_path(data_dir, &metadata.doc_did)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(metadata)?)?;
+    objects.atomic_file(&path, &serde_json::to_vec_pretty(metadata)?)?;
     Ok(())
 }
 
 fn documents_load_body(
-    data_dir: &Path,
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
     principal_id: &str,
     metadata: &DocumentsMetadata,
 ) -> anyhow::Result<String> {
-    let body = crate::auth::read_principal_root_object(
-        data_dir,
-        principal_id,
-        &crate::auth::principal_localhost_root(principal_id),
-        &metadata.working_copy_uri,
-        &documents_body_path(data_dir, principal_id, &metadata.file_name)?,
-    )
-    .map_err(|err| anyhow!("document body not found: {err}"))?;
+    let data_dir = objects.data_dir();
+    let body = objects
+        .read(
+            principal_id,
+            &crate::auth::principal_localhost_root(principal_id),
+            &metadata.working_copy_uri,
+            &documents_body_path(data_dir, principal_id, &metadata.file_name)?,
+        )
+        .map_err(|err| anyhow!("document body not found: {err}"))?;
     String::from_utf8(body).map_err(|err| anyhow!("document body is not valid UTF-8: {err}"))
 }
 
@@ -957,14 +976,14 @@ fn documents_body_path(
 }
 
 fn documents_write_body(
-    data_dir: &Path,
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
     principal_id: &str,
     file_name: &str,
     body: &str,
 ) -> anyhow::Result<()> {
+    let data_dir = objects.data_dir();
     let working_copy_uri = documents_working_copy_uri(principal_id, file_name)?;
-    crate::auth::write_principal_root_object(
-        data_dir,
+    objects.write(
         principal_id,
         &crate::auth::principal_localhost_root(principal_id),
         &working_copy_uri,
@@ -975,6 +994,7 @@ fn documents_write_body(
 
 fn documents_view(metadata: &DocumentsMetadata, body: String) -> DocumentsDocumentView {
     DocumentsDocumentView {
+        revision: documents_revision(metadata, &body),
         doc_did: metadata.doc_did.clone(),
         document_uri: documents_object_uri(&metadata.doc_did),
         title: metadata.title.clone(),
@@ -986,6 +1006,18 @@ fn documents_view(metadata: &DocumentsMetadata, body: String) -> DocumentsDocume
         latest_published_cid: metadata.latest_published_cid.clone(),
         publish_history: metadata.publish_history.clone(),
     }
+}
+
+fn documents_revision(metadata: &DocumentsMetadata, body: &str) -> String {
+    let canonical = serde_json::to_vec(&(
+        &metadata.principal_id,
+        &metadata.doc_did,
+        &metadata.working_copy_uri,
+        &metadata.title,
+        body,
+    ))
+    .expect("document revision contains only strings");
+    hex::encode(Sha256::digest(canonical))
 }
 
 fn documents_list_item(metadata: &DocumentsMetadata) -> DocumentsListItem {
@@ -1001,9 +1033,10 @@ fn documents_list_item(metadata: &DocumentsMetadata) -> DocumentsListItem {
 }
 
 fn documents_load_metadata_index(
-    data_dir: &Path,
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
     principal_id: &str,
 ) -> anyhow::Result<Vec<DocumentsMetadata>> {
+    let data_dir = objects.data_dir();
     documents_validate_principal_id(principal_id)?;
     let docs_root = documents_root(data_dir, principal_id)?;
     let metadata_root = documents_metadata_root(data_dir)?;
@@ -1052,7 +1085,8 @@ fn documents_load_summary(
     data_dir: &Path,
     principal_id: &str,
 ) -> anyhow::Result<Vec<DocumentsListItem>> {
-    Ok(documents_load_metadata_index(data_dir, principal_id)?
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    Ok(documents_load_metadata_index(&objects, principal_id)?
         .into_iter()
         .map(|metadata| documents_list_item(&metadata))
         .collect())
@@ -1063,8 +1097,9 @@ pub fn documents_load_document(
     principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
-    let body = documents_load_body(data_dir, principal_id, &metadata)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    let metadata = documents_load_metadata_for_principal(&objects, principal_id, doc_did)?;
+    let body = documents_load_body(&objects, principal_id, &metadata)?;
     Ok(documents_view(&metadata, body))
 }
 
@@ -1073,6 +1108,7 @@ fn documents_create_local(
     principal_id: &str,
     requested_title: Option<&str>,
 ) -> anyhow::Result<DocumentsDocumentView> {
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
     documents_validate_principal_id(principal_id)?;
     let docs_root = documents_root(data_dir, principal_id)?;
     std::fs::create_dir_all(&docs_root)?;
@@ -1081,7 +1117,7 @@ fn documents_create_local(
     let file_name =
         documents_reserve_file_name(&docs_root, &documents_slugify_file_name(&title), None)?;
     let body = String::new();
-    documents_write_body(data_dir, principal_id, &file_name, &body)?;
+    documents_write_body(&objects, principal_id, &file_name, &body)?;
     let ts = now_ts();
     let metadata = DocumentsMetadata {
         schema: DOCUMENTS_SCHEMA.to_string(),
@@ -1097,7 +1133,7 @@ fn documents_create_local(
         publish_history: Vec::new(),
         source: None,
     };
-    documents_save_metadata(data_dir, &metadata)?;
+    documents_save_metadata(&objects, &metadata)?;
     Ok(documents_view(&metadata, body))
 }
 
@@ -1105,16 +1141,50 @@ pub fn documents_save_local(
     data_dir: &Path,
     principal_id: &str,
     doc_did: &str,
-    requested_title: &str,
-    body: &str,
+    request: DocumentsSaveRequest,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
-    let title = documents_normalize_title(Some(requested_title), DOCUMENTS_DEFAULT_TITLE);
-    documents_write_body(data_dir, principal_id, &metadata.file_name, body)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    documents_save_locked(
+        &objects,
+        principal_id,
+        doc_did,
+        request,
+        documents_save_metadata,
+    )
+}
+
+fn documents_save_locked(
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
+    principal_id: &str,
+    doc_did: &str,
+    request: DocumentsSaveRequest,
+    save_metadata: impl FnOnce(
+        &crate::auth::PrincipalRootObjectMutation<'_>,
+        &DocumentsMetadata,
+    ) -> anyhow::Result<()>,
+) -> anyhow::Result<DocumentsDocumentView> {
+    if request.if_revision.len() != 64
+        || !request
+            .if_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid document save revision");
+    }
+    let mut metadata = documents_load_metadata_for_principal(objects, principal_id, doc_did)?;
+    let previous_body = documents_load_body(objects, principal_id, &metadata)?;
+    if documents_revision(&metadata, &previous_body) != request.if_revision {
+        bail!("Document changed since it was read. Read the current document before saving.");
+    }
+    let title = documents_normalize_title(Some(&request.title), DOCUMENTS_DEFAULT_TITLE);
+    documents_write_body(objects, principal_id, &metadata.file_name, &request.body)?;
     metadata.title = title;
     metadata.updated_at = now_ts();
-    documents_save_metadata(data_dir, &metadata)?;
-    Ok(documents_view(&metadata, body.to_string()))
+    // Existing format has two files: a metadata failure can follow a completed body write.
+    save_metadata(objects, &metadata).map_err(|_| {
+        anyhow!("Save outcome is incomplete. Read the current document before retrying.")
+    })?;
+    Ok(documents_view(&metadata, request.body))
 }
 
 pub fn documents_save_as_local(
@@ -1125,7 +1195,8 @@ pub fn documents_save_as_local(
     requested_file_name: Option<&str>,
     body: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let source = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    let source = documents_load_metadata_for_principal(&objects, principal_id, doc_did)?;
     let docs_root = documents_root(data_dir, principal_id)?;
     let owner_did = elastos_identity::load_or_create_did(data_dir)?.1;
     let title = documents_normalize_title(requested_title, &source.title);
@@ -1134,7 +1205,7 @@ pub fn documents_save_as_local(
         _ => documents_slugify_file_name(&title),
     };
     let file_name = documents_reserve_file_name(&docs_root, &desired_name, None)?;
-    documents_write_body(data_dir, principal_id, &file_name, body)?;
+    documents_write_body(&objects, principal_id, &file_name, body)?;
     let ts = now_ts();
     let metadata = DocumentsMetadata {
         schema: DOCUMENTS_SCHEMA.to_string(),
@@ -1150,7 +1221,7 @@ pub fn documents_save_as_local(
         publish_history: Vec::new(),
         source: None,
     };
-    documents_save_metadata(data_dir, &metadata)?;
+    documents_save_metadata(&objects, &metadata)?;
     Ok(documents_view(&metadata, body.to_string()))
 }
 
@@ -1159,6 +1230,7 @@ pub fn documents_import_chat_attachment_local(
     principal_id: &str,
     request: DocumentsImportChatAttachmentRequest,
 ) -> anyhow::Result<DocumentsDocumentView> {
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
     documents_validate_principal_id(principal_id)?;
     let attachment_id = request.attachment_id.trim();
     if attachment_id.is_empty()
@@ -1171,9 +1243,9 @@ pub fn documents_import_chat_attachment_local(
         bail!("invalid chat attachment id");
     }
     if let Some(existing) =
-        documents_find_chat_attachment_import(data_dir, principal_id, attachment_id)?
+        documents_find_chat_attachment_import(&objects, principal_id, attachment_id)?
     {
-        let body = documents_load_body(data_dir, principal_id, &existing)?;
+        let body = documents_load_body(&objects, principal_id, &existing)?;
         return Ok(documents_view(&existing, body));
     }
 
@@ -1184,7 +1256,7 @@ pub fn documents_import_chat_attachment_local(
     let desired_name = documents_validate_import_file_name(&request.file_name)
         .unwrap_or_else(|_| documents_slugify_file_name(&title));
     let file_name = documents_reserve_import_file_name(&docs_root, &desired_name, None)?;
-    documents_write_body(data_dir, principal_id, &file_name, &request.body)?;
+    documents_write_body(&objects, principal_id, &file_name, &request.body)?;
     let ts = now_ts();
     let metadata = DocumentsMetadata {
         schema: DOCUMENTS_SCHEMA.to_string(),
@@ -1208,16 +1280,16 @@ pub fn documents_import_chat_attachment_local(
                 .filter(|value| !value.is_empty()),
         }),
     };
-    documents_save_metadata(data_dir, &metadata)?;
+    documents_save_metadata(&objects, &metadata)?;
     Ok(documents_view(&metadata, request.body))
 }
 
 fn documents_find_chat_attachment_import(
-    data_dir: &Path,
+    objects: &crate::auth::PrincipalRootObjectMutation<'_>,
     principal_id: &str,
     attachment_id: &str,
 ) -> anyhow::Result<Option<DocumentsMetadata>> {
-    Ok(documents_load_metadata_index(data_dir, principal_id)?
+    Ok(documents_load_metadata_index(objects, principal_id)?
         .into_iter()
         .find(|metadata| {
             metadata.source.as_ref().is_some_and(|source| {
@@ -1233,7 +1305,8 @@ pub fn documents_delete_local(
     principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<()> {
-    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    let metadata = documents_load_metadata_for_principal(&objects, principal_id, doc_did)?;
     remove_file_if_exists(documents_root(data_dir, principal_id)?.join(&metadata.file_name))?;
     let metadata_dir = documents_metadata_root(data_dir)?.join(&metadata.doc_did);
     match std::fs::remove_dir_all(&metadata_dir) {
@@ -1248,8 +1321,9 @@ fn documents_export_publish(
     principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsPublishExport> {
-    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
-    let body = documents_load_body(data_dir, principal_id, &metadata)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    let metadata = documents_load_metadata_for_principal(&objects, principal_id, doc_did)?;
+    let body = documents_load_body(&objects, principal_id, &metadata)?;
     let latest_record = documents_latest_publish_record(&metadata);
     let latest_published_content_digest = latest_record.map(|record| record.content_digest.clone());
     let latest_published_at = latest_record.map(|record| record.published_at);
@@ -1285,7 +1359,8 @@ fn documents_finish_publish(
     published_at: u64,
     content_digest: &str,
 ) -> anyhow::Result<()> {
-    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    let mut metadata = documents_load_metadata_for_principal(&objects, principal_id, doc_did)?;
     metadata.latest_published_cid = Some(cid.to_string());
     metadata.publish_history.push(DocumentsPublishRecord {
         cid: cid.to_string(),
@@ -1293,7 +1368,7 @@ fn documents_finish_publish(
         content_digest: content_digest.to_string(),
     });
     metadata.updated_at = now_ts();
-    documents_save_metadata(data_dir, &metadata)
+    documents_save_metadata(&objects, &metadata)
 }
 
 fn documents_unpublish_local(
@@ -1301,14 +1376,15 @@ fn documents_unpublish_local(
     principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+    let mut metadata = documents_load_metadata_for_principal(&objects, principal_id, doc_did)?;
     if metadata.latest_published_cid.is_none() {
         bail!("document is not published");
     }
     metadata.latest_published_cid = None;
     metadata.updated_at = now_ts();
-    documents_save_metadata(data_dir, &metadata)?;
-    let body = documents_load_body(data_dir, principal_id, &metadata)?;
+    documents_save_metadata(&objects, &metadata)?;
+    let body = documents_load_body(&objects, principal_id, &metadata)?;
     Ok(documents_view(&metadata, body))
 }
 
@@ -1327,6 +1403,267 @@ mod tests {
     const TEST_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
     const TEST_PRINCIPAL: &str = "person:local:test-documents";
     const OTHER_PRINCIPAL: &str = "person:local:other-documents";
+
+    fn save_request(
+        document: &DocumentsDocumentView,
+        title: &str,
+        body: &str,
+    ) -> DocumentsSaveRequest {
+        DocumentsSaveRequest {
+            title: title.to_string(),
+            body: body.to_string(),
+            if_revision: document.revision.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn documents_save_requires_revision_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Original")).unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = DocumentsProvider::new(dir.path().to_path_buf(), Arc::downgrade(&registry));
+        let response = provider
+            .send_raw(&json!({
+                "op": "save", "principal_id": TEST_PRINCIPAL,
+                "doc_did": document.doc_did, "title": "Changed", "body": "Changed",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "error");
+        for revision in ["", "abc", &"A".repeat(64)] {
+            let mut request = save_request(&document, "Changed", "Changed");
+            request.if_revision = revision.to_string();
+            assert_eq!(
+                documents_save_local(dir.path(), TEST_PRINCIPAL, &document.doc_did, request)
+                    .unwrap_err()
+                    .to_string(),
+                "invalid document save revision"
+            );
+        }
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        assert_eq!(loaded.revision, document.revision);
+        assert_eq!(loaded.title, document.title);
+        assert_eq!(loaded.body, document.body);
+    }
+
+    #[test]
+    fn documents_save_revision_covers_title_and_body_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Original")).unwrap();
+        let title_only = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &original.doc_did,
+            save_request(&original, "New title", &original.body),
+        )
+        .unwrap();
+        assert_ne!(title_only.revision, original.revision);
+        assert_eq!(title_only.body, original.body);
+        let body_only = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &original.doc_did,
+            save_request(&title_only, &title_only.title, "New body"),
+        )
+        .unwrap();
+        assert_ne!(body_only.revision, title_only.revision);
+        assert_eq!(body_only.title, title_only.title);
+        for stale in [&original, &title_only] {
+            let err = documents_save_local(
+                dir.path(),
+                TEST_PRINCIPAL,
+                &original.doc_did,
+                save_request(stale, "Stale title", "Stale body"),
+            )
+            .unwrap_err();
+            assert!(err
+                .to_string()
+                .starts_with("Document changed since it was read."));
+        }
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &original.doc_did).unwrap();
+        assert_eq!(
+            (loaded.title, loaded.body, loaded.revision),
+            (body_only.title, body_only.body, body_only.revision)
+        );
+    }
+
+    #[test]
+    fn documents_save_revision_binds_principal_document_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Original")).unwrap();
+        let objects = crate::auth::PrincipalRootObjectMutation::acquire(dir.path()).unwrap();
+        let metadata = documents_load_metadata(&objects, &document.doc_did).unwrap();
+        for field in ["principal", "document", "path"] {
+            let mut changed = metadata.clone();
+            match field {
+                "principal" => changed.principal_id = OTHER_PRINCIPAL.to_string(),
+                "document" => changed.doc_did = documents_generate_did(),
+                "path" => changed.working_copy_uri.push_str(".other"),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                documents_revision(&changed, &document.body),
+                document.revision
+            );
+        }
+    }
+
+    #[test]
+    fn documents_save_rejects_wrong_principal_without_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let document = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Private")).unwrap();
+        let err = documents_save_local(
+            dir.path(),
+            OTHER_PRINCIPAL,
+            &document.doc_did,
+            save_request(&document, "Other", "Other"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "document does not belong to this principal"
+        );
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        assert_eq!(
+            (loaded.title, loaded.body, loaded.revision),
+            (document.title, document.body, document.revision)
+        );
+    }
+
+    #[test]
+    fn documents_save_concurrent_revision_has_one_complete_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Original")).unwrap();
+        let start = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = [("First", "First body"), ("Second", "Second body")]
+                .into_iter()
+                .map(|(title, body)| {
+                    let start = &start;
+                    let document = &document;
+                    let data_dir = dir.path();
+                    scope.spawn(move || {
+                        start.wait();
+                        documents_save_local(
+                            data_dir,
+                            TEST_PRINCIPAL,
+                            &document.doc_did,
+                            save_request(document, title, body),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .unwrap();
+        let loser = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(loser
+            .to_string()
+            .starts_with("Document changed since it was read."));
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        assert_eq!(
+            (&loaded.title, &loaded.body, &loaded.revision),
+            (&winner.title, &winner.body, &winner.revision)
+        );
+    }
+
+    #[test]
+    fn documents_save_detects_other_principal_root_body_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Original")).unwrap();
+        crate::auth::write_principal_root_object(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &crate::auth::principal_localhost_root(TEST_PRINCIPAL),
+            &document.working_copy_uri,
+            &documents_body_path(dir.path(), TEST_PRINCIPAL, &document.file_name).unwrap(),
+            b"Changed through the object path",
+        )
+        .unwrap();
+        let err = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &document.doc_did,
+            save_request(&document, "Stale title", "Stale body"),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("Document changed since it was read."));
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        assert_eq!(loaded.title, document.title);
+        assert_eq!(loaded.body, "Changed through the object path");
+        assert_ne!(loaded.revision, document.revision);
+    }
+
+    #[test]
+    fn documents_save_metadata_failure_reports_partial_outcome_until_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Original")).unwrap();
+        let metadata_path = documents_metadata_path(dir.path(), &document.doc_did).unwrap();
+        let metadata_before = std::fs::read(&metadata_path).unwrap();
+        let err = {
+            let objects = crate::auth::PrincipalRootObjectMutation::acquire(dir.path()).unwrap();
+            documents_save_locked(
+                &objects,
+                TEST_PRINCIPAL,
+                &document.doc_did,
+                save_request(&document, "New title", "New body"),
+                |_, _| Err(anyhow!("injected metadata write failure")),
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            err.to_string(),
+            "Save outcome is incomplete. Read the current document before retrying."
+        );
+        assert_eq!(std::fs::read(metadata_path).unwrap(), metadata_before);
+        let retry = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &document.doc_did,
+            save_request(&document, "New title", "New body"),
+        )
+        .unwrap_err();
+        assert!(retry
+            .to_string()
+            .starts_with("Document changed since it was read."));
+        let observed =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        assert_eq!(observed.title, "Original");
+        assert_eq!(observed.body, "New body");
+        assert_ne!(observed.revision, document.revision);
+        let recovered = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &document.doc_did,
+            save_request(&observed, "Explicit recovered title", "Newer local edits"),
+        )
+        .unwrap();
+        assert_eq!(recovered.title, "Explicit recovered title");
+        assert_eq!(recovered.body, "Newer local edits");
+    }
 
     struct MockIpfsProvider {
         cid: String,
@@ -1477,8 +1814,7 @@ mod tests {
             dir.path(),
             TEST_PRINCIPAL,
             &imported.doc_did,
-            "Shared Note",
-            "edited locally",
+            save_request(&imported, "Shared Note", "edited locally"),
         )
         .unwrap();
 
@@ -1511,8 +1847,7 @@ mod tests {
             dir.path(),
             TEST_PRINCIPAL,
             &document.doc_did,
-            "Secrets",
-            "# Secret\n",
+            save_request(&document, "Secrets", "# Secret\n"),
         )
         .unwrap();
 
@@ -1536,8 +1871,7 @@ mod tests {
             dir.path(),
             TEST_PRINCIPAL,
             &document.doc_did,
-            "Publish Me",
-            "# Publish Me\n",
+            save_request(&document, "Publish Me", "# Publish Me\n"),
         )
         .unwrap();
 
@@ -1548,6 +1882,18 @@ mod tests {
         assert_eq!(export.body, "# Publish Me\n");
         assert_eq!(export.next_version, 1);
         assert_eq!(export.latest_published_cid, None);
+
+        let newer = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &document.doc_did,
+            save_request(
+                &document,
+                "New title during publication",
+                "New body during publication",
+            ),
+        )
+        .unwrap();
 
         documents_finish_publish(
             dir.path(),
@@ -1566,6 +1912,10 @@ mod tests {
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
         assert_eq!(republish.next_version, 2);
+        assert_eq!(loaded.title, newer.title);
+        assert_eq!(loaded.body, newer.body);
+        assert_eq!(loaded.revision, newer.revision);
+        assert_eq!(summary[0].title, newer.title);
         assert_eq!(
             republish.latest_published_cid.as_deref(),
             Some("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
@@ -1742,14 +2092,18 @@ mod tests {
 
         let client = DocumentsClient::for_principal(registry, TEST_PRINCIPAL);
         let document = client.create(Some("Provider Plane")).await.unwrap();
-        let document_owner = documents_load_metadata(dir.path(), &document.doc_did)
-            .unwrap()
-            .owner_did;
+        let document_owner = {
+            let objects = crate::auth::PrincipalRootObjectMutation::acquire(dir.path()).unwrap();
+            documents_load_metadata(&objects, &document.doc_did)
+                .unwrap()
+                .owner_did
+        };
         client
             .save(
                 &document.doc_did,
                 "Provider Plane",
                 "# Provider Plane\n\nRuntime-owned publish.\n",
+                &document.revision,
             )
             .await
             .unwrap();
@@ -1859,6 +2213,7 @@ mod tests {
                 &document.doc_did,
                 "Live Provider Plane",
                 "# Live Provider Plane\n\nRuntime-owned publish through Kubo.\n",
+                &document.revision,
             )
             .await
             .unwrap();

@@ -38,13 +38,12 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "archive-manager",
     "inbox",
     "assistant",
-    "home-agent",
     "elacity-player",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
 const DEMO_PUBLISH_CAPSULES: &[&str] =
     &["gba-emulator", "gba-ucity", "chat-room", "tunnel-provider"];
-const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat"];
+const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
 const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
     "localhost-provider",
@@ -75,7 +74,6 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "archive-manager",
     "inbox",
     "assistant",
-    "home-agent",
     "elacity-player",
 ];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
@@ -153,6 +151,7 @@ pub(crate) struct PublishReleaseOptions {
     pub(crate) skip_rootfs: bool,
     pub(crate) cross: Option<String>,
     pub(crate) capsules: Vec<String>,
+    pub(crate) platform_inputs: Vec<String>,
     pub(crate) key: Option<PathBuf>,
     pub(crate) dry_run: bool,
     pub(crate) preflight_only: bool,
@@ -254,15 +253,27 @@ struct PublishKeyPreview {
     signer_did: Option<String>,
 }
 
-pub(crate) async fn run_publish_release(options: PublishReleaseOptions) -> anyhow::Result<()> {
+pub(crate) async fn run_publish_release(mut options: PublishReleaseOptions) -> anyhow::Result<()> {
     let workspace_root = workspace_root();
+    validate_platform_input_options(&options)?;
+    if !options.platform_inputs.is_empty() {
+        let caller_dir =
+            std::env::current_dir().context("Failed to resolve the caller directory")?;
+        resolve_platform_input_paths(&mut options.platform_inputs, &caller_dir)?;
+    }
+    let (available_capsules, selected_capsules) = if options.platform_inputs.is_empty() {
+        let manifests = load_capsule_manifests(&workspace_root)?;
+        let available = manifests.keys().cloned().collect::<Vec<_>>();
+        let selected = select_capsules(&options.profile, &options.capsules, &manifests)?;
+        (available, selected)
+    } else {
+        // The admitted inputs own the complete native Home component inventory.
+        (Vec::new(), Vec::new())
+    };
+    validate_publish_inputs(&options, &workspace_root, &selected_capsules)?;
     let data_dir = elastos_server::sources::default_data_dir();
     let state_path = publish_state_path(&data_dir);
     let previous_state = load_publish_state(&state_path)?;
-    let manifests = load_capsule_manifests(&workspace_root)?;
-    let available_capsules = manifests.keys().cloned().collect::<Vec<_>>();
-    let selected_capsules = select_capsules(&options.profile, &options.capsules, &manifests)?;
-    validate_publish_inputs(&options, &workspace_root, &selected_capsules)?;
 
     if options.dry_run {
         let key = inspect_release_key(options.key.as_deref())?;
@@ -308,7 +319,7 @@ pub(crate) async fn run_publish_release(options: PublishReleaseOptions) -> anyho
         Ok(None) => println!("  Bootstrap: unavailable (no running local runtime ticket)"),
         Err(error) => println!("  Bootstrap: unavailable ({})", error),
     }
-    println!("  Capsules:  {}", selected_capsules.join(", "));
+    print_publish_selection(&options, &selected_capsules);
     if let Some(cross) = &options.cross {
         println!("  Cross:     {}", cross);
     }
@@ -321,7 +332,7 @@ pub(crate) async fn run_publish_release(options: PublishReleaseOptions) -> anyho
     cmd.arg("--version").arg(&options.version);
     cmd.arg("--channel").arg(&options.channel);
     cmd.arg("--key").arg(&key.path);
-    cmd.arg("--capsules").arg(selected_capsules.join(","));
+    append_publish_selection_args(&mut cmd, &options, &selected_capsules);
     cmd.env("ELASTOS_PUBLISH_STATE_DIR", &state_dir);
     if let Ok(Some(ticket)) = &source_bootstrap {
         cmd.env("ELASTOS_SOURCE_CONNECT_TICKET", ticket);
@@ -907,6 +918,29 @@ fn validate_publish_inputs(
             );
         }
     }
+    validate_platform_input_options(options)?;
+    if !options.platform_inputs.is_empty() {
+        let mut command = Command::new("python3");
+        command
+            .arg(workspace_root.join("scripts/release-platform-input.py"))
+            .arg("validate-inputs")
+            .arg("--version")
+            .arg(&options.version)
+            .current_dir(workspace_root);
+        for input in &options.platform_inputs {
+            command.arg("--input").arg(input);
+        }
+        let output = command
+            .output()
+            .context("Failed to validate prepared release platform inputs")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Prepared release platform input validation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
     if options.skip_build {
         let elastos_bin = cargo_target_dir(workspace_root).join("release/elastos");
         if !elastos_bin.is_file() {
@@ -987,6 +1021,74 @@ fn validate_publish_inputs(
     Ok(())
 }
 
+fn validate_platform_input_options(options: &PublishReleaseOptions) -> anyhow::Result<()> {
+    if options.platform_inputs.is_empty() {
+        return Ok(());
+    }
+    if options.skip_build || options.skip_rootfs || options.cross.is_some() {
+        anyhow::bail!("--platform-input conflicts with --skip-build, --skip-rootfs, and --cross");
+    }
+    if !options.capsules.is_empty() || options.profile != "home" {
+        anyhow::bail!("--platform-input requires the home profile and the prepared component inventory; omit --capsules");
+    }
+    let expected = BTreeSet::from(["x86_64-linux", "aarch64-linux", "aarch64-darwin"]);
+    let mut supplied = BTreeSet::new();
+    for input in &options.platform_inputs {
+        let (platform, _) = input
+            .split_once('=')
+            .filter(|(_, directory)| !directory.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--platform-input requires PLATFORM=DIR: {}", input))?;
+        if !expected.contains(platform) || !supplied.insert(platform) {
+            anyhow::bail!("--platform-input requires each supported platform exactly once: x86_64-linux, aarch64-linux, aarch64-darwin");
+        }
+    }
+    if supplied != expected {
+        anyhow::bail!("--platform-input requires all three platforms: x86_64-linux, aarch64-linux, aarch64-darwin");
+    }
+    Ok(())
+}
+
+fn resolve_platform_input_paths(inputs: &mut [String], caller_dir: &Path) -> anyhow::Result<()> {
+    for input in inputs {
+        let (platform, directory) = input
+            .split_once('=')
+            .context("--platform-input requires PLATFORM=DIR")?;
+        // Joining keeps absolute paths and binds relative paths before subprocess cwd changes.
+        let directory = caller_dir.join(directory);
+        let directory = directory
+            .to_str()
+            .context("Prepared platform input paths must use UTF-8")?;
+        *input = format!("{platform}={directory}");
+    }
+    Ok(())
+}
+
+fn append_publish_selection_args(
+    command: &mut Command,
+    options: &PublishReleaseOptions,
+    selected_capsules: &[String],
+) {
+    if options.platform_inputs.is_empty() {
+        command.arg("--capsules").arg(selected_capsules.join(","));
+    } else {
+        for input in &options.platform_inputs {
+            command.arg("--platform-input").arg(input);
+        }
+    }
+}
+
+fn print_publish_selection(options: &PublishReleaseOptions, selected_capsules: &[String]) {
+    if options.platform_inputs.is_empty() {
+        println!("  Capsules:  {}", selected_capsules.join(", "));
+    } else {
+        println!("  Mode:      import three verified native Home platform inputs");
+        for input in &options.platform_inputs {
+            println!("  Input:     {}", input);
+        }
+        println!("  Inventory: prepared Home apps, providers, and metadata");
+    }
+}
+
 struct CrossBuildDetails {
     binary_path: PathBuf,
     artifacts_dir: &'static str,
@@ -996,7 +1098,7 @@ fn cross_build_details(arch: &str, ws_root: &Path) -> anyhow::Result<CrossBuildD
     let target_dir = cargo_target_dir(ws_root);
     match arch {
         "aarch64" => Ok(CrossBuildDetails {
-            binary_path: target_dir.join("aarch64-unknown-linux-gnu/release/elastos"),
+            binary_path: target_dir.join("aarch64-unknown-linux-musl/release/elastos"),
             artifacts_dir: "artifacts-aarch64",
         }),
         other => anyhow::bail!("Unsupported cross architecture: {}", other),
@@ -1021,7 +1123,8 @@ fn run_publish_preflight(
         anyhow::bail!("Missing publish script: {}", script_path.display());
     }
 
-    if !options.skip_build && which_in_path("cargo").is_none() {
+    if options.platform_inputs.is_empty() && !options.skip_build && which_in_path("cargo").is_none()
+    {
         anyhow::bail!("`cargo` not found in PATH");
     }
 
@@ -1037,7 +1140,7 @@ fn run_publish_preflight(
         .ok_or_else(|| anyhow::anyhow!("Neither `sha256sum` nor `shasum` found in PATH"))?;
     available_tools.push(sha_tool);
 
-    if !options.skip_rootfs {
+    if options.platform_inputs.is_empty() && !options.skip_rootfs {
         let rootfs_script = workspace_root.join("scripts/build/build-rootfs.sh");
         if !rootfs_script.is_file() {
             anyhow::bail!("Missing rootfs build script: {}", rootfs_script.display());
@@ -1160,7 +1263,7 @@ fn print_preflight_report(options: &PublishReleaseOptions, preflight: &PublishPr
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "missing".to_string())
     );
-    println!("  Capsules:  {}", preflight.selected_capsules.join(", "));
+    print_publish_selection(options, &preflight.selected_capsules);
     if let Some(cross) = &options.cross {
         println!("  Cross:     {}", cross);
     }
@@ -1318,8 +1421,7 @@ fn build_release_ledger_entry(
 }
 
 fn components_artifact_path(artifacts_dir: &Path, platform: &str) -> PathBuf {
-    let arch = platform.split('-').next().unwrap_or(platform);
-    artifacts_dir.join(format!("components-{}.json", arch))
+    artifacts_dir.join(format!("components-{platform}.json"))
 }
 
 fn print_release_diff_summary(
@@ -1486,11 +1588,15 @@ fn print_publish_plan(
             .unwrap_or("(will be generated on first real publish)")
     );
     println!("  Key path:  {}", key.path.display());
-    println!("  Capsules:  {}", selected_capsules.join(", "));
-    println!("  Available: {}", available_capsules.join(", "));
+    print_publish_selection(options, selected_capsules);
+    if options.platform_inputs.is_empty() {
+        println!("  Available: {}", available_capsules.join(", "));
+    }
     println!(
         "  Build:     {}",
-        if options.skip_build {
+        if !options.platform_inputs.is_empty() {
+            "use admitted native binaries"
+        } else if options.skip_build {
             "reuse existing binaries (--skip-build)"
         } else {
             "build runtime and selected capsules"
@@ -1506,7 +1612,9 @@ fn print_publish_plan(
     );
     println!(
         "  Rootfs:    {}",
-        if options.skip_rootfs {
+        if !options.platform_inputs.is_empty() {
+            "use admitted Home archives"
+        } else if options.skip_rootfs {
             "reuse artifacts/ (*.capsule.tar.gz)"
         } else {
             "rebuild selected capsule rootfs artifacts"
@@ -1529,10 +1637,12 @@ fn print_publish_plan(
             "disabled".to_string()
         }
     );
-    println!(
-        "  Cross:     {}",
-        options.cross.as_deref().unwrap_or("host platform only")
-    );
+    if options.platform_inputs.is_empty() {
+        println!(
+            "  Cross:     {}",
+            options.cross.as_deref().unwrap_or("host platform only")
+        );
+    }
     println!(
         "  IPFS bin:  {}",
         options
@@ -1570,18 +1680,168 @@ fn print_publish_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_required, build_release_ledger_entry, changed_capsules,
-        discover_available_capsules, load_publish_state, operator_release_notes,
-        publish_profile_capsules, release_discovery_topics, save_publish_state, select_capsules,
-        source_discovery_uri, validate_publish_inputs, validate_publishable_manifest,
-        PublishReleaseOptions, PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform,
-        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        append_publish_selection_args, bootstrap_required, build_release_ledger_entry,
+        changed_capsules, discover_available_capsules, load_publish_state, operator_release_notes,
+        publish_profile_capsules, release_discovery_topics, resolve_platform_input_paths,
+        save_publish_state, select_capsules, source_discovery_uri, validate_platform_input_options,
+        validate_publish_inputs, validate_publishable_manifest, PublishReleaseOptions,
+        PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
+        DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    fn platform_input_options() -> PublishReleaseOptions {
+        PublishReleaseOptions {
+            version: "0.7.1".to_string(),
+            channel: "stable".to_string(),
+            profile: "home".to_string(),
+            skip_build: false,
+            skip_rootfs: false,
+            cross: None,
+            capsules: Vec::new(),
+            platform_inputs: ["x86_64-linux", "aarch64-linux", "aarch64-darwin"]
+                .iter()
+                .map(|platform| format!("{platform}=/prepared/{platform}"))
+                .collect(),
+            key: None,
+            dry_run: false,
+            preflight_only: false,
+            public_url: false,
+            public_with_sudo: false,
+            gateway_addr: "127.0.0.1:8090".to_string(),
+            public_timeout: 60,
+            ipfs_provider_bin: None,
+            allow_no_bootstrap: false,
+        }
+    }
+
+    #[test]
+    fn test_platform_input_options_require_three_unique_supported_platforms() {
+        let options = platform_input_options();
+        validate_platform_input_options(&options).unwrap();
+        let mut incomplete = options.clone();
+        incomplete.platform_inputs.pop();
+        assert!(validate_platform_input_options(&incomplete).is_err());
+        for invalid in [
+            "x86_64-linux=/duplicate",
+            "other-platform=/unsupported",
+            "aarch64-darwin=",
+            "aarch64-darwin",
+        ] {
+            let mut invalid_options = options.clone();
+            invalid_options.platform_inputs[2] = invalid.to_string();
+            assert!(
+                validate_platform_input_options(&invalid_options).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_platform_input_options_reject_build_and_selection_overrides() {
+        for flag in ["skip-build", "skip-rootfs", "cross", "capsules", "profile"] {
+            let mut options = platform_input_options();
+            match flag {
+                "skip-build" => options.skip_build = true,
+                "skip-rootfs" => options.skip_rootfs = true,
+                "cross" => options.cross = Some("aarch64".to_string()),
+                "capsules" => options.capsules = vec!["home".to_string()],
+                "profile" => options.profile = "demo".to_string(),
+                _ => unreachable!(),
+            }
+            assert!(validate_platform_input_options(&options).is_err(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn test_platform_input_arguments_forward_without_capsule_selection() {
+        let mut options = platform_input_options();
+        let mut command = std::process::Command::new("bash");
+        append_publish_selection_args(&mut command, &options, &["home".to_string()]);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--platform-input",
+                "x86_64-linux=/prepared/x86_64-linux",
+                "--platform-input",
+                "aarch64-linux=/prepared/aarch64-linux",
+                "--platform-input",
+                "aarch64-darwin=/prepared/aarch64-darwin",
+            ]
+        );
+
+        options.platform_inputs.clear();
+        let mut command = std::process::Command::new("bash");
+        append_publish_selection_args(&mut command, &options, &["home".to_string()]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--capsules", "home"]
+        );
+    }
+
+    #[test]
+    fn test_platform_input_relative_paths_forward_from_the_caller_directory() {
+        let mut options = platform_input_options();
+        options.platform_inputs = vec![
+            "x86_64-linux=prepared inputs/linux=amd64".to_string(),
+            "aarch64-linux=/prepared inputs/linux=arm64".to_string(),
+            "aarch64-darwin=prepared/mac".to_string(),
+        ];
+        resolve_platform_input_paths(&mut options.platform_inputs, Path::new("/caller/session"))
+            .unwrap();
+        let mut command = std::process::Command::new("bash");
+        command.current_dir("/reviewed/workspace");
+        append_publish_selection_args(&mut command, &options, &[]);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--platform-input",
+                "x86_64-linux=/caller/session/prepared inputs/linux=amd64",
+                "--platform-input",
+                "aarch64-linux=/prepared inputs/linux=arm64",
+                "--platform-input",
+                "aarch64-darwin=/caller/session/prepared/mac",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_platform_input_validation_precedes_signing_key_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("publisher/key");
+        let mut options = platform_input_options();
+        options.key = Some(key.clone());
+        options.platform_inputs = ["x86_64-linux", "aarch64-linux", "aarch64-darwin"]
+            .iter()
+            .map(|platform| format!("{platform}={}", temp.path().join(platform).display()))
+            .collect();
+        let error = super::run_publish_release(options).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Prepared release platform input validation failed"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("input root must be a regular directory"),
+            "{error}"
+        );
+        assert!(!key.parent().unwrap().exists());
+    }
 
     fn test_manifest(name: &str, capsule_requires: &[&str]) -> CapsuleManifest {
         CapsuleManifest {
@@ -1615,6 +1875,8 @@ mod tests {
             providers: None,
             icon: None,
             viewer: None,
+            window_policy: None,
+            model_content: None,
             signature: None,
         }
     }
@@ -1843,9 +2105,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_release_ledger_entry_reads_artifacts() {
+    fn test_build_release_ledger_entry_keeps_three_platforms_distinct() {
         let temp = tempfile::tempdir().unwrap();
         let artifacts_dir = temp.path();
+        let platforms = ["x86_64-linux", "aarch64-linux", "aarch64-darwin"];
+        let descriptors = platforms
+            .iter()
+            .map(|platform| {
+                (
+                    *platform,
+                    serde_json::json!({
+                        "binary": { "cid": format!("binary-{platform}") },
+                        "components": { "cid": format!("components-{platform}") }
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         std::fs::write(
             artifacts_dir.join("release.json"),
             serde_json::json!({
@@ -1853,12 +2128,7 @@ mod tests {
                     "channel": "stable",
                     "version": "0.11.0",
                     "released_at": 42,
-                    "platforms": {
-                        "x86_64-linux": {
-                            "binary": { "cid": "binary-cid" },
-                            "components": { "cid": "components-cid" }
-                        }
-                    }
+                    "platforms": descriptors
                 },
                 "signer_did": "did:key:z6Mktest"
             })
@@ -1867,48 +2137,62 @@ mod tests {
         .unwrap();
         std::fs::write(
             artifacts_dir.join("release-head.json"),
-            serde_json::json!({
-                "payload": {
-                    "latest_release_cid": "release-cid"
-                }
-            })
-            .to_string(),
+            serde_json::json!({ "payload": { "latest_release_cid": "release-cid" } }).to_string(),
         )
         .unwrap();
-        std::fs::write(
+        for platform in platforms {
+            std::fs::write(
+                artifacts_dir.join(format!("components-{platform}.json")),
+                serde_json::json!({
+                    "external": {},
+                    "profiles": {},
+                    "capsules": {
+                        "home": { "cid": format!("home-{platform}"), "sha256": "a", "size": 1, "platforms": [platform] }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        // Old architecture-only files can remain from a previous publication.
+        // They must never substitute for either ARM platform's actual manifest.
+        std::fs::copy(
+            artifacts_dir.join("components-x86_64-linux.json"),
             artifacts_dir.join("components-x86_64.json"),
-            serde_json::json!({
-                "external": {},
-                "profiles": {},
-                "capsules": {
-                    "chat": { "cid": "cid-chat-1", "sha256": "a", "size": 1, "platforms": ["x86_64-linux"] }
-                }
-            })
-            .to_string(),
+        )
+        .unwrap();
+        std::fs::copy(
+            artifacts_dir.join("components-aarch64-linux.json"),
+            artifacts_dir.join("components-aarch64.json"),
         )
         .unwrap();
 
-        let entry = build_release_ledger_entry(
-            artifacts_dir,
-            "release-cid",
-            "head-cid",
-            &["chat".to_string()],
-        )
-        .unwrap();
+        let read = || {
+            build_release_ledger_entry(
+                artifacts_dir,
+                "release-cid",
+                "head-cid",
+                &["home".to_string()],
+            )
+        };
+        let entry = read().unwrap();
         assert_eq!(entry.version, "0.11.0");
         assert_eq!(entry.channel, "stable");
         assert_eq!(entry.release_cid, "release-cid");
         assert_eq!(entry.head_cid, "head-cid");
         assert_eq!(entry.signer_did, "did:key:z6Mktest");
-        assert_eq!(
-            entry
-                .platforms
-                .get("x86_64-linux")
-                .unwrap()
-                .capsules
-                .get("chat"),
-            Some(&"cid-chat-1".to_string())
-        );
+        assert_eq!(entry.platforms.len(), 3);
+        for platform in platforms {
+            let record = &entry.platforms[platform];
+            assert_eq!(record.binary_cid, format!("binary-{platform}"));
+            assert_eq!(record.components_cid, format!("components-{platform}"));
+            assert_eq!(record.capsules["home"], format!("home-{platform}"));
+        }
+        std::fs::remove_file(artifacts_dir.join("components-aarch64-darwin.json")).unwrap();
+        assert!(read()
+            .unwrap_err()
+            .to_string()
+            .contains("components-aarch64-darwin.json"));
     }
 
     #[test]
@@ -1922,6 +2206,7 @@ mod tests {
             skip_rootfs: true,
             cross: None,
             capsules: Vec::new(),
+            platform_inputs: Vec::new(),
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -1951,6 +2236,7 @@ mod tests {
             skip_rootfs: false,
             cross: Some("aarch64".to_string()),
             capsules: Vec::new(),
+            platform_inputs: Vec::new(),
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -1966,6 +2252,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--cross aarch64 with --skip-build requested"));
+
+        let selected = super::REQUIRED_SUPPORTED_PUBLISH_CAPSULES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let target_dir = super::cargo_target_dir(temp.path());
+        let gnu = target_dir.join("aarch64-unknown-linux-gnu/release/elastos");
+        std::fs::create_dir_all(gnu.parent().unwrap()).unwrap();
+        std::fs::write(&gnu, b"stale gnu build").unwrap();
+        let err = validate_publish_inputs(&options, temp.path(), &selected).unwrap_err();
+        assert!(err.to_string().contains("aarch64-unknown-linux-musl"));
+
+        let musl = target_dir.join("aarch64-unknown-linux-musl/release/elastos");
+        std::fs::create_dir_all(musl.parent().unwrap()).unwrap();
+        std::fs::write(&musl, b"publisher musl build").unwrap();
+        validate_publish_inputs(&options, temp.path(), &selected).unwrap();
     }
 
     #[test]
@@ -1986,6 +2288,7 @@ mod tests {
             skip_rootfs: true,
             cross: Some("aarch64".to_string()),
             capsules: Vec::new(),
+            platform_inputs: Vec::new(),
             key: None,
             dry_run: true,
             preflight_only: false,
@@ -2013,6 +2316,7 @@ mod tests {
             skip_rootfs: false,
             cross: None,
             capsules: Vec::new(),
+            platform_inputs: Vec::new(),
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -2044,6 +2348,7 @@ mod tests {
             skip_rootfs: false,
             cross: None,
             capsules: Vec::new(),
+            platform_inputs: Vec::new(),
             key: None,
             dry_run: false,
             preflight_only: false,
@@ -2072,6 +2377,7 @@ mod tests {
             skip_rootfs: false,
             cross: None,
             capsules: Vec::new(),
+            platform_inputs: Vec::new(),
             key: None,
             dry_run: false,
             preflight_only: false,

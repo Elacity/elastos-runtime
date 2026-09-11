@@ -17,13 +17,14 @@ const require = createRequire(new URL("../elastos/tools/browser-playwright-engin
 const { chromium } = require("playwright");
 
 const ELASTOS_BASE_URL = (process.env.ELASTOS_BASE_URL || "http://localhost:8090").replace(/\/+$/, "");
-const HOME_URL = process.env.HOME_URL || `${ELASTOS_BASE_URL}/apps/home/`;
+const HOME_URL = process.env.HOME_URL || `${ELASTOS_BASE_URL}/home/`;
 const TEST_NAME = process.env.HOME_VIRTUAL_AUTH_NAME || `Agent Smoke ${new Date().toISOString()}`;
 const HEADLESS = process.env.HOME_VIRTUAL_AUTH_HEADED !== "1";
 const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
 const CLEANUP_PASSKEY = process.env.HOME_VIRTUAL_AUTH_CLEANUP !== "0";
 const INCLUDE_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER === "1";
 const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
+const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
@@ -671,11 +672,35 @@ async function homeState(page) {
     unlockNameVisible: !(document.querySelector("#home-unlock-name")?.hidden ?? true),
     unlockStatus: document.querySelector("#home-unlock-status")?.textContent?.trim() || "",
     activeShellRootHidden: document.querySelector("#active-shell-root")?.hidden !== false,
+    activeShellFrameHidden: document.querySelector("#active-shell-frame")?.hidden === true,
     activeShellFrameSrc: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+    activeShellFrameHasSrcdoc: document.querySelector("#active-shell-frame")?.hasAttribute("srcdoc") !== false,
     hostGuiDomPresent: Boolean(document.querySelector(
       "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
     )),
   }));
+}
+
+async function assertSignedOutShell(page, state) {
+  assert(
+    state.authority === "unsigned" && state.shell === "resolving" && state.gui === "dormant"
+      && state.activeShellRootHidden && state.activeShellFrameHidden
+      && state.activeShellFrameSrc === "about:blank" && !state.activeShellFrameHasSrcdoc
+      && !state.hostGuiDomPresent,
+    "A Home shell remained mounted behind the passkey prompt",
+    state,
+  );
+  // Inspect through Playwright because Home's opaque iframe sandbox owns a
+  // separate origin. A blank src attribute alone does not prove it unloaded.
+  const element = await page.locator("#active-shell-frame").elementHandle();
+  const frame = await element?.contentFrame();
+  assert(frame, "Home's cleared shell frame was missing", state);
+  await frame.waitForFunction(
+    () => document.URL === "about:blank" && document.head?.childNodes.length === 0
+      && document.body?.childNodes.length === 0,
+    null,
+    { timeout: 5_000 },
+  );
 }
 
 async function waitForSignedHome(page, timeoutMs = 30_000) {
@@ -2438,17 +2463,20 @@ async function statusFromServer(page) {
   });
 }
 
-async function createPasskeyFromCurrentUnlock(page, mode) {
+async function createPasskeyFromCurrentUnlock(page, mode, onCreated) {
   const name = page.locator("#home-unlock-name");
   await name.waitFor({ state: "visible", timeout: 10_000 });
   await name.fill(TEST_NAME);
   const tokenPromise = captureNextPasskeyToken(page);
   await page.locator("#home-unlock-primary").click();
+  const created = { created: true, mode, homeToken: await tokenPromise };
+  // Registration can succeed even when the next shell-readiness check fails.
+  await onCreated(created);
   await waitForSignedHome(page);
-  return { mode, homeToken: await tokenPromise };
+  return created;
 }
 
-async function ensureSignedWithVirtualPasskey(page) {
+async function ensureSignedWithVirtualPasskey(page, onCreated) {
   await waitForHomeReady(page);
   let state = await homeState(page);
   if (state.authority === "signed") {
@@ -2470,7 +2498,7 @@ async function ensureSignedWithVirtualPasskey(page) {
   const guestRegistrationEnabled = status.body.guest_registration_enabled === true;
 
   if (!registered) {
-    const created = await createPasskeyFromCurrentUnlock(page, "admin");
+    const created = await createPasskeyFromCurrentUnlock(page, "admin", onCreated);
     return { created: true, ...created };
   }
 
@@ -2500,7 +2528,7 @@ async function ensureSignedWithVirtualPasskey(page) {
     "Home did not enter guest passkey creation mode",
     state,
   );
-  const created = await createPasskeyFromCurrentUnlock(page, "guest");
+  const created = await createPasskeyFromCurrentUnlock(page, "guest", onCreated);
   return { created: true, ...created };
 }
 
@@ -2599,17 +2627,9 @@ async function signBackIn(page) {
 
   const state = await homeState(page);
   assert(state.unlockVisible, "Home did not show the unlock prompt after sign-out", state);
-  assert(
-    state.shell === "resolving" &&
-      state.gui === "dormant" &&
-      state.activeShellRootHidden &&
-      !state.activeShellFrameSrc &&
-      !state.hostGuiDomPresent,
-    "A Home shell remained mounted behind the passkey prompt",
-    state,
-  );
+  await assertSignedOutShell(page, state);
   const clickTokenPromise = captureNextPasskeyToken(page).catch(() => null);
-  await page.locator("#home-unlock-primary").click();
+  await page.locator("#home-unlock-person").click();
   await waitForSignedHome(page);
   const token = await settleTokenWithin(clickTokenPromise, 1_000)
     || await settleTokenWithin(tokenPromise, 1_000);
@@ -2620,7 +2640,11 @@ async function signBackIn(page) {
 async function checkHomePublicCopy(page) {
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
-  await homeGuiFrame.waitForFunction(() => Boolean(document.body), null, { timeout: 15_000 });
+  await homeGuiFrame.waitForFunction(
+    () => document.body?.dataset.homeStatus === "ready",
+    null,
+    { timeout: 15_000 },
+  );
   const state = await homeGuiFrame.evaluate(() => {
     const visible = (node) => {
       const style = window.getComputedStyle(node);
@@ -2641,6 +2665,7 @@ async function checkHomePublicCopy(page) {
       horizontal_overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 2,
     };
   });
+  assert(state.text.length > 0, "Home GUI copy check needs rendered content", state);
   const internalCopy = state.text.match(/\b(runtime mirror|permissioned runtime|projection|schema|derived facts?|runtime facts?|capsules?|providers?|capabilit(?:y|ies)|affordances?|authority boundary|provider boundary|gate preview|runtime-owned|host-loaded|structured home intents?|provider operation|launch token|hostcall|objects?)\b/i);
   assert(!internalCopy, "Home GUI exposed implementation copy", { match: internalCopy?.[0], state });
   assert(state.duplicate_headings.length === 0, "Home GUI rendered duplicate visible headings", state);
@@ -2660,10 +2685,27 @@ async function openDesktopAppWindow(page, target) {
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
   await waitForSignedHome(page);
   const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
-  await homeGuiFrame.locator("#launcher-toggle").click();
-  const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
-  await card.waitFor({ state: "visible", timeout: 10_000 });
-  await card.click();
+  await homeGuiFrame.waitForFunction(
+    () => document.body?.dataset.homeStatus === "ready",
+    null,
+    { timeout: 20_000 },
+  );
+  // This smoke checks app entry. Recovery Kit and Profile completion have
+  // their own journey proof; use the visible reminder's close control here.
+  const setupReminder = homeGuiFrame.locator("#setup-sheet");
+  if (await setupReminder.isVisible()) {
+    await homeGuiFrame.locator("#setup-sheet-close").click();
+    await setupReminder.waitFor({ state: "hidden", timeout: 5_000 });
+  }
+  if (target === "system") {
+    await homeGuiFrame.locator("#toolbar-home").click();
+    await homeGuiFrame.locator("#identity-menu-system").click();
+  } else {
+    await homeGuiFrame.locator("#launcher-toggle").click();
+    const card = homeGuiFrame.locator(`#launcher-grid [data-target="${target}"]`).first();
+    await card.waitFor({ state: "visible", timeout: 10_000 });
+    await card.click();
+  }
   // The desktop restores persisted windows at boot and restore can steal
   // focus from the window the launcher just opened, so bind to the newest
   // window for the target rather than whichever one holds the active class.
@@ -2686,7 +2728,7 @@ async function openDesktopAppWindow(page, target) {
   return appFrame;
 }
 
-async function launchSystem(page, homeToken) {
+async function launchSystem(page, homeToken, passkey) {
   assert(homeToken, "launchSystem requires a passkey-issued Home token");
   const route = await page.evaluate(async (token) => {
     const response = await fetch("/api/apps/home/launch", {
@@ -2708,7 +2750,7 @@ async function launchSystem(page, homeToken) {
   }, homeToken);
   assertIsolatedLaunchRoute(route, "system");
   // Capsule documents only accept API calls from their sandboxed (opaque
-  // origin) window frames, so open System through the desktop launcher the
+  // origin) window frames, so open System through the ElastOS menu the
   // way a person does instead of navigating the trusted Home page to it.
   const systemFrame = await openDesktopAppWindow(page, "system");
   await systemFrame.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
@@ -2735,7 +2777,134 @@ async function launchSystem(page, homeToken) {
   assert(!system.fields.includes("Documents"), "System should not duplicate Documents controls", system);
   assert(system.walletControlsRemoved, "System should not include wallet account or approval controls", system);
   assert(!system.errorText, "System rendered an access error after signed launch", system);
-  return system;
+  const recoveryExport = CHECK_RECOVERY_EXPORT
+    ? await checkSystemRecoveryExport(page, systemFrame, passkey)
+    : null;
+  return { ...system, recoveryExport };
+}
+
+async function readRecoveryExportDownload(download, expected) {
+  // Read only in memory, bound the allocation, and give parse failures a fixed
+  // message: JSON syntax errors can otherwise quote recovery key material.
+  const stream = await download.createReadStream();
+  assert(stream, "Recovery Kit download did not provide a readable stream");
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of stream) {
+    bytes += chunk.length;
+    assert(bytes <= 8 * 1024 * 1024, "Recovery Kit download exceeds the smoke limit");
+    chunks.push(chunk);
+  }
+  let bundle;
+  try {
+    bundle = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new Error("Recovery Kit download is not valid JSON");
+  }
+  assert(bundle?.schema === "elastos.full-recovery-bundle/v1", "Recovery Kit download has the wrong schema");
+  assert(typeof expected.principal_id === "string" && expected.principal_id.length > 0
+    && typeof expected.localhost_root === "string" && expected.localhost_root.startsWith("localhost://")
+    && bundle.principal_id === expected.principal_id && bundle.localhost_root === expected.localhost_root,
+  "Recovery Kit download has the wrong principal binding");
+  assert(bundle.included?.data_kit === true && bundle.data_kit?.schema === "elastos.recovery-kit/v1"
+    && bundle.data_kit.principal_id === expected.principal_id
+    && bundle.data_kit.localhost_root === expected.localhost_root,
+  "Recovery Kit download is missing its bound data kit");
+  const identity = bundle.people_identity;
+  const profile = identity?.profile_authority_bundle;
+  assert(bundle.included?.people_identity === true
+    && identity?.schema === "elastos.people.recovery-identity/v1"
+    && profile?.schema === "elastos.profile-authority-bundle/v1"
+    && /^[0-9a-f]{64}$/.test(profile.profile_signing_seed_hex || "")
+    && typeof profile.signed_profile?.payload?.profile_did === "string"
+    && profile.signed_profile.payload.profile_did.startsWith("did:key:z"),
+  "Recovery Kit download is missing its Profile authority");
+  // Keep the bundle, key material, and download path out of the report.
+  return { bytes, profile_included: true, principal_binding_checked: true };
+}
+
+async function checkSystemRecoveryExport(page, systemFrame, passkey) {
+  markStage("recovery-export:system-ui");
+  assert(passkey?.principal_id, "Recovery Kit export requires the recorded signed-in principal");
+  // Static HTML is visible before System binds navigation and loads state.
+  // Wait for the recovery note to be populated even while its tab is hidden.
+  await systemFrame.waitForFunction(() => {
+    const note = document.querySelector('[data-field="recovery-note"]');
+    return note && !note.hidden && note.textContent.trim().length > 0;
+  }, null, { timeout: 30_000 });
+  // Restored windows can finish opening after the menu launch. Interact with
+  // the foreground System window, rather than a covered earlier instance.
+  const desktop = await homeGuiFrameForPage(page);
+  const activeSystem = desktop.locator('section.window.window-active[data-target="system"] iframe.window-frame');
+  await activeSystem.waitFor({ state: "visible", timeout: 10_000 });
+  const activeHandle = await activeSystem.elementHandle();
+  systemFrame = await activeHandle.contentFrame();
+  assert(systemFrame, "Foreground System window has no frame");
+  await systemFrame.waitForFunction(() => {
+    const note = document.querySelector('[data-field="recovery-note"]');
+    return note && !note.hidden && note.textContent.trim().length > 0;
+  }, null, { timeout: 30_000 });
+  await systemFrame.locator('.settings-sidebar-item[data-settings="security"]').click();
+  await systemFrame.locator('[data-field="recovery-note"]').waitFor({ state: "visible", timeout: 10_000 });
+  await systemFrame.locator('#recovery-password').fill("");
+  const profileName = systemFrame.locator('#recovery-profile-name');
+  if (await profileName.isVisible()) {
+    await profileName.fill(TEST_NAME);
+  }
+  let download = null;
+  const responseAt = (path, method) => response => response.request().method() === method
+    && new URL(response.url()).origin === new URL(HOME_URL).origin
+    && new URL(response.url()).pathname === path;
+  const responses = [];
+  const messages = [];
+  const captureResponse = response => {
+    const url = new URL(response.url());
+    if (url.origin === new URL(HOME_URL).origin
+      && /^\/api\/auth\/(recovery|passkey-step-up)\//.test(url.pathname)) {
+      responses.push({ path: url.pathname, status: response.status() });
+    }
+  };
+  const captureConsole = message => {
+    if (["warning", "error"].includes(message.type())) {
+      messages.push(redactSensitiveString(message.text()).slice(0, 1000));
+      if (messages.length > 20) messages.shift();
+    }
+  };
+  page.on("response", captureResponse);
+  page.on("console", captureConsole);
+  try {
+    markStage("recovery-export:download-and-step-up");
+    const [status, stepUp] = await Promise.all([
+      page.waitForResponse(responseAt("/api/auth/recovery/status", "GET"), { timeout: 120_000 }),
+      page.waitForResponse(responseAt("/api/auth/passkey-step-up/complete", "POST"), { timeout: 120_000 }),
+      page.waitForEvent("download", { timeout: 120_000 }).then(value => { download = value; }),
+      systemFrame.locator('#recovery-download').click(),
+    ]);
+    assert(status.ok() && stepUp.ok(), "System Recovery export did not complete its status and passkey step-up");
+    let expected;
+    try {
+      expected = await status.json();
+    } catch {
+      throw new Error("System Recovery status is not valid JSON");
+    }
+    assert(expected?.principal_id === passkey.principal_id, "System Recovery status changed the signed-in principal");
+    const result = await readRecoveryExportDownload(download, expected);
+    return { ...result, virtual_step_up_checked: true, download_deleted: true };
+  } catch (error) {
+    const ui = await systemFrame.evaluate(() => ({
+      status: document.querySelector('[data-field="recovery-status"]')?.textContent,
+      note: document.querySelector('[data-field="recovery-note"]')?.textContent,
+      downloadDisabled: document.querySelector('#recovery-download')?.disabled,
+    })).catch(() => ({ unavailable: true }));
+    error.details = redactSensitive({ stage: smokeStage, responses, messages, ui });
+    throw error;
+  } finally {
+    page.off("response", captureResponse);
+    page.off("console", captureConsole);
+    // Browser download storage has a separate lifecycle from a retained
+    // virtual-authenticator profile. Remove the exported secrets on failure too.
+    if (download) await download.delete();
+  }
 }
 
 async function checkShellSwitchJourney(page, homeToken) {
@@ -3596,27 +3765,45 @@ async function main() {
   let homeToken = "";
   let cleanupAttempted = false;
   let virtualAuthenticator = null;
+  let credentialStore = { skipped: true };
+  let failure = null;
   async function cleanupCreatedPasskey() {
     if (
       cleanupAttempted
       || !created?.created
       || !CLEANUP_PASSKEY
-      || !passkey?.proof_binding_id
-      || !homeToken
     ) {
       return cleanupResult || { skipped: !created?.created || !CLEANUP_PASSKEY };
     }
     cleanupAttempted = true;
-    cleanupResult = await revokeCurrentPasskey(page, passkey.proof_binding_id, homeToken);
+    assert(passkey?.proof_binding_id, "Test passkey cleanup needs its recorded proof binding");
+    // Sign-out invalidates the earlier Home token. Recover authority, then
+    // check ownership before revoking the one passkey created by this run.
+    const refreshed = await refreshCurrentHomeToken(page);
+    const cleanupToken = refreshed.ok && refreshed.homeToken
+      ? refreshed.homeToken : await signBackIn(page);
+    const authenticated = await currentPasskey(page, cleanupToken);
+    assert(
+      authenticated?.proof_binding_id === passkey.proof_binding_id,
+      "Cleanup authentication selected a different passkey; test credential retained",
+      { expected: passkey.proof_binding_id, current: authenticated?.proof_binding_id },
+    );
+    cleanupResult = await revokeCurrentPasskey(page, passkey.proof_binding_id, cleanupToken);
     return cleanupResult;
   }
   try {
     virtualAuthenticator = await setupVirtualAuthenticator(context, page);
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-    created = await ensureSignedWithVirtualPasskey(page);
+    created = await ensureSignedWithVirtualPasskey(page, async (registered) => {
+      created = registered;
+      homeToken = registered.homeToken;
+      credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
+      passkey = await currentPasskey(page, homeToken);
+    });
     homeToken = created.homeToken;
     passkey = await currentPasskey(page, homeToken);
     assert(passkey?.proof_binding_id, "signed virtual passkey was not visible through the passkey list", passkey);
+    credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
 
     await signOut(page, homeToken);
     homeToken = await signBackIn(page);
@@ -3626,12 +3813,10 @@ async function main() {
       "virtual passkey sign-in did not restore the same proof binding",
       { before: passkey, after: afterSignIn },
     );
-    const credentialStore = (!created.created || !CLEANUP_PASSKEY)
-      ? await persistVirtualAuthenticatorCredentials(virtualAuthenticator)
-      : { skipped: true, reason: "created credential will be cleaned up" };
+    credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
 
     const homePublicCopy = await checkHomePublicCopy(page);
-    const system = await launchSystem(page, homeToken);
+    const system = await launchSystem(page, homeToken, passkey);
     const shellSwitch = CHECK_SHELL_SWITCH
       ? await checkShellSwitchJourney(page, homeToken)
       : null;
@@ -3653,6 +3838,9 @@ async function main() {
       principal_id: passkey.principal_id,
       role: passkey.role,
       virtual_authenticator_credentials: credentialStore,
+      first_run_setup_checked: false,
+      recovery_export_checked: Boolean(system.recoveryExport),
+      recovery_export: system.recoveryExport,
       system_fields: system.fields,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
@@ -3669,6 +3857,7 @@ async function main() {
     };
     console.log(JSON.stringify(redactSensitive(report), null, 2));
   } catch (error) {
+    failure = { message: String(error.message || error), stage: smokeStage };
     if (error.skip) {
       console.log(error.message);
       if (error.details) {
@@ -3683,13 +3872,14 @@ async function main() {
         console.error(JSON.stringify(cleanup, null, 2));
       }
     } catch (cleanupError) {
+      cleanupResult = { ok: false, error: String(cleanupError.message || cleanupError) };
       console.error("virtual test passkey cleanup threw after smoke error");
       console.error(cleanupError.message || cleanupError);
     }
     console.error("FAIL home-passkey-virtual-auth-smoke");
-    console.error(error.message || error);
+    console.error(redactSensitiveString(error.message || error));
     if (error.stack) {
-      console.error(error.stack);
+      console.error(redactSensitiveString(error.stack));
     }
     if (error.details) {
       console.error(JSON.stringify(redactSensitive(error.details), null, 2));
@@ -3697,13 +3887,51 @@ async function main() {
       const state = page ? await homeState(page).catch(() => null) : null;
       if (state) {
         state.stage = smokeStage;
-        console.error(JSON.stringify(state, null, 2));
+        console.error(JSON.stringify(redactSensitive(state), null, 2));
       }
     }
     process.exitCode = 1;
   } finally {
+    // A virtual authenticator's private key lives in CDP memory, not in the
+    // browser profile. Export it before closing, including failed registration.
+    let credentialSaveError = null;
+    try {
+      credentialStore = await persistVirtualAuthenticatorCredentials(virtualAuthenticator);
+    } catch (error) {
+      credentialSaveError = String(error.message || error);
+    }
+    const retainForRecovery = cleanupResult?.ok !== true && (
+      created?.created || (credentialStore.credential_count || 0) > 0 || credentialSaveError
+    );
+    if (retainForRecovery) {
+      const recovery = {
+        schema: "elastos.home.virtual-authenticator-recovery/v1",
+        recorded_at: new Date().toISOString(),
+        home_url: HOME_URL,
+        profile_dir: PROFILE_DIR,
+        credential_store: VIRTUAL_AUTH_CREDENTIAL_STORE,
+        virtual_authenticator_credentials: credentialStore,
+        credential_save_error: credentialSaveError,
+        created_mode: created?.mode || "registration outcome unknown",
+        proof_binding_id: passkey?.proof_binding_id || null,
+        cleanup: cleanupResult || { skipped: !CLEANUP_PASSKEY },
+        failure,
+        cleanup_condition: "Keep this profile until its test passkey is revoked in Home. Set HOME_VIRTUAL_AUTH_PROFILE to this profile_dir and use the same HOME_URL to restore its authenticator.",
+      };
+      const recoveryPath = join(PROFILE_DIR, "elastos-virtual-authenticator-recovery.json");
+      try {
+        mkdirSync(PROFILE_DIR, { recursive: true, mode: 0o700 });
+        writeFileSync(recoveryPath, `${JSON.stringify(recovery, null, 2)}\n`, { mode: 0o600 });
+        chmodSync(recoveryPath, 0o600);
+      } catch (error) {
+        console.error(`Could not save recovery receipt: ${error.message || error}`);
+        process.exitCode = 1;
+      }
+      console.error("Virtual passkey profile retained until credential cleanup completes");
+      console.error(JSON.stringify(redactSensitive({ recovery_path: recoveryPath, ...recovery }), null, 2));
+    }
     await context.close().catch(() => {});
-    if (!PRESERVE_PROFILE && !process.env.HOME_VIRTUAL_AUTH_PROFILE) {
+    if (!retainForRecovery && !PRESERVE_PROFILE && !process.env.HOME_VIRTUAL_AUTH_PROFILE) {
       rmSync(PROFILE_DIR, { recursive: true, force: true });
     }
   }

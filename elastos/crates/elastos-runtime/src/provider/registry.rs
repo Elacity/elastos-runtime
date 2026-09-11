@@ -15,6 +15,125 @@ use tokio::sync::RwLock;
 use base64::Engine as _;
 use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
 
+fn private_ipfs_operation(op: &str) -> bool {
+    matches!(
+        op,
+        "runtime_prepare_backend" | "runtime_hash_staged_directory" | "runtime_check_capacity"
+    )
+}
+
+fn private_ipfs_unavailable() -> ProviderError {
+    ProviderError::Provider("local content preparation unavailable".into())
+}
+
+fn private_model_configuration(target: &str, op: &str) -> bool {
+    target.eq_ignore_ascii_case("model") && op == "init"
+}
+
+// Internal wire types. Only the typed local methods below can dispatch them.
+#[derive(serde::Serialize)]
+struct LocalStagedFile<'a> {
+    path: &'a str,
+    size: u64,
+}
+
+#[derive(serde::Serialize)]
+struct LocalStagedDirectory<'a> {
+    root: &'a str,
+    files: Vec<LocalStagedFile<'a>>,
+    total_bytes: u64,
+}
+
+impl<'a> LocalStagedDirectory<'a> {
+    fn checked(
+        root: &'a std::path::Path,
+        files: &'a [(String, u64)],
+        total_bytes: u64,
+    ) -> Result<Self, ProviderError> {
+        let root = root.to_str().ok_or_else(private_ipfs_unavailable)?;
+        if !root.starts_with('/')
+            || root.len() > 4096
+            || root.contains('\0')
+            || root[1..].split('/').count() > 64
+            || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+            || files.is_empty()
+            || files.len() > 33
+            || total_bytes == 0
+            || total_bytes > 16 * 1024 * 1024 * 1024
+        {
+            return Err(private_ipfs_unavailable());
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        let mut total = 0u64;
+        for (path, size) in files {
+            if path.is_empty()
+                || path.len() > 256
+                || path.split('/').count() > 8
+                || path.split('/').any(|p| {
+                    matches!(p, "" | "." | "..")
+                        || !p
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                })
+                || !paths.insert(path.as_str())
+            {
+                return Err(private_ipfs_unavailable());
+            }
+            total = total
+                .checked_add(*size)
+                .ok_or_else(private_ipfs_unavailable)?;
+        }
+        if total != total_bytes
+            || ["capsule.json", "_elastos_object.json"]
+                .iter()
+                .any(|required| {
+                    !files
+                        .iter()
+                        .any(|(p, size)| p.as_str() == *required && (1..=65536).contains(size))
+                })
+            || files
+                .iter()
+                .any(|(p, _)| p.match_indices('/').any(|(i, _)| paths.contains(&p[..i])))
+        {
+            return Err(private_ipfs_unavailable());
+        }
+        Ok(Self {
+            root,
+            files: files
+                .iter()
+                .map(|(path, size)| LocalStagedFile { path, size: *size })
+                .collect(),
+            total_bytes,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalDirectoryHashResult {
+    cid: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum LocalIpfsResult<T> {
+    Ok { data: Option<T> },
+}
+
+const MAX_LOCAL_IPFS_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Private local volume observation, not a reservation. Runtime must recheck
+/// before effects and keep this identity/these capacity facts out of capsule projections.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalIpfsCapacityObservation {
+    /// Local filesystem device identity, comparable to staging-directory metadata.dev().
+    pub volume_id: u64,
+    pub capacity_bytes: u64,
+    pub available_bytes: u64,
+    pub required_bytes: u64,
+}
+
 /// A route currently backed by the live Runtime provider registry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProviderRegistration {
@@ -1050,12 +1169,202 @@ impl ProviderRegistry {
             .await
     }
 
+    /// Runtime-only Init refresh of the existing local model slot. The provider
+    /// coordinator owns the atomic run/engine check and in-place configuration.
+    pub async fn refresh_local_model_configuration(
+        &self,
+        config: &super::BridgeProviderConfig,
+    ) -> Result<(), ProviderError> {
+        let unavailable = || ProviderError::Provider("model activation pending".into());
+        // Retain registration ownership through dispatch; unregister cannot
+        // replace this slot while its configuration request is in flight.
+        let slots = self.sub_providers.read().await;
+        let provider = slots
+            .get("model")
+            .and_then(SubProviderRegistration::ready_provider)
+            .ok_or_else(unavailable)?;
+        let request = serde_json::json!({"op":"init", "config":config});
+        if serde_json::to_vec(&request)
+            .map_err(|_| unavailable())?
+            .len()
+            > 272 * 1024
+        {
+            return Err(unavailable());
+        }
+        let response =
+            tokio::time::timeout(super::bridge::REQUEST_TIMEOUT, provider.send_raw(&request))
+                .await
+                .map_err(|_| unavailable())?
+                .map_err(|error| {
+                    tracing::debug!(?error, "private model activation failed");
+                    unavailable()
+                })?;
+        let data = &response["data"];
+        if response["status"] != "ok"
+            || data["provider"] != "model-provider"
+            || data["protocol_version"] != "elastos.model-provider/v1"
+            || data["offers_ready"].as_u64().is_none_or(|n| n > 64)
+        {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
+    /// Observe offers from the exact current local model registration. Holding
+    /// this read guard binds the reply to that slot, not a replacement or route.
+    pub async fn local_model_offers(&self) -> Result<Vec<serde_json::Value>, ProviderError> {
+        let unavailable = || ProviderError::Provider("model offers unavailable".into());
+        let read = async {
+            let slots = self.sub_providers.read().await;
+            let provider = slots
+                .get("model")
+                .and_then(SubProviderRegistration::ready_provider)
+                .ok_or_else(unavailable)?;
+            let response = provider
+                .send_raw(&serde_json::json!({"op":"offers_list"}))
+                .await
+                .map_err(|error| {
+                    tracing::debug!(?error, "private model offers read failed");
+                    unavailable()
+                })?;
+            let data = &response["data"];
+            let offers = data["offers"].as_array().ok_or_else(unavailable)?;
+            if response.as_object().is_none_or(|object| object.len() != 2)
+                || response["status"] != "ok"
+                || data.as_object().is_none_or(|object| object.len() != 4)
+                || data["schema"] != "elastos.model.offers-list/v1"
+                || data["provider"] != "model-provider"
+                || data["protocol_version"] != "elastos.model-provider/v1"
+                || offers.len() > 64
+            {
+                return Err(unavailable());
+            }
+            // Serialization into a fixed slice checks the bound without allocating
+            // another unbounded copy of the provider's parsed response.
+            let mut bound = vec![0u8; 256 * 1024];
+            serde_json::to_writer(bound.as_mut_slice(), &response).map_err(|_| unavailable())?;
+            Ok(offers.clone())
+        };
+        tokio::time::timeout(super::bridge::REQUEST_TIMEOUT, read)
+            .await
+            .map_err(|_| unavailable())?
+    }
+
+    /// Runtime-owned readiness for local preparation, through the existing Kubo lifecycle.
+    /// Capsule resource dispatch and provider-plane envelopes cannot call this operation.
+    pub async fn prepare_local_ipfs_backend(&self) -> Result<(), ProviderError> {
+        let result: LocalIpfsResult<LocalDirectoryHashResult> = self
+            .send_local_ipfs_preparation(&serde_json::json!({"op":"runtime_prepare_backend"}))
+            .await?;
+        match result {
+            LocalIpfsResult::Ok { data: None } => Ok(()),
+            _ => Err(private_ipfs_unavailable()),
+        }
+    }
+
+    /// Hash an exact private staged closure. Runtime must compare the computed CID
+    /// before admission; this method has no Carrier route or caller authority flag.
+    pub async fn hash_local_ipfs_directory(
+        &self,
+        root: &std::path::Path,
+        files: &[(String, u64)],
+        total_bytes: u64,
+    ) -> Result<String, ProviderError> {
+        let directory = LocalStagedDirectory::checked(root, files, total_bytes)?;
+        let result = self
+            .send_local_ipfs_preparation(
+                &serde_json::json!({"op":"runtime_hash_staged_directory","directory":directory}),
+            )
+            .await?;
+        match result {
+            LocalIpfsResult::Ok {
+                data: Some(LocalDirectoryHashResult { cid }),
+            } if cid.len() == 59
+                && cid.starts_with("bafybei")
+                && cid
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) =>
+            {
+                Ok(cid)
+            }
+            _ => Err(private_ipfs_unavailable()),
+        }
+    }
+
+    /// Observe the actual Ready backend volume through the exact local provider.
+    /// The inventory owns reservations; this result grants no retention or admission.
+    pub async fn check_local_ipfs_capacity(
+        &self,
+        required_bytes: u64,
+    ) -> Result<LocalIpfsCapacityObservation, ProviderError> {
+        if !(1..=MAX_LOCAL_IPFS_CAPACITY_REQUIRED_BYTES).contains(&required_bytes) {
+            return Err(private_ipfs_unavailable());
+        }
+        let result: LocalIpfsResult<LocalIpfsCapacityObservation> = self
+            .send_local_ipfs_preparation(
+                &serde_json::json!({"op":"runtime_check_capacity","required_bytes":required_bytes}),
+            )
+            .await?;
+        let LocalIpfsResult::Ok {
+            data: Some(observation),
+        } = result
+        else {
+            return Err(private_ipfs_unavailable());
+        };
+        if observation.volume_id == 0
+            || observation.capacity_bytes == 0
+            || observation.available_bytes > observation.capacity_bytes
+            || observation.required_bytes != required_bytes
+            || observation
+                .available_bytes
+                .checked_sub(required_bytes)
+                .is_none_or(|remaining| remaining < observation.capacity_bytes.div_ceil(10))
+        {
+            return Err(private_ipfs_unavailable());
+        }
+        Ok(observation)
+    }
+
+    async fn send_local_ipfs_preparation<T: serde::de::DeserializeOwned>(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<LocalIpfsResult<T>, ProviderError> {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Err(private_ipfs_unavailable());
+        }
+        // Exact local sub-provider only: no URI resolution, main-provider alias or Carrier fallback.
+        let provider = self
+            .sub_providers
+            .read()
+            .await
+            .get("ipfs")
+            .and_then(SubProviderRegistration::ready_provider)
+            .ok_or_else(private_ipfs_unavailable)?;
+        let response = provider.send_raw(request).await.map_err(|error| {
+            tracing::debug!(?error, "private local IPFS preparation failed");
+            private_ipfs_unavailable()
+        })?;
+        serde_json::from_value(response).map_err(|_| private_ipfs_unavailable())
+    }
+
     /// Send an already validated Runtime envelope to one exact private target.
     pub async fn send_runtime_provider_target_raw(
         &self,
         target: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        if private_model_configuration(target, request["op"].as_str().unwrap_or_default()) {
+            return Err(ProviderError::Provider(
+                "model configuration is Runtime-owned".into(),
+            ));
+        }
+        if request
+            .get("op")
+            .and_then(|v| v.as_str())
+            .is_some_and(private_ipfs_operation)
+        {
+            return Err(private_ipfs_unavailable());
+        }
         let key = target.to_lowercase();
         if !RESERVED_RUNTIME_PROVIDER_TARGETS.contains(&key.as_str()) {
             return Err(ProviderError::NoProvider(target.to_string()));
@@ -1086,6 +1395,18 @@ impl ProviderRegistry {
         request: &serde_json::Value,
         include_runtime_only: bool,
     ) -> Result<serde_json::Value, ProviderError> {
+        if private_model_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
+            return Err(ProviderError::Provider(
+                "model configuration is Runtime-owned".into(),
+            ));
+        }
+        if request
+            .get("op")
+            .and_then(|v| v.as_str())
+            .is_some_and(private_ipfs_operation)
+        {
+            return Err(private_ipfs_unavailable());
+        }
         if scheme == "localhost"
             && request
                 .get("path")
@@ -1135,6 +1456,25 @@ impl ProviderRegistry {
         &self,
         invocation: ProviderInvocation,
     ) -> Result<serde_json::Value, ProviderError> {
+        if private_model_configuration(&invocation.target, &invocation.op)
+            || private_model_configuration(
+                &invocation.target,
+                invocation.request["op"].as_str().unwrap_or_default(),
+            )
+        {
+            return Err(ProviderError::Provider(
+                "model configuration is Runtime-owned".into(),
+            ));
+        }
+        if private_ipfs_operation(&invocation.op)
+            || invocation
+                .request
+                .get("op")
+                .and_then(|v| v.as_str())
+                .is_some_and(private_ipfs_operation)
+        {
+            return Err(private_ipfs_unavailable());
+        }
         if invocation.source.trim().is_empty() {
             return Err(ProviderError::Provider(
                 "provider invocation requires source".to_string(),
@@ -1151,6 +1491,7 @@ impl ProviderRegistry {
             ));
         }
         validate_provider_transfer_contract(&invocation)?;
+        bounded_provider_read_range(&invocation)?;
         let target_op = invocation
             .request
             .get("op")
@@ -1307,6 +1648,39 @@ fn apply_provider_transfer_response(
     response: &mut serde_json::Value,
     invocation: &ProviderInvocation,
 ) -> Result<(), ProviderError> {
+    let bounded_range = bounded_provider_read_range(invocation)?;
+    let metadata_max = bounded_provider_metadata_max(invocation)?;
+    let complete = response
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|data| data.remove("_runtime_complete_metadata"));
+    if let Some(max_bytes) = metadata_max {
+        if response.get("status").and_then(serde_json::Value::as_str) != Some("error") {
+            validate_complete_metadata(response, invocation, max_bytes, complete)?;
+        }
+    } else if complete.is_some() {
+        return Err(ProviderError::Provider(
+            "unexpected complete metadata receipt".into(),
+        ));
+    }
+    let applied = response
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|data| data.remove("_runtime_applied_range"));
+    let mut normalized = invocation.clone();
+    if let Some((range, length)) = bounded_range {
+        if response.get("status").and_then(serde_json::Value::as_str) != Some("error") {
+            validate_applied_provider_range(response, invocation, range, length, applied)?;
+            // The backend already applied this exact range. Normalize the bounded
+            // payload into Bytes/Stream without applying the offset a second time.
+            normalized.range = None;
+        }
+    } else if applied.is_some() {
+        return Err(ProviderError::Provider(
+            "unexpected applied range receipt".into(),
+        ));
+    }
+    let invocation = &normalized;
     let result = match invocation.transfer {
         ProviderTransfer::Json => Ok(()),
         ProviderTransfer::Bytes => apply_provider_byte_range(response, invocation),
@@ -1314,6 +1688,227 @@ fn apply_provider_transfer_response(
     };
     redact_public_provider_runtime_metadata(response);
     result
+}
+
+const MAX_BOUNDED_PROVIDER_READ_BYTES: u64 = 64 * 1024;
+
+fn bounded_provider_metadata_max(
+    invocation: &ProviderInvocation,
+) -> Result<Option<u64>, ProviderError> {
+    if !matches!(
+        (invocation.target.as_str(), invocation.op.as_str()),
+        ("ipfs", "cat") | ("content", "fetch")
+    ) {
+        return Ok(None);
+    }
+    let Some(value) = invocation.request.get("max_bytes") else {
+        return Ok(None);
+    };
+    let invalid = || ProviderError::Provider("invalid complete metadata request".into());
+    let max = value
+        .as_u64()
+        .filter(|n| (1..=MAX_BOUNDED_PROVIDER_READ_BYTES).contains(n))
+        .ok_or_else(invalid)?;
+    if invocation.request.get("bounded_read") != Some(&serde_json::Value::Bool(true))
+        || invocation
+            .request
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            != Some("_elastos_object.json")
+        || invocation.range.is_some()
+        || invocation.request.get("range").is_some()
+        || invocation
+            .progress
+            .as_ref()
+            .and_then(|p| p.expected_bytes)
+            .is_some()
+        || !matches!(invocation.transport, ProviderInvocationTransport::Local)
+        || invocation.transfer == ProviderTransfer::Json
+    {
+        return Err(invalid());
+    }
+    match (invocation.target.as_str(), invocation.op.as_str()) {
+        ("ipfs", "cat") => Ok(Some(max)),
+        ("content", "fetch") => Ok(None), // Content validates its own nested request/receipt.
+        _ => Err(invalid()),
+    }
+}
+
+fn validate_complete_metadata(
+    response: &serde_json::Value,
+    invocation: &ProviderInvocation,
+    max: u64,
+    receipt: Option<serde_json::Value>,
+) -> Result<(), ProviderError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Receipt {
+        schema: String,
+        cid: String,
+        path: String,
+        max_bytes: u64,
+        actual_bytes: u64,
+        completed: bool,
+    }
+    let invalid = || ProviderError::Provider("invalid complete metadata receipt or payload".into());
+    let receipt: Receipt =
+        serde_json::from_value(receipt.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok")
+        || response
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|v| v.len() != 1)
+        || receipt.schema != "elastos.provider.complete-metadata/v1"
+        || !receipt.completed
+        || receipt.path != "_elastos_object.json"
+        || receipt.max_bytes != max
+        || receipt.actual_bytes == 0
+        || receipt.actual_bytes > max
+        || Some(receipt.cid.as_str())
+            != invocation
+                .request
+                .get("cid")
+                .and_then(serde_json::Value::as_str)
+    {
+        return Err(invalid());
+    }
+    let encoded = response
+        .pointer("/data/data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if encoded.len() as u64 > max.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    if bytes.len() as u64 != receipt.actual_bytes
+        || base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn bounded_provider_read_range(
+    invocation: &ProviderInvocation,
+) -> Result<Option<(ProviderByteRange, u64)>, ProviderError> {
+    if invocation.request.get("max_bytes").is_some()
+        && matches!(
+            (invocation.target.as_str(), invocation.op.as_str()),
+            ("ipfs", "cat") | ("content", "fetch")
+        )
+    {
+        bounded_provider_metadata_max(invocation)?;
+        return Ok(None);
+    }
+    match invocation.request.get("bounded_read") {
+        None | Some(serde_json::Value::Bool(false)) => return Ok(None),
+        Some(serde_json::Value::Bool(true)) => {}
+        _ => {
+            return Err(ProviderError::Provider(
+                "bounded_read must be a boolean".into(),
+            ))
+        }
+    }
+    // Content owns its nested fetch range. Its outer call must not
+    // slice the already-normalized backend response again.
+    if invocation.target == "content"
+        && invocation.op == "fetch"
+        && invocation.range.is_none()
+        && matches!(invocation.transport, ProviderInvocationTransport::Local)
+    {
+        return Ok(None);
+    }
+    if invocation.target != "ipfs"
+        || invocation.op != "cat"
+        || !matches!(invocation.transport, ProviderInvocationTransport::Local)
+        || invocation.transfer == ProviderTransfer::Json
+    {
+        return Err(ProviderError::Provider(
+            "bounded read requires local IPFS Cat bytes or stream".into(),
+        ));
+    }
+    let range = invocation
+        .range
+        .ok_or_else(|| ProviderError::Provider("bounded read requires a closed range".into()))?;
+    let length = range
+        .end
+        .and_then(|end| end.checked_sub(range.start))
+        .and_then(|size| size.checked_add(1))
+        .filter(|size| *size <= MAX_BOUNDED_PROVIDER_READ_BYTES)
+        .ok_or_else(|| ProviderError::Provider("bounded read range exceeds limit".into()))?;
+    if invocation
+        .progress
+        .as_ref()
+        .and_then(|p| p.expected_bytes)
+        .is_some_and(|expected| expected != length)
+    {
+        return Err(ProviderError::Provider(
+            "bounded read expected length mismatch".into(),
+        ));
+    }
+    Ok(Some((range, length)))
+}
+
+fn validate_applied_provider_range(
+    response: &serde_json::Value,
+    invocation: &ProviderInvocation,
+    range: ProviderByteRange,
+    length: u64,
+    applied: Option<serde_json::Value>,
+) -> Result<(), ProviderError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AppliedRange {
+        schema: String,
+        cid: String,
+        path: String,
+        start: u64,
+        end: u64,
+    }
+    let invalid = || ProviderError::Provider("invalid bounded read receipt or payload".into());
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok")
+        || response
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|data| data.len() != 1)
+    {
+        return Err(invalid());
+    }
+    let applied: AppliedRange =
+        serde_json::from_value(applied.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    if applied.schema != "elastos.provider.applied-range/v1"
+        || Some(applied.cid.as_str())
+            != invocation
+                .request
+                .get("cid")
+                .and_then(serde_json::Value::as_str)
+        || applied.path
+            != invocation
+                .request
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        || applied.start != range.start
+        || Some(applied.end) != range.end
+    {
+        return Err(invalid());
+    }
+    let encoded = response
+        .pointer("/data/data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if encoded.len() as u64 > length.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    if bytes.len() as u64 != length {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn redact_public_provider_runtime_metadata(response: &mut serde_json::Value) {
@@ -2041,6 +2636,448 @@ mod tests {
         requests: Mutex<Vec<serde_json::Value>>,
     }
 
+    #[derive(Default)]
+    struct PrivateIpfsMock {
+        requests: Mutex<Vec<serde_json::Value>>,
+        response: Mutex<Option<serde_json::Value>>,
+        hold: std::sync::atomic::AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PrivateIpfsMock {
+        async fn handle(&self, _: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("fixture raw only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            "private-ipfs-fixture"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            if self.hold.load(Ordering::Acquire) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if let Some(response) = self.response.lock().await.clone() {
+                return Ok(response);
+            }
+            Ok(match request["op"].as_str().unwrap() {
+                "runtime_prepare_backend" => serde_json::json!({"status":"ok"}),
+                "runtime_hash_staged_directory" => {
+                    serde_json::json!({"status":"ok","data":{"cid":"bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"}})
+                }
+                "runtime_check_capacity" => serde_json::json!({"status":"ok","data":{
+                    "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":request["required_bytes"]
+                }}),
+                _ => panic!("unexpected operation"),
+            })
+        }
+    }
+
+    fn private_ipfs_files() -> Vec<(String, u64)> {
+        vec![
+            ("capsule.json".into(), 2),
+            ("_elastos_object.json".into(), 2),
+            ("weights.gguf".into(), 4),
+        ]
+    }
+
+    #[tokio::test]
+    async fn model_offers_local_read_bounds_and_unavailable_slot() {
+        let registry = ProviderRegistry::new();
+        assert!(registry.local_model_offers().await.is_err());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let valid = serde_json::json!({"status":"ok", "data":{
+            "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
+            "protocol_version":"elastos.model-provider/v1", "offers":[]
+        }});
+        *provider.response.lock().await = Some(valid.clone());
+        assert_eq!(
+            registry.local_model_offers().await.unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+        for (field, value) in [
+            ("schema", serde_json::json!("unknown")),
+            ("provider", serde_json::json!("other")),
+            ("protocol_version", serde_json::json!("unknown")),
+            ("protocol_version", serde_json::Value::Null),
+            (
+                "offers",
+                serde_json::json!(vec![serde_json::Value::Null; 65]),
+            ),
+            ("offers", serde_json::json!(["x".repeat(256 * 1024)])),
+        ] {
+            let mut response = valid.clone();
+            response["data"][field] = value;
+            *provider.response.lock().await = Some(response);
+            assert!(registry.local_model_offers().await.is_err(), "{field}");
+        }
+        let mut missing_protocol = valid.clone();
+        missing_protocol["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        *provider.response.lock().await = Some(missing_protocol);
+        assert!(registry.local_model_offers().await.is_err());
+        *provider.response.lock().await =
+            Some(serde_json::json!({"status":"error", "error":"/private/model"}));
+        let error = registry.local_model_offers().await.unwrap_err().to_string();
+        assert!(!error.contains("/private/model"));
+        assert!(provider
+            .requests
+            .lock()
+            .await
+            .iter()
+            .all(|request| request == &serde_json::json!({"op":"offers_list"})));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_offers_local_read_timeout_retains_exact_slot_until_settlement() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        provider.hold.store(true, Ordering::Release);
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let reading = registry.clone();
+        let read = tokio::spawn(async move { reading.local_model_offers().await });
+        provider.entered.notified().await;
+        assert!(registry.sub_providers.try_write().is_err());
+        tokio::time::advance(super::super::bridge::REQUEST_TIMEOUT).await;
+        assert!(read.await.unwrap().is_err());
+        assert!(registry.sub_providers.try_write().is_ok());
+        assert!(Arc::ptr_eq(
+            &registry.get_sub_provider("model").await.unwrap(),
+            &(provider.clone() as Arc<dyn Provider>)
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_refresh_private_init_same_slot_and_mapping_denial() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        *provider.response.lock().await = Some(serde_json::json!({"status":"ok", "data":{
+            "provider":"model-provider", "protocol_version":"elastos.model-provider/v1", "offers_ready":0
+        }}));
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let before = registry.get_sub_provider("model").await.unwrap();
+        let carrier = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(carrier.clone()).await;
+        let config = super::super::BridgeProviderConfig::default();
+        let request = serde_json::json!({"op":"init", "config":config});
+        assert!(registry.send_raw("model", &request).await.is_err());
+        assert!(registry
+            .send_runtime_provider_target_raw("model", &request)
+            .await
+            .is_err());
+        for transport in [
+            ProviderInvocationTransport::Local,
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: "did:key:zFixture".into(),
+                timeout_ms: Some(5000),
+            }),
+        ] {
+            let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
+            invocation.target = "model".into();
+            invocation.op = "init".into();
+            invocation.request = request.clone();
+            invocation.transport = transport;
+            assert!(registry.invoke_provider(invocation).await.is_err());
+        }
+        assert!(provider.requests.lock().await.is_empty());
+        assert!(carrier.requests.lock().await.is_empty());
+        for _ in 0..2 {
+            registry
+                .refresh_local_model_configuration(&config)
+                .await
+                .unwrap();
+        }
+        assert!(Arc::ptr_eq(
+            &before,
+            &registry.get_sub_provider("model").await.unwrap()
+        ));
+        assert_eq!(
+            *provider.requests.lock().await,
+            vec![request.clone(), request]
+        );
+        *provider.response.lock().await =
+            Some(serde_json::json!({"status":"error", "message":"private failure"}));
+        assert_eq!(
+            registry
+                .refresh_local_model_configuration(&config)
+                .await
+                .unwrap_err()
+                .to_string(),
+            ProviderError::Provider("model activation pending".into()).to_string()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_refresh_withheld_init_reply_is_bounded_and_keeps_slot() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        provider.hold.store(true, Ordering::Release);
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        let executing = registry.clone();
+        let pending = tokio::spawn(async move {
+            executing
+                .refresh_local_model_configuration(&super::super::BridgeProviderConfig::default())
+                .await
+        });
+        provider.entered.notified().await;
+        assert!(registry.sub_providers.try_write().is_err());
+        tokio::time::advance(super::super::bridge::REQUEST_TIMEOUT).await;
+        assert!(pending.await.unwrap().is_err());
+        assert!(Arc::ptr_eq(
+            &registry.get_sub_provider("model").await.unwrap(),
+            &(provider.clone() as Arc<dyn Provider>)
+        ));
+    }
+
+    #[tokio::test]
+    async fn private_ipfs_generic_and_remote_dispatch_rejected_before_transmission() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("ipfs", provider.clone())
+            .await
+            .unwrap();
+        let carrier = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(carrier.clone()).await;
+        for op in [
+            "runtime_prepare_backend",
+            "runtime_hash_staged_directory",
+            "runtime_check_capacity",
+        ] {
+            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}});
+            assert!(registry.send_raw("ipfs", &request).await.is_err());
+            assert!(registry
+                .send_runtime_provider_target_raw("ipfs", &request)
+                .await
+                .is_err());
+            for transport in [
+                ProviderInvocationTransport::Local,
+                ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                    peer_did: "did:key:zFixture".into(),
+                    timeout_ms: Some(5000),
+                }),
+            ] {
+                let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
+                invocation.source = "runtime".into(); // A source label is not private-call authority.
+                invocation.target = "ipfs".into();
+                invocation.op = op.into();
+                invocation.request = request.clone();
+                invocation.transport = transport;
+                assert!(registry.invoke_provider(invocation.clone()).await.is_err());
+                invocation.op = "cat".into();
+                assert!(registry.invoke_provider(invocation.clone()).await.is_err());
+                invocation.op = op.into();
+                invocation.request["op"] = serde_json::json!("cat");
+                assert!(registry.invoke_provider(invocation).await.is_err());
+            }
+        }
+        assert!(provider.requests.lock().await.is_empty());
+        assert!(carrier.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn private_ipfs_local_typed_dispatch_and_bounded_response() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("ipfs", provider.clone())
+            .await
+            .unwrap();
+        registry.prepare_local_ipfs_backend().await.unwrap();
+        let cid = registry
+            .hash_local_ipfs_directory(
+                std::path::Path::new("/private/fixture"),
+                &private_ipfs_files(),
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cid,
+            "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"
+        );
+        let requests = provider.requests.lock().await.clone();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({"op":"runtime_prepare_backend"})
+        );
+        assert_eq!(
+            requests[1],
+            serde_json::json!({"op":"runtime_hash_staged_directory","directory":{"root":"/private/fixture","files":[{"path":"capsule.json","size":2},{"path":"_elastos_object.json","size":2},{"path":"weights.gguf","size":4}],"total_bytes":8}})
+        );
+        for response in [
+            serde_json::json!({"status":"ok","data":{"cid":cid,"path":"private"}}),
+            serde_json::json!({"status":"ok","data":{"cid":"x".repeat(4096)}}),
+            serde_json::json!({"status":"error","message":"private backend detail"}),
+        ] {
+            *provider.response.lock().await = Some(response);
+            let err = registry
+                .hash_local_ipfs_directory(
+                    std::path::Path::new("/private/fixture"),
+                    &private_ipfs_files(),
+                    8,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), private_ipfs_unavailable().to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn private_ipfs_invalid_descriptor_has_no_dispatch() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("ipfs", provider.clone())
+            .await
+            .unwrap();
+        for root in ["relative", "/private/../fixture", "/private//fixture"] {
+            assert!(registry
+                .hash_local_ipfs_directory(std::path::Path::new(root), &private_ipfs_files(), 8)
+                .await
+                .is_err());
+        }
+        for files in [
+            vec![],
+            vec![("../weights.gguf".into(), 8)],
+            vec![("capsule.json".into(), 4); 34],
+            vec![("capsule.json".into(), u64::MAX)],
+        ] {
+            assert!(registry
+                .hash_local_ipfs_directory(std::path::Path::new("/private/fixture"), &files, 8)
+                .await
+                .is_err());
+        }
+        assert!(registry
+            .hash_local_ipfs_directory(
+                std::path::Path::new("/private/fixture"),
+                &private_ipfs_files(),
+                9
+            )
+            .await
+            .is_err());
+        assert!(provider.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn private_ipfs_capacity_typed_local_observation_is_strict() {
+        let registry = ProviderRegistry::new();
+        assert!(registry.check_local_ipfs_capacity(10).await.is_err());
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        assert!(registry.check_local_ipfs_capacity(10).await.is_err());
+        assert!(provider.requests.lock().await.is_empty());
+        registry
+            .register_sub_provider("ipfs", provider.clone())
+            .await
+            .unwrap();
+        for requirement in [0, MAX_LOCAL_IPFS_CAPACITY_REQUIRED_BYTES + 1, u64::MAX] {
+            assert!(registry
+                .check_local_ipfs_capacity(requirement)
+                .await
+                .is_err());
+        }
+        assert!(provider.requests.lock().await.is_empty());
+        let observed = registry.check_local_ipfs_capacity(10).await.unwrap();
+        assert_eq!(
+            (
+                observed.volume_id,
+                observed.capacity_bytes,
+                observed.available_bytes,
+                observed.required_bytes
+            ),
+            (7, 1000, 110, 10)
+        );
+        assert_eq!(
+            provider.requests.lock().await.as_slice(),
+            &[serde_json::json!({"op":"runtime_check_capacity","required_bytes":10})]
+        );
+        assert!(registry.check_local_ipfs_capacity(11).await.is_err());
+        let valid = serde_json::json!({"status":"ok","data":{
+            "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
+        }});
+        let mut malformed = vec![
+            serde_json::json!({"status":"ok"}),
+            serde_json::json!({"status":"error","error":{"message":"private-repo-path"}}),
+        ];
+        for (field, value) in [
+            ("volume_id", serde_json::json!(0)),
+            ("volume_id", serde_json::json!("private-repo-path")),
+            ("capacity_bytes", serde_json::json!(0)),
+            ("capacity_bytes", serde_json::json!(1001)),
+            ("available_bytes", serde_json::json!(1001)),
+            ("available_bytes", serde_json::json!(9)),
+            ("required_bytes", serde_json::json!(11)),
+            ("required_bytes", serde_json::json!(u64::MAX)),
+            ("repo_path", serde_json::json!("private-repo-path")),
+        ] {
+            let mut response = valid.clone();
+            response["data"][field] = value;
+            malformed.push(response);
+        }
+        let mut missing = valid.clone();
+        missing["data"].as_object_mut().unwrap().remove("volume_id");
+        malformed.push(missing);
+        let mut extra = valid;
+        extra["private_path"] = serde_json::json!("private-repo-path");
+        malformed.push(extra);
+        for response in malformed {
+            *provider.response.lock().await = Some(response);
+            let error = registry.check_local_ipfs_capacity(10).await.unwrap_err();
+            assert_eq!(error.to_string(), private_ipfs_unavailable().to_string());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    async fn private_ipfs_unsupported_platform_has_no_dispatch() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        registry
+            .register_sub_provider("ipfs", provider.clone())
+            .await
+            .unwrap();
+        assert!(registry.prepare_local_ipfs_backend().await.is_err());
+        assert!(registry.check_local_ipfs_capacity(1).await.is_err());
+        assert!(registry
+            .hash_local_ipfs_directory(
+                std::path::Path::new("/private/fixture"),
+                &private_ipfs_files(),
+                8
+            )
+            .await
+            .is_err());
+        assert!(provider.requests.lock().await.is_empty());
+    }
+
     #[async_trait::async_trait]
     impl ProviderCarrierInvoker for MockCarrierInvoker {
         async fn invoke_carrier_provider(
@@ -2249,6 +3286,341 @@ mod tests {
         );
         assert_eq!(response["_runtime_transfer"]["transfer"], "json");
         assert_eq!(response["_runtime_transfer"]["status"], "completed");
+    }
+
+    fn bounded_read_fixture(transfer: ProviderTransfer) -> (ProviderInvocation, serde_json::Value) {
+        (
+            ProviderInvocation {
+                source: "content-provider".into(),
+                target: "ipfs".into(),
+                op: "cat".into(),
+                request: serde_json::json!({ "op": "cat", "bounded_read": true, "cid": "fixture-cid", "path": "weights.gguf" }),
+                transfer,
+                range: Some(ProviderByteRange {
+                    start: 8,
+                    end: Some(11),
+                }),
+                progress: Some(ProviderProgress {
+                    request_id: "range-fixture".into(),
+                    expected_bytes: Some(4),
+                }),
+                transport: ProviderInvocationTransport::Local,
+            },
+            serde_json::json!({ "status": "ok", "data": {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"89ab"),
+                "_runtime_applied_range": { "schema": "elastos.provider.applied-range/v1",
+                    "cid": "fixture-cid", "path": "weights.gguf", "start": 8, "end": 11 }
+            } }),
+        )
+    }
+
+    #[test]
+    fn bounded_read_consumes_exact_range_once_and_removes_private_receipt() {
+        for transfer in [ProviderTransfer::Bytes, ProviderTransfer::Stream] {
+            let (invocation, mut response) = bounded_read_fixture(transfer);
+            apply_provider_transfer_response(&mut response, &invocation).unwrap();
+            assert_eq!(
+                provider_stream_response_bytes(response["data"].as_object().unwrap()).unwrap(),
+                b"89ab"
+            );
+            assert!(response["data"].get("_runtime_applied_range").is_none());
+        }
+    }
+
+    fn complete_metadata_fixture(
+        transfer: ProviderTransfer,
+    ) -> (ProviderInvocation, serde_json::Value) {
+        let (mut invocation, _) = bounded_read_fixture(transfer);
+        invocation.range = None;
+        invocation.progress = None;
+        invocation.request["path"] = serde_json::json!("_elastos_object.json");
+        invocation.request["max_bytes"] = serde_json::json!(65536);
+        let bytes = b" \n{ \"files\": [] }\t\n";
+        let response = serde_json::json!({"status":"ok","data":{
+            "data":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "_runtime_complete_metadata":{
+                "schema":"elastos.provider.complete-metadata/v1", "cid":"fixture-cid",
+                "path":"_elastos_object.json", "max_bytes":65536,
+                "actual_bytes":bytes.len(), "completed":true
+            }
+        }});
+        (invocation, response)
+    }
+
+    #[test]
+    fn complete_metadata_preserves_bytes_and_rejects_inexact_receipts() {
+        for transfer in [ProviderTransfer::Bytes, ProviderTransfer::Stream] {
+            let (invocation, response) = complete_metadata_fixture(transfer);
+            let mut valid = response.clone();
+            apply_provider_transfer_response(&mut valid, &invocation).unwrap();
+            assert_eq!(
+                provider_stream_response_bytes(valid["data"].as_object().unwrap()).unwrap(),
+                b" \n{ \"files\": [] }\t\n"
+            );
+            assert!(valid["data"].get("_runtime_complete_metadata").is_none());
+            for (pointer, value) in [
+                ("/data/_runtime_complete_metadata", serde_json::Value::Null),
+                (
+                    "/data/_runtime_complete_metadata/schema",
+                    serde_json::json!("other/v1"),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/cid",
+                    serde_json::json!("other-cid"),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/path",
+                    serde_json::json!("other.json"),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/completed",
+                    serde_json::json!(false),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/completed",
+                    serde_json::json!("true"),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/max_bytes",
+                    serde_json::json!(65535),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/actual_bytes",
+                    serde_json::json!(0),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/actual_bytes",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/data/_runtime_complete_metadata/actual_bytes",
+                    serde_json::json!(65537),
+                ),
+                ("/data/data", serde_json::json!("invalid base64")),
+            ] {
+                let mut invalid = response.clone();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    apply_provider_transfer_response(&mut invalid, &invocation).is_err(),
+                    "{pointer}"
+                );
+            }
+            for length in [65536, 65537] {
+                let mut bounded = response.clone();
+                bounded["data"]["data"] = serde_json::json!(
+                    base64::engine::general_purpose::STANDARD.encode(vec![b' '; length])
+                );
+                bounded["data"]["_runtime_complete_metadata"]["actual_bytes"] =
+                    serde_json::json!(length);
+                assert_eq!(
+                    apply_provider_transfer_response(&mut bounded, &invocation).is_ok(),
+                    length == 65536
+                );
+            }
+            let mut extra = response.clone();
+            extra["data"]["_runtime_complete_metadata"]["extra"] = serde_json::json!(true);
+            assert!(apply_provider_transfer_response(&mut extra, &invocation).is_err());
+            let mut mixed = response;
+            mixed["data"]["_runtime_applied_range"] = serde_json::json!({});
+            assert!(apply_provider_transfer_response(&mut mixed, &invocation).is_err());
+        }
+    }
+
+    #[test]
+    fn complete_metadata_requires_unambiguous_local_contract() {
+        let (invocation, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("64"),
+            serde_json::json!(0),
+            serde_json::json!(65537),
+        ] {
+            let mut invalid = invocation.clone();
+            invalid.request["max_bytes"] = value;
+            assert!(bounded_provider_read_range(&invalid).is_err());
+        }
+        let mut invalids = Vec::new();
+        let mut invalid = invocation.clone();
+        invalid.range = Some(ProviderByteRange {
+            start: 0,
+            end: Some(3),
+        });
+        invalids.push(invalid);
+        let mut invalid = invocation.clone();
+        invalid.request["range"] = serde_json::json!({"start":0,"end":3});
+        invalids.push(invalid);
+        let mut invalid = invocation.clone();
+        invalid.progress = Some(ProviderProgress {
+            request_id: "metadata".into(),
+            expected_bytes: Some(4),
+        });
+        invalids.push(invalid);
+        let mut invalid = invocation.clone();
+        invalid.request["path"] = serde_json::json!("weights.gguf");
+        invalids.push(invalid);
+        let mut invalid = invocation.clone();
+        invalid.request["bounded_read"] = serde_json::json!(false);
+        invalids.push(invalid);
+        let mut invalid = invocation;
+        invalid.transfer = ProviderTransfer::Json;
+        invalids.push(invalid);
+        for invalid in invalids {
+            assert!(bounded_provider_read_range(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_provider_max_bytes_retains_provider_owned_semantics() {
+        let (mut invocation, _) = complete_metadata_fixture(ProviderTransfer::Json);
+        invocation.target = "model".into();
+        invocation.op = "describe".into();
+        invocation.request = serde_json::json!({"op":"describe","max_bytes":"provider-specific"});
+        let mut response = serde_json::json!({"status":"ok","data":{"text":"ordinary"}});
+        let expected = response.clone();
+        apply_provider_transfer_response(&mut response, &invocation).unwrap();
+        assert_eq!(response, expected);
+        invocation.request["bounded_read"] = serde_json::json!(true);
+        assert!(apply_provider_transfer_response(&mut response, &invocation).is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_metadata_rejects_carrier_before_dispatch() {
+        let registry = ProviderRegistry::new();
+        let carrier = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(carrier.clone()).await;
+        for (target, op) in [("ipfs", "cat"), ("content", "fetch")] {
+            let (mut invocation, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
+            invocation.target = target.into();
+            invocation.op = op.into();
+            invocation.request["op"] = serde_json::json!(op);
+            invocation.transport =
+                ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                    peer_did: "did:key:zFixture".into(),
+                    timeout_ms: Some(5000),
+                });
+            assert!(registry.invoke_provider(invocation).await.is_err());
+        }
+        assert!(carrier.requests.lock().await.is_empty());
+    }
+
+    #[test]
+    fn bounded_read_rejects_missing_conflicting_or_malformed_receipts_and_payloads() {
+        for transfer in [ProviderTransfer::Bytes, ProviderTransfer::Stream] {
+            let (invocation, response) = bounded_read_fixture(transfer);
+            for (pointer, value) in [
+                ("/data/_runtime_applied_range", serde_json::Value::Null),
+                (
+                    "/data/_runtime_applied_range/schema",
+                    serde_json::json!("unknown"),
+                ),
+                (
+                    "/data/_runtime_applied_range/cid",
+                    serde_json::json!("other-cid"),
+                ),
+                (
+                    "/data/_runtime_applied_range/path",
+                    serde_json::json!("other.gguf"),
+                ),
+                ("/data/_runtime_applied_range/start", serde_json::json!(0)),
+                ("/data/_runtime_applied_range/end", serde_json::json!(12)),
+                ("/data/_runtime_applied_range/start", serde_json::json!("8")),
+                ("/data/data", serde_json::json!("%%%%")),
+                (
+                    "/data/data",
+                    serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"89a")),
+                ),
+                (
+                    "/data/data",
+                    serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b"89abc")),
+                ),
+            ] {
+                let mut invalid = response.clone();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    apply_provider_transfer_response(&mut invalid, &invocation).is_err(),
+                    "accepted {pointer}"
+                );
+            }
+            let mut missing = response.clone();
+            missing["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("_runtime_applied_range");
+            assert!(apply_provider_transfer_response(&mut missing, &invocation).is_err());
+            let mut extra = response.clone();
+            extra["data"]["_runtime_applied_range"]["extra"] = serde_json::json!(true);
+            assert!(apply_provider_transfer_response(&mut extra, &invocation).is_err());
+            let mut conflicting = response.clone();
+            conflicting["data"]["stream"] = provider_stream_payload(b"other payload");
+            assert!(apply_provider_transfer_response(&mut conflicting, &invocation).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_read_requires_strict_mode_and_closed_small_range() {
+        let (invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
+        for range in [
+            None,
+            Some(ProviderByteRange {
+                start: 8,
+                end: None,
+            }),
+            Some(ProviderByteRange {
+                start: 9,
+                end: Some(8),
+            }),
+            Some(ProviderByteRange {
+                start: 0,
+                end: Some(MAX_BOUNDED_PROVIDER_READ_BYTES),
+            }),
+            Some(ProviderByteRange {
+                start: 0,
+                end: Some(u64::MAX),
+            }),
+        ] {
+            let mut invalid = invocation.clone();
+            invalid.range = range;
+            assert!(bounded_provider_read_range(&invalid).is_err());
+        }
+        let mut invalid = invocation.clone();
+        invalid.request["bounded_read"] = serde_json::json!("true");
+        assert!(bounded_provider_read_range(&invalid).is_err());
+        let mut invalid = invocation.clone();
+        invalid.target = "availability".into();
+        assert!(bounded_provider_read_range(&invalid).is_err());
+        let mut invalid = invocation.clone();
+        invalid.transfer = ProviderTransfer::Json;
+        assert!(bounded_provider_read_range(&invalid).is_err());
+        let mut invalid = invocation;
+        invalid.progress.as_mut().unwrap().expected_bytes = Some(5);
+        assert!(bounded_provider_read_range(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_rejects_remote_content_and_outer_range_before_dispatch() {
+        let registry = ProviderRegistry::new();
+        let carrier = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(carrier.clone()).await;
+        let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Stream);
+        invocation.target = "content".into();
+        invocation.op = "fetch".into();
+        invocation.request["op"] = serde_json::json!("fetch");
+        invocation.range = None;
+        assert!(bounded_provider_read_range(&invocation).is_ok());
+        let mut remote = invocation.clone();
+        remote.transport = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did: "did:key:zFixture".into(),
+            timeout_ms: Some(5000),
+        });
+        assert!(matches!(registry.invoke_provider(remote).await,
+            Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
+        invocation.range = Some(ProviderByteRange {
+            start: 8,
+            end: Some(11),
+        });
+        assert!(matches!(registry.invoke_provider(invocation).await,
+            Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
+        assert!(carrier.requests.lock().await.is_empty());
     }
 
     #[tokio::test]

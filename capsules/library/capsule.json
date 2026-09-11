@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "description": "Browse local files, folders, and published content",
   "role": "app",
+  "window_policy": "hybrid",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",

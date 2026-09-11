@@ -1655,6 +1655,7 @@ mod tests {
         let supervisor = Supervisor::new(
             data_dir.to_path_buf(),
             ComponentsManifest {
+                model_catalog: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -1855,6 +1856,7 @@ mod tests {
         Supervisor::new(
             tempfile::tempdir().unwrap().keep(),
             ComponentsManifest {
+                model_catalog: None,
                 external: std::collections::HashMap::new(),
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -1989,6 +1991,7 @@ mod tests {
                     checksum: None,
                     extract_path: None,
                     install_path: Some("bin/vmlinux".to_string()),
+                    binary_path: None,
                     strategy: Some("local-copy".to_string()),
                     source: Some("/boot/Image".to_string()),
                     note: Some("local arm64 kernel".to_string()),
@@ -2001,6 +2004,7 @@ mod tests {
         let supervisor = Supervisor::new(
             data_dir.to_path_buf(),
             ComponentsManifest {
+                model_catalog: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2043,6 +2047,7 @@ mod tests {
                     checksum: Some(checksum),
                     extract_path: None,
                     install_path: Some("bin/vmlinux".to_string()),
+                    binary_path: None,
                     strategy: Some("local-copy".to_string()),
                     source: Some("/boot/Image".to_string()),
                     note: Some("local arm64 kernel".to_string()),
@@ -2055,6 +2060,7 @@ mod tests {
         let supervisor = Supervisor::new(
             data_dir.to_path_buf(),
             ComponentsManifest {
+                model_catalog: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2085,6 +2091,7 @@ mod tests {
                     checksum: None,
                     extract_path: None,
                     install_path: Some("bin/crosvm".to_string()),
+                    binary_path: None,
                     strategy: None,
                     source: None,
                     note: None,
@@ -2097,6 +2104,7 @@ mod tests {
         let supervisor = Supervisor::new(
             data_dir.to_path_buf(),
             ComponentsManifest {
+                model_catalog: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2140,6 +2148,7 @@ mod tests {
         let supervisor = Supervisor::new(
             data_dir.to_path_buf(),
             ComponentsManifest {
+                model_catalog: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -2184,6 +2193,7 @@ mod tests {
         let supervisor = Supervisor::new(
             data_dir.to_path_buf(),
             ComponentsManifest {
+                model_catalog: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),

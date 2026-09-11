@@ -16,6 +16,7 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             rights_methods: Vec::new(),
             protected_content_creator_mint: None,
             protected_content_market: None,
+            plain_http_rpc_hosts: Vec::new(),
         },
         ChainNetwork {
             id: "esc-mainnet".to_string(),
@@ -30,6 +31,7 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             rights_methods: Vec::new(),
             protected_content_creator_mint: None,
             protected_content_market: None,
+            plain_http_rpc_hosts: Vec::new(),
         },
         ChainNetwork {
             id: "base-mainnet".to_string(),
@@ -45,6 +47,7 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             rights_methods: Vec::new(),
             protected_content_creator_mint: None,
             protected_content_market: None,
+            plain_http_rpc_hosts: Vec::new(),
         },
         ChainNetwork {
             id: "btc-mainnet".to_string(),
@@ -60,6 +63,7 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             rights_methods: Vec::new(),
             protected_content_creator_mint: None,
             protected_content_market: None,
+            plain_http_rpc_hosts: Vec::new(),
         },
     ]
 }
@@ -186,11 +190,55 @@ fn validate_protected_content_market(network: &ChainNetwork) -> Result<(), Strin
 }
 
 pub(super) fn validate_rpc_url(network: &ChainNetwork) -> Result<(), String> {
+    validate_plain_http_rpc_hosts(&network.id, &network.plain_http_rpc_hosts)?;
     validate_rpc_url_value(
         &network.id,
         &network.rpc_url,
         network.kind == ChainKind::BitcoinCoreRpc,
+        &network.plain_http_rpc_hosts,
     )
+}
+
+/// The plain-http allowlist names bare hostnames only (no scheme, port,
+/// path or credentials), so an entry can never widen the rule beyond the
+/// exact host it names; loopback needs no entry.
+fn validate_plain_http_rpc_hosts(network_id: &str, hosts: &[String]) -> Result<(), String> {
+    for host in hosts {
+        let valid = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+            && !host.starts_with('.')
+            && !host.ends_with('.')
+            && !host.starts_with('-');
+        if !valid {
+            return Err(format!(
+                "invalid plain_http_rpc_hosts entry for {network_id}: expected a bare hostname"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `url` is plain http against loopback or an explicitly allowlisted
+/// host (exact, case-insensitive hostname match; any port).
+fn is_permitted_plain_http(url: &str, plain_http_rpc_hosts: &[String]) -> bool {
+    if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
+        return true;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    plain_http_rpc_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
 }
 
 fn url_has_userinfo(url: &str) -> bool {
@@ -215,7 +263,7 @@ fn validate_protected_content_policy_sources(
     let mut unique_origins = std::collections::BTreeSet::new();
     for url in &policy.evidence_rpc_urls {
         let (canonical_url, canonical_origin) =
-            canonicalize_protected_content_evidence_rpc_url(&network.id, url)?;
+            canonicalize_protected_content_evidence_rpc_url(network, url)?;
         if !unique_urls.insert(canonical_url) || !unique_origins.insert(canonical_origin) {
             return Err(format!(
                 "network {} action {:?} configures duplicate or shared-origin protected-content evidence RPC URLs",
@@ -227,11 +275,12 @@ fn validate_protected_content_policy_sources(
 }
 
 fn canonicalize_protected_content_evidence_rpc_url(
-    network_id: &str,
+    network: &ChainNetwork,
     url: &str,
 ) -> Result<(String, String), String> {
+    let network_id = &network.id;
     let trimmed = url.trim();
-    validate_rpc_url_value(network_id, trimmed, false)?;
+    validate_rpc_url_value(network_id, trimmed, false, &network.plain_http_rpc_hosts)?;
     let parsed =
         reqwest::Url::parse(trimmed).map_err(|_| format!("invalid RPC URL for {network_id}"))?;
     Ok((
@@ -244,15 +293,13 @@ fn validate_rpc_url_value(
     network_id: &str,
     url: &str,
     allow_empty_loopback_only: bool,
+    plain_http_rpc_hosts: &[String],
 ) -> Result<(), String> {
     if url_has_userinfo(url) {
         return Err(format!("invalid RPC URL for {}", network_id));
     }
     if allow_empty_loopback_only {
-        if url.is_empty()
-            || url.starts_with("http://127.0.0.1:")
-            || url.starts_with("http://localhost:")
-        {
+        if url.is_empty() || is_permitted_plain_http(url, plain_http_rpc_hosts) {
             return Ok(());
         }
         return Err(format!(
@@ -261,11 +308,63 @@ fn validate_rpc_url_value(
         ));
     }
     if url.is_empty()
-        || !(url.starts_with("https://")
-            || url.starts_with("http://127.0.0.1:")
-            || url.starts_with("http://localhost:"))
+        || !(url.starts_with("https://") || is_permitted_plain_http(url, plain_http_rpc_hosts))
     {
         return Err(format!("invalid RPC URL for {}", network_id));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod plain_http_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn plain_http_is_loopback_only_unless_the_host_is_allowlisted() {
+        let none: Vec<String> = Vec::new();
+        assert!(validate_rpc_url_value("n", "http://127.0.0.1:8545", false, &none).is_ok());
+        assert!(validate_rpc_url_value("n", "http://localhost:8545", false, &none).is_ok());
+        assert!(validate_rpc_url_value("n", "https://rpc.example", false, &none).is_ok());
+        assert!(
+            validate_rpc_url_value("n", "http://host.docker.internal:8545", false, &none).is_err()
+        );
+        let allowed = vec!["host.docker.internal".to_string()];
+        assert!(
+            validate_rpc_url_value("n", "http://host.docker.internal:8545", false, &allowed)
+                .is_ok()
+        );
+        assert!(
+            validate_rpc_url_value("n", "http://HOST.docker.internal:8547/", false, &allowed)
+                .is_ok()
+        );
+        assert!(
+            validate_rpc_url_value("n", "http://other.internal:8545", false, &allowed).is_err()
+        );
+        assert!(validate_rpc_url_value(
+            "n",
+            "http://user@host.docker.internal:8545",
+            false,
+            &allowed
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn plain_http_allowlist_entries_must_be_bare_hostnames() {
+        assert!(validate_plain_http_rpc_hosts("n", &["host.docker.internal".to_string()]).is_ok());
+        for bad in [
+            "",
+            "http://host",
+            "host:8545",
+            "host/path",
+            ".host",
+            "-host",
+            "host.",
+        ] {
+            assert!(
+                validate_plain_http_rpc_hosts("n", &[bad.to_string()]).is_err(),
+                "{bad}"
+            );
+        }
+    }
 }

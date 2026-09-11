@@ -930,6 +930,16 @@ code {
   margin-top: 10px;
 }
 
+[data-field="recovery-status"] {
+  flex-shrink: 0;
+  max-width: 40%;
+}
+
+[data-field="recovery-note"]:not([hidden]),
+#recovery-profile-setup:not([hidden]) {
+  margin-top: 10px;
+}
+
 .recovery-pending {
   display: flex;
   align-items: center;
@@ -1170,7 +1180,9 @@ code {
 
 .technical-toolbar {
   justify-content: space-between;
+  align-items: center;
   min-height: 44px;
+  padding: 10px 0;
 }
 
 .technical-toolbar .system-status {

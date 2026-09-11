@@ -4989,3 +4989,259 @@ fn init_rejects_rights_methods_on_non_evm_networks() {
 
     assert_eq!(error_code(response), "invalid_config");
 }
+
+fn runtime_invocation_envelope_json(op: &str) -> Value {
+    json!({
+        "schema": "elastos.provider.invocation/v1",
+        "source": "runtime",
+        "target": "chain",
+        "op": op,
+        "capability": format!("provider:runtime->chain:{op}"),
+        "transport": "runtime-local-provider-plane",
+        "carrier": null,
+        "transfer": "json",
+        "range": null,
+        "progress": null,
+        "abi": {
+            "schema": "elastos.provider.transfer-abi/v1",
+            "transfer": "json",
+            "transport": "runtime-local-provider-plane",
+            "range_supported": false,
+            "progress_supported": false,
+            "progress_mode": "none",
+            "transport_native_stream": false,
+            "backpressure": "not_applicable",
+            "cancel_supported": false
+        }
+    })
+}
+
+fn frame_error_code(result: Result<Request, Response>) -> String {
+    match result {
+        Ok(request) => panic!("frame unexpectedly decoded: {request:?}"),
+        Err(response) => error_code(response),
+    }
+}
+
+#[test]
+fn request_frame_accepts_and_strips_the_runtime_invocation_envelope() {
+    // The Runtime provider plane attaches `_runtime_invocation` to every
+    // forwarded request; the typed request enum rejects unknown fields, so
+    // the frame decoder must validate and remove it first.
+    let mut frame = json!({
+        "op": "resolve_protected_content_policy",
+        "encrypted_content": format!("0x{}", "ab".repeat(32)),
+        "content_access_id": format!("0x{}", "cd".repeat(16)),
+        "action": "view"
+    });
+    frame["_runtime_invocation"] =
+        runtime_invocation_envelope_json("resolve_protected_content_policy");
+    let request = decode_request_frame(&frame.to_string()).unwrap();
+    assert!(matches!(
+        request,
+        Request::ResolveProtectedContentPolicy {
+            action: ProtectedContentPolicyAction::View,
+            ..
+        }
+    ));
+
+    // Frames without an envelope (tests, tooling) keep decoding as before.
+    assert!(matches!(
+        decode_request_frame(r#"{"op":"networks"}"#).unwrap(),
+        Request::Networks
+    ));
+}
+
+#[test]
+fn request_frame_rejects_mismatched_or_malformed_runtime_invocation_envelopes() {
+    let base = json!({"op": "networks"});
+
+    let mut wrong_target = base.clone();
+    wrong_target["_runtime_invocation"] = runtime_invocation_envelope_json("networks");
+    wrong_target["_runtime_invocation"]["target"] = json!("wallet");
+    let mut wrong_op = base.clone();
+    wrong_op["_runtime_invocation"] = runtime_invocation_envelope_json("status");
+    let mut carrier_hop = base.clone();
+    carrier_hop["_runtime_invocation"] = runtime_invocation_envelope_json("networks");
+    carrier_hop["_runtime_invocation"]["transport"] = json!("carrier-provider-plane");
+    carrier_hop["_runtime_invocation"]["carrier"] = json!({"peer_did": "did:example:peer"});
+    let mut wrong_abi = base.clone();
+    wrong_abi["_runtime_invocation"] = runtime_invocation_envelope_json("networks");
+    wrong_abi["_runtime_invocation"]["abi"]["range_supported"] = json!(true);
+    let mut missing_abi = base.clone();
+    missing_abi["_runtime_invocation"] = runtime_invocation_envelope_json("networks");
+    missing_abi["_runtime_invocation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("abi");
+    let mut extra_field = base.clone();
+    extra_field["_runtime_invocation"] = runtime_invocation_envelope_json("networks");
+    extra_field["_runtime_invocation"]["stream"] = json!({});
+    let mut predeclared_transfer = base.clone();
+    predeclared_transfer["_runtime_transfer"] = json!({});
+
+    for frame in [
+        wrong_target,
+        wrong_op,
+        carrier_hop,
+        wrong_abi,
+        missing_abi,
+        extra_field,
+        predeclared_transfer,
+    ] {
+        assert_eq!(
+            frame_error_code(decode_request_frame(&frame.to_string())),
+            "invalid_runtime_invocation",
+            "frame: {frame}"
+        );
+    }
+
+    assert_eq!(
+        frame_error_code(decode_request_frame(
+            r#"{"op":"status","network":"base-mainnet","bogus":1}"#
+        )),
+        "invalid_request"
+    );
+    assert_eq!(
+        frame_error_code(decode_request_frame(r#"[1,2,3]"#)),
+        "invalid_request"
+    );
+    assert_eq!(
+        frame_error_code(decode_request_frame("not json")),
+        "invalid_request"
+    );
+}
+
+#[test]
+fn describe_protected_content_market_source_reports_the_configured_gateway() {
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        ],
+    );
+    let network = provider
+        .networks
+        .iter()
+        .find(|network| network.protected_content_market.is_some())
+        .expect("a network with a market source");
+    let expected = normalize_evm_address(
+        &network
+            .protected_content_market
+            .as_ref()
+            .unwrap()
+            .authority_gateway_contract,
+    );
+    let data = ok_data(
+        provider.handle(Request::DescribeProtectedContentMarketSource {
+            network: network.id.clone(),
+        }),
+    );
+    assert_eq!(data["schema"], PROTECTED_CONTENT_MARKET_SOURCE_SCHEMA);
+    assert_eq!(data["authority_gateway_contract"], expected);
+    assert_eq!(data["evidence_rpc_sources"], 2);
+    assert_eq!(
+        error_code(
+            provider.handle(Request::DescribeProtectedContentMarketSource {
+                network: "no-such-network".to_string(),
+            })
+        ),
+        "protected_content_market_not_configured"
+    );
+}
+
+#[test]
+fn protected_content_rights_evidence_pins_lagging_sources_to_the_lowest_finalized_block() {
+    // Independent evidence sources legitimately disagree on the finalized
+    // head by a block (a provider lagging, or a local fork's ticker between
+    // two calls). The provider pins every source to the lowest finalized
+    // block, confirms it is canonical there by hash, and re-evaluates the
+    // rights call at exactly that block; agreement there is corroboration.
+    let operation = protected_content_signed_operation();
+    let policy = operation.statement().policy_body();
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        policy.content_access_id().as_bytes(),
+        &wallet_subject_hex(&operation),
+    )
+    .unwrap();
+    let older_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let newer_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let call = |hash: &str| {
+        json!([
+            { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    // Source A already finalized block 0x2b; after pinning it must confirm
+    // 0x2a is canonical under the older hash and answer the call there.
+    let ahead_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2b", newer_hash)),
+        ),
+        (
+            "eth_call",
+            call(newer_hash),
+            RpcReply::Result(evm_bool_word(true)),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            RpcReply::Result(finalized_block_json("0x2a", older_hash)),
+        ),
+        (
+            "eth_call",
+            call(older_hash),
+            RpcReply::Result(evm_bool_word(true)),
+        ),
+    ];
+    // Source B still finalizes 0x2a; pinned to its own head, it re-confirms
+    // the block and re-answers the call there.
+    let behind_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", older_hash)),
+        ),
+        (
+            "eth_call",
+            call(older_hash),
+            RpcReply::Result(evm_bool_word(true)),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            RpcReply::Result(finalized_block_json("0x2a", older_hash)),
+        ),
+        (
+            "eth_call",
+            call(older_hash),
+            RpcReply::Result(evm_bool_word(true)),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(ahead_sequence),
+                spawn_rpc_sequence_asserting_server_with_replies(behind_sequence),
+            ],
+        ),
+    );
+    match provider.handle(Request::ProtectedContentRightsEvidence {
+        signed_runtime_release_operation: contract_hex(&operation),
+    }) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["finalized_block_number"], json!(0x2a));
+            assert_eq!(data["finalized_block_hash"], json!(older_hash));
+        }
+        other => panic!("expected pinned corroboration to succeed, got {other:?}"),
+    }
+}

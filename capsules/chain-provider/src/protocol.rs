@@ -11,6 +11,8 @@ pub(super) const PROTECTED_CONTENT_CREATOR_MINT_SCHEMA: &str =
     "elastos.chain.protected-content-creator-mint/v1";
 pub(super) const PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA: &str =
     "elastos.chain.protected-content-creator-mint-source/v1";
+pub(super) const PROTECTED_CONTENT_MARKET_SOURCE_SCHEMA: &str =
+    "elastos.chain.protected-content-market-source/v1";
 pub(super) const PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA: &str =
     "elastos.chain.protected-content-mint-receipt/v1";
 pub(super) const PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA: &str =
@@ -49,6 +51,13 @@ pub(super) struct ChainNetwork {
     pub(super) protected_content_creator_mint: Option<ProtectedContentCreatorMintMethod>,
     #[serde(default)]
     pub(super) protected_content_market: Option<ProtectedContentMarketMethod>,
+    /// Hostnames this network may reach over plain `http://` in addition to
+    /// loopback. Empty (the default) keeps the https-or-loopback rule; an
+    /// operator names a host here explicitly when a trusted, non-TLS RPC
+    /// lives on another machine of the same private deployment (e.g. a
+    /// container reaching its host's local fork through the host gateway).
+    #[serde(default)]
+    pub(super) plain_http_rpc_hosts: Vec<String>,
 }
 
 impl ChainNetwork {
@@ -250,6 +259,9 @@ pub(super) enum Request {
         action: ProtectedContentPolicyAction,
     },
     DescribeProtectedContentCreatorMintSource,
+    DescribeProtectedContentMarketSource {
+        network: String,
+    },
     ResolveProtectedContentCreatorMint {
         creator: String,
         token_uri: String,
@@ -396,6 +408,142 @@ pub(super) enum Response {
         code: String,
         message: String,
     },
+}
+
+const RUNTIME_INVOCATION_FIELD: &str = "_runtime_invocation";
+const RUNTIME_TRANSFER_FIELD: &str = "_runtime_transfer";
+const RUNTIME_INVOCATION_SCHEMA: &str = "elastos.provider.invocation/v1";
+const RUNTIME_TRANSFER_ABI_SCHEMA: &str = "elastos.provider.transfer-abi/v1";
+const RUNTIME_LOCAL_TRANSPORT: &str = "runtime-local-provider-plane";
+const CHAIN_PROVIDER_TARGET: &str = "chain";
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// The invocation envelope the Runtime provider plane attaches to every
+/// request it forwards (see `attach_provider_invocation_envelope` in the
+/// Runtime registry). The chain provider serves both the Runtime itself and
+/// Home capsules, so `source` is not pinned; everything that describes *this*
+/// hop — target, op, local JSON transport and its transfer ABI — is.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RuntimeInvocationEnvelope {
+    schema: String,
+    #[allow(dead_code)]
+    source: String,
+    target: String,
+    op: String,
+    #[allow(dead_code)]
+    capability: String,
+    transport: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    carrier: Option<Value>,
+    transfer: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    range: Option<Value>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    progress: Option<Value>,
+    abi: RuntimeInvocationAbi,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeInvocationAbi {
+    schema: String,
+    transfer: String,
+    transport: String,
+    range_supported: bool,
+    progress_supported: bool,
+    progress_mode: String,
+    transport_native_stream: bool,
+    backpressure: String,
+    cancel_supported: bool,
+}
+
+impl RuntimeInvocationEnvelope {
+    fn validate_for_op(&self, op: &str) -> Result<(), String> {
+        let exact = [
+            ("schema", self.schema.as_str(), RUNTIME_INVOCATION_SCHEMA),
+            ("target", self.target.as_str(), CHAIN_PROVIDER_TARGET),
+            ("op", self.op.as_str(), op),
+            (
+                "transport",
+                self.transport.as_str(),
+                RUNTIME_LOCAL_TRANSPORT,
+            ),
+            ("transfer", self.transfer.as_str(), "json"),
+        ];
+        for (field, actual, expected) in exact {
+            if actual != expected {
+                return Err(format!(
+                    "chain provider invocation requires {field}={expected}, received {actual}"
+                ));
+            }
+        }
+        if self.carrier.is_some() || self.range.is_some() || self.progress.is_some() {
+            return Err(
+                "chain provider invocation forbids Carrier, range, and progress metadata"
+                    .to_string(),
+            );
+        }
+        let abi = &self.abi;
+        if abi.schema != RUNTIME_TRANSFER_ABI_SCHEMA
+            || abi.transfer != "json"
+            || abi.transport != RUNTIME_LOCAL_TRANSPORT
+            || abi.range_supported
+            || abi.progress_supported
+            || abi.progress_mode != "none"
+            || abi.transport_native_stream
+            || abi.backpressure != "not_applicable"
+            || abi.cancel_supported
+        {
+            return Err(
+                "chain provider invocation requires the exact Runtime-local JSON ABI".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Decodes one stdio request frame. A `_runtime_invocation` envelope, when
+/// present, is validated against this hop and removed before the typed
+/// request is decoded (the request enum rejects unknown fields, so it cannot
+/// pass through). A frame that predeclares `_runtime_transfer` is refused:
+/// that field is reserved for the Runtime's response side.
+pub(super) fn decode_request_frame(line: &str) -> Result<Request, Response> {
+    let mut value = serde_json::from_str::<Value>(line)
+        .map_err(|err| Response::error("invalid_request", &err.to_string()))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(Response::error(
+            "invalid_request",
+            "chain provider request must be a JSON object",
+        ));
+    };
+    if object.contains_key(RUNTIME_TRANSFER_FIELD) {
+        return Err(Response::error(
+            "invalid_runtime_invocation",
+            "chain provider request must not predeclare _runtime_transfer",
+        ));
+    }
+    if let Some(envelope) = object.remove(RUNTIME_INVOCATION_FIELD) {
+        let op = object
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let envelope = serde_json::from_value::<RuntimeInvocationEnvelope>(envelope)
+            .map_err(|err| Response::error("invalid_runtime_invocation", &err.to_string()))?;
+        envelope
+            .validate_for_op(&op)
+            .map_err(|err| Response::error("invalid_runtime_invocation", &err))?;
+    }
+    serde_json::from_value::<Request>(value)
+        .map_err(|err| Response::error("invalid_request", &err.to_string()))
 }
 
 impl Response {

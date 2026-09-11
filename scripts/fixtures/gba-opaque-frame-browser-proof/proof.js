@@ -17,6 +17,27 @@ async function saveStatus() {
   return response.json();
 }
 
+async function proveSavePreconditions() {
+  const url = "/api/viewers/gba-emulator/storage/gba-ucity/save/conditional-proof.sav";
+  const token = new URLSearchParams(location.hash.slice(1)).get("home_token");
+  const headers = { "x-elastos-home-token": token };
+  const put = (condition, body) => fetch(url, { method: "PUT", headers: { ...headers, ...condition }, body });
+  if ((await put({}, "rejected")).status !== 428) throw new Error("missing precondition accepted");
+  if ((await put({ "If-Match": "malformed" }, "rejected")).status !== 400) throw new Error("malformed precondition accepted");
+  const created = await put({ "If-None-Match": "*" }, "first");
+  const firstRevision = created.headers.get("etag");
+  if (created.status !== 204 || !/^"[0-9a-f]{64}"$/.test(firstRevision || "")) throw new Error("opaque frame cannot read PUT revision");
+  const read = await fetch(url, { headers });
+  if (read.headers.get("etag") !== firstRevision || await read.text() !== "first") throw new Error("opaque frame cannot read GET revision");
+  if ((await put({ "If-None-Match": "*" }, "rejected")).status !== 412) throw new Error("create collision accepted");
+  const winner = await put({ "If-Match": firstRevision }, "winner");
+  if (winner.status !== 204) throw new Error("conditional save rejected");
+  if ((await put({ "If-Match": firstRevision }, "loser")).status !== 412) throw new Error("stale save replaced winner");
+  const final = await fetch(url, { headers });
+  if (await final.text() !== "winner" || final.headers.get("etag") !== winner.headers.get("etag")) throw new Error("winner not preserved");
+  return true;
+}
+
 async function postResult(result) {
   await fetch("/proof", {
     method: "POST",
@@ -236,6 +257,7 @@ async function run() {
       "audioRendered",
       "stateSaved",
       "stateLoaded",
+      "conditionalSave",
     ].every((name) => initial[name] === true);
     const stateLoadedAfterReload = document.querySelector("#status")?.textContent === "State 1 loaded";
     const renderActivityAfterReload = await proveRenderContinuity({ requirePixelChange: false });
@@ -354,6 +376,7 @@ async function run() {
     });
     return;
   }
+  const conditionalSave = await proveSavePreconditions();
   window.name = JSON.stringify({
     schema: "elastos.gba.opaque-frame-proof/v2",
     phase: "reload",
@@ -374,6 +397,7 @@ async function run() {
       audioOutput,
       stateSaved,
       stateLoaded,
+      conditionalSave,
     },
   });
   location.reload();

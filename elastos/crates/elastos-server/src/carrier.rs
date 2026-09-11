@@ -45,7 +45,7 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use elastos_common::localhost::{
     publisher_artifacts_path, publisher_install_script_path, publisher_publish_state_path,
@@ -61,7 +61,9 @@ use elastos_runtime::provider::{
 };
 
 use crate::content::{ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH};
-use crate::operator_control::{OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN};
+use crate::operator_control::{
+    load_operator_control, OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN,
+};
 use crate::sources::TrustedSource;
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
@@ -478,6 +480,54 @@ fn add_ticket_endpoints(
     added
 }
 
+/// Loads every ticket from the operator peer store (written by `elastos
+/// node peer add --did ... --ticket ...`) into the endpoint's
+/// `MemoryLookup`, so a later `connect_resolved_peer` by peer DID can
+/// resolve an address without waiting on gossip/mDNS/DHT discovery.
+///
+/// Never aborts Carrier startup: an absent or empty store is normal, and a
+/// malformed ticket is skipped with a warning rather than failing the
+/// whole seeding pass.
+fn seed_address_book_from_operator_peer_store(
+    memory_lookup: &MemoryLookup,
+    data_dir: &std::path::Path,
+) {
+    let config = match load_operator_control(data_dir) {
+        Ok(config) => config,
+        Err(err) => {
+            debug!(
+                "carrier: no operator peer store to seed address book from: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    let mut bootstrap_peers = Vec::new();
+    for peer in &config.peers {
+        let peer_did = peer.did.as_str();
+        let ticket = peer.connect_ticket.trim();
+        if ticket.is_empty() {
+            continue;
+        }
+
+        let endpoints = decode_ticket_endpoints(ticket);
+        if endpoints.is_empty() {
+            warn!(
+                peer_did,
+                "carrier: operator peer store has a malformed connect ticket, skipping"
+            );
+            continue;
+        }
+
+        add_ticket_endpoints(memory_lookup, &mut bootstrap_peers, &endpoints, false);
+        debug!(
+            peer_did,
+            "seeded Carrier address book from operator peer store"
+        );
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GossipJoinExactRequest {
@@ -840,11 +890,32 @@ enum CarrierNodeNetwork {
     Isolated,
 }
 
+/// The well-known Carrier bind address used when an operator names none.
+pub const DEFAULT_CARRIER_BIND_ADDR: &str = "0.0.0.0:4433";
+
 pub async fn start_carrier_node_with_registry(
     signing_key: &ed25519_dalek::SigningKey,
     did: &str,
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
+) -> Result<CarrierNode> {
+    start_carrier_node_with_registry_bound(signing_key, did, data_dir, provider_registry, None)
+        .await
+}
+
+/// Start a Carrier node on an operator-chosen bind address.
+///
+/// `bind_addr` of `None` keeps the well-known [`DEFAULT_CARRIER_BIND_ADDR`]
+/// attempt. When supplied, the explicit address must bind successfully.
+/// Every caller shares this path, so the operator peer-store address
+/// book seeding and provider-invoke dispatch are identical for a runtime host
+/// and a standalone provider host.
+pub async fn start_carrier_node_with_registry_bound(
+    signing_key: &ed25519_dalek::SigningKey,
+    did: &str,
+    data_dir: PathBuf,
+    provider_registry: Option<Weak<ProviderRegistry>>,
+    bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<CarrierNode> {
     start_carrier_node_with_network(
         signing_key,
@@ -852,6 +923,7 @@ pub async fn start_carrier_node_with_registry(
         data_dir,
         provider_registry,
         CarrierNodeNetwork::Public,
+        bind_addr,
     )
     .await
 }
@@ -869,6 +941,7 @@ async fn start_isolated_carrier_node_with_registry(
         data_dir,
         provider_registry,
         CarrierNodeNetwork::Isolated,
+        None,
     )
     .await
 }
@@ -879,6 +952,7 @@ async fn start_carrier_node_with_network(
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
     network: CarrierNodeNetwork,
+    bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<CarrierNode> {
     let expected_did = crate::crypto::encode_signing_key_did(signing_key);
     let decoded_did =
@@ -903,18 +977,32 @@ async fn start_carrier_node_with_network(
                     info!("carrier: using custom relay {}", relay_url);
                 }
             }
+            let requested_bind_addr = match bind_addr {
+                Some(addr) => addr,
+                None => DEFAULT_CARRIER_BIND_ADDR
+                    .parse::<std::net::SocketAddr>()
+                    .context("default Carrier bind address must parse")?,
+            };
             match builder
-                .bind_addr("0.0.0.0:4433".parse::<std::net::SocketAddr>().unwrap())
+                .bind_addr(requested_bind_addr)
                 .map_err(|e| anyhow::anyhow!("{}", e))
             {
                 Ok(builder) => match builder.bind().await {
                     Ok(ep) => ep,
+                    Err(error) if bind_addr.is_some() => {
+                        anyhow::bail!("Failed to bind requested Carrier address {requested_bind_addr}: {error}");
+                    }
                     Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
                         .secret_key(secret_key)
                         .bind()
                         .await
                         .context("Failed to bind Carrier endpoint")?,
                 },
+                Err(error) if bind_addr.is_some() => {
+                    anyhow::bail!(
+                        "Invalid requested Carrier address {requested_bind_addr}: {error}"
+                    );
+                }
                 Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
                     .bind()
@@ -951,6 +1039,12 @@ async fn start_carrier_node_with_network(
         .address_lookup()
         .context("Carrier endpoint closed before address lookup setup")?
         .add(memory_lookup.clone());
+
+    // Seed the address book from tickets stored by `elastos node peer add`
+    // so a peer-DID custody dial can resolve without a live discovery
+    // round trip. Shared by every caller of this startup path (serve,
+    // gateway, and future custody-node roles).
+    seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir);
 
     let gossip = spawn_carrier_gossip(&endpoint);
 
@@ -2912,7 +3006,7 @@ impl CarrierAvailabilityProvider {
         let reputation_snapshot = self.peer_reputation.lock().await.clone();
         let remote_candidate_limit =
             carrier_remote_candidate_limit(requirements, replicas, desired_replicas);
-        let remote_candidate_pool = content_availability_replicas_with_reputation(
+        let mut remote_candidate_pool = content_availability_replicas_with_reputation(
             &existing_messages,
             cid,
             &reputation_snapshot,
@@ -2920,11 +3014,35 @@ impl CarrierAvailabilityProvider {
         .into_iter()
         .filter(|replica| replica.node_did != node_did)
         .collect::<Vec<_>>();
+        // A freshly published CID has no announcements yet, so peers that
+        // only announce what they already hold can never be its first
+        // replicas. The operator's registered peers (`elastos node peer
+        // add`) are the replica targets this node was told to use; offer
+        // them behind any announced holder of the CID.
+        if let Some(data_dir) = self.data_dir.as_deref() {
+            append_operator_peer_store_replica_candidates(
+                &mut remote_candidate_pool,
+                data_dir,
+                &node_did,
+                &reputation_snapshot,
+                announced_at,
+            );
+        }
         let remote_candidate_count = remote_candidate_pool.len();
-        let remote_candidate_limit_applied = remote_candidate_count > remote_candidate_limit;
+        // `remote_candidate_limit` is how many remote placements this ensure
+        // seeks (the replica shortfall); the abuse guard is the number of
+        // candidates it may DIAL. A failed candidate must not consume a
+        // placement slot: with a dead announced holder ranked ahead of a
+        // never-attempted operator peer, taking exactly `limit` candidates
+        // left the peer unreachable on every pass and a single node loss
+        // could never be repaired (observed live, 2026-09-06). Walk the
+        // ordered pool until the placements are proven, dialling at most
+        // MAX_CARRIER_REPLICATION_CANDIDATES peers.
+        let remote_candidate_limit_applied =
+            remote_candidate_count > MAX_CARRIER_REPLICATION_CANDIDATES;
         let remote_candidates = remote_candidate_pool
             .into_iter()
-            .take(remote_candidate_limit)
+            .take(MAX_CARRIER_REPLICATION_CANDIDATES)
             .collect::<Vec<_>>();
         let fetch_descriptor = if replicas > 0 {
             Some(serde_json::json!({
@@ -3042,6 +3160,9 @@ impl CarrierAvailabilityProvider {
             {
                 Some(registry) => {
                     for candidate in remote_candidates {
+                        if remote_proofs.len() >= remote_candidate_limit {
+                            break;
+                        }
                         attempted_remote_invocations =
                             attempted_remote_invocations.saturating_add(1);
                         match ensure_content_via_carrier_provider_invocation(
@@ -3127,7 +3248,12 @@ impl CarrierAvailabilityProvider {
                 replication_errors.len() as u32,
                 remote_candidate_limit_applied,
             ),
-            "checked_at": announced_at,
+            // The observation is as fresh as its LAST proof, not its first
+            // dial: walking dead candidates (connect timeouts) can take
+            // longer than a consumer's freshness window, and a receipt
+            // stamped at the start would arrive already stale (observed
+            // live after a single node loss, 2026-09-06).
+            "checked_at": now_secs(),
         });
         if status == "repair_needed" {
             availability["reason"] = serde_json::Value::String(carrier_repair_reason(
@@ -5149,13 +5275,73 @@ fn content_availability_replicas_with_reputation(
             reputation_reason,
         });
     }
+    sort_replica_candidates(&mut replicas);
+    replicas
+}
+
+fn sort_replica_candidates(replicas: &mut [CarrierAvailabilityReplica]) {
     replicas.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
             .then_with(|| b.announced_at.cmp(&a.announced_at))
             .then_with(|| a.node_did.cmp(&b.node_did))
     });
-    replicas
+}
+
+/// Operator-registered peers as replication candidates. They rank below a
+/// signed announcement of the same CID (base score 40 vs 50) so an actual
+/// holder is always preferred, carry the local reputation adjustment like
+/// every other candidate, and are skipped when the DID is this node or is
+/// already in the pool. Ticket validity is not judged here: an unreachable
+/// peer fails its invocation, which is recorded as a replication error and
+/// a reputation failure, exactly like a stale announcement would.
+fn append_operator_peer_store_replica_candidates(
+    pool: &mut Vec<CarrierAvailabilityReplica>,
+    data_dir: &std::path::Path,
+    self_did: &str,
+    reputation: &HashMap<String, CarrierPeerReputation>,
+    now: u64,
+) {
+    let config = match load_operator_control(data_dir) {
+        Ok(config) => config,
+        Err(err) => {
+            debug!("carrier: no operator peer store for replica candidates: {err}");
+            return;
+        }
+    };
+    for peer in &config.peers {
+        let connect_ticket = peer.connect_ticket.trim();
+        if connect_ticket.is_empty()
+            || peer.did == self_did
+            || pool.iter().any(|replica| replica.node_did == peer.did)
+        {
+            continue;
+        }
+        let (reputation_score, reputation_reason) =
+            carrier_reputation_score(reputation.get(&peer.did));
+        let mut score = 40_u32;
+        let mut reasons = vec!["operator_peer_store"];
+        if reputation_score > 0 {
+            score = score.saturating_add(reputation_score as u32);
+            reasons.push("local_reputation_positive");
+        } else if reputation_score < 0 {
+            score = score.saturating_sub(reputation_score.unsigned_abs());
+            reasons.push("local_reputation_negative");
+        } else {
+            reasons.push("local_reputation_neutral");
+        }
+        pool.push(CarrierAvailabilityReplica {
+            node_did: peer.did.clone(),
+            endpoint_id: None,
+            connect_ticket: connect_ticket.to_string(),
+            announced_at: now,
+            score: score.min(100),
+            selection_reason: reasons.join("+"),
+            reputation_score,
+            reputation_reason,
+        });
+    }
+    sort_replica_candidates(pool);
 }
 
 fn carrier_replica_candidate_score(
@@ -6514,6 +6700,7 @@ fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) 
 pub struct CarrierClient {
     conn: iroh::endpoint::Connection,
     _endpoint: Endpoint,
+    owns_endpoint: bool,
 }
 
 fn carrier_provider_invoke_message(
@@ -6587,6 +6774,7 @@ impl CarrierClient {
         Ok(Self {
             conn,
             _endpoint: endpoint.clone(),
+            owns_endpoint: false,
         })
     }
 
@@ -6603,18 +6791,31 @@ impl CarrierClient {
             .await
             .context("Failed to bind")?;
 
-        let conn = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            endpoint.connect(addr, CARRIER_ALPN),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("connect timed out"))?
-        .context("connect failed")?;
+        Self::connect_owned_endpoint(endpoint, addr, timeout_secs).await
+    }
 
-        Ok(Self {
-            conn,
-            _endpoint: endpoint,
-        })
+    async fn connect_owned_endpoint(
+        endpoint: Endpoint,
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        match Self::connect_known_endpoint(&endpoint, addr, timeout_secs).await {
+            Ok(mut client) => {
+                client.owns_endpoint = true;
+                Ok(client)
+            }
+            Err(err) => {
+                endpoint.close().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Finish a short-lived client without closing a Runtime-owned endpoint.
+    async fn close(self) {
+        if self.owns_endpoint {
+            self._endpoint.close().await;
+        }
     }
 
     pub async fn connect(
@@ -6856,13 +7057,16 @@ async fn read_carrier_len_prefixed_bytes(
 }
 
 async fn fetch_file_with_timeout(
-    client: &CarrierClient,
+    client: CarrierClient,
     path: &str,
     timeout_secs: u64,
 ) -> Result<Vec<u8>> {
-    tokio::time::timeout(Duration::from_secs(timeout_secs), client.fetch_file(path))
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), client.fetch_file(path))
         .await
-        .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))?
+        .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))
+        .and_then(|result| result);
+    client.close().await;
+    result
 }
 
 pub async fn fetch_file_from_trusted_source(
@@ -6876,7 +7080,7 @@ pub async fn fetch_file_from_trusted_source(
     let ticket_endpoints = decode_ticket_endpoints(&source.connect_ticket);
     for (index, endpoint) in ticket_endpoints.into_iter().enumerate() {
         match CarrierClient::connect_endpoint_addr(endpoint, connect_timeout_secs).await {
-            Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
             },
@@ -6887,7 +7091,7 @@ pub async fn fetch_file_from_trusted_source(
     let relay_endpoints = relay_only_ticket_endpoints(source);
     for (index, endpoint) in relay_endpoints.into_iter().enumerate() {
         match CarrierClient::connect_endpoint_addr(endpoint, connect_timeout_secs).await {
-            Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
             },
@@ -6899,7 +7103,7 @@ pub async fn fetch_file_from_trusted_source(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect(&node_id, &addrs, connect_timeout_secs).await {
-        Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
+        Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
                 errors.push(format!("direct fetch failed: {err}"));
@@ -6927,7 +7131,9 @@ pub async fn try_p2p_discovery(
     let client = CarrierClient::connect(publisher_node_id, publisher_addrs, timeout_secs)
         .await
         .ok()?;
-    let release = client.release_head().await.ok()??;
+    let release = client.release_head().await;
+    client.close().await;
+    let release = release.ok()??;
     release["head_cid"].as_str().map(|s| s.to_string())
 }
 
@@ -7509,6 +7715,8 @@ mod tests {
     struct MockCarrierProviderPlaneInvoker {
         requests: Mutex<Vec<serde_json::Value>>,
         fail_ensure: bool,
+        /// Connect tickets whose `ensure` always fails (a dead peer).
+        fail_tickets: Vec<String>,
         reject_admission: bool,
         omit_admission_receipt: bool,
     }
@@ -7621,7 +7829,9 @@ mod tests {
                     .iter()
                     .filter(|request| request["op"] == "ensure")
                     .count();
-                if self.fail_ensure && ensure_attempts == 1 {
+                if (self.fail_ensure && ensure_attempts == 1)
+                    || self.fail_tickets.iter().any(|dead| dead == ticket)
+                {
                     return Ok(serde_json::json!({
                         "status": "error",
                         "code": "pin_failed",
@@ -8512,6 +8722,162 @@ mod tests {
         ));
     }
 
+    async fn carrier_client_fetch_cleanup_case(reply: &str) {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let observer = endpoint.clone();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let server_endpoint = server.clone();
+        let reply = reply.to_string();
+        let server_reply = reply.clone();
+        let serving = tokio::spawn(async move {
+            let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut reader = BufReader::new(recv);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                "artifact"
+            );
+            match server_reply.as_str() {
+                "success" => {
+                    send.write_all(&7u64.to_be_bytes()).await.unwrap();
+                    send.write_all(b"fixture").await.unwrap();
+                    send.finish().unwrap();
+                }
+                "error" => {
+                    send.write_all(b"{\"ok\":false,\"error\":\"fixture missing\"}\n")
+                        .await
+                        .unwrap();
+                    send.finish().unwrap();
+                }
+                "timeout" => {}
+                _ => unreachable!(),
+            }
+            conn.closed().await
+        });
+        let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
+            .await
+            .unwrap();
+        let result = fetch_file_with_timeout(client, "artifact", 1).await;
+        let closed_before_return = observer.is_closed();
+        observer.close().await;
+        let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        server.close().await;
+        assert!(
+            closed_before_return,
+            "owned fetch endpoint remained open after {reply}"
+        );
+        assert!(matches!(
+            remote_close,
+            iroh::endpoint::ConnectionError::ApplicationClosed(_)
+        ));
+        match reply.as_str() {
+            "success" => assert_eq!(result.unwrap(), b"fixture"),
+            "error" => assert_eq!(
+                result.unwrap_err().to_string(),
+                "trusted source file fetch for artifact failed: fixture missing"
+            ),
+            "timeout" => assert_eq!(
+                result.unwrap_err().to_string(),
+                "file fetch timed out after 1s"
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_client_owned_fetch_success_closes_endpoint() {
+        carrier_client_fetch_cleanup_case("success").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_owned_fetch_error_closes_endpoint() {
+        carrier_client_fetch_cleanup_case("error").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_owned_fetch_timeout_closes_endpoint() {
+        carrier_client_fetch_cleanup_case("timeout").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_client_failed_connect_closes_only_owned_endpoint() {
+        for owned in [true, false] {
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let observer = endpoint.clone();
+            let unavailable = iroh::EndpointAddr::from(SecretKey::from_bytes(&[137; 32]).public());
+            let result = if owned {
+                CarrierClient::connect_owned_endpoint(endpoint, unavailable, 1).await
+            } else {
+                CarrierClient::connect_known_endpoint(&endpoint, unavailable, 1).await
+            };
+            let closed_before_return = observer.is_closed();
+            observer.close().await;
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().to_string(), "connect failed");
+            assert_eq!(closed_before_return, owned);
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_client_connect_timeout_closes_owned_endpoint() {
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let observer = endpoint.clone();
+        let address = iroh::EndpointAddr::from(SecretKey::from_bytes(&[138; 32]).public())
+            .with_addrs([iroh::TransportAddr::Ip(blackhole.local_addr().unwrap())]);
+        let result = CarrierClient::connect_owned_endpoint(endpoint, address, 1).await;
+        let closed_before_return = observer.is_closed();
+        observer.close().await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().to_string(), "connect timed out");
+        assert!(closed_before_return);
+    }
+
+    #[tokio::test]
+    async fn carrier_client_borrowed_close_keeps_endpoint_usable() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        for _ in 0..2 {
+            let accept = async { server.accept().await.unwrap().await.unwrap() };
+            let connect = CarrierClient::connect_known_endpoint(&endpoint, address.clone(), 5);
+            let (connection, client) = tokio::join!(accept, connect);
+            client.unwrap().close().await;
+            assert!(!endpoint.is_closed());
+            // The peer closes this completed connection; the next iteration
+            // proves the caller's endpoint can still open another one.
+            connection.close(0u32.into(), b"fixture complete");
+        }
+        endpoint.close().await;
+        server.close().await;
+    }
+
     struct PeerDidRouteFixture {
         local_registry: Arc<ProviderRegistry>,
         remote_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
@@ -8758,6 +9124,84 @@ mod tests {
 
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn operator_peer_store_tickets_seed_carrier_address_book_at_startup() {
+        // Start B first so its resolved address can be written into A's
+        // operator peer store before A starts.
+        let remote_requests = Arc::new(StdMutex::new(Vec::new()));
+        let remote_registry = Arc::new(ProviderRegistry::new());
+        remote_registry
+            .register_runtime_provider_target(
+                "custody",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: remote_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let (remote_sk, remote_did) = elastos_identity::derive_did(&[97; 32]);
+        let remote_node = start_isolated_carrier_node_with_registry(
+            &remote_sk,
+            &remote_did,
+            remote_dir.path().to_path_buf(),
+            Some(Arc::downgrade(&remote_registry)),
+        )
+        .await
+        .unwrap();
+        let remote_addr = wait_for_direct_endpoint_addr(&remote_node.endpoint).await;
+
+        // Write B's ticket into A's operator peer store the same way
+        // `elastos node peer add --did ... --ticket ...` does.
+        let local_dir = tempfile::tempdir().unwrap();
+        crate::operator_control::upsert_peer(
+            local_dir.path(),
+            crate::operator_control::OperatorPeer {
+                did: remote_did.clone(),
+                label: String::new(),
+                connect_ticket: encode_ticket_for(remote_addr.clone()),
+                allow: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // Start A's Carrier node from that data dir. No manual MemoryLookup
+        // seeding is performed by this test.
+        let local_registry = Arc::new(ProviderRegistry::new());
+        let (local_sk, local_did) = elastos_identity::derive_did(&[98; 32]);
+        let local_node = start_isolated_carrier_node_with_registry(
+            &local_sk,
+            &local_did,
+            local_dir.path().to_path_buf(),
+            Some(Arc::downgrade(&local_registry)),
+        )
+        .await
+        .unwrap();
+        local_registry
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    local_node.endpoint.clone(),
+                    Arc::downgrade(&local_registry),
+                ),
+            ))
+            .await;
+
+        let response = local_registry
+            .invoke_provider(peer_did_custody_invocation(&remote_did))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["op"], "evaluate");
+        let requests = remote_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["_runtime_invocation"]["target"], "custody");
+        drop(requests);
+
+        shutdown_test_carrier_node(remote_node).await;
+        shutdown_test_carrier_node(local_node).await;
     }
 
     #[tokio::test]
@@ -9599,6 +10043,7 @@ mod tests {
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
+            fail_tickets: Vec::new(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -9656,6 +10101,7 @@ mod tests {
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
+            fail_tickets: Vec::new(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -9711,6 +10157,7 @@ mod tests {
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
+            fail_tickets: Vec::new(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -9791,6 +10238,7 @@ mod tests {
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
+            fail_tickets: Vec::new(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -9854,6 +10302,7 @@ mod tests {
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
             fail_ensure: false,
+            fail_tickets: Vec::new(),
             reject_admission: true,
             omit_admission_receipt: false,
         });
@@ -9911,6 +10360,7 @@ mod tests {
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
             fail_ensure: false,
+            fail_tickets: Vec::new(),
             reject_admission: false,
             omit_admission_receipt: true,
         });
@@ -10496,6 +10946,235 @@ mod tests {
             repair_graph_kind: CarrierRepairGraphKind::Auto,
         };
         assert_eq!(carrier_remote_candidate_limit(quota_blocked, 2, 2), 0);
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_ensure_replicates_to_operator_peer_store_peers_without_announcements(
+    ) {
+        // A freshly published CID has no announcements on its topic. The
+        // peers registered through `elastos node peer add` are the replica
+        // targets this node was told to use, so `ensure` must invoke them
+        // and count their signed proofs as live remote replicas.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (_remote_sk, remote_did) = elastos_identity::derive_did(&[22u8; 32]);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[21u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let remote_ticket = carrier_connect_ticket(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::operator_control::upsert_peer(
+            data_dir.path(),
+            crate::operator_control::OperatorPeer {
+                did: remote_did.clone(),
+                label: "custody-a".to_string(),
+                connect_ticket: remote_ticket.clone(),
+                allow: Vec::new(),
+            },
+        )
+        .unwrap();
+        // This node itself in the store must never become its own candidate.
+        crate::operator_control::upsert_peer(
+            data_dir.path(),
+            crate::operator_control::OperatorPeer {
+                did: local_did.clone(),
+                label: "self".to_string(),
+                connect_ticket: remote_ticket.clone(),
+                allow: Vec::new(),
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "policy": "network_default",
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 1
+                },
+                "requirements": {
+                    "min_replicas": 2,
+                    "max_replicas": 2,
+                    "require_live_multi_peer_proof": true
+                },
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher"
+            }))
+            .await
+            .unwrap();
+        let availability = &response["data"]["availability"];
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(availability["status"], "network_available");
+        assert_eq!(availability["replicas"], 2);
+        assert_eq!(
+            availability["peer_selection"]["mode"],
+            "carrier_provider_replication"
+        );
+        assert_eq!(
+            availability["peer_selection"]["live_multi_peer_proof"],
+            true
+        );
+        assert_eq!(availability["abuse_controls"]["candidate_count"], 1);
+        let remote = &availability["peer_selection"]["replicas"][1];
+        assert_eq!(remote["node_did"], remote_did);
+        assert!(remote["selection_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("operator_peer_store"));
+        let requests = invoker.requests.lock().await;
+        assert!(requests
+            .iter()
+            .all(|request| request["ticket"] == remote_ticket));
+        assert!(requests.iter().any(|request| request["op"] == "ensure"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_ensure_walks_past_a_dead_announced_holder_to_an_operator_peer(
+    ) {
+        // Regression for the live single-node-loss case: the shortfall is
+        // one placement, the dead node is an announced holder (ranked ahead
+        // of any operator-store peer) and must not consume that placement
+        // slot -- the next candidate is dialled and proves the replica.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (dead_message, dead_did) = signed_content_availability_message(
+            cid,
+            [23u8; 32],
+            "ticket:dead",
+            "dead-endpoint",
+            1_700_000_000,
+        );
+        let (_live_sk, live_did) = elastos_identity::derive_did(&[22u8; 32]);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[21u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let live_ticket = carrier_connect_ticket(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([dead_message], 1_700_000_000));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::operator_control::upsert_peer(
+            data_dir.path(),
+            crate::operator_control::OperatorPeer {
+                did: live_did.clone(),
+                label: "custody-c".to_string(),
+                connect_ticket: live_ticket.clone(),
+                allow: Vec::new(),
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            fail_tickets: vec!["ticket:dead".to_string()],
+            ..Default::default()
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "policy": "network_default",
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 1
+                },
+                "requirements": {
+                    "min_replicas": 2,
+                    "max_replicas": 2,
+                    "require_live_multi_peer_proof": true
+                },
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher"
+            }))
+            .await
+            .unwrap();
+        let availability = &response["data"]["availability"];
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(
+            availability["status"], "network_available",
+            "{availability}"
+        );
+        assert_eq!(availability["replicas"], 2);
+        assert_eq!(availability["abuse_controls"]["candidate_count"], 2);
+        assert_eq!(availability["abuse_controls"]["attempt_limit"], 1);
+        assert_eq!(availability["abuse_controls"]["attempted_operations"], 2);
+        assert_eq!(availability["abuse_controls"]["failed_operations"], 1);
+        assert_eq!(availability["abuse_controls"]["throttled"], false);
+        let proven = &availability["peer_selection"]["replicas"][1];
+        assert_eq!(proven["node_did"], live_did);
+        assert_ne!(proven["node_did"], dead_did);
+        let requests = invoker.requests.lock().await;
+        let ensure_tickets: Vec<&str> = requests
+            .iter()
+            .filter(|request| request["op"] == "ensure")
+            .map(|request| request["ticket"].as_str().unwrap())
+            .collect();
+        assert_eq!(ensure_tickets, vec!["ticket:dead", live_ticket.as_str()]);
     }
 
     #[tokio::test]
@@ -11232,6 +11911,34 @@ mod tests {
                 .contains("trusted source publisher_node_id must be one raw Iroh endpoint ID"),
             "unexpected configured transport-id error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_carrier_bind_reports_occupied_address() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[109u8; 32]);
+        let did = crate::crypto::encode_signing_key_did(&signing_key);
+        let result = start_carrier_node_with_registry_bound(
+            &signing_key,
+            &did,
+            dir.path().to_path_buf(),
+            None,
+            Some(address),
+        )
+        .await;
+        match result {
+            Ok(node) => {
+                node.shutdown().await;
+                panic!("an explicit occupied listener must not select another address");
+            }
+            Err(error) => assert!(
+                error.to_string().contains(&address.to_string()),
+                "{error:#}"
+            ),
+        }
+        assert_eq!(occupied.local_addr().unwrap(), address);
     }
 
     #[tokio::test]

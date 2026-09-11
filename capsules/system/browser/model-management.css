@@ -1,0 +1,14 @@
+/* Shared tokens follow the active System or Marketplace theme. */
+.model-management[hidden] { display: none; }
+.model-management { min-width: 0; color: var(--el-text); font-size: 13px; }
+.model-management > p:empty { display: none; }
+.model-row { padding: 16px; margin-top: 12px; border: 1px solid var(--el-hairline); border-radius: 8px; background: var(--el-surface-raised); min-width: 0; }
+.model-row h2 { font-size: 16px; margin: 0 0 8px; }
+.model-row p { overflow-wrap: anywhere; line-height: 1.5; margin: 8px 0; }
+.model-row .model-size, .model-row .model-hint, .model-details { color: var(--el-muted); font-size: 12px; }
+.model-details summary { cursor: pointer; }
+.model-details p { font-size: 11px; }
+.model-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 12px 0; }
+.model-keep { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.model-keep input { accent-color: var(--el-accent); width: 16px; height: 16px; margin: 0; }
+.model-row progress { width: 100%; accent-color: var(--el-accent); }

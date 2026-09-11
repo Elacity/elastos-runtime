@@ -3938,6 +3938,10 @@ function sanitizeBrowserUploadFileName(value) {
 }
 
 function validateBrowserFileUploadEvent(event) {
+  const requestId = event?.request_id;
+  if (typeof requestId !== "string" || !/^[A-Za-z0-9_:-]{1,128}$/.test(requestId)) {
+    throw new Error("Browser file upload requires its current file picker request.");
+  }
   const contentBase64 = String(event?.content_base64 || "");
   if (!contentBase64) {
     throw new Error("browser file_upload input requires Library file bytes");
@@ -3965,6 +3969,7 @@ function validateBrowserFileUploadEvent(event) {
     .slice(0, 2048);
   return {
     contentBase64,
+    requestId,
     fileName: sanitizeBrowserUploadFileName(event?.file_name),
     mimeType,
     objectUri,
@@ -4039,14 +4044,21 @@ async function uploadFileIntoBrowserPage(browserPage, event, timeoutMs) {
   }
   const upload = validateBrowserFileUploadEvent(event);
   const chooser = browserPage.file_chooser?.pending || null;
-  if (!Number.isInteger(chooser?.backend_node_id)) {
+  if (!Number.isInteger(chooser?.backend_node_id) || chooser.request_id !== upload.requestId || chooser.upload_started) {
     throw new Error("Browser file upload requires an active Runtime Library file picker request.");
   }
+  chooser.upload_started = true;
+  const requireCurrentChooser = () => {
+    if (browserPage.file_chooser?.pending !== chooser) {
+      throw new Error("Browser file picker target is no longer available.");
+    }
+  };
   return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
     await cdp.request("Page.enable");
     await cdp.request("Runtime.enable");
     await ensureBrowserFileChooserInterception(cdp, browserPage);
     await cdp.request("DOM.enable");
+    requireCurrentChooser();
     const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "elastos-browser-upload-"));
     const uploadPath = path.join(uploadDir, upload.fileName || "Library item");
     fs.writeFileSync(uploadPath, Buffer.from(upload.contentBase64, "base64"), { mode: 0o600 });
@@ -4058,10 +4070,12 @@ async function uploadFileIntoBrowserPage(browserPage, event, timeoutMs) {
       backendNodeId: chooser.backend_node_id,
       files: [uploadPath],
     });
+    requireCurrentChooser();
     const node = await cdp.request("DOM.resolveNode", {
       backendNodeId: chooser.backend_node_id,
     });
     const objectId = node?.object?.objectId;
+    requireCurrentChooser();
     if (!objectId) {
       throw new Error("Browser file picker target is no longer available.");
     }
@@ -4091,12 +4105,14 @@ async function uploadFileIntoBrowserPage(browserPage, event, timeoutMs) {
     if (uploadResult.ok !== true) {
       throw new Error("Browser file picker did not accept the Library item.");
     }
+    requireCurrentChooser();
     browserPage.file_chooser.pending = null;
     const state = await browserPageStateFromCdp(browserPage, cdp, timeoutMs);
     return {
       ...state,
       file_upload: {
         schema: "elastos.browser.file-upload-result/v1",
+        request_id: upload.requestId,
         file_name: uploadResult.file_name || upload.fileName,
         mime_type: uploadResult.type || upload.mimeType,
         size_bytes: Number(uploadResult.size || upload.sizeBytes),

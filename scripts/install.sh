@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# ElastOS Installer — Linux preview web bootstrap, then Carrier-backed updates/setup
+# ElastOS Installer — signed web bootstrap, then Carrier-backed updates/setup
 #
 # Usage:
-#   curl -fsSL https://<publisher-origin>/install.sh | bash   # Linux x86_64/aarch64 preview
+#   curl -fsSL https://<publisher-origin>/install.sh | bash
 #
 #   ELASTOS_HEAD_CID=QmXyz ELASTOS_MAINTAINER_DID=did:key:z6Mk... \
 #     curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash
@@ -23,11 +23,10 @@
 #
 # Downloads exactly 2 files:
 #   1. elastos binary → ~/.local/bin/elastos
-#   2. components.json → ${XDG_DATA_HOME:-~/.local/share}/elastos/components.json
+#   2. components.json → the platform's ElastOS application-data directory
 #
-# Capsules are NOT pre-installed. They are downloaded on-demand by the
-# supervisor when a command needs them (e.g., `elastos chat` downloads
-# chat + its provider dependencies automatically).
+# After bootstrap, setup installs the Home profile and opens browser Home.
+# Use --install-only for automated provisioning or other profiles.
 #
 # Trust model:
 #   1. Bootstrap over the stamped publisher URL (or explicit operator/debug CID gateway)
@@ -35,15 +34,16 @@
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
 #   5. Download binary + components.json, verify SHA-256
-#   6. Install to ~/.local/bin/elastos + ${XDG_DATA_HOME:-~/.local/share}/elastos/
+#   6. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
 #   7. Save trusted-source Carrier metadata for later `setup` and `update`
 #
-# Fails closed: if trust anchors are missing or OpenSSL doesn't support
-# Ed25519 and --allow-unsigned is not passed, the installer exits.
+# Fails closed if trust anchors or signature verification fail, unless the
+# operator explicitly selects --allow-unsigned.
 #
-# Dependencies: curl, python3, openssl (1.1.1+ for Ed25519), sha256sum|shasum
+# Dependencies: curl, python3 (stdlib only), sha256sum|shasum
 #
 
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
 set -euo pipefail
 
 # ── Trust anchors (baked in by publish-release.sh) ────────────────────
@@ -118,11 +118,11 @@ NC='\033[0m'
 show_help() {
     echo ""
     echo -e "${BOLD}ElastOS Installer${NC}"
-    echo "  Current public install preview: Linux x86_64/aarch64."
-    echo "  macOS uses source-home staging for now; see docs/MAC.md."
+    echo "  Release lookup: Linux x86_64/aarch64 and macOS Apple silicon."
+    echo "  The signed release determines which platforms have downloads."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
-    echo "  curl -fsSL https://<publisher-origin>/install.sh | bash   # Linux x86_64/aarch64 preview"
+    echo "  curl -fsSL https://<publisher-origin>/install.sh | bash"
     echo "  curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash   # operator/debug only"
     echo "  ./scripts/install.sh [options]"
     echo ""
@@ -134,15 +134,18 @@ show_help() {
     echo "  --publisher-node-id ID   Publisher P2P node ID (for durable Carrier link)"
     echo "  --allow-unsigned      Skip signature verification (NOT recommended)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
+    echo "  --install-only        Install Runtime without setup or opening Home"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
     echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
+    echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
     echo ""
-    echo -e "${BOLD}What does NOT get installed:${NC}"
-    echo "  Capsules are downloaded on-demand when you run commands."
-    echo "  Example: 'elastos chat' auto-downloads chat + providers."
+    echo -e "${BOLD}After installation:${NC}"
+    echo "  Setup installs the Home profile, then opens Home in your browser."
+    echo "  Keep the terminal open while using Home; Ctrl+C stops it."
+    echo "  Without an interactive terminal, the installer prints the launch command."
     echo ""
     echo -e "${BOLD}Trust model:${NC}"
     echo "  All artifacts signed with Ed25519. install.sh is the explicit"
@@ -155,12 +158,30 @@ show_help() {
     echo ""
     exit 0
 }
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-die()  { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
-info() { echo -e "  ${GREEN}▶${NC} $*"; }
-warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
+info() { echo -e "  ${GREEN:-}▶${NC:-} $*"; }
+warn() { echo -e "  ${YELLOW:-}!${NC:-} $*"; }
+
+installer_data_dir() {
+    local home_dir="$1"
+    local xdg_data_home="${2:-}"
+    [[ "$home_dir" == /* ]] || die "Home directory must be an absolute path"
+    case "$(uname -s)" in
+        Darwin) printf '%s\n' "${home_dir%/}/Library/Application Support/elastos" ;;
+        Linux)
+            if [[ "$xdg_data_home" == /* ]]; then
+                printf '%s\n' "${xdg_data_home%/}/elastos"
+            else
+                printf '%s\n' "${home_dir%/}/.local/share/elastos"
+            fi
+            ;;
+        *) die "Unsupported OS: $(uname -s)" ;;
+    esac
+}
 
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -175,7 +196,11 @@ detect_platform() {
 
     case "${OS}" in
         linux)  PLATFORM="${ARCH}-linux" ;;
-        *) die "Unsupported OS: ${OS}. Current public install preview is Linux-only." ;;
+        darwin)
+            [[ "$ARCH" == aarch64 ]] || die "macOS release lookup requires Apple silicon"
+            PLATFORM="aarch64-darwin"
+            ;;
+        *) die "Unsupported OS: ${OS}" ;;
     esac
 }
 
@@ -218,8 +243,10 @@ print(node_id)
         return 0
     fi
 
-    local refreshed=()
-    mapfile -t refreshed <<<"$parsed"
+    local refreshed=() line
+    while IFS= read -r line; do
+        refreshed+=("$line")
+    done <<<"$parsed"
     if [[ "${SOURCE_CONNECT_TICKET_EXPLICIT}" != true ]]; then
         SOURCE_CONNECT_TICKET="${refreshed[0]:-}"
     fi
@@ -263,110 +290,234 @@ sha256_file() {
     fi
 }
 
-stop_stale_runtime_if_needed() {
-    local coords_path="$1"
-    local label="$2"
-    local expected_sha="$3"
-    local pid=""
-    local running_sha=""
-
-    [[ -f "$coords_path" ]] || return 0
-
-    read -r pid running_sha < <(python3 - "$coords_path" <<'PY'
+installer_runtime_control() {
+    # All callers stop verified processes before changing the selected install.
+    # Smoke cleanup can disable the binary scan when using a shared branch binary.
+    python3 - "$@" <<'PY_RUNTIME_CONTROL'
 import json
-import sys
-
-path = sys.argv[1]
-try:
-    data = json.load(open(path, "r", encoding="utf-8"))
-except Exception:
-    print("")
-    sys.exit(0)
-pid = data.get("pid", "")
-sha = data.get("binary_sha256", "")
-print(f"{pid} {sha}")
-PY
-    )
-
-    if [[ -z "$pid" ]]; then
-        rm -f "$coords_path"
-        return 0
-    fi
-
-    if [[ ! -d "/proc/${pid}" ]]; then
-        rm -f "$coords_path"
-        return 0
-    fi
-
-    if [[ -n "$running_sha" && "$running_sha" == "$expected_sha" ]]; then
-        return 0
-    fi
-
-    info "Stopping stale ${label} (pid ${pid}) so the new install starts cleanly"
-    kill "${pid}" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        [[ ! -d "/proc/${pid}" ]] && break
-        sleep 0.2
-    done
-    if [[ -d "/proc/${pid}" ]]; then
-        kill -9 "${pid}" 2>/dev/null || true
-    fi
-    rm -f "$coords_path"
-}
-
-stop_stale_installed_elastos_processes() {
-    local label="$1"
-    local expected_sha="$2"
-    shift 2
-    local binary="${INSTALL_DIR}/elastos"
-    local pid=""
-    local running_sha=""
-
-    [[ -x "$binary" ]] || return 0
-
-    while IFS= read -r pid; do
-        [[ -n "$pid" ]] || continue
-        [[ -d "/proc/${pid}" ]] || continue
-        running_sha=$(sha256_file "/proc/${pid}/exe" 2>/dev/null || true)
-        if [[ -n "$running_sha" && "$running_sha" == "$expected_sha" ]]; then
-            continue
-        fi
-        info "Stopping stale ${label} (pid ${pid}) so the new install starts cleanly"
-        kill "${pid}" 2>/dev/null || true
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            [[ ! -d "/proc/${pid}" ]] && break
-            sleep 0.2
-        done
-        if [[ -d "/proc/${pid}" ]]; then
-            kill -9 "${pid}" 2>/dev/null || true
-        fi
-    done < <(python3 - "$binary" "$@" <<'PY'
 import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
 import sys
+import time
 
-binary = os.path.realpath(sys.argv[1])
-expected_args = sys.argv[2:]
+PREFIXES = ("serve", "gateway", "room open")
 
-for pid in os.listdir("/proc"):
-    if not pid.isdigit():
-        continue
+
+def process_snapshot(pid):
+    if type(pid) is not int or not 1 < pid < 2**31:
+        raise ValueError("Runtime PID must be a positive process ID greater than one")
     try:
-        raw = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-    except Exception:
-        continue
-    raw = [item.decode("utf-8", "ignore") for item in raw if item]
-    if not raw:
-        continue
-    try:
-        exe = os.path.realpath(raw[0])
-    except Exception:
-        continue
-    if exe != binary:
-        continue
-    if raw[1:1 + len(expected_args)] == expected_args:
-        print(pid)
-PY
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        raise ValueError("Runtime process belongs to another owner")
+    result = subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "lstart=", "-o", "stat=", "-o", "command="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
     )
+    if result.returncode:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        raise ValueError("Runtime process identity is unavailable")
+    parts = result.stdout.strip().split(None, 7)
+    if len(parts) != 8 or not parts[0].isdigit():
+        raise ValueError("Runtime process identity is ambiguous")
+    if int(parts[0]) != os.geteuid():
+        raise ValueError("Runtime process belongs to another owner")
+    if parts[6].startswith("Z"):
+        return None
+    return (" ".join(parts[1:6]), parts[7])
+
+
+def matches_command(snapshot, binary, prefixes=PREFIXES):
+    for prefix in prefixes:
+        command = binary + " " + prefix
+        if snapshot[1] == command or snapshot[1].startswith(command + " "):
+            return True
+    return False
+
+
+def stop_owned_process(pid, expected, binary, prefixes=PREFIXES):
+    if not matches_command(expected, binary, prefixes):
+        raise ValueError("Runtime process does not match the selected binary and command")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        current = process_snapshot(pid)
+        if current is None:
+            return
+        if current != expected:
+            raise ValueError("Runtime process identity changed; preserved the new process")
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        for _ in range(20):
+            current = process_snapshot(pid)
+            if current is None:
+                return
+            if current != expected:
+                raise ValueError("Runtime process identity changed; preserved the new process")
+            time.sleep(0.1)
+    raise ValueError("Runtime process did not stop; preserved its state")
+
+
+def read_coords(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077):
+            raise ValueError("Runtime coordinates require an owner-only regular file")
+        data = source.read(65537)
+    if len(data) > 65536:
+        raise ValueError("Runtime coordinates exceed the size limit")
+    value = json.loads(data)
+    pid = value.get("pid")
+    if type(pid) is not int or not 1 < pid < 2**31:
+        raise ValueError("Runtime coordinates contain an invalid PID")
+    return (pid, data, metadata.st_dev, metadata.st_ino, metadata.st_mtime)
+
+
+def remove_dead_coords(path, recorded):
+    current = read_coords(path)
+    if current is None:
+        return
+    if current != recorded or process_snapshot(recorded[0]) is not None:
+        raise ValueError("Runtime coordinates changed; preserved the new state")
+    path.unlink()
+
+
+def selected_processes(binary):
+    result = subprocess.run(
+        ["ps", "-ww", "-u", str(os.geteuid()), "-o", "pid=", "-o", "command="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError("Cannot inspect processes for the selected installation")
+    found = {}
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        if not matches_command(("", fields[1]), binary):
+            if matches_command(("", fields[1]), os.path.basename(binary)):
+                raise ValueError("A Runtime command has an ambiguous binary path; close it and retry")
+            continue
+        pid = int(fields[0])
+        snapshot = process_snapshot(pid)
+        if snapshot is not None:
+            if not matches_command(snapshot, binary):
+                raise ValueError("Runtime process changed during inspection")
+            found[pid] = snapshot
+    return found
+
+
+def descendant_processes(parents):
+    if not parents:
+        return {}
+    result = subprocess.run(
+        ["ps", "-axo", "pid=", "-o", "ppid="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError("Cannot inspect Runtime child processes")
+    relationships = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(field.isdigit() for field in fields):
+            raise ValueError("Runtime child process ownership is ambiguous")
+        relationships.append(tuple(map(int, fields)))
+    found = {}
+    family = set(parents)
+    while True:
+        children = {pid for pid, parent in relationships if parent in family and pid not in family}
+        if not children:
+            return found
+        for pid in children:
+            snapshot = process_snapshot(pid)
+            if snapshot is not None:
+                found[pid] = snapshot
+        family.update(children)
+
+
+def wait_for_descendants(children):
+    # One overall deadline, independent of the number of captured children.
+    deadline = time.monotonic() + 2
+    pending = dict(children)
+    while pending:
+        for pid, expected in list(pending.items()):
+            current = process_snapshot(pid)
+            if current is None:
+                del pending[pid]
+            elif current != expected:
+                raise ValueError("Runtime child identity changed; preserved its state")
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("Runtime child remains active; preserved its state")
+        time.sleep(0.1)
+
+
+def stop_installation(data_dir, binary, scan_binary):
+    binary = os.path.abspath(binary)
+    data_dir = Path(data_dir)
+    records = []
+    selected = {}
+    # Validate every recorded owner before sending the first signal.
+    for name in ("runtime-coords.json", "home-runtime-coords.json", "gateway-runtime-coords.json"):
+        path = data_dir / name
+        recorded = read_coords(path)
+        if recorded is None:
+            continue
+        records.append((path, recorded))
+        pid = recorded[0]
+        snapshot = process_snapshot(pid)
+        if snapshot is not None:
+            if not matches_command(snapshot, binary):
+                raise ValueError("Recorded Runtime is foreign or ambiguous; preserved its process and state")
+            # ps lstart and this Python process use the same local timezone.
+            # Its second precision rejects definite PID reuse; coordinates do
+            # not yet carry a process birth identity for finer comparisons.
+            started = time.mktime(time.strptime(snapshot[0], "%a %b %d %H:%M:%S %Y"))
+            if started > int(recorded[4]):
+                raise ValueError("Runtime process started after its ownership record; preserved its process and state")
+            selected[pid] = snapshot
+    if scan_binary:
+        for pid, snapshot in selected_processes(binary).items():
+            if pid not in selected:
+                raise ValueError("A process using this binary has no ownership record in the selected data directory; close it and retry")
+            if selected[pid] != snapshot:
+                raise ValueError("Runtime process identity changed during inspection")
+    children = descendant_processes(selected)
+    for pid, snapshot in selected.items():
+        stop_owned_process(pid, snapshot, binary)
+    wait_for_descendants(children)
+    if scan_binary and selected_processes(binary):
+        raise ValueError("A new Runtime started during cleanup; preserved its state")
+    for path, recorded in records:
+        remove_dead_coords(path, recorded)
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) != 4 or sys.argv[3] not in ("true", "false"):
+            raise ValueError("Expected data directory, Runtime binary and binary-scan flag")
+        stop_installation(sys.argv[1], sys.argv[2], sys.argv[3] == "true")
+    except (ValueError, OSError, TypeError, AttributeError) as error:
+        print("Runtime cleanup stopped: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_RUNTIME_CONTROL
 }
 
 # Fetch a CID from IPFS gateways (tries each in order)
@@ -374,7 +525,7 @@ ipfs_fetch() {
     local cid="$1"
     local output="$2"
     local url
-    for gw in "${GATEWAYS[@]}"; do
+    for gw in ${GATEWAYS[@]+"${GATEWAYS[@]}"}; do
         url="${gw}/ipfs/${cid}"
         if curl -fsSL --max-time 30 -o "$output" "$url" 2>/dev/null; then
             LAST_SUCCESS_GATEWAY="$gw"
@@ -391,106 +542,21 @@ ipfs_fetch() {
 json_get() {
     local file="$1"
     local expr="$2"
-    python3 -c "
+    python3 - "$file" "$expr" <<'PY'
 import json, sys
-with open('${file}', 'r') as f:
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
     d = json.load(f)
 try:
-    v = ${expr}
+    v = eval(sys.argv[2], {"d": d})
     if v is None:
         sys.exit(0)
     print(v)
 except (KeyError, TypeError, IndexError):
     sys.exit(0)
-"
-}
-
-# Compact JSON payload (equivalent to jq -c '.payload')
-json_payload() {
-    local file="$1"
-    python3 -c "
-import json
-with open('${file}', 'r') as f:
-    d = json.load(f)
-print(json.dumps(d['payload'], separators=(',', ':')))"
-}
-
-# Canonical sorted JSON (equivalent to jq -cS .)
-json_canonical() {
-    python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(json.dumps(d, separators=(',', ':'), sort_keys=True))"
-}
-
-hex_to_bin() {
-    local hex="$1"
-    local output="$2"
-    python3 - "$hex" "$output" <<'PY'
-import pathlib
-import sys
-
-hex_data = sys.argv[1].strip()
-output = pathlib.Path(sys.argv[2])
-output.write_bytes(bytes.fromhex(hex_data))
 PY
 }
 
 # ── Ed25519 verification ─────────────────────────────────────────────
-
-has_ed25519() {
-    if openssl list -public-key-algorithms 2>/dev/null | grep -qi "ED25519"; then
-        return 0
-    fi
-    openssl genpkey -algorithm ED25519 -out /dev/null >/dev/null 2>&1
-}
-
-decode_did_to_hex() {
-    local did="$1"
-    local multibase="${did#did:key:z}"
-    [[ "$multibase" == "$did" ]] && die "Invalid DID format: $did"
-
-    local raw_hex
-    if command -v python3 &>/dev/null; then
-        raw_hex=$(python3 -c "
-import sys
-ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-def b58decode(s):
-    n = 0
-    for c in s:
-        n = n * 58 + ALPHABET.index(c)
-    pad = len(s) - len(s.lstrip('1'))
-    result = []
-    while n > 0:
-        result.append(n & 0xff)
-        n >>= 8
-    return bytes(pad) + bytes(reversed(result))
-raw = b58decode('${multibase}')
-if len(raw) != 34 or raw[0] != 0xed or raw[1] != 0x01:
-    print('ERROR', file=sys.stderr)
-    sys.exit(1)
-print(raw[2:].hex())
-") || die "Failed to decode DID"
-    elif command -v perl &>/dev/null; then
-        raw_hex=$(perl -e '
-my @alpha = split //, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-my %val; $val{$alpha[$_]} = $_ for 0..57;
-my $s = "'"${multibase}"'";
-use Math::BigInt;
-my $n = Math::BigInt->new(0);
-$n = $n * 58 + $val{$_} for split //, $s;
-my $hex = $n->as_hex(); $hex =~ s/^0x//;
-$hex = "0" . $hex if length($hex) % 2;
-while (length($hex) < 68) { $hex = "00" . $hex; }
-die "Bad multicodec" unless substr($hex, 0, 4) eq "ed01";
-print substr($hex, 4);
-') || die "Failed to decode DID"
-    else
-        die "Need python3 or perl for base58 decoding"
-    fi
-
-    echo "$raw_hex"
-}
 
 verify_signature() {
     local json_file="$1"
@@ -502,59 +568,215 @@ verify_signature() {
         return 0
     fi
 
-    if ! has_ed25519; then
-        die "OpenSSL does not support Ed25519 on this system.\n  Install OpenSSL 1.1.1+ or pass --allow-unsigned (NOT recommended)."
-    fi
+    if ! python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
+# RFC 8032 sections 5.1.3, 5.1.4 and 5.1.7:
+# https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1
+# Verification only: all curve operations below use public data.
+import hashlib
+import json
+import re
+import sys
 
-    local payload sig_hex signer_did payload_signer_did
-    payload=$(json_payload "$json_file")
-    sig_hex=$(json_get "$json_file" 'd["signature"]')
-    signer_did=$(json_get "$json_file" 'd["signer_did"]')
-    payload_signer_did=$(json_get "$json_file" 'd.get("payload",{}).get("signer_did","")')
+FIELD = 2**255 - 19
+ORDER = 2**252 + 27742317777372353535851937790883648493
+D = -121665 * pow(121666, FIELD - 2, FIELD) % FIELD
+SQRT_MINUS_ONE = pow(2, (FIELD - 1) // 4, FIELD)
+IDENTITY = (0, 1, 1, 0)
 
-    if [[ "$signer_did" != "$expected_did" ]]; then
-        die "Signer mismatch!\n  Expected: ${expected_did}\n  Got:      ${signer_did}"
-    fi
-    if [[ -n "$payload_signer_did" && "$payload_signer_did" != "$signer_did" ]]; then
-        die "Payload/envelope signer mismatch!\n  Payload:  ${payload_signer_did}\n  Envelope: ${signer_did}"
-    fi
 
-    local canonical
-    canonical=$(echo -n "$payload" | json_canonical)
+def point_add(left, right):
+    x1, y1, z1, t1 = left
+    x2, y2, z2, t2 = right
+    a = (y1 - x1) * (y2 - x2) % FIELD
+    b = (y1 + x1) * (y2 + x2) % FIELD
+    c = 2 * D * t1 * t2 % FIELD
+    d = 2 * z1 * z2 % FIELD
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % FIELD, g * h % FIELD, f * g % FIELD, e * h % FIELD)
 
-    local digest_hex
-    digest_hex=$(printf '%s\0%s' "$domain" "$canonical" | sha256sum | cut -d' ' -f1 2>/dev/null) \
-        || digest_hex=$(printf '%s\0%s' "$domain" "$canonical" | shasum -a 256 | cut -d' ' -f1)
 
-    local pubkey_hex
-    pubkey_hex=$(decode_did_to_hex "$signer_did")
+def point_mul(scalar, point):
+    result = IDENTITY
+    while scalar:
+        if scalar & 1:
+            result = point_add(result, point)
+        point = point_add(point, point)
+        scalar >>= 1
+    return result
 
-    local der_prefix="302a300506032b6570032100"
-    local tmpdir
-    tmpdir=$(mktemp -d)
 
-    hex_to_bin "${der_prefix}${pubkey_hex}" "${tmpdir}/pubkey.der"
-    openssl pkey -inform DER -pubin -in "${tmpdir}/pubkey.der" -out "${tmpdir}/pubkey.pem" 2>/dev/null \
-        || die "Failed to create PEM from public key"
+def point_equal(left, right):
+    return ((left[0] * right[2] - right[0] * left[2]) % FIELD == 0
+            and (left[1] * right[2] - right[1] * left[2]) % FIELD == 0)
 
-    hex_to_bin "$digest_hex" "${tmpdir}/digest.bin"
-    hex_to_bin "$sig_hex" "${tmpdir}/sig.bin"
 
-    if openssl pkeyutl -verify -pubin -inkey "${tmpdir}/pubkey.pem" \
-        -in "${tmpdir}/digest.bin" -sigfile "${tmpdir}/sig.bin" \
-        -rawin 2>/dev/null; then
-        rm -rf "$tmpdir"
-        info "Signature verified"
-    else
-        rm -rf "$tmpdir"
+def decode_point(encoded):
+    if len(encoded) != 32:
+        raise ValueError("Ed25519 point must contain 32 bytes")
+    packed = int.from_bytes(encoded, "little")
+    y, sign = packed & (2**255 - 1), packed >> 255
+    if y >= FIELD:
+        raise ValueError("Noncanonical Ed25519 point")
+    y_squared = y * y % FIELD
+    x_squared = (y_squared - 1) * pow(D * y_squared + 1, FIELD - 2, FIELD) % FIELD
+    x = pow(x_squared, (FIELD + 3) // 8, FIELD)
+    if (x * x - x_squared) % FIELD:
+        x = x * SQRT_MINUS_ONE % FIELD
+    if (x * x - x_squared) % FIELD or (x == 0 and sign):
+        raise ValueError("Invalid Ed25519 point")
+    if x & 1 != sign:
+        x = FIELD - x
+    return (x, y, 1, x * y % FIELD)
+
+
+BASE = decode_point(bytes.fromhex("58" + "66" * 31))
+
+
+def verify_ed25519(public_key, message, signature):
+    if len(signature) != 64:
+        raise ValueError("Ed25519 signature must contain 64 bytes")
+    public = decode_point(public_key)
+    r_point = decode_point(signature[:32])
+    scalar = int.from_bytes(signature[32:], "little")
+    if scalar >= ORDER:
+        raise ValueError("Noncanonical Ed25519 scalar")
+    # The installer accepts canonical points and the strict verification
+    # equation. Reject small-order keys and R values, including the identity.
+    if any(point_equal(point_mul(8, point), IDENTITY) for point in (public, r_point)):
+        raise ValueError("Small-order Ed25519 point")
+    challenge = int.from_bytes(
+        hashlib.sha512(signature[:32] + public_key + message).digest(), "little"
+    ) % ORDER
+    if not point_equal(point_mul(scalar, BASE), point_add(r_point, point_mul(challenge, public))):
+        raise ValueError("Ed25519 signature does not match")
+
+
+def decode_did_key(did):
+    if not isinstance(did, str) or not did.startswith("did:key:z"):
+        raise ValueError("Expected an Ed25519 did:key with base58btc encoding")
+    encoded = did[len("did:key:z"):]
+    if not 1 <= len(encoded) <= 64:
+        raise ValueError("Invalid DID key length")
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    number = 0
+    for char in encoded:
+        number = number * 58 + alphabet.index(char)
+    raw = (b"\0" * (len(encoded) - len(encoded.lstrip("1")))
+           + number.to_bytes((number.bit_length() + 7) // 8, "big"))
+    if len(raw) != 34 or raw[:2] != b"\xed\x01":
+        raise ValueError("DID key must use the Ed25519 multicodec")
+    return raw[2:]
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON field: " + key)
+        result[key] = value
+    return result
+
+
+def verify_envelope(json_file, domain, expected_did):
+    with open(json_file, "r", encoding="utf-8") as source:
+        envelope = json.load(source, object_pairs_hook=unique_object)
+    signer = envelope["signer_did"]
+    if not expected_did or signer != expected_did:
+        raise ValueError("Envelope signer differs from the pinned maintainer DID")
+    payload = envelope["payload"]
+    if not isinstance(payload, dict):
+        raise ValueError("Release payload must be a JSON object")
+    if "signer_did" in payload and payload["signer_did"] != signer:
+        raise ValueError("Payload and envelope signer differ")
+    signature = envelope["signature"]
+    if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-fA-F]{128}", signature):
+        raise ValueError("Signature must contain 64 hex-encoded bytes")
+    # Matches the publisher's compact sorted UTF-8 JSON and Runtime's
+    # SHA256(domain + NUL + payload), signed with ordinary Ed25519.
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True,
+                           ensure_ascii=False, allow_nan=False).encode("utf-8")
+    digest = hashlib.sha256(domain.encode("utf-8") + b"\0" + canonical).digest()
+    verify_ed25519(decode_did_key(signer), digest, bytes.fromhex(signature))
+
+
+if __name__ == "__main__":
+    try:
+        verify_envelope(*sys.argv[1:])
+    except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
+        print("Signature verification failed: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_ED25519
+    then
         die "Signature verification FAILED"
+    fi
+    info "Signature verified"
+}
+
+validate_release_identity() {
+    # Both envelopes are verified before this check, on every transport.
+    # The signed digest binds exact envelope bytes; the CID stays content identity.
+    if ! python3 - "$1" "$2" <<'PY_RELEASE_IDENTITY'
+import hashlib
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        head = json.load(source)["payload"]
+    with open(sys.argv[2], "rb") as source:
+        release_bytes = source.read()
+    release = json.loads(release_bytes)["payload"]
+    if head.get("schema") != "elastos.release.head/v1" or release.get("schema") != "elastos.release/v1":
+        raise ValueError("Unexpected release schema")
+    expected = head.get("release_sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("Release head requires a lowercase SHA-256 envelope binding; ask the publisher to update its metadata")
+    if hashlib.sha256(release_bytes).hexdigest() != expected:
+        raise ValueError("Release envelope differs from the signed head")
+    for field in ("version", "channel"):
+        value = head.get(field)
+        if not isinstance(value, str) or not value or release.get(field) != value:
+            raise ValueError("Release head and release " + field + " must match")
+except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
+    print("Release identity check failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY_RELEASE_IDENTITY
+    then
+        die "Release binding or metadata mismatch; retry after the publisher finishes updating"
+    fi
+}
+
+# Setup leaves the curl pipe unread. Browser Home runs in the controlling
+# terminal; non-interactive provisioning prints the command for a later launch.
+finish_install() {
+    local runtime_bin="${INSTALL_DIR}/elastos"
+    if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
+        info "Runtime installed: ${runtime_bin}"
+        return 0
+    fi
+    info "Setting up Home..."
+    "$runtime_bin" setup </dev/null || return $?
+    if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
+        info "Opening Home..."
+        "$runtime_bin" home --browser </dev/tty || return $?
+    else
+        info "Home is installed. Open it from a terminal:"
+        printf '  %q home --browser\n' "$runtime_bin"
     fi
 }
 
 # ── Parse args ────────────────────────────────────────────────────────
 
+# Repo smoke/publisher helpers source these definitions inside a subshell.
+# The downloaded installer remains one self-contained script.
+if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
+    return 0
+fi
+
 ALLOW_UNSIGNED=false
 INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -576,6 +798,7 @@ while [[ $# -gt 0 ]]; do
         --publisher-node-id)
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
             PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
+        --install-only) INSTALL_ONLY=true; shift ;;
         --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
@@ -594,7 +817,7 @@ if [[ ${#CLI_GATEWAYS[@]} -gt 0 ]]; then
 elif [[ -n "${ELASTOS_IPFS_GATEWAYS:-}" ]]; then
     GATEWAYS=()
     IFS=', ' read -r -a ENV_GATEWAYS <<< "${ELASTOS_IPFS_GATEWAYS}"
-    for gw in "${ENV_GATEWAYS[@]}"; do
+    for gw in ${ENV_GATEWAYS[@]+"${ENV_GATEWAYS[@]}"}; do
         [[ -z "$gw" ]] && continue
         gw="${gw%/}"
         gw="${gw%/ipfs}"
@@ -633,12 +856,6 @@ done
 
 if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
     die "Neither sha256sum nor shasum found"
-fi
-
-if [[ "$ALLOW_UNSIGNED" != true ]]; then
-    if ! has_ed25519; then
-        die "OpenSSL does not support Ed25519 on this system.\n  Install OpenSSL 1.1.1+ or pass --allow-unsigned (NOT recommended).\n  Failing closed for your safety."
-    fi
 fi
 
 echo ""
@@ -697,6 +914,7 @@ RELEASE_SCHEMA=$(json_get "${TMPDIR}/release.json" 'd["payload"]["schema"]') \
 
 info "Verifying release signature..."
 verify_signature "${TMPDIR}/release.json" "elastos.release.v1" "$MAINTAINER_DID"
+validate_release_identity "${TMPDIR}/release-head.json" "${TMPDIR}/release.json"
 
 # ── Extract platform info ────────────────────────────────────────────
 
@@ -754,6 +972,12 @@ sha256_check "${TMPDIR}/components.json" "$COMPONENTS_SHA256"
 
 # ── Install (2 files) ────────────────────────────────────────────────
 
+DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
+info "Stopping verified Runtime processes for this installation before its protected-root check..."
+installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
+    || die "Close this installation's Runtime and retry; its existing files were preserved"
+info "Open Home again after installation to reconnect."
+
 info "Installing binary to ${INSTALL_DIR}/elastos..."
 mkdir -p "$INSTALL_DIR"
 TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
@@ -766,8 +990,8 @@ if ! printf '%s' "${INSTALLED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; 
     die "Installed binary version mismatch at ${INSTALL_DIR}/elastos\n  Expected: ${RELEASE_VERSION}\n  Got:      ${INSTALLED_VERSION_OUTPUT:-<no output>}"
 fi
 
-DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/elastos"
-mkdir -p "$DATA_DIR"
+# New Runtime data is private; preserve the mode of an existing installation.
+(umask 077; mkdir -p "$DATA_DIR")
 
 # Evict stale cached capsules when components.json changes (CID mismatch).
 # This forces the supervisor to re-download updated capsule binaries on demand.
@@ -797,11 +1021,6 @@ fi
 
 info "Installing components.json to ${DATA_DIR}/..."
 cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
-
-stop_stale_runtime_if_needed "${DATA_DIR}/runtime-coords.json" "runtime" "${BINARY_SHA256}"
-stop_stale_runtime_if_needed "${DATA_DIR}/home-runtime-coords.json" "Home runtime" "${BINARY_SHA256}"
-stop_stale_installed_elastos_processes "Room gateway" "${BINARY_SHA256}" room open
-stop_stale_installed_elastos_processes "gateway" "${BINARY_SHA256}" gateway
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
 info "Verifying and upgrading configured protected roots while Runtime is stopped..."
@@ -884,30 +1103,6 @@ cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
 cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
 info "Saved publisher metadata for future upgrades"
 
-# ── Guest-network compatibility mode (optional) ─────────────────────
-# Normal app capsules (chat, Documents, etc.) are Carrier-only and rootless.
-# CAP_NET_ADMIN belongs only to explicit guest-network capsules, mediated by
-# the runtime. Do NOT print sudo suggestions for normal installs.
+# ── Complete installation ─────────────────────────────────────────────
 
-# ── Done ──────────────────────────────────────────────────────────────
-
-echo ""
-echo -e "${GREEN}${BOLD}ElastOS ${RELEASE_VERSION} installed!${NC}"
-echo ""
-echo -e "  ${INSTALL_DIR}/elastos"
-echo ""
-
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-    echo -e "  Add to your PATH:"
-    echo ""
-    echo "    export PATH=\"${INSTALL_DIR}:\$PATH\""
-    echo ""
-fi
-
-echo -e "  Setup home:     elastos setup"
-echo -e "  Open Home:      elastos"
-echo -e "  Check source:   elastos source show"
-echo -e "  Check updates:  elastos update --check"
-echo -e "  Optional chat:  elastos chat --nick $(whoami)"
-echo -e "  Full help:      elastos --help"
-echo ""
+finish_install

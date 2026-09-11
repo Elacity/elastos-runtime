@@ -545,14 +545,12 @@ fn validated_contract_address(value: &str, label: &str) -> anyhow::Result<String
     let hex_part = value
         .strip_prefix("0x")
         .with_context(|| format!("{label} must start with 0x"))?;
-    if hex_part.len() != 40
-        || !hex_part
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        anyhow::bail!("{label} must be 0x plus 40 lowercase hex characters");
+    if hex_part.len() != 40 || !hex_part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("{label} must be 0x plus 40 hex characters");
     }
-    Ok(value.to_string())
+    // Accept EIP-55 mixed-case input; store canonical lowercase so every
+    // downstream comparison and serialized config sees one form.
+    Ok(format!("0x{}", hex_part.to_ascii_lowercase()))
 }
 
 fn validated_selector(value: &str) -> anyhow::Result<()> {
@@ -1067,6 +1065,30 @@ fn validated_custody_node_label(value: &str, label: &str) -> anyhow::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_address_accepts_mixed_case_and_normalizes_to_lowercase() {
+        let checksummed = "0x5a694A6d988354dca491fe0F6db7a6ef46b656c2";
+        let normalized = validated_contract_address(checksummed, "mint pay token").unwrap();
+        assert_eq!(normalized, "0x5a694a6d988354dca491fe0f6db7a6ef46b656c2");
+
+        let lowercase = "0x0000000000000000000000000000000000000033";
+        assert_eq!(
+            validated_contract_address(lowercase, "mint pay token").unwrap(),
+            lowercase
+        );
+
+        for bad in [
+            "0x123",
+            "5a694a6d988354dca491fe0f6db7a6ef46b656c2",
+            "0x5a694a6d988354dca491fe0f6db7a6ef46b656gg",
+        ] {
+            assert!(
+                validated_contract_address(bad, "mint pay token").is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn create_policy_authority_key_creates_owner_only_key_and_receipt() {

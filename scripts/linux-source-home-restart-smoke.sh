@@ -255,12 +255,18 @@ data = pathlib.Path(os.environ["XDG_DATA_HOME"]) / "elastos"
 home = (data / "capsules/home/browser/index.html").read_bytes()
 services = (data / "capsules/services/browser/index.html").read_bytes()
 if os.environ.get("ELASTOS_SMOKE_BAD_HOME") == "1":
-    home = b"wrong Home\n"
+    home = b"wrong Home\\n"
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/apps/home/":
+            self.send_response(308)
+            self.send_header("Location", "/home/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         values = {
-            "/apps/home/": home,
+            "/home/": home,
             "/apps/services/": services,
         }
         body = values.get(self.path)
@@ -291,6 +297,10 @@ import sys
 
 if os.environ.get("ELASTOS_SMOKE_FAIL_UPGRADE") == "1":
     raise SystemExit(41)
+empty_receipt = os.environ.get("ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT")
+if empty_receipt is not None:
+    print(empty_receipt)
+    raise SystemExit(0)
 backup = pathlib.Path(sys.argv[sys.argv.index("--backup-dir") + 1])
 backup.mkdir(mode=0o700, parents=True, exist_ok=False)
 proof = backup / "rollback.json"
@@ -442,6 +452,8 @@ def dry_run_proof(base):
         raise AssertionError("dry-run receipt status mismatch")
     if value.get("gateway_bin") != str(fixture.runtime.resolve()):
         raise AssertionError("dry run did not select the stable Runtime")
+    if value.get("home_url") != f"http://{fixture.addr}/home/":
+        raise AssertionError("dry-run receipt did not name canonical Home")
     if value.get("installed_runtime_sha256") != sha256(fixture.runtime):
         raise AssertionError("dry run did not bind the installed Runtime hash")
     if any("rollback" in name for name in value):
@@ -480,7 +492,57 @@ def dry_run_proof(base):
     return fixture
 
 
+def empty_upgrade_proof(base):
+    empty_receipt = {
+        "schema": "elastos.principal-root.upgrade-receipt/v1",
+        "status": "already_ready",
+        "root_count": 0,
+        "object_count": 0,
+        "roots": [],
+    }
+    empty = Fixture(base, "empty-install")
+    try:
+        result = empty.run(
+            env=empty.environment(ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT=json.dumps(empty_receipt))
+        )
+        receipt = json.loads(result.stdout)
+        if receipt.get("ok") is not True or any(
+            receipt.get(f"{name}_http_code") != 200 for name in ("home", "services")
+        ):
+            raise AssertionError("empty installation did not reach readiness")
+        if "principal_root_rollback" in receipt or list((empty.data / "backups").iterdir()):
+            raise AssertionError("empty installation manufactured or claimed a rollback")
+    finally:
+        empty.cleanup()
+
+    invalid_receipts = [
+        "", "{", "[]",
+        json.dumps(list(empty_receipt.items())),
+        json.dumps({**empty_receipt, "schema": "wrong"}),
+        json.dumps({**empty_receipt, "status": "upgraded"}),
+        json.dumps({**empty_receipt, "root_count": 1}),
+        json.dumps({**empty_receipt, "object_count": 1}),
+        json.dumps({**empty_receipt, "roots": ["root"]}),
+        json.dumps({**empty_receipt, "roots": {}}),
+        json.dumps({**empty_receipt, "root_count": False}),
+        json.dumps({**empty_receipt, "object_count": False}),
+        json.dumps({**empty_receipt, "extra": True}),
+        json.dumps(empty_receipt)[:-1] + ',"root_count":0}',
+        " " * 4096 + json.dumps(empty_receipt),
+    ]
+    for index, payload in enumerate(invalid_receipts):
+        fixture = Fixture(base, f"invalid-empty-receipt-{index}")
+        assert_rejected(
+            fixture,
+            "rollback_missing_without_empty_upgrade",
+            env=fixture.environment(ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT=payload),
+        )
+        if fixture.pid_file.exists() or list((fixture.data / "backups").iterdir()):
+            raise AssertionError("invalid empty-upgrade receipt started a gateway or created rollback")
+
+
 def linux_active_proof(base):
+    empty_upgrade_proof(base)
     dead_stale = Fixture(base, "dead-stale-pid")
     dead_stale.write_pid(
         99999999,
@@ -489,6 +551,8 @@ def linux_active_proof(base):
     )
     dead_success = dead_stale.run()
     dead_receipt = json.loads(dead_success.stdout)
+    if dead_receipt.get("home_url") != f"http://{dead_stale.addr}/home/":
+        raise AssertionError("restart receipt did not name canonical Home")
     dead_pid = dead_receipt.get("gateway_pid")
     if not isinstance(dead_pid, int) or not process_alive(dead_pid):
         raise AssertionError("dead prior PID record did not admit one new gateway")
@@ -667,6 +731,7 @@ def main():
                 "exact_process_owner": True if active else "skipped_non_linux",
                 "rollback_and_failure_cleanup": True if active else "skipped_non_linux",
                 "home_services_parity": True if active else "skipped_non_linux",
+                "empty_upgrade_without_rollback": True if active else "skipped_non_linux",
                 "fixture_residue": False,
             },
             separators=(",", ":"),

@@ -1,5 +1,12 @@
 # Protected content
 
+The target [storage and access contract](STORAGE_AND_ACCESS.md) extends the
+object model to private storage, controlled sharing, groups, devices, and
+agents. The [implementation guide](OBJECT_PROTECTION_IMPLEMENTATION.md) defines
+how to replace or supplement dKMS/dDRM mechanisms while preserving Runtime
+authority and existing object formats. These are staged design instructions;
+the provider sequence below retains its own source and installed acceptance gates.
+
 Protected content is Runtime-mediated. Library and Marketplace own the creator
 and buyer experience, and `elacity-player` owns video presentation. Runtime
 owns authority, durable operations, provider selection, Wallet and Chain
@@ -194,20 +201,67 @@ the stable installed Runtime, own one exact PID file, stop only the proven
 prior Runtime, preserve one bounded principal-root rollback, and write one
 owner-only restart receipt.
 
+`elastos run <provider> [--with <provider>]... --carrier-addr <addr>` hosts
+one or more native providers standalone, outside the full Home/gateway
+supervisor tree, and writes an owner-only readiness receipt at
+`<data_dir>/run/provider-host.ready.json` once every requested provider is
+registered and Carrier is bound. A custody node process is exactly this
+composition: `elastos run custody-provider --with availability-provider
+--with ipfs-provider --with chain-provider --carrier-addr <addr>`. The chain
+plane is not optional on a committee member: a node settles every release
+by evaluating the rights request through its own
+`protected_content_rights_evidence` call, so the host refuses to start the
+chain plane without a `protected-content/chain-provider.json` naming the
+protected-content network, and its evidence RPC URLs must be reachable from
+the node itself (not only from the client).
+
+`deploy/custody-host/` builds a simulation-only container image of that
+composition plus a same-host, container-per-node compose harness for three
+custody nodes. Its own README states the simulation boundary explicitly:
+process isolation and real Carrier transport between the containers are
+faithfully simulated, but distinct hardware, distinct operators, and
+distinct failure domains are not, and the image must never hold a real
+recipient's key material. The operator flow over that harness is: each
+node's container provisions its inactive custody state and exports a
+DID-named public descriptor to a shared handoff directory on first boot, and
+reads the client's protected-content chain configuration back from that same
+directory on every boot (`up.sh sync-chain-config` derives it, rewriting
+host-loopback evidence RPC URLs to the container-reachable host gateway); the
+operator runs `elastos node peer add` against each node's exported connect
+ticket from the client Runtime; the operator then runs the offline
+composition ceremony described above over the three descriptors to
+assemble and sign the owner-only 2-of-3 composition; a node restart (the
+platform restart helper, or the container's own restart) proves the node
+returns with the same DID and no required environment; and the installed
+proof driver script (see [scripts/README.md](../scripts/README.md)) drives
+the resulting composition end to end.
+
 ## Remaining work
 
 The ordered release proof is in [TASKS.md](../TASKS.md). The protected-content
 part requires:
 
 1. final combined-source review and CI;
-2. matching localhost, seed and third-node installation receipts;
-3. one signed owner-only 2-of-3 custody composition across distinct operators;
+2. matching localhost, seed and third-node installation receipts; a
+   simulation-only container harness proves the same node-provisioning,
+   peer-add, and restart-resurrection mechanics on one host, not distinct
+   installed hardware;
+3. one signed owner-only 2-of-3 custody composition across distinct
+   operators; the composition ceremony and its offline verify path are
+   proven over three real node descriptors and real Carrier transport
+   dials on the simulation-only harness, not yet across genuinely distinct
+   operators and failure domains;
 4. private multi-source Chain configuration and deployed Base evidence;
 5. bound-KID allow/deny/unbound reads, CentralStorage binding and the exact
-   funded `AuthorityGateway.buyAccess` receipt/event;
-6. three replicas plus repair after one replica is lost;
+   funded `AuthorityGateway.buyAccess` receipt/event; proven headless on an
+   Anvil fork of Base by the installed e2e proof driver, not yet on the real
+   Base deployment;
+6. three replicas plus repair after one replica is lost; proven on the
+   simulation-only harness by the same driver, not yet on distinct hardware;
 7. the installed two-Runtime mint-list-deny-buy-open-play-close journey,
    including restart, replay, tamper rejection, settlement and cleanup;
+   proven headless by the same driver (`finalize` reads `overall_ok: true`,
+   see `state.md`), not yet through Brave on the seed;
 8. the manual UIUX matrix in `TASKS.md`; and
 9. one atomic cutover that removes the provisional authority surfaces.
 

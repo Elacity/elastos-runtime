@@ -25,10 +25,6 @@ const HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.services.peer-contacts
 /// that renames the object and its schema together.
 const LEGACY_HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.people.contacts-state/v1";
 const HOME_PEOPLE_DISCOVERY_SCHEMA: &str = "elastos.people.discovery/v1";
-const PEOPLE_PROFILE_PROTECTION_REQUIRED_SCHEMA: &str =
-    "elastos.people.profile-protection-required/v1";
-const PEOPLE_PROFILE_PROTECTION_REQUIRED_MESSAGE: &str =
-    "Open System, choose Security, and download Recovery. Then retry creating your Profile.";
 const HOME_SERVICES_STATE_SCHEMA: &str = "elastos.services.state/v1";
 const HOME_SERVICES_STATE_MAX_BYTES: usize = 32 * 1024;
 const HOME_SERVICES_REQUESTS_SCHEMA: &str = "elastos.services.requests/v1";
@@ -118,14 +114,6 @@ struct HomeEventsResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct PeopleProfileProtectionRequiredResponse {
-    schema: &'static str,
-    status: &'static str,
-    action_target: &'static str,
-    message: &'static str,
-}
-
-#[derive(Debug, Serialize)]
 struct HomeRealtimeEvent {
     kind: String,
     scope: String,
@@ -136,6 +124,7 @@ struct HomeRealtimeEvent {
 struct HomeRealtimeSnapshot {
     principal_id: String,
     recovery_readiness: RecoveryReadinessSummary,
+    profile_readiness: ProfileReadinessSummary,
     notification_signature: Vec<String>,
     wallet_request_signature: Vec<String>,
     capability_request_count: usize,
@@ -1898,24 +1887,43 @@ pub(super) async fn people_profile_update(
         Err(err) => return home_error_response(err),
     };
     if existing_profile.is_none() {
-        let recovery = match crate::api::auth_gateway::principal_root_recovery_status_for_context(
-            &state, &context,
-        ) {
-            Ok(recovery) => recovery,
-            Err(err) => return home_error_response(err),
-        };
-        if !crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
-            return (
-                StatusCode::CONFLICT,
-                Json(PeopleProfileProtectionRequiredResponse {
-                    schema: PEOPLE_PROFILE_PROTECTION_REQUIRED_SCHEMA,
-                    status: "recovery_required",
-                    action_target: "system",
-                    message: PEOPLE_PROFILE_PROTECTION_REQUIRED_MESSAGE,
-                }),
+        let initialized = (|| {
+            let principal = crate::auth::load_principal_for_proof_binding(
+                &state.data_dir,
+                context
+                    .proof_binding_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Profile requires passkey authority"))?,
+            )?;
+            crate::api::auth_gateway::initialize_local_profile(
+                &state,
+                &principal,
+                &context.session_id,
+                &req.display_name,
             )
-                .into_response();
+        })();
+        if let Err(err) = initialized {
+            return home_error_response(err);
         }
+        // Return the identity just established; a retried first-create must not
+        // manufacture another Profile revision.
+        refresh_runtime_owned_contexts_after_profile_change(
+            &state.data_dir,
+            state.collaboration_discovery_service.as_ref(),
+        );
+        return match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
+            Ok(identity) => Json(identity.without_device_identity()).into_response(),
+            Err(err) => home_error_response(err),
+        };
+    }
+    if existing_profile
+        .as_ref()
+        .is_some_and(|profile| profile.document().display_name == req.display_name.trim())
+    {
+        return match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
+            Ok(identity) => Json(identity.without_device_identity()).into_response(),
+            Err(err) => home_error_response(err),
+        };
     }
     match update_profile_for_context(&state.data_dir, &context, &req.display_name) {
         Ok(identity) => {
@@ -3337,6 +3345,12 @@ async fn home_realtime_snapshot(
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
         recovery_readiness,
+        profile_readiness: profile_readiness_for_principal(
+            &state.data_dir,
+            &home_browser_principal_id(context),
+            &home_browser_localhost_root(context),
+        )
+        .readiness,
         notification_signature,
         wallet_request_signature,
         capability_request_count,
@@ -3376,7 +3390,11 @@ struct HomeRealtimeCursorParts {
 
 fn home_realtime_cursor_parts(snapshot: &HomeRealtimeSnapshot) -> HomeRealtimeCursorParts {
     HomeRealtimeCursorParts {
-        home: stable_cursor_hash(&(&snapshot.principal_id, &snapshot.recovery_readiness)),
+        home: stable_cursor_hash(&(
+            &snapshot.principal_id,
+            &snapshot.recovery_readiness,
+            &snapshot.profile_readiness,
+        )),
         inbox: stable_cursor_hash(&(
             &snapshot.notification_signature,
             &snapshot.wallet_request_signature,
@@ -3622,7 +3640,8 @@ pub(super) async fn home_browser_state_update(
     };
     match home_save_browser_state(&state.data_dir, &context, input) {
         Ok(state) => Json(state).into_response(),
-        Err(err) => home_error_response(err),
+        Err(err) => gateway_assistant_workspace_v2::migration_error_response(&err)
+            .unwrap_or_else(|| home_error_response(err)),
     }
 }
 
@@ -3753,7 +3772,12 @@ pub(super) fn recovery_readiness_for_context(
         &home_browser_localhost_root(context),
     ) {
         Ok(recovery) => {
-            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
+            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
+                && !recovery
+                    .required_actions
+                    .iter()
+                    .any(|action| action == "download_recovery_kit_with_profile")
+            {
                 RecoveryReadinessSummary::ready()
             } else {
                 RecoveryReadinessSummary::setup_required()
@@ -4382,8 +4406,10 @@ fn is_missing_principal_root_state_file(err: &anyhow::Error) -> bool {
 fn home_save_browser_state(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    input: HomeBrowserStateUpdate,
+    mut input: HomeBrowserStateUpdate,
 ) -> anyhow::Result<HomeBrowserStateSummary> {
+    let _migration_guard = gateway_assistant_workspace_v2::mutation_guard()?;
+    gateway_assistant_workspace_v2::preserve_legacy_home_agent(data_dir, context, &mut input)?;
     let mut state = home_browser_state(data_dir, context)?;
     if let Some(layout) = input.layout {
         state.layout = layout;
@@ -4872,16 +4898,20 @@ fn sanitize_home_session_targets(
     known_targets: &BTreeSet<String>,
 ) -> Option<serde_json::Value> {
     let session_object = session.as_object_mut()?;
-    let windows = session_object
+    let retains_agent = session_object.contains_key("agent");
+    let Some(windows) = session_object
         .get_mut("windows")
-        .and_then(|value| value.as_array_mut())?;
+        .and_then(|value| value.as_array_mut())
+    else {
+        return retains_agent.then_some(session);
+    };
     windows.retain(|window| {
         window
             .get("target")
             .and_then(|target| target.as_str())
             .is_some_and(|target| known_targets.contains(target))
     });
-    if windows.is_empty() {
+    if windows.is_empty() && !retains_agent {
         return None;
     }
     Some(session)
@@ -5940,6 +5970,7 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -5979,6 +6010,7 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -6021,6 +6053,7 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
             capability_request_count: 0,
@@ -6034,9 +6067,16 @@ mod home_realtime_tests {
             }),
         };
         let cursor = home_realtime_cursor(&snapshot);
+        let profile_changed = HomeRealtimeSnapshot {
+            profile_readiness: ProfileReadinessSummary::ready(),
+            ..snapshot
+        };
+        assert!(home_realtime_events(&cursor, &profile_changed)
+            .iter()
+            .any(|event| event.kind == "home.summary.changed"));
         let changed = HomeRealtimeSnapshot {
             recovery_readiness: RecoveryReadinessSummary::ready(),
-            ..snapshot
+            ..profile_changed
         };
 
         let events = home_realtime_events(&cursor, &changed);

@@ -1,12 +1,390 @@
 # State
 
-Last updated: 2026-09-03 UTC
+## Current public preview and review checkpoint, 2026-09-11
+
+`feat/0.7.1-integration` is the active working/review branch in
+[draft PR64](https://github.com/Elacity/elastos-runtime/pull/64), based on
+`upstream/0.7.1-dev` at `6c61c990`. Product checkpoint `06bf4e0f` preserves
+both website heads and the reviewed contributor histories. The redundant website
+refs and checkout are removed; the remaining donor/history gates still apply.
+
+Public website and Home now run `259666222f12b21283131cc7926ba7d0c1a52e99`,
+tree `419bdba6a09ed37e8176ddfda9c22c1a270f6054`. This extends the publication
+closeout with reconciled dependency locks and `--locked` setup builds.
+All 25 required Linux manifests passed locked offline checks, and the cached
+Linux source-home build completed. Application source retains the reviewed behavior.
+
+The authorized deployment at 17:42 UTC passed installed integrity, 573 artifact
+file comparisons, running Runtime parity and public website/Home/Services/Assistant
+hash checks. `/apps/home/` redirects to `/home/`. Account records, keys, user files
+and provider settings match the preserved state. Migration and restart receipts
+report zero migrated roots/objects. An owner-only identity directory and Runtime's
+empty identity lock are the recorded metadata changes. Anders confirmed existing-account sign-in and saved work. The temporary stage
+and bounded deployment rollback are removed.
+The configured Browser Engine is unavailable and inactive custody remains unconfigured.
+See [public preview proof](docs/audits/2026-09-11-public-preview.md).
+
+Mac checkpoint Homes retain installed code `3c2f9a80` and Runtime SHA-256
+`1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666`.
+Main/dev and contributor PRs retain their prior identities. Full J1 to J5 and
+D1 to D6 acceptance remains open. The [team report](docs/audits/2026-09-11-team-sync.md)
+and [contributor review](docs/audits/2026-09-11-contributor-review.md) cover
+5 to 11 September. Next implementation: exact Marketplace-to-Assistant handoff
+and safe removal, then cold Content/Carrier delivery. Recurring monitoring stays paused.
+
+Earlier dated records below retain their original artifacts and verdicts. This
+checkpoint owns the current public installation status.
+
+## Installed and source evidence
+
+The September 11 integration now uses the full donor history. The combined source
+preserves current recovery, cookie and shutdown code while adding model admission,
+provider lifecycle, storage and window behavior. Focused source and rendered
+fixtures pass; the earlier recovery human Homes remain `1e320578`. Full model history is
+merged by `b318bfda`, and Sash shelf ancestry is reconciled by `37c82d4f`. Irzhy
+foundation `617796a9` retains current lifecycle fixes after a reproduced explicit
+Carrier bind defect was repaired. Its focused source checks pass; dedicated
+provider-host and J5 installed proof remains pending. The bounded installed Qwen checkpoint now passes on Mac. The adapted URUX/UIUX candidate is already included through Irzhy reconstruction
+(`8b547590` → `7dd1780b` → `985fdffc`), with later Sash dock and lock-face
+changes. The proposed full old-URUX-tip merge is superseded by review of concrete
+remaining behavior differences. The remaining protected-content stack retains
+its source order and feature-preservation gates
+in [the integration check](docs/audits/2026-09-11-integration-preservation.md).
+The approved Assistant consolidation `fa297cb5` now passes source, rendered and installed Mac checks: one identity, real Qwen reply/save/reload, original draft/model preservation and full Runtime restart. The separate human Home now has an enrolled passkey account. Human review exposed stale System/Marketplace archive metadata; guard `822c4e3d` and corrected installation receipts close that launch gap. Anders confirms Assistant works. Current candidate `3c2f9a80` adds Keep intent during preparation, ordinary Marketplace model rows/details, shared Models theme tokens and distinct Assistant activity. Both Mac Homes have matching Runtime `1a55c86d95f5ca286bb63ee65242f3c23e19d0d1acd29888dc976b0033639666` and 84 served browser artifact records. Installed System retention readback and a real Qwen reply/save/reload pass; the human Home shows Qwen available locally with account and data preserved. Pending preparation is covered by Runtime/rendered tests while installed proof reuses the existing model admission. Original UI parity beyond this slice and full cross-platform J3 acceptance remain open. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md).
+
+
+The earlier isolated Mac J3 receipt records Runtime `fbf1a4b0` with matching build,
+installed and served hashes and current manifests. Signed catalog visibility,
+Use/cancel/retry, exact local package admission, cold startup, exact model
+selection, an actual Qwen reply and its saved conversation pass. Reply and unsent
+draft survive reload with the same CID/offer and zero implicit dispatches.
+Explicit Stop returns `settlement_unknown`; the UI says “Outcome unknown” and
+keeps that result after reload. This passes the approved honest-unknown alternative;
+confirmed backend cancellation remains unproven. The native adapter deliberately
+preserves this distinction when HTTP stream closure cannot confirm backend stop.
+
+Owned shutdown closes all 29 processes, including the model engine, closes a held
+HTTP connection and releases the port. The same installed Home restarts and produces a second real reply. All six package
+files keep their hashes, sizes, inodes and modification times; protected files and
+prior message hashes match. The original unsent draft is restored. There are zero
+Content mutations and zero Bitswap payload bytes received during measured reuse. The two model-menu gaps are repaired by `8f28b6e3` and pass installed checks: zero
+stale empty copy, a 10 px gap after refresh, normal picker close and unchanged
+workspace after reload. A copied release-cache metadata mismatch was captured
+and corrected as a source installation; the stamper regression prevents recurrence.
+Human Homes retain their existing candidate. Linux J3 requires additional disk
+headroom and a reviewed target startup profile. Its previews and data are preserved.
+The [integration check](docs/audits/2026-09-11-integration-preservation.md) records
+failures, repairs, independent review and the remaining full J3 gates.
+
+Last updated: 2026-09-11 UTC
+
+- Historical publication `00003b6f`, tree `7d816617`, was the website/recovery
+  review checkpoint. The later local integration donor and Assistant/model
+  repairs are now included in published integration. The original zero-offer
+  and duplicate-Assistant observations are superseded by the bounded installed
+  Mac results above; their original diagnostics and receipts remain historical.
+
+- The first J3 bootstrap slice integrates donor `c95cf4c9` with the current
+  media setup call sites. Small artifact fixtures and all 56 Runtime setup
+  tests pass on Mac ARM64; the basic repository gate passes. This is source
+  verification. Installed Homes remain `1e320578`; local provider/admission
+  source is now in the full donor merge. The installed diagnostic follows. See the
+  [bootstrap report](docs/audits/2026-09-11-j3-bootstrap.md).
+
+- User-review follow-up `1e320578` is installed in the two isolated human
+  Homes. System displays the restored Profile name for an unnamed current
+  passkey, and Recovery/Advanced spacing is repaired. Mac and Linux stay
+  signed in together in one browser cookie jar through reload/refresh;
+  signing out of Mac leaves Linux signed in. Current source, artifact,
+  process and served-file receipts pass. Restored user data is preserved.
+  AUTH-01 awaits final user acceptance. See the checkpoint report below.
+
+- The original combined automated J1/C2 checkpoint passes on Mac ARM64 and Linux
+  x86_64 installed candidate `f21d285e`. Browser recovery restores the original
+  Profile DID/name and covers wrong-password data preservation, retry and
+  reload/sign-in/System continuation. `a45164cf` repairs completed-kit retry
+  after a new sign-in; `f21d285e` repairs managed child ownership at shutdown.
+  Both targets close three held connections, all owned descendants and their
+  coordinates, release the port and restart the same Home. Full Home setup
+  repetition, media integrity and installed Carrier cleanup/reuse pass.
+  [The report](docs/audits/2026-09-11-first-checkpoint.md) binds source, hashes,
+  receipts and evidence limits. AUTH-01 retains its pending human passkey
+  verdict; isolated Homes are prepared. Automated test services are stopped,
+  C3/J3 execution has resumed and recurring monitoring stays paused. Existing user previews
+  and public stage retain `d790a48e`; public live remains unchanged.
+
+- J1 identity foundation integrates registration RP/origin binding and atomic,
+  conflict-safe identity persistence from donors `145fec2b` and `eb25f747`.
+  Forty-seven identity tests, eighteen gateway registration tests and one
+  cross-process auth-lock test pass on macOS ARM64 with Rust 1.91.0. Basic
+  repository gates pass. Existing gateway behavior is preserved. This is source
+  acceptance; installed J1 proof follows the remaining setup changes.
+
+- J1 account setup binds Create/Recover intent to passkey enrollment and
+  resumes interrupted owner creation. Product candidate `d790a48e` passed real
+  signed Mac installation, default setup, account creation, sign-out/sign-in,
+  System entry and Profile-inclusive Recovery Kit export. The user also ran
+  the installer successfully. Full recovery and the app matrix remain open.
+
+- The private seed now serves `d790a48e`, with Runtime SHA-256
+  `6068849b898284465980b049f37488f2f7de95db15c981529eadb389d7c41a53`.
+  Source, installed and served artifact checks pass. Actual passkey step-up
+  and a 5,032-byte Recovery Kit export pass; the kit includes the Profile and
+  matching principal binding. Smoke repair `49a62db1` selects the foreground
+  System window after recovery controls load. A separate clean preview is
+  available. Public live remains unchanged.
+
+- Mac testing exposed unclosed download connections, slow gateway shutdown
+  and duplicate media-tool installation. Carrier repair `4e62b6db` passes six
+  focused lifecycle tests and basic repository gates. Gateway connection closure passes five isolated tests; media setup reuse
+  passes seven setup/cache checks. The combined installed checkpoint now has the scoped results above; full
+  journey acceptance remains pending.
+  Recovery source `67572db1` enters kit selection before passkey setup;
+  exact Profile DID/name restoration, Home summary and retry checks pass. The installed preview retains its earlier recovery flow.
+
+- Closeout user findings: two Home assistant surfaces (one reported outdated),
+  model loading failure and Browser loading failure. Both `assistant` and
+  `home-agent` capsules exist in this candidate; their intended roles and
+  installed launch paths need reconciliation before retiring either surface.
+  These are priority open J3/J4 product issues, not verified capabilities.
+- Refreshed origin still has dev at `6c61c990`. The protected-content follow-up
+  branch moved from `decab1f5` to `06179578`; re-review its current PR62 scope
+  rather than relying on the older plan snapshot. Closeout inventory found
+  75 local branches and 12 worktrees. The follow-up review removed five fully
+  preserved branch names, leaving 70 branches and all 12 worktrees. All removed
+  tips and reflog revisions remain reachable; 24 other merged-tip candidates
+  retain unreviewed historical reflog work. Dirty donor work is preserved; the detached
+  Browser build is reachable from `fix/browser-maturity`. Repository-wide
+  branch consolidation remains open.
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
-## Release Posture
+## Execution evidence history — 2026-09-10
+
+The closeout facts above and the current handover control the next action.
+The snapshots below retain their original source and installed identities;
+earlier candidates and pending steps describe the state at that point.
+
+The first execution pilot is the public storefront and `/home/` on the seed,
+using reviewed source from the active local work. Mission R2 corrects an initial
+private-Mac interpretation. [TASKS.md](TASKS.md) is the current queue; the linked
+approved plan retains full release acceptance.
+
+- Freshly fetched public main is `8ac18bec` (`v0.7.0`); development is
+  `6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac`, tree
+  `184b7a52f93403956817cdb1a8a15781b76bb4e2`. PR58, PR52 and PR54 are merged.
+- The user chose that development base for `feat/0.7.1-website-execution`.
+  The branch began at the same commit/tree, zero ahead and zero behind. The
+  website, route and restart-helper source is reviewed in `cdcb7902`, tree
+  `564c5dddeebbd4f963182c05a240a157f6d1a775`, one commit after that fetched
+  development ref. This is the scoped C1 source; journey donor intake follows
+  under C2–C5. Publication and seed deployment remain pending.
+- Follow-up source commits are `92d1a31f` for fresh Linux setup/restart,
+  `e3478890` for installer platform/process handling and `c97e1c67` for dated
+  hosted evidence. Their file hashes match the reviewed test receipts.
+- Local integration donor `6972e165` is clean, tree `8b32a72a`, 51 ahead and
+  zero behind dev. Browser donor `50196355`, tree `f650c4dd`, is 164 ahead
+  and two behind dev, with seven preserved dirty files at the review snapshot.
+  These local lines are absent from the fetched origin branches.
+- Recorded Home installation remains `94ed0dc6`; diagnostic source `05ee824d`
+  was built from `e9b9baf7` and is uninstalled. Browser recorded Mac Runtime
+  is `690170bc`, Linux consumer/Exit is `b8c78d79`, and `de0a299e` remains
+  a built candidate. This task has not yet repeated their installed proof.
+- Public reads show root 200, `/home/` 404 and `/apps/home/` 200. Published
+  installer metadata remains `0.1.2`, with Linux x86_64 and aarch64 entries.
+  Served website and Home source identities remain unproved. The site must
+  distinguish download, source and hosted Runtime facts.
+- PR60 `617796a9` and PR59 `25ab205e` remain open; draft PR62 `decab1f5`
+  contains planned follow-up work. PR63 `424acd3d` supplies verified framing
+  under D6; the J1 replacement owns closure once visible.
+- The source pilot passes 31 focused Rust cases, four manifest follow-up cases,
+  Home recovery/sign-out checks, 20 website tests, six website checks and the
+  required entropy/format gates. Four rendered desktop/mobile cases cover
+  metadata success, absence and disagreement, keyboard use and layout.
+  Independent review resolved moving-source instructions, stale installer proof
+  and installed-app identity. Full Mac and Linux restart smokes also pass;
+  committed objects match the corresponding source and workbook receipts.
+  The three new journey rows retain pending target acceptance.
+- The installer bootstrap passes 18 offline tests with stock Bash 3.2,
+  including signed publisher envelopes and RFC 8032 vectors. Independent
+  comparison with a second Ed25519 implementation accepted 128 valid signatures
+  and rejected 256 modified inputs. Canonical Mac data/process handling and
+  complete candidate installation remain open at that bootstrap snapshot.
+  The subsequent platform slice passes 38 tests covering canonical Mac/Linux
+  data paths and process ownership. It preserves another installation sharing
+  a binary and retains state when captured children survive shutdown. Independent
+  review passed. Real three-platform installation remains open.
+- The 30-minute monitor is paused at closeout. Historical monitoring proof: Nine independent process cases
+  passed review. Its first real observation exposed task permission limits;
+  a writable shared state and coordinator reads resolved them in a second real
+  observation. The recurring timer subsequently delivered and the monitor wrote
+  and verified its observation. Old tasks retain their pause.
+- Seed preparation reproduced W2's two Linux prerequisites: an `already_ready`
+  upgrade creates no backup directory, and inherited shared-write permissions
+  can make the installation unsafe. The repairs pass focused Mac/Linux tests,
+  including empty and malformed receipts, inherited permissions and preserved
+  existing artifacts. The repaired frozen source `3e27cac8`, tree
+  `619657c5fee77bb226d5dedff689f873cbfb93e6`, completes fresh target
+  installation and startup using the completed build cache. Built, installed
+  and running Runtime SHA-256 is
+  `cac06eaef00b95559a5415ddce2ef4c3ba428d9c47deb34eb13121e2624e8947`.
+  All 25 HTTP checks pass, including website/Home artifact parity, redirects,
+  manifest identity and traversal rejection. Private desktop/mobile layout,
+  passkey sign-out/sign-in, Recovery Kit download and Profile creation pass.
+  The public target package is prepared. Public deployment and full journey
+  acceptance remain open.
+- Hosted website evidence can now identify a dated operator check of source,
+  tree and artifact hashes on the exact serving origin. Its source template
+  stays unverified until public proof. The follow-up passes 22 website tests,
+  six truth checks and four rendered receipt cases; it keeps install actions
+  unavailable. This dated record makes no claim of continuous verification.
+
+- Subsequent delivery source `a0743a17` binds the exact release envelope bytes
+  to a digest in the signed head. Independent review, 42 installer tests and
+  ten updater tests pass across both metadata transports. This source is outside
+  frozen seed `3e27cac8`. New clients require binding-ready publisher metadata;
+  publication and rollback must preserve that ordering.
+- Installed browser QA exposed stale driver controls and expired-token cleanup.
+  The repaired driver preserves recoverable test credentials, checks the actual
+  cleared sandbox and uses the visible returning-user control. Independent
+  review accepts the repair. Failed attempts remain in private evidence.
+  Ordinary seed UI checks then completed Recovery Kit and Profile creation.
+  A subsequent full app smoke stops at its outdated System launcher selector;
+  automated shell/app-matrix acceptance remains open in J1/C2.
+  The driver now uses the source-defined ElastOS menu and System Settings
+  control. Syntax, entropy and format checks pass; target rerun is pending.
+- The monitor delivered recurring observations but misapplied a historical stop
+  from a prior mission. The original message date and scope established the
+  error; the correction was withdrawn and the freshness rule is now explicit.
+- The user reported 20% weekly usage before the first public result. Current
+  execution is focused on C1 public website/Home delivery. Broader installer
+  and journey work stays queued at this boundary.
+- The public `v0.7.0` tag is `8ac18bec`; the distinct local `0.7.0` tag is
+  `3585f340`. The old updater selects release platform by CPU architecture,
+  so its Mac first hop needs an actual baseline and a recorded bridge decision.
+  Current tag assets and source-home receipts alone do not establish the
+  required ordinary update path.
+
+- The storefront follows the reviewed design reference with platform tabs and
+  a centered introduction. It explains local AI, Browser and protected publishing,
+  provides a first-use guide, describes Runtime/Home/Apps/permissions, and shows
+  feature availability. The 0.7.1 command remains hidden with Copy disabled until
+  its installer is served and verified; old public-version copy is omitted.
+  Desktop/mobile, keyboard and clipboard/fallback checks pass. User review and
+  public deployment approval remain open.
+- The candidate installer now runs Home setup and opens terminal Home after
+  verified bootstrap. It uses the installed binary's absolute path and reads
+  interactive input from the terminal. Headless setup prints the launch path;
+  install-only mode lets automation own setup and process cleanup. Forty-three
+  offline installer checks pass; four optional captured-public-fixture checks
+  were skipped. This is source/fixture proof. Actual fresh-device installation
+  and browser Home launch remain open.
+- The installation guides now explain that the source Home profile already
+  includes Documents, Library and the CLI's IPFS backend. Getting started omits
+  redundant component setup. The Mac guide selects an explicit development ref,
+  loads Rust into the shell and supplies the required collaboration setup mode.
+  These documentation corrections preserve the open Content/Carrier acceptance.
+
+- Release publisher manifests now use full OS/CPU platform filenames in local
+  exports and ledger reads. A regression reproduced Linux ARM capsule data in
+  the Darwin ARM ledger before the repair. The three-platform ledger test and
+  all 21 publisher tests pass; shell export checks pass for three host/cross
+  combinations. Independent source review found no further affected consumers.
+  Native support assets now select the host OS target while microVM guests
+  retain Linux targets. ARM Linux preflight now checks the musl artifact used
+  by the shell publisher; GNU-only input rejects before publication. Three
+  native/guest target cases and all 21 publisher tests pass with independent
+  source review. Complete artifact assembly and fresh installation remain
+  delivery work.
+
+- The publisher now assembles its served artifact directory before release
+  signing, including universal app archives previously omitted from that copy.
+  Staged Runtime and manifest hashes must match the release descriptors. The
+  component checker also verifies advertised local app, provider metadata and
+  capsule file sizes/hashes, and rejects unsafe paths and file types. Five
+  regression groups pass, including ten cases through the actual pre-signing
+  gate. Independent source review found no concrete issues. These checks are
+  wired into CI and `just verify`; remote CI has not run for this local work.
+  URL-only dependencies, complete platform-input admission, atomic promotion
+  and fresh installation remain separate open delivery checks.
+
+- The low-level publisher now rejects `--dry-run` before side effects and
+  directs operators to the existing read-only `elastos publish-release` planner.
+  The former shell mode still reached upload/Publisher-write code despite its
+  no-write description. The full-script tripwire test reproduced an attempted
+  temporary-key allocation, then passed after repair. Six publisher regression
+  groups and independent source review pass. Normal publication keeps its
+  existing behavior and approval gate.
+
+- App and provider-metadata archives now use Python's standard library, replacing
+  GNU-only tar options that failed on macOS. The archive writer preserves app
+  layout, executable files and symbolic links, with normalized file metadata.
+  Seven publisher regression groups pass. The same fixture on macOS ARM64
+  (Python 3.9) and Linux x86_64 (Python 3.12) produces identical compressed
+  bytes and extracts with each system's tar. Independent source review passes.
+  Archive hashes change from the previous writer; a new candidate must bind
+  the new bytes. Full candidate builds and device installation remain open.
+
+- Direct app, native provider and provider-metadata builders now record local
+  file descriptors before any capsule upload. Publication attaches real CIDs
+  in a separate step. Build and archive failures return through Bash command
+  substitutions, and nested app entrypoints get their parent directory before
+  copying. Ten regression groups pass on macOS and Linux, including four
+  preparation failures that stop before upload. Independent source review and
+  required source checks pass. Actual candidate installation remains open.
+
+- The native preparation worker builds from a clean Git revision and tracked
+  Cargo lockfiles, then exports local artifacts with an unsigned source/file
+  receipt. Admission checks all three platform inputs against the candidate
+  source, component template, native OS/CPU, provider contracts and exact file
+  inventory. Preparation and admission fixtures pass for all three platforms.
+  Actual Mac, Linux x86 and Linux ARM preparation pass from 8587dff6, including managed
+  media delivery. All three inputs pass full file verification; shared app and
+  provider-metadata archives match across platforms. Linux ioctl and custody
+  syscall repairs pass native compilation and focused tests. Publisher input
+  staging and its CLI pass offline checks and Linux musl tests. Complete
+  publication promotion, final input regeneration and signed fresh installs
+  remain open.
+
+- Three standalone Linux Browser helpers now have tracked Cargo lockfiles.
+  Their registry versions and checksums match the existing Runtime workspace
+  pins. Offline locked dependency resolution passes for all three projects.
+
+- Home CLI delivery now uses one platform-specific capsule archive containing
+  its native terminal renderer. Runtime and source-home provisioning use the
+  same installed capsule path. Checks reject missing, non-executable, malformed
+  or wrong-platform renderers before launch. A real Mac renderer build and
+  archive extraction match byte for byte; narrow Rust extraction/launch tests
+  and eight preparation fixtures pass. Development fixtures use the installed
+  renderer, and the demo reports incompatible older releases before launch.
+  Full signed fresh-device acceptance remains open.
+
+- Managed Home now has one media-tools component containing FFmpeg and FFprobe,
+  built from pinned FFmpeg 9.0.1 and x264 sources with their source and licenses.
+  Setup installs and verifies this archive before private media import. Ordinary
+  setup uses the supplied pair; source-home has an explicit developer directory.
+  New data roots and archive directories have explicit permissions. Tests cover
+  common umasks, real archive extraction/import, existing unsafe paths, pair
+  mismatch and source/recipe tampering. Mac tools build with system-only shared
+  dependencies. Signed fresh installation and replacement of older imported
+  media tools remain open.
+
+- The focused required video repair from donor e3a8c4eb makes media-provider
+  accept Runtime's current invocation ABI and normalize FFmpeg DASH segments to
+  the existing zero-based contract. Runtime preserves codec configuration boxes
+  through protection. Provider and contract regressions pass; an actual generated
+  video run through the relocated tools, provider and Runtime validator accepts
+  one track, two segments and 128 samples. Full J5 purchase/playback/cleanup and
+  the required external review remain open.
+
+The source and installed sections below preserve the earlier evidence snapshot.
+Their original identities qualify those results. Current milestone receipts
+above take precedence where the work has moved; remaining sections are refreshed
+as their journeys are accepted.
+
+## Prior release/source snapshot — 2026-09-03
 
 - A fresh fetch records `origin/main` at `8ac18bec` as the released `v0.7.0`
   source and `origin/upstream/0.7.1-dev` at `c511b133` as the active
@@ -129,8 +507,9 @@ unchained audit history. Current signed-checkpoint policy owns compatibility;
 retaining those donors does not mean their behavior is in the candidate.
 
 The reviewed content-distribution, Recovery/Profile and WSL-first documents
-are included. The catalog currently projects installed capsules; signed network
-discovery, Home Get and model-content packaging remain planned work. WSL
+are included. The combined source projects installed capsules and a verified signed model
+catalog. Local Content preparation and admission are implemented; ordinary cold
+Carrier delivery and the Marketplace-to-Assistant handoff remain open. WSL
 packaging and native Windows support also remain unproved product targets.
 
 Runtime owns authenticated principal and session authority, capability
@@ -229,6 +608,87 @@ media, ciphertext staging, CEKs, and shares inside their private process
 boundaries. Each custody node owns one independent share and its node-local
 rights check. Runtime and capsules do not receive private provider, storage,
 Chain, RPC, or Carrier topology.
+
+Verified on branch `feat/protected-content-installed-e2e-proof` between
+2026-09-02 and 2026-09-04, against the simulation-only
+`deploy/custody-host/` three-node harness (see its own README for the
+simulation boundary):
+
+- The three-node compose harness is live with DID-keyed public descriptor
+  handoff, and node resurrection after stop/start is proven on three separate
+  occasions: each node returns with the same DID, a fresh readiness receipt,
+  and zero required environment variables.
+- Real `CarrierPeerDid` transport dial proofs exist for each node: a signed
+  operator-control denial plus the container-side audit log recording the
+  dialing client's DID.
+- The offline 2-of-3 custody composition ceremony
+  (`elastos protected-content-config`) runs over three real node descriptors
+  exported by the harness, and its own verify path passes.
+- `protected-content-installed-e2e-proof.sh --phase preflight` reports
+  `preflight_ok: true` for all three nodes' descriptors, dials, and receipts.
+- `scripts/custody-harness-ci-smoke.sh` (the CI-safe `provision` + `preflight`
+  rehearsal against a fresh throwaway harness instance) passes fully, locally.
+
+Verified on the same branch between 2026-09-05 and 2026-09-07, live, against
+the same simulation-only three-node harness, with the installed client
+Runtime (`scripts/setup-source-home.sh` receipt, started by
+`scripts/mac-source-home-restart.sh`) and three custody-host containers built
+from the reviewed server/capsules tree, an Anvil fork of Base as the private
+chain (two distinct-origin evidence RPC sources, finality advanced by a block
+ticker) and headless, recovery-ready, profiled principals (creator, buyer,
+denial) with managed wallet accounts funded through `anvil_setBalance`:
+
+- The full installed journey ran end to end and the finalize receipt reads
+  `overall_ok: true` with every required phase present and `ok: true`: mint
+  (real ffmpeg DASH preparation, CENC protection, three-node custody
+  provisioning, a signed availability receipt with three replicas and a live
+  multi-peer proof, the on-chain mint and the ERC-1155 operator approval on
+  the operative), availability, buy (fresh availability, `buyAccess`
+  finalized on both evidence sources), open (managed-wallet viewer release
+  approval, a 2-of-3 release settled by the nodes' own chain rights evidence,
+  init and segment reads, close), the custody and replica drills, the
+  negative cases (below quorum fails closed, non-purchaser and cross-principal
+  reads denied, stale replay rejected, tampered custody share excluded), the
+  mid-session restart (SIGKILL between approval and confirmation, no
+  duplicate transaction), cleanup (explicit close settles; the boot sweeper
+  settles a lease abandoned by a mid-open kill) and finalize.
+- Product contracts observed live and now asserted by the driver: one
+  stopped or tampered committee member does not deny the viewer (2-of-3
+  serves; below quorum with two nodes down fails closed on availability);
+  `content status` reports the last stored availability receipt; media parts
+  are released strictly in order; a non-purchasing principal is refused by
+  the purchase gate before any session gate.
+- A custody committee member settles every release through its own chain
+  rights evidence, so the standalone provider host and the custody-host
+  image carry the chain plane (trusting the provisioned client issuer), and
+  each node needs the client's network configuration with evidence RPC URLs
+  reachable from the node.
+- The receipt's phase blocks cite the branch commits current when each phase
+  ran (the branch was re-folded to three commits during the run); the
+  binding evidence is the recorded host and per-container binary sha256.
+  After the proof, the server/capsules commit took two lint-only edits to
+  pass `cargo clippy --all-targets -D warnings` (an explicit
+  `too_many_arguments` allow on `RuntimePreparedRecipient::from_persisted_parts`
+  and boxing the signed arm of `RuntimeReleaseWalletOutcome`) plus test-only
+  changes (the mock wallet binds outcomes on the real six authority fields,
+  a regression test for the restart-completion projection); no behaviour
+  changed, and the proof binaries predate those edits.
+
+Not yet verified: the same journey on distinct seed/third-node hardware
+across genuinely distinct operators and failure domains (gates 3 and 4), a
+real Base deployment instead of the Anvil fork, and the in-browser Brave
+UIUX path of the journey (gate 8). The local `custody-harness-ci-smoke.sh`
+runs are arm64 on Docker Desktop; the CI job `custody-harness-smoke` ran for
+the first time on a Linux amd64 runner on 2026-09-07 (PR #57) and failed
+before any node exported its descriptor: a bind mount keeps the host
+directory's owner and mode on Linux, so the containers' unprivileged user
+could not write `shared/` (Docker Desktop maps that ownership away, which
+is why no macOS run could see it). `up.sh` and the entrypoint now handle
+that host explicitly and the smoke preserves the nodes' logs on failure;
+the third run on that runner (2026-09-07, after the same steps had passed on
+a plain Linux Docker Engine in a VM) is green: three distinct DID-keyed
+descriptors, composition generated and verified, three Carrier dial proofs,
+provision and preflight `ok: true`, clean teardown.
 
 ## PR15 Extraction Ledger
 
@@ -434,12 +894,11 @@ complete. Installed proof and the atomic authority cutover remain open.
   boundary.
 - A missing installed components manifest or model-provider entry leaves the
   provider unconfigured and unavailable. Runtime does not select a fallback.
-- The current localhost installation has no
-  `providers/model-provider/config.json`, so the provider reports an honest
-  zero-offer state. The current provider can call an OpenAI-compatible Chat
-  Completions backend. It does not yet own a local engine lifecycle, implement
-  a provider-internal OpenAI Responses API adapter, or publish a remote model
-  service.
+- The preserved human-test installations still report zero offers. The combined
+  source now owns the bounded local llama lifecycle, verified model admission,
+  restart reconciliation and provider-internal Chat Completions/Responses adapters.
+  Model-provider source verification passes 204 unit and five process tests;
+  paid hosted calls and installed Qwen acceptance retain their separate gates.
 - The current source does not integrate the Codex SDK. Codex remains a later
   agent-execution adapter behind typed agent operations and explicit
   filesystem, network, tool, and approval grants. It is not a model offer.
@@ -447,36 +906,26 @@ complete. Installed proof and the atomic authority cutover remain open.
   `base_path`, `allowed_paths`, `read_only`, `encryption_key`, and `extra`
   without weakening strict unknown-field handling. The zero-offer stdio Init
   test passes with the Runtime envelope in source tests.
-- Assistant is a standalone first-party capsule with its own protected
-  workspace. Its tested Chat, Build, and Studio behavior uses typed model
-  offers and runs. Transcript copy goes only through the trusted Home
-  Clipboard path.
-- Home Agent is the Home-owned Agent face. Home GUI owns the Shelf transition
-  to its composer, Agent Space, and `launchHomeTarget`. `home-agent` owns
-  sessions, transcript, composer, and settings. Runtime owns the protected,
-  revisioned workspace and model-proxy binding.
-- Home Agent uses the typed `offers_list`, `runs_create`, `runs_events`, and
-  `runs_cancel` operations. Its Home message contract is pinned. The source has
-  one Shelf and one Home-owned Agent face, and the Agent room stays in the
-  Space ring. Fixes `450db538` and `900d7e5c` keep activation, message routing,
-  and saved layout upgrades on that canonical path without a duplicate generic
-  window.
-- Runtime accepts one opaque, bounded workspace envelope for this local
-  contract. Typed document schemas remain future work when a cross-authority
-  operation needs them.
-- Assistant model messages render a self-contained safe markdown subset with
-  escaped HTML, inert links, headings/lists/blockquotes/tables, fenced and
-  inline code, and inline/display math through vendored KaTeX 0.18.3. Focused
-  source proof lives in `scripts/assistant-shell-smoke.mjs`. The Home audit
-  records observed UI behavior separately; configured model-run and advanced
-  workflow acceptance remain open.
-- Home Agent is the canonical Home-integrated Agent surface. Standalone
-  Assistant remains installed while the product inventories and tests its
-  distinct working behavior. It can remain as an explicitly scoped optional
-  app, or its useful behavior can move before removal. Future Home Agent tools,
-  Library reads, web search, Studio, Usage, and sampling controls require their
-  typed Runtime operations first. The zero-offer Home Agent state is installed
-  proof of honest absence, not configured inference.
+- Assistant is the canonical first-party capsule for Sash’s Agent Space,
+  conversation UI and composer, with Chat, Build and Studio controls. Home GUI
+  owns shelf motion and the frame; Runtime owns protected workspace v2 and model
+  authority. Legacy Home Agent launches resolve to Assistant before token creation.
+- Source installers retire the old Home Agent capsule tree while retaining its
+  protected workspace. Migration preserves all three old stores, full records,
+  editable drafts and exact run identities. Concurrent edits retain both versions.
+- Typed model controls retain exact CID/offer selection. Studio saves request
+  identity before create and keeps per-session drafts, run cursors and output
+  history. Historical foreign runs and copied sessions retain their original
+  identities without acquiring authority. Copy uses trusted Home Clipboard.
+- The source and rendered preservation gates pass. Installed canonical Assistant
+  `fa297cb5` passes one catalog identity, legacy launch, a real Qwen reply, exact
+  saved/reloaded text and model selection, and owned shutdown/restart. Current
+  build/installed/served receipts match. The new human Home has an enrolled passkey account and a locally cached
+  Qwen package. System/Marketplace metadata repair `822c4e3d` passes actual
+  launch. Anders now confirms successful Assistant use; current `3c2f9a80` also passes the bounded Models/activity follow-up described above. Full human J3 acceptance remains pending. Earlier Home Agent and standalone Assistant observations above are
+  historical target receipts. Advanced tools, Library reads, search and broader Studio capabilities
+  retain their typed-contract gates.
+
 
 ## System Truth
 
@@ -490,7 +939,7 @@ complete. Installed proof and the atomic authority cutover remain open.
 
 ## Home Shell Truth
 
-- `/apps/home/` remains the Home front door. The current internal shell model is
+- `/home/` is the Home front door; `/apps/home/` remains a compatible old entry. The current internal shell model is
   `home-shell-host` for host lifecycle, `home-gui` for the desktop projection,
   and `home-cli` for the command projection.
 - `home` remains the installed host/front-door bridge id for `/apps/home/`;

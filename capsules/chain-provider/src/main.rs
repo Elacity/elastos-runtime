@@ -166,6 +166,9 @@ impl ChainProvider {
             Request::DescribeProtectedContentCreatorMintSource => {
                 self.describe_protected_content_creator_mint_source()
             }
+            Request::DescribeProtectedContentMarketSource { network } => {
+                self.describe_protected_content_market_source(&network)
+            }
             Request::ResolveProtectedContentCreatorMint {
                 creator,
                 token_uri,
@@ -1086,6 +1089,22 @@ impl ChainProvider {
         Response::ok(json!({
             "schema": PROTECTED_CONTENT_POLICY_SCHEMA,
             "policy_body": format!("0x{}", encode_hex(&policy_bytes)),
+        }))
+    }
+
+    /// The market contract a creator must authorise as ERC-1155 operator on
+    /// the ledger before a buyer can be delivered a copy: the Runtime checks
+    /// and, if needed, raises that approval in the creator tail.
+    fn describe_protected_content_market_source(&self, network_id: &str) -> Response {
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_MARKET_SOURCE_SCHEMA,
+            "network": network_id,
+            "authority_gateway_contract": normalize_evm_address(&market.authority_gateway_contract),
+            "evidence_rpc_sources": market.evidence_rpc_urls.len(),
         }))
     }
 
@@ -2328,7 +2347,7 @@ impl ChainProvider {
         data: &str,
         expected_content_access_id: &ContentAccessIdV1,
     ) -> Result<ProtectedContentRightsObservation, Response> {
-        let mut successful = Vec::new();
+        let mut observed: Vec<(&String, ProtectedContentRightsObservation)> = Vec::new();
         for rpc_url in evidence_rpc_urls {
             if let Some(observation) = self.observe_protected_content_rights_source(
                 network,
@@ -2337,9 +2356,13 @@ impl ChainProvider {
                 data,
                 expected_content_access_id,
             ) {
-                successful.push(observation);
+                observed.push((rpc_url, observation));
             }
         }
+        let mut successful: Vec<ProtectedContentRightsObservation> = observed
+            .iter()
+            .map(|(_, observation)| *observation)
+            .collect();
         if successful
             .iter()
             .any(|observation| observation.chain_id != expected_chain_id)
@@ -2355,6 +2378,43 @@ impl ChainProvider {
                 "protected-content evidence sources produced fewer than two matching finalized observations",
             ));
         }
+        // Independent sources legitimately lag each other by a block or more
+        // in what they consider finalized (finality is monotone, so the
+        // lowest finalized head is final on every source). When the heads
+        // differ, pin every source to that lowest finalized block: the
+        // block must be canonical there by hash, and the rights call is
+        // re-evaluated at exactly that block, so the corroboration compares
+        // the same finalized state everywhere instead of racing finality.
+        let heads_agree = successful[1..].iter().all(|observation| {
+            observation.finalized_block_number == successful[0].finalized_block_number
+                && observation.finalized_block_hash == successful[0].finalized_block_hash
+        });
+        if !heads_agree {
+            let pin = *successful
+                .iter()
+                .min_by_key(|observation| observation.finalized_block_number)
+                .expect("at least two observations");
+            let mut pinned = Vec::with_capacity(observed.len());
+            for (rpc_url, _) in &observed {
+                if let Some(repinned) = self.observe_protected_content_rights_source_at(
+                    network,
+                    rpc_url,
+                    contract,
+                    data,
+                    expected_content_access_id,
+                    &pin,
+                ) {
+                    pinned.push(repinned);
+                }
+            }
+            successful = pinned;
+            if successful.len() < 2 {
+                return Err(Response::error(
+                    "insufficient_rights_observations",
+                    "protected-content evidence sources produced fewer than two matching finalized observations",
+                ));
+            }
+        }
         let reference = successful[0];
         if successful[1..]
             .iter()
@@ -2366,6 +2426,49 @@ impl ChainProvider {
             ));
         }
         Ok(reference)
+    }
+
+    /// Re-observes one source at a pinned finalized block: the block must be
+    /// canonical on that source under the pinned hash, and the rights call
+    /// is evaluated at exactly that block.
+    fn observe_protected_content_rights_source_at(
+        &self,
+        network: &ChainNetwork,
+        rpc_url: &str,
+        contract: &str,
+        data: &str,
+        expected_content_access_id: &ContentAccessIdV1,
+        pin: &ProtectedContentRightsObservation,
+    ) -> Option<ProtectedContentRightsObservation> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let block = self
+            .evm_rpc(
+                &source_network,
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", pin.finalized_block_number), false]),
+            )
+            .ok()
+            .and_then(|value| evm_finalized_block(&value).ok())?;
+        if block.finalized_block_number != pin.finalized_block_number
+            || block.finalized_block_hash != pin.finalized_block_hash
+        {
+            return None;
+        }
+        let outcome = self.protected_content_eth_call_outcome(
+            &source_network,
+            contract,
+            data,
+            &pin.finalized_block_hash,
+            expected_content_access_id,
+        )?;
+        Some(ProtectedContentRightsObservation {
+            chain_id: pin.chain_id,
+            finalized_block_number: pin.finalized_block_number,
+            finalized_block_hash: pin.finalized_block_hash,
+            finalized_block_timestamp: block.finalized_block_timestamp,
+            outcome,
+        })
     }
 
     fn observe_protected_content_rights_source(
@@ -2946,10 +3049,9 @@ fn main() {
             continue;
         }
 
-        let request = match serde_json::from_str::<Request>(&line) {
+        let request = match decode_request_frame(&line) {
             Ok(request) => request,
-            Err(err) => {
-                let response = Response::error("invalid_request", &err.to_string());
+            Err(response) => {
                 writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
                 stdout.flush().unwrap();
                 continue;

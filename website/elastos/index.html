@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ElastOS | Your apps. Your Home.</title>
+  <meta name="description" content="Your files, apps and contacts in one desktop. Open ElastOS Home in your browser, or install the Runtime on your own hardware.">
+  <meta name="theme-color" content="#050608">
+  <link rel="icon" href="./assets/elastos-mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./site.css">
+  <script src="./site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="ElastOS website"><img src="./assets/elastos-logo.svg" width="168" height="28" alt="ElastOS"></a>
+      <span class="release-badge">0.7.1 <span>preview</span></span>
+      <nav aria-label="Main navigation">
+        <a href="#explore">Explore</a>
+        <a href="#status">Status</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs">Docs</a>
+      </nav>
+      <a class="header-home" href="/home/">Open Home <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <img class="hero-mark" src="./assets/elastos-mark.svg" width="80" height="80" alt="">
+        <h1 id="hero-title">ElastOS</h1>
+        <p class="hero-tagline">A personal computer you control,<br>with your choice of apps and AI.</p>
+        <p class="hero-lead">Open your desktop in a browser. Keep your files on your own computer or a server you choose, and decide what each app or assistant can access.</p>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Install ElastOS <span aria-hidden="true">↓</span></a>
+          <a class="button secondary" id="open-home" href="/home/">Try Home <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="action-note">Development preview.</p>
+      </section>
+
+      <section class="install-section" id="install" aria-labelledby="install-title">
+        <div class="install-heading"><h2 id="install-title">Install on your hardware</h2><span class="install-version">0.7.1</span></div>
+        <div class="install-card">
+          <div class="platform-tabs" role="tablist" aria-label="Installation platform">
+            <button type="button" role="tab" id="linux-x86" aria-selected="true" aria-controls="install-panel" data-platform="Linux x86_64" tabindex="0">Linux x86_64</button>
+            <button type="button" role="tab" id="linux-arm" aria-selected="false" aria-controls="install-panel" data-platform="Linux ARM64" tabindex="-1">Linux ARM64</button>
+            <button type="button" role="tab" id="mac-arm" aria-selected="false" aria-controls="install-panel" data-platform="macOS · Apple silicon" tabindex="-1">macOS · Apple silicon</button>
+          </div>
+          <div class="install-body" id="install-panel" role="tabpanel" aria-labelledby="linux-x86" tabindex="0">
+            <p class="install-caption">One command. Setup included.</p>
+            <div class="command-box">
+              <pre tabindex="0" aria-label="Installation command" hidden><code id="install-command">curl -fsSL https://elastos.elacitylabs.com/install.sh | bash</code></pre>
+              <p class="install-status" id="install-status">0.7.1 installer coming soon.</p>
+              <button type="button" class="copy-button" id="copy-install" disabled aria-describedby="install-status">Copy</button>
+            </div>
+            <p class="sr-only" id="copy-status" role="status" aria-live="polite"></p>
+            <a class="text-link" id="install-guide" href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs/INSTALL.md">Installation guide <span aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+        <p class="install-alternative">Want to try it first? <a href="/home/">Open Home in your browser <span aria-hidden="true">↗</span></a></p>
+      </section>
+
+      <section class="section" id="explore" aria-labelledby="explore-title">
+        <div class="section-heading"><p class="eyebrow">Inside Home</p><h2 id="explore-title">Apps that work on your terms.</h2><p>Keep your documents, messages and media together. Choose the tools you use and decide what an app or assistant can do with your work.</p></div>
+        <div class="features-grid">
+          <article class="feature-card"><div class="feature-heading"><span class="feature-kind">AI</span><span class="status-label">Preview</span></div><h3>Run models on your hardware</h3><p>Choose a model to run on your computer. Give an assistant access to the information it needs for a task, with separate permission to change or share your work.</p><a href="#status">Local AI status <span aria-hidden="true">↓</span></a></article>
+          <article class="feature-card"><div class="feature-heading"><span class="feature-kind">Browser</span><span class="status-label">Preview</span></div><h3>Bring the web into Home</h3><p>Open websites in Browser with Wallet available for dapps. Runtime manages the Browser service and its network access.</p><a href="#status">Browser status <span aria-hidden="true">↓</span></a></article>
+          <article class="feature-card"><div class="feature-heading"><span class="feature-kind">Publishing</span><span class="status-label">In testing</span></div><h3>Set access rules for your content</h3><p>Publish protected video, list it for purchase and let buyers play it through their granted access. Publishing and playback use the same identity and permissions system.</p><a href="#status">Protected video status <span aria-hidden="true">↓</span></a></article>
+        </div>
+      </section>
+
+      <section class="section first-steps" id="first-steps" aria-labelledby="first-steps-title">
+        <div class="section-heading">
+          <p class="eyebrow">Start with Home</p>
+          <h2 id="first-steps-title">Your first 10 minutes</h2>
+          <p>Open Home and follow the setup guide, then try your first app.</p>
+        </div>
+        <div class="steps-grid">
+          <article class="step-card"><span class="step-number">01</span><h3>Sign in with a passkey</h3><p>Use your device to sign in. If you are setting up a new Home, create its first passkey.</p><a href="/home/">Open Home <span aria-hidden="true">↗</span></a></article>
+          <article class="step-card"><span class="step-number">02</span><h3>Save your Recovery Kit</h3><p>Download your Recovery Kit during setup and keep it somewhere safe. You will need it if you lose access.</p><span class="step-location">System Settings → Security</span></article>
+          <article class="step-card"><span class="step-number">03</span><h3>Review your profile</h3><p>Open People to view your profile and change the name others see when they connect with you.</p><span class="step-location">Home → People</span></article>
+          <article class="step-card"><img src="./assets/documents.png" width="36" height="36" alt=""><h3>Write something</h3><p>Open Documents, start a document and save it. Return to your draft from Home.</p><span class="step-location">Home → Documents</span></article>
+          <article class="step-card"><img src="./assets/library.png" width="36" height="36" alt=""><h3>Explore your files</h3><p>Open Library to browse the files in your Home and find what you have saved.</p><span class="step-location">Home → Library</span></article>
+          <article class="step-card"><img src="./assets/system.png" width="36" height="36" alt=""><h3>Make Home yours</h3><p>Use the ElastOS menu to open System Settings. Manage your account, appearance and services.</p><span class="step-location">ElastOS menu → System Settings</span></article>
+        </div>
+      </section>
+
+      <section class="section" id="about" aria-labelledby="about-title">
+        <div class="section-heading"><p class="eyebrow">How it fits together</p><h2 id="about-title">What ElastOS is</h2></div>
+        <div class="concept-grid">
+          <article><span class="concept-number">01 /</span><h3>Runtime</h3><p>The software that runs on your machine. It manages apps, services and access to your data.</p></article>
+          <article><span class="concept-number">02 /</span><h3>Home</h3><p>Your desktop in the browser. Sign in with a passkey to open apps and manage your account.</p></article>
+          <article><span class="concept-number">03 /</span><h3>Apps</h3><p>Signed packages for tasks such as writing, managing files and connecting with people. Your documents and settings stay separate from the installed app.</p></article>
+          <article><span class="concept-number">04 /</span><h3>Permissions</h3><p>Reading a document, changing it and sharing it each need permission. Runtime checks access for apps and AI agents alike.</p></article>
+        </div>
+      </section>
+
+      <section class="section" id="status" aria-labelledby="status-title">
+        <div class="section-heading"><p class="eyebrow">0.7.1 preview</p><h2 id="status-title">What works today</h2><p>Start with Home. The wider app and device experience is still in testing.</p></div>
+        <div class="status-table-wrap">
+          <table class="status-table">
+            <thead><tr><th scope="col">Feature</th><th scope="col">Status</th><th scope="col">What to expect</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Passkeys, Recovery Kit and Profile</th><td><span class="status-label available">Available in Home</span></td><td>Create your account and profile, then save your Recovery Kit.</td></tr>
+              <tr><th scope="row">Documents and Library</th><td><span class="status-label">Preview</span></td><td>Write documents and browse files. The full save and sharing experience is still being tested.</td></tr>
+              <tr><th scope="row">Install on your device</th><td><span class="status-label">Coming soon</span></td><td>The 0.7.1 installer will support Linux and Apple silicon Macs.</td></tr>
+              <tr><th scope="row">Update an existing installation</th><td><span class="status-label">In testing</span></td><td>The 0.7.1 upgrade path is being checked for preservation of accounts, settings and files.</td></tr>
+              <tr><th scope="row">Local AI</th><td><span class="status-label">Preview</span></td><td>Requires a configured model service. Getting and using models directly from Home is in development.</td></tr>
+              <tr><th scope="row">Browser</th><td><span class="status-label">Preview</span></td><td>Requires a configured Browser service. Media playback and reconnect behavior are still in testing.</td></tr>
+              <tr><th scope="row">Protected video</th><td><span class="status-label">In testing</span></td><td>Publishing, purchases and playback are being tested together.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section developer-section" id="developers" aria-labelledby="developer-title">
+        <div class="section-intro">
+          <p class="eyebrow">For developers</p>
+          <h2 id="developer-title">Build with ElastOS.</h2>
+          <p>ElastOS is open source and in active development. Build the Runtime on your own computer, work on an app, or help improve the project.</p>
+          <a class="text-link" href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev">Explore the source <span aria-hidden="true">↗</span></a>
+        </div>
+        <div class="developer-links">
+          <h3>Help improve Home</h3>
+          <p>Report bugs or confusing parts of Home in GitHub issues. Include what you tried and what happened.</p>
+          <a href="https://github.com/Elacity/elastos-runtime/tree/upstream/0.7.1-dev/docs">Read the development docs <span aria-hidden="true">↗</span></a>
+          <a href="https://github.com/Elacity/elastos-runtime/issues">Report an issue <span aria-hidden="true">↗</span></a>
+        </div>
+      </section>
+    </main>
+    <footer>
+      <a class="brand" href="/" aria-label="ElastOS website"><img src="./assets/elastos-logo.svg" width="132" height="22" alt="ElastOS"></a>
+      <p>Hosted by Elacity Labs.</p>
+      <div>
+        <a href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md">Development status</a>
+        <a href="https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/LICENSE">License</a>
+        <a href="https://github.com/Elacity/elastos-runtime/security/advisories/new">Report a security issue</a>
+      </div>
+    </footer>
+  </div>
+</body>
+</html>

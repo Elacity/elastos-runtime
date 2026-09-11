@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-/* Home Agent capsule gate.
+/* Canonical Assistant Sash capsule gate.
 
    Encodes what the capsule owes the Runtime and Home GUI, in Anders' terms:
    - inference runs only through the typed model contract (offers_list,
      runs_create with a typed input, runs_events by after_sequence, runs_cancel);
      no offer is named in source, no ping, no mock provider, no mock reply,
      no surface the Runtime does not back (tool grants, plan, workbench,
-     model catalog, Studio);
+     speculative model downloads or mock Studio);
    - the workspace is a Runtime object behind the capsule's launch token,
      revisioned, never browser storage;
    - Home GUI owns the morph and the place; the capsule speaks to Home only by
@@ -18,21 +18,22 @@ import { readFileSync, readdirSync } from "node:fs";
 
 const root = new URL("../", import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), "utf8");
-const capsuleDir = new URL("capsules/home-agent/browser/", root);
+const capsuleDir = new URL("capsules/assistant/browser/", root);
 const capsuleScripts = readdirSync(capsuleDir)
   .filter((name) => name.endsWith(".js"))
   .map((name) => [name, readFileSync(new URL(name, capsuleDir), "utf8")]);
 
-const agentLive = read("capsules/home-agent/browser/agent-live.js");
-const agentStream = read("capsules/home-agent/browser/agent-stream.js");
-const agentHarness = read("capsules/home-agent/browser/agent-harness.js");
-const harnessHost = read("capsules/home-agent/browser/harness-host.js");
-const entry = read("capsules/home-agent/browser/home-agent.js");
-const indexHtml = read("capsules/home-agent/browser/index.html");
-const manifest = JSON.parse(read("capsules/home-agent/capsule.json"));
+const agentLive = read("capsules/assistant/browser/agent-live.js");
+const agentStream = read("capsules/assistant/browser/agent-stream.js");
+const agentHarness = read("capsules/assistant/browser/agent-harness.js");
+const harnessHost = read("capsules/assistant/browser/harness-host.js");
+const entry = read("capsules/assistant/browser/home-agent.js");
+const indexHtml = read("capsules/assistant/browser/index.html");
+const manifest = JSON.parse(read("capsules/assistant/capsule.json"));
 const components = JSON.parse(read("components.json"));
 const gateway = read("elastos/crates/elastos-server/src/api/gateway.rs");
-const gatewayHomeAgent = read("elastos/crates/elastos-server/src/api/gateway_home_agent.rs");
+const gatewayWorkspace = read("elastos/crates/elastos-server/src/api/gateway_assistant_workspace_v2.rs");
+const gatewayAssistant = read("elastos/crates/elastos-server/src/api/gateway_assistant.rs");
 const homeFace = read("capsules/home-gui/browser/shell-assistant-face.js");
 const homeWindows = read("capsules/home-gui/browser/shell-windows.js");
 const homeSurface = read("capsules/home-gui/browser/shell-surface.js");
@@ -63,7 +64,7 @@ for (const gone of ["mock-agent-provider.js", "agent-grants.js", "agent-studio.j
 
 assert.ok(agentLive.includes('from "./model-contract.js"'), "agent-live speaks the typed contract module");
 assert.ok(agentLive.includes("after_sequence: afterSequence"), "runs_events is polled by after_sequence");
-assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: newRequestId() })"));
+assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: createRequestId })"));
 assert.ok(agentLive.includes('modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })'));
 assert.ok(!agentLive.includes("agent-run-cursor"), "the URUX cursor helper is gone");
 
@@ -75,12 +76,12 @@ assert.ok(turnStart.includes("startLiveTurnForPrompt(userText)"));
 assert.ok(!turnStart.includes("startMockStream"), "no mock reply when no model is live");
 assert.ok(!agentStream.includes("Preview mock"), "live failures are reported, never replaced by a mock");
 assert.ok(agentStream.includes("NO_MODEL_OFFER_STATUS"), "the no-offer state is an honest status line");
-assert.ok(agentLive.includes("models.find((m) => m.offerId === selectedLiveOfferId)"), "the model menu selects among advertised offers only");
+assert.ok(agentLive.includes("selectedModelOffer(models.map"), "the model menu resolves exact current offer and optional content identity");
 
 /* ---- workspace: a Runtime object ----------------------------------------- */
 
-assert.ok(harnessHost.includes('const WORKSPACE_URL = "/api/apps/home-agent/workspace"'));
-assert.ok(harnessHost.includes('const WORKSPACE_SCHEMA = "elastos.home-agent.workspace/v1"'));
+assert.ok(harnessHost.includes('const WORKSPACE_URL = "/api/apps/assistant/workspace-v2"'));
+assert.ok(harnessHost.includes('const WORKSPACE_SCHEMA = "elastos.assistant.workspace/v2"'));
 assert.ok(harnessHost.includes("if_revision: workspaceRevision"), "writes carry the revision they saw");
 assert.ok(harnessHost.includes("error?.status === 409"), "a revision conflict reloads, never overwrites");
 assert.ok(harnessHost.includes("if (workspaceRevision === null) {"), "no write before the read");
@@ -90,41 +91,45 @@ assert.ok(
   "ready is posted after the workspace is read",
 );
 assert.equal(
-  (gateway.match(/\/api\/apps\/home-agent\/workspace/g) || []).length,
+  (gateway.match(/\/api\/apps\/assistant\/workspace-v2/g) || []).length,
   1,
   "one workspace route",
 );
-assert.ok(gateway.includes("gateway_home_agent::principal_root_protected_object_inventory(localhost_root)"));
-assert.ok(gatewayHomeAgent.includes('const HOME_AGENT_CAPSULE_ID: &str = "home-agent"'));
-assert.ok(gatewayHomeAgent.includes("require_home_launch_token_context(&state.data_dir, &headers, HOME_AGENT_CAPSULE_ID)"));
-assert.ok(gatewayHomeAgent.includes("write_protected_principal_root_object("));
-assert.ok(gatewayHomeAgent.includes("#[serde(deny_unknown_fields)]"));
+assert.ok(gateway.includes("gateway_assistant::principal_root_protected_object_inventory(localhost_root)"));
+assert.ok(gatewayAssistant.includes("principal_root_protected_object_inventory("));
+assert.ok(gatewayWorkspace.includes('const RELATIVE_PATH: &str = ".AppData/ElastOS/Assistant/workspace-v2.json"'));
+assert.ok(gatewayWorkspace.includes('require_home_launch_token_context(&state.data_dir, &headers, "assistant")'));
+assert.ok(gatewayWorkspace.includes("write_protected_principal_root_object("));
+assert.ok(gatewayWorkspace.includes("#[serde(deny_unknown_fields)]"));
+assert.ok(harnessHost.includes("migrateLegacyWorkspaces(saved.legacy)"), "legacy sources enter the canonical workspace");
+assert.ok(harnessHost.includes("mergeWorkspaceDocuments(lastSnapshot || {}, local, remote || {})"), "conflicts retain both writers");
 
 /* ---- manifest and install ------------------------------------------------ */
 
-assert.equal(manifest.name, "home-agent");
+assert.equal(manifest.name, "assistant");
 const methods = manifest.interfaces.flatMap((i) => i.methods.map((m) => m.operation)).sort();
-assert.deepEqual(methods, ["offers_list", "runs_cancel", "runs_create", "runs_events"]);
-assert.ok(components.external?.["home-agent"], "components.json installs home-agent");
+assert.deepEqual(methods, ["offers_list", "retention", "runs_cancel", "runs_create", "runs_events", "runs_get"]);
+assert.ok(components.external?.assistant, "components.json installs Assistant");
+assert.ok(!components.external?.["home-agent"], "the legacy app is retired from installation");
 assert.ok(
-  localCarrierSetup.includes('HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent"') &&
-    localCarrierSetup.includes('"home-agent": pathlib.Path(os.environ["HOME_AGENT_CAPSULE_DIR"])') &&
-    localCarrierSetup.includes('"${DATA_DIR}/capsules/home-agent/browser/index.html"'),
-  "the local Carrier setup fixture stages and verifies home-agent",
+  localCarrierSetup.includes('ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant"') &&
+    localCarrierSetup.includes('"assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"])') &&
+    localCarrierSetup.includes('"${DATA_DIR}/capsules/assistant/browser/index.html"'),
+  "the local Carrier setup fixture stages and verifies canonical Assistant",
 );
 
 /* ---- ownership split with Home GUI ---------------------------------------- */
 
-assert.ok(homeFace.includes('const TARGET_ID = "home-agent"'));
+assert.ok(homeFace.includes('const TARGET_ID = "assistant"'));
 assert.ok(
-  homeWindows.includes('const HOME_AGENT_TARGET_ID = "home-agent"') &&
+  homeWindows.includes('const HOME_AGENT_TARGET_ID = "assistant"') &&
     (homeWindows.match(/targetId === HOME_AGENT_TARGET_ID/g) || []).length === 3 &&
-    (homeWindows.match(/showAssistantFace\(\);/g) || []).length === 2,
-  "Home Agent target activation and session restore must stay on the one Assistant face",
+    (homeWindows.match(/showAssistantFace\((?:normalizedLaunchQuery\(options\.query\))?\);/g) || []).length === 2,
+  "canonical and legacy target activation and session restore stay on one Assistant face",
 );
 assert.ok(
   /export function openSelectedLauncherTarget\(\)[\s\S]{0,180}openTarget\(shellState\.selectedLauncherTargetId\)/.test(homeSurface) &&
-    /if \(action === "open-target"\)[\s\S]{0,220}openTarget\(shellState\.contextMenuTarget\.targetId\)/.test(homeSurface) &&
+    /if \(action === "open-target" \|\| action === "open-target-new-window"\)[\s\S]{0,220}openTarget\(shellState\.contextMenuTarget\.targetId,/.test(homeSurface) &&
     /function attachTargetIconInteractions\(node, targetId, source\)[\s\S]{0,2600}handleTaskbarTargetClick\(targetId\)/.test(homeSurface) &&
     /function attachTargetIconInteractions\(node, targetId, source\)[\s\S]{0,2600}openTarget\(targetId\)/.test(homeSurface),
   "desktop, launcher, taskbar, keyboard, and context-menu activation must converge on Home target activation",
@@ -156,7 +161,13 @@ assert.ok(
 assert.ok(!agentStream.includes("asHtml"), "appendMessage has no unused HTML option");
 assert.ok(!agentStream.includes("body.innerHTML = text"), "appendMessage has no raw HTML branch");
 assert.ok(!indexHtml.includes('data-sidebar-nav="usage"'), "Usage nav is gone");
-assert.ok(!indexHtml.includes('data-sidebar-nav="studio"'), "Studio nav is gone");
+assert.ok(!indexHtml.includes('data-sidebar-nav="studio"'), "Studio uses the shared mode controls, not a second sidebar");
+for (const mode of ["chat", "build", "studio"]) {
+  assert.ok(indexHtml.includes(`data-assistant-mode="${mode}"`), `${mode} is a canonical Assistant mode`);
+}
+assert.equal((indexHtml.match(/id="agent-harness-sidebar"/g) || []).length, 1, "one Sash sidebar");
+const modes = read("capsules/assistant/browser/assistant-modes.js");
+assert.ok(modes.includes('from "./assistant.js"') && modes.includes("studioOnly: true"), "Studio uses the typed controller");
 for (const theatre of [
   "data-workbench",
   "agent-approve-menu",
@@ -180,7 +191,7 @@ assert.ok(!/preview|mock/i.test(indexHtml), "index.html carries no preview or mo
 for (const shelf of ["taskbar-sortable", "launcher", "space-pager", "agent-shelf-toggle", "shelf-face-apps"]) {
   assert.ok(!indexHtml.includes(shelf), `index.html carries Home's ${shelf}`);
 }
-const agentShelf = read("capsules/home-agent/browser/agent-shelf.js");
+const agentShelf = read("capsules/assistant/browser/agent-shelf.js");
 assert.ok(
   !/data-agent-morph|agentMorph|flipTaskbarGeometry|launcher/i.test(agentShelf),
   "the capsule runs no Shelf morph of its own; it asks Home to leave and Home runs the one morph",
@@ -195,12 +206,12 @@ assert.ok(
 );
 assert.ok(/dismiss: \(\) => leaveAgentRoom\(\)/.test(agentShelf), "Esc asks Home to leave");
 assert.ok(
-  /closest\?\.\("#agent-harness-home"\)[\s\S]{0,400}leaveAgentRoom\(\);/.test(read("capsules/home-agent/browser/agent-harness.js")),
+  /closest\?\.\("#agent-harness-home"\)[\s\S]{0,400}leaveAgentRoom\(\);/.test(read("capsules/assistant/browser/agent-harness.js")),
   "the sidebar Home row asks Home to leave",
 );
-const configureSections = read("capsules/home-agent/browser/agent-configure.js");
+const configureSections = read("capsules/assistant/browser/agent-configure.js");
 assert.ok(configureSections.includes('export const CONFIGURE_SECTIONS = new Set(["models", "prompt"]);'), "Settings shows only what the Runtime backs");
-assert.ok(!/Planning weekend|calm weekend/.test(read("capsules/home-agent/browser/agent-harness.js")), "no seeded conversation");
+assert.ok(!/Planning weekend|calm weekend/.test(read("capsules/assistant/browser/agent-harness.js")), "no seeded conversation");
 
 /* ---- the pure contract module -------------------------------------------- */
 
@@ -402,4 +413,4 @@ assert.throws(
 assert.throws(() => contract.applyRunEventsPage({ events: "nope" }, 0), /malformed/);
 assert.throws(() => contract.applyRunEventsPage(null, 0), /malformed/);
 
-console.log("home-agent shell smoke: ok");
+console.log("canonical Assistant Sash shell smoke: ok");

@@ -12,29 +12,38 @@ Install the host tools first:
 xcode-select --install
 brew install node e2fsprogs coturn ffmpeg
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 rustup target add wasm32-unknown-unknown
 ```
 
-Setup imports `ffmpeg`/`ffprobe` for the media-provider prerequisite and
+Source-home imports `ffmpeg`/`ffprobe` from the explicit developer tools directory
+`SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR` for the media-provider prerequisite and
 fail-closed rejects any group-writable ancestor of the resolved binaries. If
 setup stops with `ffmpeg prerequisite parent is unsafe`, tighten the Homebrew
 directory on that path (commonly `chmod g-w /opt/homebrew/Cellar`) and rerun.
 
+Ordinary Home setup fetches the signed `media-tools` package and imports its
+managed executable pair. The host tool instructions above apply to source-home
+development.
+
 Then get the repo and build/install the source-home runtime into an isolated
-Mac test home:
+Mac test home. Replace `upstream/RELEASE-dev` below with the development ref
+listed in [state.md](../state.md):
 
 ```bash
 mkdir -p "$HOME/Code"
-git clone https://github.com/Elacity/elastos-runtime.git "$HOME/Code/elastos-runtime"
+git clone --branch upstream/RELEASE-dev https://github.com/Elacity/elastos-runtime.git "$HOME/Code/elastos-runtime"
 cd "$HOME/Code/elastos-runtime"
 
 export MAC_TEST_HOME="$HOME/elastos-mac-test-home"
 export USER_HOME="$HOME"
+export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$(dirname "$(command -v ffmpeg)")"
 
 HOME="$MAC_TEST_HOME" \
 CARGO_HOME="$USER_HOME/.cargo" \
 RUSTUP_HOME="$USER_HOME/.rustup" \
 PATH="$USER_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
+ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
 scripts/setup-source-home.sh
 ```
 
@@ -85,6 +94,7 @@ HOME="$MAC_TEST_HOME" \
 CARGO_HOME="$USER_HOME/.cargo" \
 RUSTUP_HOME="$USER_HOME/.rustup" \
 PATH="$USER_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
+ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
 scripts/setup-source-home.sh
 
 HOME="$MAC_TEST_HOME" scripts/browser-vm-artifact-preflight.sh

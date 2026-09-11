@@ -5,7 +5,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use elastos_runtime::auth::RuntimeAuditEventV1;
 use elastos_wallet_contract::{
     PublicNetwork, ValidatedChainOutcomeBindingV1, ValidatedChainOutcomeV1,
-    WalletProviderOperationV2, WalletProviderRequestV2, VALIDATED_CHAIN_OUTCOME_SCHEMA,
+    VerifiedWalletInvocationContext, WalletProviderOperationV2, WalletProviderRequestV2,
+    VALIDATED_CHAIN_OUTCOME_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1257,9 +1258,40 @@ async fn finish_transaction_completion(
             }
         };
         if let Some(outcome) = outcome {
+            // The Wallet binds the outcome to the approval's ORIGINAL
+            // authority (the launch that raised it). After a Runtime restart
+            // the completing caller holds a fresh launch, so project under
+            // the effect's persisted binding, never the caller's -- the
+            // effect already proved it belongs to this principal.
+            let projection_authority = match VerifiedWalletInvocationContext::new(
+                effect.authority.principal_id.clone(),
+                effect.authority.session_id.clone(),
+                effect.authority.proof_binding_id.clone(),
+                effect.authority.grant_id.clone(),
+                effect.authority.actor.clone(),
+                effect.authority.launch_id.clone(),
+            ) {
+                Ok(context) => {
+                    RuntimeWalletAuthority::from_persisted_transaction_authority(context)
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "Wallet outcome projection pending: persisted effect authority is invalid: {err:?}"
+                    ));
+                    store.effects[effect_index].state = TransactionEffectState::CompletionPending;
+                    store.effects[effect_index].completion_error = Some(errors.join("; "));
+                    return;
+                }
+            };
+            if transaction_authority(authority) != effect.authority {
+                tracing::debug!(
+                    effect_id = %effect.effect_id,
+                    "transaction effect: projecting the Chain outcome under the effect's original authority (caller holds a newer launch)"
+                );
+            }
             match runtime_wallet_data_with_request_id(
                 state,
-                authority,
+                &projection_authority,
                 wallet_request_id(&effect.effect_id, "chain-outcome"),
                 WalletProviderOperationV2::AttachValidatedChainOutcome { outcome },
             )
@@ -1316,6 +1348,12 @@ async fn reconcile_transaction_effect(
         .required_wallet_hash()
         .map_err(internal_error)?
         .to_string();
+    tracing::debug!(
+        effect_id = %store.effects[effect_index].effect_id,
+        state = ?store.effects[effect_index].state,
+        transaction_hash = %expected_hash,
+        "transaction effect: reconciling against the Chain"
+    );
     let external_originating_address = store.effects[effect_index]
         .external_originating_address()
         .map(ToString::to_string);
@@ -1344,6 +1382,12 @@ async fn reconcile_transaction_effect(
                     false,
                     external_originating_address.as_deref(),
                 ) {
+                    tracing::warn!(
+                        effect_id = %store.effects[effect_index].effect_id,
+                        op = *op,
+                        error = %err,
+                        "transaction effect: Chain reconciliation result failed exact validation"
+                    );
                     let effect = &mut store.effects[effect_index];
                     effect.state = TransactionEffectState::Indeterminate;
                     effect.completion_error = Some(err.to_string());

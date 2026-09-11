@@ -212,6 +212,7 @@ async function runInboxHomeChromeSmoke() {
     console,
     document,
     window: {
+      crypto: { randomUUID: () => "inbox-fixture-document" },
       location: {
         search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&presentation=rail",
         hash: "#home_token=inbox-test-token",
@@ -436,6 +437,7 @@ async function runInboxLaunchSelectionSmoke() {
     console,
     document,
     window: {
+      crypto: { randomUUID: () => "inbox-fixture-document" },
       location: {
         search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=entry-wallet",
         hash: "#home_token=inbox-test-token",
@@ -519,6 +521,7 @@ async function runInboxMissingLaunchSelectionSmoke() {
     console,
     document,
     window: {
+      crypto: { randomUUID: () => "inbox-fixture-document" },
       location: {
         search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=missing-entry",
         hash: "#home_token=inbox-test-token",
@@ -609,6 +612,7 @@ async function runInboxRemovedLaunchSelectionSmoke() {
     console,
     document,
     window: {
+      crypto: { randomUUID: () => "inbox-fixture-document" },
       location: {
         search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=entry-wallet",
         hash: "#home_token=inbox-test-token",
@@ -709,6 +713,7 @@ async function runInboxRequestedSelectionAppearsLaterSmoke() {
     console,
     document,
     window: {
+      crypto: { randomUUID: () => "inbox-fixture-document" },
       location: {
         search: "?home_origin=http%3A%2F%2Flocalhost%3A61180&notification_id=entry-wallet",
         hash: "#home_token=inbox-test-token",

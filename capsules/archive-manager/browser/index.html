@@ -594,6 +594,7 @@
 <body>
   <section id="empty-state" class="empty-state" hidden>
     <div class="empty-card">
+      <p id="empty-status" class="muted" role="status"></p>
       <div class="empty-actions" aria-label="Archive actions">
         <button id="open-existing-archive" class="journey-button" type="button">
           <strong>Open archive</strong>
@@ -678,10 +679,15 @@
     </section>
   </main>
 
-  <script>
+  <script type="module">
+    import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
     const params = new URLSearchParams(window.location.search);
     const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
     const homeParentOrigin = params.get("home_origin") || "";
+    const homeNavigation = createHomeNavigationClient({ homeToken, homeOrigin: homeParentOrigin });
+    let archiveSelectionSequence = 0;
+    const libraryPickerDocumentNonce = crypto.randomUUID();
+    let libraryPickerRequest = null;
     let objectUri = params.get("objectUri") || params.get("uri") || "";
     const objectName = params.get("name") || objectUri.split("/").pop() || "Archive";
     const launchPolicy = parseArchiveSupport(params.get("archiveSupport"));
@@ -761,10 +767,13 @@
     render(state);
     if (!objectUri) {
       showEmptyState();
+      homeNavigation.setQuery({});
     } else {
       showWorkspace();
       hydrateDestinationRoots().catch(() => {});
-      hydrateStatOnly().then(() => hydrateArchiveEntries()).catch((error) => {
+      const sequence = archiveSelectionSequence;
+      hydrateStatOnly().then((loaded) => loaded && sequence === archiveSelectionSequence && hydrateArchiveEntries()).catch((error) => {
+        if (sequence !== archiveSelectionSequence) return;
         state.entryStatus = "Could not load this archive: " + error.message;
         state.entries = [];
         renderEntries();
@@ -819,19 +828,40 @@
     }
 
     function handleTrustedHomeMessage(event) {
-      if (!isTrustedHomeMessage(event)) return;
       const data = event.data || {};
       if (data.type === "archive:open-library-object") {
-        openLibraryObject(data.object).catch((error) => {
-          showWorkspace();
-          state.entryStatus = "Could not open this Library archive: " + error.message;
-          state.entries = [];
-          renderEntries();
+        if (event.origin !== homeParentOrigin || event.source !== window.top) return;
+        acceptLibraryPickerObject(data).catch(() => false).then((accepted) => {
+          window.top.postMessage({
+            type: "home:picker-accepted", homeToken,
+            pickerId: data.pickerId, requestId: data.requestId,
+            documentNonce: data.documentNonce, deliveryId: data.deliveryId, accepted,
+          }, homeParentOrigin);
         });
         return;
       }
+      if (!isTrustedHomeMessage(event)) return;
       if (data.type !== "elastos:menu-command" || typeof data.cmd !== "string") return;
       handleHomeMenuCommand(data.cmd);
+    }
+
+    async function acceptLibraryPickerObject(data) {
+      const request = libraryPickerRequest;
+      if (!request || request.consumed || data.requestId !== request.id ||
+          data.documentNonce !== libraryPickerDocumentNonce || !data.pickerId || !data.deliveryId) return false;
+      request.consumed = true;
+      try {
+        if (await openLibraryObject(data.object) === false) return false;
+        return libraryPickerRequest === request;
+      } catch (_error) {
+        if (libraryPickerRequest === request) {
+          state.entryStatus = "Could not open this Library archive. Choose it again from Library.";
+          renderEntries();
+        }
+        return false;
+      } finally {
+        if (libraryPickerRequest === request) libraryPickerRequest = null;
+      }
     }
 
     function handleHomeMenuCommand(command) {
@@ -863,27 +893,25 @@
     }
 
     function openLibraryPicker(intent) {
+      if (libraryPickerRequest?.consumed) return;
       const query = {
         mode: intent === "create" ? "archive-create" : "archive-open",
         returnTarget: "archive-manager",
       };
       if (homeToken && homeParentOrigin && window.top && window.top !== window) {
+        libraryPickerRequest = { id: crypto.randomUUID(), consumed: false };
         window.top.postMessage({
           type: "home:open-target",
           target: "library",
           query,
           homeToken,
+          requestId: libraryPickerRequest.id,
+          documentNonce: libraryPickerDocumentNonce,
         }, homeParentOrigin);
         return;
       }
-      const url = new URL("/apps/library/", window.location.origin);
-      for (const [key, value] of Object.entries(query)) {
-        if (value) url.searchParams.set(key, value);
-      }
-      if (homeToken) {
-        url.hash = new URLSearchParams({ home_token: homeToken }).toString();
-      }
-      window.location.assign(url.pathname + url.search + url.hash);
+      state.entryStatus = "Open Archive from Home to choose a Library item.";
+      renderEntries();
     }
 
     async function openLibraryObject(object) {
@@ -891,6 +919,7 @@
         throw new Error("Library did not return an archive object.");
       }
       objectUri = object.uri;
+      const sequence = ++archiveSelectionSequence;
       state.name = object.name || object.uri.split("/").pop() || "Archive";
       state.uri = object.uri;
       state.mime = object.mime || "";
@@ -909,13 +938,18 @@
       showWorkspace();
       render(state);
       await hydrateDestinationRoots().catch(() => {});
-      await hydrateStatOnly();
-      await hydrateArchiveEntries();
+      if (sequence !== archiveSelectionSequence) return false;
+      if (!await hydrateStatOnly() || sequence !== archiveSelectionSequence) return false;
+      const loaded = await hydrateArchiveEntries();
+      if (sequence !== archiveSelectionSequence) return false;
+      if (loaded === false) throw new Error("Archive files could not be loaded.");
       announceHomeChrome();
     }
 
     async function hydrateStatOnly() {
       const token = homeToken;
+      const sequence = archiveSelectionSequence;
+      const uri = objectUri;
       if (!token || !objectUri) {
         return;
       }
@@ -926,10 +960,12 @@
         headers: { "x-elastos-home-token": token },
       });
       const envelope = await response.json().catch(() => ({}));
+      if (sequence !== archiveSelectionSequence || uri !== objectUri) return false;
       if (!response.ok) {
         throw new Error(envelope.message || envelope.error || "viewer stat failed");
       }
       const object = envelope?.data?.object || {};
+      if (object.uri !== uri) return false;
       Object.assign(state, {
         name: object.name || state.name,
         uri: object.uri || state.uri,
@@ -938,10 +974,13 @@
         policy: object.metadata?.archive_support || state.policy,
       });
       render(state);
+      return true;
     }
 
     async function hydrateArchiveEntries() {
       const token = homeToken;
+      const sequence = archiveSelectionSequence;
+      const uri = objectUri;
       if (!token || !objectUri) {
         state.entryStatus = "Opened with launch metadata only.";
         renderEntries();
@@ -959,13 +998,15 @@
         headers: { "x-elastos-home-token": token },
       });
       const envelope = await response.json().catch(() => ({}));
+      if (sequence !== archiveSelectionSequence || uri !== objectUri) return false;
       if (!response.ok) {
         state.entryStatus = envelope.message || envelope.error || "Could not read this archive.";
         state.entries = [];
         renderEntries();
-        return;
+        return false;
       }
       const data = envelope?.data || {};
+      if (!Array.isArray(data.entries) || (data.object && data.object.uri !== uri)) return false;
       state.entries = Array.isArray(data.entries) ? data.entries : [];
       state.selectedEntries = new Set([...state.selectedEntries].filter((path) =>
         state.entries.some((entry) => entry.path === path && entry?.safety?.status !== "blocked")
@@ -981,6 +1022,8 @@
         state.policy = data.object.metadata?.archive_support || state.policy;
       }
       render(state);
+      homeNavigation.setQuery({ objectUri: uri });
+      return true;
     }
 
     async function hydrateDestinationRoots() {
@@ -1101,6 +1144,7 @@
     }
 
     function renderEntries() {
+      document.querySelector("#empty-status").textContent = !objectUri && state.entryStatus !== "Not loaded" ? state.entryStatus : "";
       const pill = document.querySelector("#entries-pill");
       const rows = filteredEntries();
       const hasBlocked = rows.some((entry) => entry?.safety?.status === "blocked");

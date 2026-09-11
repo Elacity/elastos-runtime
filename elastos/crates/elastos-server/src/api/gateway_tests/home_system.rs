@@ -76,7 +76,7 @@ async fn home_test_get_json_without_origin(
     (status, payload)
 }
 
-async fn home_test_post_json(
+pub(super) async fn home_test_post_json(
     app: &axum::Router,
     uri: &str,
     token: &str,
@@ -356,7 +356,7 @@ pub(super) fn write_home_principal_object_json_for_authority(
 }
 
 #[tokio::test]
-async fn test_home_static_route_serves_browser_surface() {
+async fn test_home_entry_serves_browser_surface() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
     std::fs::write(
@@ -373,7 +373,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .clone()
         .oneshot(
             test_browser_request("localhost:61180", "http://localhost:61180")
-                .uri("/apps/home/")
+                .uri("/home/")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -385,7 +385,7 @@ async fn test_home_static_route_serves_browser_surface() {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .all(|value| !value.starts_with(&format!("{HOME_SESSION_COOKIE}="))),
+            .all(|value| !value.starts_with(HOME_SESSION_COOKIE)),
         "Home index should not auto-mint a local Home session cookie"
     );
     assert_eq!(
@@ -418,12 +418,19 @@ async fn test_home_static_route_serves_browser_surface() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["authority"]["signed_in"], false);
 
-    let valid_cookie = format!("{}={}", HOME_SESSION_COOKIE, home_app_token(dir.path()));
+    let cookie_name = home_session_cookie_name(
+        test_browser_request("localhost:61180", "http://localhost:61180")
+            .body(Body::empty())
+            .unwrap()
+            .headers(),
+    )
+    .unwrap();
+    let valid_cookie = format!("{}={}", cookie_name, home_app_token(dir.path()));
     let existing_session = app
         .clone()
         .oneshot(
-            Request::builder()
-                .uri("/apps/home/")
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/home/")
                 .header(COOKIE, valid_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -437,7 +444,7 @@ async fn test_home_static_route_serves_browser_surface() {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .all(|value| !value.starts_with(&format!("{HOME_SESSION_COOKIE}="))),
+            .all(|value| !value.starts_with(HOME_SESSION_COOKIE)),
         "valid Home session cookie should not be replaced"
     );
 
@@ -445,7 +452,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/apps/home/home-shell-host.js")
+                .uri("/home/home-shell-host.js")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -478,6 +485,154 @@ async fn test_home_static_route_serves_browser_surface() {
             .and_then(|value| value.to_str().ok()),
         Some("application/javascript")
     );
+}
+
+#[tokio::test]
+async fn test_home_entry_redirects_preserve_bookmarks_and_capsule_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    for (uri, location) in [
+        ("/home", "/home/"),
+        ("/apps/home", "/home/"),
+        ("/apps/home/", "/home/"),
+        ("/apps/home/?view=accounts", "/home/?view=accounts"),
+        ("/home?view=accounts", "/home/?view=accounts"),
+        ("/apps/system", "/apps/system/"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
+        assert_eq!(response.headers()["location"], location, "{uri}");
+        assert!(response.headers().get(SET_COOKIE).is_none(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    std::fs::write(
+        dir.path()
+            .join("capsules/home/browser/manifest.webmanifest"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../capsules/home/browser/manifest.webmanifest"
+        )),
+    )
+    .unwrap();
+    for (host, origin) in [
+        ("localhost:8090", "http://localhost:8090"),
+        ("elastos.elacitylabs.com", "https://elastos.elacitylabs.com"),
+    ] {
+        for (home_path, capsule_path) in [
+            ("/home/", "/apps/home/index.html"),
+            ("/home/index.html", "/apps/home/index.html"),
+            ("/home/home-shell-host.js", "/apps/home/home-shell-host.js"),
+            (
+                "/home/manifest.webmanifest",
+                "/apps/home/manifest.webmanifest",
+            ),
+        ] {
+            let home = app
+                .clone()
+                .oneshot(
+                    test_browser_request(host, origin)
+                        .uri(home_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let capsule = app
+                .clone()
+                .oneshot(
+                    test_browser_request(host, origin)
+                        .uri(capsule_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(home.status(), StatusCode::OK, "{home_path}");
+            assert_eq!(capsule.status(), StatusCode::OK, "{capsule_path}");
+            assert_eq!(home.headers(), capsule.headers(), "{home_path}");
+            assert_eq!(home.headers()["cache-control"], "no-store");
+            assert_eq!(home.headers()["cross-origin-opener-policy"], "same-origin");
+            assert_eq!(
+                home.headers()["cross-origin-embedder-policy"],
+                "require-corp"
+            );
+            assert_eq!(home.headers()["x-content-type-options"], "nosniff");
+            if home_path.ends_with('/') || home_path.ends_with(".html") {
+                let csp = home.headers()["content-security-policy"].to_str().unwrap();
+                assert!(csp.contains("connect-src 'self'"));
+                assert!(csp.contains("frame-ancestors 'none'"));
+            }
+            let home_body = axum::body::to_bytes(home.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let capsule_body = axum::body::to_bytes(capsule.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(home_body, capsule_body, "{home_path}");
+            if home_path.ends_with(".webmanifest") {
+                let manifest: serde_json::Value = serde_json::from_slice(&home_body).unwrap();
+                for path in [home_path, capsule_path] {
+                    let manifest_url = url::Url::parse(&format!("{origin}{path}")).unwrap();
+                    let start = manifest_url
+                        .join(manifest["start_url"].as_str().unwrap())
+                        .unwrap();
+                    let scope = manifest_url
+                        .join(manifest["scope"].as_str().unwrap())
+                        .unwrap();
+                    let id = start.join(manifest["id"].as_str().unwrap()).unwrap();
+                    assert_eq!(start.as_str(), format!("{origin}/home/"));
+                    assert_eq!(scope, start);
+                    // Preserve the former implicit id while moving Home's navigation scope.
+                    assert_eq!(id.as_str(), format!("{origin}/apps/home/"));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_home_entry_rejects_path_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    for uri in [
+        "/home/%2e%2e/manifest.json",
+        "/home/browser/%2e%2e/index.html",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+    #[cfg(unix)]
+    {
+        std::fs::write(dir.path().join("outside.txt"), "outside Home").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("outside.txt"),
+            dir.path().join("capsules/home/browser/escape.txt"),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/home/escape.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]
@@ -1104,10 +1259,10 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     // browser surface, System (asserted below at /api/apps/system/summary).
     // The Home shell has no consumer for it, so the Home summary strips it.
     assert!(payload["identity"]["device_did"].is_null());
-    assert_eq!(payload["home"]["route"], "/apps/home/");
+    assert_eq!(payload["home"]["route"], "/home/");
     assert_eq!(payload["home"]["attach_kind"], "iframe");
     assert_eq!(payload["app"]["id"], "home");
-    assert_eq!(payload["app"]["route"], "/apps/home/");
+    assert_eq!(payload["app"]["route"], "/home/");
     assert!(payload["appearance"]["background_image_url"].is_null());
     assert_eq!(payload["runtime"]["running"], false);
     assert_eq!(payload["site"]["root_uri"], MY_WEBSITE_URI);
@@ -2207,7 +2362,7 @@ async fn test_home_summary_does_not_turn_conversation_members_into_people_contac
 }
 
 #[tokio::test]
-async fn test_people_profile_creation_requires_completed_system_recovery_without_partial_state() {
+async fn test_root_only_recovery_export_preserves_later_profile_consent() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
@@ -2225,55 +2380,6 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
         .is_none(),
         "this journey starts with no protection"
     );
-    let before_profile_attempt = file_snapshot(dir.path());
-
-    for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/apps/people/profile")
-                    .header("x-elastos-home-token", authority.people_token.as_str())
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"display_name":"Anders"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            payload,
-            json!({
-                "schema": "elastos.people.profile-protection-required/v1",
-                "status": "recovery_required",
-                "action_target": "system",
-                "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
-            })
-        );
-        assert_eq!(file_snapshot(dir.path()), before_profile_attempt);
-    }
-    assert!(
-        crate::collaboration_profile_authority::load_profile_authority(
-            dir.path(),
-            &principal.principal_id,
-            &principal.localhost_root,
-        )
-        .unwrap()
-        .is_none()
-    );
-    assert!(crate::auth::load_principal_root_protection(
-        dir.path(),
-        &principal.principal_id,
-        &principal.localhost_root,
-    )
-    .unwrap()
-    .is_none());
-
     let export_intent = json!({
         "principal_id": authority.principal_id,
         "localhost_root": principal.localhost_root,
@@ -2323,6 +2429,21 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
         .iter()
         .any(|protector| protector.verified_at.is_some()));
 
+    assert!(
+        crate::collaboration_profile_authority::load_profile_authority(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .is_none(),
+        "export does not turn an account label into a Profile"
+    );
+    assert!(protection
+        .protectors
+        .iter()
+        .all(|p| p.profile_coverage.is_none()));
+
     let profile = app
         .clone()
         .oneshot(
@@ -2370,7 +2491,148 @@ fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &st
 }
 
 #[tokio::test]
-async fn test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule() {
+async fn existing_profile_setup_protects_root_without_claiming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("Private account label"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "active-shell.json",
+        json!({
+            "schema": "elastos.home.active-shell/v1", "principal_id": principal.principal_id,
+            "localhost_root": principal.localhost_root, "active": "home-gui",
+        }),
+    );
+    let uri = format!(
+        "{}/.AppData/ElastOS/Home/active-shell.json",
+        principal.localhost_root
+    );
+    let path = elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &uri).unwrap();
+    let plaintext = std::fs::read(&path).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let before = file_snapshot(dir.path());
+    for invalid in ["", "   ", "bad/name"] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/people/profile")
+                    .header("x-elastos-home-token", authority.people_token.as_str())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"display_name": invalid}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert_eq!(file_snapshot(dir.path()), before);
+    }
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        &authority.people_token,
+        "null",
+        json!({"display_name": "Confirmed public name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let protection = crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(protection
+        .protectors
+        .iter()
+        .all(|p| p.verified_at.is_none() && p.profile_coverage.is_none()));
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(profile.document().display_name, "Confirmed public name");
+    assert_ne!(std::fs::read(&path).unwrap(), plaintext);
+    assert_eq!(
+        crate::auth::read_principal_root_object(
+            dir.path(),
+            &principal.principal_id,
+            &principal.localhost_root,
+            &uri,
+            &path
+        )
+        .unwrap(),
+        plaintext
+    );
+    assert_eq!(
+        crate::auth::load_auth_state(dir.path())
+            .unwrap()
+            .audit
+            .iter()
+            .filter(|event| event.event_type == "auth.principal_root.plaintext_migrated")
+            .count(),
+        1
+    );
+    assert_eq!(
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap()
+            .display_name,
+        "Private account label"
+    );
+    let after_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after_principal).unwrap(),
+        serde_json::to_value(&principal).unwrap()
+    );
+    let established = file_snapshot(dir.path());
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        &authority.people_token,
+        "null",
+        json!({"display_name": "Confirmed public name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        file_snapshot(dir.path()),
+        established,
+        "repeat confirmation is read-only"
+    );
+    let restarted = gateway_router(test_state(dir.path()));
+    let (status, payload) = home_test_get_json(
+        &restarted,
+        "/api/apps/people/summary",
+        &authority.people_token,
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
+    assert_recovery_readiness_projection(&payload, "setup_required", "profile without backup");
+    assert_eq!(
+        payload["discovery"]["status"], "unconfigured",
+        "Profile creation does not opt into discovery"
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
@@ -2394,25 +2656,6 @@ async fn test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule(
         assert_recovery_readiness_projection(&payload, "setup_required", path);
     }
     assert_eq!(file_snapshot(dir.path()), before_summary);
-
-    let (status, payload) = home_test_post_json(
-        &app,
-        "/api/apps/people/profile",
-        authority.people_token.as_str(),
-        "null",
-        json!({ "display_name": "Anders" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        payload,
-        json!({
-            "schema": "elastos.people.profile-protection-required/v1",
-            "status": "recovery_required",
-            "action_target": "system",
-            "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
-        })
-    );
 
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 
@@ -3437,7 +3680,7 @@ async fn test_system_summary_reports_identity_and_app_id() {
     assert_eq!(payload["identity"]["profile_setup_display_name"], "anders");
     assert!(payload["identity"]["device_did"].is_string());
     assert_eq!(payload["home"]["id"], "home");
-    assert_eq!(payload["home"]["route"], "/apps/home/");
+    assert_eq!(payload["home"]["route"], "/home/");
     assert_eq!(payload["app"]["id"], "system");
     assert_eq!(payload["app"]["route"], "/apps/system/");
     assert_eq!(payload["runtime"]["running"], false);
@@ -4510,7 +4753,19 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
-                .header(COOKIE, format!("{}={home_token}", HOME_SESSION_COOKIE))
+                .header(
+                    COOKIE,
+                    format!(
+                        "{}={home_token}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap()
+                    ),
+                )
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
                 .unwrap(),
@@ -4769,6 +5024,115 @@ async fn test_home_launch_validates_shell_targets() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_window_policy_survives_discovery_catalog_and_home_launch() {
+    for policy in ["single", "multiple", "hybrid"] {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, role) in [("window-app", "app"), ("window-viewer", "viewer")] {
+            write_test_browser_capsule(dir.path(), name, role, "Window policy fixture", None);
+            let path = dir.path().join("capsules").join(name).join("capsule.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest["runtime_abi"] = json!("elastos.runtime-projection/v1");
+            manifest["bus_contract"] = json!("elastos.runtime-projection/v1");
+            manifest["execution"] = json!("web-projection");
+            manifest["projections"] = json!(["web"]);
+            manifest["window_policy"] = json!(policy);
+            std::fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        }
+        write_test_browser_capsule(dir.path(), "window-absent", "app", "No policy", None);
+        write_test_viewer_capsule(
+            dir.path(),
+            "window-content",
+            "window-viewer",
+            "data.bin",
+            "Content",
+        );
+        let discovered = crate::api::browser_capsules::list_launchable_browser_capsules(dir.path());
+        for name in ["window-app", "window-viewer"] {
+            let capsule = discovered
+                .iter()
+                .find(|capsule| capsule.name == name)
+                .unwrap();
+            assert_eq!(serde_json::to_value(capsule.window_policy).unwrap(), policy);
+        }
+        let content = crate::api::browser_capsules::resolve_viewer_bound_capsule(
+            dir.path(),
+            "window-content",
+            "window-viewer",
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(content.window_policy).unwrap(), policy);
+        let catalog = capsule_catalog_summary(dir.path());
+        let targets = home_targets_from_catalog(&catalog);
+        let catalog = serde_json::to_value(catalog).unwrap();
+        for target in ["window-app", "window-viewer", "window-content"] {
+            let summary = catalog["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|capsule| capsule["name"] == target)
+                .unwrap();
+            assert_eq!(summary["window_policy"], policy, "catalog {target}");
+            let summary = targets.iter().find(|entry| entry.target == target).unwrap();
+            assert_eq!(
+                serde_json::to_value(summary).unwrap()["window_policy"],
+                policy
+            );
+            let direct = home_launch_target(dir.path(), target).unwrap();
+            assert_eq!(
+                serde_json::to_value(direct).unwrap()["window_policy"],
+                policy
+            );
+        }
+        let absent = catalog["capsules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capsule| capsule["name"] == "window-absent")
+            .unwrap();
+        assert!(absent.get("window_policy").is_none());
+        let app = gateway_router(test_state(dir.path()));
+        for target in [
+            "window-app",
+            "window-viewer",
+            "window-content",
+            "window-absent",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/apps/home/launch")
+                        .header(HOST, "localhost:61180")
+                        .header("origin", "http://localhost:61180")
+                        .header("sec-fetch-site", "same-origin")
+                        .header("x-elastos-home-token", home_app_token(dir.path()))
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({"target": target}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "launch {target}");
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if target == "window-absent" {
+                assert!(payload.get("window_policy").is_none());
+            } else {
+                assert_eq!(payload["window_policy"], policy, "launch {target}");
+            }
+            if target == "window-content" {
+                assert_eq!(payload["viewer"], "window-viewer");
+                assert_isolated_launch_route(payload["route"].as_str().unwrap(), "window-viewer");
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -5192,7 +5556,17 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .uri("/api/apps/home/summary")
                 .header(
                     COOKIE,
-                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                    format!(
+                        "{}={}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap(),
+                        authority.home_token
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -5215,7 +5589,17 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .uri("/api/apps/home/active-shell")
                 .header(
                     COOKIE,
-                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                    format!(
+                        "{}={}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap(),
+                        authority.home_token
+                    ),
                 )
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"active":"home-gui"}"#))
@@ -5234,7 +5618,17 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .uri("/api/apps/home/active-shell")
                 .header(
                     COOKIE,
-                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                    format!(
+                        "{}={}",
+                        home_session_cookie_name(
+                            test_browser_request("localhost:61180", "http://localhost:61180")
+                                .body(Body::empty())
+                                .unwrap()
+                                .headers()
+                        )
+                        .unwrap(),
+                        authority.home_token
+                    ),
                 )
                 .body(Body::empty())
                 .unwrap(),

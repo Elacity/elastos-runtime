@@ -854,6 +854,8 @@ pub(in crate::api) struct CapsuleIconVariant {
 #[derive(Clone, Serialize)]
 struct HomeTargetSummary {
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     title: String,
     description: String,
     route: String,
@@ -909,6 +911,8 @@ enum HomeTargetKind {
 #[derive(Serialize)]
 struct HomeLaunchResponse {
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     title: String,
     route: String,
     attach_kind: String,

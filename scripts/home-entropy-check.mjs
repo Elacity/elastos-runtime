@@ -189,6 +189,7 @@ function listMarkdownFiles(dir = repoRootPath) {
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -214,6 +215,7 @@ function listTextFiles(dir) {
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -446,6 +448,7 @@ function listFilesRecursive(dir) {
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
       entry.name === "target" ||
+      entry.name === "target-build" ||
       entry.name === "node_modules"
     ) {
       continue;
@@ -465,6 +468,7 @@ function isTestOrGeneratedPath(path) {
   const name = parts.at(-1)?.toLowerCase() || "";
   return (
     parts.includes("target") ||
+    parts.includes("target-build") ||
     parts.includes("tests") ||
     parts.includes("test") ||
     parts.includes("__tests__") ||
@@ -864,25 +868,34 @@ for (const [token, value] of new Map([
 }
 
 const assistantIndex = read("capsules/assistant/browser/index.html");
-const assistantScript = read("capsules/assistant/browser/assistant.js");
-const assistantStyle = read("capsules/assistant/browser/style.css");
+const assistantController = read("capsules/assistant/browser/assistant.js");
+const assistantEntry = read("capsules/assistant/browser/home-agent.js");
+const assistantWorkspace = read("capsules/assistant/browser/harness-host.js");
+const assistantModes = read("capsules/assistant/browser/assistant-modes.js");
+const assistantScript = [assistantController, assistantEntry, assistantWorkspace, assistantModes,
+  read("capsules/assistant/browser/agent-live.js")].join("\n");
+const assistantStyle = ["style.css", "home-agent.css", "agent-harness.css", "assistant-modes.css"]
+  .map(name => read(`capsules/assistant/browser/${name}`)).join("\n");
+const assistantWorkspaceGateway = read("elastos/crates/elastos-server/src/api/gateway_assistant_workspace_v2.rs");
 const assistantGateway = read(
   "elastos/crates/elastos-server/src/api/gateway_assistant.rs",
 );
 const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
 
 assert(
-  assistantIndex.includes('<script type="module" src="./assistant.js"></script>'),
-  "Assistant must boot through its capsule-owned browser shell",
+  assistantIndex.includes('<script type="module" src="./home-agent.js"></script>') &&
+    assistantEntry.includes('from "./assistant-modes.js"') &&
+    assistantModes.includes('from "./assistant.js"') && assistantModes.includes("studioOnly: true"),
+  "Assistant boots the Sash shell and uses the typed controller for Studio",
 );
 assert(
   !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
   "Assistant must not add browser-owned persistence",
 );
 assert(
-  assistantScript.includes("/api/apps/assistant/workspace") &&
-    !assistantScript.includes("workspace.json") &&
-    !assistantScript.includes("session.agent"),
+  assistantWorkspace.includes('const WORKSPACE_URL = "/api/apps/assistant/workspace-v2"') &&
+    !assistantWorkspace.includes("workspace.json") &&
+    !assistantWorkspace.includes("session.agent"),
   "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
 );
 assert(
@@ -919,17 +932,27 @@ assert(
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
-    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+    // SVG namespace identifiers inside local data images are not endpoints.
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`.replaceAll("http://www.w3.org/2000/svg", "svg-namespace"),
   ),
   "Assistant capsule source must not expose backend endpoints, topology, or credentials",
 );
 assert(
-  (gatewaySource.match(/\/api\/apps\/assistant\/workspace/g) || []).length === 1,
-  "Assistant workspace must expose exactly one dedicated Runtime route",
+  (gatewaySource.match(/"\/api\/apps\/assistant\/workspace-v2"/g) || []).length === 1 &&
+    (gatewaySource.match(/"\/api\/apps\/assistant\/workspace"/g) || []).length === 1,
+  "Assistant has one canonical v2 route and retains the legacy workspace route",
+);
+assert(
+  assistantWorkspaceGateway.includes('const SCHEMA: &str = "elastos.assistant.workspace/v2"') &&
+    assistantWorkspaceGateway.includes("MAX_BYTES: usize = 8 * 1024 * 1024") &&
+    assistantWorkspaceGateway.includes('const RELATIVE_PATH: &str = ".AppData/ElastOS/Assistant/workspace-v2.json"') &&
+    assistantWorkspaceGateway.includes("read_principal_root_object(") &&
+    assistantWorkspaceGateway.includes("write_protected_principal_root_object("),
+  "Canonical Assistant uses bounded v2 storage under the protected principal root",
 );
 assert(
   (assistantGateway.match(/elastos\.assistant\.workspace\/v1/g) || []).length >= 1,
-  "Assistant workspace must use one bounded v1 schema",
+  "Legacy Assistant reads retain their v1 schema",
 );
 assert(
   (assistantGateway.match(
@@ -940,7 +963,7 @@ assert(
     ) || []).length === 1 &&
     (assistantGateway.match(/fn assistant_workspace_uri\(/g) || []).length === 1 &&
     (assistantGateway.match(/\.AppData\/ElastOS\/Assistant\/workspace\.json/g) || []).length === 0,
-  "Assistant workspace must use exactly one protected principal-root file",
+  "Legacy Assistant retains its exact protected workspace file for adoption",
 );
 assert(
   assistantGateway.includes("read_principal_root_object(") &&
@@ -949,7 +972,7 @@ assert(
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
-    assistantGateway,
+    `${assistantGateway}\n${assistantWorkspaceGateway}`,
   ),
   "Assistant workspace route must not encode backend endpoints, topology, or credentials",
 );
@@ -2691,7 +2714,7 @@ assert(
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
     !shellStyle.includes(".home-people-") &&
-    shellWindows.includes('"people",') &&
+    JSON.parse(peopleCapsule).window_policy === "single" &&
     shellJs.includes('people: new Set(["chat-room", "system"])') &&
     homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
   "People must be a standalone app capsule while Home remains only its launch and message host",
@@ -3059,14 +3082,15 @@ assert(
 );
 assert(
   shellAuthJs.includes("profileReadinessActionTarget") &&
-    shellAuthJs.includes('return "people"') &&
+    !shellAuthJs.includes('return "people"') &&
     shellAuthJs.includes('return "system"') &&
-    shellJs.includes("openTargetFromHomeGui(profileActionTarget)") &&
+    shellJs.includes("openTargetFromHomeGui(profileActionTarget, { query })") &&
+    shellJs.includes('query.recovery = "import"') &&
     peopleScript.includes('readiness.schema === "elastos.profile.readiness/v1"') &&
     peopleScript.includes('profileForm?.dataset.profileState === "unavailable"') &&
     !peopleScript.includes("identity.profile ?") &&
     !peopleDiscoverySmoke.includes("identity.profile ?"),
-  "First-run Profile UX must consume typed Runtime readiness: only setup-required opens People, while unavailable, missing, or unknown authority fails closed through System without browser identity inference",
+  "First-run Profile UX must consume typed Runtime readiness: setup-required opens System import, while unavailable, missing, or unknown readiness checks System without browser identity inference",
 );
 const peopleProfileSave = sourceBlock(
   gatewayApi,
@@ -3075,19 +3099,16 @@ const peopleProfileSave = sourceBlock(
 );
 assert(
   peopleProfileSave.includes("validate_profile_authority_update") &&
-    peopleProfileSave.includes("principal_root_recovery_status_for_context") &&
-    peopleProfileSave.includes("PeopleProfileProtectionRequiredResponse") &&
-    gatewayApi.includes("elastos.people.profile-protection-required/v1") &&
+    peopleProfileSave.includes("require_profile_authority_passkey_binding") &&
+    peopleProfileSave.includes("initialize_local_profile") &&
     !peopleProfileSave.includes("ensure_principal_root_protection") &&
     !peopleProfileSave.includes("RecoveryKitDelivery") &&
-    peopleScript.includes("elastos.people.profile-protection-required/v1") &&
-    peopleScript.includes("Open System") &&
-    peopleScript.includes("choose Security") &&
+    !peopleScript.includes("elastos.people.profile-protection-required/v1") &&
     authGatewayApi.includes("mark_recovery_kit_handed_to_person") &&
     gatewayHomeSystemTests.includes(
-      "test_people_profile_creation_requires_completed_system_recovery_without_partial_state",
+      "existing_profile_setup_protects_root_without_claiming_recovery",
     ),
-  "People Profile creation must remain mutation-free until verified System Recovery protection exists; People never mints or retains unseen Recovery material",
+  "Runtime initializes local Profile protection under current passkey authority; exporting a Recovery Kit remains a separate action",
 );
 assert(
   profileUpdates.includes(
@@ -3587,18 +3608,30 @@ assert(
     !fileExists("capsules/gba-engine-provider"),
   "GBA ROM and save access must use generic Runtime viewer routes without a host engine provider",
 );
+const guardedDocumentsProvider = documentsProvider.replace(/objects\s*\.\s*(read|write)\s*\(/g, "objects.$1(");
 assertProtectedPrincipalRootAccessor(
-  documentsProvider,
+  guardedDocumentsProvider,
   "fn documents_load_body(",
-  "read_principal_root_object(",
+  "objects.read(",
   "Documents body reads",
 );
 assertProtectedPrincipalRootAccessor(
-  documentsProvider,
+  guardedDocumentsProvider,
   "fn documents_write_body(",
-  "write_principal_root_object(",
+  "objects.write(",
   "Documents body writes",
 );
+for (const entry of ["documents_load_document", "documents_save_local", "documents_create_local", "documents_save_as_local", "documents_import_chat_attachment_local", "documents_delete_local", "documents_export_publish", "documents_finish_publish", "documents_unpublish_local", "documents_load_summary"]) {
+  assert(sourceBlock(documentsProvider, `fn ${entry}(`, entry).includes("PrincipalRootObjectMutation::acquire(data_dir)?"),
+    `${entry} must share the principal-root mutation guard`);
+}
+const documentObjectGuard = sourceBlock(runtimeAuth, "impl<'a> PrincipalRootObjectMutation<'a>", "Documents object guard");
+assert(documentObjectGuard.includes("principal_root_object_mutation_lock()") &&
+  documentObjectGuard.includes("validate_principal_root_object_binding(") &&
+  documentObjectGuard.includes("validate_principal_root_object_path(") &&
+  documentObjectGuard.includes("read_principal_root_object_locked(") &&
+  documentObjectGuard.includes("write_principal_root_object_locked("),
+  "Documents guard must retain authenticated principal-root reads and writes");
 assertProtectedPrincipalRootAccessor(
   gatewayApi,
   "fn home_browser_state(\n",
@@ -4410,7 +4443,7 @@ assertProtectedPrincipalRootAccessor(
 assertProtectedPrincipalRootAccessor(
   viewerGatewayApi,
   "pub async fn viewer_storage_put(",
-  "write_principal_root_object(",
+  "write_principal_root_object_if_revision(",
   "Viewer/content storage writes",
 );
 assert(
@@ -5002,13 +5035,13 @@ assert(
   "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
-  marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
+  marketplaceUi.includes('capsule.cid ? "Verified app" : "Local app"') &&
     marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
     marketplaceUi.includes("Trust:") &&
     marketplaceUi.includes("Status:") &&
     marketplaceUi.includes("Available actions") &&
     !marketplaceUi.includes("CID-backed") &&
-    !marketplaceUi.includes("Content ID") &&
+    !marketplaceUi.replace(/function technicalDetails\(app\) \{[\s\S]*?function packageLabel/, "").includes("Content ID") &&
     !marketplaceUi.includes("Signed package") &&
     !marketplaceUi.includes("Package identity:") &&
     !marketplaceUi.includes('price-tag">${app.cid ? "CID"') &&
@@ -5841,12 +5874,13 @@ assert(
     archiveManager.includes('title: "File"') &&
     archiveManager.includes('title: "Edit"') &&
     archiveManager.includes('return event.origin === "null" && event.source === window.parent;') &&
-    !archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveManager.includes("acceptLibraryPickerObject(data)") &&
     archiveBehaviorSmoke.includes("archive-product-behavior-smoke: OK") &&
     archiveLayoutSmoke.includes("archive-product-layout-smoke: OK") &&
     justfile.includes("node scripts/archive-product-behavior-smoke.mjs") &&
     justfile.includes("node scripts/archive-product-layout-smoke.mjs"),
-  "Archive must use the shared UI tokens, the accepted Home top-out or trusted-parent-in boundary, and dedicated source or browser smokes wired into the normal UIUX gate",
+  "Archive must keep parent-owned menus separate from exact Home picker delivery and retain the shared UI tokens and dedicated smokes",
 );
 assert(
     archiveManagerManifest.includes('"name": "archive-manager"') &&
@@ -5875,7 +5909,8 @@ assert(
     archiveManager.includes('returnTarget: "archive-manager"') &&
     archiveManager.includes('archive:open-library-object') &&
     archiveManager.includes("async function openLibraryObject(object)") &&
-    archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
+    archiveManager.includes('requestId: libraryPickerRequest.id') &&
+    !archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
     archiveManager.includes("Extract selected") &&
     archiveManager.includes("Extract all") &&
     archiveManager.includes("Select visible") &&
@@ -6018,7 +6053,7 @@ assert(
     shellSurface.includes("function canRevealDesktopObject(object)") &&
     homeShellRegressionSmoke.includes("desktop object without capability metadata opened instead of failing closed") &&
     homeShellRegressionSmoke.includes("desktop object actions without capability metadata reached Runtime") &&
-    shellSurface.includes('openTarget("library", { query: { uri: object.uri } })') &&
+    shellSurface.includes('openTarget("library", { ...options, query: { uri: object.uri } })') &&
     shellSurface.includes("desktopObjectViewer(object)") &&
     shellSurface.includes('openTarget(viewer,') &&
     shellSurface.includes('objectUri: object.uri') &&
@@ -7687,12 +7722,18 @@ assert(
 );
 assert(
   shellIndex.includes('id="home-unlock-name"') &&
-    shellAuth.includes("display_name: displayName"),
-  "Home passkey creation must collect and persist a passkey/user display name",
+    shellAuth.includes('public_name: displayName') &&
+    shellAuth.includes('JSON.stringify({ intent: pending.intent })'),
+  "Home Create must bind its explicit public name to the registration intent",
 );
 assert(
-  shellAuth.includes("Enter a name for this passkey."),
-  "Home must not create anonymous Passkey/guest principals",
+  shellAuth.includes("Enter the display name people will see.") &&
+    shellAuth.includes('intent: pending.intent') &&
+    !shellAuth.includes("profile_display_name: displayName") &&
+    !shellAuth.includes("display_name: displayName") &&
+    shellIndex.includes('id="home-enrollment-recover"') &&
+    shellIndex.includes('id="home-unlock-name-label"'),
+  "Home guided enrollment must keep Create consent in one intent and offer Recover",
 );
 assert(
   shellAuth.includes("Create guest account") &&
@@ -7718,7 +7759,7 @@ assert(
 assert(
   !shellAuth.includes("status.accounts") &&
     !shellAuth.includes("profile_setup_display_name") &&
-    !shellAuth.includes("guestRegistrationAvailable"),
+    shellAuth.includes("guestRegistrationAvailable = guestRegistrationEnabled;"),
   "Home lock sign-in must not depend on unsigned account-directory or profile setup fields",
 );
 assert(
@@ -7727,7 +7768,7 @@ assert(
   "Home guest creation must be a distinct state, not blended into sign-in",
 );
 assert(
-  shellAuth.includes("setUnlockNameVisible(canCreate)") &&
+  shellAuth.includes('setUnlockNameVisible(enrolling && purpose === "create")') &&
     !shellAuth.includes(
       "const canCreate = !registered || guestRegistrationEnabled",
     ),
@@ -7796,9 +7837,9 @@ assert(
   "Protected-content contracts must reject hidden object, key-release, and decrypt-session authority fields at decode time",
 );
 assert(
-  shellStyle.includes(".visually-hidden") &&
-    shellIndex.includes('class="visually-hidden"'),
-  "Home unlock labels must use a real visually-hidden utility instead of leaking form labels into the UI",
+  shellIndex.includes('id="home-unlock-name-label" for="home-unlock-name"') &&
+    shellIndex.includes('aria-describedby="home-unlock-name-hint"'),
+  "Home enrollment keeps the public-name label and audience hint visible with the editable field",
 );
 assert(
   !shellStyle.includes("home-unlock-kicker"),
@@ -7861,7 +7902,9 @@ assert(
 assert(
   system.includes('id="recovery-password"') &&
     system.includes("Download Recovery Kit") &&
-    system.includes("Downloads everything recoverable for this account") &&
+    system.includes("Save your Profile, Home recovery authority, and included Wallet keys in one kit.") &&
+    system.includes('id="recovery-profile-name"') &&
+    systemJs.includes("intent.profile_display_name = name;") &&
     systemJs.includes("download_password") &&
     systemJs.includes("recoveryDownloadPassword") &&
     systemJs.includes("elastos.full-recovery-bundle.export.request/v1") &&
@@ -7880,7 +7923,7 @@ assert(
     recoveryKitLiveSmoke.includes(
       "elastos.full-recovery-bundle.import.response/v2",
     ),
-  "System Recovery Kit download must be the full recover-everything path: data root plus built-in Wallet keys with optional password wrapping",
+  "System Recovery Kit export requires an existing Profile and preserves root authority, included Wallet keys, optional password wrapping and audited import",
 );
 assert(
     system.includes('id="recovery-import"') &&
@@ -10640,8 +10683,10 @@ assert(
     rememberWindowRestoreBounds(entry.node);
     return;
   }`) &&
-    shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"])') &&
-    !shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["browser"])') &&
+    shellWindows.includes('targetById(summary, targetId)?.window_policy === "single"') &&
+    !shellWindows.includes('SINGLE_SESSION_TARGETS') &&
+    [JSON.parse(peopleCapsule), inboxCapsuleManifest, walletCapsuleManifest, systemCapsuleManifest]
+      .every(manifest => manifest.window_policy === "single") &&
     shellWindows.includes("export function normalizeRestorableSession") &&
     shellWindows.includes("withBrowserInstanceQuery(options)") &&
     shellWindows.includes("activateTargetGroup(targetId)") &&
@@ -10659,11 +10704,11 @@ assert(
     ) &&
     shellWindowGeometry.includes("node.dataset.browserMaximized") &&
     shellWindowGeometry.includes("browserAspectResizeBounds"),
-  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, keep true singleton handling scoped to People, and must not install generic iframe auto-fit observers that fight the remote display during resize",
+  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, follow manifest-owned window policy, and keep generic iframe auto-fit observers outside the remote display resize path",
 );
 assert(
-  shellWindows.includes("query: normalizedLaunchQuery(entry.launchQuery)") &&
-    shellWindows.includes("query: restorableLaunchQuery(targetId, item)") &&
+  shellWindows.includes("query: restorableLaunchQuery(entry.targetId, { query: entry.launchQuery })") &&
+    shellWindows.includes("const query = restorableLaunchQuery(targetId, item)") &&
     shellWindows.includes('if (targetId === "browser" && !query.browser_instance)') &&
     shellWindows.includes('const launchQuery = targetId === "browser"') &&
     shellWindows.includes("withBrowserInstanceQuery({ query: options.query }).query") &&
@@ -11400,7 +11445,7 @@ assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
     gatewayApi.includes("fn home_launch_target") &&
     gatewayApi.includes("fn is_home_visible_target") &&
-    gatewayApi.includes(
+    gatewayApi.replace(/\s+/g, " ").includes(
       "WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID",
     ) &&
     gatewayTests.includes(

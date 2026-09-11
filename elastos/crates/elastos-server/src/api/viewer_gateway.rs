@@ -309,8 +309,12 @@ pub async fn viewer_storage_get(
             Ok(target) => target,
             Err(err) => return viewer_error_response(err),
         };
-    if !target.path.is_file() {
-        return (StatusCode::NOT_FOUND, "viewer storage file not found").into_response();
+    match std::fs::symlink_metadata(&target.path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, "viewer storage file not found").into_response();
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return (StatusCode::BAD_REQUEST, "viewer storage file unavailable").into_response(),
     }
     match crate::auth::read_principal_root_object(
         &state.data_dir,
@@ -319,15 +323,24 @@ pub async fn viewer_storage_get(
         &target.object_uri,
         &target.path,
     ) {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [
-                ("content-type", "application/octet-stream"),
-                ("cache-control", "no-store"),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => {
+            let revision = crate::auth::principal_root_object_revision(
+                &target.principal_id,
+                &target.object_uri,
+                &bytes,
+            );
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("cache-control", "no-store"),
+                    ("etag", revision.as_str()),
+                    ("access-control-expose-headers", "ETag"),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
         Err(err) => viewer_error_response(err),
     }
 }
@@ -343,16 +356,73 @@ pub async fn viewer_storage_put(
             Ok(target) => target,
             Err(err) => return viewer_error_response(err),
         };
-    match crate::auth::write_principal_root_object(
+    let precondition = match viewer_storage_precondition(&headers) {
+        Ok(precondition) => precondition,
+        Err(status) => {
+            return (
+                status,
+                "viewer storage requires one valid save precondition",
+            )
+                .into_response()
+        }
+    };
+    match crate::auth::write_principal_root_object_if_revision(
         &state.data_dir,
         &target.principal_id,
         &target.localhost_root,
         &target.object_uri,
         &target.path,
         body.as_ref(),
+        precondition,
     ) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            let revision = crate::auth::principal_root_object_revision(
+                &target.principal_id,
+                &target.object_uri,
+                body.as_ref(),
+            );
+            (
+                StatusCode::NO_CONTENT,
+                [
+                    ("etag", revision.as_str()),
+                    ("cache-control", "no-store"),
+                    ("access-control-expose-headers", "ETag"),
+                ],
+            )
+                .into_response()
+        }
+        Err(err) if err.is::<crate::auth::PrincipalRootObjectWriteConflict>() => (
+            StatusCode::PRECONDITION_FAILED,
+            "saved data changed in another window",
+        )
+            .into_response(),
         Err(err) => viewer_error_response(err),
+    }
+}
+
+fn viewer_storage_precondition(
+    headers: &HeaderMap,
+) -> Result<crate::auth::PrincipalRootObjectPrecondition<'_>, StatusCode> {
+    use crate::auth::PrincipalRootObjectPrecondition;
+    let matching = headers.get_all("if-match").iter().collect::<Vec<_>>();
+    let absent = headers.get_all("if-none-match").iter().collect::<Vec<_>>();
+    match (matching.as_slice(), absent.as_slice()) {
+        ([], []) => Err(StatusCode::PRECONDITION_REQUIRED),
+        ([], [value]) if value.as_bytes() == b"*" => Ok(PrincipalRootObjectPrecondition::Absent),
+        ([value], []) => {
+            let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+            if value.len() != 66
+                || !value.starts_with('"')
+                || !value.ends_with('"')
+                || !value.as_bytes()[1..65]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(PrincipalRootObjectPrecondition::Revision(value))
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
     }
 }
 

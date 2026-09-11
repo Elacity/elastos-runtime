@@ -21,6 +21,15 @@ MAX_CAPSULE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_RECEIPT_BYTES = 16 * 1024
 GIT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
 PLATFORM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# Keep selection aligned with Runtime setup.rs and the source capsule stamper.
+PLATFORM_ALIASES = {
+    "x86_64-linux": "linux-amd64",
+    "linux-amd64": "x86_64-linux",
+    "aarch64-linux": "linux-arm64",
+    "linux-arm64": "aarch64-linux",
+    "aarch64-darwin": "darwin-arm64",
+    "darwin-arm64": "aarch64-darwin",
+}
 
 
 class InstallError(Exception):
@@ -118,7 +127,7 @@ def open_regular(path, limit, *, executable=False, trusted_runtime=False):
         fail("unsafe_artifact")
 
 
-def hash_descriptor(descriptor, metadata, limit):
+def hash_descriptor(descriptor, metadata, limit, *, payload=None):
     digest = hashlib.sha256()
     total = 0
     while True:
@@ -129,6 +138,8 @@ def hash_descriptor(descriptor, metadata, limit):
         if total > limit:
             fail("artifact_oversize")
         digest.update(chunk)
+        if payload is not None:
+            payload.extend(chunk)
     final = os.fstat(descriptor)
     if (
         total != metadata.st_size
@@ -147,6 +158,81 @@ def hash_file(path, limit, *, executable=False, trusted_runtime=False):
         return hash_descriptor(descriptor, metadata, limit)
     finally:
         os.close(descriptor)
+
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("components_json")
+        result[key] = value
+    return result
+
+
+def validate_source_components(manifest, platform):
+    if not isinstance(manifest, dict):
+        fail("components_shape")
+    capsules = manifest.get("capsules", {})
+    external = manifest.get("external", {})
+    if not isinstance(capsules, dict) or not isinstance(external, dict):
+        fail("components_shape")
+    for name, entry in capsules.items():
+        if not isinstance(entry, dict):
+            fail("components_shape")
+        # A source stamp binds the installed entrypoint and clears archive identity.
+        # Genuine archive entries may also carry entrypoint hashes.
+        for field in ("cid", "sha256", "entrypoint_sha256"):
+            if field in entry and not isinstance(entry[field], str):
+                fail("components_shape")
+        if not entry.get("entrypoint_sha256") or entry.get("cid", "").strip() or entry.get("sha256", "").strip():
+            continue
+        component = external.get(name)
+        if component is None:
+            continue
+        if not isinstance(component, dict):
+            fail("components_shape")
+        mappings = component.get("platforms", {})
+        if not isinstance(mappings, dict) or any(not isinstance(value, dict) for value in mappings.values()):
+            fail("components_shape")
+        # Presence, including an empty exact record, wins over alias/wildcard.
+        selected = next((mappings[key] for key in (
+            platform, PLATFORM_ALIASES.get(platform), "*",
+        ) if key in mappings), {})
+        for field in ("cid", "checksum", "url", "release_path"):
+            value = selected.get(field)
+            if value is not None and not isinstance(value, str):
+                fail("components_shape")
+            if value and value.strip():
+                fail("source_capsule_archive_identity")
+        size = selected.get("size")
+        if size is not None and (type(size) is not int or size < 0):
+            fail("components_shape")
+        if size:
+            fail("source_capsule_archive_identity")
+        install_path = selected.get("install_path")
+        if install_path is None:
+            install_path = component.get("install_path")
+        if install_path != entry.get("install_path") or install_path != f"capsules/{name}":
+            fail("source_capsule_install_path")
+
+
+def source_components_hash(path, platform):
+    descriptor, metadata = open_regular(path, MAX_COMPONENTS_BYTES)
+    payload = bytearray()
+    try:
+        digest = hash_descriptor(descriptor, metadata, MAX_COMPONENTS_BYTES, payload=payload)
+    finally:
+        os.close(descriptor)
+    try:
+        manifest = json.loads(
+            payload,
+            object_pairs_hook=unique_json_object,
+            parse_constant=lambda _value: fail("components_json"),
+        )
+    except (ValueError, UnicodeError, RecursionError):
+        fail("components_json")
+    validate_source_components(manifest, platform)
+    return digest
 
 
 def git_value(source_root, revision):
@@ -316,7 +402,7 @@ def install(
     require_safe_destination(installed_runtime, 0o700)
     require_safe_destination(receipt_path, 0o600)
 
-    components_hash = hash_file(data_dir / "components.json", MAX_COMPONENTS_BYTES)
+    components_hash = source_components_hash(data_dir / "components.json", args.platform)
     capsules_hash = hash_file(
         receipts_dir / CAPSULE_RECEIPT_NAME, MAX_CAPSULE_RECEIPT_BYTES
     )
@@ -332,6 +418,8 @@ def install(
         runtime_stage, staged_hash = runtime_stager(built_runtime, bin_dir)
         if staged_hash != built_hash:
             fail("built_runtime_mismatch")
+        if hash_file(data_dir / "components.json", MAX_COMPONENTS_BYTES) != components_hash:
+            fail("components_changed")
         receipt = {
             "schema": SCHEMA,
             "source": source,

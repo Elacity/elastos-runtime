@@ -374,7 +374,7 @@ async function runScenario(name) {
     assert.equal(environment.nodes.get("profile-submit").textContent, "Create Profile");
     assert.equal(
       environment.nodes.get("profile-description").textContent,
-      "Your Profile is your signed identity for People and Chat.",
+      "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.",
     );
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Person/);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Stale Profile/);
@@ -699,17 +699,12 @@ async function runScenario(name) {
     return;
   }
 
-  if (name === "recovery_required") {
+  if (name === "create_retry") {
     const environment = setupEnvironment(name, [
       summary(null, discoverySummary(), {
         profile_setup_display_name: "Suggested Name",
       }),
-      response(409, {
-        schema: "elastos.people.profile-protection-required/v1",
-        status: "recovery_required",
-        action_target: "system",
-        message: "Open System, choose Security, and download Recovery. Then retry creating your Profile.",
-      }),
+      response(503, { message: "Profile setup unavailable" }),
       response(200, {}),
       summary("Runtime Name", discoverySummary(), {
         profile: { display_name: "Recovered Profile" },
@@ -717,28 +712,17 @@ async function runScenario(name) {
     ]);
     await import("../capsules/people/browser/people.js");
     await settle();
+    assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/profile").length, 0,
+      "suggestion is editable presentation until explicitly confirmed");
     environment.nodes.get("profile-name").value = "Recovered Profile";
 
     await triggerProfileSubmit(environment);
-    assert.equal(environment.nodes.get("profile-form").dataset.profileState, "recovery_required");
-    assert.equal(environment.nodes.get("profile-title").textContent, "Recovery required");
-    assert.equal(environment.nodes.get("profile-submit").textContent, "Open System");
-    assert.equal(environment.nodes.get("profile-name").disabled, true);
-    assert.match(environment.nodes.get("profile-description").textContent, /choose Security/);
-
-    await triggerProfileSubmit(environment);
-    assert.deepEqual(environment.messages.at(-1), {
-      message: {
-        type: "home:open-target",
-        target: "system",
-        query: {},
-        homeToken: "people-test-token",
-      },
-      origin: "http://localhost:61180",
-    });
-    assert.equal(environment.nodes.get("profile-form").dataset.profileState, "retry");
-    assert.equal(environment.nodes.get("profile-submit").textContent, "Retry Create Profile");
+    assert.equal(environment.nodes.get("profile-form").dataset.profileState, "create");
+    assert.equal(environment.nodes.get("profile-submit").textContent, "Create Profile");
     assert.equal(environment.nodes.get("profile-name").disabled, false);
+    assert.equal(environment.nodes.get("profile-name").value, "Recovered Profile");
+    assert(!environment.messages.some(({ message }) => message.type === "home:open-target"),
+      "first-create errors remain in People without a recovery prerequisite");
 
     await triggerProfileSubmit(environment);
     assert.equal(environment.nodes.get("profile-form").dataset.profileState, "saved");
@@ -788,7 +772,7 @@ if (!scenario) {
     "configured",
     "setup_suggestion_confirmed",
     "unavailable",
-    "recovery_required",
+    "create_retry",
     "isolated",
     "discovery_states",
     "discovery_reload_converges",

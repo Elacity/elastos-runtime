@@ -43,6 +43,7 @@ const state = {
   homeStateWrites: [],
   errors: [],
 };
+const pageErrors = [];
 
 function assert(condition, message, details = undefined) {
   if (condition) {
@@ -124,17 +125,21 @@ function homeSummary() {
     home: { route: "/apps/home/", attach_kind: "iframe" },
     app: { id: "home", route: "/apps/home/" },
     identity: {
-      id: principalId,
-      display_name: "Lifecycle Fixture",
+      device_did: null,
+      profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" },
+      recovery_readiness: { schema: "elastos.recovery.readiness/v1", status: "ready" },
     },
     authority: {
       signed_in: true,
       principal_id: principalId,
+      session_id: "fixture-session",
       proof_binding_id: "fixture-proof-binding",
+      wallet_connected: false,
     },
     browser_state: {
       schema: "elastos.home.browser-state/v1",
       principal_id: principalId,
+      localhost_root: "localhost://fixture",
       layout: null,
       recent_targets: ["browser"],
       session: {
@@ -158,25 +163,51 @@ function homeSummary() {
       },
     },
     active_shell: {
+      schema: "elastos.home.active-shell/v1",
       active: "home-gui",
       candidates: [
         {
           name: "home-gui",
           title: "Desktop",
+          description: "Fixture Desktop", route: "/apps/home-gui/", role: "shell", trust_state: "trusted",
           launchable: true,
         },
       ],
     },
-    appearance: {},
-    runtime: {},
-    site: {},
-    room: {},
-    people: {},
-    services: {},
-    notifications: [],
-    desktop_objects: [],
-    capsule_catalog: [],
-    capsule_interfaces: [],
+    // Current HomeSummaryResponse fields, including the strict appearance contract.
+    appearance: {
+      schema: "elastos.home.appearance/v1", revision: 0, theme: "dark", accent: "blue",
+      accent_custom: "#4f7fff", dock_auto_hide: false, sounds: false, focus_mode: false,
+      background_image_url: null, background_overlay_enabled: true, background_overlay_opacity: 0.55,
+    },
+    runtime: { running: true, kind: "local", version: null, api_url: null, pid: null, running_capsules: [], note: null },
+    site: { staged: false, root_uri: "", path: "", active_release: null, active_channel: null, active_bundle_cid: null, release_count: 0 },
+    room: {
+      room_slug: "fixture", title: "", member_count: 0, active_member_count: 0, pending_count: 0, active_session_count: 0,
+      latest_request_name: null, latest_request_device: null, local_runtime_did: null, local_runtime_role: null,
+      canonical_hosted_guest_url: null, ephemeral_hosted_guest_url: null,
+      browser_access_allowed: true, browser_access_block_reason: null, pending_requests: [], active_sessions: [],
+    },
+    people: { schema: "elastos.people.contacts/v1", contact_count: 0, contacts: [], service_offer_count: 0, service_offers: [] },
+    services: {
+      schema: "elastos.runtime.services/v1", local_offer_count: 0, remote_offer_count: 0,
+      available_local_offer_count: 0, available_remote_offer_count: 0, local_offers: [], remote_offers: [],
+      available_local_offers: [], available_remote_offers: [], grant_model: "principal_scoped_provider_grant",
+      carrier_contract: "People discovers trusted offers; Carrier carries signed offer envelopes; providers enforce grants.",
+      capsule_contract: "capsule -> runtime capability -> provider grant -> service",
+    },
+    notifications: { unread_count: 0, attention_count: 0, entries: [] },
+    desktop_objects: { schema: "elastos.home.desktop-objects/v1", uri: "localhost://fixture/Desktop", objects: [], stale: false },
+    capsule_catalog: {
+      schema: "elastos.capsules.catalog/v1", capsules: [],
+      counts: { total: 0, installed: 0, launchable: 0, interfaces: 0, methods: 0, apps: 0, viewers: 0, providers: 0, content: 0, shell: 0 },
+      policy: { install_state: "signed-app-install-pending", install_note: "Fixture inventory", payment_state: "provider-rail-required", payment_note: "", drm_state: "provider-rail-required", drm_note: "" },
+    },
+    capsule_interfaces: {
+      schema: "elastos.capsules.interfaces/v1", interfaces: [],
+      counts: { capsules: 0, interfaces: 0, methods: 0, executable_methods: 0 },
+      policy: { descriptor_state: "manifest-declared", descriptor_note: "Fixture inventory", invocation_state: "runtime-gated", invocation_note: "" },
+    },
     targets: [
       {
         target: "browser",
@@ -359,6 +390,16 @@ async function handleApi(req, res, url) {
   }
   if (url.pathname === "/api/apps/home/summary" && req.method === "GET") {
     json(res, 200, homeSummary());
+    return true;
+  }
+  if (url.pathname === "/api/apps/home/collaboration/presence" && req.method === "POST") {
+    if (!requireToken(req, homeAuthorityToken, res)) return true;
+    assert(JSON.stringify(await readBody(req)) === "{}", "Home presence must use an empty admitted request");
+    json(res, 200, {
+      schema: "elastos.people.discovery/v1", configured: false, enabled: false,
+      status: "unconfigured", status_message: "Discovery isn’t available on this Home.",
+      discovered_count: 0, discovered_peers: [], request_count: 0,
+    });
     return true;
   }
   if (url.pathname === "/api/apps/home/runtime/ensure" && req.method === "POST") {
@@ -640,12 +681,13 @@ function playwrightSpecifier() {
 async function waitFor(check, timeoutMs, label) {
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
+    assert(pageErrors.length === 0 && state.errors.length === 0, `fixture failed while waiting for ${label}`, { pageErrors, serverErrors: state.errors });
     if (await check()) {
       return;
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
-  throw new Error(`timed out waiting for ${label}`);
+  throw new Error(`timed out waiting for ${label}: ${JSON.stringify({ pageErrors, serverErrors: state.errors })}`);
 }
 
 function homeGuiFrame(page) {
@@ -662,6 +704,7 @@ try {
   const imported = await import(playwrightSpecifier());
   const { chromium } = imported.default || imported;
   browser = await chromium.launch({
+    ...(process.env.ELASTOS_BROWSER_EXECUTABLE ? { executablePath: process.env.ELASTOS_BROWSER_EXECUTABLE } : {}),
     headless: true,
     args: [
       "--disable-background-networking",
@@ -765,23 +808,21 @@ try {
   );
 
   const page = await context.newPage();
-  const pageErrors = [];
-  page.on("pageerror", (error) => pageErrors.push(String(error?.stack || error)));
+  const recordPageError = (error) => {
+    if (pageErrors.length < 20) pageErrors.push(String(error).slice(0, 2000));
+  };
+  page.on("pageerror", (error) => recordPageError(error?.stack || error));
   page.on("console", (message) => {
     if (message.type() === "error") {
-      pageErrors.push(`console: ${message.text()}`);
+      recordPageError(`console: ${message.text()}`);
     }
   });
 
   await page.goto(`${origin}/apps/home/`, { waitUntil: "domcontentloaded" });
-  await page.waitForFunction(
-    () => document.body.dataset.homeStatus === "ready",
-    null,
-    { timeout: 15_000 },
-  );
+  await waitFor(() => page.evaluate(() => document.body.dataset.homeStatus === "ready"), 15_000, "initial Home bootstrap");
   await waitFor(() => homeGuiFrame(page), 15_000, "first real Home GUI frame");
   const firstGui = homeGuiFrame(page);
-  await firstGui.waitForSelector('.window[data-target="browser"]', { timeout: 15_000 });
+  await waitFor(() => firstGui.locator('.window[data-target="browser"]').isVisible(), 15_000, "initial Browser window");
   assert(
     await firstGui.locator('.window[data-target="browser"]').count() === 1,
     "first Home load did not restore exactly one Browser shell",
@@ -807,21 +848,17 @@ try {
   state.browserVmCount = 1;
   state.activeCleanupId = recoveredCleanupId;
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForFunction(
-    () => document.body.dataset.homeStatus === "ready",
-    null,
-    { timeout: 15_000 },
-  );
+  await waitFor(() => page.evaluate(() => document.body.dataset.homeStatus === "ready"), 15_000, "restored Home bootstrap");
   await waitFor(() => homeGuiFrame(page), 15_000, "refreshed real Home GUI frame");
   const restoredGui = homeGuiFrame(page);
-  await restoredGui.waitForSelector('.window[data-target="browser"]', { timeout: 15_000 });
+  await waitFor(() => restoredGui.locator('.window[data-target="browser"]').isVisible(), 15_000, "restored Browser window");
   await waitFor(
     () => browserFrame(page)?.url().includes("fixture_duplicate_open=1"),
     15_000,
     "restored real Browser frame",
   );
   const restoredBrowser = browserFrame(page);
-  await restoredBrowser.waitForSelector("#browser-form", { timeout: 15_000 });
+  await waitFor(() => restoredBrowser.locator("#browser-form").isVisible(), 15_000, "restored Browser bootstrap");
   await waitFor(
     () => state.browserStatusPolls > 0 && state.browserOpenCompleted,
     15_000,

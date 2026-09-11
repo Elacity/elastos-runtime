@@ -517,6 +517,7 @@ export function initializeShellLayout(summary) {
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
     desktopHidden: normalizedDesktopHidden,
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
+    setupReminderDismissed: stored?.setupReminderDismissed === true,
   };
 
   let changed =

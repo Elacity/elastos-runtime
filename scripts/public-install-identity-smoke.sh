@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/public-install-guards.sh"
+source "${REPO_ROOT}/scripts/lib/runtime-cleanup.sh"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"
 HOME_DIR="$(mktemp -d /tmp/elastos-public-identity-XXXXXX)"
-trap 'rm -rf "$HOME_DIR"' EXIT
+DATA_DIR=""
+cleanup() {
+    if [[ -n "$DATA_DIR" ]] && ! cleanup_elastos_runtime_home "$HOME_DIR" "$DATA_DIR" "${RUN_BIN:-${HOME_DIR}/.local/bin/elastos}"; then
+        echo "[public-identity] cleanup could not verify shutdown; preserved ${HOME_DIR}" >&2
+        exit 1
+    fi
+    rm -rf "$HOME_DIR"
+}
+trap cleanup EXIT
+DATA_DIR="$(elastos_runtime_data_dir "$HOME_DIR" "${HOME_DIR}/xdg-data")"
 
 echo "[public-identity] install from public gateway"
 HOME="${HOME_DIR}" \
 XDG_DATA_HOME="${HOME_DIR}/xdg-data" \
 ELASTOS_PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
-bash -lc 'mkdir -p "$HOME" "$XDG_DATA_HOME" && curl -fsSL "${ELASTOS_PUBLISHER_GATEWAY%/}/install.sh" | bash' \
-    >/tmp/elastos-public-identity-install.log
+bash --noprofile --norc -c 'set -eo pipefail; mkdir -p "$HOME" "$XDG_DATA_HOME" && curl -fsSL "${ELASTOS_PUBLISHER_GATEWAY%/}/install.sh" | bash' \
+    >"${HOME_DIR}/install.log"
 
 INSTALLED_BIN="${HOME_DIR}/.local/bin/elastos"
 RUN_BIN="${ELASTOS_BIN_OVERRIDE:-${INSTALLED_BIN}}"
-DATA_DIR="${HOME_DIR}/xdg-data/elastos"
 INSTALLED_COMPONENTS_MANIFEST="${DATA_DIR}/components.json"
 SOURCES_PATH="${DATA_DIR}/sources.json"
 
@@ -81,7 +93,7 @@ guard_branch_binary_requires_checksummed_public_manifest "${INSTALLED_COMPONENTS
 HOME="${HOME_DIR}" \
 XDG_DATA_HOME="${HOME_DIR}/xdg-data" \
 ELASTOS_COMPONENTS_MANIFEST="${INSTALLED_COMPONENTS_MANIFEST}" \
-"${RUN_BIN}" setup >/tmp/elastos-public-identity-setup.log
+"${RUN_BIN}" setup >"${HOME_DIR}/setup.log"
 
 echo "[public-identity] prove DID-backed identity contract"
 ELASTOS_COMPONENTS_MANIFEST="${INSTALLED_COMPONENTS_MANIFEST}" \
