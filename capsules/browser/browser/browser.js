@@ -2420,19 +2420,20 @@ async function restoreRuntimePageViewer(summary) {
   showStatus("Restoring the Browser display...", { sticky: true });
   startPageHeartbeat();
   try {
-    await fetchPageStatus({ history: "replace", forceAddress: true });
-    if (!runtimeViewerOwnerActive(owner)) return true;
-    publishRuntimePageForHost(currentPage);
     // Page status is diagnostic; attach replaces offers within retained Runtime authority.
     if (currentPage.display_session?.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");
     }
-    const display = await attachRecoveredDisplay(summary, owner);
-    if (!display || !runtimeViewerOwnerActive(owner)) return true;
+    const [status, display] = await Promise.all([
+      fetchPageStatus({ history: "replace", forceAddress: true }),
+      attachRecoveredDisplay(summary, owner),
+    ]);
+    if (!status || !display || !runtimeViewerOwnerActive(owner)) return true;
     if (display.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");
     }
     currentPage = { ...currentPage, display_session: display };
+    publishRuntimePageForHost(currentPage);
     currentDisplayMode = display.mode;
     syncDisplayInputFromSession(display);
     currentView = viewFromDisplaySession(display) || currentPage.view;

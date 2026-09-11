@@ -929,6 +929,12 @@ test("recovery observer binds requests to the viewer and keeps their start gener
     assert.deepEqual(records.map(value => [value.kind, value.phase, value.document_generation]),
       [["status", "request", 0], ["navigation", "commit", 1], ["status", "response", 0], ["closing", "request", 1]]);
     assert.equal(records[0].request_id, records[2].request_id);
+    const summary = request("/api/apps/browser/summary?browser_instance=instance-one");
+    emit("request", request("/api/apps/browser/summary?browser_instance=foreign"));
+    emit("request", summary);
+    emit("response", { request: () => summary, status: () => 200 });
+    assert.deepEqual(records.slice(-2).map(value => [value.kind, value.phase]), [["summary", "request"], ["summary", "response"]]);
+
     const event = { source: frameWindow, origin: "null", data: {
       type: "elastos.home.browser-authority-renew.request/v1", homeToken: "token-one",
       browserInstance: "instance-one", requestId: "renew-one" } };
@@ -998,7 +1004,12 @@ for (const observation of ["ready", "document-transition", "unexpected-viewer-er
       await assert.rejects(run, error => error.details.viewer_reload.failure === "probe_setup_or_observation_failed");
       assert.deepEqual(actions, []);
     } else {
-      assert.equal((await run).ok, true);
+      const outcome = await run;
+      assert.equal(outcome.ok, true);
+      assert.deepEqual(Array.from(outcome.state_observation.steps, row => row.step),
+        ["runtime_summary", "remote_page_status", "viewer_document_metrics"]);
+      assert.ok(outcome.state_observation.steps.every(row => row.end_ms >= row.start_ms));
+      assert.equal(outcome.state_observation.steps[0].outcome, "complete");
       assert.deepEqual(actions, ["wait-commit", "reload-frame", "input"]);
       assert.match(requests[1].url, /\/pages\/runtime-owner\/status$/);
     }
@@ -1102,4 +1113,44 @@ test("observer cancellation disposes a listener handle returned after its setup 
   assert.equal(remoteListener, false);
   assert.equal(disposed, 1);
   assert.ok([...listeners.values()].every(value => value.size === 0));
+});
+
+for (const mode of ["body-abort", "overflow"]) test(`reload substep evidence is bounded and retains ${mode}`, async () => {
+  const controller = new AbortController();
+  let release, inFlight, count = 0;
+  const body = new Promise(resolve => { release = resolve; });
+  const frame = { url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one",
+    evaluate: async () => ({ viewer: null, video: null }) };
+  const wrapper = harnessFunction("runControlledBrowserViewerReload", {
+    readBrowserViewerReloadDocument, markStage: () => {}, assert: (value, message) => assert.ok(value, message),
+    fetch: async () => { count++; return { ok: true, json: () => mode === "body-abort" ? body : { sessions: {} } }; },
+    diagnoseBrowserViewerReload: async callbacks => {
+      if (mode === "overflow") {
+        for (let i = 0; i < 40; i++) await callbacks.readState({ signal: controller.signal, deadlineMs: 5000 });
+        return { ok: true };
+      }
+      inFlight = callbacks.readState({ signal: controller.signal, deadlineMs: 5000 }).catch(() => {});
+      await new Promise(resolve => setImmediate(resolve));
+      controller.abort();
+      throw Object.assign(new Error("state deadline"), { evidence: { ok: false, failure: "state_deadline" } });
+    },
+  });
+  const run = wrapper({}, frame, "private-token", async () => {}, "http://private.invalid");
+  if (mode === "overflow") {
+    const result = await run;
+    assert.equal(result.state_observation.steps.length, 64);
+    assert.equal(result.state_observation.dropped_steps, 16);
+    assert.equal(count, 40);
+  } else {
+    let evidence;
+    await assert.rejects(run, error => { evidence = error.details.viewer_reload; return evidence.failure === "state_deadline"; });
+    assert.equal(evidence.state_observation.steps.length, 1);
+    const row = evidence.state_observation.steps[0];
+    assert.equal(row.step, "runtime_summary"); assert.equal(row.outcome, "aborted");
+    assert.ok(row.start_ms <= row.headers_ms && row.headers_ms <= row.end_ms);
+    const frozen = JSON.stringify(evidence);
+    release({ sessions: { recoverable_page: { page_id: "private-page" } } }); await inFlight;
+    assert.equal(JSON.stringify(evidence), frozen); assert.equal(count, 1);
+    assert.ok(!frozen.includes("private"));
+  }
 });

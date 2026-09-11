@@ -359,3 +359,17 @@ test("failed Runtime predicate is retained before any pending viewer check", asy
     assert.ok(evidence.binding_failure.failed_checks.includes(check));
   assert.ok(evidence.binding_failure.at_ms >= evidence.reload_started_ms);
 });
+
+test("reload retains summary and attachment header timing without accepting bodies or changing its gate", async () => {
+  const f = fixture(), reload = f.args.reloadViewer;
+  f.args.reloadViewer = async budget => {
+    await reload(budget);
+    f.event("summary", "request"); f.event("summary", "response", { status: 200 });
+    f.event("signaling", "headers", { signal_type: "display_attach", status: 200 });
+  };
+  const evidence = await f.run();
+  assert.equal(evidence.started_monotonic_ms, 0);
+  assert.equal(evidence.requests.filter(row => row.kind === "summary").length, 2);
+  assert.ok(evidence.requests.some(row => row.kind === "signaling" && row.event === "headers" && row.status === 200));
+  assert.ok(evidence.reload_ms <= 5000); assert.ok(!JSON.stringify(evidence).includes(secret));
+});
