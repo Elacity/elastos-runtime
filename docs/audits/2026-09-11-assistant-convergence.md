@@ -96,3 +96,26 @@ reused. Linux remains pending on its recorded capacity and startup-profile gates
 Final packaging/signing follows source freeze and the release gate. Human
 recovery acceptance, cold Carrier delivery, remaining contributor integration,
 Browser and protected-content gates retain their existing status.
+
+## Human follow-up: System and Marketplace launch
+
+Human review found a real installation gap after passkey enrollment. System
+launch returned `502`: its source entrypoint record retained an external release
+archive identity without the matching registry archive hash. Marketplace had the
+same mismatch. Their source and installed app files already matched.
+
+Installer guard `822c4e3d` now checks source capsule metadata before staging the
+Runtime or replacing the success receipt. It applies Runtime's platform selection
+order, permits valid source and archive entries, and rejects conflicts before
+mutation. Regression cases cover stale identity, platform aliases, install paths,
+malformed input and metadata changes during staging; the installer smoke passes.
+
+Both Mac J3 Homes now have corrected metadata and fresh canonical receipts. The
+Runtime and capsule bytes remain those of the accepted candidate; all 147 affected
+artifact records match source, built, installed and served bytes where applicable.
+Owned restart preserves the enrolled human account, Profile and app data. System
+and Marketplace open through normal dock controls in the test Home and Anders's
+actual browser. System shows the current passkey account; Marketplace Models
+shows the verified Qwen package with its Use action. Full human Qwen admission
+and reply acceptance remain pending. Existing recovery Homes and Linux are
+unchanged. The original failure receipt remains available in the private checkpoint.

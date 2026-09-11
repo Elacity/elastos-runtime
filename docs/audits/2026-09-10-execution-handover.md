@@ -43,9 +43,11 @@ admitted package files are reused. See
 mapping and the distinction between installed data and three-store fixture proof.
 
 A separate fresh Mac human Home serves the same candidate and has a verified
-locally cached Qwen package. Its normal passkey setup is ready. The private
-checkpoint records its URL and receipt. Human enrollment and normal model
-admission there require the user's presence. The earlier recovery human Homes
+locally cached Qwen package. The user has enrolled a passkey account. The private
+checkpoint records its URL and receipt. Human review found stale release metadata
+for System and Marketplace; installer guard `822c4e3d` and corrected metadata now
+pass normal launches in the actual browser. Account and Profile data remain
+intact. Human Qwen admission and reply acceptance are next. The earlier recovery human Homes
 remain `1e320578`; existing user previews and public stage remain `d790a48e`.
 The original recovery, retry, reload, media reuse and Carrier cleanup receipts
 remain accepted. Full AUTH-01 human acceptance is still pending.
