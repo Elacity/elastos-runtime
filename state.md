@@ -38,7 +38,10 @@ Last updated: 2026-09-10 UTC
 - Refreshed origin still has dev at `6c61c990`. The protected-content follow-up
   branch moved from `decab1f5` to `06179578`; re-review its current PR62 scope
   rather than relying on the older plan snapshot. Closeout inventory found
-  75 local branches and 12 worktrees. Dirty donor work is preserved; the detached
+  75 local branches and 12 worktrees. The follow-up review removed five fully
+  preserved branch names, leaving 70 branches and all 12 worktrees. All removed
+  tips and reflog revisions remain reachable; 24 other merged-tip candidates
+  retain unreviewed historical reflog work. Dirty donor work is preserved; the detached
   Browser build is reachable from `fix/browser-maturity`. Repository-wide
   branch consolidation remains open.
 
@@ -46,7 +49,11 @@ This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
 volatile proof logs remain outside the repository.
 
-## Current execution snapshot — 2026-09-10
+## Execution evidence history — 2026-09-10
+
+The closeout facts above and the current handover control the next action.
+The snapshots below retain their original source and installed identities;
+earlier candidates and pending steps describe the state at that point.
 
 The first execution pilot is the public storefront and `/home/` on the seed,
 using reviewed source from the active local work. Mission R2 corrects an initial
@@ -97,7 +104,7 @@ approved plan retains full release acceptance.
   data paths and process ownership. It preserves another installation sharing
   a binary and retains state when captured children survive shutdown. Independent
   review passed. Real three-platform installation remains open.
-- The existing 30-minute monitor is active. Nine independent process cases
+- The 30-minute monitor is paused at closeout. Historical monitoring proof: Nine independent process cases
   passed review. Its first real observation exposed task permission limits;
   a writable shared state and coordinator reads resolved them in a second real
   observation. The recurring timer subsequently delivered and the monitor wrote

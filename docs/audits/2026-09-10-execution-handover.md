@@ -1,8 +1,9 @@
 # ElastOS 0.7.1 execution handover
 
 Session closeout requested by Anders on 2026-09-10 after 49% of the weekly
-allowance was used. Resume only when Anders asks. The full five-journey release
-mission remains open; this is a handover, not release acceptance.
+allowance was used. Anders then requested a handover review and safe branch
+cleanup. That closeout work is complete; product execution remains paused until
+Anders resumes it. The full five-journey release mission remains open.
 
 ## Resume here
 
@@ -11,13 +12,35 @@ Read this document, the single Now queue in [TASKS.md](../../TASKS.md),
 [Notion plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9).
 Notion owns D1–D6 and required acceptance. TASKS owns next work; state owns
 verified facts. Private process, path, proof and inventory details are in the
-local operator ledger and `.git/development-loop-current.md`.
+local operator ledger and current checkpoint. Resolve their directory with
+`git rev-parse --path-format=absolute --git-common-dir`; read
+`development-loop-current.md` there. A linked worktree's `.git` is a file.
 
 Use `feat/0.7.1-website-execution`, based on the user-selected
 `origin/upstream/0.7.1-dev` at `6c61c990`. Preserve the integration and Browser
 donors. Before edits, recheck HEAD/tree, dirt, fetched divergence and target
 receipts. Local source is ahead of installed artifacts. A new source commit
 alone does not require rebuilding every component.
+
+The closeout review started from clean source `3f789db1`, tree
+`a8ca58bad7c36b8b4e441e700b5286b06a14d50c`, 48 ahead and zero behind the
+fetched dev base. Subsequent closeout edits affect documentation only. The
+private checkpoint records the final handover commit. Use this checkout
+explicitly: the default repository checkout contains unrelated dirty donor work.
+
+First execution checkpoint: read the source-repair receipts, select one combined
+working candidate, rebuild only affected outputs, and prove kit-first Recover
+with the original Profile DID/name plus prompt shutdown on matching installed
+artifacts. The private Mac assembly helper is pinned to the older candidate;
+review and update its explicit source input before using it. Preserve both user
+test Homes, keys and the private publisher. Revalidate process IDs and port
+ownership before restarting anything. This working build precedes the final
+release assembly after C5. Capture bounded diagnostics on the first test failure.
+
+The public deployment stage also contains the older `d790a48e` candidate. Replace
+the staged artifacts with the selected candidate, then refresh their receipt and
+preservation plan before seeking deployment approval. Product development and
+recurring monitors stay paused during this closeout review.
 
 ## Delivered and verified
 
@@ -44,16 +67,18 @@ and exact name are checked by recovery tests and the Home summary. File/password
 state stays in memory. Wrong encrypted passwords are checked by the server after
 passkey setup. A reload clears this memory; sign-in/System recovery is still the
 resumption path and needs a coherent follow-up. Installed recovery acceptance
-remains open. The journey workbook's AUTH-01 wording also needs reconciliation
-with the accepted Profile-first Create and kit-first Recover behavior; retain
-its actual pending verdict.
+remains open. Notion now states the intended order: Create stores the protected
+Profile and display name before exporting a complete Recovery Kit; Recover opens
+kit selection first and restores the existing Profile. Refresh an earlier kit
+when later Profile changes require it. The journey workbook's AUTH-01 wording
+still needs the same correction before its next run; retain its pending verdict.
 
-Gateway shutdown must close active connections before releasing data-root
-ownership. A timeout that merely abandons waiting is insufficient. The final
-source check must prove connection EOF/reset, child reaping and safe restart.
-Media tools are downloaded twice because the named installation-state check
-mistakes a tool archive for a capsule requiring `capsule.json`; preserve archive
-CID/checksum validation when correcting that classification.
+Installed `d790a48e` still has the reported slow shutdown and duplicate media-tool
+download behavior. Source repair `a8b8f54d` closes active connections before
+releasing data-root ownership and proves EOF/reset, child reaping and safe
+restart. Repair `f8824ee4` distinguishes tool archives from capsules while
+preserving archive CID/checksum validation. Their next gate is combined installed
+verification.
 
 Closeout source acceptance: recovery `67572db1` passes enrollment edge cases,
 six viewport checks, encrypted fresh-machine and real-enrollment recovery
@@ -98,10 +123,18 @@ Browser, shared Home, update or protected-video acceptance.
 ## Branch and entropy discipline
 
 The closeout inventory records every branch's commit/tree, worktree dirt,
-protecting refs and preservation decision. Inventory: 75 local branches and 12 worktrees; four were dirty at the
-initial closeout scan. Many branches still hold unmerged
-work; the detached Browser build and historical backup refs need explicit
-reconciliation. No branch or user state was deleted during closeout.
+protecting refs and preservation decision. The follow-up review reduced 75 local
+branches to 70 by removing five fully preserved branch names. Their tip commits
+and reflog revisions remain reachable from retained refs, with an exact restoration
+map in the private cleanup receipt. Another 24 merged-tip candidates retain
+historical reflog work and need review before removal.
+
+All 12 worktrees remain. The active website checkout is clean at handoff; the
+root documentation, Browser maturity and Home URUX worktrees contain preserved
+dirty work. The detached Browser build is contained in `fix/browser-maturity`.
+Three historical backup refs and the clean review/build worktrees retain their
+ledger owner and cleanup conditions. Broader donor integration and cleanup remain
+open. Branch count alone is not a reason to merge incompatible work.
 
 Before integrating a donor, map its unique commits and dirty changes to one
 owning journey. Preserve semantic conflict resolutions, especially provider
