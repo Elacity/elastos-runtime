@@ -1147,6 +1147,26 @@ pub(super) fn home_service_offers_for_people_contact(
         source: "people_contact".to_string(), runtime_contract: None,
         contact_id: Some(contact.contact_id.clone()), capsule_hint: Some("browser".to_string()), route: None,
     });
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: format!("offer:{}:model", contact.contact_id),
+        service_uri: super::MODEL_SERVICE_URI.to_string(),
+        service_kind: super::MODEL_SERVICE_KIND.to_string(),
+        display_name: format!("{}'s AI model", contact.display_name),
+        provider_uri: Some("elastos://model/*".to_string()),
+        provider_label: "Remote model".to_string(),
+        policy_summary: "Ask this person to run their local AI model for you. Their Runtime keeps the model and decides every request; your conversation stays on your Home.".to_string(),
+        status: "requestable".to_string(),
+        enabled: false,
+        grant_required: true,
+        grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
+        capsule_contract: "assistant -> Runtime service grant -> owner-bound model run".to_string(),
+        source: "people_contact".to_string(),
+        runtime_contract: None,
+        contact_id: Some(contact.contact_id.clone()),
+        capsule_hint: Some("assistant".to_string()),
+        route: None,
+    });
     offers
 }
 
@@ -1466,6 +1486,28 @@ fn home_local_service_offers(
             contact_id: None,
             capsule_hint: Some("browser".to_string()),
             route: Some("/apps/browser/".to_string()),
+        });
+    }
+    if data_dir.join("bin/model-provider").is_file() {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: super::MODEL_LOCAL_OFFER.to_string(),
+            service_uri: "elastos://model/offers".to_string(),
+            service_kind: super::MODEL_SERVICE_KIND.to_string(),
+            display_name: "AI model".to_string(),
+            provider_uri: Some("elastos://model/*".to_string()),
+            provider_label: "Model provider".to_string(),
+            policy_summary: "Share your local AI model with accepted contacts. Each request needs your approval in Inbox; hosted models stay private; this Runtime decides every run and can revoke access.".to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
+            capsule_contract: "assistant -> model capability -> model provider".to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: None,
+            contact_id: None,
+            capsule_hint: Some("assistant".to_string()),
+            route: Some("/apps/assistant/".to_string()),
         });
     }
     if data_dir.join("bin/ipfs-provider").is_file() {

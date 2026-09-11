@@ -1550,6 +1550,9 @@ const carrierBridge = read(
   "elastos/crates/elastos-server/src/resource_bridge.rs",
 );
 const carrierRuntime = read("elastos/crates/elastos-server/src/carrier.rs");
+const modelServiceRuntime = read(
+  "elastos/crates/elastos-server/src/api/gateway_model_service.rs",
+);
 const runtimeCore = read("elastos/crates/elastos-server/src/runtime.rs");
 const runtimeControl = read(
   "elastos/crates/elastos-server/src/runtime_control.rs",
@@ -6828,9 +6831,18 @@ assert(
     carrierRuntime.includes('"transfer": "stream"') &&
     carrierRuntime.includes("ProviderTransfer::Stream") &&
     carrierRuntime.includes('"carrier_provider_invoke"') &&
-    /"content"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
+    /"content"\s*\|\s*"model"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
       carrierRuntime,
     ) &&
+    // The model target is admitted only through the destination-owned grant
+    // check; the generic registry path must never serve it.
+    carrierRuntime.includes('if msg.data["target"] == "model" {') &&
+    carrierRuntime.includes("crate::api::gateway::invoke_remote_model(") &&
+    modelServiceRuntime.includes("authorize_home_service_model(") &&
+    modelServiceRuntime.includes("fn remote_principal_id(") &&
+    modelServiceRuntime.includes('local_object.remove("_runtime_invocation");') &&
+    modelServiceRuntime.includes("fn shareable_offers(") &&
+    modelServiceRuntime.includes("fn redact_provider_error(") &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
     carrierRuntime.includes("with_carrier_endpoint_and_registry") &&

@@ -224,6 +224,8 @@ struct HomeServicesPendingAccessDecision {
     remote_exit: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_engine: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_model: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +245,8 @@ struct HomeServicesRemoteOfferRequestRecord {
     installed_remote_exit_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_engine_grant: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_model_grant: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_access_decision: Option<HomeServicesPendingAccessDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2129,6 +2133,7 @@ pub(super) async fn services_offer_update(
                                 status: "requested".to_string(),
                                 installed_remote_exit_id: None,
                                 remote_engine_grant: None,
+                                remote_model_grant: None,
                                 pending_access_decision: None,
                                 access_decision_sha256: None,
                             },
@@ -2433,6 +2438,16 @@ fn home_services_supported_request(kind: &str, uri: &str) -> bool {
     (kind == HOME_REMOTE_EXIT_SERVICE_KIND && uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI)
         || (kind == crate::carrier::ENGINE_SERVICE_KIND
             && uri == crate::carrier::ENGINE_SERVICE_URI)
+        || (kind == super::MODEL_SERVICE_KIND && uri == super::MODEL_SERVICE_URI)
+}
+
+fn home_services_local_model_shared(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<bool> {
+    Ok(home_services_selection_state(data_dir, context)?
+        .local_offer_ids
+        .contains(super::MODEL_LOCAL_OFFER))
 }
 
 fn home_services_local_engine_shared(
@@ -2453,6 +2468,10 @@ fn home_services_request_shared(
         && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
     {
         home_services_local_engine_shared(data_dir, context)
+    } else if request.service_kind == super::MODEL_SERVICE_KIND
+        && request.service_uri == super::MODEL_SERVICE_URI
+    {
+        home_services_local_model_shared(data_dir, context)
     } else if request.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
         && request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
     {
@@ -2471,7 +2490,7 @@ fn home_services_send_access_request(
     offer: &HomeServiceOfferSummary,
 ) -> anyhow::Result<HomeServiceAccessRequestSent> {
     if !home_services_supported_request(&offer.service_kind, &offer.service_uri) {
-        anyhow::bail!("only Browser Engine and Exit service requests are supported");
+        anyhow::bail!("only Browser Engine, Exit and model service requests are supported");
     }
     let contact =
         home_services_peer_contact_record_for_offer(data_dir, context, discovery_service, offer)?;
@@ -2623,6 +2642,20 @@ fn home_services_send_access_decision(
             "peer_did":runtime.peer_id, "connect_ticket":runtime.connect_ticket,
             "operations":crate::carrier::browser_engine_binding::operations(request.grant_scope.as_deref()),
             "expires_at":request.grant_expires_at,
+        });
+    }
+    if decision == "approved"
+        && request.service_kind == super::MODEL_SERVICE_KIND
+        && request.service_uri == super::MODEL_SERVICE_URI
+    {
+        payload["remote_model_grant"] = serde_json::json!({
+            "schema": super::MODEL_GRANT_SCHEMA,
+            "grant_id": super::model_grant_id(&request.request_id),
+            "peer_did": runtime.peer_id,
+            "connect_ticket": runtime.connect_ticket,
+            "offer_scope": "local_engines",
+            "operations": super::MODEL_OPERATIONS,
+            "expires_at": request.grant_expires_at,
         });
     }
     crate::carrier::sign_service_message(data_dir, &mut payload)?;
@@ -2827,6 +2860,12 @@ fn home_services_merge_access_decision(
         } else {
             None
         },
+        remote_model: if decision == "approved" && record.service_kind == super::MODEL_SERVICE_KIND
+        {
+            Some(home_services_remote_model_grant(context, record, payload)?)
+        } else {
+            None
+        },
         remote_exit: if decision == "approved"
             && record.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
         {
@@ -2901,6 +2940,7 @@ fn home_services_activate_pending_decision(
         .and_then(|exit| exit["id"].as_str())
         .map(str::to_string);
     next_record.remote_engine_grant = pending.remote_engine.clone();
+    next_record.remote_model_grant = pending.remote_model.clone();
     next_record.pending_access_decision = None;
     next.updated_at = now_ts();
     if pending.remote_exit.is_none() && record.installed_remote_exit_id.is_none() {
@@ -3408,6 +3448,136 @@ fn home_services_remote_engine_grant(
     )
 }
 
+fn home_services_remote_model_grant(
+    context: &HomeLaunchTokenContext,
+    record: &HomeServicesRemoteOfferRequestRecord,
+    payload: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let grant = &payload["remote_model_grant"];
+    let revision = payload["created_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("model grant revision required"))?;
+    let expiry = grant["expires_at"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("model grant expiry required"))?;
+    let ticket = home_services_payload_text(
+        grant,
+        "connect_ticket",
+        HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES,
+    )
+    .ok_or_else(|| anyhow::anyhow!("model Carrier ticket required"))?;
+    anyhow::ensure!(
+        grant["schema"] == super::MODEL_GRANT_SCHEMA
+            && grant["grant_id"].as_str()
+                == Some(super::model_grant_id(&record.request_id).as_str())
+            && grant["peer_did"].as_str() == Some(&record.target_peer_id)
+            && grant["offer_scope"] == "local_engines"
+            && grant["operations"] == serde_json::json!(super::MODEL_OPERATIONS)
+            && expiry > now_ts()
+            && expiry > revision
+            && expiry - revision <= super::MODEL_GRANT_TTL_SECS,
+        "model grant is expired or does not match the requested service"
+    );
+    record.target_peer_id.parse::<iroh::PublicKey>()?;
+    Ok(serde_json::json!({
+        "schema": super::MODEL_GRANT_SCHEMA,
+        "id": format!("remote-model-{}", hex::encode(&Sha256::digest(record.request_id.as_bytes())[..8])),
+        "grant_id": grant["grant_id"],
+        "peer_did": record.target_peer_id,
+        "connect_ticket": ticket,
+        "principal_id": context.principal_id,
+        "offer_scope": "local_engines",
+        "operations": grant["operations"],
+        "expires_at": expiry,
+    }))
+}
+
+/// Destination authority for a remote model operation. The grant must have
+/// been issued by this Runtime, stay approved and shared, and the requester
+/// must still be an accepted contact whose device key matches the Carrier
+/// source endpoint.
+pub(crate) fn authorize_home_service_model(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    source: &iroh::PublicKey,
+    grant_id: &str,
+    requester_principal_id: &str,
+    now: u64,
+) -> anyhow::Result<super::ModelServiceGrant> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    anyhow::ensure!(
+        principals.len() <= 64,
+        "model authority scope is unavailable"
+    );
+    let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+        .ok_or_else(|| anyhow::anyhow!("model signing identity unavailable"))?;
+    let mut authorized = None;
+    for principal in principals {
+        let context = HomeLaunchTokenContext {
+            principal_id: principal.principal_id,
+            proof_binding_id: Some(principal.proof_binding_id),
+            session_id: String::new(),
+            grant_id: String::new(),
+        };
+        let state = home_services_requests_state(data_dir, &context)?;
+        for record in state
+            .requests
+            .values()
+            .filter(|record| super::model_grant_id(&record.request_id) == grant_id)
+        {
+            anyhow::ensure!(
+                record.authenticated_request
+                    && record.status == "approved"
+                    && record.service_uri == super::MODEL_SERVICE_URI
+                    && record.service_kind == super::MODEL_SERVICE_KIND
+                    && home_services_local_model_shared(data_dir, &context)?,
+                "model grant is not active"
+            );
+            let profile = load_profile_authority_for_context(data_dir, &context)?
+                .ok_or_else(|| anyhow::anyhow!("model profile authority unavailable"))?;
+            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+                data_dir,
+                &context.principal_id,
+                &home_browser_localhost_root(&context),
+                network.clone(),
+                &profile,
+                &local_did,
+            )?;
+            anyhow::ensure!(
+                store.snapshot()?.contacts().iter().any(
+                    |contact| crate::carrier::did_to_public_key(
+                        contact.remote_presence_device_did()
+                    ) == Some(*source)
+                        && record.requester_did.as_deref()
+                            == Some(contact.remote_presence_device_did())
+                ),
+                "model requester is no longer an accepted contact"
+            );
+            let grant = super::ModelServiceGrant {
+                provider_principal_id: context.principal_id.clone(),
+                requester_principal_id: record
+                    .requester_principal_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("model requester principal required"))?,
+                requester_endpoint: record
+                    .requester_peer_id
+                    .parse::<iroh::PublicKey>()
+                    .ok()
+                    .ok_or_else(|| anyhow::anyhow!("model requester identity invalid"))?,
+                grant_id: grant_id.to_string(),
+                revision: record.updated_at,
+                expires_at: record
+                    .grant_expires_at
+                    .ok_or_else(|| anyhow::anyhow!("model grant expiry required"))?,
+            };
+            grant.validate(source, requester_principal_id, now)?;
+            anyhow::ensure!(authorized.is_none(), "model grant ownership is ambiguous");
+            authorized = Some(grant);
+        }
+    }
+    authorized.ok_or_else(|| anyhow::anyhow!("model grant was not issued by this Runtime"))
+}
+
 pub(in crate::api::gateway) fn home_services_remote_engine_grants(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -3818,8 +3988,12 @@ fn home_services_mark_access_request(
     let mut request = request;
     request.status = status.to_string();
     request.updated_at = revision;
-    request.grant_expires_at = (status == "approved")
-        .then(|| revision.saturating_add(crate::carrier::EXIT_GRANT_TTL_SECS));
+    let grant_ttl = if request.service_kind == super::MODEL_SERVICE_KIND {
+        super::MODEL_GRANT_TTL_SECS
+    } else {
+        crate::carrier::EXIT_GRANT_TTL_SECS
+    };
+    request.grant_expires_at = (status == "approved").then(|| revision.saturating_add(grant_ttl));
     if request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI {
         let limit = (status == "approved").then_some(crate::carrier::EXIT_GRANT_MAX_STREAMS);
         request.exit_max_active_streams = limit;

@@ -1407,7 +1407,17 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             };
-            let response = if msg.data["target"] == "browser-engine" {
+            let response = if msg.data["target"] == "model" {
+                let network = gossip_state.lock().await.browser_exit_network.clone();
+                crate::api::gateway::invoke_remote_model(
+                    registry.clone(),
+                    data_dir,
+                    network,
+                    source_endpoint_id,
+                    &msg.data,
+                )
+                .await
+            } else if msg.data["target"] == "browser-engine" {
                 let (network, slots, endpoint) = {
                     let state = gossip_state.lock().await;
                     (
@@ -2000,6 +2010,7 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
     matches!(
         target,
         "content"
+            | "model"
             | "availability"
             | "custody"
             | "rights"

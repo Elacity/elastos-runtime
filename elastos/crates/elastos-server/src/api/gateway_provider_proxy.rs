@@ -3841,7 +3841,7 @@ pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value)
         .map(String::as_str)
 }
 
-fn normalize_model_provider_request(
+pub(super) fn normalize_model_provider_request(
     op: &str,
     request: &serde_json::Value,
     context: &HomeLaunchTokenContext,

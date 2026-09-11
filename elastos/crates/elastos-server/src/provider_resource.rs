@@ -150,7 +150,9 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
             _ => None,
         },
         "browser-engine" => match op {
-            "status" | "readiness" | "page_status" | "diagnostics" | "inspect" => Some(Action::Read),
+            "status" | "readiness" | "page_status" | "diagnostics" | "inspect" => {
+                Some(Action::Read)
+            }
             "launch" | "attach_stream" | "input" | "webrtc_signal" => Some(Action::Write),
             "close_page" => Some(Action::Delete),
             _ => None,
