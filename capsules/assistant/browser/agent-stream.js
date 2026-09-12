@@ -535,6 +535,9 @@ export function formatStreamError(err) {
   if (code === "no_model_offers") {
     return NO_MODEL_OFFER_STATUS;
   }
+  if (code === "model_busy") {
+    return "Model is busy.";
+  }
   if (code === "selection_unavailable") {
     return `Model run failed: ${String(err?.message || "model offer is not available").slice(0, 160)}`;
   }

@@ -329,9 +329,9 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 &offer,
                 &mut run,
                 RunError {
-                    class: ErrorClass::SelectionUnavailable,
-                    code: "selection_unavailable".to_string(),
-                    message: "model offer is not available".to_string(),
+                    class: ErrorClass::RateLimited,
+                    code: "model_busy".to_string(),
+                    message: "Model is busy.".to_string(),
                 },
             )?;
             self.journal.store_run(&run)?;
@@ -3263,51 +3263,78 @@ mod tests {
     fn concurrency_limit_is_enforced() {
         let root = temp_root("concurrency");
         let adapters = FakeAdapters {
-            dispatch_results: Arc::new(Mutex::new(vec![
-                Ok(DispatchResult::Running {
-                    events: vec![EventSeed {
-                        kind: "dispatched",
-                        data: serde_json::json!({}),
-                    }],
-                    backend_state: serde_json::json!({"job_id":"job-1"}),
-                }),
-                Ok(DispatchResult::Running {
-                    events: vec![EventSeed {
-                        kind: "dispatched",
-                        data: serde_json::json!({}),
-                    }],
-                    backend_state: serde_json::json!({"job_id":"job-2"}),
-                }),
-            ])),
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Running {
+                events: vec![EventSeed {
+                    kind: "dispatched",
+                    data: serde_json::json!({}),
+                }],
+                backend_state: serde_json::json!({"job_id":"job-1"}),
+            })])),
             ..Default::default()
         };
-        let mut state = init_state(&root, vec![offer("local-text")], adapters);
+        let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
+        assert_eq!(offer("local-text").policy.concurrency_limit, 1);
         let input1 = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"one"});
         let input2 = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"two"});
+        let first_binding = create_binding("request:one", "local-text", &input1);
+        let second_binding = create_binding("request:two", "local-text", &input2);
         let first = state
             .handle_runs_create(RunsCreateRequest {
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
                 input: input1.clone(),
-                runtime_binding: create_binding("request:one", "local-text", &input1),
+                runtime_binding: first_binding,
             })
             .unwrap();
-        let second = state
-            .handle_runs_create(RunsCreateRequest {
-                op: "runs_create".to_string(),
-                offer_id: "local-text".to_string(),
-                operation: "text.generate".to_string(),
-                input: input2.clone(),
-                runtime_binding: create_binding("request:two", "local-text", &input2),
-            })
-            .unwrap();
+        let second_request = RunsCreateRequest {
+            op: "runs_create".to_string(),
+            offer_id: "local-text".to_string(),
+            operation: "text.generate".to_string(),
+            input: input2.clone(),
+            runtime_binding: second_binding.clone(),
+        };
+        let second = state.handle_runs_create(second_request.clone()).unwrap();
         assert_eq!(first["data"]["status"], "running");
         assert_eq!(second["data"]["status"], "failed");
+        assert_eq!(second["data"]["terminal"]["error"]["class"], "rate_limited");
+        assert_eq!(second["data"]["terminal"]["error"]["code"], "model_busy");
         assert_eq!(
-            second["data"]["terminal"]["error"]["class"],
-            "selection_unavailable"
+            second["data"]["terminal"]["error"]["message"],
+            "Model is busy."
         );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+
+        let replay = state.handle_runs_create(second_request).unwrap();
+        assert_eq!(replay["data"]["status"], "failed");
+        assert_eq!(replay["data"]["run_id"], second["data"]["run_id"]);
+        assert_eq!(replay["data"]["terminal"]["error"]["class"], "rate_limited");
+        assert_eq!(replay["data"]["terminal"]["error"]["code"], "model_busy");
+        assert_eq!(
+            replay["data"]["terminal"]["error"]["message"],
+            "Model is busy."
+        );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+
+        let events = state
+            .handle_runs_events(RunsEventsRequest {
+                op: "runs_events".to_string(),
+                run_id: second["data"]["run_id"].as_str().unwrap().to_string(),
+                after_sequence: Some(0),
+                runtime_binding: access_binding(&second_binding),
+            })
+            .unwrap();
+        let terminal = events["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["terminal"] == true)
+            .expect("capacity failure keeps a terminal event");
+        assert_eq!(terminal["kind"], "failed");
+        assert_eq!(terminal["data"]["class"], "rate_limited");
+        assert_eq!(terminal["data"]["code"], "model_busy");
+        assert_eq!(terminal["data"]["message"], "Model is busy.");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
     }
 
     #[test]

@@ -3451,10 +3451,7 @@ mod tests {
         let blocked_binding =
             create_binding("request:local-timeout-blocked", &offer, &blocked_input);
         let blocked = create_run(&provider, &offer, &blocked_binding, &blocked_input);
-        assert_eq!(
-            blocked["data"]["terminal"]["error"]["code"],
-            "selection_unavailable"
-        );
+        assert_eq!(blocked["data"]["terminal"]["error"]["code"], "model_busy");
 
         assert_eq!(
             wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding))["data"]

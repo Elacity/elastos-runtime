@@ -765,6 +765,33 @@ test("immediate failed create shows the provider result and restores it after sa
   assert.deepEqual(calls.filter((op) => op.startsWith("runs_")), ["runs_create"]);
 });
 
+test("saved model_busy lastTurn shows Busy after restore", () => {
+  const { ctx, status } = streamControllerFixture();
+  const saved = {
+    id: "one",
+    title: "overflow",
+    group: "Today",
+    messages: [{ role: "user", text: "Reply with the word overflow", modelText: "Reply with the word overflow" }],
+    lastTurn: {
+      state: "failed",
+      error: "model_busy",
+      providerRunId: "run-busy",
+      completedAt: 1,
+    },
+  };
+  ctx.sessions[0] = recoverStalePersistedTurn(saved);
+  status.textContent = "";
+  controller.renderActiveSession();
+  const visible = controller.formatStreamError({ code: "model_busy" });
+  assert.equal(visible, "Model is busy.");
+  assert.equal(ctx.sessions[0].lastTurn.state, "failed");
+  assert.equal(ctx.sessions[0].lastTurn.error, "model_busy");
+  assert.equal(status.textContent, visible);
+  assert.match(status.textContent, /busy/i);
+  assert.doesNotMatch(status.textContent, /model offer is not available/);
+  assert.doesNotMatch(status.textContent, /Model run failed/);
+});
+
 function renderedAgentText(stream) {
   const row = (stream.children || []).find((child) => child.dataset?.role === "agent");
   if (!row) return "";
