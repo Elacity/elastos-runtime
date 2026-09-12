@@ -2763,6 +2763,7 @@ assert(
     servicesScript.includes("isReadOnlyServiceOffer") &&
     servicesScript.includes("Managed by config") &&
     servicesScript.includes("Approved") &&
+    servicesScript.includes("Expired") &&
     servicesScript.includes("Denied") &&
     servicesScript.includes("serviceRequestStatus") &&
     servicesScript.includes("Share with People") &&

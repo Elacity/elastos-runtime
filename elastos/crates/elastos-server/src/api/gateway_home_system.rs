@@ -2104,7 +2104,14 @@ pub(super) async fn services_offer_update(
                         );
                     }
                 } else if req.selected {
-                    if offer.grant_required && !services_state.remote_offer_ids.contains(offer_id) {
+                    // A first request, or a fresh one after the earlier grant expired.
+                    let expired_grant = services_state
+                        .remote_offer_requests
+                        .get(offer_id)
+                        .is_some_and(|request| remote_offer_request_expired(request, now_ts()));
+                    if offer.grant_required
+                        && (!services_state.remote_offer_ids.contains(offer_id) || expired_grant)
+                    {
                         let sent = home_services_send_access_request(
                             &data_dir,
                             &context,
@@ -4158,12 +4165,14 @@ fn apply_home_services_selection(
         partition_service_offers(local_offers, &state.local_offer_ids);
     let (mut remote_offers, available_remote_offers) =
         partition_service_offers(remote_offers, &state.remote_offer_ids);
+    let now = now_ts();
     for offer in &mut remote_offers {
         if let Some(request) = state.remote_offer_requests.get(&offer.offer_id) {
             let installed =
                 request.status == "approved" && request.installed_remote_exit_id.is_some();
             offer.status = match request.status.as_str() {
                 "approved" if installed => "active",
+                "approved" if remote_offer_request_expired(request, now) => "expired",
                 "approved" => "approved",
                 "denied" => "denied",
                 _ => "requested",
@@ -4187,6 +4196,21 @@ fn apply_home_services_selection(
     services.available_local_offers = available_local_offers;
     services.available_remote_offers = available_remote_offers;
     Ok(())
+}
+
+/// An approved request whose signed grant has passed its expiry. The card
+/// says so, and asking again sends a fresh request instead of pretending the
+/// old approval still works.
+fn remote_offer_request_expired(request: &HomeServicesRemoteOfferRequestRecord, now: u64) -> bool {
+    if request.status != "approved" {
+        return false;
+    }
+    [&request.remote_model_grant, &request.remote_engine_grant]
+        .into_iter()
+        .flatten()
+        .filter_map(|grant| grant["expires_at"].as_u64())
+        .next()
+        .is_some_and(|expires_at| expires_at <= now)
 }
 
 fn partition_service_offers(
@@ -7245,5 +7269,29 @@ mod services_kind_tests {
         assert_eq!(noun, "Browser Engine");
         let (noun, _) = home_services_request_notification_copy("remote_exit", "elastos://x");
         assert_eq!(noun, "Browser Exit Node");
+    }
+
+    #[test]
+    fn an_approved_model_grant_past_its_expiry_is_expired() {
+        let request = HomeServicesRemoteOfferRequestRecord {
+            status: "approved".into(),
+            remote_model_grant: Some(serde_json::json!({ "expires_at": 100 })),
+            ..Default::default()
+        };
+        assert!(remote_offer_request_expired(&request, 100));
+        assert!(remote_offer_request_expired(&request, 101));
+        assert!(!remote_offer_request_expired(&request, 99));
+        let live = HomeServicesRemoteOfferRequestRecord {
+            status: "approved".into(),
+            remote_model_grant: Some(serde_json::json!({ "expires_at": 200 })),
+            ..Default::default()
+        };
+        assert!(!remote_offer_request_expired(&live, 100));
+        let denied = HomeServicesRemoteOfferRequestRecord {
+            status: "denied".into(),
+            remote_model_grant: Some(serde_json::json!({ "expires_at": 50 })),
+            ..Default::default()
+        };
+        assert!(!remote_offer_request_expired(&denied, 100));
     }
 }

@@ -196,6 +196,10 @@ function renderServiceCard(offer, source, selected) {
   const statusTone = serviceStatusTone(offer, source);
   const primaryAction = serviceActionLabel(source, selected, offer);
   const pending = pendingServiceAction?.offerId === offerId && pendingServiceAction?.section === source;
+  const expired = grantRequired && serviceRequestStatus(offer) === "expired";
+  // An expired grant stays in the subscribed list. Asking again posts
+  // selected=true so the Runtime sends a fresh request.
+  const nextSelected = expired ? "true" : selected ? "false" : "true";
   return `
     <article class="service-card">
       <div class="service-card-main">
@@ -208,7 +212,7 @@ function renderServiceCard(offer, source, selected) {
           <p class="service-copy">${escapeHtml(copy)}</p>
         </div>
         <div class="service-actions">
-          ${offerId && !readOnly ? `<button class="pc2-btn" type="button" data-service-offer-id="${escapeHtml(offerId)}" data-service-section="${source}" data-service-selected="${selected ? "false" : "true"}">${primaryAction}</button>` : ""}
+          ${offerId && !readOnly ? `<button class="pc2-btn" type="button" data-service-offer-id="${escapeHtml(offerId)}" data-service-section="${source}" data-service-selected="${nextSelected}">${primaryAction}</button>` : ""}
           ${readOnly ? '<span class="status-badge" data-tone="ok">Managed by config</span>' : ""}
         </div>
       </div>
@@ -356,6 +360,9 @@ function serviceCopy(offer, source, selected) {
     if (selected && requestStatus === "approved") {
       return `${name} was approved. ${copy.consumer} can use it when access becomes active.`;
     }
+    if (selected && requestStatus === "expired") {
+      return `${name} approval expired. Ask again to renew access.`;
+    }
     if (selected && requestStatus === "denied") {
       return `${name} denied the request. Remove it and ask again if needed.`;
     }
@@ -384,6 +391,9 @@ function serviceStatus(offer, source, selected) {
       if (requestStatus === "approved") {
         return "Approved";
       }
+      if (requestStatus === "expired") {
+        return "Expired";
+      }
       if (requestStatus === "denied") {
         return "Denied";
       }
@@ -396,6 +406,9 @@ function serviceStatus(offer, source, selected) {
 }
 
 function serviceActionLabel(source, selected, offer = null) {
+  if (selected && serviceRequestStatus(offer) === "expired") {
+    return "Ask to use";
+  }
   if (selected) {
     return source === "others" ? "Remove" : "Stop sharing";
   }
@@ -407,7 +420,9 @@ function serviceActionLabel(source, selected, offer = null) {
 
 function serviceRequestStatus(offer) {
   const status = readText(offer?.status);
-  return status === "approved" || status === "denied" ? status : "requested";
+  return status === "approved" || status === "denied" || status === "expired"
+    ? status
+    : "requested";
 }
 
 function orderedServiceOffers(offers) {
