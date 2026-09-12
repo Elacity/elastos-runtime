@@ -99,10 +99,51 @@ pub(crate) struct RemoteModelRunRecord {
     pub remote_principal_id: String,
     pub capsule_id: String,
     pub offer_id: String,
+    /// The typed operation of the run, kept so this Runtime can still answer
+    /// a settlement read after the provider journal has pruned the run.
+    #[serde(default)]
+    pub operation: String,
     pub request_id: String,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<u64>,
+    /// The settled status this Runtime observed, durable beyond the journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<String>,
+}
+
+impl RemoteModelRunRecord {
+    /// The durable settlement reply for a run the provider no longer knows:
+    /// the observed terminal status, or `settlement_unknown` when this
+    /// Runtime never saw the run settle. Output is not retained here.
+    fn settlement_view(&self, run_id: &str) -> Value {
+        let status = self
+            .terminal_status
+            .clone()
+            .unwrap_or_else(|| "settlement_unknown".to_string());
+        json!({ "status": "ok", "data": {
+            "schema": "elastos.model.run-view/v1",
+            "run_id": run_id,
+            "offer_id": self.offer_id,
+            "operation": self.operation,
+            "status": status,
+            "sequence_cursor": 0,
+            "terminal": { "status": status },
+            "settlement_source": "runtime_index",
+            "output_retained": false,
+        } })
+    }
+
+    fn settlement_events_page(&self, run_id: &str, after_sequence: u64) -> Value {
+        json!({ "status": "ok", "data": {
+            "schema": "elastos.model.run-events/v1",
+            "run_id": run_id,
+            "next_cursor": after_sequence,
+            "has_more": false,
+            "events": [],
+            "settlement_source": "runtime_index",
+        } })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -426,17 +467,33 @@ async fn read_authority(
 /// answers with an events page and no status; its terminal event carries
 /// `terminal: true`. Both indexes settle their records from this one reading.
 pub(super) fn run_result_is_terminal(result: &Value) -> bool {
+    run_result_terminal_status(result).is_some()
+}
+
+const RUN_TERMINAL_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "settlement_unknown"];
+
+/// The settled status a typed model reply reports, if any: the run view's
+/// `status` or `terminal.status`, or the kind of the events page's terminal
+/// event (`output` settles as `completed`).
+pub(super) fn run_result_terminal_status(result: &Value) -> Option<String> {
     let data = &result["data"];
-    let view_terminal = data["status"].as_str().is_some_and(|status| {
-        matches!(
-            status,
-            "completed" | "failed" | "cancelled" | "settlement_unknown"
-        )
-    }) || data["terminal"].is_object();
-    let event_terminal = data["events"]
-        .as_array()
-        .is_some_and(|events| events.iter().any(|event| event["terminal"] == true));
-    view_terminal || event_terminal
+    let terminal = |value: &Value| {
+        value
+            .as_str()
+            .filter(|status| RUN_TERMINAL_STATUSES.contains(status))
+            .map(str::to_string)
+    };
+    terminal(&data["status"])
+        .or_else(|| terminal(&data["terminal"]["status"]))
+        .or_else(|| {
+            data["events"].as_array()?.iter().find_map(|event| {
+                (event["terminal"] == true).then(|| match event["kind"].as_str() {
+                    Some("output") | None => "completed".to_string(),
+                    Some(kind) => terminal(&Value::String(kind.to_string()))
+                        .unwrap_or_else(|| "completed".to_string()),
+                })
+            })
+        })
 }
 
 /// Serve one model operation for a remote consumer. Every path returns a
@@ -654,6 +711,27 @@ pub(crate) async fn invoke(
         if held_slot {
             release_run_slot(data_dir, now, &reservation_key);
         }
+        // The provider journal keeps a run for a bounded time; this Runtime's
+        // record outlives it. A settlement read of a run the provider no
+        // longer knows is answered from the record, so the consumer either
+        // learns the observed terminal status or an honest `settlement_unknown`.
+        if let Some((run_id, record)) = indexed_run
+            .as_ref()
+            .filter(|_| matches!(operation, "runs_get" | "runs_events"))
+        {
+            tracing::info!(
+                "remote model run {run_id} settled from the Runtime record after provider error: {message}"
+            );
+            let reply = if operation == "runs_get" {
+                record.settlement_view(run_id)
+            } else {
+                record.settlement_events_page(
+                    run_id,
+                    normalized["after_sequence"].as_u64().unwrap_or(0),
+                )
+            };
+            return json!({ "ok": true, "result": reply });
+        }
         let class = redact_provider_error(&message);
         tracing::info!("remote model provider status error ({class}): {message}");
         return denied(class, "model provider rejected the operation");
@@ -680,8 +758,13 @@ pub(crate) async fn invoke(
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
+                    operation: normalized["operation"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                     request_id: request_id.clone(),
                     created_at: now,
+                    terminal_status: run_result_terminal_status(&result),
                     terminal_at: run_result_is_terminal(&result).then_some(now),
                 };
                 if let Err(err) = commit_run_slot(data_dir, now, &reservation_key, &run_id, record)
@@ -705,10 +788,13 @@ pub(crate) async fn invoke(
         }
         _ => {
             if let Some((run_id, record)) = indexed_run {
-                if record.terminal_at.is_none() && run_result_is_terminal(&result) {
+                if let Some(status) =
+                    run_result_terminal_status(&result).filter(|_| record.terminal_at.is_none())
+                {
                     let _ = update_run_index(data_dir, now, |index| {
                         if let Some(entry) = index.runs.get_mut(&run_id) {
                             entry.terminal_at = Some(now);
+                            entry.terminal_status = Some(status);
                         }
                         Ok(())
                     });
@@ -791,12 +877,13 @@ pub(crate) async fn cancel_grant_runs(
         match registry.send_raw("model", &normalized).await {
             Ok(result) if provider_status_error(&result).is_none() => {
                 // A settled cancel closes the record; a later sweep skips it.
-                if run_result_is_terminal(&result) {
+                if let Some(status) = run_result_terminal_status(&result) {
                     let now = crate::auth::now_ts();
                     let settled = run_id.clone();
                     let _ = update_run_index(data_dir, now, |index| {
                         if let Some(entry) = index.runs.get_mut(&settled) {
                             entry.terminal_at = Some(now);
+                            entry.terminal_status = Some(status);
                         }
                         Ok(())
                     });
@@ -906,10 +993,25 @@ mod tests {
             remote_principal_id: remote_principal_id("did:key:z6Mksource", "p"),
             capsule_id: "assistant".into(),
             offer_id: "qwen".into(),
+            operation: "text.generate".into(),
             request_id: "req-1".into(),
             created_at: 100,
             terminal_at: None,
+            terminal_status: None,
         };
+        // A record written before `operation` and `terminal_status` existed
+        // still parses, and a pruned run then reports `settlement_unknown`.
+        let legacy: RemoteModelRunRecord = serde_json::from_value(json!({
+            "grant_id": "g", "source_endpoint_did": "did:key:z6Mksource",
+            "requester_principal_id": "p", "remote_principal_id": "remote:abc",
+            "capsule_id": "assistant", "offer_id": "qwen", "request_id": "req-0",
+            "created_at": 1,
+        }))
+        .expect("legacy record parses");
+        assert_eq!(
+            legacy.settlement_view("run:sha256:old")["data"]["status"],
+            "settlement_unknown"
+        );
         update_run_index(dir.path(), 100, |index| {
             index.runs.insert("run:sha256:aaaa".into(), record.clone());
             index.runs.insert(

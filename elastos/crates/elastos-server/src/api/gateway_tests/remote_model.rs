@@ -972,3 +972,59 @@ mod denial_authority {
         fx.shutdown().await;
     }
 }
+
+// The provider journal prunes a run after its retention; the owning Runtime's
+// record outlives it and answers the consumer's settlement read.
+#[tokio::test]
+async fn a_pruned_run_settles_from_the_owners_record() {
+    let fx = TwoRuntimes::start().await;
+    // Run A settles through its events page; run B is never observed settling.
+    let a = fx.create_run("seed-req-a", "qwen-local").await;
+    assert_eq!(a["ok"], true, "{a}");
+    let run_a = run_id_for(&fx.remote_principal(), "seed-req-a");
+    for _ in 0..2 {
+        let page = fx
+            .run_operation("runs_events", &run_a, SEED_PRINCIPAL)
+            .await;
+        assert_eq!(page["ok"], true, "{page}");
+    }
+    assert_eq!(fx.run_record(&run_a)["terminal_status"], "completed");
+    let b = fx.create_run("seed-req-b", "qwen-local").await;
+    assert_eq!(b["ok"], true, "{b}");
+    let run_b = run_id_for(&fx.remote_principal(), "seed-req-b");
+    assert!(fx.run_record(&run_b)["terminal_status"].is_null());
+
+    // The provider forgets both runs (journal pruned).
+    fx.provider.run_owners.lock().unwrap().clear();
+
+    let settled = fx.run_operation("runs_get", &run_a, SEED_PRINCIPAL).await;
+    assert_eq!(settled["ok"], true, "{settled}");
+    assert_eq!(settled["result"]["data"]["status"], "completed");
+    assert_eq!(settled["result"]["data"]["terminal"]["status"], "completed");
+    assert_eq!(settled["result"]["data"]["output_retained"], false);
+    assert_eq!(
+        settled["result"]["data"]["settlement_source"],
+        "runtime_index"
+    );
+    let page = fx
+        .run_operation("runs_events", &run_a, SEED_PRINCIPAL)
+        .await;
+    assert_eq!(page["ok"], true, "{page}");
+    assert_eq!(page["result"]["data"]["has_more"], false);
+    assert_eq!(page["result"]["data"]["events"], json!([]));
+
+    let unknown = fx.run_operation("runs_get", &run_b, SEED_PRINCIPAL).await;
+    assert_eq!(unknown["ok"], true, "{unknown}");
+    assert_eq!(unknown["result"]["data"]["status"], "settlement_unknown");
+    assert_eq!(
+        unknown["result"]["data"]["terminal"]["status"],
+        "settlement_unknown"
+    );
+
+    // Another principal still learns nothing about either run.
+    let foreign = fx
+        .run_operation("runs_get", &run_a, OTHER_SEED_PRINCIPAL)
+        .await;
+    assert_eq!(foreign["code"], "denied", "{foreign}");
+    fx.shutdown().await;
+}
