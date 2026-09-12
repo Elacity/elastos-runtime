@@ -287,10 +287,12 @@ async fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
 
 struct TwoRuntimes {
     owner: tempfile::TempDir,
-    _seed: tempfile::TempDir,
+    seed: tempfile::TempDir,
     authority: TestPasskeyAuthority,
     provider: Arc<FakeModelProvider>,
     registry: Arc<ProviderRegistry>,
+    /// The seed's own registry with a Carrier invoker: the real consumer path.
+    seed_registry: Arc<ProviderRegistry>,
     owner_service: crate::carrier::CarrierRuntimeService,
     owner_addr: iroh::EndpointAddr,
     seed_node: crate::carrier::CarrierNode,
@@ -343,12 +345,22 @@ impl TwoRuntimes {
         )
         .await
         .unwrap();
+        let seed_registry = Arc::new(ProviderRegistry::new());
+        seed_registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    seed_node.endpoint.clone(),
+                    Arc::downgrade(&seed_registry),
+                ),
+            ))
+            .await;
         let fixture = Self {
             owner,
-            _seed: seed,
+            seed,
             authority,
             provider,
             registry,
+            seed_registry,
             owner_service,
             owner_addr,
             seed_node,
@@ -642,4 +654,135 @@ async fn a_full_run_index_refuses_before_any_model_work_starts() {
         .run_record(&run_id_for(&fx.remote_principal(), "seed-req-full"))
         .is_null());
     fx.shutdown().await;
+}
+
+// The seed gateway's own routing over Carrier: the path the Assistant uses.
+mod consumer_path {
+    use super::*;
+    use crate::api::gateway::gateway_model_remote::{
+        remote_offer_id, remote_run_route, route_run_operation, ConsumerModelGrant,
+        RemoteRouteError,
+    };
+
+    fn ticket_for(endpoint: &iroh::EndpointAddr) -> String {
+        let bytes = serde_json::to_vec(&json!({ "topic": null, "endpoints": [endpoint] })).unwrap();
+        let mut encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
+        encoded.make_ascii_lowercase();
+        encoded
+    }
+
+    fn seed_context() -> HomeLaunchTokenContext {
+        HomeLaunchTokenContext {
+            principal_id: SEED_PRINCIPAL.to_string(),
+            session_id: "auth:seed".to_string(),
+            proof_binding_id: None,
+            grant_id: "grant:seed-launch".to_string(),
+        }
+    }
+
+    impl TwoRuntimes {
+        fn consumer_grant(&self) -> ConsumerModelGrant {
+            ConsumerModelGrant::from_record(&json!({
+                "grant_id": self.grant_id,
+                "peer_did": self.owner_service.endpoint().unwrap().id().to_string(),
+                "connect_ticket": ticket_for(&self.owner_addr),
+                "service_display_name": "Mac model",
+                "expires_at": now_ts() + 3600,
+            }))
+            .expect("grant record")
+        }
+
+        async fn route(
+            &self,
+            grants: &[ConsumerModelGrant],
+            op: &str,
+            normalized: Value,
+        ) -> Result<Option<Value>, RemoteRouteError> {
+            route_run_operation(
+                self.seed_registry.clone(),
+                self.seed.path(),
+                grants,
+                &seed_context(),
+                "assistant",
+                op,
+                &normalized,
+                now_ts(),
+            )
+            .await
+        }
+    }
+
+    fn access(op: &str, run_id: &str, request_id: &str) -> Value {
+        json!({ "op": op, "run_id": run_id, "after_sequence": 0,
+            "runtime_binding": { "principal_id": SEED_PRINCIPAL, "request_id": request_id } })
+    }
+
+    #[tokio::test]
+    async fn existing_runs_settle_after_the_grant_is_denied_while_new_runs_are_refused() {
+        let fx = TwoRuntimes::start().await;
+        let grant = fx.consumer_grant();
+        let create = json!({ "op": "runs_create", "offer_id": remote_offer_id(&fx.grant_id, "qwen-local"),
+            "operation": "text.generate", "input": { "prompt": "hello" },
+            "runtime_binding": { "principal_id": SEED_PRINCIPAL, "request_id": "seed-req-c" } });
+        let created = fx
+            .route(std::slice::from_ref(&grant), "runs_create", create.clone())
+            .await
+            .unwrap()
+            .expect("remote route");
+        let run_id = run_id_for(&fx.remote_principal(), "seed-req-c");
+        assert_eq!(created["data"]["run_id"], run_id);
+        let route = remote_run_route(fx.seed.path(), SEED_PRINCIPAL, &run_id)
+            .unwrap()
+            .expect("stored route");
+        assert_eq!(route.grant_id, fx.grant_id);
+        assert_eq!(route.connect_ticket, grant.connect_ticket);
+        assert!(route.terminal_at.is_none());
+
+        // The owner denies the request: no active grant remains on the seed.
+        fx.write_request_record("denied");
+        let refused = fx.route(&[], "runs_create", create).await;
+        assert!(
+            matches!(refused, Err(RemoteRouteError::Rejected { ref code }) if code == "denied"),
+            "{refused:?}"
+        );
+
+        let page = fx
+            .route(
+                &[],
+                "runs_events",
+                access("runs_events", &run_id, "seed-ev-1"),
+            )
+            .await
+            .unwrap()
+            .expect("settlement route");
+        assert_eq!(page["data"]["events"].as_array().unwrap().len(), 2);
+        assert_eq!(fx.last_provider_call().await["op"], "runs_events");
+        let last = fx
+            .route(
+                &[],
+                "runs_events",
+                access("runs_events", &run_id, "seed-ev-2"),
+            )
+            .await
+            .unwrap()
+            .expect("settlement route");
+        assert_eq!(last["data"]["events"][0]["terminal"], true);
+        let settled = remote_run_route(fx.seed.path(), SEED_PRINCIPAL, &run_id)
+            .unwrap()
+            .expect("stored route");
+        assert!(settled.terminal_at.is_some(), "{settled:?}");
+        assert!(fx.run_record(&run_id)["terminal_at"].is_u64());
+
+        // A run this Home never routed remotely stays on the local path.
+        let local = fx
+            .route(
+                &[],
+                "runs_get",
+                access("runs_get", "run:sha256:00", "seed-local"),
+            )
+            .await
+            .unwrap();
+        assert!(local.is_none());
+        fx.shutdown().await;
+    }
 }

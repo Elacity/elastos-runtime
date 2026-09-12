@@ -1760,15 +1760,18 @@ pub(super) async fn gateway_provider_proxy(
                 Ok(value) => value,
                 Err((status, message)) => return (status, message).into_response(),
             };
-        // Approved remote model grants route runs to the granting Runtime. A
-        // grant lookup failure keeps the local path; it cannot widen authority.
+        // Approved remote model grants route new runs to the granting Runtime.
+        // A grant lookup failure keeps the local path; it cannot widen
+        // authority. Runs already routed remotely settle through their stored
+        // route even after the grant expired or was denied, so every run
+        // operation consults the route; a local run returns to the local path.
         remote_model_grants = super::gateway_model_remote::consumer_grants(
             &state.data_dir,
             &context,
             state.collaboration_discovery_service.as_ref(),
         )
         .unwrap_or_default();
-        if !remote_model_grants.is_empty() && op != "offers_list" {
+        if op != "offers_list" {
             match super::gateway_model_remote::route_run_operation(
                 Arc::clone(&registry),
                 &state.data_dir,

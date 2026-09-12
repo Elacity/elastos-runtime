@@ -45,11 +45,31 @@ pub(crate) struct RemoteRunRoute {
     pub principal_id: String,
     pub grant_id: String,
     pub peer_did: String,
+    /// The granting Runtime's Carrier ticket at creation time. Settlement of
+    /// this run (`runs_get`, `runs_events`, `runs_cancel`) keeps working after
+    /// the grant expires or is denied; the granting Runtime still decides.
+    #[serde(default)]
+    pub connect_ticket: String,
+    pub display_name: String,
     pub offer_id: String,
     pub request_id: String,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<u64>,
+}
+
+impl RemoteRunRoute {
+    /// The grant facts needed to settle this run, independent of the grant's
+    /// current status on this Home. Authority to start new runs is not implied.
+    fn settlement_grant(&self) -> Option<ConsumerModelGrant> {
+        (!self.connect_ticket.is_empty()).then(|| ConsumerModelGrant {
+            grant_id: self.grant_id.clone(),
+            peer_did: self.peer_did.clone(),
+            connect_ticket: self.connect_ticket.clone(),
+            display_name: self.display_name.clone(),
+            expires_at: 0,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,7 +167,7 @@ impl ConsumerModelGrant {
     /// The services layer stores the granting Runtime's Carrier peer id under
     /// `peer_did` (shared wire shape with Engine grants). The Carrier route
     /// pins the ticket to a `did:key`, so the id is converted once here.
-    fn from_record(grant: &Value) -> Option<Self> {
+    pub(crate) fn from_record(grant: &Value) -> Option<Self> {
         let peer_id = grant["peer_did"]
             .as_str()?
             .parse::<iroh::PublicKey>()
@@ -441,6 +461,8 @@ pub(crate) async fn route_run_operation(
                     principal_id: context.principal_id.clone(),
                     grant_id: grant.grant_id.clone(),
                     peer_did: grant.peer_did.clone(),
+                    connect_ticket: grant.connect_ticket.clone(),
+                    display_name: grant.display_name.clone(),
                     offer_id: offer_id.to_string(),
                     request_id: normalized
                         .pointer("/runtime_binding/request_id")
@@ -483,14 +505,19 @@ pub(crate) async fn route_run_operation(
             else {
                 return Ok(None);
             };
-            let grant = grants
-                .iter()
-                .find(|grant| grant.grant_id == route.grant_id)
-                .ok_or_else(|| RemoteRouteError::Rejected {
-                    code: "denied".to_string(),
-                })?;
+            // An active grant is preferred; a run created under a grant that
+            // has since expired or been denied still settles through the
+            // route it was created with. The granting Runtime owns that check.
+            let grant = match grants.iter().find(|grant| grant.grant_id == route.grant_id) {
+                Some(grant) => grant.clone(),
+                None => route
+                    .settlement_grant()
+                    .ok_or_else(|| RemoteRouteError::Rejected {
+                        code: "denied".to_string(),
+                    })?,
+            };
             let request = typed_request(normalized, context, capsule_id, &route.grant_id);
-            let mut result = call_grant(&registry, grant, op, request).await?;
+            let mut result = call_grant(&registry, &grant, op, request).await?;
             if route.terminal_at.is_none() && run_is_terminal(&result) {
                 let run_id = run_id.to_string();
                 let _ = update_index(data_dir, now, |index| {
@@ -619,11 +646,24 @@ mod tests {
             principal_id: "p1".into(),
             grant_id: "g".into(),
             peer_did: "did:key:z6Mkpeer".into(),
+            connect_ticket: "ticket".into(),
+            display_name: "Mac".into(),
             offer_id: "remote:g:qwen".into(),
             request_id: "req".into(),
             created_at: 10,
             terminal_at: None,
         };
+        // A route written before tickets were stored cannot settle by itself.
+        assert!(RemoteRunRoute {
+            connect_ticket: String::new(),
+            ..route.clone()
+        }
+        .settlement_grant()
+        .is_none());
+        assert_eq!(
+            route.settlement_grant().map(|grant| grant.grant_id),
+            Some("g".to_string())
+        );
         update_index(dir.path(), 10, |index| {
             index.runs.insert("run:sha256:aa".into(), route.clone());
             index.runs.insert(
