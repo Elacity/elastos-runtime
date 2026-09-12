@@ -540,6 +540,9 @@ export function formatStreamError(err) {
     : "Model run failed";
 }
 
+export const OUTPUT_UNRETAINED_STATUS =
+  "The run completed. This Runtime did not keep the output.";
+
 export function setStreamStatus(label, { tone = "idle" } = {}) {
   const el = document.querySelector("[data-agent-stream-status]");
   if (!el) {
@@ -584,6 +587,13 @@ function showRunSettlement(turn, detail = turn?.error === "run_not_found"
     void startLiveTurnForPrompt("", { resumeTurn: turn });
   });
   el.append(" ", button);
+}
+
+function showOutputUnretained(turn) {
+  if (turn?.outputRetained !== false) {
+    return;
+  }
+  setStreamStatus(OUTPUT_UNRETAINED_STATUS);
 }
 
 export function ensureJumpToLatest() {
@@ -891,6 +901,8 @@ export function renderActiveSession() {
     void startLiveTurnForPrompt("", { resumeTurn: session.lastTurn });
   } else if (session.lastTurn?.state === TurnState.SETTLEMENT_UNKNOWN) {
     showRunSettlement(session.lastTurn);
+  } else if (session.lastTurn?.outputRetained === false) {
+    showOutputUnretained(session.lastTurn);
   }
 }
 
@@ -2440,6 +2452,39 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       answerRow?.classList.remove("is-streaming");
       progress.dispatch({ type: "GENERATION_ERROR", text: "Settlement unknown" });
       showRunSettlement(result.turnManifest);
+      return;
+    }
+    if (result.outputUnretained) {
+      const partial = materializeCanonical();
+      syncCanonical();
+      state.renderQueued = false;
+      renderAbort?.abort();
+      renderAbort = null;
+      if (renderTimer) {
+        window.clearTimeout(renderTimer);
+        renderTimer = 0;
+      }
+      setPhase("finalizing");
+      qos.ingestEvent({ type: "completed" });
+      flushStreamingUI(true);
+      const answer = String(partial.answer || "").trim();
+      const reasoning = String(partial.reasoning || "").trim();
+      commitAgentReply(session, answer, reasoning, { turn: result.turnManifest });
+      answerRow?.classList.remove("is-streaming");
+      if (!answer) {
+        progressEl?.remove();
+        answerRow?.remove();
+      }
+      if (session && result.turnManifest) {
+        liveTurn = result.turnManifest;
+        session.lastTurn = cheapTurnSnapshot(liveTurn);
+        try {
+          host.persistAgentWorkspaceSoon?.();
+        } catch {
+          /* optional */
+        }
+      }
+      showOutputUnretained(result.turnManifest);
       return;
     }
     /* Unlock before joining the canonical string. */

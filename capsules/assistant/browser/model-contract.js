@@ -126,12 +126,24 @@ export function applyRunEventsPage(page, afterSequence) {
       }
     } else if (kind === "output") {
       terminal = { status: "completed", output: event.data ?? null, error: null };
+    } else if (kind === "completed") {
+      const retained = event.data?.output_retained !== false;
+      terminal = {
+        status: "completed",
+        output: retained ? event.data ?? null : null,
+        error: null,
+        ...(retained ? {} : { outputRetained: false }),
+      };
     } else if (kind === "failed" || kind === "cancelled" || kind === "settlement_unknown") {
       terminal = { status: kind, output: null, error: event.data ?? null };
     }
     if (event.terminal === true && !terminal) {
       terminal = { status: "completed", output: null, error: null };
     }
+  }
+  if (terminal && page.output_retained === false) {
+    terminal.outputRetained = false;
+    terminal.output = null;
   }
   if (nextCursor < lastSequence) {
     throw contractError("bad_cursor", "run events cursor behind last sequence");

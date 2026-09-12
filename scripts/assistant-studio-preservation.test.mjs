@@ -155,6 +155,65 @@ test("restored same-actor Studio run reads its exact cursor without another crea
   assert.deepEqual(f.app.snapshot().studioHistory[0].output, output);
 });
 
+
+test("restored Studio run at cursor 7 settles from a retained missing-journal page", async t => {
+  const f = await fixture(t, {
+    studioState: { activeRun: restoredRun },
+    readEvents: async body => {
+      assert.equal(body.after_sequence, 7);
+      return response({ status: "ok", data: {
+        schema: "elastos.model.run-events/v1", run_id: runId, next_cursor: 8,
+        has_more: false, settlement_source: "runtime_index",
+        events: [{ sequence: 8, kind: "settlement_unknown", terminal: true, data: {} }],
+      } });
+    },
+  });
+  await flush();
+  assert.deepEqual(f.operations().map(call => call.url), ["/api/provider/model/runs_events"]);
+  assert.equal(f.operations()[0].body.after_sequence, 7);
+  assert.equal(f.app.snapshot().activeRun.afterSequence, 8);
+  assert.equal(f.app.snapshot().activeRun.status, "settlement_unknown");
+  assert.equal(f.app.snapshot().activeRun.terminal, true);
+  assert.equal(f.app.snapshot().activeRun.createRequestId, "original-request");
+});
+
+test("a completed pruned journal states that Studio output was not retained", async t => {
+  const f = await fixture(t, {
+    studioState: { activeRun: restoredRun },
+    readEvents: async body => {
+      assert.equal(body.after_sequence, 7);
+      return response({ status: "ok", data: {
+        schema: "elastos.model.run-events/v1", run_id: runId, next_cursor: 8,
+        has_more: false, settlement_source: "runtime_index", output_retained: false,
+        events: [{ sequence: 8, kind: "completed", terminal: true, data: { output_retained: false } }],
+      } });
+    },
+  });
+  await flush();
+  assert.deepEqual(f.operations().map(call => call.url), ["/api/provider/model/runs_events"]);
+  assert.equal(f.app.snapshot().activeRun.status, "completed");
+  assert.equal(f.app.snapshot().activeRun.terminal, true);
+  assert.equal(f.app.snapshot().studioResult, null);
+  assert.equal(f.app.snapshot().statusMessage, "The run completed. This Runtime did not keep the output.");
+});
+
+test("a completed pruned create view states that Studio output was not retained", async t => {
+  const pending = defer();
+  const started = defer();
+  const f = await fixture(t, { studioState: { studioDraft: "Keep this draft" },
+    create: body => { started.resolve(body); return pending.promise; } });
+  const first = f.app.sendDraft();
+  await started.promise;
+  pending.resolve(response({ status: "ok", data: {
+    schema: "elastos.model.run/v1", run_id: runId, status: "completed", sequence_cursor: 0,
+    terminal: { status: "completed" }, settlement_source: "runtime_index", output_retained: false,
+  } }));
+  assert.equal(await first, true);
+  assert.equal(f.app.snapshot().activeRun.status, "completed");
+  assert.equal(f.app.snapshot().studioResult, null);
+  assert.equal(f.app.snapshot().statusMessage, "The run completed. This Runtime did not keep the output.");
+  assert.deepEqual(f.operations().map(call => call.url), ["/api/provider/model/runs_create"]);
+});
 for (const [label, binding] of [["foreign actor", { actorCapsule: "home-agent" }],
   ["history copy", { attachmentAllowed: false }]]) {
   test(`Studio ${label} retains history without events or cancellation`, async t => {

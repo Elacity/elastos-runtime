@@ -387,6 +387,19 @@ assert.equal(page2.terminal.status, "completed");
 assert.equal(contract.terminalOutputText(page2.terminal.output), "Hello");
 assert.equal(contract.terminalOutputText({ schema: "other", text: "x" }), "");
 
+const prunedCompleted = contract.applyRunEventsPage(
+  {
+    events: [{ sequence: 3, kind: "completed", terminal: true, data: { output_retained: false } }],
+    next_cursor: 3,
+    has_more: false,
+    output_retained: false,
+  },
+  2,
+);
+assert.equal(prunedCompleted.terminal.status, "completed");
+assert.equal(prunedCompleted.terminal.outputRetained, false);
+assert.equal(prunedCompleted.terminal.output, null);
+
 const failed = contract.applyRunEventsPage(
   { events: [{ sequence: 1, kind: "failed", data: { code: "backend_down", message: "no backend" }, terminal: true }], next_cursor: 1 },
   0,

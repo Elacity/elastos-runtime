@@ -17,7 +17,7 @@ function fixtureWindow(location) {
 }
 globalThis.window = fixtureWindow({ href: "http://home.invalid/apps/assistant/", hash: "#home_token=fixture" });
 const live = await import("../capsules/assistant/browser/agent-live.js");
-const { turnStoreGet } = await import("../capsules/assistant/browser/agent-context.js");
+const { turnStoreGet, cheapTurnSnapshot } = await import("../capsules/assistant/browser/agent-context.js");
 const { recoverStalePersistedTurn } = await import("../capsules/assistant/browser/agent-stream-qos.js");
 const controller = await import("../capsules/assistant/browser/agent-stream.js");
 const workspace = await import("../capsules/assistant/browser/agent-workspace.js");
@@ -202,6 +202,168 @@ test("Runtime unknown settlement stays unknown rather than stopped", async () =>
   assert.equal(recoverStalePersistedTurn({ lastTurn: result.turnManifest }).lastTurn.completedAt, result.turnManifest.completedAt);
 });
 
+test("an immediately failed create settles without polling events", async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const op = new URL(url).pathname.split("/").pop();
+    calls.push(op);
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    if (op === "runs_create") return { ok: true, json: async () => ({
+      run_id: "run-full", sequence_cursor: 0, status: "failed",
+      terminal: { status: "failed", error: { code: "selection_unavailable", message: "model offer is not available" } },
+    }) };
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  await assert.rejects(
+    live.streamChatViaContract([{ role: "user", content: "fixture" }], { onAccepted() {}, onState() {} }),
+    (error) => error.code === "selection_unavailable",
+  );
+  assert.deepEqual(calls.filter((op) => op.startsWith("runs_")), ["runs_create"]);
+});
+
+test("a retained unknown create settles from the create view without polling", async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const op = new URL(url).pathname.split("/").pop();
+    calls.push(op);
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    if (op === "runs_create") return { ok: true, json: async () => ({
+      run_id: "run-pruned", sequence_cursor: 0, status: "settlement_unknown",
+      terminal: { status: "settlement_unknown" }, settlement_source: "runtime_index",
+    }) };
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  const result = await live.streamChatViaContract([{ role: "user", content: "fixture" }], { onAccepted() {}, onState() {} });
+  assert.equal(result.turnManifest.state, "settlement_unknown");
+  assert.equal(result.turnManifest.providerRunId, "run-pruned");
+  assert.ok(result.turnManifest.completedAt > 0);
+  assert.deepEqual(calls.filter((op) => op.startsWith("runs_")), ["runs_create"]);
+});
+
+test("reload of a retained settlement settles from get without polling events", async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const op = new URL(url).pathname.split("/").pop();
+    calls.push(op);
+    if (op === "runs_get") return { ok: true, json: async () => ({
+      run_id: "exact-run", status: "settlement_unknown",
+      terminal: { status: "settlement_unknown" }, settlement_source: "runtime_index",
+    }) };
+    throw new Error(`unexpected operation ${op}`);
+  };
+  const result = await live.streamChatViaContract([], {
+    turnManifest: { turnId: "saved", providerRunId: "exact-run", state: "settlement_unknown" },
+  });
+  assert.equal(result.turnManifest.state, "settlement_unknown");
+  assert.ok(result.turnManifest.completedAt > 0);
+  assert.deepEqual(calls, ["runs_get"]);
+});
+
+test("an attached poll settles from a retained terminal event", async () => {
+  const f = await fixture();
+  f.events.resolve({ events: [{ sequence: 1, kind: "settlement_unknown", terminal: true, data: {} }], next_cursor: 1, has_more: false });
+  const result = await f.result;
+  assert.equal(result.turnManifest.state, "settlement_unknown");
+  assert.ok(result.turnManifest.completedAt > 0);
+});
+
+test("an attached poll at cursor 7 settles from a retained terminal event", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const op = new URL(url).pathname.split("/").pop();
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ op, body });
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    if (op === "runs_create") return { ok: true, json: async () => ({
+      run_id: "run-attached", sequence_cursor: 7, status: "running",
+    }) };
+    if (op === "runs_events") {
+      assert.equal(body.after_sequence, 7);
+      return { ok: true, json: async () => ({
+        schema: "elastos.model.run-events/v1",
+        run_id: "run-attached",
+        events: [{ sequence: 8, kind: "settlement_unknown", terminal: true, data: {} }],
+        next_cursor: 8, has_more: false, settlement_source: "runtime_index",
+      }) };
+    }
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  const result = await live.streamChatViaContract([{ role: "user", content: "fixture" }], { onAccepted() {}, onState() {} });
+  assert.equal(result.turnManifest.state, "settlement_unknown");
+  assert.ok(result.turnManifest.completedAt > 0);
+  assert.equal(calls.filter((c) => c.op === "runs_events").length, 1);
+});
+
+test("a completed pruned journal states that live output was not retained", async () => {
+  const calls = [];
+  const deltas = [];
+  globalThis.fetch = async (url) => {
+    const op = new URL(url).pathname.split("/").pop();
+    calls.push(op);
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    if (op === "runs_create") return { ok: true, json: async () => ({
+      run_id: "run-completed-pruned", sequence_cursor: 0, status: "completed",
+      terminal: { status: "completed" }, settlement_source: "runtime_index",
+      output_retained: false,
+    }) };
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  const result = await live.streamChatViaContract([{ role: "user", content: "fixture" }], {
+    onAccepted() {}, onState() {}, onDelta: (delta) => deltas.push(delta),
+  });
+  assert.equal(result.turnManifest.state, "completed");
+  assert.equal(result.turnManifest.outputRetained, false);
+  assert.equal(deltas.length, 0);
+  assert.deepEqual(calls.filter((op) => op.startsWith("runs_")), ["runs_create"]);
+});
+
+test("an attached poll of a completed pruned journal states that output was not retained", async () => {
+  const calls = [];
+  const deltas = [];
+  globalThis.fetch = async (url, init) => {
+    const op = new URL(url).pathname.split("/").pop();
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ op, body });
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    if (op === "runs_create") return { ok: true, json: async () => ({
+      run_id: "run-completed-events", sequence_cursor: 2, status: "running",
+    }) };
+    if (op === "runs_events") {
+      assert.equal(body.after_sequence, 2);
+      return { ok: true, json: async () => ({
+        schema: "elastos.model.run-events/v1",
+        run_id: "run-completed-events",
+        events: [{ sequence: 3, kind: "completed", terminal: true, data: { output_retained: false } }],
+        next_cursor: 3, has_more: false, settlement_source: "runtime_index",
+        output_retained: false,
+      }) };
+    }
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  const result = await live.streamChatViaContract([{ role: "user", content: "fixture" }], {
+    onAccepted() {}, onState() {}, onDelta: (delta) => deltas.push(delta),
+  });
+  assert.equal(result.turnManifest.state, "completed");
+  assert.equal(result.turnManifest.outputRetained, false);
+  assert.equal(deltas.length, 0);
+  assert.equal(calls.filter((c) => c.op === "runs_events").length, 1);
+});
+
 test("navigation and reload retain the exact run without another create or cancel", async () => {
   const f = await fixture();
   live.detachLiveChatStream();
@@ -343,6 +505,252 @@ function controllerFixture() {
   sessions.bindAgentSessions(ctx, { sessionListEl: () => null });
   return { ctx, status };
 }
+
+function createDomNode(tag = "div") {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    className: "",
+    dataset: {},
+    textContent: "",
+    hidden: false,
+    children: [],
+    style: {},
+    isConnected: true,
+    classList: {
+      _names: new Set(),
+      add(...names) { names.forEach((name) => this._names.add(name)); node.className = [...this._names].join(" "); },
+      remove(...names) { names.forEach((name) => this._names.delete(name)); node.className = [...this._names].join(" "); },
+      toggle(name, force) {
+        if (force === true) this.add(name);
+        else if (force === false) this.remove(name);
+        else if (this._names.has(name)) this.remove(name);
+        else this.add(name);
+      },
+      contains(name) { return this._names.has(name); },
+    },
+    append(...nodes) {
+      for (const child of nodes) {
+        if (child == null) continue;
+        const next = typeof child === "string" ? { textContent: child, children: [] } : child;
+        next.parent = this;
+        this.children.push(next);
+      }
+    },
+    replaceChildren(...nodes) { this.children = []; this.append(...nodes); },
+    remove() {
+      this.removed = true;
+      if (this.parent?.children) this.parent.children = this.parent.children.filter((child) => child !== this);
+    },
+    querySelector(selector) {
+      const wanted = selector.startsWith(".") ? selector.slice(1) : "";
+      const walk = (root) => {
+        for (const child of root.children || []) {
+          if (wanted && String(child.className || "").split(/\s+/).includes(wanted)) return child;
+          const found = walk(child);
+          if (found) return found;
+        }
+        return null;
+      };
+      return walk(this);
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    setAttribute() {},
+    scrollIntoView() {},
+    contains() { return false; },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+    scrollHeight: 0,
+    scrollTop: 0,
+    clientHeight: 0,
+  };
+  Object.defineProperty(node, "innerHTML", {
+    set(value) { this._html = String(value || ""); this.content = createDomNode("fragment"); },
+    get() { return this._html || ""; },
+  });
+  return node;
+}
+
+function streamControllerFixture() {
+  const { ctx, status } = controllerFixture();
+  ctx.turnBusy = false;
+  ctx.sessions[0].messages = [{ role: "user", text: "fixture", modelText: "fixture" }];
+  const stream = createDomNode("div");
+  const viewport = createDomNode("div");
+  const priorQuery = document.querySelector.bind(document);
+  document.createElement = (tag) => createDomNode(tag);
+  document.createTextNode = (value = "") => {
+    const text = String(value);
+    return {
+      data: text,
+      textContent: text,
+      nodeType: 3,
+      children: [],
+      appendData(extra) {
+        this.data += String(extra);
+        this.textContent = this.data;
+      },
+    };
+  };
+  document.querySelector = (selector) => selector === "[data-agent-stream-status]" ? status : priorQuery(selector);
+  controller.bindAgentStream(ctx, {
+    streamEl: () => stream,
+    streamViewportEl: () => viewport,
+    streamScrollEl: () => stream,
+    titleEl: () => createDomNode("h1"),
+    clearEmptyState() {},
+    scrollStreamToEnd() {},
+    renderSessions() {},
+    persistAgentWorkspaceSoon() {},
+  });
+  return { ctx, status, stream };
+}
+
+async function runUnretainedLiveTurn(t, { create, eventsPages = [] }) {
+  t.after(() => { live.detachLiveChatStream(); live.selectLiveOffer(""); });
+  const { ctx, status, stream } = streamControllerFixture();
+  controller.bindAgentStream(ctx, {
+    streamEl: () => stream,
+    streamViewportEl: () => createDomNode("div"),
+    streamScrollEl: () => stream,
+    titleEl: () => createDomNode("h1"),
+    clearEmptyState() {},
+    scrollStreamToEnd() {},
+    renderSessions() {},
+    persistAgentWorkspaceSoon() {},
+  });
+  let offerLists = 0;
+  let eventPage = 0;
+  globalThis.fetch = async (url, init) => {
+    const op = new URL(url).pathname.split("/").pop();
+    const body = init?.body ? JSON.parse(init.body) : null;
+    if (op === "offers_list") {
+      offerLists += 1;
+      return { ok: true, json: async () => ({ offers: [
+        { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      ] }) };
+    }
+    if (op === "runs_create") return { ok: true, json: async () => create };
+    if (op === "runs_events") {
+      const page = eventsPages[Math.min(eventPage, Math.max(eventsPages.length - 1, 0))];
+      eventPage += 1;
+      return { ok: true, json: async () => page.data };
+    }
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  const offersAfterProbe = offerLists;
+  controller.startTurnForPrompt("fixture");
+  const started = Date.now();
+  while (Date.now() - started < 2000) {
+    if (ctx.sessions[0].lastTurn?.outputRetained === false) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (ctx.sessions[0].lastTurn?.outputRetained !== false) {
+    throw new Error(`unretained turn missing: ${JSON.stringify(ctx.sessions[0].lastTurn)} status=${status.textContent}`);
+  }
+  await new Promise(setImmediate);
+  return { ctx, status, stream, offerLists, offersAfterProbe };
+}
+
+test("live chat states completed pruned output with no deltas and restores the warning", async t => {
+  const { ctx, status, offerLists, offersAfterProbe } = await runUnretainedLiveTurn(t, {
+    create: {
+      run_id: "run-completed-pruned", sequence_cursor: 0, status: "completed",
+      terminal: { status: "completed" }, settlement_source: "runtime_index",
+      output_retained: false,
+    },
+  });
+  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
+  assert.notEqual(status.textContent, "Model returned an empty reply");
+  assert.equal(offerLists, offersAfterProbe, "completed pruned output must not force an inference probe");
+  assert.equal(ctx.sessions[0].lastTurn.state, "completed");
+  assert.equal(ctx.sessions[0].lastTurn.outputRetained, false);
+  assert.ok(!ctx.sessions[0].messages.some((message) => message.role === "agent"));
+  const snap = cheapTurnSnapshot(ctx.sessions[0].lastTurn);
+  assert.equal(snap.outputRetained, false);
+  assert.equal(cheapTurnSnapshot({ ...ctx.sessions[0].lastTurn, outputRetained: true }).outputRetained, undefined);
+  const saved = JSON.parse(JSON.stringify(workspace.serializeSessionForPersist(ctx.sessions[0])));
+  assert.equal(saved.lastTurn.outputRetained, false);
+  ctx.sessions[0] = recoverStalePersistedTurn(saved);
+  status.textContent = "";
+  controller.renderActiveSession();
+  assert.equal(ctx.sessions[0].lastTurn.outputRetained, false);
+  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
+});
+
+test("live chat keeps partial deltas and restores completed-but-unavailable output", async t => {
+  const { ctx, status, offerLists, offersAfterProbe } = await runUnretainedLiveTurn(t, {
+    create: { run_id: "run-partial-pruned", sequence_cursor: 0, status: "running" },
+    eventsPages: [
+      { after: 0, data: {
+        schema: "elastos.model.run-events/v1", run_id: "run-partial-pruned",
+        events: [{ sequence: 1, kind: "text_delta", data: { text: "Partial prefix" } }],
+        next_cursor: 1, has_more: true,
+      } },
+      { after: 1, data: {
+        schema: "elastos.model.run-events/v1", run_id: "run-partial-pruned",
+        events: [{ sequence: 2, kind: "completed", terminal: true, data: { output_retained: false } }],
+        next_cursor: 2, has_more: false, settlement_source: "runtime_index",
+        output_retained: false,
+      } },
+    ],
+  });
+  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
+  assert.equal(offerLists, offersAfterProbe);
+  assert.equal(ctx.sessions[0].lastTurn.state, "completed");
+  assert.equal(ctx.sessions[0].lastTurn.outputRetained, false);
+  const agent = ctx.sessions[0].messages.filter((message) => message.role === "agent");
+  assert.equal(agent.length, 1);
+  assert.equal(agent[0].text, "Partial prefix");
+  assert.equal(agent[0].partial, undefined);
+  const saved = JSON.parse(JSON.stringify(workspace.serializeSessionForPersist(ctx.sessions[0])));
+  assert.equal(saved.lastTurn.outputRetained, false);
+  assert.equal(saved.messages.at(-1).text, "Partial prefix");
+  ctx.sessions[0] = recoverStalePersistedTurn(saved);
+  status.textContent = "";
+  controller.renderActiveSession();
+  assert.equal(ctx.sessions[0].messages.at(-1).text, "Partial prefix");
+  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
+});
+
+function renderedAgentText(stream) {
+  const row = (stream.children || []).find((child) => child.dataset?.role === "agent");
+  if (!row) return "";
+  const parts = [];
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (typeof node.data === "string") parts.push(node.data);
+    else if (String(node.className || "").includes("agent-stream-frozen-block") && node.textContent) {
+      parts.push(node.textContent);
+    }
+    for (const child of node.children || []) walk(child);
+  };
+  walk(row);
+  return parts.join("");
+}
+
+test("live chat flushes two consecutive deltas before reopen of unretained output", async t => {
+  const { ctx, status, stream, offerLists, offersAfterProbe } = await runUnretainedLiveTurn(t, {
+    create: { run_id: "run-two-deltas", sequence_cursor: 0, status: "running" },
+    eventsPages: [
+      { after: 0, data: {
+        schema: "elastos.model.run-events/v1", run_id: "run-two-deltas",
+        events: [
+          { sequence: 1, kind: "text_delta", data: { text: "Hel" } },
+          { sequence: 2, kind: "text_delta", data: { text: "lo" } },
+          { sequence: 3, kind: "completed", terminal: true, data: { output_retained: false } },
+        ],
+        next_cursor: 3, has_more: false, settlement_source: "runtime_index",
+        output_retained: false,
+      } },
+    ],
+  });
+  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
+  assert.equal(offerLists, offersAfterProbe);
+  assert.equal(renderedAgentText(stream), "Hello", "both deltas must paint before reopen");
+  assert.equal(ctx.sessions[0].messages.filter((message) => message.role === "agent").at(-1)?.text, "Hello");
+});
 
 test("refresh after a refused new turn requires another deliberate Send", async t => {
   t.after(() => live.selectLiveOffer(""));

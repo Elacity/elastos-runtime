@@ -946,6 +946,7 @@ export function cheapTurnSnapshot(turn) {
     startedAt: Number(turn.startedAt) || undefined,
     completedAt: Number(turn.completedAt) || undefined,
     error: turn.error ? String(turn.error).slice(0, 120) : undefined,
+    ...(turn.outputRetained === false ? { outputRetained: false } : {}),
   };
 }
 

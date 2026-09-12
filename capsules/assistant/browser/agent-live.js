@@ -457,9 +457,6 @@ export async function streamChatViaContract(
     providerRunId: runId,
     state: TurnState.SUBMITTED,
   });
-  patch({ state: activeRun === run ? TurnState.STREAMING : TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
-  if (activeRun === run) onAccepted?.({ run_id: runId, turnId: turn.turnId });
-  if (run.cancelRequested && activeRun === run) void abortLiveChatStream();
 
   let seq = 0;
   let streamedChars = 0;
@@ -469,6 +466,7 @@ export async function streamChatViaContract(
     const next = extra.detached ? turn : patch({
       state: extra.settlementUnknown ? TurnState.SETTLEMENT_UNKNOWN : extra.aborted ? TurnState.STOPPED : TurnState.COMPLETED,
       completedAt: Date.now(),
+      ...(extra.outputUnretained ? { outputRetained: false } : {}),
     });
     return {
       usage: null,
@@ -482,8 +480,48 @@ export async function streamChatViaContract(
       turnManifest: next,
     };
   };
+  const settleFromTerminal = (terminal) => {
+    if (!terminal || typeof terminal !== "object") {
+      return null;
+    }
+    if (terminal.status === "completed") {
+      if (terminal.outputRetained === false) {
+        return finish({ outputUnretained: true });
+      }
+      const finalText = terminalOutputText(terminal.output);
+      if (finalText && streamedChars === 0) {
+        seq += 1;
+        emit("", finalText, false);
+      }
+      return finish();
+    }
+    if (terminal.status === "cancelled") {
+      return finish({ aborted: true });
+    }
+    if (terminal.status === "settlement_unknown") {
+      return finish({ settlementUnknown: true });
+    }
+    patch({ state: TurnState.FAILED, completedAt: Date.now() });
+    const detail = terminal.error && typeof terminal.error === "object" ? terminal.error : {};
+    throw contractError(
+      String(detail.code || terminal.status || "run_failed"),
+      String(detail.message || `run ${terminal.status}`),
+    );
+  };
+  const createdTerminal = created.terminal && typeof created.terminal === "object" ? created.terminal : null;
+  if (createdTerminal && created.output_retained === false) {
+    createdTerminal.outputRetained = false;
+  }
+  if (!createdTerminal) {
+    patch({ state: activeRun === run ? TurnState.STREAMING : TurnState.SETTLEMENT_UNKNOWN, completedAt: null });
+  }
+  if (activeRun === run) onAccepted?.({ run_id: runId, turnId: turn.turnId });
+  if (!createdTerminal && run.cancelRequested && activeRun === run) void abortLiveChatStream();
 
   try {
+    if (createdTerminal) {
+      return settleFromTerminal(createdTerminal);
+    }
     for (;;) {
       if (epoch !== liveStreamEpoch || activeRun !== run) {
         return finish({ detached: true });
@@ -517,29 +555,10 @@ export async function streamChatViaContract(
       if (epoch !== liveStreamEpoch || activeRun !== run) {
         return finish({ detached: true });
       }
-      const terminal = applied.terminal || (!applied.hasMore && resuming ? created.terminal : null);
-      if (terminal) {
-        if (terminal.status === "completed") {
-          /* A provider that did not stream settles with the whole text once. */
-          const finalText = terminalOutputText(terminal.output);
-          if (finalText && streamedChars === 0) {
-            seq += 1;
-            emit("", finalText, false);
-          }
-          return finish();
-        }
-        if (terminal.status === "cancelled") {
-          return finish({ aborted: true });
-        }
-        if (terminal.status === "settlement_unknown") {
-          return finish({ settlementUnknown: true });
-        }
-        patch({ state: TurnState.FAILED, completedAt: Date.now() });
-        const detail = terminal.error && typeof terminal.error === "object" ? terminal.error : {};
-        throw contractError(
-          String(detail.code || terminal.status || "run_failed"),
-          String(detail.message || `run ${terminal.status}`),
-        );
+      const terminal = applied.terminal || (!applied.hasMore ? created.terminal : null);
+      const settled = settleFromTerminal(terminal);
+      if (settled) {
+        return settled;
       }
       if (applied.hasMore) {
         continue;

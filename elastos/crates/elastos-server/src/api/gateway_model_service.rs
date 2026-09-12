@@ -104,6 +104,10 @@ pub(crate) struct RemoteModelRunRecord {
     #[serde(default)]
     pub operation: String,
     pub request_id: String,
+    /// Canonical hash of the create input. Empty on records written before
+    /// this field existed; those records still parse and still retry.
+    #[serde(default)]
+    pub input_hash: String,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<u64>,
@@ -135,13 +139,41 @@ impl RemoteModelRunRecord {
     }
 
     fn settlement_events_page(&self, run_id: &str, after_sequence: u64) -> Value {
+        let status = self
+            .terminal_status
+            .clone()
+            .unwrap_or_else(|| "settlement_unknown".to_string());
+        let kind = match status.as_str() {
+            "completed" => "completed",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            _ => "settlement_unknown",
+        };
+        // An attached client has already consumed prepared/dispatched events.
+        // Emit the terminal at the next compatible sequence so a cursor of 2
+        // or 7 still settles, and keep next_cursor equal to that sequence.
+        // Completed index settlement keeps the status and states that output
+        // is no longer retained; it does not send an empty output payload.
+        let sequence = after_sequence.saturating_add(1);
+        let event_data = if kind == "completed" {
+            json!({ "output_retained": false })
+        } else {
+            json!({})
+        };
         json!({ "status": "ok", "data": {
             "schema": "elastos.model.run-events/v1",
             "run_id": run_id,
-            "next_cursor": after_sequence,
+            "next_cursor": sequence,
             "has_more": false,
-            "events": [],
+            "events": [json!({
+                "schema": "elastos.model.run-event/v1",
+                "sequence": sequence,
+                "kind": kind,
+                "data": event_data,
+                "terminal": true,
+            })],
             "settlement_source": "runtime_index",
+            "output_retained": false,
         } })
     }
 }
@@ -162,15 +194,33 @@ struct RemoteModelRunIndex {
 const MODEL_RUN_PENDING_TTL_SECS: u64 = 600;
 
 /// One create attempt is identified by who asked for what: the grant, the
-/// destination-owned principal and the request id. A retry of the same
-/// request reuses its record and never consumes a second slot.
-fn run_reservation_key(grant_id: &str, remote_principal_id: &str, request_id: &str) -> String {
-    format!("{grant_id}:{remote_principal_id}:{request_id}")
+/// destination-owned principal, the consumer capsule and the request id.
+/// A retry of that same request reuses its record and never consumes a
+/// second slot. Another capsule with the same request id is a different run.
+fn run_reservation_key(
+    grant_id: &str,
+    remote_principal_id: &str,
+    capsule_id: &str,
+    request_id: &str,
+) -> String {
+    format!("{grant_id}:{remote_principal_id}:{capsule_id}:{request_id}")
+}
+
+fn record_capsule_id(record: &RemoteModelRunRecord) -> &str {
+    if record.capsule_id.is_empty() {
+        "assistant"
+    } else {
+        &record.capsule_id
+    }
 }
 
 enum RunSlot {
-    /// This request already has a run record; the provider's create is idempotent.
-    Existing,
+    /// This request already has a run record. Answer from that record
+    /// and, while the run is still open, a live journal read.
+    Existing {
+        run_id: String,
+        record: RemoteModelRunRecord,
+    },
     /// A slot is held under the reservation key until commit or release.
     Reserved,
 }
@@ -258,16 +308,20 @@ fn reserve_run_slot(
     key: &str,
     grant_id: &str,
     remote_principal_id: &str,
+    capsule_id: &str,
     request_id: &str,
 ) -> anyhow::Result<RunSlot> {
     update_run_index(data_dir, now, |index| {
-        let existing = index.runs.values().any(|record| {
+        if let Some((run_id, record)) = index.runs.iter().find(|(_, record)| {
             record.grant_id == grant_id
                 && record.remote_principal_id == remote_principal_id
+                && record_capsule_id(record) == capsule_id
                 && record.request_id == request_id
-        });
-        if existing {
-            return Ok(RunSlot::Existing);
+        }) {
+            return Ok(RunSlot::Existing {
+                run_id: run_id.clone(),
+                record: record.clone(),
+            });
         }
         if index.pending.contains_key(key) {
             anyhow::bail!("model run reservation is already held");
@@ -385,6 +439,166 @@ fn redact_provider_error(err: &str) -> &'static str {
     } else {
         "provider_failure"
     }
+}
+
+fn provider_error_code(result: &Value) -> &str {
+    result.get("code").and_then(Value::as_str).unwrap_or("")
+}
+
+fn mark_run_settled(data_dir: &Path, now: u64, run_id: &str, status: &str) {
+    let _ = update_run_index(data_dir, now, |index| {
+        if let Some(entry) = index.runs.get_mut(run_id) {
+            if entry.terminal_at.is_none() {
+                entry.terminal_at = Some(now);
+                entry.terminal_status = Some(status.to_string());
+            }
+        }
+        Ok(())
+    });
+}
+
+fn record_for_index_settlement(
+    data_dir: &Path,
+    now: u64,
+    run_id: &str,
+    record: &RemoteModelRunRecord,
+) -> RemoteModelRunRecord {
+    if record.terminal_status.is_some() {
+        return record.clone();
+    }
+    mark_run_settled(data_dir, now, run_id, "settlement_unknown");
+    RemoteModelRunRecord {
+        terminal_at: Some(now),
+        terminal_status: Some("settlement_unknown".into()),
+        ..record.clone()
+    }
+}
+
+fn index_settlement_reply(
+    data_dir: &Path,
+    now: u64,
+    operation: &str,
+    run_id: &str,
+    record: &RemoteModelRunRecord,
+    after_sequence: u64,
+) -> Value {
+    let record = record_for_index_settlement(data_dir, now, run_id, record);
+    let reply = if operation == "runs_events" {
+        record.settlement_events_page(run_id, after_sequence)
+    } else {
+        record.settlement_view(run_id)
+    };
+    json!({ "ok": true, "result": reply })
+}
+
+fn recover_missing_run_or_deny(
+    data_dir: &Path,
+    now: u64,
+    operation: &str,
+    run_id: &str,
+    record: &RemoteModelRunRecord,
+    result: &Value,
+    message: &str,
+    after_sequence: u64,
+) -> Value {
+    if provider_error_code(result) == "run_not_found" {
+        tracing::info!(
+            "remote model run {run_id} settled from the Runtime record after the provider forgot it"
+        );
+        return index_settlement_reply(data_dir, now, operation, run_id, record, after_sequence);
+    }
+    let class = redact_provider_error(message);
+    tracing::info!("remote model provider status error ({class}): {message}");
+    denied(class, "model provider rejected the operation")
+}
+
+fn request_conflicts_with_record(record: &RemoteModelRunRecord, normalized: &Value) -> bool {
+    let offer_id = normalized["offer_id"].as_str().unwrap_or("");
+    let operation = normalized["operation"].as_str().unwrap_or("");
+    let input_hash = normalized
+        .pointer("/runtime_binding/input_hash")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let capsule_id = normalized
+        .pointer("/runtime_binding/capsule_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    (!record.capsule_id.is_empty() && record.capsule_id != capsule_id)
+        || (!record.offer_id.is_empty() && record.offer_id != offer_id)
+        || (!record.operation.is_empty() && record.operation != operation)
+        || (!record.input_hash.is_empty() && record.input_hash != input_hash)
+}
+
+fn refuse_unbound_or_conflicting_create(
+    record: &RemoteModelRunRecord,
+    normalized: &Value,
+) -> Option<Value> {
+    if request_conflicts_with_record(record, normalized) {
+        return Some(denied(
+            "denied",
+            "request_id conflicts with an existing model run",
+        ));
+    }
+    // A pre-repair record has no input hash. RunView does not carry the
+    // original fingerprint, so this Runtime cannot prove a replay. Refuse
+    // create here; owned get, events and cancel still use the record.
+    if record.input_hash.is_empty() {
+        return Some(denied(
+            "request_unbound",
+            "this request cannot be replayed because its original input was not retained",
+        ));
+    }
+    None
+}
+
+async fn answer_retained_create(
+    registry: &ProviderRegistry,
+    data_dir: &Path,
+    now: u64,
+    context: &HomeLaunchTokenContext,
+    capsule_id: &str,
+    normalized: &Value,
+    request_id: &str,
+    run_id: String,
+    record: RemoteModelRunRecord,
+) -> Value {
+    if let Some(refusal) = refuse_unbound_or_conflicting_create(&record, normalized) {
+        return refusal;
+    }
+    let get_request = json!({
+        "run_id": run_id,
+        "request_id": format!("retry:{request_id}"),
+    });
+    let get_normalized =
+        match normalize_model_provider_request("runs_get", &get_request, context, capsule_id) {
+            Ok(normalized) => normalized,
+            Err((_, message)) => {
+                tracing::info!("remote model retained get rejected: {message}");
+                return denied(
+                    "invalid_provider_invocation",
+                    "model request did not match the typed contract",
+                );
+            }
+        };
+    let result = match registry.send_raw("model", &get_normalized).await {
+        Ok(result) => result,
+        Err(err) => {
+            let class = redact_provider_error(&err.to_string());
+            tracing::info!("remote model provider error ({class}): {err}");
+            return denied(class, "model provider rejected the operation");
+        }
+    };
+    if let Some(message) = provider_status_error(&result) {
+        return recover_missing_run_or_deny(
+            data_dir, now, "runs_get", &run_id, &record, &result, &message, 0,
+        );
+    }
+    if let Some(status) =
+        run_result_terminal_status(&result).filter(|_| record.terminal_at.is_none())
+    {
+        mark_run_settled(data_dir, now, &run_id, &status);
+    }
+    json!({ "ok": true, "result": result })
 }
 
 fn provider_status_error(result: &Value) -> Option<String> {
@@ -665,14 +879,16 @@ pub(crate) async fn invoke(
         }
     }
 
-    // A create holds its record slot before any model work starts; a retry of
-    // an already recorded request needs no slot. A full index refuses here.
+    // A create holds its record slot before any model work starts. A retry of
+    // an already recorded request is answered from that record before another
+    // create. A full index refuses here.
     let request_id = normalized
         .pointer("/runtime_binding/request_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let reservation_key = run_reservation_key(grant_id, &context.principal_id, &request_id);
+    let reservation_key =
+        run_reservation_key(grant_id, &context.principal_id, capsule_id, &request_id);
     let held_slot = if operation == "runs_create" {
         match reserve_run_slot(
             data_dir,
@@ -680,10 +896,24 @@ pub(crate) async fn invoke(
             &reservation_key,
             grant_id,
             &context.principal_id,
+            capsule_id,
             &request_id,
         ) {
             Ok(RunSlot::Reserved) => true,
-            Ok(RunSlot::Existing) => false,
+            Ok(RunSlot::Existing { run_id, record }) => {
+                return answer_retained_create(
+                    &registry,
+                    data_dir,
+                    now,
+                    &context,
+                    capsule_id,
+                    &normalized,
+                    &request_id,
+                    run_id,
+                    record,
+                )
+                .await;
+            }
             Err(err) => {
                 tracing::info!("remote model run refused before dispatch: {err}");
                 return denied(
@@ -712,25 +942,22 @@ pub(crate) async fn invoke(
             release_run_slot(data_dir, now, &reservation_key);
         }
         // The provider journal keeps a run for a bounded time; this Runtime's
-        // record outlives it. A settlement read of a run the provider no
-        // longer knows is answered from the record, so the consumer either
-        // learns the observed terminal status or an honest `settlement_unknown`.
+        // record outlives it. Only a missing-run reply uses that record. Other
+        // provider failures stay recoverable.
         if let Some((run_id, record)) = indexed_run
             .as_ref()
             .filter(|_| matches!(operation, "runs_get" | "runs_events"))
         {
-            tracing::info!(
-                "remote model run {run_id} settled from the Runtime record after provider error: {message}"
+            return recover_missing_run_or_deny(
+                data_dir,
+                now,
+                operation,
+                run_id,
+                record,
+                &result,
+                &message,
+                normalized["after_sequence"].as_u64().unwrap_or(0),
             );
-            let reply = if operation == "runs_get" {
-                record.settlement_view(run_id)
-            } else {
-                record.settlement_events_page(
-                    run_id,
-                    normalized["after_sequence"].as_u64().unwrap_or(0),
-                )
-            };
-            return json!({ "ok": true, "result": reply });
         }
         let class = redact_provider_error(&message);
         tracing::info!("remote model provider status error ({class}): {message}");
@@ -763,6 +990,11 @@ pub(crate) async fn invoke(
                         .unwrap_or_default()
                         .to_string(),
                     request_id: request_id.clone(),
+                    input_hash: normalized
+                        .pointer("/runtime_binding/input_hash")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     created_at: now,
                     terminal_status: run_result_terminal_status(&result),
                     terminal_at: run_result_is_terminal(&result).then_some(now),
@@ -967,6 +1199,46 @@ mod tests {
     }
 
     #[test]
+    fn settlement_events_page_emits_one_terminal_event() {
+        let record = RemoteModelRunRecord {
+            grant_id: "g".into(),
+            source_endpoint_did: "did:key:z6Mksource".into(),
+            requester_principal_id: "p".into(),
+            remote_principal_id: remote_principal_id("did:key:z6Mksource", "p"),
+            capsule_id: "assistant".into(),
+            offer_id: "qwen".into(),
+            operation: "text.generate".into(),
+            request_id: "req-1".into(),
+            input_hash: "sha256:aa".into(),
+            created_at: 100,
+            terminal_at: Some(150),
+            terminal_status: Some("completed".into()),
+        };
+        let page = record.settlement_events_page("run:1", 0);
+        assert_eq!(page["data"]["events"][0]["kind"], "completed");
+        assert_eq!(page["data"]["events"][0]["data"]["output_retained"], false);
+        assert_eq!(page["data"]["events"][0]["sequence"], 1);
+        assert_eq!(page["data"]["events"][0]["terminal"], true);
+        assert_eq!(page["data"]["next_cursor"], 1);
+        assert_eq!(page["data"]["output_retained"], false);
+        let mid = record.settlement_events_page("run:1", 2);
+        assert_eq!(mid["data"]["events"][0]["sequence"], 3);
+        assert_eq!(mid["data"]["next_cursor"], 3);
+        let high = record.settlement_events_page("run:1", 7);
+        assert_eq!(high["data"]["events"][0]["sequence"], 8);
+        assert_eq!(high["data"]["next_cursor"], 8);
+        let unknown = RemoteModelRunRecord {
+            terminal_at: None,
+            terminal_status: None,
+            ..record
+        };
+        assert_eq!(
+            unknown.settlement_events_page("run:2", 0)["data"]["events"][0]["kind"],
+            "settlement_unknown"
+        );
+    }
+
+    #[test]
     fn provider_errors_cross_carrier_only_as_bounded_classes() {
         assert_eq!(
             redact_provider_error("run concurrency limit reached for offer"),
@@ -995,6 +1267,7 @@ mod tests {
             offer_id: "qwen".into(),
             operation: "text.generate".into(),
             request_id: "req-1".into(),
+            input_hash: String::new(),
             created_at: 100,
             terminal_at: None,
             terminal_status: None,

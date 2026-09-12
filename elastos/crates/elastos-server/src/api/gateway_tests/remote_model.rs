@@ -11,7 +11,7 @@ use crate::collaboration_profile_authority::{
     signed_profile_document_for_test, VerifiedCollaborationProfileDocument,
 };
 use elastos_common::collaboration_protocol::*;
-use elastos_model_contract::{RuntimeAccessBinding, RuntimeCreateBinding};
+use elastos_model_contract::{model_input_hash, RuntimeAccessBinding, RuntimeCreateBinding};
 use elastos_runtime::signature::{generate_keypair, SigningKey};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
@@ -31,9 +31,15 @@ fn provider_error(err: impl std::fmt::Display) -> ProviderError {
 }
 
 fn run_id_for(principal_id: &str, request_id: &str) -> String {
+    run_id_for_capsule(principal_id, request_id, "assistant")
+}
+
+fn run_id_for_capsule(principal_id: &str, request_id: &str, capsule_id: &str) -> String {
     format!(
         "run:sha256:{}",
-        hex::encode(Sha256::digest(format!("{principal_id}:{request_id}")))
+        hex::encode(Sha256::digest(format!(
+            "{principal_id}:{capsule_id}:{request_id}"
+        )))
     )
 }
 
@@ -48,7 +54,14 @@ fn run_view(run_id: &str, status: &str) -> Value {
         status,
         "completed" | "failed" | "cancelled" | "settlement_unknown"
     ) {
-        view["terminal"] = json!({ "status": status });
+        let mut terminal = json!({ "status": status });
+        if status == "completed" {
+            terminal["output"] = json!({
+                "schema": "elastos.model.output.text/v1",
+                "text": "hello",
+            });
+        }
+        view["terminal"] = terminal;
     }
     json!({ "status": "ok", "data": view })
 }
@@ -75,6 +88,9 @@ struct FakeModelProvider {
     calls: TokioMutex<Vec<Value>>,
     run_owners: std::sync::Mutex<BTreeMap<String, String>>,
     event_pages: std::sync::Mutex<BTreeMap<String, u32>>,
+    run_status: std::sync::Mutex<BTreeMap<String, String>>,
+    /// Injected once onto the next `runs_get` or `runs_events` reply.
+    next_error: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -116,28 +132,73 @@ impl Provider for FakeModelProvider {
             binding
                 .validate(offer_id, operation, &request["input"])
                 .map_err(provider_error)?;
-            let run_id = run_id_for(&binding.principal_id, &binding.request_id);
+            let run_id = run_id_for_capsule(
+                &binding.principal_id,
+                &binding.request_id,
+                &binding.capsule_id,
+            );
             self.run_owners
                 .lock()
                 .unwrap()
                 .insert(run_id.clone(), binding.principal_id);
+            self.run_status
+                .lock()
+                .unwrap()
+                .insert(run_id.clone(), "running".to_string());
             return Ok(run_view(&run_id, "running"));
         }
         let binding: RuntimeAccessBinding =
             serde_json::from_value(request["runtime_binding"].clone()).map_err(provider_error)?;
         let run_id = request["run_id"].as_str().unwrap_or_default();
         binding.validate(run_id).map_err(provider_error)?;
+        if matches!(op, "runs_get" | "runs_events") {
+            if let Some(code) = self.next_error.lock().unwrap().take() {
+                return Ok(json!({ "status": "error", "code": code, "message": code }));
+            }
+        }
+        if !self.run_owners.lock().unwrap().contains_key(run_id) {
+            return Ok(json!({
+                "status": "error",
+                "code": "run_not_found",
+                "message": "model run is not available for the current caller",
+            }));
+        }
         if self.run_owners.lock().unwrap().get(run_id) != Some(&binding.principal_id) {
-            return Ok(json!({ "status": "error", "message": "run owner mismatch" }));
+            return Ok(
+                json!({ "status": "error", "code": "denied", "message": "run owner mismatch" }),
+            );
         }
         Ok(match op {
-            "runs_get" => run_view(&binding.run_id, "running"),
-            "runs_cancel" => run_view(&binding.run_id, "cancelled"),
+            "runs_get" => {
+                let status = self
+                    .run_status
+                    .lock()
+                    .unwrap()
+                    .get(&binding.run_id)
+                    .cloned()
+                    .unwrap_or_else(|| "running".to_string());
+                run_view(&binding.run_id, &status)
+            }
+            "runs_cancel" => {
+                self.run_status
+                    .lock()
+                    .unwrap()
+                    .insert(binding.run_id.clone(), "cancelled".to_string());
+                run_view(&binding.run_id, "cancelled")
+            }
             _ => {
                 let mut pages = self.event_pages.lock().unwrap();
                 let page = pages.entry(binding.run_id.clone()).or_insert(0);
                 *page += 1;
-                events_page(&binding.run_id, *page)
+                let page = *page;
+                drop(pages);
+                if page > 1 {
+                    self.run_status
+                        .lock()
+                        .unwrap()
+                        .insert(binding.run_id.clone(), "completed".to_string());
+                }
+                events_page(&binding.run_id, page)
             }
         })
     }
@@ -453,13 +514,41 @@ impl TwoRuntimes {
     }
 
     async fn create_run(&self, request_id: &str, offer_id: &str) -> Value {
+        self.create_run_as(
+            request_id,
+            offer_id,
+            "assistant",
+            json!({ "prompt": "hello" }),
+        )
+        .await
+    }
+
+    async fn create_run_as(
+        &self,
+        request_id: &str,
+        offer_id: &str,
+        capsule_id: &str,
+        input: Value,
+    ) -> Value {
         self.call(
             "runs_create",
             json!({
                 "op": "runs_create", "offer_id": offer_id, "operation": "text.generate",
-                "input": { "prompt": "hello" }, "request_id": request_id,
-                "remote_model": self.remote(SEED_PRINCIPAL, "assistant"),
+                "input": input, "request_id": request_id,
+                "remote_model": self.remote(SEED_PRINCIPAL, capsule_id),
                 "_runtime_invocation": { "schema": "elastos.provider.invocation/v1" },
+            }),
+        )
+        .await
+    }
+
+    async fn run_events(&self, run_id: &str, after_sequence: u64) -> Value {
+        self.call(
+            "runs_events",
+            json!({
+                "op": "runs_events", "run_id": run_id, "after_sequence": after_sequence,
+                "request_id": format!("events:{after_sequence}"),
+                "remote_model": self.remote(SEED_PRINCIPAL, "assistant"),
             }),
         )
         .await
@@ -491,6 +580,14 @@ impl TwoRuntimes {
 
     async fn last_provider_call(&self) -> Value {
         self.provider.calls.lock().await.last().cloned().unwrap()
+    }
+
+    async fn create_count(&self) -> usize {
+        self.provider_ops()
+            .await
+            .iter()
+            .filter(|op| *op == "runs_create")
+            .count()
     }
 
     async fn shutdown(mut self) {
@@ -632,7 +729,10 @@ impl TwoRuntimes {
                 "grant_id": self.grant_id, "source_endpoint_did": self.seed_did,
                 "requester_principal_id": SEED_PRINCIPAL,
                 "remote_principal_id": self.remote_principal(), "capsule_id": "assistant",
-                "offer_id": "qwen-local", "request_id": request_id, "created_at": now_ts(),
+                "offer_id": "qwen-local", "operation": "text.generate",
+                "request_id": request_id,
+                "input_hash": model_input_hash(&json!({ "prompt": "hello" })).unwrap(),
+                "created_at": now_ts(),
             })
         };
         for n in 0..count {
@@ -652,6 +752,16 @@ impl TwoRuntimes {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    fn strip_record_input_hash(&self, run_id: &str) {
+        let path = self.owner.path().join("services-model-runs.json");
+        let mut index: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        index["runs"][run_id]
+            .as_object_mut()
+            .unwrap()
+            .remove("input_hash");
+        std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
     }
 
     fn run_index_len(&self) -> usize {
@@ -717,7 +827,12 @@ async fn a_recorded_request_retries_through_a_full_index_without_a_new_slot() {
         retried["result"]["data"]["run_id"],
         run_id_for(&fx.remote_principal(), "seed-req-lost")
     );
-    assert_eq!(fx.last_provider_call().await["op"], "runs_create");
+    assert_eq!(fx.last_provider_call().await["op"], "runs_get");
+    assert_eq!(
+        fx.create_count().await,
+        0,
+        "a recorded retry must not create again"
+    );
     assert_eq!(fx.run_index_len(), 512, "the retry consumed no capacity");
     // An unrelated new request is still refused.
     let refused = fx.create_run("seed-req-new", "qwen-local").await;
@@ -730,7 +845,7 @@ mod consumer_path {
     use super::*;
     use crate::api::gateway::gateway_model_remote::{
         remote_offer_id, remote_run_route, route_run_operation, ConsumerModelGrant,
-        RemoteRouteError,
+        RemoteRouteError, REMOTE_RUN_INDEX_MAX,
     };
 
     fn ticket_for(endpoint: &iroh::EndpointAddr) -> String {
@@ -767,17 +882,67 @@ mod consumer_path {
             op: &str,
             normalized: Value,
         ) -> Result<Option<Value>, RemoteRouteError> {
+            self.route_as("assistant", grants, op, normalized).await
+        }
+
+        async fn route_as(
+            &self,
+            capsule_id: &str,
+            grants: &[ConsumerModelGrant],
+            op: &str,
+            normalized: Value,
+        ) -> Result<Option<Value>, RemoteRouteError> {
             route_run_operation(
                 self.seed_registry.clone(),
                 self.seed.path(),
                 grants,
                 &seed_context(),
-                "assistant",
+                capsule_id,
                 op,
                 &normalized,
                 now_ts(),
             )
             .await
+        }
+
+        fn fill_consumer_run_index(
+            &self,
+            count: usize,
+            recorded_request: Option<&str>,
+            capsule_id: &str,
+        ) {
+            let mut runs = serde_json::Map::new();
+            let record = |request_id: String| {
+                json!({
+                    "principal_id": SEED_PRINCIPAL,
+                    "grant_id": self.grant_id,
+                    "peer_did": "did:key:z6Mkpeer",
+                    "connect_ticket": "ticket",
+                    "display_name": "Mac",
+                    "offer_id": remote_offer_id(&self.grant_id, "qwen-local"),
+                    "request_id": request_id,
+                    "capsule_id": capsule_id,
+                    "created_at": now_ts(),
+                })
+            };
+            for n in 0..count {
+                runs.insert(format!("run:sha256:{n:064x}"), record(format!("open-{n}")));
+            }
+            if let Some(request_id) = recorded_request {
+                runs.insert(
+                    format!("run:sha256:{:064x}", 0),
+                    record(request_id.to_string()),
+                );
+            }
+            std::fs::write(
+                self.seed.path().join("services-model-remote-runs.json"),
+                serde_json::to_vec(&json!({
+                    "schema": "elastos.services.model-remote-runs/v1",
+                    "runs": runs,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         }
     }
 
@@ -869,6 +1034,40 @@ mod consumer_path {
             .await
             .unwrap();
         assert!(local.is_none());
+        fx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_full_consumer_index_refuses_a_second_capsule_before_any_model_work() {
+        let fx = TwoRuntimes::start().await;
+        let grant = fx.consumer_grant();
+        fx.fill_consumer_run_index(REMOTE_RUN_INDEX_MAX, Some("seed-req-shared"), "assistant");
+        let ops_before = fx.provider_ops().await;
+        let creates_before = fx.create_count().await;
+        let create = json!({
+            "op": "runs_create",
+            "offer_id": remote_offer_id(&fx.grant_id, "qwen-local"),
+            "operation": "text.generate",
+            "input": { "prompt": "hello" },
+            "runtime_binding": {
+                "principal_id": SEED_PRINCIPAL,
+                "request_id": "seed-req-shared",
+            },
+        });
+        let refused = fx
+            .route_as(
+                "home-agent",
+                std::slice::from_ref(&grant),
+                "runs_create",
+                create,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(RemoteRouteError::Rejected { ref code }) if code == "rate_limited"),
+            "{refused:?}"
+        );
+        assert_eq!(fx.provider_ops().await, ops_before);
+        assert_eq!(fx.create_count().await, creates_before);
         fx.shutdown().await;
     }
 }
@@ -1011,7 +1210,14 @@ async fn a_pruned_run_settles_from_the_owners_record() {
         .await;
     assert_eq!(page["ok"], true, "{page}");
     assert_eq!(page["result"]["data"]["has_more"], false);
-    assert_eq!(page["result"]["data"]["events"], json!([]));
+    let events = page["result"]["data"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{page}");
+    assert_eq!(events[0]["kind"], "completed");
+    assert_eq!(events[0]["data"]["output_retained"], false);
+    assert_eq!(events[0]["terminal"], true);
+    assert_eq!(page["result"]["data"]["output_retained"], false);
+    assert_eq!(page["result"]["data"]["next_cursor"], 1);
+    assert_eq!(page["result"]["data"]["settlement_source"], "runtime_index");
 
     let unknown = fx.run_operation("runs_get", &run_b, SEED_PRINCIPAL).await;
     assert_eq!(unknown["ok"], true, "{unknown}");
@@ -1020,11 +1226,309 @@ async fn a_pruned_run_settles_from_the_owners_record() {
         unknown["result"]["data"]["terminal"]["status"],
         "settlement_unknown"
     );
+    assert_eq!(
+        fx.run_record(&run_b)["terminal_status"],
+        "settlement_unknown"
+    );
 
     // Another principal still learns nothing about either run.
     let foreign = fx
         .run_operation("runs_get", &run_a, OTHER_SEED_PRINCIPAL)
         .await;
     assert_eq!(foreign["code"], "denied", "{foreign}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_completed_run_does_not_dispatch_again_after_the_journal_is_pruned() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-replay", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-replay");
+    for _ in 0..2 {
+        let page = fx
+            .run_operation("runs_events", &run_id, SEED_PRINCIPAL)
+            .await;
+        assert_eq!(page["ok"], true, "{page}");
+    }
+    assert_eq!(fx.run_record(&run_id)["terminal_status"], "completed");
+    let creates_before = fx.create_count().await;
+    assert_eq!(creates_before, 1);
+    fx.provider.run_owners.lock().unwrap().clear();
+
+    let retried = fx.create_run("seed-req-replay", "qwen-local").await;
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_eq!(retried["result"]["data"]["run_id"], run_id);
+    assert_eq!(retried["result"]["data"]["status"], "completed");
+    assert_eq!(
+        retried["result"]["data"]["settlement_source"],
+        "runtime_index"
+    );
+    assert_eq!(
+        fx.create_count().await,
+        creates_before,
+        "replay after journal cleanup must not dispatch again"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_recorded_request_rejects_a_conflicting_offer_on_retry() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-bind", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-bind");
+    let path = fx.owner.path().join("services-model-runs.json");
+    let mut index: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    index["runs"][&run_id]["offer_id"] = json!("other-local");
+    std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let retried = fx.create_run("seed-req-bind", "qwen-local").await;
+    assert_eq!(retried["ok"], false, "{retried}");
+    assert_eq!(retried["code"], "denied", "{retried}");
+    assert_eq!(fx.create_count().await, 1);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_provider_read_fault_stays_recoverable_instead_of_settling() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-fault", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-fault");
+    for code in ["journal_corrupt", "internal_error", "not_initialized"] {
+        *fx.provider.next_error.lock().unwrap() = Some(code.to_string());
+        let get = fx.run_operation("runs_get", &run_id, SEED_PRINCIPAL).await;
+        assert_eq!(get["ok"], false, "{code}: {get}");
+        assert_eq!(get["code"], "provider_failure", "{code}: {get}");
+        assert!(
+            fx.run_record(&run_id)["terminal_status"].is_null(),
+            "{code} must leave the owner record open"
+        );
+        *fx.provider.next_error.lock().unwrap() = Some(code.to_string());
+        let events = fx
+            .run_operation("runs_events", &run_id, SEED_PRINCIPAL)
+            .await;
+        assert_eq!(events["ok"], false, "{code}: {events}");
+        assert_eq!(events["code"], "provider_failure", "{code}: {events}");
+    }
+    fx.shutdown().await;
+}
+#[tokio::test]
+async fn a_lost_create_reply_recovers_completed_output_from_the_journal() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-output", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-output");
+    for _ in 0..2 {
+        let page = fx.run_events(&run_id, 0).await;
+        assert_eq!(page["ok"], true, "{page}");
+    }
+    assert_eq!(fx.run_record(&run_id)["terminal_status"], "completed");
+    let creates_before = fx.create_count().await;
+    assert_eq!(creates_before, 1);
+
+    let retried = fx.create_run("seed-req-output", "qwen-local").await;
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_eq!(retried["result"]["data"]["run_id"], run_id);
+    assert_eq!(retried["result"]["data"]["status"], "completed");
+    assert_eq!(
+        retried["result"]["data"]["terminal"]["output"]["text"],
+        "hello"
+    );
+    assert_ne!(
+        retried["result"]["data"]["settlement_source"],
+        "runtime_index"
+    );
+    assert_eq!(fx.last_provider_call().await["op"], "runs_get");
+    assert_eq!(
+        fx.create_count().await,
+        creates_before,
+        "a lost create reply must not dispatch again while the journal exists"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_attached_events_cursor_settles_after_the_journal_is_pruned() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-cursor", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-cursor");
+    let first = fx.run_events(&run_id, 0).await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["data"]["events"][1]["sequence"], 2);
+    fx.provider.run_owners.lock().unwrap().clear();
+
+    let settled = fx.run_events(&run_id, 2).await;
+    assert_eq!(settled["ok"], true, "{settled}");
+    assert_eq!(settled["result"]["data"]["events"][0]["sequence"], 3);
+    assert_eq!(settled["result"]["data"]["events"][0]["terminal"], true);
+    assert_eq!(settled["result"]["data"]["next_cursor"], 3);
+    assert_eq!(
+        settled["result"]["data"]["settlement_source"],
+        "runtime_index"
+    );
+    let high = fx.run_events(&run_id, 7).await;
+    assert_eq!(high["ok"], true, "{high}");
+    assert_eq!(high["result"]["data"]["events"][0]["sequence"], 8);
+    assert_eq!(high["result"]["data"]["next_cursor"], 8);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_changed_input_is_rejected_before_and_after_journal_prune() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-input", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-input");
+    assert!(!fx.run_record(&run_id)["input_hash"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    let changed = fx
+        .create_run_as(
+            "seed-req-input",
+            "qwen-local",
+            "assistant",
+            json!({ "prompt": "other" }),
+        )
+        .await;
+    assert_eq!(changed["ok"], false, "{changed}");
+    assert_eq!(changed["code"], "denied", "{changed}");
+    assert_eq!(fx.create_count().await, 1);
+    assert!(fx.run_record(&run_id)["terminal_status"].is_null());
+
+    fx.provider.run_owners.lock().unwrap().clear();
+    let changed_again = fx
+        .create_run_as(
+            "seed-req-input",
+            "qwen-local",
+            "assistant",
+            json!({ "prompt": "other" }),
+        )
+        .await;
+    assert_eq!(changed_again["ok"], false, "{changed_again}");
+    assert_eq!(changed_again["code"], "denied", "{changed_again}");
+    assert_eq!(fx.create_count().await, 1);
+    assert!(fx.run_record(&run_id)["terminal_status"].is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn assistant_and_home_agent_keeps_separate_runs_for_the_same_request_id() {
+    let fx = TwoRuntimes::start().await;
+    let assistant = fx.create_run("seed-req-shared", "qwen-local").await;
+    let home_agent = fx
+        .create_run_as(
+            "seed-req-shared",
+            "qwen-local",
+            "home-agent",
+            json!({ "prompt": "hello" }),
+        )
+        .await;
+    assert_eq!(assistant["ok"], true, "{assistant}");
+    assert_eq!(home_agent["ok"], true, "{home_agent}");
+    let assistant_id = run_id_for_capsule(&fx.remote_principal(), "seed-req-shared", "assistant");
+    let home_id = run_id_for_capsule(&fx.remote_principal(), "seed-req-shared", "home-agent");
+    assert_ne!(assistant_id, home_id);
+    assert_eq!(assistant["result"]["data"]["run_id"], assistant_id);
+    assert_eq!(home_agent["result"]["data"]["run_id"], home_id);
+    assert_eq!(fx.create_count().await, 2);
+    assert!(fx.run_record(&assistant_id)["terminal_status"].is_null());
+    assert!(fx.run_record(&home_id)["terminal_status"].is_null());
+    assert_eq!(fx.run_record(&assistant_id)["capsule_id"], "assistant");
+    assert_eq!(fx.run_record(&home_id)["capsule_id"], "home-agent");
+
+    let result = crate::api::gateway::gateway_model_service::deny_grant_and_settle(
+        Some(fx.registry.clone()),
+        fx.owner.path(),
+        &HomeLaunchTokenContext {
+            principal_id: fx.authority.principal_id.clone(),
+            session_id: fx.authority.session_id.clone(),
+            proof_binding_id: Some(fx.authority.proof_binding_id.clone()),
+            grant_id: fx.authority.grant_id.clone(),
+        },
+        None,
+        REQUEST_ID,
+    )
+    .await;
+    assert!(result.is_err(), "delivery failure surfaces: {result:?}");
+    let cancels = fx
+        .provider_ops()
+        .await
+        .iter()
+        .filter(|op| *op == "runs_cancel")
+        .count();
+    assert_eq!(cancels, 2, "each capsule run must be cancelled");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_legacy_record_refuses_changed_input_replay_while_the_journal_exists() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-legacy", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-legacy");
+    fx.strip_record_input_hash(&run_id);
+    assert!(fx.run_record(&run_id).get("input_hash").is_none());
+
+    let changed = fx
+        .create_run_as(
+            "seed-req-legacy",
+            "qwen-local",
+            "assistant",
+            json!({ "prompt": "other" }),
+        )
+        .await;
+    assert_eq!(changed["ok"], false, "{changed}");
+    assert_eq!(changed["code"], "request_unbound", "{changed}");
+    assert_eq!(fx.create_count().await, 1);
+    assert_eq!(fx.last_provider_call().await["op"], "offers_list");
+
+    let got = fx.run_operation("runs_get", &run_id, SEED_PRINCIPAL).await;
+    assert_eq!(got["ok"], true, "{got}");
+    assert_eq!(got["result"]["data"]["status"], "running", "{got}");
+    let page = fx.run_events(&run_id, 0).await;
+    assert_eq!(page["ok"], true, "{page}");
+    let cancel = fx
+        .run_operation("runs_cancel", &run_id, SEED_PRINCIPAL)
+        .await;
+    assert_eq!(cancel["ok"], true, "{cancel}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_legacy_record_refuses_changed_input_replay_after_the_journal_is_pruned() {
+    let fx = TwoRuntimes::start().await;
+    let created = fx.create_run("seed-req-legacy-pruned", "qwen-local").await;
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-legacy-pruned");
+    fx.strip_record_input_hash(&run_id);
+    fx.provider.run_owners.lock().unwrap().clear();
+
+    let changed = fx
+        .create_run_as(
+            "seed-req-legacy-pruned",
+            "qwen-local",
+            "assistant",
+            json!({ "prompt": "other" }),
+        )
+        .await;
+    assert_eq!(changed["ok"], false, "{changed}");
+    assert_eq!(changed["code"], "request_unbound", "{changed}");
+    assert_eq!(fx.create_count().await, 1);
+
+    let got = fx.run_operation("runs_get", &run_id, SEED_PRINCIPAL).await;
+    assert_eq!(got["ok"], true, "{got}");
+    assert_eq!(
+        got["result"]["data"]["status"], "settlement_unknown",
+        "{got}"
+    );
+    let page = fx.run_events(&run_id, 0).await;
+    assert_eq!(page["ok"], true, "{page}");
+    assert_eq!(
+        page["result"]["data"]["events"][0]["kind"],
+        "settlement_unknown"
+    );
     fx.shutdown().await;
 }

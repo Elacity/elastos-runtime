@@ -24,7 +24,7 @@ use super::gateway_home_token::HomeLaunchTokenContext;
 
 const REMOTE_OFFER_PREFIX: &str = "remote:";
 const REMOTE_RUN_INDEX_SCHEMA: &str = "elastos.services.model-remote-runs/v1";
-const REMOTE_RUN_INDEX_MAX: usize = 1024;
+pub(crate) const REMOTE_RUN_INDEX_MAX: usize = 1024;
 const REMOTE_RUN_RETENTION_SECS: u64 = 7 * 24 * 3600;
 const CARRIER_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const TRANSPORT_INTERRUPTED: &str = "transport_interrupted";
@@ -54,6 +54,10 @@ pub(crate) struct RemoteRunRoute {
     pub display_name: String,
     pub offer_id: String,
     pub request_id: String,
+    /// Empty on routes written before capsule identity was stored; those
+    /// routes belong to Assistant.
+    #[serde(default)]
+    pub capsule_id: String,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<u64>,
@@ -86,8 +90,24 @@ struct RemoteRunIndex {
 
 const REMOTE_RUN_PENDING_TTL_SECS: u64 = 600;
 
-fn route_reservation_key(principal_id: &str, grant_id: &str, request_id: &str) -> String {
-    format!("{principal_id}:{grant_id}:{request_id}")
+fn route_capsule_id(capsule_id: &str) -> &str {
+    if capsule_id.is_empty() {
+        "assistant"
+    } else {
+        capsule_id
+    }
+}
+
+fn route_reservation_key(
+    principal_id: &str,
+    grant_id: &str,
+    capsule_id: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "{principal_id}:{grant_id}:{}:{request_id}",
+        route_capsule_id(capsule_id)
+    )
 }
 
 enum RouteSlot {
@@ -345,12 +365,15 @@ fn reserve_route_slot(
     key: &str,
     principal_id: &str,
     grant_id: &str,
+    capsule_id: &str,
     request_id: &str,
 ) -> Result<RouteSlot, RemoteRouteError> {
-    update_index(data_dir, now, |index| {
+    let capsule_id = route_capsule_id(capsule_id);
+    match update_index(data_dir, now, |index| {
         let existing = index.runs.values().any(|route| {
             route.principal_id == principal_id
                 && route.grant_id == grant_id
+                && route_capsule_id(&route.capsule_id) == capsule_id
                 && route.request_id == request_id
         });
         if existing {
@@ -365,8 +388,19 @@ fn reserve_route_slot(
         );
         index.pending.insert(key.to_string(), now);
         Ok(RouteSlot::Reserved)
-    })
-    .map_err(|err| RemoteRouteError::Invalid(err.to_string()))
+    }) {
+        Ok(slot) => Ok(slot),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("remote run index is full") {
+                Err(RemoteRouteError::Rejected {
+                    code: "rate_limited".into(),
+                })
+            } else {
+                Err(RemoteRouteError::Invalid(message))
+            }
+        }
+    }
 }
 
 fn commit_route_slot(
@@ -524,7 +558,8 @@ pub(crate) async fn route_run_operation(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let key = route_reservation_key(&context.principal_id, grant_id, &request_id);
+            let key =
+                route_reservation_key(&context.principal_id, grant_id, capsule_id, &request_id);
             let held_slot = matches!(
                 reserve_route_slot(
                     data_dir,
@@ -532,7 +567,8 @@ pub(crate) async fn route_run_operation(
                     &key,
                     &context.principal_id,
                     grant_id,
-                    &request_id
+                    capsule_id,
+                    &request_id,
                 )?,
                 RouteSlot::Reserved
             );
@@ -554,6 +590,7 @@ pub(crate) async fn route_run_operation(
                     display_name: grant.display_name.clone(),
                     offer_id: offer_id.to_string(),
                     request_id: request_id.clone(),
+                    capsule_id: capsule_id.to_string(),
                     created_at: now,
                     terminal_at: run_is_terminal(&result).then_some(now),
                 };
@@ -737,6 +774,7 @@ mod tests {
             display_name: "Mac".into(),
             offer_id: "remote:g:qwen".into(),
             request_id: "req".into(),
+            capsule_id: "assistant".into(),
             created_at: 10,
             terminal_at: None,
         };

@@ -981,6 +981,17 @@ export function createAssistantApp({
       state.studioProgress = null;
     }
     if (terminal.status === "completed") {
+      if (terminal.outputRetained === false) {
+        if (run.mode === MODE_STUDIO) {
+          state.studioResult = null;
+        }
+        state.statusMessage = "The run completed. This Runtime did not keep the output.";
+        if (run.mode !== MODE_STUDIO) {
+          markWorkspaceDirty();
+        }
+        notify();
+        return true;
+      }
       if (run.mode === MODE_STUDIO) {
         const output = parseStudioOutput(terminal.output);
         if (!output) {
@@ -1026,6 +1037,7 @@ export function createAssistantApp({
       status: runView.status,
       output: runView.terminal?.output ?? null,
       error: runView.terminal?.error ?? null,
+      outputRetained: runView.output_retained !== false,
     });
   }
 
@@ -1057,6 +1069,13 @@ export function createAssistantApp({
           status: "completed",
           output: event.data ?? null,
           error: null,
+        };
+      } else if (event.kind === "completed") {
+        terminal = {
+          status: "completed",
+          output: event.data?.output_retained === false ? null : event.data ?? null,
+          error: null,
+          outputRetained: event.data?.output_retained !== false,
         };
       } else if (event.kind === "failed") {
         terminal = {
