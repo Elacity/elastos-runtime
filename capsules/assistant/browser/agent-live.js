@@ -501,10 +501,11 @@ export async function streamChatViaContract(
     if (terminal.status === "settlement_unknown") {
       return finish({ settlementUnknown: true });
     }
-    patch({ state: TurnState.FAILED, completedAt: Date.now() });
     const detail = terminal.error && typeof terminal.error === "object" ? terminal.error : {};
+    const code = String(detail.code || terminal.status || "run_failed");
+    patch({ state: TurnState.FAILED, completedAt: Date.now(), error: code.slice(0, 120) });
     throw contractError(
-      String(detail.code || terminal.status || "run_failed"),
+      code,
       String(detail.message || `run ${terminal.status}`),
     );
   };

@@ -535,6 +535,9 @@ export function formatStreamError(err) {
   if (code === "no_model_offers") {
     return NO_MODEL_OFFER_STATUS;
   }
+  if (code === "selection_unavailable") {
+    return `Model run failed: ${String(err?.message || "model offer is not available").slice(0, 160)}`;
+  }
   return err?.message
     ? `Model run failed: ${String(err.message).slice(0, 160)}`
     : "Model run failed";
@@ -587,6 +590,12 @@ function showRunSettlement(turn, detail = turn?.error === "run_not_found"
     void startLiveTurnForPrompt("", { resumeTurn: turn });
   });
   el.append(" ", button);
+}
+
+function showRunFailure(turn, detail) {
+  setStreamStatus(detail || formatStreamError({
+    code: String(turn?.error || "run_failed"),
+  }), { tone: "error" });
 }
 
 function showOutputUnretained(turn) {
@@ -901,6 +910,8 @@ export function renderActiveSession() {
     void startLiveTurnForPrompt("", { resumeTurn: session.lastTurn });
   } else if (session.lastTurn?.state === TurnState.SETTLEMENT_UNKNOWN) {
     showRunSettlement(session.lastTurn);
+  } else if (session.lastTurn?.state === TurnState.FAILED) {
+    showRunFailure(session.lastTurn);
   } else if (session.lastTurn?.outputRetained === false) {
     showOutputUnretained(session.lastTurn);
   }
@@ -2337,6 +2348,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         if (generation !== ctx.streamGeneration) return;
         if (next.state === TurnState.CANCEL_PENDING) setStreamStatus("Cancel requested. Waiting for Runtime.");
         if (next.state === TurnState.SETTLEMENT_UNKNOWN) showRunSettlement(next);
+        if (next.state === TurnState.FAILED) showRunFailure(next);
       },
       onAccepted: ({ run_id } = {}) => {
           persistTurn(turnStoreGet(turnId));

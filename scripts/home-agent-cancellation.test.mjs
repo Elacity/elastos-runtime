@@ -714,6 +714,57 @@ test("live chat keeps partial deltas and restores completed-but-unavailable outp
   assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
 });
 
+test("immediate failed create shows the provider result and restores it after save", async t => {
+  t.after(() => { live.detachLiveChatStream(); live.selectLiveOffer(""); });
+  const { ctx, status } = streamControllerFixture();
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const op = new URL(url).pathname.split("/").pop();
+    calls.push(op);
+    if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+      { id: "fixture", title: "Fixture", operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+    ] }) };
+    if (op === "runs_create") return { ok: true, json: async () => ({
+      run_id: "run-overflow", sequence_cursor: 2, status: "failed",
+      terminal: { status: "failed", error: { class: "selection_unavailable", code: "selection_unavailable", message: "model offer is not available" } },
+    }) };
+    throw new Error(`unexpected operation ${op}`);
+  };
+  await live.probeLiveInference({ force: true });
+  controller.startTurnForPrompt("Reply with the word overflow");
+  const started = Date.now();
+  while (Date.now() - started < 2000) {
+    if (ctx.sessions[0].lastTurn?.state === "failed" && status.textContent) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const visible = controller.formatStreamError({
+    code: "selection_unavailable",
+    message: "model offer is not available",
+  });
+  assert.equal(ctx.sessions[0].lastTurn.state, "failed");
+  assert.equal(ctx.sessions[0].lastTurn.error, "selection_unavailable");
+  assert.equal(ctx.sessions[0].lastTurn.providerRunId, "run-overflow");
+  assert.ok(ctx.sessions[0].lastTurn.completedAt > 0);
+  assert.equal(status.textContent, visible);
+  assert.match(status.textContent, /model offer is not available/);
+  assert.doesNotMatch(status.textContent, /busy/i);
+  assert.equal(live.unresolvedModelTurn(ctx.sessions[0].lastTurn), false);
+  assert.equal(controller.canSubmitNewTurn(), true);
+  assert.deepEqual(calls.filter((op) => op.startsWith("runs_")), ["runs_create"]);
+  const saved = JSON.parse(JSON.stringify(workspace.serializeSessionForPersist(ctx.sessions[0])));
+  assert.equal(saved.lastTurn.state, "failed");
+  assert.equal(saved.lastTurn.error, "selection_unavailable");
+  ctx.sessions[0] = recoverStalePersistedTurn(saved);
+  status.textContent = "";
+  controller.renderActiveSession();
+  assert.equal(ctx.sessions[0].lastTurn.state, "failed");
+  assert.equal(status.textContent, visible);
+  assert.match(status.textContent, /model offer is not available/);
+  assert.doesNotMatch(status.textContent, /busy/i);
+  assert.equal(controller.canSubmitNewTurn(), true);
+  assert.deepEqual(calls.filter((op) => op.startsWith("runs_")), ["runs_create"]);
+});
+
 function renderedAgentText(stream) {
   const row = (stream.children || []).find((child) => child.dataset?.role === "agent");
   if (!row) return "";
