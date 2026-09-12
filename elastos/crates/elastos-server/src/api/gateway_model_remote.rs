@@ -78,6 +78,21 @@ struct RemoteRunIndex {
     schema: String,
     #[serde(default)]
     runs: BTreeMap<String, RemoteRunRoute>,
+    /// Slots held between a create's reservation and its route (key to
+    /// reservation time); they count toward capacity.
+    #[serde(default)]
+    pending: BTreeMap<String, u64>,
+}
+
+const REMOTE_RUN_PENDING_TTL_SECS: u64 = 600;
+
+fn route_reservation_key(principal_id: &str, grant_id: &str, request_id: &str) -> String {
+    format!("{principal_id}:{grant_id}:{request_id}")
+}
+
+enum RouteSlot {
+    Existing,
+    Reserved,
 }
 
 fn index_path(data_dir: &Path) -> PathBuf {
@@ -103,6 +118,7 @@ fn read_index(data_dir: &Path) -> anyhow::Result<RemoteRunIndex> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RemoteRunIndex {
             schema: REMOTE_RUN_INDEX_SCHEMA.to_string(),
             runs: BTreeMap::new(),
+            pending: BTreeMap::new(),
         }),
         Err(err) => Err(err).context("remote run index read"),
     }
@@ -123,9 +139,12 @@ fn update_index<T>(
         let anchor = route.terminal_at.unwrap_or(route.created_at);
         now.saturating_sub(anchor) <= REMOTE_RUN_RETENTION_SECS
     });
+    index
+        .pending
+        .retain(|_, reserved_at| now.saturating_sub(*reserved_at) <= REMOTE_RUN_PENDING_TTL_SECS);
     let result = update(&mut index)?;
     anyhow::ensure!(
-        index.runs.len() <= REMOTE_RUN_INDEX_MAX,
+        index.runs.len() + index.pending.len() <= REMOTE_RUN_INDEX_MAX,
         "remote run index is full"
     );
     let path = index_path(data_dir);
@@ -317,16 +336,60 @@ fn run_id_of(result: &Value) -> Option<String> {
 
 use super::gateway_model_service::run_result_is_terminal as run_is_terminal;
 
-/// Prune settled routes past retention and confirm one more run fits.
-fn reserve_run_route(data_dir: &Path, now: u64) -> Result<(), RemoteRouteError> {
+/// Hold one route slot for a create, or recognise a request that already has
+/// its route (a retry after a lost reply). Check and hold share one lock and
+/// one index write, so two creates cannot both take the last slot.
+fn reserve_route_slot(
+    data_dir: &Path,
+    now: u64,
+    key: &str,
+    principal_id: &str,
+    grant_id: &str,
+    request_id: &str,
+) -> Result<RouteSlot, RemoteRouteError> {
     update_index(data_dir, now, |index| {
+        let existing = index.runs.values().any(|route| {
+            route.principal_id == principal_id
+                && route.grant_id == grant_id
+                && route.request_id == request_id
+        });
+        if existing {
+            return Ok(RouteSlot::Existing);
+        }
+        if index.pending.contains_key(key) {
+            anyhow::bail!("remote run reservation is already held");
+        }
         anyhow::ensure!(
-            index.runs.len() < REMOTE_RUN_INDEX_MAX,
+            index.runs.len() + index.pending.len() < REMOTE_RUN_INDEX_MAX,
             "remote run index is full"
         );
-        Ok(())
+        index.pending.insert(key.to_string(), now);
+        Ok(RouteSlot::Reserved)
     })
     .map_err(|err| RemoteRouteError::Invalid(err.to_string()))
+}
+
+fn commit_route_slot(
+    data_dir: &Path,
+    now: u64,
+    key: &str,
+    run_id: &str,
+    route: RemoteRunRoute,
+) -> anyhow::Result<()> {
+    update_index(data_dir, now, |index| {
+        index.pending.remove(key);
+        index.runs.entry(run_id.to_string()).or_insert(route);
+        Ok(())
+    })
+}
+
+fn release_route_slot(data_dir: &Path, now: u64, key: &str) {
+    if let Err(err) = update_index(data_dir, now, |index| {
+        index.pending.remove(key);
+        Ok(())
+    }) {
+        tracing::warn!("remote run reservation {key} could not be released: {err}");
+    }
 }
 
 fn rewrite_offer_ids(value: &mut Value, grant_id: &str) {
@@ -454,10 +517,34 @@ pub(crate) async fn route_run_operation(
                 })?;
             let mut request = typed_request(normalized, context, capsule_id, grant_id);
             request["offer_id"] = Value::String(inner_offer_id.to_string());
-            // Route capacity is reserved before the granting Runtime starts
-            // work, so a full index refuses here instead of orphaning a run.
-            reserve_run_route(data_dir, now)?;
-            let mut result = call_grant(&registry, grant, op, request).await?;
+            // A route slot is held before the granting Runtime starts work; a
+            // retry of a routed request needs no slot. A full index refuses here.
+            let request_id = normalized
+                .pointer("/runtime_binding/request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let key = route_reservation_key(&context.principal_id, grant_id, &request_id);
+            let held_slot = matches!(
+                reserve_route_slot(
+                    data_dir,
+                    now,
+                    &key,
+                    &context.principal_id,
+                    grant_id,
+                    &request_id
+                )?,
+                RouteSlot::Reserved
+            );
+            let mut result = match call_grant(&registry, grant, op, request).await {
+                Ok(result) => result,
+                Err(err) => {
+                    if held_slot {
+                        release_route_slot(data_dir, now, &key);
+                    }
+                    return Err(err);
+                }
+            };
             if let Some(run_id) = run_id_of(&result) {
                 let route = RemoteRunRoute {
                     principal_id: context.principal_id.clone(),
@@ -466,18 +553,14 @@ pub(crate) async fn route_run_operation(
                     connect_ticket: grant.connect_ticket.clone(),
                     display_name: grant.display_name.clone(),
                     offer_id: offer_id.to_string(),
-                    request_id: normalized
-                        .pointer("/runtime_binding/request_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    request_id: request_id.clone(),
                     created_at: now,
                     terminal_at: run_is_terminal(&result).then_some(now),
                 };
-                if let Err(err) = update_index(data_dir, now, |index| {
-                    index.runs.entry(run_id.clone()).or_insert(route);
-                    Ok(())
-                }) {
+                if let Err(err) = commit_route_slot(data_dir, now, &key, &run_id, route) {
+                    if held_slot {
+                        release_route_slot(data_dir, now, &key);
+                    }
                     // The granting Runtime runs work this Home cannot address;
                     // ask it to settle that run before reporting the failure.
                     let cancel = typed_request(
@@ -496,6 +579,8 @@ pub(crate) async fn route_run_operation(
                     }
                     return Err(RemoteRouteError::Invalid(err.to_string()));
                 }
+            } else if held_slot {
+                release_route_slot(data_dir, now, &key);
             }
             rewrite_offer_ids(&mut result, grant_id);
             Ok(Some(result))

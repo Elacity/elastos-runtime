@@ -622,29 +622,50 @@ async fn run_lifecycle_stays_with_the_creating_principal_through_denial_and_revo
     fx.shutdown().await;
 }
 
+impl TwoRuntimes {
+    /// Fill the owner's run index with `count` open records, optionally
+    /// including the record a specific earlier request would have left.
+    fn fill_run_index(&self, count: usize, recorded_request: Option<&str>) {
+        let mut runs = serde_json::Map::new();
+        let record = |request_id: String| {
+            json!({
+                "grant_id": self.grant_id, "source_endpoint_did": self.seed_did,
+                "requester_principal_id": SEED_PRINCIPAL,
+                "remote_principal_id": self.remote_principal(), "capsule_id": "assistant",
+                "offer_id": "qwen-local", "request_id": request_id, "created_at": now_ts(),
+            })
+        };
+        for n in 0..count {
+            runs.insert(format!("run:sha256:{n:064x}"), record(format!("open-{n}")));
+        }
+        if let Some(request_id) = recorded_request {
+            runs.insert(
+                run_id_for(&self.remote_principal(), request_id),
+                record(request_id.to_string()),
+            );
+        }
+        std::fs::write(
+            self.owner.path().join("services-model-runs.json"),
+            serde_json::to_vec(
+                &json!({ "schema": "elastos.services.model-runs/v1", "runs": runs }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn run_index_len(&self) -> usize {
+        let path = self.owner.path().join("services-model-runs.json");
+        let index: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        index["runs"].as_object().unwrap().len()
+            + index["pending"].as_object().map_or(0, |p| p.len())
+    }
+}
+
 #[tokio::test]
 async fn a_full_run_index_refuses_before_any_model_work_starts() {
     let fx = TwoRuntimes::start().await;
-    // 512 open records: the destination's recording capacity is exhausted.
-    let mut runs = serde_json::Map::new();
-    for n in 0..512 {
-        runs.insert(
-            format!("run:sha256:{n:064x}"),
-            json!({
-                "grant_id": fx.grant_id, "source_endpoint_did": fx.seed_did,
-                "requester_principal_id": SEED_PRINCIPAL,
-                "remote_principal_id": fx.remote_principal(), "capsule_id": "assistant",
-                "offer_id": "qwen-local", "request_id": format!("open-{n}"), "created_at": now_ts(),
-            }),
-        );
-    }
-    std::fs::write(
-        fx.owner.path().join("services-model-runs.json"),
-        serde_json::to_vec(&json!({ "schema": "elastos.services.model-runs/v1", "runs": runs }))
-            .unwrap(),
-    )
-    .unwrap();
-
+    fx.fill_run_index(512, None);
     let refused = fx.create_run("seed-req-full", "qwen-local").await;
     assert_eq!(refused["ok"], false, "{refused}");
     assert_eq!(refused["code"], "rate_limited");
@@ -653,6 +674,54 @@ async fn a_full_run_index_refuses_before_any_model_work_starts() {
     assert!(fx
         .run_record(&run_id_for(&fx.remote_principal(), "seed-req-full"))
         .is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_creates_at_the_last_slot_dispatch_exactly_one_run() {
+    let fx = TwoRuntimes::start().await;
+    fx.fill_run_index(511, None);
+    let (a, b) = tokio::join!(
+        fx.create_run("seed-req-race-a", "qwen-local"),
+        fx.create_run("seed-req-race-b", "qwen-local"),
+    );
+    let outcomes = [a["ok"] == true, b["ok"] == true];
+    assert_eq!(
+        outcomes.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one create wins the slot: {a} {b}"
+    );
+    let refused = if a["ok"] == true { &b } else { &a };
+    assert_eq!(refused["code"], "rate_limited", "{refused}");
+    let dispatched = fx
+        .provider_ops()
+        .await
+        .iter()
+        .filter(|op| *op == "runs_create")
+        .count();
+    assert_eq!(dispatched, 1, "the refused create dispatched nothing");
+    assert_eq!(fx.run_index_len(), 512, "no slot stays held after commit");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_recorded_request_retries_through_a_full_index_without_a_new_slot() {
+    let fx = TwoRuntimes::start().await;
+    // The reply to "seed-req-lost" was lost after its run was recorded, and
+    // the index has since filled up.
+    fx.fill_run_index(511, Some("seed-req-lost"));
+    assert_eq!(fx.run_index_len(), 512);
+    let retried = fx.create_run("seed-req-lost", "qwen-local").await;
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_eq!(
+        retried["result"]["data"]["run_id"],
+        run_id_for(&fx.remote_principal(), "seed-req-lost")
+    );
+    assert_eq!(fx.last_provider_call().await["op"], "runs_create");
+    assert_eq!(fx.run_index_len(), 512, "the retry consumed no capacity");
+    // An unrelated new request is still refused.
+    let refused = fx.create_run("seed-req-new", "qwen-local").await;
+    assert_eq!(refused["code"], "rate_limited", "{refused}");
     fx.shutdown().await;
 }
 
@@ -737,6 +806,23 @@ mod consumer_path {
         assert_eq!(route.grant_id, fx.grant_id);
         assert_eq!(route.connect_ticket, grant.connect_ticket);
         assert!(route.terminal_at.is_none());
+
+        // A retry of the same request (its reply was lost) reuses the route
+        // and the owner's record; both sides answer with the same run.
+        let retried = fx
+            .route(std::slice::from_ref(&grant), "runs_create", create.clone())
+            .await
+            .unwrap()
+            .expect("remote route");
+        assert_eq!(retried["data"]["run_id"], run_id);
+        let seed_index: Value = serde_json::from_slice(
+            &std::fs::read(fx.seed.path().join("services-model-remote-runs.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(seed_index["runs"].as_object().unwrap().len(), 1);
+        assert!(seed_index["pending"]
+            .as_object()
+            .is_none_or(|p| p.is_empty()));
 
         // The owner denies the request: no active grant remains on the seed.
         fx.write_request_record("denied");

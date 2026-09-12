@@ -110,6 +110,28 @@ struct RemoteModelRunIndex {
     schema: String,
     #[serde(default)]
     runs: BTreeMap<String, RemoteModelRunRecord>,
+    /// Slots held for runs between their reservation and their record:
+    /// reservation key to reservation time. They count toward capacity.
+    #[serde(default)]
+    pending: BTreeMap<String, u64>,
+}
+
+/// A slot held longer than this belongs to a create that never committed or
+/// released (a crash between dispatch and record); it returns to capacity.
+const MODEL_RUN_PENDING_TTL_SECS: u64 = 600;
+
+/// One create attempt is identified by who asked for what: the grant, the
+/// destination-owned principal and the request id. A retry of the same
+/// request reuses its record and never consumes a second slot.
+fn run_reservation_key(grant_id: &str, remote_principal_id: &str, request_id: &str) -> String {
+    format!("{grant_id}:{remote_principal_id}:{request_id}")
+}
+
+enum RunSlot {
+    /// This request already has a run record; the provider's create is idempotent.
+    Existing,
+    /// A slot is held under the reservation key until commit or release.
+    Reserved,
 }
 
 fn run_index_path(data_dir: &Path) -> PathBuf {
@@ -129,6 +151,7 @@ fn read_run_index(data_dir: &Path) -> anyhow::Result<RemoteModelRunIndex> {
             return Ok(RemoteModelRunIndex {
                 schema: MODEL_RUN_INDEX_SCHEMA.to_string(),
                 runs: BTreeMap::new(),
+                pending: BTreeMap::new(),
             });
         }
         Err(err) => return Err(err).context("model run index read"),
@@ -173,24 +196,73 @@ fn update_run_index<T>(
         let anchor = record.terminal_at.unwrap_or(record.created_at);
         now.saturating_sub(anchor) <= MODEL_RUN_RETENTION_SECS
     });
+    index
+        .pending
+        .retain(|_, reserved_at| now.saturating_sub(*reserved_at) <= MODEL_RUN_PENDING_TTL_SECS);
     let result = update(&mut index)?;
     anyhow::ensure!(
-        index.runs.len() <= MODEL_RUN_INDEX_MAX,
+        index.runs.len() + index.pending.len() <= MODEL_RUN_INDEX_MAX,
         "model run index is full"
     );
     write_run_index(data_dir, &index)?;
     Ok(result)
 }
 
-/// Prune settled records past retention and confirm one more run fits.
-fn reserve_run_record(data_dir: &Path, now: u64) -> anyhow::Result<()> {
+/// Hold one slot for a create, or recognise that the request already has a
+/// record. The check and the hold happen under the same lock and land in the
+/// same index write, so two creates cannot both take the last slot.
+fn reserve_run_slot(
+    data_dir: &Path,
+    now: u64,
+    key: &str,
+    grant_id: &str,
+    remote_principal_id: &str,
+    request_id: &str,
+) -> anyhow::Result<RunSlot> {
     update_run_index(data_dir, now, |index| {
+        let existing = index.runs.values().any(|record| {
+            record.grant_id == grant_id
+                && record.remote_principal_id == remote_principal_id
+                && record.request_id == request_id
+        });
+        if existing {
+            return Ok(RunSlot::Existing);
+        }
+        if index.pending.contains_key(key) {
+            anyhow::bail!("model run reservation is already held");
+        }
         anyhow::ensure!(
-            index.runs.len() < MODEL_RUN_INDEX_MAX,
+            index.runs.len() + index.pending.len() < MODEL_RUN_INDEX_MAX,
             "model run index is full"
         );
+        index.pending.insert(key.to_string(), now);
+        Ok(RunSlot::Reserved)
+    })
+}
+
+/// Turn a held slot into the run's record (or keep an existing record).
+fn commit_run_slot(
+    data_dir: &Path,
+    now: u64,
+    key: &str,
+    run_id: &str,
+    record: RemoteModelRunRecord,
+) -> anyhow::Result<()> {
+    update_run_index(data_dir, now, |index| {
+        index.pending.remove(key);
+        index.runs.entry(run_id.to_string()).or_insert(record);
         Ok(())
     })
+}
+
+/// Return a held slot to capacity after a create that dispatched nothing.
+fn release_run_slot(data_dir: &Path, now: u64, key: &str) {
+    if let Err(err) = update_run_index(data_dir, now, |index| {
+        index.pending.remove(key);
+        Ok(())
+    }) {
+        tracing::warn!("model run reservation {key} could not be released: {err}");
+    }
 }
 
 /// Best-effort cancel of a run this Runtime dispatched but could not record.
@@ -534,26 +606,54 @@ pub(crate) async fn invoke(
                 "model offer is not shared through this grant",
             );
         }
-        // Recording capacity is reserved before any model work starts, so a
-        // full index refuses the request instead of orphaning a dispatched run.
-        if let Err(err) = reserve_run_record(data_dir, now) {
-            tracing::info!("remote model run refused before dispatch: {err}");
-            return denied(
-                "rate_limited",
-                "model run capacity on this Runtime is exhausted",
-            );
-        }
     }
+
+    // A create holds its record slot before any model work starts; a retry of
+    // an already recorded request needs no slot. A full index refuses here.
+    let request_id = normalized
+        .pointer("/runtime_binding/request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reservation_key = run_reservation_key(grant_id, &context.principal_id, &request_id);
+    let held_slot = if operation == "runs_create" {
+        match reserve_run_slot(
+            data_dir,
+            now,
+            &reservation_key,
+            grant_id,
+            &context.principal_id,
+            &request_id,
+        ) {
+            Ok(RunSlot::Reserved) => true,
+            Ok(RunSlot::Existing) => false,
+            Err(err) => {
+                tracing::info!("remote model run refused before dispatch: {err}");
+                return denied(
+                    "rate_limited",
+                    "model run capacity on this Runtime is exhausted",
+                );
+            }
+        }
+    } else {
+        false
+    };
 
     let result = match registry.send_raw("model", &normalized).await {
         Ok(result) => result,
         Err(err) => {
+            if held_slot {
+                release_run_slot(data_dir, now, &reservation_key);
+            }
             let class = redact_provider_error(&err.to_string());
             tracing::info!("remote model provider error ({class}): {err}");
             return denied(class, "model provider rejected the operation");
         }
     };
     if let Some(message) = provider_status_error(&result) {
+        if held_slot {
+            release_run_slot(data_dir, now, &reservation_key);
+        }
         let class = redact_provider_error(&message);
         tracing::info!("remote model provider status error ({class}): {message}");
         return denied(class, "model provider rejected the operation");
@@ -580,27 +680,26 @@ pub(crate) async fn invoke(
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
-                    request_id: normalized
-                        .pointer("/runtime_binding/request_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    request_id: request_id.clone(),
                     created_at: now,
                     terminal_at: run_result_is_terminal(&result).then_some(now),
                 };
-                if let Err(err) = update_run_index(data_dir, now, |index| {
-                    index.runs.entry(run_id.clone()).or_insert(record);
-                    Ok(())
-                }) {
+                if let Err(err) = commit_run_slot(data_dir, now, &reservation_key, &run_id, record)
+                {
                     // The run exists on this Runtime but has no owner record;
                     // settle it now rather than leave it running unaccounted.
                     tracing::warn!("remote model run index write failed: {err}");
                     cancel_unrecorded_run(&registry, &context, capsule_id, &run_id).await;
+                    if held_slot {
+                        release_run_slot(data_dir, now, &reservation_key);
+                    }
                     return denied(
                         "provider_failure",
                         "model run could not be recorded on this Runtime",
                     );
                 }
+            } else if held_slot {
+                release_run_slot(data_dir, now, &reservation_key);
             }
             result
         }
