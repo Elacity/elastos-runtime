@@ -37,24 +37,36 @@ fn run_id_for(principal_id: &str, request_id: &str) -> String {
     )
 }
 
+// Replies follow the provider contract (`capsules/model-provider/src/contract.rs`):
+// a `RunView` carries `status` and, once settled, a `terminal` outcome; a
+// `RunEventsPage` carries no status at all, only events with a `terminal` flag.
 fn run_view(run_id: &str, status: &str) -> Value {
-    json!({ "status": "ok", "data": {
+    let mut view = json!({
         "schema": "elastos.model.run-view/v1", "run_id": run_id, "offer_id": "qwen-local",
-        "operation": "text.generate", "status": status, "sequence_cursor": 0 } })
+        "operation": "text.generate", "status": status, "sequence_cursor": 0 });
+    if matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "settlement_unknown"
+    ) {
+        view["terminal"] = json!({ "status": status });
+    }
+    json!({ "status": "ok", "data": view })
 }
 
 fn events_page(run_id: &str, page: u32) -> Value {
-    let event = |sequence: u64, text: &str, terminal: bool| {
-        json!({ "schema": "elastos.model.run-event/v1", "sequence": sequence, "kind": "output",
+    let event = |sequence: u64, kind: &str, text: &str, terminal: bool| {
+        json!({ "schema": "elastos.model.run-event/v1", "sequence": sequence, "kind": kind,
             "data": { "schema": "elastos.model.output.text/v1", "text": text }, "terminal": terminal })
     };
     let events = match page {
-        1 => vec![event(1, "hel", false), event(2, "lo", false)],
-        _ => vec![event(3, "", true)],
+        1 => vec![
+            event(1, "delta", "hel", false),
+            event(2, "delta", "lo", false),
+        ],
+        _ => vec![event(3, "output", "hello", true)],
     };
     json!({ "status": "ok", "data": {
         "schema": "elastos.model.run-events/v1", "run_id": run_id,
-        "status": if page == 1 { "running" } else { "completed" },
         "next_cursor": events.len(), "has_more": page == 1, "events": events } })
 }
 
@@ -556,13 +568,14 @@ async fn run_lifecycle_stays_with_the_creating_principal_through_denial_and_revo
         first["result"]["data"]["events"].as_array().unwrap().len(),
         2
     );
-    assert_eq!(first["result"]["data"]["status"], "running");
+    // An events page has no status; only its terminal event settles the record.
+    assert!(first["result"]["data"].get("status").is_none(), "{first}");
     assert!(fx.run_record(&run_id)["terminal_at"].is_null());
     let second = fx
         .run_operation("runs_events", &run_id, SEED_PRINCIPAL)
         .await;
     assert_eq!(second["ok"], true, "{second}");
-    assert_eq!(second["result"]["data"]["status"], "completed");
+    assert_eq!(second["result"]["data"]["events"][0]["terminal"], true);
     let record = fx.run_record(&run_id);
     assert!(record["terminal_at"].is_u64(), "{record}");
     let binding = fx.last_provider_call().await["runtime_binding"].clone();
@@ -594,5 +607,39 @@ async fn run_lifecycle_stays_with_the_creating_principal_through_denial_and_revo
     );
     assert_eq!(cancel["runtime_binding"]["grant_id"], fx.grant_id);
     assert_eq!(cancel["runtime_binding"]["request_id"], "revoke:seed-req-2");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_full_run_index_refuses_before_any_model_work_starts() {
+    let fx = TwoRuntimes::start().await;
+    // 512 open records: the destination's recording capacity is exhausted.
+    let mut runs = serde_json::Map::new();
+    for n in 0..512 {
+        runs.insert(
+            format!("run:sha256:{n:064x}"),
+            json!({
+                "grant_id": fx.grant_id, "source_endpoint_did": fx.seed_did,
+                "requester_principal_id": SEED_PRINCIPAL,
+                "remote_principal_id": fx.remote_principal(), "capsule_id": "assistant",
+                "offer_id": "qwen-local", "request_id": format!("open-{n}"), "created_at": now_ts(),
+            }),
+        );
+    }
+    std::fs::write(
+        fx.owner.path().join("services-model-runs.json"),
+        serde_json::to_vec(&json!({ "schema": "elastos.services.model-runs/v1", "runs": runs }))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let refused = fx.create_run("seed-req-full", "qwen-local").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "rate_limited");
+    // Only the offer check reached the provider; no run was dispatched.
+    assert_eq!(fx.provider_ops().await, vec!["offers_list"]);
+    assert!(fx
+        .run_record(&run_id_for(&fx.remote_principal(), "seed-req-full"))
+        .is_null());
     fx.shutdown().await;
 }

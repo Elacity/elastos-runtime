@@ -179,6 +179,43 @@ fn update_run_index<T>(
     Ok(result)
 }
 
+/// Prune settled records past retention and confirm one more run fits.
+fn reserve_run_record(data_dir: &Path, now: u64) -> anyhow::Result<()> {
+    update_run_index(data_dir, now, |index| {
+        anyhow::ensure!(
+            index.runs.len() < MODEL_RUN_INDEX_MAX,
+            "model run index is full"
+        );
+        Ok(())
+    })
+}
+
+/// Best-effort cancel of a run this Runtime dispatched but could not record.
+async fn cancel_unrecorded_run(
+    registry: &ProviderRegistry,
+    context: &HomeLaunchTokenContext,
+    capsule_id: &str,
+    run_id: &str,
+) {
+    let request = json!({ "run_id": run_id, "request_id": format!("unrecorded:{run_id}") });
+    let Ok(normalized) =
+        normalize_model_provider_request("runs_cancel", &request, context, capsule_id)
+    else {
+        tracing::warn!("unrecorded model run {run_id} could not form a cancel request");
+        return;
+    };
+    match registry.send_raw("model", &normalized).await {
+        Ok(result) if provider_status_error(&result).is_none() => {
+            tracing::info!("unrecorded model run {run_id}: cancel requested")
+        }
+        Ok(result) => tracing::warn!(
+            "unrecorded model run {run_id}: cancel returned {}",
+            provider_status_error(&result).unwrap_or_default()
+        ),
+        Err(err) => tracing::warn!("unrecorded model run {run_id}: cancel failed: {err}"),
+    }
+}
+
 pub(crate) fn remote_model_run(
     data_dir: &Path,
     run_id: &str,
@@ -308,18 +345,23 @@ async fn read_authority(
     .context("model authority deadline")??
 }
 
-fn run_terminal(result: &Value) -> bool {
-    let status = result
-        .pointer("/data/run/status")
-        .or_else(|| result.pointer("/data/status"))
-        .or_else(|| result.pointer("/run/status"))
-        .or_else(|| result.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    matches!(
-        status,
-        "completed" | "failed" | "cancelled" | "settlement_unknown"
-    )
+/// Whether a typed model reply shows the run has settled. `runs_create`,
+/// `runs_get` and `runs_cancel` answer with a run view whose `status` is one of
+/// the terminal statuses (a `terminal` outcome accompanies it). `runs_events`
+/// answers with an events page and no status; its terminal event carries
+/// `terminal: true`. Both indexes settle their records from this one reading.
+pub(super) fn run_result_is_terminal(result: &Value) -> bool {
+    let data = &result["data"];
+    let view_terminal = data["status"].as_str().is_some_and(|status| {
+        matches!(
+            status,
+            "completed" | "failed" | "cancelled" | "settlement_unknown"
+        )
+    }) || data["terminal"].is_object();
+    let event_terminal = data["events"]
+        .as_array()
+        .is_some_and(|events| events.iter().any(|event| event["terminal"] == true));
+    view_terminal || event_terminal
 }
 
 /// Serve one model operation for a remote consumer. Every path returns a
@@ -489,6 +531,15 @@ pub(crate) async fn invoke(
                 "model offer is not shared through this grant",
             );
         }
+        // Recording capacity is reserved before any model work starts, so a
+        // full index refuses the request instead of orphaning a dispatched run.
+        if let Err(err) = reserve_run_record(data_dir, now) {
+            tracing::info!("remote model run refused before dispatch: {err}");
+            return denied(
+                "rate_limited",
+                "model run capacity on this Runtime is exhausted",
+            );
+        }
     }
 
     let result = match registry.send_raw("model", &normalized).await {
@@ -532,13 +583,16 @@ pub(crate) async fn invoke(
                         .unwrap_or_default()
                         .to_string(),
                     created_at: now,
-                    terminal_at: run_terminal(&result).then_some(now),
+                    terminal_at: run_result_is_terminal(&result).then_some(now),
                 };
                 if let Err(err) = update_run_index(data_dir, now, |index| {
                     index.runs.entry(run_id.clone()).or_insert(record);
                     Ok(())
                 }) {
+                    // The run exists on this Runtime but has no owner record;
+                    // settle it now rather than leave it running unaccounted.
                     tracing::warn!("remote model run index write failed: {err}");
+                    cancel_unrecorded_run(&registry, &context, capsule_id, &run_id).await;
                     return denied(
                         "provider_failure",
                         "model run could not be recorded on this Runtime",
@@ -549,7 +603,7 @@ pub(crate) async fn invoke(
         }
         _ => {
             if let Some((run_id, record)) = indexed_run {
-                if record.terminal_at.is_none() && run_terminal(&result) {
+                if record.terminal_at.is_none() && run_result_is_terminal(&result) {
                     let _ = update_run_index(data_dir, now, |index| {
                         if let Some(entry) = index.runs.get_mut(&run_id) {
                             entry.terminal_at = Some(now);

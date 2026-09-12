@@ -293,17 +293,18 @@ fn run_id_of(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn run_is_terminal(result: &Value) -> bool {
-    let status = result
-        .pointer("/data/run/status")
-        .or_else(|| result.pointer("/data/status"))
-        .or_else(|| result.pointer("/run/status"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    matches!(
-        status,
-        "completed" | "failed" | "cancelled" | "settlement_unknown"
-    )
+use super::gateway_model_service::run_result_is_terminal as run_is_terminal;
+
+/// Prune settled routes past retention and confirm one more run fits.
+fn reserve_run_route(data_dir: &Path, now: u64) -> Result<(), RemoteRouteError> {
+    update_index(data_dir, now, |index| {
+        anyhow::ensure!(
+            index.runs.len() < REMOTE_RUN_INDEX_MAX,
+            "remote run index is full"
+        );
+        Ok(())
+    })
+    .map_err(|err| RemoteRouteError::Invalid(err.to_string()))
 }
 
 fn rewrite_offer_ids(value: &mut Value, grant_id: &str) {
@@ -431,6 +432,9 @@ pub(crate) async fn route_run_operation(
                 })?;
             let mut request = typed_request(normalized, context, capsule_id, grant_id);
             request["offer_id"] = Value::String(inner_offer_id.to_string());
+            // Route capacity is reserved before the granting Runtime starts
+            // work, so a full index refuses here instead of orphaning a run.
+            reserve_run_route(data_dir, now)?;
             let mut result = call_grant(&registry, grant, op, request).await?;
             if let Some(run_id) = run_id_of(&result) {
                 let route = RemoteRunRoute {
@@ -446,11 +450,28 @@ pub(crate) async fn route_run_operation(
                     created_at: now,
                     terminal_at: run_is_terminal(&result).then_some(now),
                 };
-                update_index(data_dir, now, |index| {
-                    index.runs.entry(run_id).or_insert(route);
+                if let Err(err) = update_index(data_dir, now, |index| {
+                    index.runs.entry(run_id.clone()).or_insert(route);
                     Ok(())
-                })
-                .map_err(|err| RemoteRouteError::Invalid(err.to_string()))?;
+                }) {
+                    // The granting Runtime runs work this Home cannot address;
+                    // ask it to settle that run before reporting the failure.
+                    let cancel = typed_request(
+                        &json!({ "op": "runs_cancel", "run_id": run_id, "runtime_binding": {
+                            "request_id": format!("unrouted:{run_id}") } }),
+                        context,
+                        capsule_id,
+                        grant_id,
+                    );
+                    if let Err(cancel_err) =
+                        call_grant(&registry, grant, "runs_cancel", cancel).await
+                    {
+                        tracing::warn!(
+                            "unrouted remote model run {run_id}: cancel failed: {cancel_err}"
+                        );
+                    }
+                    return Err(RemoteRouteError::Invalid(err.to_string()));
+                }
             }
             rewrite_offer_ids(&mut result, grant_id);
             Ok(Some(result))
