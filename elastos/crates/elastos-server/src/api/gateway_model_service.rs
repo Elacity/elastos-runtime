@@ -165,10 +165,13 @@ fn update_run_index<T>(
         .lock()
         .map_err(|_| anyhow::anyhow!("model run index unavailable"))?;
     let mut index = read_run_index(data_dir)?;
+    // A settled record leaves after the retention window. An open record
+    // leaves after the same window from creation: no offer runs that long
+    // (the provider bounds runtime in seconds), so such a record is a run
+    // whose settlement this Runtime never observed.
     index.runs.retain(|_, record| {
-        record
-            .terminal_at
-            .is_none_or(|terminal_at| now.saturating_sub(terminal_at) <= MODEL_RUN_RETENTION_SECS)
+        let anchor = record.terminal_at.unwrap_or(record.created_at);
+        now.saturating_sub(anchor) <= MODEL_RUN_RETENTION_SECS
     });
     let result = update(&mut index)?;
     anyhow::ensure!(
@@ -816,6 +819,12 @@ mod tests {
         assert!(remote_model_run(dir.path(), "run:sha256:bbbb")
             .unwrap()
             .is_none());
+        // The open record (created at 100) leaves once the same window has
+        // passed since its creation; it cannot still be running.
+        update_run_index(dir.path(), 100 + MODEL_RUN_RETENTION_SECS + 1, |_| Ok(())).unwrap();
+        assert!(remote_model_runs_for_grant(dir.path(), "g")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

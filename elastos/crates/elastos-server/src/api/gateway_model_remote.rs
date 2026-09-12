@@ -117,10 +117,11 @@ fn update_index<T>(
         .lock()
         .map_err(|_| anyhow::anyhow!("remote run index unavailable"))?;
     let mut index = read_index(data_dir)?;
+    // Settled routes leave after the retention window; open routes leave
+    // after the same window from creation, since no run lasts that long.
     index.runs.retain(|_, route| {
-        route
-            .terminal_at
-            .is_none_or(|terminal_at| now.saturating_sub(terminal_at) <= REMOTE_RUN_RETENTION_SECS)
+        let anchor = route.terminal_at.unwrap_or(route.created_at);
+        now.saturating_sub(anchor) <= REMOTE_RUN_RETENTION_SECS
     });
     let result = update(&mut index)?;
     anyhow::ensure!(
