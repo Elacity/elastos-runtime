@@ -2008,6 +2008,11 @@ pub(super) async fn gateway_provider_proxy(
     };
     if scheme == "model" {
         if op == "offers_list" && !remote_model_grants.is_empty() {
+            // A consumer Home may run no local model provider at all; granted
+            // remote offers still form its list.
+            if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+                response = super::gateway_model_remote::offers_list_without_local_provider();
+            }
             super::gateway_model_remote::append_remote_offers(
                 &registry,
                 &remote_model_grants,

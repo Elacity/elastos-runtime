@@ -320,6 +320,22 @@ fn rewrite_offer_ids(value: &mut Value, grant_id: &str) {
 
 /// Append the offers each approved grant currently shares. An unreachable
 /// grant contributes a status entry and no offers.
+/// The typed `offers_list` reply of a Home that runs no local model provider.
+/// Remote offers append to it, so a Linux Home without a model still lists
+/// every granted service. `local_provider` names why the local list is empty.
+pub(crate) fn offers_list_without_local_provider() -> Value {
+    json!({
+        "status": "ok",
+        "data": {
+            "schema": "elastos.model.offers-list/v1",
+            "provider": "model-provider",
+            "protocol_version": "elastos.model-provider/v1",
+            "offers": [],
+            "local_provider": "unavailable",
+        }
+    })
+}
+
 pub(crate) async fn append_remote_offers(
     registry: &ProviderRegistry,
     grants: &[ConsumerModelGrant],
@@ -466,6 +482,22 @@ pub(crate) async fn route_run_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_home_without_a_local_model_provider_still_lists_remote_offers() {
+        let mut response = offers_list_without_local_provider();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["schema"], "elastos.model.offers-list/v1");
+        assert_eq!(response["data"]["offers"], json!([]));
+        assert_eq!(response["data"]["local_provider"], "unavailable");
+        // The same target array `append_remote_offers` pushes into.
+        response
+            .pointer_mut("/data/offers")
+            .and_then(Value::as_array_mut)
+            .expect("offers array")
+            .push(json!({ "id": "remote:g:qwen" }));
+        assert_eq!(response["data"]["offers"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn remote_offer_ids_round_trip_and_reject_malformed_values() {
