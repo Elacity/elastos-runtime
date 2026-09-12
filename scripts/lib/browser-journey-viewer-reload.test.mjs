@@ -90,7 +90,11 @@ function fixture(options = {}) {
         if (reads <= (options.pendingPageReads || 0)) raw.viewer.page_id = "";
         if (!options.freezeNewVideo && !(sent && options.freezeAfterInput)) { frames++; bytes += 100; }
         if (options.bytesFreeze) bytes = 0;
-      } else { frames++; bytes += 100; }
+      } else {
+        if (options.baselineHangs) await new Promise(() => {});
+        if (options.baselineStateDelay) await timer.wait(options.baselineStateDelay, budget.signal);
+        frames++; bytes += 100;
+      }
       raw.video = raw.viewer ? { present: true, hidden: reloaded && options.hidden === true, paused: false,
         ready_state: 4, video_width: 800, video_height: 600, client_width: 800, client_height: 600,
         decoded_frames: frames, ...(options.noBytes ? {} : { video_bytes_received: bytes }), token: secret } : null;
@@ -287,6 +291,30 @@ test("reload callback, readiness, and input share one deadline from reload start
 test("readiness read hanging at the deadline aborts and removes the observer", async () => {
   const f = await fails({ stateDelay: 6000 }, "state_deadline");
   assert.ok(f.calls.find(call => call.method === "state" && call.reloaded).budget.signal.aborted);
+  assert.equal(f.evidence.failure_phase, "reload");
+  assert.equal(typeof f.evidence.reload_started_ms, "number");
+});
+test("slow baseline two serial samples can complete then reload stays on the five-second budget", async () => {
+  const f = fixture({ baselineStateDelay: 2534 });
+  const proof = await f.run();
+  assert.equal(proof.ok, true);
+  assert.ok(proof.reload_started_ms >= 5000);
+  assert.ok(proof.reload_ms <= 5000);
+  const reload = f.calls.find(call => call.method === "reload");
+  const input = f.calls.find(call => call.method === "input");
+  assert.equal(input.budget.deadlineMs, reload.at + 5000);
+  const baselineReads = f.calls.filter(call => call.method === "state" && !call.reloaded);
+  assert.ok(baselineReads.length >= 2);
+  assert.ok(baselineReads[0].budget.deadlineMs >= 10000);
+});
+test("hung baseline is bounded and does not start reload", async () => {
+  const f = await fails({ baselineHangs: true }, "state_deadline");
+  assert.equal(f.evidence.failure_phase, "baseline");
+  assert.equal(f.evidence.reload_started_ms, undefined);
+  assert.equal(f.calls.some(call => call.method === "reload"), false);
+  const state = f.calls.find(call => call.method === "state");
+  assert.ok(state.budget.signal.aborted);
+  assert.ok(state.budget.deadlineMs <= 10000);
 });
 for (const kind of ["opening", "closing"]) {
   test(`${kind} immediately interrupts a hanging reload and aborts its budget`, async () => {

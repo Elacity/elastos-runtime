@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { browserJourneyBinding, browserJourneyVideo } from "./browser-journey-recovery.mjs";
 
-const WINDOW_MS = 5000, POLL_MS = 250, SUFFIX = "-reload";
+const WINDOW_MS = 5000, BASELINE_MS = 10000, POLL_MS = 250, SUFFIX = "-reload";
 const hash = value => `sha256:${createHash("sha256").update(String(value)).digest("hex").slice(0, 16)}`;
 const text = value => typeof value === "string" && value.length > 0 && value.length <= 512;
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -151,7 +151,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
     return latest;
   }
   try {
-    const baselineDeadline = clock.now() + WINDOW_MS;
+    const baselineDeadline = clock.now() + BASELINE_MS;
     // Collect a successfully installed observer even if it reports a forbidden event during setup.
     stop = await within(baselineDeadline, "observer_deadline", budget => observeRequests(record, budget), true);
     requireEvidence(typeof stop === "function", "observer_missing");
@@ -223,6 +223,7 @@ export async function diagnoseBrowserViewerReload({ expectedUrl, readReceipt, re
   evidence.ok = !failure;
   if (failure) {
     evidence.failure = failure;
+    evidence.failure_phase = phase;
     const error = new Error(`Browser viewer reload diagnostic failed: ${failure}`);
     error.evidence = evidence;
     throw error;
