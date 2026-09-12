@@ -50,6 +50,7 @@ pub(crate) struct RemoteRunRoute {
     /// the grant expires or is denied; the granting Runtime still decides.
     #[serde(default)]
     pub connect_ticket: String,
+    #[serde(default)]
     pub display_name: String,
     pub offer_id: String,
     pub request_id: String,
@@ -653,6 +654,17 @@ mod tests {
             created_at: 10,
             terminal_at: None,
         };
+        // Routes written before tickets and names were stored still parse; an
+        // installed index must never block new runs.
+        let legacy: RemoteRunIndex = serde_json::from_value(json!({
+            "schema": REMOTE_RUN_INDEX_SCHEMA,
+            "runs": { "run:sha256:old": {
+                "principal_id": "p1", "grant_id": "g", "peer_did": "did:key:z6Mkpeer",
+                "offer_id": "remote:g:qwen", "request_id": "req", "created_at": 1 } }
+        }))
+        .expect("legacy index parses");
+        assert_eq!(legacy.runs["run:sha256:old"].connect_ticket, "");
+        assert_eq!(legacy.runs["run:sha256:old"].display_name, "");
         // A route written before tickets were stored cannot settle by itself.
         assert!(RemoteRunRoute {
             connect_ticket: String::new(),
