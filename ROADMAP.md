@@ -521,6 +521,24 @@ acceptance. Hosted-sharing policy and full Jetson target proof remain requested
 work with credential, terms, access and hardware prerequisites, even when source
 review publication occurs earlier.
 
+Attested hosted inference is a planned `model-provider` backend, not a new
+provider. Some hosted services run open models inside hardware enclaves
+(Intel TDX with confidential GPU) and return a signed attestation per response
+binding the model and code that served it; NEAR AI Cloud is one current
+OpenAI-compatible example. The first step is configuration only: one
+`open_ai_compatible_text` offer beside the local offer, proving the Home Agent
+treats local and attested-hosted placements as the same capability. The second
+step is an adapter variant that fetches and verifies the attestation inside the
+provider and records the verdict on the run, so "verified" is a Runtime fact
+and not a UI label. Hosted offer configuration must carry the privacy, cost,
+limit, and resolved-model facts required in
+[Model provider](docs/MODEL_PROVIDER.md) before publication. The external
+verifier is an audited dependency, not a trust root. When another owner's
+Runtime brokers the service, the prompt must be encrypted to the verified
+execution environment itself, so the brokering Runtime routes and meters the
+run without being able to read it; a broker that can read the prompt is a
+hosted route, and must be disclosed as one.
+
 Operator tools should derive decisions from source, signed artifacts, and
 machine-readable evidence. Durable docs should record contracts and current
 truth, not terminal transcripts or machine-specific paths.
