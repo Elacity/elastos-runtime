@@ -816,7 +816,9 @@
       const response = await fetch(path, request);
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(publicInboxText(text, "Inbox could not complete the request."));
+        const error = new Error(publicInboxText(text, "Inbox could not complete the request."));
+        error.status = response.status;
+        throw error;
       }
       return response.json();
     }
@@ -930,10 +932,15 @@
       renderInbox();
     }
 
+    function pendingRequestEntries() {
+      return state.entries.filter((entry) => entry && entry.kind !== "service_access_grant");
+    }
+
     function renderInbox() {
       const entries = filteredEntries();
       const attentionCount = state.entries.filter((entry) => entry && entry.severity === "attention").length;
-      elements.pendingCount.textContent = String(state.entries.length);
+      const pendingCount = pendingRequestEntries().length;
+      elements.pendingCount.textContent = String(pendingCount);
       elements.reviewCount.textContent = String(attentionCount);
       const requestedSelectionPresent = state.requestedSelectionId
         && entries.some((entry) => entryId(entry) === state.requestedSelectionId);
@@ -968,7 +975,7 @@
         state.filter === "review" && state.entries.length !== 0
           ? "No requests need review"
           : "No requests";
-      setStatus(state.entries.length === 0 ? "" : `${state.entries.length} pending.`);
+      setStatus(pendingCount === 0 ? "" : `${pendingCount} pending.`);
       notifyRailChrome();
     }
 
@@ -1052,6 +1059,8 @@
       } else if (typeof actionId === "string" && actionId.startsWith("service-approve-request:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "service-deny-request:" + actionId.slice("service-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("service-deny-request:")) {
+        actions.appendChild(createActionButton("Revoke access", actionId, "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
         const requestId = actionId.slice("wallet-approve-request:".length);
         actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
@@ -1074,7 +1083,7 @@
         actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
       }
 
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request" && entry.kind !== "service_access_request") {
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
     }
@@ -1151,6 +1160,14 @@
       try {
         await inboxAction(actionId);
         await loadInbox();
+      } catch (error) {
+        if (error && error.status === 503) {
+          try {
+            await loadInbox();
+          } catch (_) {
+          }
+        }
+        throw error;
       } finally {
         setButtonsDisabled(false);
       }

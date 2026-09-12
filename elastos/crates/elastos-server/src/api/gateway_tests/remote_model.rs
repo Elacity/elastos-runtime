@@ -1,5 +1,6 @@
 use super::home_system::{
-    configured_discovery_network_profile_for_test, write_home_principal_object_json_for_authority,
+    configured_discovery_network_profile_for_test, home_test_get_json, home_test_post_json,
+    write_home_principal_object_json_for_authority,
 };
 use super::*;
 use crate::api::gateway::gateway_model_service::{
@@ -1110,6 +1111,37 @@ mod denial_authority {
             .unwrap()
             .to_path_buf()
         }
+
+        fn owner_inbox_app(&self) -> axum::Router {
+            let mut state = test_state(self.owner.path());
+            state.provider_registry = Some(self.registry.clone());
+            gateway_router(state)
+        }
+
+        async fn post_inbox_action(
+            app: &axum::Router,
+            token: &str,
+            action_id: &str,
+        ) -> (StatusCode, String) {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method("POST")
+                        .uri("/api/apps/inbox/actions")
+                        .header("x-elastos-home-token", token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "action_id": action_id }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
     }
 
     #[tokio::test]
@@ -1168,6 +1200,119 @@ mod denial_authority {
         assert_eq!(cancel["runtime_binding"]["grant_id"], fx.grant_id);
         let refused = fx.create_run("seed-req-after", "qwen-local").await;
         assert_eq!(refused["code"], "denied", "{refused}");
+        fx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbox_revoke_cancels_the_open_run_after_the_owner_saves_denial() {
+        let fx = TwoRuntimes::start().await;
+        let open = fx.create_run("seed-req-open", "qwen-local").await;
+        assert_eq!(open["ok"], true, "{open}");
+        let open_run_id = run_id_for(&fx.remote_principal(), "seed-req-open");
+        let app = fx.owner_inbox_app();
+        let (status, _) = home_test_post_json(
+            &app,
+            "/api/apps/home/launch",
+            &fx.authority.home_token,
+            "http://localhost:61180",
+            json!({ "target": INBOX_CAPSULE_ID }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = app_token_for_authority(fx.owner.path(), INBOX_CAPSULE_ID, &fx.authority);
+        let (status, inbox) =
+            home_test_get_json(&app, "/api/apps/inbox/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK, "{inbox}");
+        assert_eq!(inbox["notifications"]["unread_count"], 0, "{inbox}");
+        assert_eq!(inbox["notifications"]["attention_count"], 0, "{inbox}");
+        let grant = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "service_access_grant")
+            .expect("owner Inbox should show the approved model grant");
+        assert_eq!(grant["read"], true);
+        assert_eq!(
+            grant["action_ref"]["action_id"],
+            format!("service-deny-request:{REQUEST_ID}")
+        );
+        let (status, body) = TwoRuntimes::post_inbox_action(
+            &app,
+            &token,
+            &format!("service-deny-request:{REQUEST_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.contains("service access request delivery failed"),
+            "{body}"
+        );
+        let cancel = fx.last_provider_call().await;
+        assert_eq!(cancel["op"], "runs_cancel");
+        assert_eq!(cancel["run_id"], open_run_id);
+        assert_eq!(cancel["runtime_binding"]["grant_id"], fx.grant_id);
+        let refused = fx.create_run("seed-req-after", "qwen-local").await;
+        assert_eq!(refused["code"], "denied", "{refused}");
+        let (status, inbox) =
+            home_test_get_json(&app, "/api/apps/inbox/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK, "{inbox}");
+        assert!(
+            !inbox["notifications"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["kind"] == "service_access_grant"),
+            "{inbox}"
+        );
+        fx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn another_principal_cannot_revoke_the_owners_grant_from_inbox() {
+        let fx = TwoRuntimes::start().await;
+        let open = fx.create_run("seed-req-open", "qwen-local").await;
+        assert_eq!(open["ok"], true, "{open}");
+        let ops_before = fx.provider_ops().await;
+        let app = fx.owner_inbox_app();
+        let other = passkey_authority_with_name_role(
+            fx.owner.path(),
+            Some("other"),
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
+        let (status, _) = home_test_post_json(
+            &app,
+            "/api/apps/home/launch",
+            &other.home_token,
+            "http://localhost:61180",
+            json!({ "target": INBOX_CAPSULE_ID }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = app_token_for_authority(fx.owner.path(), INBOX_CAPSULE_ID, &other);
+        let (status, inbox) =
+            home_test_get_json(&app, "/api/apps/inbox/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK, "{inbox}");
+        assert!(
+            !inbox["notifications"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["kind"] == "service_access_grant"),
+            "{inbox}"
+        );
+        let (status, body) = TwoRuntimes::post_inbox_action(
+            &app,
+            &token,
+            &format!("service-deny-request:{REQUEST_ID}"),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert_eq!(fx.provider_ops().await, ops_before, "no cancel may follow");
+        assert_eq!(
+            fx.create_run("seed-req-still-open", "qwen-local").await["ok"],
+            true,
+            "the grant stays approved"
+        );
         fx.shutdown().await;
     }
 }

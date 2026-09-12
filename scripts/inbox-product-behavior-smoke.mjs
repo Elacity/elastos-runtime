@@ -90,11 +90,25 @@ function descendants(node) {
 function jsonResponse(payload) {
   return {
     ok: true,
+    status: 200,
     async json() {
       return payload;
     },
     async text() {
       return JSON.stringify(payload);
+    },
+  };
+}
+
+function textResponse(status, text) {
+  return {
+    ok: false,
+    status,
+    async json() {
+      throw new Error("error body is not json");
+    },
+    async text() {
+      return text;
     },
   };
 }
@@ -417,6 +431,101 @@ async function runInboxHomeChromeSmoke() {
     await settle();
   }
   assert.deepEqual(serviceActions, ["service-approve-request:service-1", "service-deny-request:service-1"]);
+
+  const grantActions = [];
+  let grantRevoked = false;
+  const grantEntry = {
+    id: "entry-grant",
+    kind: "service_access_grant",
+    title: "Seed may use your AI model",
+    body: "Seed may use Mac model. Revoke access to stop new runs and cancel open runs.",
+    severity: "info",
+    read: true,
+    source_app: "services",
+    action_ref: { action_id: "service-deny-request:grant-1" },
+  };
+  context.fetch = async (path, options = {}) => {
+    fetchCalls.push(path);
+    if (path === "/api/apps/inbox/actions") {
+      grantActions.push(JSON.parse(options.body).action_id);
+      grantRevoked = true;
+      return textResponse(503, "service access request delivery failed");
+    }
+    return jsonResponse({
+      notifications: {
+        attention_count: 0,
+        unread_count: 0,
+        entries: grantRevoked ? [] : [grantEntry],
+      },
+    });
+  };
+  for (const callback of windowListeners.get("message") || []) {
+    callback({ origin: "null", source: parentFrame,
+      data: { type: "elastos:menu-command", cmd: "filter-all" } });
+  }
+  await settle();
+  const summariesBeforeRevoke = fetchCalls.filter((path) => path === "/api/apps/inbox/summary").length;
+  for (const callback of windowListeners.get("message") || []) {
+    callback({ origin: "null", source: parentFrame,
+      data: { type: "elastos:menu-command", cmd: "refresh" } });
+  }
+  await settle();
+  assert.equal(nodes.get("pending-count").textContent, "0");
+  assert.equal(nodes.get("review-count").textContent, "0");
+  const grantButtons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
+  assert.deepEqual(grantButtons.map(button => button.textContent), ["Open", "Revoke access"]);
+  assert.deepEqual(grantActions, [], "Viewing an approved grant must preserve its access");
+  const revoke = grantButtons.find(button => button.textContent === "Revoke access");
+  for (const callback of revoke.listeners.get("click") || []) callback();
+  await settle();
+  assert.deepEqual(grantActions, ["service-deny-request:grant-1"]);
+  assert.ok(
+    fetchCalls.filter((path) => path === "/api/apps/inbox/summary").length > summariesBeforeRevoke,
+    "503 after a saved revoke must refresh Inbox summary",
+  );
+  assert.deepEqual(
+    descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON").map(button => button.textContent),
+    [],
+  );
+  assert.equal(nodes.get("pending-count").textContent, "0");
+  assert.equal(
+    nodes.get("status-text").textContent,
+    "service access request delivery failed",
+  );
+
+  context.fetch = async () => jsonResponse({ notifications: {
+    attention_count: 1,
+    unread_count: 1,
+    entries: [
+      {
+        id: "entry-service",
+        kind: "service_access_request",
+        title: "Browser Exit access",
+        body: "A contact requests Browser Exit access.",
+        severity: "attention",
+        read: false,
+        source_app: "services",
+        action_ref: { action_id: "service-approve-request:service-1" },
+      },
+      {
+        id: "entry-grant",
+        kind: "service_access_grant",
+        title: "Seed may use your AI model",
+        body: "Seed may use Mac model. Revoke access to stop new runs and cancel open runs.",
+        severity: "info",
+        read: true,
+        source_app: "services",
+        action_ref: { action_id: "service-deny-request:grant-1" },
+      },
+    ],
+  } });
+  for (const callback of windowListeners.get("message") || []) {
+    callback({ origin: "null", source: parentFrame,
+      data: { type: "elastos:menu-command", cmd: "refresh" } });
+  }
+  await settle();
+  assert.equal(nodes.get("pending-count").textContent, "1");
+  assert.equal(nodes.get("review-count").textContent, "1");
 }
 
 async function runInboxLaunchSelectionSmoke() {

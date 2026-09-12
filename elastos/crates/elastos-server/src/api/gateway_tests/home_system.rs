@@ -26,7 +26,7 @@ impl Drop for EnvRestore {
     }
 }
 
-async fn home_test_get_json(
+pub(super) async fn home_test_get_json(
     app: &axum::Router,
     uri: &str,
     token: &str,
@@ -8710,6 +8710,179 @@ async fn test_services_inbox_request_copy_matches_engine_or_exit_and_exact_appro
         );
         assert_eq!(entry["read"], false);
     }
+}
+
+#[tokio::test]
+async fn test_inbox_projects_approved_model_grant_outside_pending_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let authority = passkey_authority_with_profile(dir.path(), "Mac");
+    let now = crate::auth::now_ts();
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "services-requests.json",
+        json!({
+            "schema": "elastos.services.requests/v1",
+            "principal_id": authority.principal_id,
+            "localhost_root": localhost_root,
+            "updated_at": now,
+            "requests": {
+                "pending-exit-1": {
+                    "request_id": "pending-exit-1",
+                    "offer_id": "local:provider:browser-exit",
+                    "service_uri": "elastos://peer/browser-exit",
+                    "service_kind": "remote_exit",
+                    "service_display_name": "Mac Browser Exit",
+                    "requester_peer_id": "peer-alice",
+                    "requester_did": "did:key:alice",
+                    "requester_principal_id": "person:local:alice",
+                    "requester_display_name": "Alice",
+                    "created_at": now,
+                    "updated_at": now,
+                    "status": "pending",
+                    "authenticated_request": true
+                },
+                "approved-model-1": {
+                    "request_id": "approved-model-1",
+                    "offer_id": "local:provider:model",
+                    "service_uri": "elastos://peer/model",
+                    "service_kind": "remote_model",
+                    "service_display_name": "Mac model",
+                    "requester_peer_id": "peer-seed",
+                    "requester_did": "did:key:seed",
+                    "requester_principal_id": "seed-principal-a",
+                    "requester_display_name": "Seed",
+                    "created_at": now,
+                    "updated_at": now,
+                    "status": "approved",
+                    "authenticated_request": true,
+                    "grant_expires_at": now + 3600
+                },
+                "expired-model-1": {
+                    "request_id": "expired-model-1",
+                    "offer_id": "local:provider:model",
+                    "service_uri": "elastos://peer/model",
+                    "service_kind": "remote_model",
+                    "service_display_name": "Mac model",
+                    "requester_peer_id": "peer-old",
+                    "requester_did": "did:key:old",
+                    "requester_principal_id": "seed-principal-old",
+                    "requester_display_name": "Old",
+                    "created_at": now - 10,
+                    "updated_at": now - 10,
+                    "status": "approved",
+                    "authenticated_request": true,
+                    "grant_expires_at": now - 1
+                },
+                "approved-engine-1": {
+                    "request_id": "approved-engine-1",
+                    "offer_id": "local:provider:browser-engine",
+                    "service_uri": "elastos://peer/browser-engine",
+                    "service_kind": "browser_engine",
+                    "service_display_name": "Mac Browser Engine",
+                    "requester_peer_id": "peer-engine",
+                    "requester_did": "did:key:engine",
+                    "requester_principal_id": "seed-principal-engine",
+                    "requester_display_name": "Engine",
+                    "created_at": now,
+                    "updated_at": now,
+                    "status": "approved",
+                    "authenticated_request": true,
+                    "grant_expires_at": now + 3600
+                }
+            }
+        }),
+    );
+    let app = gateway_router(test_state(dir.path()));
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/home/launch",
+        &authority.home_token,
+        "http://localhost:61180",
+        json!({ "target": INBOX_CAPSULE_ID }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let (status, inbox) = home_test_get_json(&app, "/api/apps/inbox/summary", &token, "null").await;
+    assert_eq!(status, StatusCode::OK, "{inbox}");
+    let notifications = &inbox["notifications"];
+    assert_eq!(notifications["unread_count"], 1, "{inbox}");
+    assert_eq!(notifications["attention_count"], 1, "{inbox}");
+    let entries = notifications["entries"].as_array().unwrap();
+    let pending = entries
+        .iter()
+        .filter(|entry| entry["kind"] == "service_access_request")
+        .collect::<Vec<_>>();
+    let grants = entries
+        .iter()
+        .filter(|entry| entry["kind"] == "service_access_grant")
+        .collect::<Vec<_>>();
+    assert_eq!(pending.len(), 1, "{inbox}");
+    assert_eq!(grants.len(), 1, "{inbox}");
+    let grant = grants[0];
+    assert_eq!(grant["id"], "service-access-grant:approved-model-1");
+    assert_eq!(grant["source_app"], SERVICES_CAPSULE_ID);
+    assert_eq!(grant["title"], "Seed may use your AI model");
+    assert_eq!(
+        grant["body"],
+        "Seed may use Mac model. Revoke access to stop new runs and cancel open runs."
+    );
+    assert_eq!(
+        grant["action_ref"]["action_id"],
+        "service-deny-request:approved-model-1"
+    );
+    assert_eq!(grant["action_ref"]["app"], SERVICES_CAPSULE_ID);
+    assert_eq!(grant["read"], true);
+    assert_eq!(grant["severity"], "info");
+    assert!(
+        !entries.iter().any(|entry| {
+            entry["id"] == "service-access-grant:expired-model-1"
+                || entry["id"] == "service-access-grant:approved-engine-1"
+                || entry["id"] == "service-access-request:approved-model-1"
+        }),
+        "{inbox}"
+    );
+
+    let other = passkey_authority_with_name_role(
+        dir.path(),
+        Some("other"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/home/launch",
+        &other.home_token,
+        "http://localhost:61180",
+        json!({ "target": INBOX_CAPSULE_ID }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let other_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &other);
+    let (status, other_inbox) =
+        home_test_get_json(&app, "/api/apps/inbox/summary", &other_token, "null").await;
+    assert_eq!(status, StatusCode::OK, "{other_inbox}");
+    assert_eq!(
+        other_inbox["notifications"]["unread_count"], 0,
+        "{other_inbox}"
+    );
+    assert_eq!(
+        other_inbox["notifications"]["attention_count"], 0,
+        "{other_inbox}"
+    );
+    let other_entries = other_inbox["notifications"]["entries"].as_array().unwrap();
+    assert!(
+        !other_entries.iter().any(|entry| {
+            entry["kind"] == "service_access_grant" || entry["kind"] == "service_access_request"
+        }),
+        "{other_inbox}"
+    );
 }
 
 async fn services_contact_pending_engine_request(

@@ -3962,19 +3962,33 @@ pub(super) fn append_home_service_access_notifications(
     let Ok(state) = home_services_requests_state(data_dir, context) else {
         return;
     };
-    let mut requests = state
+    let now = now_ts();
+    let mut pending = state
         .requests
         .values()
         .filter(|request| request.status == "pending")
         .cloned()
         .collect::<Vec<_>>();
-    requests.sort_by_key(|request| request.created_at);
+    pending.sort_by_key(|request| request.created_at);
+    let mut grants = state
+        .requests
+        .values()
+        .filter(|request| {
+            request.status == "approved"
+                && request.service_kind == super::MODEL_SERVICE_KIND
+                && request
+                    .grant_expires_at
+                    .is_some_and(|expires_at| expires_at > now)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    grants.sort_by_key(|request| request.updated_at);
     let existing_ids = notifications
         .entries
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<BTreeSet<_>>();
-    for request in requests {
+    for request in pending {
         let id = format!("service-access-request:{}", request.request_id);
         if existing_ids.contains(&id) {
             continue;
@@ -4002,6 +4016,34 @@ pub(super) fn append_home_service_access_notifications(
             severity: "attention".to_string(),
             read: false,
             created_at: request.created_at,
+        });
+    }
+    for request in grants {
+        let id = format!("service-access-grant:{}", request.request_id);
+        if existing_ids.contains(&id) {
+            continue;
+        }
+        let (service_noun, _) =
+            home_services_request_notification_copy(&request.service_kind, &request.service_uri);
+        notifications.entries.push(HomeNotificationEntrySummary {
+            id,
+            source_app: SERVICES_CAPSULE_ID.to_string(),
+            kind: "service_access_grant".to_string(),
+            title: format!(
+                "{} may use your {service_noun}",
+                request.requester_display_name
+            ),
+            body: format!(
+                "{} may use {}. Revoke access to stop new runs and cancel open runs.",
+                request.requester_display_name, request.service_display_name
+            ),
+            action_ref: Some(HomeNotificationActionSummary {
+                app: SERVICES_CAPSULE_ID.to_string(),
+                action_id: format!("service-deny-request:{}", request.request_id),
+            }),
+            severity: "info".to_string(),
+            read: true,
+            created_at: request.updated_at,
         });
     }
 }
