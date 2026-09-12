@@ -396,21 +396,14 @@ async fn dispatch_inbox_action(
             }
         })
         .await
-        .map_err(|err| anyhow::anyhow!(err))??;
-        // Revocation closes future authority and settles the runs it had opened.
-        if let Some(registry) = state.provider_registry.clone() {
-            match super::cancel_remote_model_grant_runs(registry, &data_dir, &grant_id).await {
-                Ok(cancelled) if !cancelled.is_empty() => tracing::info!(
-                    "revoked model grant {grant_id}: cancel requested for {} run(s)",
-                    cancelled.len()
-                ),
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!("revoked model grant {grant_id}: cancel sweep failed: {err}")
-                }
-            }
-        }
-        return Ok(denied);
+        .map_err(|err| anyhow::anyhow!(err))?;
+        return super::settle_denied_model_grant(
+            state.provider_registry.clone(),
+            &data_dir,
+            &grant_id,
+            denied,
+        )
+        .await;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-approve-request:") {
         let Some(step_up_token) = action.step_up_token.as_deref() else {

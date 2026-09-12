@@ -618,6 +618,31 @@ pub(crate) async fn invoke(
     json!({ "ok": true, "result": result })
 }
 
+/// The owner's denial has two effects: the recorded decision, which the
+/// requester learns about through gossip, and the settlement of runs the
+/// grant had opened on this Runtime. The second effect never waits for the
+/// first. The denial result is returned unchanged after the sweep.
+pub(crate) async fn settle_denied_grant(
+    registry: Option<Arc<ProviderRegistry>>,
+    data_dir: &Path,
+    grant_id: &str,
+    denied: anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    if let Some(registry) = registry {
+        match cancel_grant_runs(registry, data_dir, grant_id).await {
+            Ok(cancelled) if !cancelled.is_empty() => tracing::info!(
+                "revoked model grant {grant_id}: cancel requested for {} run(s)",
+                cancelled.len()
+            ),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!("revoked model grant {grant_id}: cancel sweep failed: {err}")
+            }
+        }
+    }
+    denied
+}
+
 /// Cancel every open run created under a grant, after revoke or denial.
 /// Returns the run ids that received a cancel request.
 pub(crate) async fn cancel_grant_runs(
@@ -641,7 +666,20 @@ pub(crate) async fn cancel_grant_runs(
             continue;
         };
         match registry.send_raw("model", &normalized).await {
-            Ok(result) if provider_status_error(&result).is_none() => cancelled.push(run_id),
+            Ok(result) if provider_status_error(&result).is_none() => {
+                // A settled cancel closes the record; a later sweep skips it.
+                if run_result_is_terminal(&result) {
+                    let now = crate::auth::now_ts();
+                    let settled = run_id.clone();
+                    let _ = update_run_index(data_dir, now, |index| {
+                        if let Some(entry) = index.runs.get_mut(&settled) {
+                            entry.terminal_at = Some(now);
+                        }
+                        Ok(())
+                    });
+                }
+                cancelled.push(run_id)
+            }
             Ok(result) => tracing::info!(
                 "revoke cancel for {run_id} returned {}",
                 provider_status_error(&result).unwrap_or_default()

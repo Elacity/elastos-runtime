@@ -3,7 +3,7 @@ use super::home_system::{
 };
 use super::*;
 use crate::api::gateway::gateway_model_service::{
-    cancel_grant_runs, model_grant_id, remote_principal_id,
+    cancel_grant_runs, model_grant_id, remote_principal_id, settle_denied_grant,
 };
 use crate::collaboration_contact_store::CollaborationContactStore;
 use crate::collaboration_discovery::*;
@@ -785,4 +785,45 @@ mod consumer_path {
         assert!(local.is_none());
         fx.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn a_denial_that_failed_to_reach_the_requester_still_cancels_open_runs() {
+    let fx = TwoRuntimes::start().await;
+    let open = fx.create_run("seed-req-open", "qwen-local").await;
+    assert_eq!(open["ok"], true, "{open}");
+    let open_run_id = run_id_for(&fx.remote_principal(), "seed-req-open");
+    fx.write_request_record("denied");
+
+    // The Inbox handler passes the denial result through the sweep unchanged,
+    // so a gossip delivery error cannot skip the cancellation.
+    let delivery_failed: anyhow::Result<String> =
+        Err(anyhow::anyhow!("service access request delivery failed"));
+    let result = settle_denied_grant(
+        Some(fx.registry.clone()),
+        fx.owner.path(),
+        &fx.grant_id,
+        delivery_failed,
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    let cancel = fx.last_provider_call().await;
+    assert_eq!(cancel["op"], "runs_cancel");
+    assert_eq!(cancel["run_id"], open_run_id);
+    assert_eq!(cancel["runtime_binding"]["grant_id"], fx.grant_id);
+
+    // A delivered denial returns its message after the same sweep; nothing
+    // is left to cancel the second time.
+    let ops_before = fx.provider_ops().await;
+    let delivered = settle_denied_grant(
+        Some(fx.registry.clone()),
+        fx.owner.path(),
+        &fx.grant_id,
+        Ok("Denied service request from Seed.".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(delivered, "Denied service request from Seed.");
+    assert_eq!(fx.provider_ops().await, ops_before);
+    fx.shutdown().await;
 }
