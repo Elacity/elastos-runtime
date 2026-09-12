@@ -3,7 +3,7 @@ use super::home_system::{
 };
 use super::*;
 use crate::api::gateway::gateway_model_service::{
-    cancel_grant_runs, model_grant_id, remote_principal_id, settle_denied_grant,
+    cancel_grant_runs, model_grant_id, remote_principal_id,
 };
 use crate::collaboration_contact_store::CollaborationContactStore;
 use crate::collaboration_discovery::*;
@@ -787,43 +787,102 @@ mod consumer_path {
     }
 }
 
-#[tokio::test]
-async fn a_denial_that_failed_to_reach_the_requester_still_cancels_open_runs() {
-    let fx = TwoRuntimes::start().await;
-    let open = fx.create_run("seed-req-open", "qwen-local").await;
-    assert_eq!(open["ok"], true, "{open}");
-    let open_run_id = run_id_for(&fx.remote_principal(), "seed-req-open");
-    fx.write_request_record("denied");
+// Denial authority: the sweep follows only a denial this principal made and
+// this Runtime saved. Delivery to the requester is a separate step.
+mod denial_authority {
+    use super::*;
+    use crate::api::gateway::gateway_model_service::deny_grant_and_settle;
 
-    // The Inbox handler passes the denial result through the sweep unchanged,
-    // so a gossip delivery error cannot skip the cancellation.
-    let delivery_failed: anyhow::Result<String> =
-        Err(anyhow::anyhow!("service access request delivery failed"));
-    let result = settle_denied_grant(
-        Some(fx.registry.clone()),
-        fx.owner.path(),
-        &fx.grant_id,
-        delivery_failed,
-    )
-    .await;
-    assert!(result.is_err(), "{result:?}");
-    let cancel = fx.last_provider_call().await;
-    assert_eq!(cancel["op"], "runs_cancel");
-    assert_eq!(cancel["run_id"], open_run_id);
-    assert_eq!(cancel["runtime_binding"]["grant_id"], fx.grant_id);
+    impl TwoRuntimes {
+        fn owner_context(&self) -> HomeLaunchTokenContext {
+            HomeLaunchTokenContext {
+                principal_id: self.authority.principal_id.clone(),
+                session_id: self.authority.session_id.clone(),
+                proof_binding_id: Some(self.authority.proof_binding_id.clone()),
+                grant_id: self.authority.grant_id.clone(),
+            }
+        }
 
-    // A delivered denial returns its message after the same sweep; nothing
-    // is left to cancel the second time.
-    let ops_before = fx.provider_ops().await;
-    let delivered = settle_denied_grant(
-        Some(fx.registry.clone()),
-        fx.owner.path(),
-        &fx.grant_id,
-        Ok("Denied service request from Seed.".to_string()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(delivered, "Denied service request from Seed.");
-    assert_eq!(fx.provider_ops().await, ops_before);
-    fx.shutdown().await;
+        async fn deny_as(&self, context: &HomeLaunchTokenContext) -> anyhow::Result<String> {
+            deny_grant_and_settle(
+                Some(self.registry.clone()),
+                self.owner.path(),
+                context,
+                None,
+                REQUEST_ID,
+            )
+            .await
+        }
+
+        fn requests_state_dir(&self) -> std::path::PathBuf {
+            let root = crate::auth::principal_localhost_root(&self.authority.principal_id);
+            elastos_common::localhost::rooted_localhost_fs_path(
+                self.owner.path(),
+                &format!("{root}/.AppData/ElastOS/Home/services-requests.json"),
+            )
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+        }
+    }
+
+    #[tokio::test]
+    async fn another_principal_cannot_deny_or_cancel_the_owners_runs() {
+        let fx = TwoRuntimes::start().await;
+        let open = fx.create_run("seed-req-open", "qwen-local").await;
+        assert_eq!(open["ok"], true, "{open}");
+        let ops_before = fx.provider_ops().await;
+        let intruder = HomeLaunchTokenContext {
+            principal_id: "person:local:intruder".to_string(),
+            session_id: "auth:intruder".to_string(),
+            proof_binding_id: Some("proof:passkey:intruder".to_string()),
+            grant_id: "grant:intruder".to_string(),
+        };
+        let result = fx.deny_as(&intruder).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(fx.provider_ops().await, ops_before, "no cancel may follow");
+        assert_eq!(
+            fx.create_run("seed-req-still-open", "qwen-local").await["ok"],
+            true,
+            "the grant stays approved"
+        );
+        fx.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_denial_that_could_not_be_saved_cancels_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = TwoRuntimes::start().await;
+        let open = fx.create_run("seed-req-open", "qwen-local").await;
+        assert_eq!(open["ok"], true, "{open}");
+        let ops_before = fx.provider_ops().await;
+        let state_dir = fx.requests_state_dir();
+        let mode = std::fs::metadata(&state_dir).unwrap().permissions();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = fx.deny_as(&fx.owner_context()).await;
+        std::fs::set_permissions(&state_dir, mode).unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(fx.provider_ops().await, ops_before, "no cancel may follow");
+        fx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_saved_denial_cancels_the_open_run_even_when_delivery_fails() {
+        let fx = TwoRuntimes::start().await;
+        let open = fx.create_run("seed-req-open", "qwen-local").await;
+        assert_eq!(open["ok"], true, "{open}");
+        let open_run_id = run_id_for(&fx.remote_principal(), "seed-req-open");
+        // No discovery runtime: the decision cannot be delivered, yet it is saved.
+        let result = fx.deny_as(&fx.owner_context()).await;
+        assert!(result.is_err(), "delivery failure surfaces: {result:?}");
+        let cancel = fx.last_provider_call().await;
+        assert_eq!(cancel["op"], "runs_cancel");
+        assert_eq!(cancel["run_id"], open_run_id);
+        assert_eq!(cancel["runtime_binding"]["grant_id"], fx.grant_id);
+        let refused = fx.create_run("seed-req-after", "qwen-local").await;
+        assert_eq!(refused["code"], "denied", "{refused}");
+        fx.shutdown().await;
+    }
 }

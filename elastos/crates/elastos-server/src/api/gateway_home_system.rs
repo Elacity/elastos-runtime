@@ -4010,6 +4010,8 @@ pub(super) fn approve_home_service_access_request(
     home_services_mark_access_request(data_dir, context, discovery_service, request_id, "approved")
 }
 
+/// Deny as this principal. `Err` means no denial was saved (unknown request
+/// for this principal, invalid id, or a save failure); nothing may follow it.
 pub(super) fn deny_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -4017,8 +4019,24 @@ pub(super) fn deny_home_service_access_request(
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request_id: &str,
-) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "denied")
+) -> anyhow::Result<HomeServiceAccessDecisionRecorded> {
+    home_services_record_access_decision(data_dir, context, discovery_service, request_id, "denied")
+}
+
+/// A service access decision this principal made and this Runtime saved. The
+/// decision holds whether or not the requester could be notified; `delivery`
+/// reports that second, separate step.
+pub(super) struct HomeServiceAccessDecisionRecorded {
+    pub message: String,
+    pub delivery: anyhow::Result<()>,
+}
+
+impl HomeServiceAccessDecisionRecorded {
+    /// The one-line result for a UI action: a delivery failure surfaces as the
+    /// error the caller always showed, after the decision itself is safe.
+    pub fn into_message(self) -> anyhow::Result<String> {
+        self.delivery.map(|()| self.message)
+    }
 }
 
 fn home_services_mark_access_request(
@@ -4030,6 +4048,22 @@ fn home_services_mark_access_request(
     request_id: &str,
     status: &str,
 ) -> anyhow::Result<String> {
+    home_services_record_access_decision(data_dir, context, discovery_service, request_id, status)?
+        .into_message()
+}
+
+/// Authorize (principal-scoped lookup), apply and save the decision, then try
+/// to deliver it. `Err` means nothing was saved; `Ok` means the decision is
+/// this Runtime's truth even if `delivery` failed.
+fn home_services_record_access_decision(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    request_id: &str,
+    status: &str,
+) -> anyhow::Result<HomeServiceAccessDecisionRecorded> {
     let request_id = request_id.trim();
     if !home_services_request_id_is_valid(request_id) {
         anyhow::bail!("service request id is invalid");
@@ -4083,7 +4117,7 @@ fn home_services_mark_access_request(
     state.updated_at = revision;
     // The provider owns revocation even when the requester cannot receive gossip.
     home_save_services_requests_state(data_dir, context, &state)?;
-    home_services_send_access_decision(
+    let delivery = home_services_send_access_decision(
         data_dir,
         context,
         discovery_service,
@@ -4097,14 +4131,17 @@ fn home_services_mark_access_request(
         } else {
             err.context("service access request delivery failed")
         }
-    })?;
+    });
     let requester = request.requester_display_name.clone();
-    Ok(match status {
-        "approved" => format!(
-            "Approved service request from {requester}. A private scoped grant was sent to the requester."
-        ),
-        "denied" => format!("Denied service request from {requester}."),
-        _ => "Updated service request.".to_string(),
+    Ok(HomeServiceAccessDecisionRecorded {
+        message: match status {
+            "approved" => format!(
+                "Approved service request from {requester}. A private scoped grant was sent to the requester."
+            ),
+            "denied" => format!("Denied service request from {requester}."),
+            _ => "Updated service request.".to_string(),
+        },
+        delivery,
     })
 }
 

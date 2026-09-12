@@ -621,18 +621,39 @@ pub(crate) async fn invoke(
     json!({ "ok": true, "result": result })
 }
 
-/// The owner's denial has two effects: the recorded decision, which the
-/// requester learns about through gossip, and the settlement of runs the
-/// grant had opened on this Runtime. The second effect never waits for the
-/// first. The denial result is returned unchanged after the sweep.
-pub(crate) async fn settle_denied_grant(
+/// Deny a service request as this principal and settle the runs its grant had
+/// opened on this Runtime. Three steps, in this order: the principal-scoped
+/// denial is saved (or nothing happens), the sweep cancels that grant's open
+/// runs, and only then does the delivery result decide the message. A denial
+/// by another principal or a failed save never reaches the sweep.
+pub(in crate::api) async fn deny_grant_and_settle(
     registry: Option<Arc<ProviderRegistry>>,
     data_dir: &Path,
-    grant_id: &str,
-    denied: anyhow::Result<String>,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    request_id: &str,
 ) -> anyhow::Result<String> {
+    let recorded = {
+        let data_dir = data_dir.to_path_buf();
+        let context = context.clone();
+        let discovery_service = discovery_service.cloned();
+        let request_id = request_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            super::gateway_home_system::deny_home_service_access_request(
+                &data_dir,
+                &context,
+                discovery_service.as_ref(),
+                &request_id,
+            )
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!(err))??
+    };
+    let grant_id = model_grant_id(request_id);
     if let Some(registry) = registry {
-        match cancel_grant_runs(registry, data_dir, grant_id).await {
+        match cancel_grant_runs(registry, data_dir, &grant_id).await {
             Ok(cancelled) if !cancelled.is_empty() => tracing::info!(
                 "revoked model grant {grant_id}: cancel requested for {} run(s)",
                 cancelled.len()
@@ -643,7 +664,7 @@ pub(crate) async fn settle_denied_grant(
             }
         }
     }
-    denied
+    recorded.into_message()
 }
 
 /// Cancel every open run created under a grant, after revoke or denial.

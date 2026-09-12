@@ -80,9 +80,9 @@ mod gateway_marketplace;
 mod gateway_model_remote;
 #[path = "gateway_model_service.rs"]
 mod gateway_model_service;
+pub(in crate::api) use gateway_model_service::deny_grant_and_settle as deny_model_grant_and_settle;
 pub(crate) use gateway_model_service::{
-    invoke as invoke_remote_model, model_grant_id,
-    settle_denied_grant as settle_denied_model_grant, ModelServiceGrant, MODEL_GRANT_SCHEMA,
+    invoke as invoke_remote_model, model_grant_id, ModelServiceGrant, MODEL_GRANT_SCHEMA,
     MODEL_GRANT_SCOPE, MODEL_GRANT_TTL_SECS, MODEL_LOCAL_OFFER, MODEL_OPERATIONS,
     MODEL_SERVICE_KIND, MODEL_SERVICE_URI,
 };

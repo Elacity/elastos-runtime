@@ -379,29 +379,12 @@ async fn dispatch_inbox_action(
         .map_err(|err| anyhow::anyhow!(err))?;
     }
     if let Some(request_id) = action_id.strip_prefix("service-deny-request:") {
-        let discovery_service = state.collaboration_discovery_service.clone();
-        let data_dir = data_dir.clone();
-        let context = context.clone();
-        let request_id = request_id.to_string();
-        let grant_id = super::model_grant_id(&request_id);
-        let denied = tokio::task::spawn_blocking({
-            let data_dir = data_dir.clone();
-            move || {
-                deny_home_service_access_request(
-                    &data_dir,
-                    &context,
-                    discovery_service.as_ref(),
-                    &request_id,
-                )
-            }
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!(err))?;
-        return super::settle_denied_model_grant(
+        return super::deny_model_grant_and_settle(
             state.provider_registry.clone(),
-            &data_dir,
-            &grant_id,
-            denied,
+            data_dir,
+            context,
+            state.collaboration_discovery_service.as_ref(),
+            request_id,
         )
         .await;
     }
