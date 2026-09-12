@@ -2441,6 +2441,25 @@ fn home_services_supported_request(kind: &str, uri: &str) -> bool {
         || (kind == super::MODEL_SERVICE_KIND && uri == super::MODEL_SERVICE_URI)
 }
 
+/// The one place that binds a service kind to the offer-id suffix of a
+/// contact's Others card. Card builders and decision filters both use it.
+pub(super) fn home_services_contact_offer_suffix(kind: &str) -> &'static str {
+    if kind == crate::carrier::ENGINE_SERVICE_KIND {
+        "browser-engine"
+    } else if kind == super::MODEL_SERVICE_KIND {
+        "model"
+    } else {
+        "browser-exit"
+    }
+}
+
+pub(super) fn home_services_contact_offer_id(contact_id: &str, kind: &str) -> String {
+    format!(
+        "offer:{contact_id}:{}",
+        home_services_contact_offer_suffix(kind)
+    )
+}
+
 fn home_services_local_model_shared(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -2695,13 +2714,12 @@ fn home_services_sync_access_decisions(
         .values()
         .filter(|request| {
             contacts.contacts.values().any(|contact| {
-                let suffix = if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND {
-                    "browser-engine"
-                } else {
-                    "browser-exit"
-                };
                 home_services_supported_request(&request.service_kind, &request.service_uri)
-                    && request.offer_id == format!("offer:{}:{suffix}", contact.contact_id)
+                    && request.offer_id
+                        == home_services_contact_offer_id(
+                            &contact.contact_id,
+                            &request.service_kind,
+                        )
                     && request.target_peer_id == contact.peer_id
             })
         })
@@ -3908,6 +3926,27 @@ fn home_services_merge_access_request(
     changed
 }
 
+/// Inbox copy per service kind: what the owner is asked for, and what an
+/// approval does.
+fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static str, &'static str) {
+    if kind == crate::carrier::ENGINE_SERVICE_KIND && uri == crate::carrier::ENGINE_SERVICE_URI {
+        (
+            "Browser Engine",
+            "Approval allows the requested Browser Engine operations through your Runtime.",
+        )
+    } else if kind == super::MODEL_SERVICE_KIND && uri == super::MODEL_SERVICE_URI {
+        (
+            "AI model",
+            "Approval lets their Assistant run your shared local model through your Runtime. Your Runtime decides every request and keeps hosted models private.",
+        )
+    } else {
+        (
+            "Browser Exit Node",
+            "Approval records your intent; Browser access still requires an installed remote Exit grant.",
+        )
+    }
+}
+
 pub(super) fn append_home_service_access_notifications(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -3933,8 +3972,8 @@ pub(super) fn append_home_service_access_notifications(
         if existing_ids.contains(&id) {
             continue;
         }
-        let engine_request = request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
-            && request.service_uri == crate::carrier::ENGINE_SERVICE_URI;
+        let (service_noun, approval_effect) =
+            home_services_request_notification_copy(&request.service_kind, &request.service_uri);
         notifications.unread_count += 1;
         notifications.attention_count += 1;
         notifications.entries.push(HomeNotificationEntrySummary {
@@ -3942,21 +3981,13 @@ pub(super) fn append_home_service_access_notifications(
             source_app: SERVICES_CAPSULE_ID.to_string(),
             kind: "service_access_request".to_string(),
             title: format!(
-                "{} requests your {}",
-                request.requester_display_name,
-                if engine_request { "Browser Engine" } else { "Browser Exit Node" }
+                "{} requests your {service_noun}",
+                request.requester_display_name
             ),
-            body: if engine_request {
-                format!(
-                    "{} wants to use {}. Approval allows the requested Browser Engine operations through your Runtime.",
-                    request.requester_display_name, request.service_display_name
-                )
-            } else {
-                format!(
-                    "{} wants to use {}. Approval records your intent; Browser access still requires an installed remote Exit grant.",
-                    request.requester_display_name, request.service_display_name
-                )
-            },
+            body: format!(
+                "{} wants to use {}. {approval_effect}",
+                request.requester_display_name, request.service_display_name
+            ),
             action_ref: Some(HomeNotificationActionSummary {
                 app: SERVICES_CAPSULE_ID.to_string(),
                 action_id: format!("service-approve-request:{}", request.request_id),
@@ -7126,5 +7157,56 @@ mod home_realtime_tests {
             1,
             "recovery readiness should stay a Home summary change"
         );
+    }
+}
+
+#[cfg(test)]
+mod services_kind_tests {
+    use super::*;
+
+    // The Others card id and the decision filter must agree for every kind;
+    // a model decision was silently ignored when the filter knew two kinds.
+    #[test]
+    fn contact_offer_id_covers_every_requestable_service_kind() {
+        for (kind, uri, suffix) in [
+            (
+                HOME_REMOTE_EXIT_SERVICE_KIND,
+                HOME_BROWSER_EXIT_PEER_SERVICE_URI,
+                "browser-exit",
+            ),
+            (
+                crate::carrier::ENGINE_SERVICE_KIND,
+                crate::carrier::ENGINE_SERVICE_URI,
+                "browser-engine",
+            ),
+            (
+                super::super::MODEL_SERVICE_KIND,
+                super::super::MODEL_SERVICE_URI,
+                "model",
+            ),
+        ] {
+            assert!(home_services_supported_request(kind, uri), "{kind}");
+            assert_eq!(
+                home_services_contact_offer_id("c1", kind),
+                format!("offer:c1:{suffix}")
+            );
+        }
+    }
+
+    #[test]
+    fn request_notification_copy_names_the_requested_service() {
+        let (noun, effect) = home_services_request_notification_copy(
+            super::super::MODEL_SERVICE_KIND,
+            super::super::MODEL_SERVICE_URI,
+        );
+        assert_eq!(noun, "AI model");
+        assert!(effect.contains("shared local model"));
+        let (noun, _) = home_services_request_notification_copy(
+            crate::carrier::ENGINE_SERVICE_KIND,
+            crate::carrier::ENGINE_SERVICE_URI,
+        );
+        assert_eq!(noun, "Browser Engine");
+        let (noun, _) = home_services_request_notification_copy("remote_exit", "elastos://x");
+        assert_eq!(noun, "Browser Exit Node");
     }
 }

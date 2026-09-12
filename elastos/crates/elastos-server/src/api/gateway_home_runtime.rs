@@ -1114,7 +1114,7 @@ pub(super) fn home_service_offers_for_people_contact(
     }
     offers.push(HomeServiceOfferSummary {
         schema: "elastos.service.offer/v1".to_string(),
-        offer_id: format!("offer:{}:browser-exit", contact.contact_id),
+        offer_id: super::gateway_home_system::home_services_contact_offer_id(&contact.contact_id, "remote_exit"),
         service_uri: "elastos://peer/browser-exit".to_string(),
         service_kind: "remote_exit".to_string(),
         display_name: format!("{}'s Browser Exit", contact.display_name),
@@ -1134,7 +1134,7 @@ pub(super) fn home_service_offers_for_people_contact(
     });
     offers.push(HomeServiceOfferSummary {
         schema: "elastos.service.offer/v1".to_string(),
-        offer_id: format!("offer:{}:browser-engine", contact.contact_id),
+        offer_id: super::gateway_home_system::home_services_contact_offer_id(&contact.contact_id, crate::carrier::ENGINE_SERVICE_KIND),
         service_uri: crate::carrier::ENGINE_SERVICE_URI.to_string(),
         service_kind: crate::carrier::ENGINE_SERVICE_KIND.to_string(),
         display_name: format!("{}'s Browser Engine", contact.display_name),
@@ -1149,7 +1149,7 @@ pub(super) fn home_service_offers_for_people_contact(
     });
     offers.push(HomeServiceOfferSummary {
         schema: "elastos.service.offer/v1".to_string(),
-        offer_id: format!("offer:{}:model", contact.contact_id),
+        offer_id: super::gateway_home_system::home_services_contact_offer_id(&contact.contact_id, super::MODEL_SERVICE_KIND),
         service_uri: super::MODEL_SERVICE_URI.to_string(),
         service_kind: super::MODEL_SERVICE_KIND.to_string(),
         display_name: format!("{}'s AI model", contact.display_name),
