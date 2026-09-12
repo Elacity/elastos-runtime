@@ -144,10 +144,17 @@ pub(crate) struct ConsumerModelGrant {
 }
 
 impl ConsumerModelGrant {
+    /// The services layer stores the granting Runtime's Carrier peer id under
+    /// `peer_did` (shared wire shape with Engine grants). The Carrier route
+    /// pins the ticket to a `did:key`, so the id is converted once here.
     fn from_record(grant: &Value) -> Option<Self> {
+        let peer_id = grant["peer_did"]
+            .as_str()?
+            .parse::<iroh::PublicKey>()
+            .ok()?;
         Some(Self {
             grant_id: grant["grant_id"].as_str()?.to_string(),
-            peer_did: grant["peer_did"].as_str()?.to_string(),
+            peer_did: crate::carrier::public_key_to_did(&peer_id).ok()?,
             connect_ticket: grant["connect_ticket"].as_str()?.to_string(),
             display_name: grant["service_display_name"]
                 .as_str()
@@ -482,6 +489,30 @@ pub(crate) async fn route_run_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Carrier route filters ticket endpoints by `did:key`; a raw peer id
+    // there matched nothing and every call reported `transport_interrupted`.
+    #[test]
+    fn consumer_grant_routes_by_the_granting_runtime_did() {
+        let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let grant = ConsumerModelGrant::from_record(&json!({
+            "grant_id": "services-remote-model-grant-0011223344556677",
+            "peer_did": key.to_string(),
+            "connect_ticket": "ticket",
+            "service_display_name": "Mac",
+            "expires_at": 1,
+        }))
+        .expect("grant");
+        assert_eq!(
+            grant.peer_did,
+            crate::carrier::public_key_to_did(&key).unwrap()
+        );
+        assert!(grant.peer_did.starts_with("did:key:z6Mk"));
+        assert!(ConsumerModelGrant::from_record(&json!({
+            "grant_id": "g", "peer_did": "not-a-peer-id", "connect_ticket": "t", "expires_at": 1,
+        }))
+        .is_none());
+    }
 
     #[test]
     fn a_home_without_a_local_model_provider_still_lists_remote_offers() {
