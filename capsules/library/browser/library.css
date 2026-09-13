@@ -18,6 +18,8 @@
       --warn: var(--el-brand-strong);
       --danger: var(--el-danger);
       --library-sidebar-width: 220px;
+      /* Same fill as Home GUI's menus so popovers read as one system. */
+      --menu-fill: rgba(22, 24, 29, 0.96);
       --shadow: none;
       --radius-xl: 0;
       --radius-lg: 6px;
@@ -30,6 +32,7 @@
     :root[data-el-theme="light"] {
       color-scheme: light;
       --sidebar-bg: #f0f1f4;
+      --menu-fill: rgba(248, 250, 253, 0.97);
     }
 
     :root[data-el-theme="light"] .sidebar {
@@ -99,11 +102,6 @@
       background: rgba(181, 121, 24, 0.14);
     }
 
-    :root[data-el-theme="light"] .context-menu,
-    :root[data-el-theme="light"] .menu-submenu {
-      background: rgba(248, 248, 248, 0.98);
-    }
-
     * {
       box-sizing: border-box;
     }
@@ -157,7 +155,8 @@
       height: 100vh;
       height: 100dvh;
       display: grid;
-      grid-template-columns: minmax(180px, var(--library-sidebar-width)) 10px minmax(0, 1fr);
+      /* Zero-width seam: the resizer overlays the sidebar/main edge so the panes sit flush. */
+      grid-template-columns: minmax(180px, var(--library-sidebar-width)) 0px minmax(0, 1fr);
       gap: 0;
       padding: 0;
       overflow: hidden;
@@ -183,8 +182,8 @@
     .sidebar-resizer {
       position: relative;
       z-index: 3;
-      width: 5px;
-      margin: 0 -2px;
+      width: 9px;
+      margin: 0 -4px 0 -5px;
       cursor: col-resize;
       touch-action: none;
       background: transparent;
@@ -196,7 +195,7 @@
       position: absolute;
       top: 0;
       bottom: 0;
-      left: 2px;
+      left: 4px;
       width: 1px;
       background: color-mix(in srgb, var(--el-hairline) 70%, transparent);
     }
@@ -204,7 +203,7 @@
     .sidebar-resizer:hover::after,
     .sidebar-resizer:focus-visible::after,
     .shell[data-sidebar-resizing="true"] .sidebar-resizer::after {
-      left: 1px;
+      left: 3px;
       width: 3px;
       background: color-mix(in srgb, var(--el-accent) 75%, transparent);
     }
@@ -1017,12 +1016,14 @@
       max-width: calc(100vw - 16px);
       max-height: calc(100vh - 16px);
       overflow: visible;
-      border: 1px solid rgba(0, 0, 0, 0.18);
+      border: 1px solid var(--line);
       border-radius: 7px;
-      background: rgba(248, 248, 248, 0.98);
+      background: var(--menu-fill);
       box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
       padding: 5px 0;
-      color: #1f2328;
+      color: var(--ink);
       white-space: normal;
       user-select: none;
       scrollbar-width: thin;
@@ -1065,7 +1066,7 @@
 
     .menu-item-mark {
       flex: 0 0 auto;
-      color: rgba(31, 35, 40, 0.56);
+      color: var(--muted);
       font-size: 12px;
     }
 
@@ -1089,7 +1090,7 @@
     .menu-divider {
       height: 1px;
       margin: 4px 8px;
-      background: rgba(0, 0, 0, 0.12);
+      background: var(--line);
     }
 
     .menu-divider hr {
@@ -1103,12 +1104,14 @@
       display: none;
       width: 218px;
       max-width: calc(100vw - 16px);
-      border: 1px solid rgba(0, 0, 0, 0.18);
+      border: 1px solid var(--line);
       border-radius: 7px;
-      background: rgba(248, 248, 248, 0.98);
+      background: var(--menu-fill);
       box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
       padding: 5px 0;
-      color: #1f2328;
+      color: var(--ink);
       z-index: 81;
     }
 
