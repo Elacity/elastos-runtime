@@ -98,6 +98,12 @@ export function friendlyOpenError(error) {
     if (error.status === 403) {
       return "This page was blocked by your Exit Node settings.";
     }
+    if (/This Browser profile requires an approved transfer/i.test(text)) {
+      return text;
+    }
+    if (/Runtime viewer ingress capacity unavailable/i.test(text)) {
+      return text;
+    }
     return "Browser Engine failed to start cleanly. No Browser page or VM was acquired.";
   }
   if (outcome?.state === "terminal_post_effect_cleanup") {

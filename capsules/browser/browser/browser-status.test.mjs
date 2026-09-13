@@ -62,6 +62,22 @@ test("pre-effect open failure never claims a missing terminal close", () => {
   assert.doesNotMatch(friendlyOpenError(error), /terminal close/i);
 });
 
+test("pre-effect profile placement keeps the Runtime transfer sentence", () => {
+  const message = "This Browser profile requires an approved transfer from its owning Runtime";
+  const error = openError("terminal_pre_effect_failure");
+  error.message = message;
+  error.payload.message = message;
+  assert.equal(friendlyOpenError(error), message);
+});
+
+test("pre-effect viewer ingress capacity keeps the Runtime capacity sentence", () => {
+  const message = "Runtime viewer ingress capacity unavailable";
+  const error = openError("terminal_pre_effect_failure");
+  error.message = message;
+  error.payload.message = message;
+  assert.equal(friendlyOpenError(error), message);
+});
+
 test("compatibility denial explains the required repair before launch", () => {
   for (const [code, message] of [
     ["incompatible_engine_protocol", "Browser Engine and Runtime versions are incompatible. Update them to a compatible release."],
