@@ -165,8 +165,11 @@ assert.ok(!indexHtml.includes('data-sidebar-nav="studio"'), "Studio uses the sha
 for (const mode of ["chat", "build", "studio"]) {
   assert.ok(indexHtml.includes(`data-assistant-mode="${mode}"`), `${mode} is a canonical Assistant mode`);
 }
+assert.ok(!indexHtml.includes('class="assistant-modes"'), "Mode controls live in the sidebar, not a bar above the transcript");
+assert.ok(!indexHtml.includes("assistant-copy-conversation"), "Whole-conversation copy is gone; per-message copy stays in the transcript");
 assert.equal((indexHtml.match(/id="agent-harness-sidebar"/g) || []).length, 1, "one Sash sidebar");
 const modes = read("capsules/assistant/browser/assistant-modes.js");
+assert.ok(modes.includes("MODE_CAPABILITY") && modes.includes("eligibleStudioOffers("), "Mode controls show only when the Runtime backs them (UI ≠ authority)");
 assert.ok(modes.includes('from "./assistant.js"') && modes.includes("studioOnly: true"), "Studio uses the typed controller");
 for (const theatre of [
   "data-workbench",

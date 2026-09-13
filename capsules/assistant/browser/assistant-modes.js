@@ -1,13 +1,20 @@
-import { createAssistantApp } from "./assistant.js";
+import { createAssistantApp, eligibleStudioOffers } from "./assistant.js";
 import { getAgentWorkspaceSnapshot, setAssistantMode } from "./agent-harness.js";
 import { setAssistantWorkspaceField, getAssistantSession, ensureAssistantStudioSession, setAssistantSessionStudio, captureActiveSessionState, applyAssistantModeDraft } from "./agent-workspace.js";
 import { getHomeGuiLaunchToken, persistAgentWorkspaceNow, flushAgentWorkspace, bindWorkspaceMergeGuard } from "./harness-host.js";
 import { getLiveTurnCanonical } from "./agent-stream.js";
-import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+import { fetchModelOffers } from "./agent-live.js";
+
+/* UI ≠ authority: a mode control is shown only when the Runtime backs it.
+   Build is a saved label today (no run reads it), so its segment stays hidden;
+   Studio appears once an image or video offer is advertised. */
+const MODE_CAPABILITY = { chat: true, build: false };
 
 export async function bindAssistantModes(saved = {}) {
   const panel = document.querySelector("#assistant-studio");
   const notice = document.querySelector("#assistant-workspace-notice");
+  const segment = document.querySelector("[data-assistant-mode-segment]");
+  const studioRow = document.querySelector('button[data-assistant-mode="studio"]');
   const offer = document.querySelector("#studio-offer");
   const draft = document.querySelector("#studio-draft");
   const status = document.querySelector("#studio-status");
@@ -23,12 +30,23 @@ export async function bindAssistantModes(saved = {}) {
   status.after(check);
   const controllers = new Map();
   let visibleSessionId = saved.activeSessionId || null;
-  const clipboard = createHomeClipboardClient({
-    targetId: "assistant", homeToken: getHomeGuiLaunchToken(),
-    homeOrigin: new URL(location.href).searchParams.get("home_origin") || "null",
-    targetWindow: window.top, sourceWindow: window,
-  });
-  clipboard.start();
+  let studioAvailable = false;
+
+  function modeAvailable(mode) {
+    return mode === "studio" ? studioAvailable : Boolean(MODE_CAPABILITY[mode]);
+  }
+  function syncModeControls() {
+    segment.hidden = !MODE_CAPABILITY.build;
+    studioRow.hidden = !studioAvailable;
+  }
+  async function refreshStudioAvailability() {
+    try {
+      studioAvailable = eligibleStudioOffers(await fetchModelOffers()).length > 0;
+    } catch {
+      studioAvailable = false;
+    }
+    syncModeControls();
+  }
 
   function render(view) {
     if (draft.value !== view.studioDraft) draft.value = view.studioDraft;
@@ -134,15 +152,30 @@ export async function bindAssistantModes(saved = {}) {
     applyAssistantModeDraft(mode);
     document.body.dataset.assistantMode = mode;
     panel.hidden = mode !== "studio";
-    for (const item of document.querySelectorAll("button[data-assistant-mode]")) item.setAttribute("aria-pressed", String(item.dataset.assistantMode === mode));
+    for (const item of document.querySelectorAll("button[data-assistant-mode]")) {
+      const pressed = item.dataset.assistantMode === mode;
+      item.setAttribute("aria-pressed", String(pressed));
+      item.classList.toggle("is-active", pressed);
+    }
     setAssistantMode(mode);
     setAssistantWorkspaceField("activeMode", mode);
   }
+  // A session saved in a mode this Home no longer backs opens as chat, never as an unreachable room.
+  function showAvailableMode(mode) {
+    const wanted = ["chat", "build", "studio"].includes(mode) ? mode : "chat";
+    const hasStudioRun = wanted === "studio" && getAssistantSession()?.studio?.activeRun && !getAssistantSession().studio.activeRun.terminal;
+    showMode(modeAvailable(wanted) || hasStudioRun ? wanted : "chat");
+  }
   window.addEventListener("assistant:session-selected", event => {
     visibleSessionId = event.detail?.sessionId ?? getAssistantSession()?.id ?? null;
-    showMode(event.detail?.mode);
+    showAvailableMode(event.detail?.mode);
   });
-  showMode(saved.activeMode || saved.sessionMode || "chat");
+  const savedMode = saved.activeMode || saved.sessionMode || "chat";
+  showAvailableMode(savedMode);
+  // Offers arrive after boot; a saved Studio session reopens once its offer is confirmed.
+  void refreshStudioAvailability().then(() => {
+    if (savedMode === "studio" && studioAvailable && document.body.dataset.assistantMode === "chat") showMode("studio");
+  });
   for (const button of document.querySelectorAll("button[data-assistant-mode]")) {
     button.addEventListener("click", () => {
       const turn = getLiveTurnCanonical();
@@ -150,21 +183,13 @@ export async function bindAssistantModes(saved = {}) {
         notice.hidden = false; notice.textContent = "Finish or stop the current run before changing mode."; return;
       }
       captureActiveSessionState();
-      showMode(button.dataset.assistantMode);
+      // The Studio row is the only visible mode control while the Chat|Build segment is hidden, so it toggles.
+      const leavingStudio = button.dataset.assistantMode === "studio" && document.body.dataset.assistantMode === "studio";
+      showMode(leavingStudio ? "chat" : button.dataset.assistantMode);
     });
   }
   window.addEventListener("assistant:workspace-save", event => {
     notice.hidden = !event.detail.error; notice.textContent = event.detail.error || "";
   });
   notice.addEventListener("click", () => persistAgentWorkspaceNow());
-  document.querySelector("#assistant-copy-conversation").addEventListener("click", async () => {
-    const session = getAssistantSession();
-    const conversation = (session?.messages || []).map(message => `## ${message.role}\n\n${message.text ?? message.content ?? ""}`);
-    for (const run of session?.studio?.studioHistory || []) conversation.push(`## Studio\n\n${run.prompt || ""}\n\n${run.output?.resource_id || run.status || "Outcome unknown"}`);
-    try {
-      if (!conversation.length) return;
-      await clipboard.writeText(conversation.join("\n\n"), {purpose: "transcript.markdown"});
-      notice.hidden = false; notice.textContent = "Conversation copied.";
-    } catch { notice.hidden = false; notice.textContent = "Could not copy the conversation."; }
-  });
 }

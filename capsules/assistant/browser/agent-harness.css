@@ -693,6 +693,42 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   min-height: 32px;
 }
 
+/* Chat | Build mode segment (URUX sidebar control). */
+.agent-harness-segment {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin: 0 0 6px;
+  padding: 3px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.agent-harness-segment[hidden] {
+  display: none;
+}
+
+.agent-harness-segment-btn {
+  appearance: none;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-harness-segment-btn.is-active {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
 .agent-harness-nav-row {
   appearance: none;
   display: flex;
@@ -717,6 +753,10 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   letter-spacing: normal;
   text-align: left;
   cursor: pointer;
+}
+
+.agent-harness-nav-row[hidden] {
+  display: none;
 }
 
 .agent-harness-nav-row:hover {
