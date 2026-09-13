@@ -149,7 +149,7 @@ function eligibleTextOffers(payload) {
   );
 }
 
-function eligibleStudioOffers(payload) {
+export function eligibleStudioOffers(payload) {
   const offers = Array.isArray(payload?.offers)
     ? payload.offers
     : Array.isArray(payload?.data?.offers)

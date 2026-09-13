@@ -64,6 +64,11 @@
       </div>
     </div>
     <div class="agent-harness-nav-cluster">
+      <!-- Mode segment stays hidden until Build is a typed capability (assistant-modes.js). -->
+      <div class="agent-harness-segment" role="group" aria-label="Assistant mode" data-assistant-mode-segment hidden>
+        <button type="button" class="agent-harness-segment-btn is-active" data-assistant-mode="chat" aria-pressed="true">Chat</button>
+        <button type="button" class="agent-harness-segment-btn" data-assistant-mode="build" aria-pressed="false">Build</button>
+      </div>
       <button id="agent-harness-new-chat" class="agent-harness-new-chat" type="button" title="Start a new chat">
         <span aria-hidden="true">+</span>
         <span>New chat</span>
@@ -78,6 +83,11 @@
         <span>Home</span>
       </button>
       <nav class="agent-harness-nav" aria-label="Agent destinations">
+        <!-- Shown only while an image or video offer is advertised (assistant-modes.js). -->
+        <button type="button" class="agent-harness-nav-row" data-assistant-mode="studio" aria-pressed="false" hidden>
+          <span class="agent-harness-nav-mark" data-nav-icon="studio" aria-hidden="true"></span>
+          <span>Studio</span>
+        </button>
         <button type="button" class="agent-harness-nav-row" data-sidebar-nav="configure">
           <span class="agent-harness-nav-mark" data-nav-icon="configure" aria-hidden="true"></span>
           <span>Settings</span>
@@ -193,12 +203,6 @@
         <span class="agent-harness-icon-search" aria-hidden="true"></span>
       </button>
     </div>
-    <nav class="assistant-modes" aria-label="Assistant mode">
-      <button type="button" data-assistant-mode="chat" aria-pressed="true">Chat</button>
-      <button type="button" data-assistant-mode="build" aria-pressed="false">Build</button>
-      <button type="button" data-assistant-mode="studio" aria-pressed="false">Studio</button>
-      <button type="button" id="assistant-copy-conversation">Copy conversation</button>
-    </nav>
     <p id="assistant-workspace-notice" role="status" hidden></p>
     <section id="assistant-studio" aria-label="Studio" hidden>
       <h2>Studio</h2>
