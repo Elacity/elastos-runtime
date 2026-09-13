@@ -22,7 +22,7 @@ a new full installed campaign.
 | Surface | Accepted evidence | Remaining proof |
 | --- | --- | --- |
 | Remote Qwen | Real reply and saved chat; exact retained replay without another dispatch; owner Revoke during a run and original-chat recovery with both identifiers; honest Outcome unknown; keyboard Assistant activation; saved historic failure display; fresh Busy classification | Immediate Busy replay and successful retry after capacity frees; restart during a run; unapproved second-principal denial; complete M01-M06 and AI1 identity/Marketplace acceptance |
-| Browser | Bounded local run 92; remote run 100 navigation, media, input and 13 close effects | Actual remote reload and full U9 remain open. Attempts 101-103 stopped at automated Home focus before Engine selection; Anders did not reproduce that focus failure. Manual inspection separately shows Engine startup failure. |
+| Browser | Bounded local run 92; remote run 100 navigation, media, input and 13 close effects; ordinary open 110 completed on selected Mac Engine `remote-engine-ec54fd5eab67a5c5913513a47a797fc8` with seed Exit and `https://ela.city/` | Actual remote reload and full U9 remain open. Automatic open still fails at profile placement. Attempts 101-103 stopped at automated Home focus; Anders did not reproduce that focus failure. Open 110 left a live page that still needs Home close. |
 | Test desktop | Manual helper now uses the native viewport; Anders confirms desktop fit | The viewport correction proves fit only. It does not establish the cause of earlier automated pointer/focus failures. |
 
 Expired Busy replay preserves the run identity and terminal status after the
