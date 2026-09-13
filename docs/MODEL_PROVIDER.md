@@ -40,16 +40,18 @@ placement are independent:
 | Hosted API | Operator-configured hosted inference | Share after remote acceptance and upstream terms, privacy, and cost review |
 
 Both consumption paths use the existing model operations and service-offer
-contract. Cross-Runtime model use remains planned work. Carrier currently
-excludes `model` from its provider target allowlist. `RuntimeCreateBinding` and
-`RuntimeAccessBinding` describe local-channel authority and carry no
-authenticated remote issuer.
+contract. Carrier admits the `model` target through the destination Runtime's
+remote-model authorization path. The destination verifies the authenticated
+source endpoint and service grant, then constructs its own local provider binding
+for the consumer principal, capsule and run. `RuntimeCreateBinding` and
+`RuntimeAccessBinding` remain local-channel authority records. Installed
+acceptance and remaining remote-service work are recorded in [state.md](../state.md).
 
 An operator explicitly selects a configured capability for publication under
 Runtime policy. The owning Runtime publishes it as an
 `elastos.service.offer/v1` service and owns grants, quotas, selection, audit,
-and routing. Before reusing provider invocation for remote model work, the
-destination Runtime must verify the signed offer and grant, then map the
+and routing. For remote model work, the
+destination Runtime verifies the signed offer and grant, then maps the
 authenticated source Runtime and consumer principal, capsule, and run into
 destination-owned authority. Adding an allowlist entry alone cannot establish
 this binding. Carrier authenticates and transports the route that Runtime

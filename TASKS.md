@@ -24,7 +24,11 @@ Initial analysis source:
 [`8ac18bec65ca650615be879f7ab3f66799d9fc53`](https://github.com/Elacity/elastos-runtime/tree/8ac18bec65ca650615be879f7ab3f66799d9fc53).
 Revalidate those findings against the implementation base before each repair.
 
-### Delivery queue and 24-hour checkpoint plan
+### Historical delivery queue and 24-hour checkpoint plan
+
+This dated queue preserves the original scope and allocations. The Now section
+owns current execution and resource assignments; these historical Active labels
+do not grant a present lease.
 
 Execution revision: 2026-09-08. The user requests the full Browser outcome by
 2026-09-09, approximately 13:34 UTC, 24 hours after the deadline instruction.
@@ -167,32 +171,40 @@ verification separate from product acceptance and required human review.
 
 ## Now
 
-Mission revision R2, 2026-09-10. The [approved five-journey plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9)
-owns release acceptance and decisions D1-D6. The latest user clarification makes
-the first target the seed server running reviewed code from the active local
-work, rather than a link to a private local Runtime. [Execution](docs/EXECUTION.md)
-owns the verification recipes and monitoring decisions; [state.md](state.md)
-owns source, installed and public facts.
+Mission revision R3, 2026-09-12 (reconciled 2026-09-13 UTC). The
+[approved five-journey plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9)
+owns J1-J5 acceptance and D1-D6 decisions, including the remote inference
+amendment. This section owns execution order; [state.md](state.md) owns source,
+installed and public evidence. Earlier delivery dates and allocations are history.
 
-Session handover: [2026-09-10 execution handover](docs/audits/2026-09-10-execution-handover.md).
-The combined automated installed checkpoint passes; AUTH-01 retains its full
-human verdict. The reviewed combined source `06bf4e0f` is published through
-`feat/0.7.1-integration` in [draft PR64](https://github.com/Elacity/elastos-runtime/pull/64).
-The website checkpoint and later donor history are protected there; the redundant
-website refs and checkout are retired. The active integration checkout is named
-in the private checkpoint. Public preview `25966622` is now deployed with
-verified artifacts and preserved account/user data; Anders confirmed existing-account
-sign-in and saved work. Mac Homes retain their tested candidate. The [team report](docs/audits/2026-09-11-team-sync.md)
-and [contributor review](docs/audits/2026-09-11-contributor-review.md) describe
-included work and remaining gates. C3/J3 pauses after the bounded Mac checkpoint
-and publication. Next: exact Marketplace-to-Assistant handoff and safe removal,
-then cold Content/Carrier delivery. Browser follows its named queue. Preserve the
-remaining 69 branches and 11 worktrees under their existing history/owner gates;
-recurring monitoring stays paused.
+`feat/remote-services` is the active candidate, extending the published PR64
+checkpoint with the Browser donor and remote Qwen work. Keep its reviewed history
+and the separate dirty updater slice. Public preview remains on its accepted
+September 11 artifacts. The [team report](docs/audits/2026-09-11-team-sync.md)
+and [contributor review](docs/audits/2026-09-11-contributor-review.md) retain their
+5-11 September scope; current progress is recorded in state.
 
-This is the current execution queue. Older references below are retained
-follow-up obligations, not permission to bypass this order or the release gate.
-The C1-C7 sequence in the approved plan controls integration and publication.
+Use one execution owner for both installed test Homes. The existing Cursor
+Model and Browser tasks are paused references until one receives the next bounded
+slice. A reviewer checks the result at the evidence boundary. Recurring monitoring
+stays paused. Prepare the clean candidate for draft review; publication and public
+cutover retain their separate approvals.
+
+Next Browser slice: use the fitted desktop and normal Engine/Exit selection to
+capture the reported startup failure. Verify the exact selected service and grant,
+then distinguish environment, harness and product failure before a repair. Earlier
+automated Home focus failures remain unexplained; Anders did not reproduce them.
+After launch works, prove actual viewer reload within five seconds, input/media
+and close before performance or endurance campaigns.
+
+The independent Qwen slice is one immediate Busy replay and retry after capacity
+frees. Review the prepared helper only when that slice starts. Preserve accepted
+reply, replay and revoke evidence. Complete restart during an active run and
+second-principal denial, then join accepted U8/U9 in U10. Marketplace handoff,
+safe removal and cold Content/Carrier delivery remain required under J3; AI1-AI6
+in the approved plan separate that work from later provider and business stages.
+
+The C1-C7 sequence below retains the full release gate.
 
 | ID | Outcome | Status / owner | Required input and next proof |
 | --- | --- | --- | --- |
@@ -203,8 +215,10 @@ The C1-C7 sequence in the approved plan controls integration and publication.
 | C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
 | J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Human passkey proof pending / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Both targets pass installed browser recovery/reload/retry, complete owned shutdown/restart, full Home setup/media reuse and Carrier cleanup/reuse. User-review account label, Recovery/Advanced spacing and cross-port session isolation are repaired on `1e320578`; shared-browser Mac/Linux proof passes. Next: AUTH-01 final user acceptance on the updated preserved Homes; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
 | J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
-| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Paused after checkpoint publication / coordinator; independent review | Continue on `feat/0.7.1-integration` after a new implementation instruction. Draft PR64 contains the complete combined checkpoint; the human Mac Home now has one Assistant and admitted Qwen. Bootstrap is accepted. The full corrected donor `6972e165` is merged by `b318bfda`, and Sash shelf ancestry is reconciled by `37c82d4f`. Irzhy foundation `617796a9` is merged by `dd21d8bd`; further intake is frozen for one installed Qwen journey. Mac catalog, Use/cancel/retry, exact admission, cold startup, actual reply and saved conversation pass on installed Runtime `fbf1a4b0`. Reply/draft/exact selection survive reload without implicit dispatch. Stop shows honest unknown, as allowed by Step 5; confirmed cancellation remains unproven. Owned shutdown, restart and second reply pass with identical package files, restored draft and zero received Bitswap payload. Installed model-menu empty-state/placement and workspace-preservation checks pass on `8f28b6e3`. The source-install metadata helper repair and its regression checks pass. The adapted URUX/UIUX candidate already entered through Irzhy reconstruction; the full old-tip merge recommendation is superseded. The approved one-Assistant implementation now preserves Sash’s UI in the canonical capsule, adopts all three stores into protected v2 storage, retains complete history/drafts, and preserves concurrent edits and run ownership. Source and rendered checks pass. Candidate `fa297cb5` now also passes installed one-Assistant catalog/legacy launch, real Qwen reply/save/reload and full Runtime restart with the original draft and exact model intact. The human Mac Home now has an enrolled passkey account and a verified locally cached Qwen package. Its System/Marketplace launch metadata defect is repaired by the `822c4e3d` installer guard and corrected receipts; both apps open in the actual browser. Anders confirms Assistant works. Current `3c2f9a80` repairs pending Keep intent, normal Marketplace Models category/details, theme tokens and duplicate activity/headings. Source/rendered checks and installed Mac retention readback, Qwen reply/save/reload and human model-view observation pass, with matching receipts and user data preserved. Pending preparation itself uses source/rendered proof; the installed model was reused. Linux still needs disk headroom and a reviewed startup profile. Next required work is exact Marketplace-to-Assistant handoff, safe removal and cold Carrier delivery. Broader execution and monitoring pause at this user-feedback checkpoint; full human J3 remains required. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md). URUX and Irzhy authority-cutover → follow-up work retain their Required gates and dependency order. Track every adapted or pending feature in [the preservation check](docs/audits/2026-09-11-integration-preservation.md). Preserve current recovery, sessions, media reuse and shutdown. The full merge includes storage/window source; retain their separate installed J1 acceptance. Prove normal controls and one bounded test-owned Home preparation attempt before large transfers. Complete acceptance steps 1, 2, 3 and 5 in section 6; hosted/Codex remains Optional, remote inference and Jetson Later. |
-| J4 / C4 | Browser works in the two agreed placements | Planned / Browser owner | Retain canonical B01-B16 on the Browser branch; Mac A/A/A and Linux Home/Exit with Mac Engine A/B/A, including reload. Full claimed-role proof remains C6. |
+| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Paused after checkpoint publication / coordinator; independent review | The local-model checkpoint is preserved in draft PR64. Resume its remaining work from the active candidate named in Now. Draft PR64 contains the complete combined checkpoint; the human Mac Home now has one Assistant and admitted Qwen. Bootstrap is accepted. The full corrected donor `6972e165` is merged by `b318bfda`, and Sash shelf ancestry is reconciled by `37c82d4f`. Irzhy foundation `617796a9` is merged by `dd21d8bd`; further intake is frozen for one installed Qwen journey. Mac catalog, Use/cancel/retry, exact admission, cold startup, actual reply and saved conversation pass on installed Runtime `fbf1a4b0`. Reply/draft/exact selection survive reload without implicit dispatch. Stop shows honest unknown, as allowed by Step 5; confirmed cancellation remains unproven. Owned shutdown, restart and second reply pass with identical package files, restored draft and zero received Bitswap payload. Installed model-menu empty-state/placement and workspace-preservation checks pass on `8f28b6e3`. The source-install metadata helper repair and its regression checks pass. The adapted URUX/UIUX candidate already entered through Irzhy reconstruction; the full old-tip merge recommendation is superseded. The approved one-Assistant implementation now preserves Sash’s UI in the canonical capsule, adopts all three stores into protected v2 storage, retains complete history/drafts, and preserves concurrent edits and run ownership. Source and rendered checks pass. Candidate `fa297cb5` now also passes installed one-Assistant catalog/legacy launch, real Qwen reply/save/reload and full Runtime restart with the original draft and exact model intact. The human Mac Home now has an enrolled passkey account and a verified locally cached Qwen package. Its System/Marketplace launch metadata defect is repaired by the `822c4e3d` installer guard and corrected receipts; both apps open in the actual browser. Anders confirms Assistant works. Current `3c2f9a80` repairs pending Keep intent, normal Marketplace Models category/details, theme tokens and duplicate activity/headings. Source/rendered checks and installed Mac retention readback, Qwen reply/save/reload and human model-view observation pass, with matching receipts and user data preserved. Pending preparation itself uses source/rendered proof; the installed model was reused. Linux still needs disk headroom and a reviewed startup profile. Next required work is exact Marketplace-to-Assistant handoff, safe removal and cold Carrier delivery. Broader execution and monitoring pause at this user-feedback checkpoint; full human J3 remains required. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md). URUX and Irzhy authority-cutover → follow-up work retain their Required gates and dependency order. Track every adapted or pending feature in [the preservation check](docs/audits/2026-09-11-integration-preservation.md). Preserve current recovery, sessions, media reuse and shutdown. The full merge includes storage/window source; retain their separate installed J1 acceptance. Prove normal controls and one bounded test-owned Home preparation attempt before large transfers. Complete acceptance steps 1, 2, 3 and 5 in section 6; hosted/Codex remains Optional; remote inference is Required under C3R/M01-M06, and Jetson remains Later. |
+| C3R / U8 | Approved seed user runs the Mac model | Partial installed acceptance / next execution owner | Accepted results are in state. Next: immediate Busy replay and successful retry, restart during a run without another dispatch, and denial of an unapproved second principal. AI1 adds exact package/offer/terms identity and Marketplace handoff before final M01-M06 acceptance. |
+| J4 / C4 / U9 | Browser works in the two agreed placements | Functional proof open / next execution owner | Browser donor is integrated. Start with the observed Engine startup failure on the fitted desktop. Prove A/A/A and A/B/A, actual reload within five seconds, audio/video/input and all 13 close effects. Then finish authority, recovery, state and daily-use checks; B11 performance and B16 qualification retain their gates. |
+| U10 | Qwen and Browser work together | Waiting for U8 and U9 / execution owner | One seed principal uses both on the same Mac; each keeps its own acceptance criteria. Include AI1 when its UX/identity changes enter the candidate. |
 | J5 | Protect, list, buy, play and close controlled video | Planned / protected-content owner | PR60 original history is integrated in the published candidate; coordinate its open PR disposition with Irzhy. The focused video preparation repair adopted during C1 comes from the foundation inherited by PR62, rather than its four follow-up commits. Review PR59 authority cutover against final callers, then take PR62 work by readiness. J5 installed/human acceptance remains Required; extensions enter by readiness before freeze. |
 | C5 | Assemble and freeze the reviewed candidate | Planned / coordinator | Reviewed required source; exact optional task list. Optional work cannot delay freeze. |
 | C6 | Accept the combined signed candidate | Planned / independent reviewer and human testers | All required journeys, shared Home/app regression, Browser qualification and first-hop update proof on matching artifacts. |

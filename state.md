@@ -1,5 +1,44 @@
 # State
 
+## Current remote-services checkpoint, 2026-09-12
+
+Reconciled 2026-09-13 UTC. The unpublished `feat/remote-services` candidate is
+`4ab99128b5d9491ef0d1c3536954f519aeee0def`, tree
+`2ae65c6737fe13986d0a7b50eaf346deae896f71`, with 161 commits beyond fetched
+`origin/feat/0.7.1-integration` (`093b51ca`) and none missing from that base.
+This identifies the tested source before the documentation reconciliation.
+Product changes end at `8444ff51`; `4ab99128` changes the Browser test's baseline
+budget to ten seconds while keeping actual viewer reload at five seconds.
+The Browser donor `bf846cd8` is included. Its separate dirty updater work retains
+its owner and has not entered this candidate.
+
+The isolated Mac and Linux Runtime binaries remain `50d835ed`; the Mac model
+provider and seed Assistant use `8444ff51` components. Installation receipts bind
+that mixed set explicitly. A fresh read confirms the Runtime/provider hashes and
+available test Homes. Public Runtime retains its September 11 binary and responds
+on the public Home route. These checks preserve earlier acceptance; they are not
+a new full installed campaign.
+
+| Surface | Accepted evidence | Remaining proof |
+| --- | --- | --- |
+| Remote Qwen | Real reply and saved chat; exact retained replay without another dispatch; owner Revoke during a run and original-chat recovery with both identifiers; honest Outcome unknown; keyboard Assistant activation; saved historic failure display; fresh Busy classification | Immediate Busy replay and successful retry after capacity frees; restart during a run; unapproved second-principal denial; complete M01-M06 and AI1 identity/Marketplace acceptance |
+| Browser | Bounded local run 92; remote run 100 navigation, media, input and 13 close effects | Actual remote reload and full U9 remain open. Attempts 101-103 stopped at automated Home focus before Engine selection; Anders did not reproduce that focus failure. Manual inspection separately shows Engine startup failure. |
+| Test desktop | Manual helper now uses the native viewport; Anders confirms desktop fit | The viewport correction proves fit only. It does not establish the cause of earlier automated pointer/focus failures. |
+
+Expired Busy replay preserves the run identity and terminal status after the
+provider journal expires. The Runtime's status-only fallback is intentional;
+missing expired error details are not a demonstrated defect. Earlier failed
+receipts remain historical evidence. Stop and revoke report the backend's
+`settlement_unknown` as Outcome unknown; confirmed cancellation is a separate claim.
+
+The source can enter bounded draft review after documentation and basic gates
+pass. Public cutover needs U8, U9 and U10, the selected public configuration, and
+approval of the exact candidate. Full J1-J5, Browser B01-B16, model M01-M06,
+Marketplace AI1, cold model delivery, signed installation/update and contributor
+acceptance remain open under the approved plan. Follow the current Now section in
+[TASKS.md](TASKS.md); previous checkpoints below retain their dated scope.
+
+
 ## Current public preview and review checkpoint, 2026-09-11
 
 `feat/0.7.1-integration` is the active working/review branch in
