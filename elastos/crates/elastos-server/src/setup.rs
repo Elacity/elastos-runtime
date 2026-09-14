@@ -3123,7 +3123,9 @@ mod tests {
             "vendor/three/README.md",
         ] {
             assert!(
-                root.join("capsules/elacity-reader/browser").join(file).is_file(),
+                root.join("capsules/elacity-reader/browser")
+                    .join(file)
+                    .is_file(),
                 "missing Elacity Reader carried library file {file}"
             );
         }

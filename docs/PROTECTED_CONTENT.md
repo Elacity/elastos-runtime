@@ -4,8 +4,14 @@ Protected content is Runtime-mediated. Library and Marketplace own the creator
 and buyer experience, `elacity-player` owns video presentation,
 `elacity-reader` owns everything else a bought file can be — a picture, a
 document, text, a 3D model, a book or a comic — and `creator` uploads a file
-through the Library transport and protects-and-lists it in one flow. Runtime owns authority, durable operations, provider selection, Wallet
-and Chain coordination, lifecycle, audit, and settlement.
+through the Library transport and protects-and-lists it in one flow. Runtime
+owns authority, durable operations, provider selection, Wallet and Chain
+coordination, lifecycle, audit, and settlement.
+
+Library offers protection on any file the Runtime accepts. The source mime
+decides the kind: `video/*` and `audio/*` are media and take the rendition
+path; everything else is an object and takes the chunked-payload path. The
+kind then decides the viewer, so the creator never picks one.
 
 The intended content-distribution contract gives free and protected content
 the same package identity and availability path. Protected content adds rights,
@@ -26,8 +32,10 @@ The source path has one operation sequence:
    terms.
 2. Runtime creates the durable operation identity and selects the private
    `media-provider`.
-3. `media-provider` prepares bounded clear fMP4 in Runtime-authorized private
-   staging. It owns probe and transcode process behavior.
+3. For media, `media-provider` prepares one bounded clear fMP4 rendition in
+   Runtime-authorized private staging. It owns probe and transcode process
+   behavior. For an object, no rendition step runs: the file is sealed as it
+   is.
 4. The private protect provider encrypts the prepared media, provisions the
    immutable 2-of-3 custody envelope, and returns bounded identities and
    receipts.
@@ -46,7 +54,8 @@ The source path has one operation sequence:
 9. Library or Marketplace asks Home to launch the viewer the content calls for
    — `elacity-player` for media, `elacity-reader` for everything else — with an
    opaque, short-lived launch authority. Runtime binds the open to the
-   principal, object, accepted viewer, launch, decrypt session, and token.
+   principal, object, verified executable actor, launch, decrypt session, and
+   token.
 10. Three independent custody nodes evaluate rights locally. Any two approved
     nodes return recipient-encrypted contributions.
 11. The private protected-content decrypt provider reconstructs and uses the
@@ -67,6 +76,57 @@ clear media, ciphertext staging, CEKs, shares, process details, and private
 routes inside their owned boundaries. Carrier transports only
 Runtime-selected remote custody traffic. Storage, provider, Carrier, and Chain
 topology stays private.
+
+## Media renditions and the CENC header
+
+Audio is a first-class rendition, not a video with the picture missing.
+`media-provider` probes the source and keeps exactly one track. A source that
+carries a real video track becomes the pinned `video/mp4` / `avc1.640028`
+rendition, exactly as before. A source with only sound becomes an
+`audio/mp4` / `mp4a.40.2` AAC fMP4 rendition. Cover art is skipped rather
+than taken for a video track, so a tagged music file keeps its sound instead
+of being re-encoded into a still picture. The output profile and the
+provider's configuration fields are unchanged.
+
+The player presents whichever rendition it is given. A rendition with no
+image track and no poster collapses to the controls alone; that is the
+honest state, not a failure. Runtime has no source for a poster yet, so
+audio currently always lands on the controls-only frame.
+
+Protected media carries a CENC Protection System Specific Header. One `pssh`
+box declares the Elacity post-quantum hybrid-threshold protection scheme
+under system id b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0. Its payload is public
+scheme description and never key material: the versioned schema name, the
+protection scheme, the sample-encryption profile, the key-encapsulation
+suite, the content access id a consumer presents when it asks for a key, and
+the custody pool, epoch and committee authorization identities that say which
+quorum can answer. Those custody identities are bound at publish to the
+mint's own, so a box lifted from one title cannot stand for another. One
+module writes, parses and admits the box, so the producer, the read path that
+rewrites a protected init segment back to clear, and the layout validator
+cannot drift apart.
+
+Sample encryption is AES-128-CTR, which has no per-sample authentication
+tag. This is inherent to the CENC standard, which defines no authenticated
+scheme. Tamper-evidence on the media path therefore comes from the staged
+segment's SHA-256 and byte-length check, which runs before any keystream is
+applied — not from the cipher. Any future consumer that fetches segments over
+a network rather than reading Runtime-staged bytes has to carry that check
+itself or it has no integrity protection at all. The object path does not
+have this shape: its chunks are AES-256-GCM and the integrity is in the
+cipher. [Protected-content crypto review](PROTECTED_CONTENT_CRYPTO_REVIEW.md)
+records both, with the tests that pin them.
+
+## Viewer admission
+
+A viewer operation is admitted on the verified executable actor behind the
+launch token, never on anything the caller sends. The gateway refuses a
+viewer operation unless the launch token's selected resource and executable
+actor are the same and that actor is one of the two admitted viewers. It then
+strips every routing and binding field from the request body and substitutes
+the verified values. The session binding is derived over that verified actor,
+so a binding minted for one viewer can never match the other, and a viewer
+launched for one kind of content cannot open the other kind.
 
 ## Private providers
 
@@ -155,7 +215,11 @@ Runtime, decrypt, viewer, and staging ownership.
 The current confidentiality suite is
 `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1` for new protected content.
 External cryptographic review remains open before public dKMS or production
-confidentiality claims.
+confidentiality claims. [Protected-content crypto review](PROTECTED_CONTENT_CRYPTO_REVIEW.md)
+is the reviewer-facing package: every primitive with its crate version and
+parameters, what each construction binds, a threat model naming the test that
+pins each claim, and committed golden vectors replayed against the shipped
+code.
 
 ## Capsule boundary
 
@@ -283,5 +347,6 @@ re-register those routes. `scripts/check-wci-alignment.sh` fails if any of them
 reappears in `capsules/`, `components.json`, an install profile, or the
 capability mapping.
 
-Global listing discovery, public custody governance, and document or 3D typed
-viewers are separate later work.
+Picture, document, text, 3D, book and comic viewers ship in
+`elacity-reader`. Global listing discovery and public custody governance are
+separate later work.

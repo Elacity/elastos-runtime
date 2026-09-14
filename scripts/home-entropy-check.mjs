@@ -179,19 +179,61 @@ function assertProtectedPrincipalRootAccessor(source, needle, helper, label) {
   );
 }
 
+// Names skipped everywhere, whether or not git ignores them: the git dir
+// itself, runtime state, and agent-harness context that some clones track.
+const ALWAYS_SKIPPED_NAMES = new Set([
+  ".git",
+  ".elastos",
+  ".superpowers",
+  "superpowers",
+  ".claude",
+  "target",
+  "node_modules",
+]);
+
+// Everything git ignores, resolved once. A CI checkout is clean, so this set
+// is empty there and the walks below see exactly the tracked tree; a working
+// clone accumulates untracked harness litter (.remember/, .vscode/, editor
+// overrides) that must not be judged as repository source of truth. Deriving
+// the skip set from git instead of a hand-maintained denylist keeps the two
+// environments identical as new tooling appears.
+let ignoredPathsCache = null;
+
+function ignoredPaths() {
+  if (ignoredPathsCache) {
+    return ignoredPathsCache;
+  }
+  ignoredPathsCache = new Set();
+  try {
+    const listing = execFileSync(
+      "git",
+      ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+      { cwd: repoRootPath, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    for (const line of listing.split("\n")) {
+      const path = line.trim().replace(/\/$/, "");
+      if (path) {
+        ignoredPathsCache.add(path);
+      }
+    }
+  } catch {
+    // No git, or not a work tree: fall back to ALWAYS_SKIPPED_NAMES alone.
+  }
+  return ignoredPathsCache;
+}
+
+function isSkipped(dir, name) {
+  if (ALWAYS_SKIPPED_NAMES.has(name)) {
+    return true;
+  }
+  return ignoredPaths().has(relativeToRepo(resolve(dir, name)));
+}
+
 function listMarkdownFiles(dir = repoRootPath) {
   const entries = readdirSync(dir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (
-      entry.name === ".git" ||
-      entry.name === ".elastos" ||
-      entry.name === ".superpowers" ||
-      entry.name === "superpowers" ||
-      entry.name === ".claude" ||
-      entry.name === "target" ||
-      entry.name === "node_modules"
-    ) {
+    if (isSkipped(dir, entry.name)) {
       continue;
     }
     const full = resolve(dir, entry.name);
@@ -208,15 +250,7 @@ function listTextFiles(dir) {
   const entries = readdirSync(dir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (
-      entry.name === ".git" ||
-      entry.name === ".elastos" ||
-      entry.name === ".superpowers" ||
-      entry.name === "superpowers" ||
-      entry.name === ".claude" ||
-      entry.name === "target" ||
-      entry.name === "node_modules"
-    ) {
+    if (isSkipped(dir, entry.name)) {
       continue;
     }
     const full = resolve(dir, entry.name);

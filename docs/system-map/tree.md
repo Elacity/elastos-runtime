@@ -51,6 +51,9 @@ index so the two do not drift into competing topology descriptions.
 | Inbox approvals | `capsules/inbox` |
 | Product Chat | `capsules/chat-room` |
 | Library and objects | `capsules/library`, `capsules/object-provider` |
+| Protected-content publishing | `capsules/creator` |
+| Protected video viewer | `capsules/elacity-player` |
+| Protected document, book and 3D viewer | `capsules/elacity-reader` |
 | Browser App | `capsules/browser` |
 | Wallet UI and approval methods | `capsules/wallet`, `capsules/wallet-*` |
 

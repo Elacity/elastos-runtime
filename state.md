@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-04 UTC
+Last updated: 2026-09-14 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -313,6 +313,70 @@ a plain Linux Docker Engine in a VM) is green: three distinct DID-keyed
 descriptors, composition generated and verified, three Carrier dial proofs,
 provision and preflight `ok: true`, clean teardown.
 
+### 0.7.1 follow-up: source-verified, not installed-proven
+
+Verified on `feat/protected-content-0.7.1-followup` on 2026-09-14, in source
+only, on the ten commits above `25ab205e`. The per-item record is in
+[TASKS.md](TASKS.md#protected-content-071-follow-up-42-48-49); the plan and
+per-task briefs are in
+[docs/audits/2026-09-08-protected-content-0.7.1-followup-plan.md](docs/audits/2026-09-08-protected-content-0.7.1-followup-plan.md).
+
+Source gate on that head:
+
+- `just verify` passes every step except two that fail for reasons predating
+  this work (below). `git diff --check` is clean. `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -D warnings`, the whole workspace
+  suite, every own-workspace capsule suite, and the `browser-local-exit`
+  workspace are green.
+- `just verify-ci` passes: both the `test-capsules` and the `test-elastos`
+  container replicas are green on cold caches. One `test-elastos` run died
+  with a container EOF when the local Docker daemon crashed; the rerun after
+  restarting it is green, and nothing in the tree was touched between the two.
+- `node scripts/home-entropy-check.mjs` reports only standing-docs release
+  snapshots inside the local, git-ignored, untracked `.remember/` folder. The
+  check walks the filesystem and does not skip that directory. With the folder
+  moved aside the whole check passes, and a fresh CI checkout has no such
+  folder, so the CI `source-gate` leg is unaffected. Nothing tracked is at
+  fault.
+- `node scripts/carrier-dependency-generation-check.mjs` fails with
+  `expected one elastos-identity 0.6.0 package, found 0`. The crate takes the
+  workspace version, which became 0.7.0 at the release-preparation commit, and
+  the check still pins 0.6.0. No manifest on this branch touches it. It is not
+  part of the CI `source-gate`, `lint`, `test-elastos` or `test-capsules` jobs.
+- `cargo clippy --all-targets -D warnings` in `capsules/media-provider` fails
+  on a `manual_saturating_arithmetic` lint at an expression this branch never
+  edited. No recipe and no CI job runs clippy on that workspace, so it does not
+  gate anything today.
+
+Not proven, and not claimable from the above:
+
+- The installed journeys were never run. Three remain: Creator to Library to
+  Player; Creator to Marketplace to Reader; and audio playback. Each needs an
+  installed home from `scripts/setup-source-home.sh` with funded creator and
+  buyer principals and the three-node custody composition, driven the way
+  `scripts/protected-content-installed-e2e-proof.sh` drives the media journey.
+  What to look for: the Creator form completing upload, protect and list in
+  one flow; the mint journal carrying the object content identity for the
+  non-media case; Library and Marketplace launching the viewer the kind calls
+  for without the creator choosing; a 2-of-3 release settling; the reader
+  drawing every kind it claims and saying so plainly when it cannot; and the
+  player presenting an audio rendition with working transport controls.
+- Protected audio has no thumbnail. The player's precedence is image track,
+  then poster, then controls alone, but no Runtime path populates
+  `thumbnail_uri`, so audio always lands on the controls-only frame. The
+  precedence logic is right; the source for a poster does not exist yet.
+- CENC media is AES-128-CTR with no per-sample authentication tag. The CENC
+  standard defines no authenticated scheme, so tamper-evidence on the media
+  path is the staged segment's SHA-256 and byte-length check, run before any
+  keystream is applied, not the cipher. This matters for any future
+  frontend-only client that fetches segments over a network instead of reading
+  Runtime-staged bytes: it must carry that check itself or it has no integrity
+  protection. The object path is AES-256-GCM and does not have this shape.
+  [docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md](docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md)
+  records it in full with the tests that pin it, and
+  [docs/PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md) repeats it where the
+  `pssh` box is described.
+
 ## PR15 Extraction Ledger
 
 PR #15 / `feat/dkms-esp-port` is source evidence, not a merge target. The
@@ -328,9 +392,12 @@ integrated source adapted these useful parts to the typed Runtime path:
 - `e148218b`: applicable CI lessons remain in the focused source and platform
   gates.
 
-Current video opens in `elacity-player`. Document and 3D viewers remain later
-typed-viewer scope. External cryptographic review remains open before public
-dKMS or production confidentiality claims. Global listing discovery and public
+Protected video and audio open in `elacity-player`; pictures, documents,
+text, 3D models, books and comics open in `elacity-reader`. External
+cryptographic review remains open before public
+dKMS or production confidentiality claims; the suite card, threat model, build
+card and committed golden vectors a reviewer needs are in
+`docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md`. Global listing discovery and public
 custody governance remain later work. The shared listing link, portable import,
 buyer Runtime rights admission, and exact two-Runtime 2-of-3 source journey are
 complete. The atomic authority cutover is complete. The remaining installed
