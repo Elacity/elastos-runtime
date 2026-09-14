@@ -43,6 +43,11 @@ test("Library classifies video and audio as the media kind and everything else a
 test("Library offers protection for every file type the object side accepts", () => {
   for (const mime of [
     "video/mp4",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/flac",
+    "audio/ogg",
+    "audio/wav",
     "application/pdf",
     "image/png",
     "application/epub+zip",
@@ -55,33 +60,6 @@ test("Library offers protection for every file type the object side accepts", ()
       true,
       mime,
     );
-  }
-});
-
-test("Library withholds protection for audio until the media path accepts it", () => {
-  // Task 16 makes the media path accept audio; this test flips to `true` then.
-  // Until it does, the action must not be offered, because a listing started
-  // from here cannot complete. The kind and the viewer routing stay media.
-  for (const [name, mime] of [
-    ["song.mp3", "audio/mpeg"],
-    ["song.m4a", "audio/mp4"],
-    ["song.flac", "audio/flac"],
-    ["song.ogg", "audio/ogg"],
-    ["song.wav", "audio/wav"],
-  ]) {
-    assert.equal(
-      isRuntimeCustodyProtectable(
-        protectableObject({
-          uri: `localhost://Users/test/Music/${name}`,
-          name,
-          mime,
-        }),
-      ),
-      false,
-      mime,
-    );
-    assert.equal(protectedContentKindFor(mime), "media", mime);
-    assert.equal(viewerForProtectedContent({ mime }), "elacity-player", mime);
   }
 });
 

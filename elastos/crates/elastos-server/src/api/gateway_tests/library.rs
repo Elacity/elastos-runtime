@@ -9225,6 +9225,138 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     assert!(!dir.path().join("protected-content/runtime-mint").exists());
 }
 
+/// An audio file protects and lists through the media path, carrying the AAC
+/// fMP4 rendition pair rather than the H.264 one. Before audio was accepted
+/// the media path refused the source outright, so no `.mp3` could reach a
+/// listing at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_audio_publish_lists_the_aac_rendition() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    reset_mock_content_publish_requests();
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+    let _process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_audio_media_provider_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "audio-creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-audio-creator",
+    );
+    let buyer = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "audio-buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-audio-buyer",
+    );
+    let creator_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let buyer_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    let buyer_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account_id,
+        10,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &buyer.principal_id,
+        "eip155:8453",
+        &buyer_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state.clone());
+
+    let creator_root = crate::auth::principal_localhost_root(&creator.principal_id);
+    let uri = format!("{creator_root}/Documents/protected-audio-proof.mp3");
+    write_library_bytes(&app, &creator_token, &uri, b"audio source").await;
+    let publish_body = json!({
+        "uri": uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "copies": "0x2",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    let (publish_pending_status, publish_pending) =
+        post_library(app.clone(), &creator_token, "publish", publish_body.clone()).await;
+    assert_eq!(publish_pending_status, StatusCode::OK);
+    assert_eq!(publish_pending["status"], "error", "{publish_pending}");
+    assert_eq!(
+        publish_pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let creator_signed_transaction = {
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .expect("completed creator transaction")
+    };
+    reset_mock_chain_broadcast_count(&creator_signed_transaction);
+    let (publish_ok_status, publish_ok) =
+        post_library(app.clone(), &creator_token, "publish", publish_body).await;
+    assert_eq!(publish_ok_status, StatusCode::OK);
+    assert_eq!(publish_ok["status"], "ok", "{publish_ok}");
+    let mint_id_hex = publish_ok["data"]["content_security"]["mint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (_, listed) =
+        post_library(app.clone(), &buyer_token, "list_runtime_custody", json!({})).await;
+    let summary = listed["data"]["listings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["mint_id"] == mint_id_hex.as_str())
+        .expect("the audio listing must be listed");
+    assert_eq!(summary["mime_type"], "audio/mp4");
+    assert_eq!(summary["codecs"], "mp4a.40.2");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {

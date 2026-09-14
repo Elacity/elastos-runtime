@@ -10,10 +10,10 @@ use elastos_protected_content_custody::{
     PayloadSealerV1,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, ProtectProviderRequestOpV1,
-    ProtectProviderRequestV1, ProtectProviderResponseV1, ProtectionSessionNodeV1,
-    ProviderFailureCodeV1, ValidatedClearFmp4MediaSessionLayoutV1, MAX_OBJECT_CHUNKS_V1,
-    MAX_OBJECT_PLAINTEXT_BYTES_V1, MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
+    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, ElastosPqPsshDataV1,
+    ProtectProviderRequestOpV1, ProtectProviderRequestV1, ProtectProviderResponseV1,
+    ProtectionSessionNodeV1, ProviderFailureCodeV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    MAX_OBJECT_CHUNKS_V1, MAX_OBJECT_PLAINTEXT_BYTES_V1, MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
     MAX_PROVIDER_FRAME_BYTES_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
     PROTECT_PROVIDER_REQUEST_SCHEMA_V1, PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
@@ -359,14 +359,23 @@ impl ProtectProvider {
                         ));
                     }
                 };
-                let key_id = match request.content_access_id() {
-                    Ok(Some(value)) => *value.as_bytes(),
-                    _ => {
-                        return typed_response(ProtectProviderResponseV1::new_failure(
-                            ProviderFailureCodeV1::InvalidRequest,
-                        ));
-                    }
+                let Ok(Some(content_access_id)) = request.content_access_id() else {
+                    return typed_response(ProtectProviderResponseV1::new_failure(
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
                 };
+                // The CENC protection header the protected init segment will carry.
+                // It is built HERE because this is the only place that holds every
+                // identity it names at once: the content access id the sample
+                // entries are keyed to, and the custody pool, epoch and committee
+                // authorization this session was opened against. It carries no key
+                // material — it ships inside a public media file.
+                let pssh_data = ElastosPqPsshDataV1::new(
+                    content_access_id,
+                    &custody_pool,
+                    &custody_epoch,
+                    &custody_committee_authorization,
+                );
                 let iv_prefix = match random_bytes::<4>() {
                     Ok(value) => value,
                     Err(_) => {
@@ -378,7 +387,7 @@ impl ProtectProvider {
                 let protected_init_segment = match protect_validated_clear_fmp4_init_to_cenc_v1(
                     &clear_session_layout,
                     clear_init_segment,
-                    key_id,
+                    &pssh_data,
                 ) {
                     Ok(value) => value,
                     Err(_) => {

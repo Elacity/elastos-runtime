@@ -164,17 +164,6 @@ export function canPreviewObject(object) {
 // must not offer the action for them either.
 const UNPLACEABLE_PROTECTED_CONTENT_MIME = "application/octet-stream";
 
-// Audio is classified as the media kind below and routes to the media viewer
-// already, but the media path cannot finish an audio listing yet: preparing
-// the rendition still requires a video track. Offering the action would hand
-// the user a dead end, so audio is withheld here only.
-//
-// Task 16 makes the media path accept audio. Deleting this one constant and
-// the single `startsWith` test that uses it is the whole re-enable; the kind
-// classification and the viewer routing are already correct and must not be
-// changed for it.
-const PROTECTION_DEFERRED_MIME_PREFIX = "audio/";
-
 // Which protected item a file becomes once it is listed: "media" is the
 // transcoded audio/video rendition, "object" is everything else.
 export function protectedContentKindFor(mime) {
@@ -195,7 +184,6 @@ export function isRuntimeCustodyProtectable(object) {
     !object?.metadata?.protected_content &&
     mime !== "" &&
     mime !== UNPLACEABLE_PROTECTED_CONTENT_MIME &&
-    !mime.startsWith(PROTECTION_DEFERRED_MIME_PREFIX) &&
     capabilities?.includes("publish")
   );
 }

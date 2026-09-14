@@ -35,15 +35,16 @@ use elastos_protected_content_contracts::{
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, DecryptProviderRequestOpV1,
-    DecryptProviderRequestV1, DecryptProviderResponseV1, ProtectProviderRequestV1,
-    ProtectProviderResponseStatusV1, ProtectProviderResponseV1, ProtectionSessionNodeV1,
-    RightsProviderRequestV1, RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
-    ValidatedClearFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
-    CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
-    DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
-    MAX_OBJECT_PLAINTEXT_BYTES_V1, MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
-    MAX_PROTECT_MEDIA_SEGMENTS_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
-    PROTECT_PROVIDER_REQUEST_SCHEMA_V1, PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
+    DecryptProviderRequestV1, DecryptProviderResponseV1, ElastosPqPsshDataV1,
+    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
+    ProtectionSessionNodeV1, RightsProviderRequestV1, RightsProviderResponseV1,
+    ValidatedCencFmp4MediaSessionLayoutV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    ViewerMediaPartSelectorV1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
+    CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1, DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
+    DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1, MAX_OBJECT_PLAINTEXT_BYTES_V1,
+    MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1, MAX_PROTECT_MEDIA_SEGMENTS_V1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+    PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 use elastos_protected_content_rights::{
     PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
@@ -304,8 +305,11 @@ const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
 const CHAIN_PROTECTED_CONTENT_POLICY_OP: &str = "resolve_protected_content_policy";
 const CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1: &str = "elastos.chain.protected-content-policy/v1";
 const MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1: &str = "elastos.media-provider.prepared-media/v1";
-const MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1: &str = "video/mp4";
-const MEDIA_PROVIDER_OUTPUT_CODECS_V1: &str = "avc1.640028";
+/// The renditions the media path produces and the viewer can play, as
+/// `(mime type, codecs)`. A prepared output must match one of these exactly:
+/// halves are never mixed across entries.
+const MEDIA_PROVIDER_OUTPUT_PAIRS_V1: [(&str, &str); 2] =
+    [("video/mp4", "avc1.640028"), ("audio/mp4", "mp4a.40.2")];
 const MEDIA_PROVIDER_INPUT_FILE_NAME: &str = "input.bin";
 const MEDIA_PROVIDER_PREPARED_DIR_NAME: &str = "prepared";
 const MEDIA_PROVIDER_SEGMENTS_DIR_NAME: &str = "segments";
@@ -3777,13 +3781,54 @@ fn open_runtime_media_source_file(path: &Path) -> anyhow::Result<fs::File> {
     Ok(file)
 }
 
+/// Re-reads an already-settled preparation on resume. The durable record binds
+/// the receipt digest, and that digest covers the rendition pair, but the
+/// record does not store the pair itself -- so each allowed pair is tried
+/// against the recorded digest and only an exact match is accepted.
+fn load_settled_runtime_prepared_media(
+    operation_root: &Path,
+    recorded_receipt: Digest32,
+) -> anyhow::Result<(RuntimeCustodyLibraryPublishInputMedia, Digest32)> {
+    let (first_mime_type, first_codecs) = MEDIA_PROVIDER_OUTPUT_PAIRS_V1[0];
+    // The bytes on disk are the same whichever pair produced them, so they are
+    // read and validated once; only the pair-bound receipt is recomputed.
+    //
+    // CAUTION: this single read is labelled with pair[0] (video), and that is only
+    // sound because `load_validated_runtime_prepared_media` does not cross-check
+    // the declared pair against the init segment's own tracks -- it accepts any
+    // allowed label. If that cross-check is ever added (it should be: the validator
+    // already parses handler types and sample-entry fourccs), an AUDIO preparation
+    // resumed through here would be validated as video and fail silently at the
+    // wrong layer. Load once per pair at that point instead of relabelling.
+    let (mut media, _) = load_validated_runtime_prepared_media(
+        operation_root,
+        &RuntimePreparedMediaProviderOutput {
+            schema: MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1.to_string(),
+            mime_type: first_mime_type.to_string(),
+            codecs: first_codecs.to_string(),
+        },
+    )?;
+    for (mime_type, codecs) in MEDIA_PROVIDER_OUTPUT_PAIRS_V1 {
+        media.mime_type = mime_type.to_string();
+        media.codecs = codecs.to_string();
+        let receipt = runtime_media_preparation_receipt(&media);
+        if receipt == recorded_receipt {
+            return Ok((media, receipt));
+        }
+    }
+    anyhow::bail!("Runtime custody media preparation output is invalid");
+}
+
 fn load_validated_runtime_prepared_media(
     operation_root: &Path,
     prepared_output: &RuntimePreparedMediaProviderOutput,
 ) -> anyhow::Result<(RuntimeCustodyLibraryPublishInputMedia, Digest32)> {
     if prepared_output.schema != MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1
-        || prepared_output.mime_type != MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1
-        || prepared_output.codecs != MEDIA_PROVIDER_OUTPUT_CODECS_V1
+        || !MEDIA_PROVIDER_OUTPUT_PAIRS_V1
+            .iter()
+            .any(|(mime_type, codecs)| {
+                prepared_output.mime_type == *mime_type && prepared_output.codecs == *codecs
+            })
     {
         anyhow::bail!("Runtime custody media preparation output is invalid");
     }
@@ -4287,16 +4332,11 @@ async fn prepare_runtime_custody_library_source(
         }
         RuntimeMediaPreparationState::Prepared => {
             validate_runtime_media_staging_root(&staging_root)?;
-            let output = RuntimePreparedMediaProviderOutput {
-                schema: MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1.to_string(),
-                mime_type: MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1.to_string(),
-                codecs: MEDIA_PROVIDER_OUTPUT_CODECS_V1.to_string(),
-            };
+            let recorded_receipt = record.output_receipt_digest().ok_or_else(|| {
+                anyhow::anyhow!("Runtime custody media preparation output is invalid")
+            })?;
             let (media, output_receipt_digest) =
-                load_validated_runtime_prepared_media(&operation_root, &output)?;
-            if record.output_receipt_digest() != Some(output_receipt_digest) {
-                anyhow::bail!("Runtime custody media preparation output is invalid");
-            }
+                load_settled_runtime_prepared_media(&operation_root, recorded_receipt)?;
             return Ok(RuntimeLibraryMediaPreparation::Prepared(
                 RuntimePreparedLibraryPublish {
                     input: RuntimeCustodyLibraryPublishInput {
@@ -5440,24 +5480,39 @@ async fn protect_opened_runtime_custody_session(
     let protected_session =
         ValidatedCencFmp4MediaSessionLayoutV1::new(&expected_media, &init_segment)
             .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let custody_pool = composition
+        .signed_pool
+        .pool_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?;
+    let custody_epoch = composition
+        .signed_epoch
+        .epoch_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?;
+    let custody_committee_authorization = composition
+        .signed_committee_authorization
+        .authorization_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?;
+    // The CENC protection header the provider wrote into the init segment ships in
+    // a public media file and is what a client reading the artifacts directly will
+    // route on. The Runtime holds the same identities, so it requires the header to
+    // be present on a NEW protect output and to name exactly this session's content
+    // access id, pool, epoch and committee authorization. A provider that omits the
+    // header, or points it at some other quorum, fails here rather than publishing.
+    // (A missing header stays legal on the READ path, where media minted before the
+    // header existed have none.)
+    let expected_protection_header = ElastosPqPsshDataV1::new(
+        content_access_id,
+        &custody_pool,
+        &custody_epoch,
+        &custody_committee_authorization,
+    );
     if media_identity != expected_media
         || protected_session.content_access_id() != content_access_id
+        || protected_session.protection_header() != Some(&expected_protection_header)
         || envelope.manifest().encrypted_content() != media_identity.encrypted_content()
-        || envelope.manifest().custody_pool()
-            != composition
-                .signed_pool
-                .pool_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
-        || envelope.manifest().custody_epoch()
-            != composition
-                .signed_epoch
-                .epoch_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
-        || envelope.manifest().custody_committee_authorization()
-            != composition
-                .signed_committee_authorization
-                .authorization_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+        || envelope.manifest().custody_pool() != custody_pool
+        || envelope.manifest().custody_epoch() != custody_epoch
+        || envelope.manifest().custody_committee_authorization() != custody_committee_authorization
     {
         anyhow::bail!("Runtime custody protect output is invalid");
     }

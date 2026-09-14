@@ -11,6 +11,7 @@ mod decrypt;
 mod media;
 mod object;
 mod protect;
+pub mod pssh;
 mod rights;
 #[cfg(test)]
 mod test_support;
@@ -51,6 +52,11 @@ pub use protect::{
     ProtectProviderResponseV1, ProtectionSessionNodeV1, MAX_PROTECT_MEDIA_PART_BYTES_V1,
     MAX_PROTECT_MEDIA_SEGMENTS_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
     PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
+};
+pub use pssh::{
+    build_elastos_pq_pssh_v1, build_pssh_v1, parse_elastos_pq_pssh_v1, parse_pssh_v1,
+    ElastosPqPsshDataV1, PsshBoxV1, ELASTOS_PQ_PROTECTION_SCHEME_V1,
+    ELASTOS_PQ_PSSH_DATA_SCHEMA_V1, ELASTOS_PQ_SYSTEM_ID, MAX_ELASTOS_PQ_PSSH_DATA_BYTES_V1,
 };
 pub use rights::{
     RightsProviderRequestOpV1, RightsProviderRequestV1, RightsProviderResponseStatusV1,

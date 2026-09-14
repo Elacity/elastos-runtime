@@ -401,14 +401,6 @@ test("Library protect and list ignores ineligible objects", async () => {
       capabilities: ["publish"],
     },
     {
-      // Withheld until Task 16 makes the media path accept audio.
-      uri: "localhost://Users/test/Music/song.mp3",
-      kind: "file",
-      name: "song.mp3",
-      mime: "audio/mpeg",
-      capabilities: ["publish"],
-    },
-    {
       uri: "localhost://WebSpaces/Cloud/movie.mp4",
       kind: "file",
       name: "movie.mp4",

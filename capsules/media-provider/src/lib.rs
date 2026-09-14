@@ -35,8 +35,10 @@ const MAX_SEGMENT_COUNT: usize = 512;
 const MAX_TOTAL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const OUTPUT_SCHEMA_V1: &str = "elastos.media-provider.prepared-media/v1";
 const OUTPUT_PROFILE_BROWSER_FMP4_H264_V1: &str = "browser_fmp4_h264_v1";
-const OUTPUT_MIME_TYPE_V1: &str = "video/mp4";
-const OUTPUT_CODECS_V1: &str = "avc1.640028";
+const OUTPUT_MIME_TYPE_VIDEO_V1: &str = "video/mp4";
+const OUTPUT_CODECS_VIDEO_V1: &str = "avc1.640028";
+const OUTPUT_MIME_TYPE_AUDIO_V1: &str = "audio/mp4";
+const OUTPUT_CODECS_AUDIO_V1: &str = "mp4a.40.2";
 const OUTPUT_SEGMENT_DURATION_SECS_V1: &str = "4";
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +170,26 @@ struct ProbeStream {
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    disposition: Option<ProbeDisposition>,
+    #[serde(flatten)]
+    _extra: BTreeMap<String, Value>,
+}
+
+impl ProbeStream {
+    /// Cover art embedded in an audio file (ID3 APIC, MP4 `covr`) is reported as
+    /// a video stream carrying a single still frame. It is not a moving picture
+    /// and must never be chosen as the source's video track.
+    fn is_attached_picture(&self) -> bool {
+        self.disposition
+            .as_ref()
+            .and_then(|disposition| disposition.attached_pic)
+            == Some(1)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeDisposition {
+    attached_pic: Option<u8>,
     #[serde(flatten)]
     _extra: BTreeMap<String, Value>,
 }
@@ -206,6 +228,15 @@ struct PreparedOutputMonitor<'a> {
 #[derive(Debug)]
 struct ValidatedProbeOutput {
     duration_secs: f64,
+    track: MediaTrackKind,
+}
+
+/// Which single track of the source becomes the rendition. A source carrying
+/// both keeps the video track, exactly as it did before audio was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaTrackKind {
+    Video,
+    Audio,
 }
 
 #[derive(Debug)]
@@ -406,7 +437,13 @@ fn run_prepare_observed(
     if expected_segments > state.max_segment_count {
         return Err(());
     }
-    run_ffmpeg_observed(state, &input_path, &prepared_dir, observe_lifecycle)?;
+    run_ffmpeg_observed(
+        state,
+        &input_path,
+        &prepared_dir,
+        probe.track,
+        observe_lifecycle,
+    )?;
     normalize_segment_indexes(&segments_dir)?;
     normalize_segment_containers(&segments_dir, state.max_output_part_bytes)?;
     let init_len = validate_regular_file_len(
@@ -422,10 +459,14 @@ fn run_prepare_observed(
     if init_len.checked_add(segments_len).ok_or(())? > state.max_total_output_bytes {
         return Err(());
     }
+    let (mime_type, codecs) = match probe.track {
+        MediaTrackKind::Video => (OUTPUT_MIME_TYPE_VIDEO_V1, OUTPUT_CODECS_VIDEO_V1),
+        MediaTrackKind::Audio => (OUTPUT_MIME_TYPE_AUDIO_V1, OUTPUT_CODECS_AUDIO_V1),
+    };
     Ok(PreparedMediaOutput {
         schema: OUTPUT_SCHEMA_V1,
-        mime_type: OUTPUT_MIME_TYPE_V1.to_string(),
-        codecs: OUTPUT_CODECS_V1.to_string(),
+        mime_type: mime_type.to_string(),
+        codecs: codecs.to_string(),
     })
 }
 
@@ -440,7 +481,12 @@ fn run_ffprobe_observed(
         .arg("-print_format")
         .arg("json")
         .arg("-show_entries")
-        .arg("format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate")
+        .arg(concat!(
+            "format=duration",
+            ":stream=codec_type,width,height,avg_frame_rate,r_frame_rate",
+            // Distinguishes embedded cover art from a real video track.
+            ":stream_disposition=attached_pic",
+        ))
         .arg(input_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -460,6 +506,7 @@ fn run_ffmpeg_observed(
     state: &ConfiguredMediaProvider,
     input_path: &Path,
     prepared_dir: &Path,
+    track: MediaTrackKind,
     observe_lifecycle: &mut dyn FnMut(CommandLifecycleEvent),
 ) -> Result<(), ()> {
     let manifest_path = prepared_dir.join("manifest.mpd");
@@ -474,33 +521,51 @@ fn run_ffmpeg_observed(
         .arg("error")
         .arg("-y")
         .arg("-i")
-        .arg(input_path)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-an")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-profile:v")
-        .arg("high")
-        .arg("-level:v")
-        .arg("4.0")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
-        .arg("-r")
-        .arg("30")
-        .arg("-vf")
-        .arg("scale=w=min(iw\\,1920):h=min(ih\\,1080):force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30")
-        .arg("-g")
-        .arg("120")
-        .arg("-keyint_min")
-        .arg("120")
-        .arg("-sc_threshold")
-        .arg("0")
-        .arg("-preset")
-        .arg("veryfast")
-        .arg("-crf")
-        .arg("28")
-        .arg("-movflags")
+        .arg(input_path);
+    match track {
+        MediaTrackKind::Video => {
+            cmd.arg("-map")
+                .arg("0:v:0")
+                .arg("-an")
+                .arg("-c:v")
+                .arg("libx264")
+                .arg("-profile:v")
+                .arg("high")
+                .arg("-level:v")
+                .arg("4.0")
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-r")
+                .arg("30")
+                .arg("-vf")
+                .arg("scale=w=min(iw\\,1920):h=min(ih\\,1080):force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30")
+                .arg("-g")
+                .arg("120")
+                .arg("-keyint_min")
+                .arg("120")
+                .arg("-sc_threshold")
+                .arg("0")
+                .arg("-preset")
+                .arg("veryfast")
+                .arg("-crf")
+                .arg("28");
+        }
+        MediaTrackKind::Audio => {
+            cmd.arg("-map")
+                .arg("0:a:0")
+                .arg("-vn")
+                .arg("-c:a")
+                .arg("aac")
+                .arg("-b:a")
+                .arg("128k")
+                .arg("-ar")
+                .arg("48000")
+                .arg("-ac")
+                .arg("2");
+        }
+    }
+    // The container and segmentation flags are the same for both renditions.
+    cmd.arg("-movflags")
         .arg("+frag_keyframe+empty_moov+default_base_moof+separate_moof")
         .arg("-f")
         .arg("dash")
@@ -1008,34 +1073,50 @@ fn validate_probe_output(
     probe: &ProbeOutput,
     state: &ConfiguredMediaProvider,
 ) -> Result<ValidatedProbeOutput, ()> {
-    let stream = probe
-        .streams
-        .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        .ok_or(())?;
-    let width = stream.width.ok_or(())?;
-    let height = stream.height.ok_or(())?;
-    if width == 0
-        || height == 0
-        || width > state.max_source_width
-        || height > state.max_source_height
-    {
-        return Err(());
-    }
     let duration = parse_finite_decimal(probe.format.duration.as_deref().ok_or(())?)?;
     if duration <= 0.0 || duration > state.max_duration_secs as f64 {
         return Err(());
     }
-    let fps = parse_frame_rate(
-        stream.avg_frame_rate.as_deref(),
-        stream.r_frame_rate.as_deref(),
-    )?;
-    if fps <= 0.0 || fps > state.max_source_fps as f64 {
-        return Err(());
+    // Cover art is skipped, not treated as the video track: a tagged mp3 or m4a is
+    // an AUDIO source with a still picture attached, and routing it down the video
+    // branch would re-encode the still and drop the sound.
+    if let Some(stream) = probe.streams.iter().find(|stream| {
+        stream.codec_type.as_deref() == Some("video") && !stream.is_attached_picture()
+    }) {
+        let width = stream.width.ok_or(())?;
+        let height = stream.height.ok_or(())?;
+        if width == 0
+            || height == 0
+            || width > state.max_source_width
+            || height > state.max_source_height
+        {
+            return Err(());
+        }
+        let fps = parse_frame_rate(
+            stream.avg_frame_rate.as_deref(),
+            stream.r_frame_rate.as_deref(),
+        )?;
+        if fps <= 0.0 || fps > state.max_source_fps as f64 {
+            return Err(());
+        }
+        return Ok(ValidatedProbeOutput {
+            duration_secs: duration,
+            track: MediaTrackKind::Video,
+        });
     }
-    Ok(ValidatedProbeOutput {
-        duration_secs: duration,
-    })
+    // An audio-only source has no geometry and no frame rate to bound; the
+    // duration and the output limits are the whole budget.
+    if probe
+        .streams
+        .iter()
+        .any(|stream| stream.codec_type.as_deref() == Some("audio"))
+    {
+        return Ok(ValidatedProbeOutput {
+            duration_secs: duration,
+            track: MediaTrackKind::Audio,
+        });
+    }
+    Err(())
 }
 
 fn parse_finite_decimal(value: &str) -> Result<f64, ()> {
@@ -1361,12 +1442,14 @@ mod tests {
         };
         let mut events = Vec::new();
 
-        assert!(
-            run_ffmpeg_observed(&state, &input_path, &prepared_dir, &mut |event| {
-                events.push(event)
-            })
-            .is_err()
-        );
+        assert!(run_ffmpeg_observed(
+            &state,
+            &input_path,
+            &prepared_dir,
+            MediaTrackKind::Video,
+            &mut |event| events.push(event),
+        )
+        .is_err());
 
         let [CommandLifecycleEvent::Spawned { child_id: spawned }, CommandLifecycleEvent::Reaped {
             child_id: reaped,

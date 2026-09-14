@@ -4,6 +4,8 @@ use elastos_protected_content_contracts::{
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::pssh::{build_elastos_pq_pssh_v1, parse_elastos_pq_pssh_v1, ElastosPqPsshDataV1};
+
 const CENC_FMP4_SEGMENT_IDENTITY_DOMAIN_V1: &str = "elastos.protected-content.cenc-fmp4-segment/v1";
 const CENC_FMP4_MEDIA_IDENTITY_DOMAIN_V1: &str =
     "elastos.protected-content.cenc-fmp4-media-identity/v1";
@@ -77,12 +79,32 @@ struct ValidatedClearFmp4TrackLayoutV1 {
     resize_targets: Vec<BoxResizeTargetV1>,
 }
 
+/// The protected init segment's single `pssh` box: what it declares, and where it
+/// sits so the read path can take it back out and reproduce the clear init segment
+/// byte for byte.
+///
+/// The `header` is kept rather than discarded so the Runtime can compare what the
+/// provider wrote into a public file against the identities the Runtime itself
+/// holds — see `ValidatedCencFmp4MediaSessionLayoutV1::protection_header`.
+///
+/// The producer always appends the box as the LAST child of `moov`, and the
+/// validator enforces that, so removing it never moves any `sinf` the track rewrite
+/// pass is about to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedCencFmp4PsshV1 {
+    header: ElastosPqPsshDataV1,
+    moov_off: usize,
+    pssh_off: usize,
+    pssh_size: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedClearFmp4MediaSessionLayoutV1 {
     init_segment_sha256: Digest32,
     init_segment_bytes: u64,
     track_ids: Vec<u32>,
     tracks: Vec<ValidatedClearFmp4TrackLayoutV1>,
+    moov_off: usize,
 }
 
 impl ValidatedClearFmp4MediaSessionLayoutV1 {
@@ -93,6 +115,7 @@ impl ValidatedClearFmp4MediaSessionLayoutV1 {
             init_segment_bytes: clear_init_segment.len() as u64,
             track_ids: init.track_ids,
             tracks: init.tracks,
+            moov_off: init.moov_off,
         })
     }
 
@@ -107,10 +130,17 @@ impl ValidatedClearFmp4MediaSessionLayoutV1 {
         validate_clear_media_segment_v1(clear_segment, self.track_ids.as_slice())
     }
 
+    /// Protect the clear init segment and inject the CENC `pssh` box that declares
+    /// the scheme.
+    ///
+    /// The `tenc` default KID is taken from `pssh_data`'s own content access id
+    /// rather than passed alongside it, so the KID in the sample entry, the KID in
+    /// the box's KID list, and the id named in the JSON payload are one value and
+    /// cannot disagree.
     pub fn rewrite_protected_init(
         &self,
         clear_init_segment: &[u8],
-        key_id: [u8; 16],
+        pssh_data: &ElastosPqPsshDataV1,
     ) -> Result<Vec<u8>, ContractError> {
         verify_exact_source_bytes(
             clear_init_segment,
@@ -118,7 +148,7 @@ impl ValidatedClearFmp4MediaSessionLayoutV1 {
             self.init_segment_bytes,
             "init_segment_bytes",
         )?;
-        rewrite_protected_init_v1(clear_init_segment, &self.tracks, key_id)
+        rewrite_protected_init_v1(clear_init_segment, &self.tracks, self.moov_off, pssh_data)
     }
 }
 
@@ -266,6 +296,7 @@ pub struct ValidatedCencFmp4MediaLayoutV1 {
     init_segment_bytes: u64,
     protected_track_ids: Vec<u32>,
     track_rewrites: Vec<ValidatedCencFmp4TrackRewriteV1>,
+    pssh: Option<ValidatedCencFmp4PsshV1>,
     segments: Vec<ValidatedCencFmp4SegmentLayoutV1>,
 }
 
@@ -274,6 +305,7 @@ pub struct ValidatedCencFmp4MediaSessionLayoutV1 {
     media_identity: CencFmp4MediaIdentityV1,
     protected_track_ids: Vec<u32>,
     track_rewrites: Vec<ValidatedCencFmp4TrackRewriteV1>,
+    pssh: Option<ValidatedCencFmp4PsshV1>,
 }
 
 impl ValidatedCencFmp4MediaSessionLayoutV1 {
@@ -291,6 +323,7 @@ impl ValidatedCencFmp4MediaSessionLayoutV1 {
             media_identity: media_identity.clone(),
             protected_track_ids: init.protected_track_ids,
             track_rewrites: init.track_rewrites,
+            pssh: init.pssh,
         })
     }
 
@@ -309,6 +342,17 @@ impl ValidatedCencFmp4MediaSessionLayoutV1 {
             .content_access_id
     }
 
+    /// What the init segment's CENC protection header declares, if it carries one.
+    ///
+    /// `None` means the init segment has no `pssh` box. That is legal on the read
+    /// path — every media minted before the header existed is in that shape — and
+    /// the Runtime is the layer that decides a NEW protect output must carry one.
+    /// The validator has already proved that a header present here names this
+    /// media's own content access id.
+    pub fn protection_header(&self) -> Option<&ElastosPqPsshDataV1> {
+        self.pssh.as_ref().map(|pssh| &pssh.header)
+    }
+
     pub fn rewrite_clear_init(
         &self,
         protected_init_segment: &[u8],
@@ -318,6 +362,7 @@ impl ValidatedCencFmp4MediaSessionLayoutV1 {
             self.media_identity.init_segment_sha256(),
             self.media_identity.init_segment_bytes(),
             &self.track_rewrites,
+            self.pssh.as_ref(),
         )
     }
 
@@ -365,6 +410,7 @@ impl ValidatedCencFmp4MediaLayoutV1 {
             self.init_segment_sha256,
             self.init_segment_bytes,
             &self.track_rewrites,
+            self.pssh.as_ref(),
         )
     }
 
@@ -1047,6 +1093,7 @@ fn validate_cenc_fmp4_media_structure_v1(
         init_segment_bytes: init_segment.len() as u64,
         protected_track_ids: init.protected_track_ids,
         track_rewrites: init.track_rewrites,
+        pssh: init.pssh,
         segments,
     })
 }
@@ -1055,12 +1102,14 @@ fn validate_cenc_fmp4_media_structure_v1(
 struct ValidatedCencFmp4InitRewriteV1 {
     protected_track_ids: Vec<u32>,
     track_rewrites: Vec<ValidatedCencFmp4TrackRewriteV1>,
+    pssh: Option<ValidatedCencFmp4PsshV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedClearFmp4InitLayoutV1 {
     track_ids: Vec<u32>,
     tracks: Vec<ValidatedClearFmp4TrackLayoutV1>,
+    moov_off: usize,
 }
 
 fn validate_staged_init_segment_v1(
@@ -1145,7 +1194,11 @@ fn validate_clear_init_segment_v1(
     )?;
     track_ids.sort_unstable();
     tracks.sort_by_key(|track| track.track_id);
-    Ok(ValidatedClearFmp4InitLayoutV1 { track_ids, tracks })
+    Ok(ValidatedClearFmp4InitLayoutV1 {
+        track_ids,
+        tracks,
+        moov_off,
+    })
 }
 
 fn rewrite_clear_init_v1(
@@ -1153,6 +1206,7 @@ fn rewrite_clear_init_v1(
     expected_sha256: Digest32,
     expected_len: u64,
     track_rewrites: &[ValidatedCencFmp4TrackRewriteV1],
+    pssh: Option<&ValidatedCencFmp4PsshV1>,
 ) -> Result<Vec<u8>, ContractError> {
     verify_exact_source_bytes(
         protected_init_segment,
@@ -1160,17 +1214,20 @@ fn rewrite_clear_init_v1(
         expected_len,
         "init_segment_bytes",
     )?;
-    rewrite_clear_init_unchecked_v1(protected_init_segment, track_rewrites)
+    rewrite_clear_init_unchecked_v1(protected_init_segment, track_rewrites, pssh)
 }
 
 fn rewrite_protected_init_v1(
     clear_init_segment: &[u8],
     clear_tracks: &[ValidatedClearFmp4TrackLayoutV1],
-    key_id: [u8; 16],
+    moov_off: usize,
+    pssh_data: &ElastosPqPsshDataV1,
 ) -> Result<Vec<u8>, ContractError> {
     if clear_init_segment.is_empty() {
         return Err(ContractError::InvalidField("init_segment_bytes"));
     }
+    let key_id = *pssh_data.parsed_content_access_id()?.as_bytes();
+    let pssh = build_elastos_pq_pssh_v1(pssh_data)?;
     let mut rewritten = clear_init_segment.to_vec();
     let mut ordered_tracks = clear_tracks.to_vec();
     ordered_tracks.sort_by_key(|track| std::cmp::Reverse(track.sample_entry_off));
@@ -1209,14 +1266,38 @@ fn rewrite_protected_init_v1(
             .ok_or(ContractError::InvalidField("init_segment_bytes"))?;
         rewritten.splice(insert_at..insert_at, sinf);
     }
+    // `moov` is the last top-level box of an init segment, so appending the `pssh`
+    // to the buffer appends it as `moov`'s last child. Growing the header after the
+    // bytes are in place keeps the declared size and the buffer length in step.
+    rewritten.extend_from_slice(&pssh);
+    grow_box_size_in_place(&mut rewritten, moov_off, pssh.len(), "init_segment_bytes")?;
     Ok(rewritten)
 }
 
 fn rewrite_clear_init_unchecked_v1(
     protected_init_segment: &[u8],
     track_rewrites: &[ValidatedCencFmp4TrackRewriteV1],
+    pssh: Option<&ValidatedCencFmp4PsshV1>,
 ) -> Result<Vec<u8>, ContractError> {
     let mut rewritten = protected_init_segment.to_vec();
+    // Taken out first: the box is `moov`'s last child, so every `sinf` the track
+    // pass removes below sits at a lower offset and does not move.
+    if let Some(pssh) = pssh {
+        let pssh_end = pssh
+            .pssh_off
+            .checked_add(pssh.pssh_size)
+            .ok_or(ContractError::InvalidField("init_segment_bytes"))?;
+        if pssh_end > rewritten.len() {
+            return Err(ContractError::InvalidField("init_segment_bytes"));
+        }
+        shrink_box_size_in_place(
+            &mut rewritten,
+            pssh.moov_off,
+            pssh.pssh_size,
+            "init_segment_bytes",
+        )?;
+        rewritten.drain(pssh.pssh_off..pssh_end);
+    }
     let mut ordered_track_rewrites = track_rewrites.to_vec();
     ordered_track_rewrites.sort_by_key(|rewrite| std::cmp::Reverse(rewrite.sinf_off));
     for rewrite in ordered_track_rewrites {
@@ -1269,6 +1350,7 @@ fn validate_init_segment_v1(bytes: &[u8]) -> Result<ValidatedCencFmp4InitRewrite
     let mut protected_track_ids = Vec::new();
     let mut track_rewrites = Vec::new();
     let mut mvex = None;
+    let mut pssh = None;
     for (off, h) in scan_boxes(bytes, moov_off + moov_h.header_size, moov_off + moov_h.size)? {
         match &h.box_type {
             b"trak" => {
@@ -1284,6 +1366,15 @@ fn validate_init_segment_v1(bytes: &[u8]) -> Result<ValidatedCencFmp4InitRewrite
             }
             b"mvex" => {
                 if mvex.replace((off, h)).is_some() {
+                    return Err(ContractError::InvalidField("init_segment_bytes"));
+                }
+            }
+            // The ONE admitted exception to the strict `moov` child allowlist, and
+            // it is admitted only after it parses as this scheme's own CENC
+            // protection header. A second one, a foreign system id, a malformed box
+            // or an unreadable payload all fall through to the error below.
+            b"pssh" => {
+                if pssh.replace((off, h)).is_some() {
                     return Err(ContractError::InvalidField("init_segment_bytes"));
                 }
             }
@@ -1311,11 +1402,49 @@ fn validate_init_segment_v1(bytes: &[u8]) -> Result<ValidatedCencFmp4InitRewrite
         mvex_off + mvex_h.size,
         protected_track_ids.as_slice(),
     )?;
+    let pssh = pssh
+        .map(|(off, h)| validate_pssh_v1(bytes, moov_off, moov_h, off, h, expected_access_id))
+        .transpose()?;
     protected_track_ids.sort_unstable();
     track_rewrites.sort_by_key(|rewrite| rewrite.track_id);
     Ok(ValidatedCencFmp4InitRewriteV1 {
         protected_track_ids,
         track_rewrites,
+        pssh,
+    })
+}
+
+/// Admit a `pssh` child of `moov` only when it is this scheme's own, well formed,
+/// and bound to the same content access id the tracks declare.
+///
+/// Four separate checks, each of which alone rejects a box that is not ours: the
+/// box must be the last `moov` child (the layout the read path removes), it must
+/// carry [`crate::pssh::ELASTOS_PQ_SYSTEM_ID`], its `Data` payload must parse as
+/// the versioned JSON schema, and its single KID must be the `tenc` default KID of
+/// every track.
+fn validate_pssh_v1(
+    data: &[u8],
+    moov_off: usize,
+    moov_h: BoxHeader,
+    pssh_off: usize,
+    pssh_h: BoxHeader,
+    expected_access_id: ContentAccessIdV1,
+) -> Result<ValidatedCencFmp4PsshV1, ContractError> {
+    let pssh_end = pssh_off
+        .checked_add(pssh_h.size)
+        .ok_or(ContractError::InvalidField("init_segment_bytes"))?;
+    if pssh_end != moov_off + moov_h.size {
+        return Err(ContractError::InvalidField("init_segment_bytes"));
+    }
+    let header = parse_elastos_pq_pssh_v1(slice_at(data, pssh_off, pssh_h.size)?)?;
+    if header.parsed_content_access_id()? != expected_access_id {
+        return Err(ContractError::InvalidField("init_segment_bytes"));
+    }
+    Ok(ValidatedCencFmp4PsshV1 {
+        header,
+        moov_off,
+        pssh_off,
+        pssh_size: pssh_h.size,
     })
 }
 
@@ -2492,9 +2621,28 @@ fn read_u64_at(data: &[u8], start: usize) -> Result<u64, ContractError> {
 mod tests {
     use std::fmt::Write as _;
 
+    use elastos_protected_content_contracts::{
+        CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1, CustodyPoolIdentityV1,
+    };
     use sha2::{Digest as _, Sha256};
 
     use super::*;
+    use crate::pssh::{build_pssh_v1, ELASTOS_PQ_SYSTEM_ID};
+
+    const TEST_KEY_ID: [u8; 16] = [0x55; 16];
+
+    fn test_pssh_data_for(key_id: [u8; 16]) -> ElastosPqPsshDataV1 {
+        ElastosPqPsshDataV1::new(
+            ContentAccessIdV1::new(key_id).unwrap(),
+            &CustodyPoolIdentityV1::new(Digest32::new([0x61; 32]), 512).unwrap(),
+            &CustodyEpochIdentityV1::new(Digest32::new([0x62; 32]), 512).unwrap(),
+            &CustodyCommitteeAuthorizationIdentityV1::new(Digest32::new([0x63; 32]), 512).unwrap(),
+        )
+    }
+
+    fn test_pssh_data() -> ElastosPqPsshDataV1 {
+        test_pssh_data_for(TEST_KEY_ID)
+    }
 
     fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
         let size = (8 + content.len()) as u32;
@@ -3205,7 +3353,7 @@ mod tests {
         assert_eq!(session.track_ids(), &[1, 2]);
 
         let protected_init = session
-            .rewrite_protected_init(&clear_init, [0x55; 16])
+            .rewrite_protected_init(&clear_init, &test_pssh_data())
             .unwrap();
         let clear_segment = valid_clear_segment(1, b"clear-video");
         let protected_segment = session
@@ -3323,7 +3471,7 @@ mod tests {
         let segment_layout = session.validate_segment(&clear_segment).unwrap();
 
         let protected_init = session
-            .rewrite_protected_init(&clear_init, [0x55; 16])
+            .rewrite_protected_init(&clear_init, &test_pssh_data())
             .unwrap();
         let protected_segment = segment_layout
             .rewrite_protected_segment(
@@ -3362,7 +3510,7 @@ mod tests {
         let mut tampered_init = clear_init.clone();
         tampered_init[0] ^= 1;
         assert!(session
-            .rewrite_protected_init(&tampered_init, [0x55; 16])
+            .rewrite_protected_init(&tampered_init, &test_pssh_data())
             .is_err());
 
         let mut tampered_segment = clear_segment.clone();
@@ -3542,20 +3690,135 @@ mod tests {
         assert!(shrink_box_size_in_place(&mut standard, 0, 1, "test").is_err());
     }
 
+    /// `pssh` is the ONE box admitted into `moov` beyond the fixed allowlist, and
+    /// only after it parses as this scheme's own protection header. Every other
+    /// shape of `pssh` — and every other unknown box — still fails closed.
+    #[test]
+    fn media_structure_admits_only_a_well_formed_elacity_pssh_in_moov() {
+        let valid_segment = valid_segment(1, b"video-segment-ciphertext");
+        // `make_sinf` keys the fixture's `tenc` to this id, so the box's KID list
+        // and its JSON payload must both name it.
+        let fixture_key_id = [0x44u8; 16];
+        let data = test_pssh_data_for(fixture_key_id);
+        let good = build_elastos_pq_pssh_v1(&data).unwrap();
+
+        // An init segment with NO `pssh` is still valid: every media minted before
+        // this box existed must keep validating.
+        assert!(CencFmp4MediaIdentityV1::validate_structure(
+            &build_init_segment(&[(1, b"vide"), (2, b"soun")], &[1, 2], &[]),
+            std::slice::from_ref(&valid_segment),
+        )
+        .is_ok());
+
+        let accepted = build_init_segment(
+            &[(1, b"vide"), (2, b"soun")],
+            &[1, 2],
+            std::slice::from_ref(&good),
+        );
+        let layout = CencFmp4MediaIdentityV1::validate_structure(
+            &accepted,
+            std::slice::from_ref(&valid_segment),
+        )
+        .expect("a well-formed Elacity pssh is accepted");
+        // And the read path takes it straight back out.
+        assert_eq!(
+            layout.rewrite_clear_init(&accepted).unwrap(),
+            rewrite_clear_init_of(&build_init_segment(
+                &[(1, b"vide"), (2, b"soun")],
+                &[1, 2],
+                &[]
+            )),
+        );
+
+        let foreign_system_id = {
+            let mut id = ELASTOS_PQ_SYSTEM_ID;
+            id[0] ^= 0xff;
+            build_pssh_v1(&id, &[fixture_key_id], &data.to_json_bytes().unwrap())
+        };
+        let unparseable_data =
+            build_pssh_v1(&ELASTOS_PQ_SYSTEM_ID, &[fixture_key_id], b"not-json-at-all");
+        let wrong_scheme = {
+            let mut tampered = data.clone();
+            tampered.protection_scheme = "cenc:some-other-scheme".to_string();
+            build_pssh_v1(
+                &ELASTOS_PQ_SYSTEM_ID,
+                &[fixture_key_id],
+                &serde_json::to_vec(&tampered).unwrap(),
+            )
+        };
+        let kid_not_in_payload = build_pssh_v1(
+            &ELASTOS_PQ_SYSTEM_ID,
+            &[[0x99u8; 16]],
+            &data.to_json_bytes().unwrap(),
+        );
+        let kid_is_a_different_track_key =
+            build_elastos_pq_pssh_v1(&test_pssh_data_for([0x99; 16]))
+                .expect("a pssh for some other key id still builds");
+        let empty_kid_list =
+            build_pssh_v1(&ELASTOS_PQ_SYSTEM_ID, &[], &data.to_json_bytes().unwrap());
+        let malformed = make_box(b"pssh", b"x");
+
+        for rejected in [
+            foreign_system_id,
+            unparseable_data,
+            wrong_scheme,
+            kid_not_in_payload,
+            kid_is_a_different_track_key,
+            empty_kid_list,
+            malformed,
+        ] {
+            assert!(
+                CencFmp4MediaIdentityV1::validate_structure(
+                    &build_init_segment(
+                        &[(1, b"vide"), (2, b"soun")],
+                        &[1, 2],
+                        std::slice::from_ref(&rejected)
+                    ),
+                    std::slice::from_ref(&valid_segment),
+                )
+                .is_err(),
+                "a pssh that is not this scheme's must be refused"
+            );
+        }
+
+        // Two boxes, and a box that is not `moov`'s last child, are both refused:
+        // the read path removes exactly one box from exactly one place.
+        assert!(CencFmp4MediaIdentityV1::validate_structure(
+            &build_init_segment(
+                &[(1, b"vide"), (2, b"soun")],
+                &[1, 2],
+                &[good.clone(), good.clone()]
+            ),
+            std::slice::from_ref(&valid_segment),
+        )
+        .is_err());
+        assert!(CencFmp4MediaIdentityV1::validate_structure(
+            &build_init_segment(
+                &[(1, b"vide"), (2, b"soun")],
+                &[1, 2],
+                &[good, make_box(b"udta", b"trailing")]
+            ),
+            std::slice::from_ref(&valid_segment),
+        )
+        .is_err());
+    }
+
+    fn rewrite_clear_init_of(protected_init_without_pssh: &[u8]) -> Vec<u8> {
+        let valid_segment = valid_segment(1, b"video-segment-ciphertext");
+        CencFmp4MediaIdentityV1::validate_structure(
+            protected_init_without_pssh,
+            std::slice::from_ref(&valid_segment),
+        )
+        .unwrap()
+        .rewrite_clear_init(protected_init_without_pssh)
+        .unwrap()
+    }
+
     #[test]
     fn media_structure_rejects_invalid_init_and_segment_grammar() {
         let valid_init = valid_init_segment();
         let valid_segment = valid_segment(1, b"video-segment-ciphertext");
 
-        assert!(CencFmp4MediaIdentityV1::validate_structure(
-            &build_init_segment(
-                &[(1, b"vide"), (2, b"soun")],
-                &[1, 2],
-                &[make_box(b"pssh", b"x")]
-            ),
-            std::slice::from_ref(&valid_segment),
-        )
-        .is_err());
         assert!(CencFmp4MediaIdentityV1::validate_structure(
             &build_init_segment(&[(1, b"vide"), (1, b"soun")], &[1, 1], &[]),
             std::slice::from_ref(&valid_segment),

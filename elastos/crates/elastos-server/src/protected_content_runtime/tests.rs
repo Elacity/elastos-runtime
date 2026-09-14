@@ -116,11 +116,12 @@ use elastos_protected_content_contracts::{
     X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, CustodyProviderRequestV1,
-    CustodyProviderResponseV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
-    DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
-    ProtectProviderResponseV1, ProtectionSessionNodeV1, ProviderFailureCodeV1,
-    RightsProviderRequestV1, RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    build_elastos_pq_pssh_v1, CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1,
+    CustodyProviderRequestV1, CustodyProviderResponseV1, DecryptProviderRequestV1,
+    DecryptProviderResponseStatusV1, DecryptProviderResponseV1, ElastosPqPsshDataV1,
+    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
+    ProtectionSessionNodeV1, ProviderFailureCodeV1, RightsProviderRequestV1,
+    RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
     ValidatedCustodyProviderRequestV1, ValidatedDecryptProviderRequestV1,
     ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
     CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
@@ -166,9 +167,29 @@ struct ProcessChainEvidenceProvider {
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 enum TestMediaPreparationResponse {
-    Prepared,
+    Prepared {
+        mime_type: &'static str,
+        codecs: &'static str,
+    },
     SettledFailure,
     UnknownSettlement,
+}
+
+#[cfg(unix)]
+impl TestMediaPreparationResponse {
+    const fn prepared_video() -> Self {
+        Self::Prepared {
+            mime_type: "video/mp4",
+            codecs: "avc1.640028",
+        }
+    }
+
+    const fn prepared_audio() -> Self {
+        Self::Prepared {
+            mime_type: "audio/mp4",
+            codecs: "mp4a.40.2",
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -3698,7 +3719,7 @@ impl Provider for TestMediaPreparationProvider {
         }
         self.requests.lock().await.push(operation_id.clone());
         match self.response {
-            TestMediaPreparationResponse::Prepared => {
+            TestMediaPreparationResponse::Prepared { mime_type, codecs } => {
                 let prepared_root = self.staging_root.join(operation_id).join("prepared");
                 owner_only_dir(&prepared_root);
                 owner_only_dir(&prepared_root.join("segments"));
@@ -3718,8 +3739,8 @@ impl Provider for TestMediaPreparationProvider {
                 }
                 Ok(ok_provider_response(json!({
                     "schema": "elastos.media-provider.prepared-media/v1",
-                    "mime_type": "video/mp4",
-                    "codecs": "avc1.640028",
+                    "mime_type": mime_type,
+                    "codecs": codecs,
                 })))
             }
             TestMediaPreparationResponse::SettledFailure => Ok(json!({
@@ -8437,7 +8458,7 @@ async fn runtime_media_preparation_reuses_exact_settled_output_and_rejects_sourc
     let provider = Arc::new(TestMediaPreparationProvider {
         staging_root: staging_root.clone(),
         requests: Mutex::new(Vec::new()),
-        response: TestMediaPreparationResponse::Prepared,
+        response: TestMediaPreparationResponse::prepared_video(),
     });
     let registry = Arc::new(ProviderRegistry::new());
     registry
@@ -8478,6 +8499,113 @@ async fn runtime_media_preparation_reuses_exact_settled_output_and_rejects_sourc
     assert!(error
         .to_string()
         .contains("conflicts with existing authority"));
+    assert_eq!(provider.requests.lock().await.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn media_preparation_accepts_audio_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    let input = media_preparation_source_input(temp.path(), "person:local:media-audio");
+    let provider = Arc::new(TestMediaPreparationProvider {
+        staging_root,
+        requests: Mutex::new(Vec::new()),
+        response: TestMediaPreparationResponse::prepared_audio(),
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
+        .await
+        .unwrap();
+
+    let prepared = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect("an audio rendition must settle");
+    let RuntimeLibraryMediaPreparation::Prepared(prepared) = prepared else {
+        panic!("expected a prepared audio rendition");
+    };
+    assert_eq!(prepared.input.mime_type, "audio/mp4");
+    assert_eq!(prepared.input.codecs, "mp4a.40.2");
+    assert_eq!(provider.requests.lock().await.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn media_preparation_rejects_unknown_pair() {
+    // Only the pairs the media path can actually play are accepted; anything
+    // else fails closed rather than reaching a listing no viewer can open.
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    for (index, (mime_type, codecs)) in [
+        ("audio/webm", "opus"),
+        // Each half of an allowed pair is still rejected when it is crossed
+        // with the other rendition's half.
+        ("audio/mp4", "avc1.640028"),
+        ("video/mp4", "mp4a.40.2"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A fresh principal per pair: a rejected attempt settles as failed and
+        // that record is terminal for its own source.
+        let input = media_preparation_source_input(
+            temp.path(),
+            &format!("person:local:media-unknown-pair-{index}"),
+        );
+        let provider = Arc::new(TestMediaPreparationProvider {
+            staging_root: staging_root.clone(),
+            requests: Mutex::new(Vec::new()),
+            response: TestMediaPreparationResponse::Prepared { mime_type, codecs },
+        });
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
+            .await
+            .unwrap();
+        let error = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+            .await
+            .expect_err("an unlisted rendition pair must fail closed");
+        assert!(
+            error.to_string().contains("output is invalid"),
+            "{mime_type} {codecs}: {error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn media_preparation_resume_matches_audio_receipt() {
+    // A crash between the provider settling and the listing completing leaves
+    // a record that binds the receipt digest but not the rendition pair, so
+    // resuming has to rediscover which allowed pair produced that digest.
+    let temp = tempfile::tempdir().unwrap();
+    let (data_dir, staging_root) = setup_media_preparation_root(temp.path());
+    let input = media_preparation_source_input(temp.path(), "person:local:media-audio-resume");
+    let provider = Arc::new(TestMediaPreparationProvider {
+        staging_root,
+        requests: Mutex::new(Vec::new()),
+        response: TestMediaPreparationResponse::prepared_audio(),
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_runtime_provider_target(MEDIA_PROVIDER_ID, provider.clone())
+        .await
+        .unwrap();
+
+    let first = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect("first audio preparation must settle");
+    assert!(matches!(first, RuntimeLibraryMediaPreparation::Prepared(_)));
+
+    let resumed = prepare_runtime_custody_library_source(&data_dir, registry.as_ref(), &input)
+        .await
+        .expect("a settled audio preparation must resume from its receipt");
+    let RuntimeLibraryMediaPreparation::Prepared(resumed) = resumed else {
+        panic!("expected the resumed audio rendition");
+    };
+    assert_eq!(resumed.input.mime_type, "audio/mp4");
+    assert_eq!(resumed.input.codecs, "mp4a.40.2");
     assert_eq!(provider.requests.lock().await.len(), 1);
 }
 
@@ -9553,6 +9681,190 @@ async fn runtime_custody_library_publish_recovers_open_handle_by_cancelling_befo
     assert_eq!(requests[0]["op"], "cancel_protection_session");
 }
 
+/// Drives a full media publish against a protect provider whose protected init
+/// segment is rebuilt by `steer`, and returns the resulting error string.
+///
+/// `steer` receives the honest protected init segment (the one this session's own
+/// identities produce) plus the length of the protection header inside it, so a
+/// caller can hand back an init segment with the header removed or replaced.
+#[cfg(unix)]
+async fn library_publish_error_with_steered_protection_header(
+    principal: &str,
+    steer: impl FnOnce(&RuntimeMintIntent, Vec<u8>, usize) -> Vec<u8>,
+) -> String {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let (epoch, composition_now) = write_library_publish_test_composition(&data_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    let input = library_publish_test_input(principal);
+    let composition = load_runtime_custody_composition(&data_dir, registry.clone())
+        .unwrap()
+        .unwrap();
+    let configured = composition.configured_nodes().unwrap();
+    let selected = resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        crate::auth::now_ts(),
+        &configured,
+    )
+    .unwrap();
+    let mint_nodes = selected
+        .iter()
+        .map(|node| node.binding().clone())
+        .collect::<Vec<_>>();
+    let mint_intent = load_or_persist_runtime_mint_intent(
+        &runtime_mint_journal(&data_dir),
+        &composition,
+        &input,
+        mint_nodes,
+    )
+    .unwrap();
+    let honest_header = ElastosPqPsshDataV1::new(
+        mint_intent.content_access_id(),
+        &mint_intent.custody_pool(),
+        &mint_intent.custody_epoch(),
+        &mint_intent.custody_committee_authorization(),
+    );
+    let header_bytes = build_elastos_pq_pssh_v1(&honest_header).unwrap().len();
+    let clear_layout =
+        ValidatedClearFmp4MediaSessionLayoutV1::new(&input.clear_init_segment).unwrap();
+    let (_, protected_segments) = media_components(0x41);
+    let honest_init = clear_layout
+        .rewrite_protected_init(&input.clear_init_segment, &honest_header)
+        .unwrap();
+    let protected_init = steer(&mint_intent, honest_init, header_bytes);
+    let protected_media = CencFmp4MediaIdentityV1::new_from_bytes(
+        &protected_init,
+        &protected_segments,
+        MEDIA_MIME_TYPE_V1,
+        MEDIA_CODECS_V1,
+    )
+    .unwrap();
+    let committee = validated_custody_committee_for_epoch(&epoch, composition_now);
+    let content_key =
+        elastos_protected_content_custody::ContentEncryptionKeyV1::generate().unwrap();
+    let envelope = provision_custody_envelope(
+        protected_media.encrypted_content().clone(),
+        &content_key,
+        &committee,
+    )
+    .unwrap();
+    let handle = [0x4b; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1];
+    let protect = SequencedProvider::new(
+        PROTECT_PROVIDER_ID,
+        vec![
+            Ok(ok_typed_protect_provider_response(
+                ProtectProviderResponseV1::new_opened(handle, &protected_init).unwrap(),
+            )),
+            Ok(ok_typed_protect_provider_response(
+                ProtectProviderResponseV1::new_segment_protected(handle, 0, &protected_segments[0])
+                    .unwrap(),
+            )),
+            Ok(ok_typed_protect_provider_response(
+                ProtectProviderResponseV1::new_segment_protected(handle, 1, &protected_segments[1])
+                    .unwrap(),
+            )),
+            Ok(ok_typed_protect_provider_response(
+                ProtectProviderResponseV1::new_finalized(handle, &protected_media, &envelope)
+                    .unwrap(),
+            )),
+            Ok(ok_typed_protect_provider_response(
+                ProtectProviderResponseV1::new_cancelled(handle).unwrap(),
+            )),
+        ],
+    );
+    registry
+        .register_runtime_provider_target(PROTECT_PROVIDER_ID, protect.clone())
+        .await
+        .unwrap();
+
+    let error = publish_runtime_custody_library_object(&data_dir, registry, input)
+        .await
+        .expect_err("a protect output whose protection header is wrong must not publish");
+    let requests = protect.requests().await;
+    assert_eq!(
+        requests.last().map(|request| request["op"].clone()),
+        Some(serde_json::json!("cancel_protection_session")),
+        "the rejected session must still be settled: {requests:?}"
+    );
+    error.to_string()
+}
+
+/// A protected init segment with no `pssh` box at all - what a protect provider
+/// that simply never wrote one would return. `moov` is the last top-level box and
+/// the header is its last child, so removing it is a truncation plus a size fixup.
+#[cfg(unix)]
+fn strip_trailing_protection_header(mut protected_init: Vec<u8>, header_bytes: usize) -> Vec<u8> {
+    let moov_off = u32::from_be_bytes(protected_init[0..4].try_into().unwrap()) as usize;
+    let moov_size =
+        u32::from_be_bytes(protected_init[moov_off..moov_off + 4].try_into().unwrap()) as usize;
+    protected_init.truncate(protected_init.len() - header_bytes);
+    let shrunk = u32::try_from(moov_size - header_bytes).unwrap();
+    protected_init[moov_off..moov_off + 4].copy_from_slice(&shrunk.to_be_bytes());
+    protected_init
+}
+
+/// A NEW protect output must carry the protection header. The box ships in a
+/// public media file and a client reading the artifacts directly routes on it, so
+/// a provider that omits it never reaches publish. (Absence stays legal on the
+/// READ path - `media_structure_admits_only_a_well_formed_elacity_pssh_in_moov`
+/// pins that an init segment without one still validates.)
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_rejects_a_protect_output_with_no_protection_header() {
+    let error = library_publish_error_with_steered_protection_header(
+        "person:local:runtime-custody-missing-protection-header",
+        |_, protected_init, header_bytes| {
+            strip_trailing_protection_header(protected_init, header_bytes)
+        },
+    )
+    .await;
+    assert!(
+        error.contains("Runtime custody protect output is invalid"),
+        "{error}"
+    );
+}
+
+/// The header must name THIS session's custody quorum. A structurally perfect box
+/// that points a future client at some other pool is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_rejects_a_protection_header_naming_another_pool() {
+    let error = library_publish_error_with_steered_protection_header(
+        "person:local:runtime-custody-foreign-protection-pool",
+        |intent, protected_init, header_bytes| {
+            let foreign_pool = CustodyPoolIdentityV1::new(Digest32::new([0xee; 32]), 512).unwrap();
+            assert_ne!(foreign_pool, intent.custody_pool());
+            let foreign_header = ElastosPqPsshDataV1::new(
+                intent.content_access_id(),
+                &foreign_pool,
+                &intent.custody_epoch(),
+                &intent.custody_committee_authorization(),
+            );
+            let cleared = strip_trailing_protection_header(protected_init, header_bytes);
+            let foreign_box = build_elastos_pq_pssh_v1(&foreign_header).unwrap();
+            let moov_off = u32::from_be_bytes(cleared[0..4].try_into().unwrap()) as usize;
+            let moov_size =
+                u32::from_be_bytes(cleared[moov_off..moov_off + 4].try_into().unwrap()) as usize;
+            let mut steered = cleared;
+            steered.extend_from_slice(&foreign_box);
+            let grown = u32::try_from(moov_size + foreign_box.len()).unwrap();
+            steered[moov_off..moov_off + 4].copy_from_slice(&grown.to_be_bytes());
+            steered
+        },
+    )
+    .await;
+    assert!(
+        error.contains("Runtime custody protect output is invalid"),
+        "{error}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_publish_retains_cleanup_obligation_when_close_fails() {
@@ -9595,7 +9907,12 @@ async fn runtime_custody_library_publish_retains_cleanup_obligation_when_close_f
     let protected_init = clear_layout
         .rewrite_protected_init(
             &input.clear_init_segment,
-            *mint_intent.content_access_id().as_bytes(),
+            &ElastosPqPsshDataV1::new(
+                mint_intent.content_access_id(),
+                &mint_intent.custody_pool(),
+                &mint_intent.custody_epoch(),
+                &mint_intent.custody_committee_authorization(),
+            ),
         )
         .unwrap();
     let protected_media = CencFmp4MediaIdentityV1::new_from_bytes(
@@ -13246,6 +13563,33 @@ pub(crate) async fn register_runtime_custody_mock_media_provider_for_test_regist
     data_dir: &Path,
     registry: &Arc<ProviderRegistry>,
 ) {
+    register_runtime_custody_mock_media_provider_rendition(
+        data_dir,
+        registry,
+        TestMediaPreparationResponse::prepared_video(),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+pub(crate) async fn register_runtime_custody_mock_audio_media_provider_for_test_registry(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+) {
+    register_runtime_custody_mock_media_provider_rendition(
+        data_dir,
+        registry,
+        TestMediaPreparationResponse::prepared_audio(),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn register_runtime_custody_mock_media_provider_rendition(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+    response: TestMediaPreparationResponse,
+) {
     let provider_root = data_dir.join("protected-content/media-provider");
     owner_only_dir(&provider_root);
     let staging_root = provider_root.join("staging");
@@ -13256,7 +13600,7 @@ pub(crate) async fn register_runtime_custody_mock_media_provider_for_test_regist
             Arc::new(TestMediaPreparationProvider {
                 staging_root,
                 requests: Mutex::new(Vec::new()),
-                response: TestMediaPreparationResponse::Prepared,
+                response,
             }),
         )
         .await
@@ -13512,7 +13856,7 @@ async fn runtime_media_preparation_stages_plaintext_from_a_protected_principal_r
     let provider = Arc::new(TestMediaPreparationProvider {
         staging_root: staging_root.clone(),
         requests: Mutex::new(Vec::new()),
-        response: TestMediaPreparationResponse::Prepared,
+        response: TestMediaPreparationResponse::prepared_video(),
     });
     let registry = Arc::new(ProviderRegistry::new());
     registry
