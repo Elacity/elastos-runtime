@@ -204,12 +204,15 @@ try {
   assert.equal(await frame.locator("#agent-model-menu").getByRole("option", { name: "Qwen installed fixture", exact: true }).count(), 1);
   await frame.locator("#agent-model-picker").click();
   stage = "Chat Build Studio controls";
-  for (const mode of ["build", "studio", "chat"]) {
+  // Text-only fixture: Build has no typed capability and no image/video offer is
+  // advertised, so neither control is shown (UI ≠ authority). Chat stays pressed.
+  for (const mode of ["build", "studio"]) {
     const button = frame.locator(`button[data-assistant-mode="${mode}"]`);
-    await button.click();
-    assert.equal(await button.getAttribute("aria-pressed"), "true");
-    assert.equal(await frame.locator("#assistant-studio").isVisible(), mode === "studio");
+    assert.equal(await button.count(), 1, `${mode} control exists`);
+    assert.equal(await button.isVisible(), false, `${mode} control hidden without a Runtime-backed capability`);
   }
+  assert.equal(await frame.locator('button[data-assistant-mode="chat"]').getAttribute("aria-pressed"), "true");
+  assert.equal(await frame.locator("#assistant-studio").isVisible(), false);
   // Let preceding real UI writes settle, then open a second stale writer.
   await until(() => stored.document.sessionMode === "chat", "mode save");
   const second = await openPage();
