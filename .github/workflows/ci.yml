@@ -56,6 +56,8 @@ jobs:
         run: node --test capsules/library/browser/src/*.test.mjs
       - name: creator browser unit tests
         run: node --test capsules/creator/browser/*.test.mjs
+      - name: reader browser unit tests
+        run: node --test capsules/elacity-reader/browser/*.test.mjs
 
   lint:
     name: lint

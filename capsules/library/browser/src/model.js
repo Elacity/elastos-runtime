@@ -159,8 +159,32 @@ export function canPreviewObject(object) {
   return !!previewKind(object);
 }
 
-export function isRuntimeCustodyProtectableVideo(object) {
+// A type the publish side cannot place. It refuses these before any listing
+// work rather than sealing something no viewer could ever open, so Library
+// must not offer the action for them either.
+const UNPLACEABLE_PROTECTED_CONTENT_MIME = "application/octet-stream";
+
+// Audio is classified as the media kind below and routes to the media viewer
+// already, but the media path cannot finish an audio listing yet: preparing
+// the rendition still requires a video track. Offering the action would hand
+// the user a dead end, so audio is withheld here only.
+//
+// Task 16 makes the media path accept audio. Deleting this one constant and
+// the single `startsWith` test that uses it is the whole re-enable; the kind
+// classification and the viewer routing are already correct and must not be
+// changed for it.
+const PROTECTION_DEFERRED_MIME_PREFIX = "audio/";
+
+// Which protected item a file becomes once it is listed: "media" is the
+// transcoded audio/video rendition, "object" is everything else.
+export function protectedContentKindFor(mime) {
+  const value = String(mime || "");
+  return value.startsWith("video/") || value.startsWith("audio/") ? "media" : "object";
+}
+
+export function isRuntimeCustodyProtectable(object) {
   const capabilities = Array.isArray(object?.capabilities) ? object.capabilities : null;
+  const mime = String(object?.mime || "");
   return !!(
     object &&
     !isDirectory(object) &&
@@ -169,9 +193,17 @@ export function isRuntimeCustodyProtectableVideo(object) {
     !object.published &&
     !object?.metadata?.readonly &&
     !object?.metadata?.protected_content &&
-    String(object.mime || "").startsWith("video/") &&
+    mime !== "" &&
+    mime !== UNPLACEABLE_PROTECTED_CONTENT_MIME &&
+    !mime.startsWith(PROTECTION_DEFERRED_MIME_PREFIX) &&
     capabilities?.includes("publish")
   );
+}
+
+export function viewerForProtectedContent(object) {
+  return protectedContentKindFor(object?.mime) === "media"
+    ? "elacity-player"
+    : "elacity-reader";
 }
 
 const MAX_UINT256 = (1n << 256n) - 1n;

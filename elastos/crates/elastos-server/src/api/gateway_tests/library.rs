@@ -9227,6 +9227,400 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    reset_mock_content_publish_requests();
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+    let _process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "object-creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-object-creator",
+    );
+    let buyer = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "object-buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-object-buyer",
+    );
+    let creator_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let buyer_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let reader_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_READER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let player_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer,
+    );
+    let creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    let buyer_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account_id,
+        10,
+    )
+    .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &buyer.principal_id,
+        "eip155:8453",
+        &buyer_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state.clone());
+
+    // A non-media file: `mime_for_name` routes `.pdf` to the EPC1 object
+    // path, not to the media provider (which is deliberately not registered
+    // in this test at all -- if the dispatch regressed to media, publish
+    // would fail on a missing media provider rather than silently pass).
+    // Deliberately MULTI-chunk (1 MiB + 4 KiB → a full chunk and a short
+    // final one): a single-chunk object would never exercise the framed-chunk
+    // slicing offsets, the in-order chunk sequence, or the short last chunk.
+    let clear_object = (0u32..(1_048_576 + 4096))
+        .map(|value| (value % 251) as u8)
+        .collect::<Vec<u8>>();
+    let creator_root = crate::auth::principal_localhost_root(&creator.principal_id);
+    let uri = format!("{creator_root}/Documents/protected-object-proof.pdf");
+    write_library_bytes(&app, &creator_token, &uri, &clear_object).await;
+    let publish_body = json!({
+        "uri": uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "copies": "0x2",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    let (publish_pending_status, publish_pending) =
+        post_library(app.clone(), &creator_token, "publish", publish_body.clone()).await;
+    assert_eq!(publish_pending_status, StatusCode::OK);
+    assert_eq!(publish_pending["status"], "error", "{publish_pending}");
+    assert_eq!(
+        publish_pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let creator_signed_transaction = {
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+        wallet_provider
+            .provider
+            .latest_transaction_signed_transaction()
+            .await
+            .expect("completed creator transaction")
+    };
+    reset_mock_chain_broadcast_count(&creator_signed_transaction);
+    let (publish_ok_status, publish_ok) =
+        post_library(app.clone(), &creator_token, "publish", publish_body).await;
+    assert_eq!(publish_ok_status, StatusCode::OK);
+    assert_eq!(publish_ok["status"], "ok", "{publish_ok}");
+    let mint_id_hex = publish_ok["data"]["content_security"]["mint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&mint_id_hex).unwrap().try_into().unwrap(),
+    );
+    // An object publish now runs the SAME creator tail as media: encrypted
+    // content, metadata document and portable listing are all published.
+    assert_eq!(mock_content_publish_request_count(), 3);
+    let listing_path = runtime_custody_listing_path_for_test(dir.path(), mint_id);
+    let listing_before_buy = std::fs::read(&listing_path).unwrap();
+    let listing_json: serde_json::Value = serde_json::from_slice(&listing_before_buy).unwrap();
+    assert!(
+        listing_json["package"]["media_identity_base64"].is_null(),
+        "an object listing must not carry a media identity"
+    );
+    assert!(listing_json["package"]["content_identity_base64"].is_string());
+
+    let (_, listed) =
+        post_library(app.clone(), &buyer_token, "list_runtime_custody", json!({})).await;
+    let summary = listed["data"]["listings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["mint_id"] == mint_id_hex.as_str())
+        .expect("the object listing must be listed");
+    assert_eq!(summary["mime_type"], "application/pdf");
+    assert_eq!(summary["codecs"], "");
+
+    // Buy: identical flow to media (approval, then the buy transaction).
+    for _ in 0..2 {
+        let (buy_status, buy_pending) = post_library(
+            app.clone(),
+            &buyer_token,
+            "buy",
+            json!({"mint_id": mint_id_hex}),
+        )
+        .await;
+        assert_eq!(buy_status, StatusCode::OK);
+        assert_eq!(buy_pending["status"], "error", "{buy_pending}");
+        assert_eq!(
+            buy_pending["message"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+        );
+        let _ = wallet_provider
+            .provider
+            .complete_latest_transaction_approval()
+            .await;
+    }
+    let (buy_ok_status, buy_ok) = post_library(
+        app.clone(),
+        &buyer_token,
+        "buy",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(buy_ok_status, StatusCode::OK);
+    assert_eq!(buy_ok["status"], "ok", "{buy_ok}");
+    assert_eq!(buy_ok["data"]["availability"]["status"], "buyer_owned");
+
+    // Kind <-> viewer: the media player must not be able to open an object.
+    let (_, player_open) = post_library(
+        app.clone(),
+        &player_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(player_open["status"], "error", "{player_open}");
+    assert_eq!(
+        player_open["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE
+    );
+
+    let (open_status, open_payload) = post_library(
+        app.clone(),
+        &reader_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(open_status, StatusCode::OK);
+    assert_eq!(open_payload["status"], "ok", "{open_payload}");
+    let open_keys = open_payload["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        open_keys,
+        std::collections::BTreeSet::from([
+            "chunk_count",
+            "chunk_plaintext_bytes",
+            "content_kind",
+            "content_type",
+            "expires_at",
+            "mint_id",
+            "plaintext_bytes",
+            "schema",
+            "viewer_session_handle",
+        ])
+    );
+    assert_eq!(
+        open_payload["data"]["content_kind"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT
+    );
+    assert_eq!(open_payload["data"]["content_type"], "application/pdf");
+    assert_eq!(
+        open_payload["data"]["plaintext_bytes"].as_u64(),
+        Some(clear_object.len() as u64)
+    );
+    assert_eq!(open_payload["data"]["chunk_count"].as_u64(), Some(2));
+    assert_eq!(
+        open_payload["data"]["chunk_plaintext_bytes"].as_u64(),
+        Some(1_048_576),
+        "the reader needs the plaintext chunk size to size its buffer"
+    );
+    let viewer_handle = open_payload["data"]["viewer_session_handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A replayed open returns the identical object response, not a media one.
+    let (_, open_replay) = post_library(
+        app.clone(),
+        &reader_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(open_replay, open_payload);
+
+    // Media's selector on an object session is refused, not ignored.
+    let (_, wrong_selector) = post_library(
+        app.clone(),
+        &reader_token,
+        "read_viewer",
+        json!({
+            "mint_id": mint_id_hex,
+            "viewer_session_handle": viewer_handle,
+            "segment_index": 0,
+        }),
+    )
+    .await;
+    assert_eq!(wrong_selector["status"], "error", "{wrong_selector}");
+    // An object read must name its chunk; there is no init-part default.
+    let (_, missing_selector) = post_library(
+        app.clone(),
+        &reader_token,
+        "read_viewer",
+        json!({"mint_id": mint_id_hex, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(missing_selector["status"], "error", "{missing_selector}");
+    // Chunks are released in order: chunk 1 before chunk 0 is refused.
+    let (_, out_of_order) = post_library(
+        app.clone(),
+        &reader_token,
+        "read_viewer",
+        json!({
+            "mint_id": mint_id_hex,
+            "viewer_session_handle": viewer_handle,
+            "chunk_index": 1,
+        }),
+    )
+    .await;
+    assert_eq!(out_of_order["status"], "error", "{out_of_order}");
+
+    // Walk every chunk in order and reassemble: the full chunk first, then
+    // the short final one. Each response must name the chunk it carries, and
+    // the concatenation must be the creator's exact clear bytes -- which is
+    // what proves the Runtime sliced `object.epc1` at the sealer's own framed
+    // offsets rather than at offsets it re-derived.
+    let mut reassembled: Vec<u8> = Vec::with_capacity(clear_object.len());
+    for chunk_index in 0..2u32 {
+        let (chunk_status, chunk_payload) = post_library(
+            app.clone(),
+            &reader_token,
+            "read_viewer",
+            json!({
+                "mint_id": mint_id_hex,
+                "viewer_session_handle": viewer_handle,
+                "chunk_index": chunk_index,
+            }),
+        )
+        .await;
+        assert_eq!(chunk_status, StatusCode::OK);
+        assert_eq!(chunk_payload["status"], "ok", "{chunk_payload}");
+        assert_eq!(
+            chunk_payload["data"]["content_kind"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT
+        );
+        assert_eq!(
+            chunk_payload["data"]["chunk_index"].as_u64(),
+            Some(u64::from(chunk_index))
+        );
+        let plaintext = base64::engine::general_purpose::STANDARD
+            .decode(chunk_payload["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            plaintext.len(),
+            if chunk_index == 0 { 1_048_576 } else { 4096 },
+            "chunk {chunk_index} must carry its own plaintext length"
+        );
+        reassembled.extend_from_slice(&plaintext);
+    }
+    assert_eq!(
+        reassembled, clear_object,
+        "the reader must recover the exact clear object bytes"
+    );
+
+    // Every chunk has been released: replaying the last one is refused, so a
+    // session cannot be milked for repeat decryptions of the same chunk.
+    let (_, replayed_chunk) = post_library(
+        app.clone(),
+        &reader_token,
+        "read_viewer",
+        json!({
+            "mint_id": mint_id_hex,
+            "viewer_session_handle": viewer_handle,
+            "chunk_index": 1,
+        }),
+    )
+    .await;
+    assert_eq!(replayed_chunk["status"], "error", "{replayed_chunk}");
+    // ...and so is the one-past-the-end chunk, which the in-order counter
+    // alone would admit on an exhausted session (`next` now equals the chunk
+    // count): only the chunk-count ceiling refuses it.
+    let (_, past_the_end_chunk) = post_library(
+        app.clone(),
+        &reader_token,
+        "read_viewer",
+        json!({
+            "mint_id": mint_id_hex,
+            "viewer_session_handle": viewer_handle,
+            "chunk_index": 2,
+        }),
+    )
+    .await;
+    assert_eq!(
+        past_the_end_chunk["status"], "error",
+        "{past_the_end_chunk}"
+    );
+
+    let (close_status, close_payload) = post_library(
+        app.clone(),
+        &reader_token,
+        "close_viewer",
+        json!({"mint_id": mint_id_hex, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(close_status, StatusCode::OK);
+    assert_eq!(close_payload["status"], "ok", "{close_payload}");
+    let viewer_record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(runtime_custody_viewer_record_path_for_test(
+            dir.path(),
+            &buyer.principal_id,
+            mint_id,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(viewer_record["lifecycle_status"], "closed");
+    assert_eq!(std::fs::read(&listing_path).unwrap(), listing_before_buy);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     reset_mock_chain_raw_requests();
@@ -9980,6 +10374,11 @@ async fn test_library_provider_runtime_custody_publish_gates_on_content_type() {
         "clip.m4v",
         "clip.avi",
         "clip.ts",
+        // `.ogv` (ffmpeg's `ogg` demuxer) and `.asf` (the same `asf` demuxer
+        // `.wmv` already uses) were publishable before the media allowlist
+        // landed and must stay so.
+        "clip.ogv",
+        "clip.asf",
         "song.m4a",
         "song.wav",
         "song.flac",

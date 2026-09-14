@@ -10,12 +10,13 @@ import {
   isArchiveObject,
   isBlockedObject,
   isDirectory,
-  isRuntimeCustodyProtectableVideo,
+  isRuntimeCustodyProtectable,
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
   parentUri,
   publishedCid,
+  viewerForProtectedContent,
   viewerOptions,
 } from "./model.js";
 
@@ -73,11 +74,11 @@ export function createLibraryActions({
       deliverArchiveObject(object);
       return;
     }
-    if (isRuntimeCustodyProtectedVideo(object)) {
-      if (openProtectedVideo(object)) {
+    if (isRuntimeCustodyProtected(object)) {
+      if (openProtectedContent(object)) {
         return;
       }
-      setStatus("Protected video is unavailable.");
+      setStatus("Protected content is unavailable.");
       return;
     }
     if (isArchiveObject(object) && openWithViewer(object, "archive-manager")) {
@@ -95,19 +96,16 @@ export function createLibraryActions({
     showProperties(object);
   }
 
-  function isRuntimeCustodyProtectedVideo(object) {
-    return (
-      String(object?.mime || "").startsWith("video/") &&
-      object?.metadata?.protected_content?.schema === RUNTIME_CUSTODY_METADATA_SCHEMA
-    );
+  function isRuntimeCustodyProtected(object) {
+    return object?.metadata?.protected_content?.schema === RUNTIME_CUSTODY_METADATA_SCHEMA;
   }
 
-  function openProtectedVideo(object) {
+  function openProtectedContent(object) {
     const mintId = String(object?.metadata?.protected_content?.mint_id || "").trim();
     if (!MINT_ID_HEX_RE.test(mintId)) {
       return false;
     }
-    return openTarget("elacity-player", { mint_id: mintId });
+    return openTarget(viewerForProtectedContent(object), { mint_id: mintId });
   }
 
   function openWithViewer(object, viewer) {
@@ -344,7 +342,7 @@ export function createLibraryActions({
   }
 
   async function protectAndListObject(object) {
-    if (!isRuntimeCustodyProtectableVideo(object)) return;
+    if (!isRuntimeCustodyProtectable(object)) return;
     const operationKey = String(object.uri || "");
     const existing = protectAndListInFlight.get(operationKey);
     if (existing) {

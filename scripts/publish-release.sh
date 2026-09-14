@@ -78,6 +78,7 @@ DEFAULT_CAPSULES=(
     home-agent
     creator
     elacity-player
+    elacity-reader
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -113,6 +114,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     home-agent
     creator
     elacity-player
+    elacity-reader
 )
 SUPPORT_BINARY_ASSETS=(
     shell
@@ -869,7 +871,8 @@ build_platform_independent_direct_assets() {
         assistant \
         home-agent \
         creator \
-        elacity-player; do
+        elacity-player \
+        elacity-reader; do
         if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
             archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"
         else

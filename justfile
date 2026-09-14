@@ -155,6 +155,7 @@ verify:
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test capsules/library/browser/src/*.test.mjs
     node --test capsules/creator/browser/*.test.mjs
+    node --test capsules/elacity-reader/browser/*.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     ./scripts/browser-local-exit-orphan-cleanup-smoke.sh
@@ -190,6 +191,7 @@ product-ui-browser:
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
+    node scripts/elacity-reader-smoke.mjs
 
 product-ui-virtual-auth:
     HOME_VIRTUAL_AUTH_APP_MATRIX=1 node scripts/home-passkey-virtual-auth-smoke.mjs

@@ -1,0 +1,53 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "elacity-reader",
+  "version": "0.1.0",
+  "description": "Protected document, picture, book, comic and 3D viewer",
+  "role": "viewer",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "author": "elastos",
+  "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
+  "interfaces": [
+    {
+      "id": "elastos.protected-content.reader",
+      "version": "0.1.0",
+      "description": "Open protected files you own and read them page by page",
+      "methods": [
+        {
+          "id": "viewer.open",
+          "description": "Open a protected file session.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "open_viewer"
+        },
+        {
+          "id": "viewer.read",
+          "description": "Read one part of a protected file.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "read_viewer"
+        },
+        {
+          "id": "viewer.close",
+          "description": "Close a protected file session.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "close_viewer"
+        }
+      ]
+    }
+  ],
+  "requires": [{ "name": "object-provider", "kind": "capsule" }],
+  "resources": { "memory_mb": 96, "gpu": false }
+}

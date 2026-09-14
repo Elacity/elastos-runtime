@@ -47,12 +47,11 @@ const EXT_MIME = {
   ply: "model/mesh",
 };
 
-// The chain's actual default primary-sale split (capsules/chain-provider/src/
-// main.rs:48-51: CentralStorage.protocolShares() mints the creator 950/1000
-// royalty units and the protocol owner 50/1000). Cosmetic here (see
-// summarizeRoyaltyRows) — no publish field carries a royalty split — but the
-// default rows shown to the creator reflect this real on-chain distribution
-// rather than an invented one.
+// The real default primary-sale split applied when an asset is listed: the
+// creator receives 950 of 1000 royalty units and the protocol owner 50.
+// Cosmetic here (see summarizeRoyaltyRows) — no publish field carries a
+// royalty split — but the default rows shown to the creator reflect the
+// distribution actually applied rather than an invented one.
 const DEFAULT_CREATOR_ROYALTY_PERCENT = 95;
 const DEFAULT_PROTOCOL_ROYALTY_PERCENT = 5;
 const ROYALTY_TOTAL_TARGET_PERCENT = 100;

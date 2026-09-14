@@ -3389,10 +3389,32 @@ pub(crate) async fn runtime_custody_publish_via_gateway(
         state,
         authority,
         registry,
-        prepared_input,
+        (&prepared_input).into(),
         facts,
     )
     .await
+}
+
+/// Object twin of [`runtime_custody_publish_via_gateway`]: seal, mint,
+/// provision and publish the EPC1 object, then run the SAME creator tail
+/// (chain mint, metadata document, portable listing) the media path runs. The
+/// tail is shared, not duplicated — everything kind-specific it needs it reads
+/// from the persisted mint draft.
+pub(crate) async fn runtime_custody_publish_object_via_gateway(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    registry: Arc<ProviderRegistry>,
+    input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishObjectInput,
+) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
+    let tail_input = crate::protected_content_runtime::RuntimeCustodyCreatorTailInput::from(&input);
+    let facts = crate::protected_content_runtime::publish_runtime_custody_library_object_content(
+        &state.data_dir,
+        Arc::clone(&registry),
+        input,
+    )
+    .await?;
+    runtime_custody_publish_creator_tail_from_facts(state, authority, registry, tail_input, facts)
+        .await
 }
 
 pub(crate) async fn runtime_custody_buy_via_gateway(
@@ -3718,7 +3740,7 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     registry: Arc<ProviderRegistry>,
-    input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+    input: crate::protected_content_runtime::RuntimeCustodyCreatorTailInput,
     mut facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
 ) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
     let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
@@ -3943,7 +3965,14 @@ pub(crate) async fn runtime_custody_publish_creator_tail_for_test(
     input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
     facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
 ) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
-    runtime_custody_publish_creator_tail_from_facts(state, authority, registry, input, facts).await
+    runtime_custody_publish_creator_tail_from_facts(
+        state,
+        authority,
+        registry,
+        (&input).into(),
+        facts,
+    )
+    .await
 }
 
 pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value) -> Option<&str> {

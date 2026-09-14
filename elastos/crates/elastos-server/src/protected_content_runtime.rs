@@ -52,10 +52,10 @@ use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
     cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
     close_viewer_session_with_result, open_viewer_session, prepare_recipient,
-    read_viewer_media_part, resolve_runtime_mint_selected_nodes, ExclusiveFileLock,
-    PersistedRuntimeMint, PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
-    RuntimeContentIdentityV1, RuntimeCustodyTerminalKind, RuntimeDecryptProvider,
-    RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
+    read_viewer_media_part, read_viewer_object_chunk, resolve_runtime_mint_selected_nodes,
+    ExclusiveFileLock, PersistedRuntimeMint, PersistedRuntimeReleaseOperation,
+    RuntimeContentAvailabilityRequirement, RuntimeContentIdentityV1, RuntimeCustodyTerminalKind,
+    RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
     RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorError,
     RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
     RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerContentV1,
@@ -4014,6 +4014,67 @@ async fn invoke_runtime_media_provider_prepare(
     }
 }
 
+/// The publish-input fields the creator tail (chain mint, metadata, listing)
+/// actually reads. Both publish inputs project into it, so the tail is one
+/// kind-agnostic function instead of a media copy and an object copy:
+/// everything kind-specific it needs, it reads from the persisted mint draft.
+#[derive(Clone)]
+pub(crate) struct RuntimeCustodyCreatorTailInput {
+    pub object_uri: String,
+    pub principal_id: String,
+    pub wallet_account_id: String,
+    pub wallet_account_address: String,
+    pub creator_mint_source_digest: Digest32,
+    pub copies: String,
+    pub price: String,
+}
+
+impl std::fmt::Debug for RuntimeCustodyCreatorTailInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyCreatorTailInput")
+            .field("object_uri", &self.object_uri)
+            .field("principal_id", &self.principal_id)
+            .field("wallet_account_id", &"[redacted]")
+            .field("wallet_account_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
+            .field("copies", &self.copies)
+            .field("price", &self.price)
+            .finish()
+    }
+}
+
+impl From<&RuntimeCustodyLibraryPublishInput> for RuntimeCustodyCreatorTailInput {
+    fn from(input: &RuntimeCustodyLibraryPublishInput) -> Self {
+        Self {
+            object_uri: input.object_uri.clone(),
+            principal_id: input.principal_id.clone(),
+            wallet_account_id: input.wallet_account_id.clone(),
+            wallet_account_address: input.wallet_account_address.clone(),
+            creator_mint_source_digest: input.creator_mint_source_digest,
+            copies: input.copies.clone(),
+            price: input.price.clone(),
+        }
+    }
+}
+
+impl From<&RuntimeCustodyLibraryPublishObjectInput> for RuntimeCustodyCreatorTailInput {
+    fn from(input: &RuntimeCustodyLibraryPublishObjectInput) -> Self {
+        Self {
+            object_uri: input.object_uri.clone(),
+            principal_id: input.principal_id.clone(),
+            wallet_account_id: input.wallet_account_id.clone(),
+            wallet_account_address: input.wallet_account_address.clone(),
+            creator_mint_source_digest: input.creator_mint_source_digest,
+            copies: input.copies.clone(),
+            price: input.price.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub object_uri: String,
@@ -4579,12 +4640,10 @@ pub(crate) async fn publish_runtime_custody_library_object(
 
 /// Object twin of `publish_runtime_custody_library_object`. Ends where the
 /// media function's completed mint (custody-provisioned + content-available)
-/// is ready — it does not attempt the creator/chain-mint/listing tail. See
-/// the Task 13 report: the portable-listing/purchase package that tail
-/// writes (`RuntimePortableListingPackage`, `DecodedRuntimePortableAsset`,
-/// and the whole open/buy path that decodes them) is media-only in a way
-/// that goes well beyond the six helpers this task named, and widening it
-/// safely is out of this task's scope.
+/// is ready. The creator/chain-mint/listing tail is NOT duplicated here: the
+/// caller (`runtime_custody_publish_object_via_gateway`) runs the same shared
+/// `runtime_custody_publish_creator_tail_from_facts` the media path runs, now
+/// that the portable listing package carries either content kind.
 pub(crate) async fn publish_runtime_custody_library_object_content(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
@@ -6016,9 +6075,9 @@ async fn verify_runtime_portable_chain(
 /// Re-verifies a portable listing's published content and rebuilds the mint
 /// draft it commits to. Dispatches on the listing's own content kind with an
 /// explicit two-arm match: media keeps the untouched
-/// [`verify_runtime_portable_media`] path, and objects are refused here until
-/// the object open/read path wires their twin — never silently treated as
-/// media, and never defaulted.
+/// [`verify_runtime_portable_media`] path and objects take
+/// [`verify_runtime_portable_object`] — never silently treated as media, and
+/// never defaulted.
 async fn verify_runtime_portable_content(
     data_dir: &Path,
     registry: &Arc<ProviderRegistry>,
@@ -6038,10 +6097,97 @@ async fn verify_runtime_portable_content(
             )
             .await
         }
-        RuntimeContentIdentityV1::Object(_) => {
-            anyhow::bail!("Runtime custody portable object listing verification is unavailable")
+        RuntimeContentIdentityV1::Object(object_identity) => {
+            verify_runtime_portable_object(
+                data_dir,
+                registry,
+                package,
+                decoded,
+                object_identity,
+                now_unix_seconds,
+            )
+            .await
         }
     }
+}
+
+/// Object twin of [`verify_runtime_portable_media`]. Step for step the same
+/// sequence — re-observe availability, fetch and verify the published files
+/// against the listing's own identity, verify the receipt, resolve the
+/// custody composition's currently selected nodes, rebuild the mint draft and
+/// require it to hash back to the listing's `mint_id`. The media function is
+/// untouched; only the three content-shaped steps differ (object manifest and
+/// `object.epc1` instead of `identity.bin` + `init.mp4` + segments, the object
+/// receipt twin, and `RuntimeMintDraft::new_from_identity` with an
+/// `Object` identity instead of `RuntimeMintDraft::new` from raw media bytes).
+#[allow(clippy::too_many_arguments)]
+async fn verify_runtime_portable_object(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+    package: &RuntimePortableListingPackage,
+    decoded: &DecodedRuntimePortableAsset,
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    now_unix_seconds: u64,
+) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
+    // Same clock discipline as the media path: a dead candidate's connect
+    // timeouts can outlast the receipt's future-skew allowance.
+    let now_unix_seconds = now_unix_seconds.max(crate::auth::now_ts());
+    let trusted_receipt_signer_did =
+        crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        trusted_receipt_signer_did,
+        &package.content_id,
+        &package.publisher_profile_did,
+        PROTECTED_CONTENT_REPLICATION_POLICY,
+        PROTECTED_CONTENT_MIN_REPLICAS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
+    )?;
+    let receipt =
+        refresh_content_availability_receipt(registry, &package.content_cid, &requirement).await?;
+    let manifest =
+        crate::content::fetch_content_object_manifest(registry, &package.content_cid).await?;
+    verify_protected_content_object_manifest_and_files(
+        registry,
+        &package.content_cid,
+        &manifest,
+        object_identity,
+    )
+    .await?;
+    let availability = verify_protected_content_object_receipt(
+        &package.content_cid,
+        &manifest,
+        &receipt,
+        object_identity,
+        &requirement,
+        now_unix_seconds.max(crate::auth::now_ts()),
+    )?;
+    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let configured_nodes = composition.configured_nodes()?;
+    let selected = resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        now_unix_seconds.max(crate::auth::now_ts()),
+        &configured_nodes,
+    )?;
+    let draft = RuntimeMintDraft::new_from_identity(
+        RuntimeContentIdentityV1::Object(object_identity.clone()),
+        decoded.content_access_id,
+        decoded.key_envelope.clone(),
+        decoded.rights_policy.clone(),
+        decoded.content_key_commitment,
+        decoded.key_envelope.threshold(),
+        selected.iter().map(|node| node.binding().clone()).collect(),
+    )?;
+    if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
+        anyhow::bail!("Runtime custody portable listing is invalid");
+    }
+    Ok((draft, availability))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6604,6 +6750,46 @@ impl RuntimeCustodyViewerRecord {
         Ok(())
     }
 
+    /// Object chunks are released strictly in order too, but unlike media
+    /// there is no init part: chunk n IS part n (media's part 0 is the init
+    /// segment and part n+1 is segment n). The counter and
+    /// `mark_media_part_read` are shared and kind-agnostic; only this
+    /// mapping differs.
+    ///
+    /// `chunk_count` bounds the request the way media's caller bounds
+    /// `segment_index` against `encrypted_segments().len()` — and, like
+    /// media, before the published content is fetched, not after. Without it
+    /// an exhausted session (`next_media_part_index == chunk_count`) would
+    /// pass the ordering check for `chunk_index == chunk_count` and only fail
+    /// once the whole framed object had been fetched and re-hashed.
+    fn require_object_chunk_index(&self, chunk_index: u32, chunk_count: u32) -> anyhow::Result<()> {
+        const MESSAGE: &str = "Runtime custody viewer object chunk is invalid";
+        if chunk_index >= chunk_count {
+            tracing::warn!(
+                requested_chunk = chunk_index,
+                chunk_count,
+                "runtime custody viewer: object chunk requested past the last chunk"
+            );
+            return Err(anyhow::anyhow!(
+                "requested object chunk {chunk_index} but the object has {chunk_count} chunks"
+            )
+            .context(MESSAGE));
+        }
+        if chunk_index != self.next_media_part_index {
+            tracing::warn!(
+                requested_chunk = chunk_index,
+                next_chunk = self.next_media_part_index,
+                "runtime custody viewer: object chunk requested out of order"
+            );
+            return Err(anyhow::anyhow!(
+                "requested object chunk {chunk_index} but the next chunk is {}",
+                self.next_media_part_index
+            )
+            .context(MESSAGE));
+        }
+        Ok(())
+    }
+
     fn mark_media_part_read(&mut self, now: u64) -> anyhow::Result<()> {
         self.next_media_part_index = self
             .next_media_part_index
@@ -7013,8 +7199,13 @@ pub(crate) async fn open_runtime_custody_viewer(
                             session.expires_at(),
                         )
                     }
-                    RuntimeContentIdentityV1::Object(_) => {
-                        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE)
+                    RuntimeContentIdentityV1::Object(object_identity) => {
+                        runtime_custody_viewer_object_public_response(
+                            object_identity,
+                            mint_id,
+                            session.viewer_session_handle(),
+                            session.expires_at(),
+                        )
                     }
                 };
             }
@@ -7097,12 +7288,43 @@ pub(crate) async fn open_runtime_custody_viewer(
             .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
     let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
         .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
-    let expected_media_identity = draft
-        .media_identity()
-        .ok_or_else(|| anyhow::anyhow!("Runtime custody mint draft is not a media identity"))?;
-    let (media_identity, protected_init) =
-        fetch_runtime_custody_open_media(registry.as_ref(), &purchase.cid, expected_media_identity)
+    // Fetch and re-verify the published content for THIS draft's kind, and
+    // carry the verified result forward: it is what the viewer session is
+    // opened over and what the public response is built from further down, so
+    // neither can ever describe content the Runtime did not just re-observe.
+    // Media reconstructs its identity FROM the fetched bytes; an object is one
+    // published file, so its bytes are verified AGAINST the draft's identity
+    // (exact length and sha256) instead — either way an identity only survives
+    // here if the published bytes back it.
+    let open_content = match draft.content_identity() {
+        RuntimeContentIdentityV1::Media(expected_media_identity) => {
+            let (media_identity, protected_init) = fetch_runtime_custody_open_media(
+                registry.as_ref(),
+                &purchase.cid,
+                expected_media_identity,
+            )
             .await?;
+            RuntimeCustodyOpenContent::Media {
+                media_identity,
+                protected_init,
+            }
+        }
+        RuntimeContentIdentityV1::Object(expected_object_identity) => {
+            let framed = fetch_runtime_custody_open_object(
+                registry.as_ref(),
+                &purchase.cid,
+                expected_object_identity,
+            )
+            .await?;
+            RuntimeCustodyOpenContent::Object {
+                object_identity: expected_object_identity.clone(),
+                framed_header: runtime_custody_object_framed_header(
+                    &framed,
+                    expected_object_identity,
+                )?,
+            }
+        }
+    };
     let now = crate::auth::now_ts();
     let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
     let (prepared, mut open_pending, audit_request_id, replay_wallet_request) =
@@ -7463,10 +7685,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer,
             content_key_commitment: draft.content_key_commitment(),
-            content: RuntimeOpenViewerContentV1::Media {
-                media_identity: &media_identity,
-                protected_init_segment: &protected_init,
-            },
+            content: open_content.as_open_viewer_content(),
             signed_node_contributions: &contributions,
             signed_terminal_receipt: &terminal_receipt,
             now_unix_seconds: crate::auth::now_ts(),
@@ -7514,10 +7733,60 @@ pub(crate) async fn open_runtime_custody_viewer(
         .await;
         return Err(error);
     }
-    // `media_identity` here is the already-fetched-and-validated owned media
-    // identity from above (this open-viewer flow only ever handles media
-    // drafts today), not `draft.media_identity()` — no Option to unwrap.
-    runtime_custody_viewer_public_response(&media_identity, mint_id, &handle, expires_at)
+    // Built from `open_content` — the identity the fetch above re-verified
+    // against the published bytes — so the response can never describe content
+    // the Runtime did not just re-observe.
+    match &open_content {
+        RuntimeCustodyOpenContent::Media { media_identity, .. } => {
+            runtime_custody_viewer_public_response(media_identity, mint_id, &handle, expires_at)
+        }
+        RuntimeCustodyOpenContent::Object {
+            object_identity, ..
+        } => runtime_custody_viewer_object_public_response(
+            object_identity,
+            mint_id,
+            &handle,
+            expires_at,
+        ),
+    }
+}
+
+/// The published content an open has fetched and verified, owned for the
+/// lifetime of `open_runtime_custody_viewer`.
+///
+/// Only the framed HEADER of an object is retained: that is all
+/// `RuntimeOpenViewerContentV1::Object` needs, and a framed object can be tens
+/// of megabytes.
+enum RuntimeCustodyOpenContent {
+    Media {
+        media_identity: CencFmp4MediaIdentityV1,
+        protected_init: Vec<u8>,
+    },
+    Object {
+        object_identity: ChunkedPayloadObjectIdentityV1,
+        framed_header: Vec<u8>,
+    },
+}
+
+impl RuntimeCustodyOpenContent {
+    fn as_open_viewer_content(&self) -> RuntimeOpenViewerContentV1<'_> {
+        match self {
+            Self::Media {
+                media_identity,
+                protected_init,
+            } => RuntimeOpenViewerContentV1::Media {
+                media_identity,
+                protected_init_segment: protected_init,
+            },
+            Self::Object {
+                object_identity,
+                framed_header,
+            } => RuntimeOpenViewerContentV1::Object {
+                object_identity,
+                framed_header,
+            },
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7533,6 +7802,7 @@ pub(crate) async fn read_runtime_custody_viewer(
     session_id: Option<&str>,
     grant_id: Option<&str>,
     segment_index: Option<u32>,
+    chunk_index: Option<u32>,
 ) -> anyhow::Result<Value> {
     let mint_id = parse_mint_id_hex(mint_id_hex)?;
     let _viewer_lifecycle_guard =
@@ -7564,12 +7834,28 @@ pub(crate) async fn read_runtime_custody_viewer(
         mint_id,
         "Runtime custody viewer session is unavailable",
     )?;
-    // Kind dispatch above every lifecycle shortcut: this read path is the
-    // media one (`segment_index`-driven parts). An object session's chunk
-    // read is refused here rather than being served a media part.
-    let media_identity = match &asset.content_identity {
-        RuntimeContentIdentityV1::Media(media_identity) => media_identity,
-        RuntimeContentIdentityV1::Object(_) => {
+    // Kind dispatch above every lifecycle shortcut. Each kind names its parts
+    // with its OWN selector, and the other kind's selector is refused rather
+    // than accepted-and-ignored: a media read must not carry `chunk_index`, an
+    // object read must not carry `segment_index`, and an object read must name
+    // the chunk it wants (there is no object analogue of media's
+    // "no segment_index means the init segment" default).
+    let content_selector = match (&asset.content_identity, segment_index, chunk_index) {
+        (RuntimeContentIdentityV1::Media(media_identity), _, None) => {
+            RuntimeCustodyViewerReadSelector::Media {
+                media_identity,
+                segment_index,
+            }
+        }
+        (RuntimeContentIdentityV1::Object(object_identity), None, Some(chunk_index)) => {
+            RuntimeCustodyViewerReadSelector::Object {
+                object_identity,
+                chunk_index,
+            }
+        }
+        (RuntimeContentIdentityV1::Media(_), _, Some(_))
+        | (RuntimeContentIdentityV1::Object(_), Some(_), _)
+        | (RuntimeContentIdentityV1::Object(_), None, None) => {
             anyhow::bail!("Runtime custody viewer session is unavailable")
         }
     };
@@ -7609,32 +7895,84 @@ pub(crate) async fn read_runtime_custody_viewer(
             anyhow::bail!("Runtime custody viewer session is unavailable");
         }
     };
-    record.require_media_part_index(segment_index)?;
-    let selector = if let Some(segment_index) = segment_index {
-        let path = protected_content_segment_path(
-            usize::try_from(segment_index)
-                .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?,
-        );
-        if usize::try_from(segment_index).ok() >= Some(media_identity.encrypted_segments().len()) {
-            anyhow::bail!("Runtime custody viewer media part is invalid");
-        }
-        let encrypted =
-            crate::content::fetch_bytes_via_provider(registry.as_ref(), &purchase.cid, Some(&path))
+    let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
+    let response = match content_selector {
+        RuntimeCustodyViewerReadSelector::Media {
+            media_identity,
+            segment_index,
+        } => {
+            record.require_media_part_index(segment_index)?;
+            let selector = if let Some(segment_index) = segment_index {
+                let path = protected_content_segment_path(usize::try_from(segment_index).map_err(
+                    |_| anyhow::anyhow!("Runtime custody viewer media part is invalid"),
+                )?);
+                if usize::try_from(segment_index).ok()
+                    >= Some(media_identity.encrypted_segments().len())
+                {
+                    anyhow::bail!("Runtime custody viewer media part is invalid");
+                }
+                let encrypted = crate::content::fetch_bytes_via_provider(
+                    registry.as_ref(),
+                    &purchase.cid,
+                    Some(&path),
+                )
                 .await
                 .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
-        ViewerMediaPartSelectorV1::segment(segment_index, encrypted)
-            .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?
-    } else {
-        ViewerMediaPartSelectorV1::init()
+                ViewerMediaPartSelectorV1::segment(segment_index, encrypted)
+                    .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?
+            } else {
+                ViewerMediaPartSelectorV1::init()
+            };
+            let part = read_viewer_media_part(&decrypt, &session, selector, crate::auth::now_ts())
+                .await
+                .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
+            json!({
+                "schema": "elastos.library.runtime-custody-viewer-part/v1",
+                "mint_id": hex::encode(mint_id.as_bytes()),
+                "viewer_session_handle": handle_hex,
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(part.clear_media_part()),
+            })
+        }
+        RuntimeCustodyViewerReadSelector::Object {
+            object_identity,
+            chunk_index,
+        } => {
+            record.require_object_chunk_index(chunk_index, object_identity.chunk_count())?;
+            // Re-fetch and re-verify the whole framed object against the
+            // listing's identity, then hand the decrypt provider exactly ONE
+            // framed chunk (~1 MiB + tag), never the whole file: a provider
+            // frame carries the chunk as a JSON integer array, so a 1 MiB
+            // chunk already costs roughly 4 MiB of the 16 MiB frame ceiling.
+            let framed = fetch_runtime_custody_open_object(
+                registry.as_ref(),
+                &purchase.cid,
+                object_identity,
+            )
+            .await?;
+            let framed_chunk =
+                runtime_custody_object_framed_chunk(&framed, object_identity, chunk_index)?;
+            drop(framed);
+            let chunk = read_viewer_object_chunk(
+                &decrypt,
+                &session,
+                chunk_index,
+                &framed_chunk,
+                crate::auth::now_ts(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
+            json!({
+                "schema": "elastos.library.runtime-custody-viewer-part/v1",
+                "content_kind": RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT,
+                "mint_id": hex::encode(mint_id.as_bytes()),
+                "viewer_session_handle": handle_hex,
+                "chunk_index": chunk_index,
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(chunk.plaintext()),
+            })
+        }
     };
-    let part = read_viewer_media_part(
-        &RuntimeDecryptRegistryAdapter::new(registry.clone()),
-        &session,
-        selector,
-        crate::auth::now_ts(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
     record.mark_media_part_read(crate::auth::now_ts())?;
     if persist_runtime_custody_viewer_record(data_dir, principal_id, mint_id, &record).is_err() {
         let _ = settle_runtime_custody_viewer_cleanup(
@@ -7648,13 +7986,22 @@ pub(crate) async fn read_runtime_custody_viewer(
         .await;
         anyhow::bail!("Runtime custody viewer session is unavailable");
     }
-    Ok(json!({
-        "schema": "elastos.library.runtime-custody-viewer-part/v1",
-        "mint_id": hex::encode(mint_id.as_bytes()),
-        "viewer_session_handle": handle_hex,
-        "encoding": "base64",
-        "data": base64::engine::general_purpose::STANDARD.encode(part.clear_media_part()),
-    }))
+    Ok(response)
+}
+
+/// Which part of which content kind one `read_viewer` call names, after the
+/// caller's two selectors have been checked against the session's actual
+/// content kind.
+enum RuntimeCustodyViewerReadSelector<'a> {
+    Media {
+        media_identity: &'a CencFmp4MediaIdentityV1,
+        /// `None` is media's init segment, exactly as before.
+        segment_index: Option<u32>,
+    },
+    Object {
+        object_identity: &'a ChunkedPayloadObjectIdentityV1,
+        chunk_index: u32,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8802,6 +9149,81 @@ async fn fetch_runtime_custody_open_media(
     Ok((media, init))
 }
 
+/// Object twin of [`fetch_runtime_custody_open_media`]. Fetches the published
+/// `object.epc1` and verifies the whole framed file against the identity the
+/// listing commits to (exact length and sha256) before a single byte of it is
+/// used; the caller then slices the framed header or one framed chunk out of
+/// it.
+///
+/// The whole file is fetched because an object is ONE published file, unlike
+/// media's separately-addressable segment files: a chunk read therefore
+/// re-fetches it and slices. A byte-ranged content fetch would avoid that
+/// (`ProviderByteRange` already exists on the content fetch path) but its
+/// semantics are honoured by the backing storage provider, not by this layer,
+/// so verifying the complete file against its committed digest is the only
+/// shape that keeps the "never use unverified published bytes" property
+/// without depending on range fidelity.
+async fn fetch_runtime_custody_open_object(
+    registry: &ProviderRegistry,
+    cid: &str,
+    expected: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<u8>> {
+    let framed = crate::content::fetch_bytes_via_provider(
+        registry,
+        cid,
+        Some(PROTECTED_CONTENT_OBJECT_EPC1_PATH),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
+    if framed.len() as u64 != expected.encrypted_content().ciphertext_bytes()
+        || Digest32::new(sha2::Sha256::digest(&framed).into())
+            != expected.encrypted_content().ciphertext_sha256()
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE);
+    }
+    Ok(framed)
+}
+
+/// The framed header block at offset 0 of a verified framed object.
+fn runtime_custody_object_framed_header(
+    framed: &[u8],
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<u8>> {
+    let header_bytes = usize::try_from(object_identity.framed_header_bytes())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
+    framed
+        .get(..header_bytes)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))
+}
+
+/// One framed chunk of a verified framed object, addressed by chunk index.
+/// The byte ranges come from the custody crate's own
+/// `framed_chunk_ranges_v1`, the same arithmetic the sealer and the chunk
+/// decrypter use, rather than being re-derived here.
+fn runtime_custody_object_framed_chunk(
+    framed: &[u8],
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    chunk_index: u32,
+) -> anyhow::Result<Vec<u8>> {
+    const MESSAGE: &str = "Runtime custody viewer object chunk is invalid";
+    if chunk_index >= object_identity.chunk_count() {
+        anyhow::bail!(MESSAGE);
+    }
+    let range = elastos_protected_content_custody::framed_chunk_ranges_v1(
+        object_identity.framed_header_bytes(),
+        object_identity.plaintext_bytes(),
+    )
+    .nth(usize::try_from(chunk_index).map_err(|_| anyhow::anyhow!(MESSAGE))?)
+    .ok_or_else(|| anyhow::anyhow!(MESSAGE))?;
+    let start = usize::try_from(range.start).map_err(|_| anyhow::anyhow!(MESSAGE))?;
+    let end = usize::try_from(range.end).map_err(|_| anyhow::anyhow!(MESSAGE))?;
+    framed
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!(MESSAGE))
+}
+
 fn runtime_open_error(error: elastos_protected_content_runtime::RuntimeOpenError) -> anyhow::Error {
     match error {
         elastos_protected_content_runtime::RuntimeOpenError::WalletAuthority => {
@@ -8981,6 +9403,35 @@ fn expected_runtime_custody_viewer_capsule(
         RuntimeContentIdentityV1::Media(_) => ELACITY_PLAYER_CAPSULE_ID,
         RuntimeContentIdentityV1::Object(_) => ELACITY_READER_CAPSULE_ID,
     }
+}
+
+/// Object twin of [`RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA`].
+pub(crate) const RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT: &str = "object";
+
+/// Object twin of [`runtime_custody_viewer_public_response`]. Carries the same
+/// five kind-independent fields in the same order (`schema`, `content_kind`,
+/// `mint_id`, `viewer_session_handle`, `expires_at`) and then the geometry a
+/// reader needs to walk the content: its declared content type, the plaintext
+/// size it decrypts to, how many chunks that is, and the plaintext chunk size
+/// every chunk but the last one has. Media's own four geometry fields
+/// (`mime_type`/`codecs`/`has_init_segment`/`segment_count`) are untouched.
+fn runtime_custody_viewer_object_public_response(
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    mint_id: Digest32,
+    viewer_session_handle: &[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    expires_at: u64,
+) -> anyhow::Result<Value> {
+    Ok(json!({
+        "schema": "elastos.library.runtime-custody-viewer/v1",
+        "content_kind": RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT,
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "viewer_session_handle": hex::encode(viewer_session_handle),
+        "expires_at": expires_at,
+        "content_type": object_identity.content_type(),
+        "plaintext_bytes": object_identity.plaintext_bytes(),
+        "chunk_count": object_identity.chunk_count(),
+        "chunk_plaintext_bytes": MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
+    }))
 }
 
 fn runtime_custody_viewer_public_response(

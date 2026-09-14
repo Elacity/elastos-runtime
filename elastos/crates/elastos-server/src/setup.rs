@@ -2698,6 +2698,7 @@ mod tests {
             "creator",
             "marketplace",
             "elacity-player",
+            "elacity-reader",
         ];
         for profile_name in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
             let profile = &manifest.profiles[profile_name];
@@ -3079,6 +3080,68 @@ mod tests {
                     .iter()
                     .any(|value| value == "elacity-player"),
                 "profile {profile} must include the Elacity Player capsule"
+            );
+        }
+    }
+
+    #[test]
+    fn elacity_reader_capsule_is_packaged_with_a_capsule_owned_icon() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("capsules/elacity-reader/capsule.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema"], "elastos.capsule/v1");
+        assert_eq!(manifest["name"], "elacity-reader");
+        assert_eq!(manifest["icon"], "browser/icons");
+        assert_eq!(manifest["entrypoint"], "browser/index.html");
+
+        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            assert!(
+                root.join("capsules/elacity-reader/browser/icons")
+                    .join(file)
+                    .is_file(),
+                "missing Elacity Reader icon asset {file}"
+            );
+        }
+
+        // The two libraries the reader draws with are carried in its own tree,
+        // pinned file by file in their notes, so an installed reader never
+        // reaches for either of them at open time.
+        for file in [
+            "vendor/pdfjs/pdf.min.mjs",
+            "vendor/pdfjs/pdf.worker.min.mjs",
+            "vendor/pdfjs/LICENSE",
+            "vendor/pdfjs/README.md",
+            "vendor/three/three.module.js",
+            "vendor/three/controls/OrbitControls.js",
+            "vendor/three/loaders/GLTFLoader.js",
+            "vendor/three/loaders/OBJLoader.js",
+            "vendor/three/loaders/STLLoader.js",
+            "vendor/three/utils/BufferGeometryUtils.js",
+            "vendor/three/LICENSE",
+            "vendor/three/README.md",
+        ] {
+            assert!(
+                root.join("capsules/elacity-reader/browser").join(file).is_file(),
+                "missing Elacity Reader carried library file {file}"
+            );
+        }
+
+        let components: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        assert_eq!(
+            components["external"]["elacity-reader"]["install_path"],
+            "capsules/elacity-reader"
+        );
+        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            assert!(
+                components["profiles"][profile]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "elacity-reader"),
+                "profile {profile} must include the Elacity Reader capsule"
             );
         }
     }

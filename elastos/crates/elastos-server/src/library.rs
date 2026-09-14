@@ -397,13 +397,16 @@ enum ObjectProviderRequest {
         session_id: Option<String>,
         #[serde(default)]
         grant_id: Option<String>,
-        // No `chunk_index` yet: the object read path is deferred, and a
-        // declared-but-ignored selector would silently serve a media part
-        // driven by `segment_index` instead. `deny_unknown_fields` on this
-        // enum turns a caller that sends one into an explicit request error
-        // until the object read path lands and can honour it.
+        /// Media's part selector: absent means the init segment, `Some(n)`
+        /// means segment `n`. Refused outright on an object session.
         #[serde(default)]
         segment_index: Option<u32>,
+        /// The object's part selector: which framed chunk to decrypt.
+        /// Required on an object session (an object has no init part, so
+        /// there is nothing for "absent" to mean) and refused outright on a
+        /// media session — never accepted and ignored.
+        #[serde(default)]
+        chunk_index: Option<u32>,
     },
     CloseViewer {
         principal_id: String,
@@ -1741,6 +1744,7 @@ async fn handle_runtime_custody_library_request(
             session_id,
             grant_id,
             segment_index,
+            chunk_index,
         } => {
             crate::protected_content_runtime::read_runtime_custody_viewer(
                 &data_dir,
@@ -1754,6 +1758,7 @@ async fn handle_runtime_custody_library_request(
                 session_id.as_deref(),
                 grant_id.as_deref(),
                 segment_index,
+                chunk_index,
             )
             .await
         }
@@ -1817,6 +1822,16 @@ async fn library_publish(
         // shape, so a later retry as media would be refused as "conflicts with
         // existing authority". A clear refusal before any mint is the only safe
         // answer until object open lands.
+        //
+        // This refusal set has exactly one member, and Library's "Protect and
+        // List" predicate depends on that: it decides whether to offer the
+        // action by testing the object's type against this same one value
+        // rather than restating the `mime_for_name` table, so that a new
+        // extension added above needs no capsule change. Adding a SECOND
+        // refused type here therefore silently makes Library offer an action
+        // this function will reject. If that ever happens, widen
+        // `isRuntimeCustodyProtectable` in
+        // `capsules/library/browser/src/model.js` in the same change.
         if content_type == "application/octet-stream" {
             anyhow::bail!(RUNTIME_CUSTODY_PUBLISH_UNSUPPORTED_TYPE_MESSAGE);
         }
@@ -1836,10 +1851,9 @@ async fn library_publish(
         .await?;
         // Video/audio keep the existing media-provider transcode path
         // unchanged (D5: audio also transcodes to fMP4). Every other type
-        // takes the new EPC1 object path, which mints/provisions/verifies
-        // availability but — unlike the media path — stops short of the
-        // creator chain-mint + listing tail (see
-        // `publish_runtime_custody_library_object_content`'s doc comment).
+        // takes the EPC1 object path, which now runs the SAME creator tail
+        // (chain mint, metadata document, portable listing) so an object mint
+        // can be bought and opened exactly like a media one.
         let facts = if content_type.starts_with("video/") || content_type.starts_with("audio/") {
             let runtime_input =
                 crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput {
@@ -1880,8 +1894,9 @@ async fn library_publish(
                     clear_plaintext,
                     source_storage,
                 };
-            crate::protected_content_runtime::publish_runtime_custody_library_object_content(
-                &state.data_dir,
+            crate::api::gateway::runtime_custody_publish_object_via_gateway(
+                state,
+                authority,
                 registry,
                 runtime_input,
             )
@@ -6625,13 +6640,21 @@ fn mime_for_name(name: &str) -> &'static str {
         "pdf" => "application/pdf",
         "tar" => "application/x-tar",
         "zip" => "application/zip",
-        // Video containers (ffmpeg demuxers: mov, m4v, matroska, avi, flv,
-        // mpeg, mpegts, asf, vob).
+        // Video containers (ffmpeg demuxers: mov, m4v, matroska, webm, ogg,
+        // avi, flv, mpeg, mpegts, asf, vob).
         "mp4" | "m4v" => "video/mp4",
         "mov" => "video/quicktime",
         "3gp" | "3g2" => "video/3gpp",
         "mkv" | "mk3d" => "video/x-matroska",
         "webm" => "video/webm",
+        // `ogv` is ffmpeg's `ogg` demuxer, the same one `ogg`/`oga` below
+        // already route to the media path; it was publishable before the
+        // media allowlist landed and is restored here.
+        "ogv" => "video/ogg",
+        // `asf` is ffmpeg's `asf` demuxer -- literally the same demuxer
+        // `wmv` below already routes to the media path, so the provider
+        // demonstrably handles it.
+        "asf" => "video/x-ms-asf",
         "avi" => "video/x-msvideo",
         "flv" | "f4v" => "video/x-flv",
         "mpg" | "mpeg" | "vob" => "video/mpeg",
@@ -6898,10 +6921,15 @@ mod tests {
         }
     }
 
-    /// A caller that sends a `chunk_index` selector must be told it is not
-    /// supported, never silently served a `segment_index`-driven media part.
+    /// `chunk_index` is now a DECLARED and honoured selector on `read_viewer`
+    /// (it names the object chunk to decrypt), so a request carrying one must
+    /// no longer be refused as an unknown field — it must reach the ordinary
+    /// viewer-route gate, which still refuses viewer operations on the raw
+    /// provider route. An undeclared selector must still be a request error,
+    /// which is what keeps a future third selector from being accepted and
+    /// silently ignored.
     #[tokio::test]
-    async fn raw_object_provider_route_rejects_a_chunk_index_selector() {
+    async fn raw_object_provider_route_parses_a_chunk_index_selector_and_denies_the_route() {
         let registry = Arc::new(ProviderRegistry::new());
         let temp = tempfile::tempdir().unwrap();
         let provider = ObjectProvider::new(temp.path().to_path_buf(), Arc::downgrade(&registry));
@@ -6911,18 +6939,36 @@ mod tests {
                 "principal_id": "person:local:raw-viewer",
                 "mint_id": "00".repeat(32),
                 "viewer_session_handle": "00".repeat(32),
+                "executable_actor": "elacity-reader",
                 "chunk_index": 0,
             }))
             .await
             .unwrap();
-        assert_eq!(response["status"], "error");
-        assert_eq!(response["code"], "invalid_request");
+        assert_eq!(response["status"], "error", "{response}");
+        assert_eq!(
+            response["message"], RUNTIME_CUSTODY_VIEWER_ROUTE_DENIED_MESSAGE,
+            "{response}"
+        );
+
+        let unknown_selector = provider
+            .send_raw(&json!({
+                "op": "read_viewer",
+                "principal_id": "person:local:raw-viewer",
+                "mint_id": "00".repeat(32),
+                "viewer_session_handle": "00".repeat(32),
+                "executable_actor": "elacity-reader",
+                "frame_index": 0,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(unknown_selector["status"], "error");
+        assert_eq!(unknown_selector["code"], "invalid_request");
         assert!(
-            response["message"]
+            unknown_selector["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("chunk_index"),
-            "{response}"
+                .contains("frame_index"),
+            "{unknown_selector}"
         );
     }
 

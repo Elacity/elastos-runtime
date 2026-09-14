@@ -10999,6 +10999,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         Some("runtime-session:alpha"),
         Some("grant:alpha"),
         Some(0),
+        None,
     )
     .await
     .unwrap_err();
@@ -11018,6 +11019,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
         Some("grant:alpha"),
+        None,
         None,
     )
     .await
@@ -11045,6 +11047,7 @@ async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
         Some("grant:alpha"),
+        None,
         None,
     )
     .await
@@ -11238,6 +11241,7 @@ async fn runtime_custody_viewer_open_read_and_close_reject_wrong_principal_witho
         Some(&proof_binding_id),
         Some("runtime-session:alpha"),
         Some("grant:alpha"),
+        None,
         None,
     )
     .await
@@ -11829,6 +11833,7 @@ async fn runtime_custody_viewer_expiry_reconciles_exact_cleanup_before_read() {
         Some("runtime-session:alpha"),
         Some("grant:alpha"),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -12005,6 +12010,7 @@ async fn runtime_custody_viewer_read_and_close_reject_substituted_session_withou
         Some("runtime-session:beta"),
         Some("grant:alpha"),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -12092,6 +12098,7 @@ async fn runtime_custody_viewer_read_and_close_reject_malformed_binding_without_
         Some(&proof_binding_id),
         Some(""),
         Some("grant:alpha"),
+        None,
         None,
     )
     .await
@@ -13885,4 +13892,143 @@ fn listing_package_requires_exactly_one_identity_field_of_the_matching_kind() {
         unknown_kind.decode_and_validate().is_err(),
         "an unknown content-identity kind byte must fail closed"
     );
+}
+
+/// Seals a real multi-chunk EPC1 object with the custody crate's own sealer,
+/// then requires the Runtime's framed-header and framed-chunk slicers to
+/// recover the sealer's exact bytes for EVERY chunk — including the short
+/// final one. This is what makes it safe for the Runtime to slice a chunk out
+/// of a published `object.epc1` instead of re-deriving the framing arithmetic:
+/// the ranges come from the custody crate's `framed_chunk_ranges_v1`, and this
+/// test pins them against the sealer that produced the file.
+#[test]
+fn object_framed_chunk_slicing_recovers_every_sealed_chunk() {
+    const CHUNK_BYTES: usize = 1_048_576;
+    let chunks = [
+        (0u32..CHUNK_BYTES as u32)
+            .map(|value| value as u8)
+            .collect::<Vec<u8>>(),
+        vec![0xa5u8; CHUNK_BYTES],
+        vec![0x5au8; 4096],
+    ];
+    let plaintext_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+    let (mut sealer, framed_header) = elastos_protected_content_custody::PayloadSealerV1::open(
+        "application/pdf",
+        plaintext_bytes,
+    )
+    .unwrap();
+    let framed_chunks: Vec<Vec<u8>> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            sealer
+                .seal_chunk(u32::try_from(index).unwrap(), chunk)
+                .unwrap()
+        })
+        .collect();
+    let mut framed = framed_header.clone();
+    for chunk in &framed_chunks {
+        framed.extend_from_slice(chunk);
+    }
+    let object_identity = ChunkedPayloadObjectIdentityV1::new(
+        EncryptedContentIdentityV1::new(
+            Digest32::new(sha2::Sha256::digest(&framed).into()),
+            framed.len() as u64,
+        )
+        .unwrap(),
+        "application/pdf",
+        plaintext_bytes,
+        u32::try_from(framed_header.len()).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(object_identity.chunk_count(), 3);
+    assert_eq!(
+        super::runtime_custody_object_framed_header(&framed, &object_identity).unwrap(),
+        framed_header
+    );
+    for (index, expected) in framed_chunks.iter().enumerate() {
+        assert_eq!(
+            &super::runtime_custody_object_framed_chunk(
+                &framed,
+                &object_identity,
+                u32::try_from(index).unwrap()
+            )
+            .unwrap(),
+            expected,
+            "framed chunk {index} must be recovered byte-for-byte"
+        );
+    }
+    // Out-of-range chunk indices fail closed rather than slicing garbage.
+    assert!(super::runtime_custody_object_framed_chunk(&framed, &object_identity, 3).is_err());
+    assert!(
+        super::runtime_custody_object_framed_chunk(&framed, &object_identity, u32::MAX).is_err()
+    );
+    // A truncated file cannot yield a chunk either.
+    let truncated = framed[..framed.len() - 1].to_vec();
+    assert!(super::runtime_custody_object_framed_chunk(&truncated, &object_identity, 2).is_err());
+}
+
+/// Object chunk admission must bound the request by the object's own chunk
+/// count, not only by the in-order counter. Without the ceiling an EXHAUSTED
+/// session (`next_media_part_index == chunk_count`) passes the ordering check
+/// for `chunk_index == chunk_count` and is only refused after the whole framed
+/// object has been fetched and re-hashed — media bounds `segment_index`
+/// against `encrypted_segments().len()` before it fetches anything, and the
+/// object path must fail just as early.
+#[test]
+fn object_chunk_admission_bounds_the_request_by_the_chunk_count() {
+    const CHUNK_COUNT: u32 = 2;
+    let binding = super::derive_runtime_custody_session_binding(
+        "person:local:object-reader",
+        "did:key:zObjectReader",
+        super::ELACITY_READER_CAPSULE_ID,
+        TEST_VIEWER_LAUNCH_ID,
+        "proof:object",
+        "runtime-session:object",
+        "grant:object",
+        digest(0x31),
+    )
+    .unwrap();
+    let mut record = super::RuntimeCustodyViewerRecord::from_open_pending(
+        super::RuntimeCustodyOpenPendingInput {
+            principal_id: "person:local:object-reader",
+            profile_did: "did:key:zObjectReader",
+            mint_id: digest(0x31),
+            content_id: "content:object",
+            runtime_session_binding: binding,
+            audit_request_id: digest(0x32),
+            viewer_session_handle: [0x33; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+            expires_at: NOW + 600,
+            now: NOW,
+        },
+    )
+    .unwrap();
+
+    // Fresh session: chunk 0 is admitted, every other index is not.
+    record.require_object_chunk_index(0, CHUNK_COUNT).unwrap();
+    assert!(record.require_object_chunk_index(1, CHUNK_COUNT).is_err());
+    assert!(
+        record
+            .require_object_chunk_index(CHUNK_COUNT, CHUNK_COUNT)
+            .is_err(),
+        "a chunk index at the ceiling must be refused even on a fresh session"
+    );
+
+    record.mark_media_part_read(NOW).unwrap();
+    record.mark_media_part_read(NOW).unwrap();
+
+    // Exhausted session: the counter now equals the chunk count, so ONLY the
+    // ceiling can refuse `chunk_index == chunk_count`.
+    assert!(
+        record
+            .require_object_chunk_index(CHUNK_COUNT, CHUNK_COUNT)
+            .is_err(),
+        "an exhausted session must refuse the one-past-the-end chunk before any content fetch"
+    );
+    assert!(record
+        .require_object_chunk_index(u32::MAX, CHUNK_COUNT)
+        .is_err());
+    // A previously released chunk is still refused by the ordering rule.
+    assert!(record.require_object_chunk_index(0, CHUNK_COUNT).is_err());
 }

@@ -41,6 +41,7 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "home-agent",
     "creator",
     "elacity-player",
+    "elacity-reader",
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
 const DEMO_PUBLISH_CAPSULES: &[&str] =
@@ -79,6 +80,7 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "home-agent",
     "creator",
     "elacity-player",
+    "elacity-reader",
 ];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 

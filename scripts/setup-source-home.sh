@@ -611,6 +611,7 @@ APP_CAPSULES=(
     library
     creator
     elacity-player
+    elacity-reader
     marketplace
     archive-manager
     inbox

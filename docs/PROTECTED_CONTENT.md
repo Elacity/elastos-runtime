@@ -1,9 +1,10 @@
 # Protected content
 
 Protected content is Runtime-mediated. Library and Marketplace own the creator
-and buyer experience, `elacity-player` owns video presentation, and `creator`
-uploads a file through the Library transport and protects-and-lists it in one
-flow. Runtime owns authority, durable operations, provider selection, Wallet
+and buyer experience, `elacity-player` owns video presentation,
+`elacity-reader` owns everything else a bought file can be — a picture, a
+document, text, a 3D model, a book or a comic — and `creator` uploads a file
+through the Library transport and protects-and-lists it in one flow. Runtime owns authority, durable operations, provider selection, Wallet
 and Chain coordination, lifecycle, audit, and settlement.
 
 The intended content-distribution contract gives free and protected content
@@ -42,14 +43,16 @@ The source path has one operation sequence:
 8. Before buy or open, Runtime verifies one fresh signed availability receipt
    for the exact mint, content identity, CID, publisher, provider, policy,
    replica count, and freshness window.
-9. Library or Marketplace asks Home to launch `elacity-player` with an opaque,
-   short-lived launch authority. Runtime binds the open to the principal,
-   object, accepted viewer, launch, decrypt session, and token.
+9. Library or Marketplace asks Home to launch the viewer the content calls for
+   — `elacity-player` for media, `elacity-reader` for everything else — with an
+   opaque, short-lived launch authority. Runtime binds the open to the
+   principal, object, accepted viewer, launch, decrypt session, and token.
 10. Three independent custody nodes evaluate rights locally. Any two approved
     nodes return recipient-encrypted contributions.
 11. The private protected-content decrypt provider reconstructs and uses the
-    CEK inside its process. It serves bounded ordered media reads to the exact
-    viewer session and settles open, read, and close ownership.
+    CEK inside its process. It serves bounded ordered media reads, or bounded
+    fixed-size chunk reads for a non-media file, to the exact viewer session
+    and settles open, read, and close ownership.
 
 Source tests cover this sequence across two Runtimes with separate principals,
 Wallets, device identities and state. The creator exports an immutable listing

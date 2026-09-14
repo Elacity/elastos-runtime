@@ -1125,6 +1125,20 @@
         }
       }
     },
+    "elacity-reader": {
+      "install_path": "capsules/elacity-reader",
+      "description": "Protected document, picture, book, comic and 3D viewer capsule through Runtime-scoped object-provider access.",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "elacity-reader.tar.gz",
+          "extract_path": "elacity-reader",
+          "install_path": "capsules/elacity-reader"
+        }
+      }
+    },
     "elacity-player": {
       "install_path": "capsules/elacity-player",
       "description": "Protected video viewer capsule through Runtime-scoped object-provider access.",
@@ -1402,6 +1416,7 @@
         "library",
         "creator",
         "elacity-player",
+        "elacity-reader",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1455,6 +1470,7 @@
         "library",
         "creator",
         "elacity-player",
+        "elacity-reader",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1523,6 +1539,7 @@
         "library",
         "creator",
         "elacity-player",
+        "elacity-reader",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1575,6 +1592,7 @@
         "library",
         "creator",
         "elacity-player",
+        "elacity-reader",
         "marketplace",
         "archive-manager",
         "inbox",
@@ -1629,6 +1647,7 @@
         "library",
         "creator",
         "elacity-player",
+        "elacity-reader",
         "marketplace",
         "archive-manager",
         "inbox",

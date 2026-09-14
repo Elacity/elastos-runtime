@@ -130,6 +130,7 @@ for capsule in \
     documents \
     creator \
     elacity-player \
+    elacity-reader \
     inbox \
     library \
     marketplace \
@@ -190,6 +191,7 @@ ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
 HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent" \
 ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
+ELACITY_READER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-reader" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
 WALLET_METAMASK_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-metamask" \
@@ -300,6 +302,7 @@ browser_capsules = {
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
     "home-agent": pathlib.Path(os.environ["HOME_AGENT_CAPSULE_DIR"]),
     "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
+    "elacity-reader": pathlib.Path(os.environ["ELACITY_READER_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
     "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
@@ -499,6 +502,10 @@ for installed in \
     "${DATA_DIR}/capsules/library/browser/icons/folder.svg" \
     "${DATA_DIR}/capsules/creator/browser/index.html" \
     "${DATA_DIR}/capsules/creator/browser/creator.js" \
+    "${DATA_DIR}/capsules/elacity-reader/browser/index.html" \
+    "${DATA_DIR}/capsules/elacity-reader/browser/reader.js" \
+    "${DATA_DIR}/capsules/elacity-reader/browser/vendor/pdfjs/pdf.min.mjs" \
+    "${DATA_DIR}/capsules/elacity-reader/browser/vendor/three/three.module.js" \
     "${DATA_DIR}/capsules/marketplace/browser/index.html" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
