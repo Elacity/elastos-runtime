@@ -18,7 +18,7 @@
       {
         "resource": "elastos://ipfs/*",
         "actions": ["read", "write", "delete", "admin"],
-        "operations": ["add_bytes", "add_path", "add_directory", "cat", "cat_to_path", "get_bytes", "ls", "download_directory", "pin", "unpin", "health", "status"]
+        "operations": ["add_bytes", "add_path", "add_directory", "cat", "cat_to_path", "get_bytes", "ls", "download_directory", "pin", "unpin", "ensure_started", "health", "status"]
       }
     ],
     "audit_events": ["ipfs.publish", "ipfs.fetch", "ipfs.pin", "ipfs.unpin"]
@@ -118,6 +118,15 @@
           "audit": "full",
           "resource": "elastos://ipfs/*",
           "operation": "unpin"
+        },
+        {
+          "id": "ensure_started",
+          "description": "Bring the managed Kubo daemon up (or adopt a running one) and report its libp2p identity, through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "ensure_started"
         },
         {
           "id": "health",

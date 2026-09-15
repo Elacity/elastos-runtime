@@ -35,10 +35,10 @@ pub use mint_journal::{
     ExclusiveFileLock, PersistedRuntimeMint, RuntimeContentAvailabilityRequirement,
     RuntimeContentIdentityV1, RuntimeCustodyTerminalKind, RuntimeMediaPreparationRecord,
     RuntimeMediaPreparationState, RuntimeMintCreatorDesiredTerms, RuntimeMintCreatorEffectBinding,
-    RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
-    RuntimeMintIntent, RuntimeMintIntentContentV1, RuntimeMintJournal, RuntimeMintJournalError,
-    RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeVerifiedContentAvailability,
-    RuntimeVerifiedContentIdentityRootV1,
+    RuntimeMintCreatorStage, RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence,
+    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintIntentContentV1, RuntimeMintJournal,
+    RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
+    RuntimeVerifiedContentAvailability, RuntimeVerifiedContentIdentityRootV1,
 };
 pub use open::{
     bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,

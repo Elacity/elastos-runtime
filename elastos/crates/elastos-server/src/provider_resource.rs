@@ -243,6 +243,16 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
             Some(Action::Read)
         }
         "add_bytes" | "add_path" | "add_directory" | "pin" => Some(Action::Write),
+        // Brings the node's kubo daemon up (or adopts a running one) and
+        // reports its libp2p identity. Write rather than Execute: it changes
+        // node state, and Write is already in this capsule's declared action
+        // set, so mapping it here grants no new class of authority (the
+        // manifest declares the method `risk: write` for the same reason).
+        // The provider host calls it at startup so peering is established
+        // long before a publish needs replicas -- a kubo first started at
+        // publish time cannot be found by peers that have never met it, and
+        // the resulting pin has no timeout.
+        "ensure_started" => Some(Action::Write),
         "unpin" => Some(Action::Delete),
         _ => None,
     }
@@ -366,6 +376,7 @@ fn ipfs_resource(op: &str) -> Result<String, String> {
             "download_directory",
             "pin",
             "unpin",
+            "ensure_started",
             "health",
             "status",
         ],

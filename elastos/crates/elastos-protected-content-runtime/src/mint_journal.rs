@@ -1806,6 +1806,28 @@ impl RuntimeMintCreatorTerminalEvidence {
     }
 }
 
+/// How far a recorded creator mint has actually got.
+///
+/// The three stages differ in what may still be done with the record, so they
+/// are one enum rather than a pair of `is_some()` tests repeated at every call
+/// site:
+///
+/// * [`RuntimeMintCreatorStage::Recorded`] — the terms are on record and
+///   nothing has been raised on any ledger. Dropping the record leaves no
+///   ledger entry behind and no holder, so it is safe.
+/// * [`RuntimeMintCreatorStage::EffectRaised`] — a ledger transaction was
+///   raised behind a wallet approval the creator may still complete, so it can
+///   still settle later. Dropping the record would leave that settlement with
+///   nothing recording it, so it is refused.
+/// * [`RuntimeMintCreatorStage::Settled`] — the mint settled with a seller and
+///   a token id. Nothing about it can change any more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMintCreatorStage {
+    Recorded,
+    EffectRaised,
+    Settled,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeMintCreatorState {
@@ -1862,6 +1884,19 @@ impl RuntimeMintCreatorState {
 
     pub fn desired_terms(&self) -> &RuntimeMintCreatorDesiredTerms {
         &self.desired_terms
+    }
+
+    /// Classify this record for callers that must decide what is still
+    /// permitted, without reaching into which optional fields happen to be
+    /// populated.
+    pub const fn stage(&self) -> RuntimeMintCreatorStage {
+        if self.terminal.is_some() {
+            RuntimeMintCreatorStage::Settled
+        } else if self.effect.is_some() || self.operator_approval.is_some() {
+            RuntimeMintCreatorStage::EffectRaised
+        } else {
+            RuntimeMintCreatorStage::Recorded
+        }
     }
 
     pub fn metadata_cid(&self) -> &str {
@@ -2530,6 +2565,37 @@ impl RuntimeMintJournal {
             .ok_or(RuntimeMintJournalError::Conflict)?
             .with_operator_approval(effect)?;
         record.creator_state = Some(creator_state);
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    /// Drop a recorded creator mint that never reached a ledger, so the
+    /// creator can start over at different terms.
+    ///
+    /// Refused at every later stage: once a transaction has been raised behind
+    /// a wallet approval the creator may still complete it, and once the mint
+    /// has settled a holder exists. This is the only place that rule lives —
+    /// no caller may decide it. A record with nothing bound is already in the
+    /// requested state, so the call replays as a no-op.
+    pub fn discard_creator_state(
+        &self,
+        mint_id: Digest32,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        match record
+            .creator_state
+            .as_ref()
+            .map(RuntimeMintCreatorState::stage)
+        {
+            None => return Ok(record),
+            Some(RuntimeMintCreatorStage::Recorded) => {}
+            Some(RuntimeMintCreatorStage::EffectRaised | RuntimeMintCreatorStage::Settled) => {
+                return Err(RuntimeMintJournalError::Conflict)
+            }
+        }
+        record.creator_state = None;
         self.write_replace(&record)?;
         Ok(record)
     }
@@ -4638,6 +4704,95 @@ mod tests {
             .load(draft.mint_id())
             .unwrap();
         assert!(reloaded.creator_state() == completed.creator_state());
+    }
+
+    #[test]
+    fn creator_state_discard_is_allowed_only_before_anything_is_raised() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let draft = draft();
+        custody_provision_all(&journal, &draft);
+        let requirement = availability_requirement();
+        let evidence = availability_evidence(&draft, 0x77);
+        journal
+            .mark_content_available(draft.mint_id(), &requirement, evidence)
+            .unwrap();
+
+        // Nothing recorded yet: the record is already in the requested state.
+        assert!(journal
+            .discard_creator_state(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_none());
+
+        let creator_state = RuntimeMintCreatorState::new(
+            creator_desired_terms(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+        let bound = journal
+            .bind_creator_state(draft.mint_id(), creator_state.clone())
+            .unwrap();
+        assert_eq!(
+            bound.creator_state().map(RuntimeMintCreatorState::stage),
+            Some(RuntimeMintCreatorStage::Recorded)
+        );
+
+        // Terms on record, nothing raised: dropping them is safe and durable.
+        assert!(journal
+            .discard_creator_state(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_none());
+        assert!(RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_none());
+
+        // Re-terming after a discard is what start over means.
+        let restarted = RuntimeMintCreatorState::new(
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x64", "0x186a0").unwrap(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+        journal
+            .bind_creator_state(draft.mint_id(), restarted)
+            .unwrap();
+
+        // A raised transaction may still settle, so the record must stay.
+        let raised = journal
+            .bind_creator_effect(draft.mint_id(), creator_effect_binding())
+            .unwrap();
+        assert_eq!(
+            raised.creator_state().map(RuntimeMintCreatorState::stage),
+            Some(RuntimeMintCreatorStage::EffectRaised)
+        );
+        assert_eq!(
+            journal.discard_creator_state(draft.mint_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+
+        // A settled mint has a holder; nothing about it can change.
+        let settled = journal
+            .mark_creator_completed(draft.mint_id(), creator_terminal_evidence())
+            .unwrap();
+        assert_eq!(
+            settled.creator_state().map(RuntimeMintCreatorState::stage),
+            Some(RuntimeMintCreatorStage::Settled)
+        );
+        assert_eq!(
+            journal.discard_creator_state(draft.mint_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert!(RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_some());
     }
 
     #[test]

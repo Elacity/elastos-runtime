@@ -58,9 +58,10 @@ use elastos_protected_content_runtime::{
     RuntimeContentAvailabilityRequirement, RuntimeContentIdentityV1, RuntimeCustodyTerminalKind,
     RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
     RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorError,
-    RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
-    RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerContentV1,
-    RuntimeOpenViewerSessionInput, RuntimePreparedRecipient, RuntimePreparedRecipientCancelResult,
+    RuntimeMintCoordinatorOutcome, RuntimeMintCreatorStage, RuntimeMintCreatorState,
+    RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal,
+    RuntimeMintJournalError, RuntimeOpenViewerContentV1, RuntimeOpenViewerSessionInput,
+    RuntimePreparedRecipient, RuntimePreparedRecipientCancelResult,
     RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
     RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
@@ -194,6 +195,158 @@ macro_rules! release_unavailable_missing {
         }
     };
 }
+/// Wire identity of the typed answer a creator app gets when an attempt to
+/// protect a file is refused because an earlier attempt for the same file is
+/// already on record at different terms.
+pub(crate) const RUNTIME_CUSTODY_CREATOR_MINT_BLOCKED_SCHEMA_V1: &str =
+    "elastos.protected-content.creator-mint-blocked/v1";
+
+pub(crate) const RUNTIME_CUSTODY_CREATOR_DISCARD_DENIED_MESSAGE: &str =
+    "The earlier attempt to protect this file has already reached the blockchain and cannot be dropped";
+
+/// What an earlier creator mint already on record means for a new attempt at
+/// different terms, and what the creator may still do about it.
+///
+/// Mirrors [`RuntimeMintCreatorStage`] one-to-one and exists separately only so
+/// the wire spelling an app branches on is fixed here rather than derived from
+/// a type an app cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyCreatorMintBlockedState {
+    /// Terms are on record and nothing was raised on any ledger.
+    RecordedOnly,
+    /// A transaction is out for the creator's approval and may still settle.
+    ApprovalOutstanding,
+    /// The mint settled; a seller and a token id exist.
+    AlreadyMinted,
+}
+
+impl RuntimeCustodyCreatorMintBlockedState {
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::RecordedOnly => "recorded_only",
+            Self::ApprovalOutstanding => "approval_outstanding",
+            Self::AlreadyMinted => "already_minted",
+        }
+    }
+
+    /// Dropping the record is safe only while nothing was raised on a ledger.
+    const fn can_discard(self) -> bool {
+        matches!(self, Self::RecordedOnly)
+    }
+
+    /// Re-running the same attempt at the recorded terms still moves it
+    /// forward in both unsettled states; a settled mint has nothing to resume.
+    const fn can_resume(self) -> bool {
+        matches!(self, Self::RecordedOnly | Self::ApprovalOutstanding)
+    }
+}
+
+/// A refusal that carries its reason as data.
+///
+/// Re-terming a mint already in flight stays refused. What this adds is that
+/// the creator is told what was recorded and which action is open to them,
+/// without any app having to read the sentence. The recorded copies and price
+/// travel here, to the person who entered them — never into the log.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyCreatorMintBlocked {
+    state: RuntimeCustodyCreatorMintBlockedState,
+    mint_id: String,
+    copies: String,
+    price: String,
+}
+
+impl RuntimeCustodyCreatorMintBlocked {
+    pub(crate) fn new(mint_id: Digest32, recorded: &RuntimeMintCreatorState) -> Self {
+        let state = match recorded.stage() {
+            RuntimeMintCreatorStage::Recorded => {
+                RuntimeCustodyCreatorMintBlockedState::RecordedOnly
+            }
+            RuntimeMintCreatorStage::EffectRaised => {
+                RuntimeCustodyCreatorMintBlockedState::ApprovalOutstanding
+            }
+            RuntimeMintCreatorStage::Settled => {
+                RuntimeCustodyCreatorMintBlockedState::AlreadyMinted
+            }
+        };
+        Self {
+            state,
+            mint_id: hex::encode(mint_id.as_bytes()),
+            copies: recorded.desired_terms().copies().to_string(),
+            price: recorded.desired_terms().price().to_string(),
+        }
+    }
+
+    /// Stage name for the operator log. Carries no terms and no account.
+    pub(crate) const fn state_label(&self) -> &'static str {
+        self.state.wire_value()
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        json!({
+            "schema": RUNTIME_CUSTODY_CREATOR_MINT_BLOCKED_SCHEMA_V1,
+            "state": self.state.wire_value(),
+            "mint_id": self.mint_id,
+            "recorded_copies": self.copies,
+            "recorded_price": self.price,
+            "can_discard": self.state.can_discard(),
+            "can_resume": self.state.can_resume(),
+        })
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyCreatorMintBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.state {
+            RuntimeCustodyCreatorMintBlockedState::RecordedOnly => {
+                "An earlier attempt to protect this file is still on record at different terms"
+            }
+            RuntimeCustodyCreatorMintBlockedState::ApprovalOutstanding => {
+                "An earlier attempt to protect this file is waiting for approval in Wallet, so its terms can no longer change"
+            }
+            RuntimeCustodyCreatorMintBlockedState::AlreadyMinted => {
+                "This file is already protected and listed, so its terms can no longer change"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RuntimeCustodyCreatorMintBlocked {}
+
+/// Drop the creator terms recorded for one object so its owner can start over.
+///
+/// The object is named the way its owner names it, and the mint it reaches is
+/// the one that owner's own publish intent completed into — so no caller can
+/// reach another principal's record through this. Whether the record may be
+/// dropped at all is decided by the mint journal, which refuses every stage
+/// past "nothing raised yet".
+pub(crate) fn discard_runtime_custody_creator_terms(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    source_storage: &str,
+) -> anyhow::Result<bool> {
+    let journal = runtime_mint_journal(data_dir);
+    let request_id =
+        RuntimeMintIntent::request_id_for_source(principal_id, object_uri, source_storage)
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?;
+    let intent = match journal.load_intent(request_id) {
+        Ok(intent) => intent,
+        Err(RuntimeMintJournalError::NotFound) => return Ok(false),
+        Err(_) => anyhow::bail!("Runtime custody mint intent is unavailable"),
+    };
+    let Some(mint_id) = intent.completed_mint_id() else {
+        return Ok(false);
+    };
+    match journal.discard_creator_state(mint_id) {
+        Ok(_) => Ok(true),
+        Err(RuntimeMintJournalError::Conflict) => {
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_DISCARD_DENIED_MESSAGE)
+        }
+        Err(RuntimeMintJournalError::NotFound) => Ok(false),
+        Err(_) => anyhow::bail!("Runtime custody mint intent is unavailable"),
+    }
+}
+
 pub(crate) const RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE: &str =
     "Runtime custody mint requires cleanup reconciliation";
 pub(crate) const RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE: &str =

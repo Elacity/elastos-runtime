@@ -6625,6 +6625,161 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     );
 }
 
+/// The live defect: a creator protected a file at 10 copies for 1000000, the
+/// attempt stalled, and a retry at 100 copies for 100000 was refused with one
+/// opaque sentence and no way forward. The refusal stands — terms on an
+/// in-flight mint still cannot move — but it now names what was recorded and
+/// what may still be done, and start over actually works.
+#[tokio::test]
+async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_starting_over() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_content_publish_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-tail-stalled-terms",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let mut input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x8b, &wallet_account_id);
+    // 10 copies at 1000000, exactly as first entered.
+    input.copies = "0xa".to_string();
+    input.price = "0xf4240".to_string();
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
+    let mint_id = facts.mint_id;
+    let journal = crate::protected_content_runtime::runtime_mint_journal(dir.path());
+    journal
+        .bind_creator_state(
+            mint_id,
+            elastos_protected_content_runtime::RuntimeMintCreatorState::new(
+                elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
+                    wallet_account_id.clone(),
+                    input.copies.clone(),
+                    input.price.clone(),
+                )
+                .unwrap(),
+                "bafystalledcreatorcid",
+                "ipfs://bafystalledcreatorcid/metadata.json",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    // The retry: 100 copies at 100000.
+    let mut retry_input = input.clone();
+    retry_input.copies = "0x64".to_string();
+    retry_input.price = "0x186a0".to_string();
+    let retry_facts = || crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+        content_cid: facts.content_cid.clone(),
+        mint_id,
+        content_id: facts.content_id.clone(),
+        display_name: facts.display_name.clone(),
+        availability: facts.availability.clone(),
+        receipt: facts.receipt.clone(),
+        content_security: facts.content_security.clone(),
+        listing_uri: None,
+    };
+    let refusal = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        retry_input.clone(),
+        retry_facts(),
+    )
+    .await
+    .unwrap_err();
+    let blocked = refusal
+        .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
+        .expect("the refusal must carry its reason as data, not as a sentence to match");
+    let reported = blocked.as_json();
+    assert_eq!(reported["state"], "recorded_only");
+    assert_eq!(reported["recorded_copies"], "0xa");
+    assert_eq!(reported["recorded_price"], "0xf4240");
+    assert_eq!(reported["can_discard"], true);
+    assert_eq!(reported["mint_id"], hex::encode(mint_id.as_bytes()));
+    // The old opaque sentence must no longer be what this case says.
+    assert_ne!(
+        refusal.to_string(),
+        "Runtime custody creator mint is unavailable"
+    );
+
+    // Start over: drop the recorded terms, then the retry is authorised and
+    // reaches the wallet approval it always should have.
+    assert!(
+        crate::protected_content_runtime::discard_runtime_custody_creator_terms(
+            dir.path(),
+            &authority.principal_id,
+            &uri,
+            &input.source_storage,
+        )
+        .unwrap()
+    );
+    let restart_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let restart_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &restart_token);
+    let pending = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &restart_authority,
+        registry,
+        retry_input,
+        retry_facts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pending.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let restarted = crate::protected_content_runtime::runtime_mint_journal(dir.path())
+        .load(mint_id)
+        .unwrap();
+    let restarted_terms = restarted
+        .creator_state()
+        .expect("the new attempt is on record")
+        .desired_terms()
+        .clone();
+    assert_eq!(restarted_terms.copies(), "0x64");
+    assert_eq!(restarted_terms.price(), "0x186a0");
+
+    // With a transaction now raised behind a wallet approval that may still
+    // settle, dropping the record is refused — server-side, not by the app.
+    let denied = crate::protected_content_runtime::discard_runtime_custody_creator_terms(
+        dir.path(),
+        &authority.principal_id,
+        &uri,
+        &input.source_storage,
+    )
+    .unwrap_err();
+    assert_eq!(
+        denied.to_string(),
+        crate::protected_content_runtime::RUNTIME_CUSTODY_CREATOR_DISCARD_DENIED_MESSAGE
+    );
+    assert!(
+        crate::protected_content_runtime::runtime_mint_journal(dir.path())
+            .load(mint_id)
+            .unwrap()
+            .creator_state()
+            .and_then(elastos_protected_content_runtime::RuntimeMintCreatorState::effect)
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_duplicates() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
@@ -11145,6 +11300,35 @@ async fn test_creator_token_can_upload_and_publish_runtime_custody() {
             .wallet_account_id(),
         creator_account_id
     );
+}
+
+/// Starting over is an action the creator takes from the app that offered it,
+/// so both surfaces that can protect a file can also drop a stalled attempt.
+/// The rule about WHEN that is allowed is not here — it is enforced beneath
+/// this route, and neither app is trusted with it.
+#[tokio::test]
+async fn test_discard_protection_is_reachable_from_both_protecting_apps() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/never-protected.txt");
+
+    for capsule in [LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID] {
+        let token = app_token_for_authority(dir.path(), capsule, &authority);
+        let (status, payload) = post_library(
+            app.clone(),
+            &token,
+            "discard_protection",
+            json!({ "uri": uri }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "capsule={capsule}");
+        // Nothing was ever recorded for this object, so there is nothing to
+        // drop and the answer says exactly that.
+        assert_eq!(payload, json!(null), "capsule={capsule}");
+        assert_eq!(payload["data"]["discarded"], false, "capsule={capsule}");
+    }
 }
 
 #[tokio::test]

@@ -1646,7 +1646,9 @@ pub(super) async fn gateway_provider_proxy(
             | "share"
             | "shared_access"
             | "events" => &[LIBRARY_CAPSULE_ID],
-            "roots" | "stat" | "publish" => &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID],
+            "roots" | "stat" | "publish" | "discard_protection" => {
+                &[LIBRARY_CAPSULE_ID, CREATOR_CAPSULE_ID]
+            }
             "open_viewer" | "read_viewer" | "close_viewer" => {
                 &[ELACITY_PLAYER_CAPSULE_ID, ELACITY_READER_CAPSULE_ID]
             }
@@ -3736,6 +3738,29 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     Ok(runtime_custody_buy_terminal_response(&purchase))
 }
 
+/// Refuse a new attempt that would re-term a mint already on record, and say
+/// enough for the creator to act on it: what was recorded, and which of the
+/// recorded mint's three stages it is in.
+///
+/// The refusal itself is unchanged — terms on an in-flight mint still cannot
+/// move. What changes is that the answer is typed, so an app decides what to
+/// offer without reading the sentence, and the recorded copies and price reach
+/// the person who entered them through the answer rather than through the log,
+/// which never carries them.
+fn runtime_custody_creator_mint_blocked(
+    mint_id: Digest32,
+    existing: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+) -> anyhow::Error {
+    let blocked =
+        crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked::new(mint_id, existing);
+    tracing::warn!(
+        line = line!(),
+        state = blocked.state_label(),
+        "Runtime custody creator mint refused new terms for a mint already on record"
+    );
+    anyhow::Error::new(blocked)
+}
+
 async fn runtime_custody_publish_creator_tail_from_facts(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
@@ -3766,7 +3791,10 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     .map_err(creator_mint_unavailable!())?;
     if let Some(existing) = mint.creator_state() {
         if existing.desired_terms() != &desired_terms {
-            return Err(creator_mint_unavailable_missing!()());
+            return Err(runtime_custody_creator_mint_blocked(
+                facts.mint_id,
+                existing,
+            ));
         }
         if let Some(terminal) = existing.terminal() {
             if !terminal
@@ -4233,6 +4261,7 @@ fn library_operation_needs_runtime_coordinator(op: &str) -> bool {
         "publish"
             | "unpublish"
             | "repair"
+            | "discard_protection"
             | "sync"
             | "list_runtime_custody"
             | "import_runtime_custody"
@@ -4466,6 +4495,102 @@ mod tests {
             pay_token: "0x00000000000000000000000000000000000000bb".to_string(),
             payment_processor: Some("0x00000000000000000000000000000000000000ff".to_string()),
         }
+    }
+
+    #[test]
+    fn runtime_custody_creator_mint_blocked_reports_the_stage_and_the_recorded_terms() {
+        let mint_id = elastos_protected_content_contracts::Digest32::new([0x11; 32]);
+        let recorded = test_creator_state();
+
+        // Nothing raised: the recorded attempt may be dropped, or repeated.
+        let error = super::runtime_custody_creator_mint_blocked(mint_id, &recorded);
+        let blocked = error
+            .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
+            .expect("refusal must carry its reason as data");
+        let json = blocked.as_json();
+        assert_eq!(
+            json["schema"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_CREATOR_MINT_BLOCKED_SCHEMA_V1
+        );
+        assert_eq!(json["state"], "recorded_only");
+        assert_eq!(json["recorded_copies"], "0x2");
+        assert_eq!(json["recorded_price"], "0x5");
+        assert_eq!(json["can_discard"], true);
+        assert_eq!(json["can_resume"], true);
+        assert_eq!(json["mint_id"], hex::encode(mint_id.as_bytes()));
+
+        // A transaction is out for approval: it may still settle, so the
+        // record must survive; only finishing it is on offer.
+        let raised = recorded
+            .clone()
+            .with_effect(
+                elastos_protected_content_runtime::RuntimeMintCreatorEffectBinding::new(
+                    "effect-1",
+                    "approval-1",
+                    "a".repeat(64),
+                    "wallet-account-1",
+                    "0x00000000000000000000000000000000000000ee",
+                    "eip155:8453",
+                    "base-mainnet",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let json = super::runtime_custody_creator_mint_blocked(mint_id, &raised)
+            .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
+            .expect("refusal must carry its reason as data")
+            .as_json();
+        assert_eq!(json["state"], "approval_outstanding");
+        assert_eq!(json["can_discard"], false);
+        assert_eq!(json["can_resume"], true);
+
+        // Settled: a seller and a token id exist, so nothing is on offer.
+        let settled = raised
+            .with_terminal(creator_terminal_evidence_for_test())
+            .unwrap();
+        let json = super::runtime_custody_creator_mint_blocked(mint_id, &settled)
+            .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
+            .expect("refusal must carry its reason as data")
+            .as_json();
+        assert_eq!(json["state"], "already_minted");
+        assert_eq!(json["can_discard"], false);
+        assert_eq!(json["can_resume"], false);
+    }
+
+    /// The refusal's own sentence stays plain, and no app is expected to read
+    /// it: it is a fallback for surfaces that predate the typed answer.
+    #[test]
+    fn runtime_custody_creator_mint_blocked_never_reuses_the_unavailable_sentence() {
+        let error = super::runtime_custody_creator_mint_blocked(
+            elastos_protected_content_contracts::Digest32::new([0x11; 32]),
+            &test_creator_state(),
+        );
+        assert_ne!(
+            error.to_string(),
+            super::RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE
+        );
+        assert!(error.to_string().contains("earlier attempt"));
+    }
+
+    fn creator_terminal_evidence_for_test(
+    ) -> elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence {
+        elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence::new(
+            "bafycreatorcid",
+            "ipfs://bafymetadata/metadata.json",
+            "0x00000000000000000000000000000000000000ee",
+            "eip155:8453",
+            "base-mainnet",
+            "0x00000000000000000000000000000000000000aa",
+            "0x77",
+            "0x00000000000000000000000000000000000000dd",
+            "0x2",
+            "0x5",
+            "0x00000000000000000000000000000000000000bb",
+            Some("0x00000000000000000000000000000000000000ff".to_string()),
+            "c".repeat(64),
+            1,
+        )
+        .unwrap()
     }
 
     #[test]

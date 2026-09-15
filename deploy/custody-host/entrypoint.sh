@@ -8,8 +8,9 @@
 # One-shot-provisions this node's inactive custody state root and its public
 # descriptor on first boot (guarded by a receipt file so restarts are a
 # no-op), then execs the standalone provider host from Task 4
-# (`elastos run custody-provider --with availability-provider --with
-# ipfs-provider`). Only the descriptor -- a public artifact, and the sole
+# (`elastos run custody-provider`, with the extra planes its --role calls for
+# -- see the role block below). Only the descriptor -- a public
+# artifact, and the sole
 # thing that crosses into /shared -- carries the node's identity forward
 # (its transport.peer_did field IS the DID; no separate .did file); all
 # custody state stays under the private, owner-only data root.
@@ -25,6 +26,49 @@ image_root="/opt/elastos-image"
 elastos_bin="${data_root}/bin/elastos"
 shared="/shared"
 init_receipt="${data_root}/protected-content/custody-provider/container-init.json"
+
+# --role decides which provider planes this node hosts. Container args reach
+# here because the image's ENTRYPOINT is this script, so `command:` in
+# docker-compose.yaml (or trailing args to `docker run`) land in "$@".
+#
+#   custody  (default) custody + chain ONLY. Key-share custody and release is
+#            the custody provider's whole job (`provision_node_share`,
+#            `release_contribution`, `prepare_evidence`, `settle_evidence`) --
+#            it never reads ciphertext, which arrives inside the signed
+#            release operation. A custody-only node therefore has no reason to
+#            run kubo, and must never be a content-availability failure point.
+#            This is the default precisely because custody is the role: a node
+#            has to be asked, explicitly, to take on storage as well.
+#   storage            custody + chain + availability + ipfs. The node also
+#            serves as a content-availability replica, so it needs a working
+#            kubo and the availability plane's ensure URL.
+#
+# `--with chain-provider` is NOT optional in either role: a committee member
+# settles every release through its own chain rights evidence, so a node
+# without it fails closed on release.
+custody_node_role="custody"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --role)
+        [ "$#" -ge 2 ] || fail "--role needs a value: storage or custody"
+        custody_node_role="$2"
+        shift 2
+        ;;
+    --role=*)
+        custody_node_role="${1#--role=}"
+        shift
+        ;;
+    *)
+        fail "unknown argument '$1' -- this entrypoint accepts only --role <storage|custody>"
+        ;;
+    esac
+done
+case "${custody_node_role}" in
+storage | custody) ;;
+*)
+    fail "--role must be 'storage' or 'custody' (got '${custody_node_role}')"
+    ;;
+esac
 
 fail() {
     echo "FAIL: $*" >&2
@@ -102,13 +146,21 @@ if [ ! -f "${init_receipt}" ]; then
     # branch), so a restart of an already-provisioned node needs none of the
     # four: zero required env vars.
     if [ -z "${CUSTODY_TRUSTED_RUNTIME_ISSUER:-}" ] || [ -z "${CUSTODY_OPERATOR:-}" ] \
-        || [ -z "${CUSTODY_FAILURE_DOMAIN:-}" ] || [ -z "${ELASTOS_AVAILABILITY_ENSURE_URL:-}" ]; then
-        fail "first boot needs CUSTODY_TRUSTED_RUNTIME_ISSUER, CUSTODY_OPERATOR, CUSTODY_FAILURE_DOMAIN, and ELASTOS_AVAILABILITY_ENSURE_URL to provision this node -- set them in docker-compose.yaml or pass -e to docker run"
+        || [ -z "${CUSTODY_FAILURE_DOMAIN:-}" ]; then
+        fail "first boot needs CUSTODY_TRUSTED_RUNTIME_ISSUER, CUSTODY_OPERATOR and CUSTODY_FAILURE_DOMAIN to provision this node -- set them in docker-compose.yaml or pass -e to docker run"
+    fi
+    # Only the storage role hosts the availability plane, and only that plane
+    # reads this URL (`elastos run --with availability-provider` has no CLI
+    # flag for it). A custody-only node never needs it. It is still persisted
+    # below whenever it IS supplied, so a node provisioned as custody-only can
+    # later be restarted as storage without re-supplying it.
+    if [ "${custody_node_role}" = "storage" ] && [ -z "${ELASTOS_AVAILABILITY_ENSURE_URL:-}" ]; then
+        fail "first boot in the 'storage' role also needs ELASTOS_AVAILABILITY_ENSURE_URL (the availability plane fails closed without it) -- set it, or start this node with --role custody"
     fi
     # This value is about to be hand-embedded in a plain JSON string field
     # below (see the printf comment); reject anything that field can't
     # safely hold rather than write corrupt JSON a later boot can't parse.
-    case "${ELASTOS_AVAILABILITY_ENSURE_URL}" in
+    case "${ELASTOS_AVAILABILITY_ENSURE_URL:-}" in
         *'"'* | *'\'*)
             fail "ELASTOS_AVAILABILITY_ENSURE_URL contains a double-quote or backslash, which this entrypoint's plain-JSON receipt writer cannot safely embed"
             ;;
@@ -154,7 +206,7 @@ if [ ! -f "${init_receipt}" ]; then
     # so a restart never needs ELASTOS_AVAILABILITY_ENSURE_URL supplied
     # again (see the `else` branch below).
     printf '{"did":"%s","provisioned_at":"%s","availability_ensure_url":"%s"}\n' \
-        "${did}" "$(date -u +%FT%TZ)" "${ELASTOS_AVAILABILITY_ENSURE_URL}" >"${init_receipt}.tmp"
+        "${did}" "$(date -u +%FT%TZ)" "${ELASTOS_AVAILABILITY_ENSURE_URL:-}" >"${init_receipt}.tmp"
     chmod 0600 "${init_receipt}.tmp"
     mv "${init_receipt}.tmp" "${init_receipt}"
 else
@@ -162,9 +214,14 @@ else
     # needs from where first boot persisted it, so a restart requires
     # setting nothing at all (CUSTODY_* are never needed again either --
     # provision-custody-node above only runs once, in the branch above).
-    ELASTOS_AVAILABILITY_ENSURE_URL="$(sed -n 's/.*"availability_ensure_url":"\([^"]*\)".*/\1/p' "${init_receipt}")"
-    if [ -z "${ELASTOS_AVAILABILITY_ENSURE_URL}" ]; then
-        fail "${init_receipt} has no availability_ensure_url field; run: docker exec <container> cat ${init_receipt}"
+    # A value supplied in the environment wins over the persisted one, so a
+    # node first provisioned as custody-only (which persists an empty string)
+    # can be restarted as storage by supplying the URL again.
+    if [ -z "${ELASTOS_AVAILABILITY_ENSURE_URL:-}" ]; then
+        ELASTOS_AVAILABILITY_ENSURE_URL="$(sed -n 's/.*"availability_ensure_url":"\([^"]*\)".*/\1/p' "${init_receipt}")"
+    fi
+    if [ "${custody_node_role}" = "storage" ] && [ -z "${ELASTOS_AVAILABILITY_ENSURE_URL}" ]; then
+        fail "${init_receipt} carries no availability_ensure_url and none was supplied, but this node is starting in the 'storage' role -- set ELASTOS_AVAILABILITY_ENSURE_URL, or start it with --role custody; run: docker exec <container> cat ${init_receipt}"
     fi
     export ELASTOS_AVAILABILITY_ENSURE_URL
 fi
@@ -207,6 +264,13 @@ fi
 # environment either way by this point (just-validated first-boot value, or
 # restored from the receipt above) -- `elastos run --with
 # availability-provider` reads it directly, there is no CLI flag for it.
+if [ "${custody_node_role}" = "custody" ]; then
+    echo "INFO: starting in the 'custody' role -- custody + chain planes only, no ipfs/availability" >&2
+    exec "${elastos_bin}" run custody-provider \
+        --with chain-provider \
+        --carrier-addr 0.0.0.0:4433
+fi
+
 exec "${elastos_bin}" run custody-provider \
     --with availability-provider \
     --with ipfs-provider \

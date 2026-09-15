@@ -333,6 +333,14 @@ enum ObjectProviderRequest {
         principal_id: String,
         uri: String,
     },
+    /// Drop the protection terms recorded for this object so its owner can
+    /// start over at different ones. Only ever permitted while nothing has
+    /// been raised on a ledger; that rule is enforced beneath this request,
+    /// never by the caller that sends it.
+    DiscardProtection {
+        principal_id: String,
+        uri: String,
+    },
     Share {
         principal_id: String,
         uri: String,
@@ -525,6 +533,7 @@ impl Provider for ObjectProvider {
             }
             request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
             | ObjectProviderRequest::ImportRuntimeCustody { .. }
+            | ObjectProviderRequest::DiscardProtection { .. }
             | ObjectProviderRequest::Buy { .. }
             | ObjectProviderRequest::OpenViewer { .. }
             | ObjectProviderRequest::ReadViewer { .. }
@@ -575,6 +584,7 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
         | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::DiscardProtection { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
@@ -812,6 +822,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         }
         request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
+        | ObjectProviderRequest::DiscardProtection { .. }
         | ObjectProviderRequest::Buy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -1634,6 +1645,7 @@ fn handle_library_request(
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
         | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::DiscardProtection { .. }
         | ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
@@ -1677,6 +1689,9 @@ async fn handle_runtime_custody_library_request(
                 &data_dir,
                 &principal_id,
             )
+        }
+        ObjectProviderRequest::DiscardProtection { principal_id, uri } => {
+            library_discard_protection(&data_dir, &principal_id, &uri)
         }
         ObjectProviderRequest::ImportRuntimeCustody {
             principal_id,
@@ -1788,6 +1803,33 @@ async fn handle_runtime_custody_library_request(
         }
         _ => anyhow::bail!("runtime custody library operation is invalid"),
     }
+}
+
+/// Drop the protection terms recorded for one object so its owner can start
+/// over at different ones.
+///
+/// Whether the recorded attempt may be dropped at all is not decided here and
+/// is not a property of the caller: the mint journal refuses every stage past
+/// "nothing raised on a ledger yet", so an app that offers the action wrongly
+/// gets the same refusal a hand-written request would.
+fn library_discard_protection(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<Value> {
+    let target = library_target(data_dir, principal_id, uri)?;
+    let source_storage = published_source_storage(data_dir, principal_id, &target)?;
+    let discarded = crate::protected_content_runtime::discard_runtime_custody_creator_terms(
+        data_dir,
+        principal_id,
+        &target.uri,
+        source_storage,
+    )?;
+    Ok(json!({
+        "schema": "elastos.library.protection-discarded/v1",
+        "uri": target.uri,
+        "discarded": discarded,
+    }))
 }
 
 async fn library_publish(
@@ -3208,6 +3250,7 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         | ObjectProviderRequest::Publish { uri, .. }
         | ObjectProviderRequest::Unpublish { uri, .. }
         | ObjectProviderRequest::Repair { uri, .. }
+        | ObjectProviderRequest::DiscardProtection { uri, .. }
         | ObjectProviderRequest::Share { uri, .. }
         | ObjectProviderRequest::SharedAccess { uri, .. } => any_webspace(&[uri]),
         ObjectProviderRequest::CompressArchive { uri, uris, .. } => {
@@ -6737,11 +6780,21 @@ fn provider_error(code: &str, message: &str) -> Value {
 /// app-facing sentence (the outermost error), and `detail` carries the cause
 /// chain beneath it (fail-closed site, provider verdict, RPC revert data) so
 /// an operator or driver can see why without the runtime log.
+///
+/// A refusal that carries its reason as data adds a typed, versioned field of
+/// its own. That field — not the sentence — is what an app branches on: reading
+/// English to decide what to offer is how a recoverable state once reached a
+/// dead end in the apps.
 fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
     let mut response = provider_error(code, &error.to_string());
     let detail = anyhow_error_detail(error);
     if !detail.is_empty() {
         response["detail"] = Value::String(detail);
+    }
+    if let Some(blocked) =
+        error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
+    {
+        response["creator_mint"] = blocked.as_json();
     }
     response
 }
@@ -6793,6 +6846,42 @@ mod tests {
         );
         let plain = super::provider_error_from("library_error", &anyhow::anyhow!("only"));
         assert!(plain.get("detail").is_none());
+    }
+
+    /// A refusal that carries its reason as data must reach the caller as data.
+    /// Apps decide what to offer from this field; the sentence is only a
+    /// fallback, and matching patterns against it is what once turned a
+    /// recoverable state into a dead end.
+    #[test]
+    fn provider_error_from_carries_the_typed_creator_mint_refusal() {
+        let recorded = elastos_protected_content_runtime::RuntimeMintCreatorState::new(
+            elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
+                "wallet-account-1",
+                "0xa",
+                "0xf4240",
+            )
+            .unwrap(),
+            "bafycreatorcid",
+            "ipfs://bafymetadata/metadata.json",
+        )
+        .unwrap();
+        let blocked = crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked::new(
+            elastos_protected_content_contracts::Digest32::new([0x11; 32]),
+            &recorded,
+        );
+        let sentence = blocked.to_string();
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(blocked));
+
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["message"], sentence);
+        assert_eq!(value["creator_mint"]["state"], "recorded_only");
+        assert_eq!(value["creator_mint"]["recorded_copies"], "0xa");
+        assert_eq!(value["creator_mint"]["recorded_price"], "0xf4240");
+        assert_eq!(value["creator_mint"]["can_discard"], true);
+
+        // Every other failure keeps the envelope it always had.
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("creator_mint").is_none());
     }
 
     use super::*;

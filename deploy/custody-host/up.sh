@@ -147,10 +147,95 @@ print(value)
 ' "$1"
 }
 
+# docker-compose.yml substitutes ${CUSTODY_NODE_LOG} into each node's
+# RUST_LOG. elastos-server's tracing init is
+# `EnvFilter::from_default_env().add_directive("elastos=info")`
+# (elastos/crates/elastos-server/src/main.rs:1223-1224), and add_directive
+# REPLACES any directive parsed from RUST_LOG that has the same target -- so
+# a bare `RUST_LOG=trace`, or even an explicit `elastos=trace`, is silently
+# clobbered back to info. Only a strictly longer target prefix out-ranks the
+# baseline, so every level word here expands to explicit directives for all
+# three namespaces the node actually logs under:
+#   elastos::*          -- the binary (provider_host, server_infra)
+#   elastos_server::*   -- the server library (carrier)
+#   elastos_runtime::*  -- the runtime library (provider::bridge, the
+#                          pending-request warnings; provider::registry)
+# elastos_runtime in particular is where a stuck provider op reports itself,
+# which is the usual reason to raise the level on these nodes at all.
+#
+# Anything that is not one of the four level words is passed through
+# verbatim, so a caller who needs a surgical filter can say e.g.
+#   --log-level 'elastos_runtime::provider::bridge=trace,elastos=debug'
+# without this function second-guessing it.
+resolve_log_filter() {
+    case "$1" in
+    error | warn | info | debug | trace)
+        printf 'elastos=%s,elastos_server=%s,elastos_runtime=%s\n' "$1" "$1" "$1"
+        ;;
+    "")
+        fail "--log-level needs a value: error|warn|info|debug|trace, or a raw RUST_LOG filter"
+        ;;
+    *)
+        # A raw filter. Reject the characters that would break out of the
+        # single KEY=VALUE line written into .env rather than emit a file
+        # docker compose will misparse.
+        case "$1" in
+        *[$'\n']* | *'"'* | *"'"*)
+            fail "--log-level filter contains a newline or quote character: ${1}"
+            ;;
+        esac
+        printf '%s\n' "$1"
+        ;;
+    esac
+}
+
+# Rewrites CUSTODY_NODE_LOG in .env, preserving every other key. .env is
+# read by docker compose for ${...} substitution, so this is the one place
+# the setting has to land for both `up` and a later recreate.
+write_env_log_filter() {
+    local filter="$1"
+    local tmp
+    tmp="$(mktemp)"
+    if [ -f .env ]; then
+        grep -v '^CUSTODY_NODE_LOG=' .env >"${tmp}" || true
+    fi
+    printf 'CUSTODY_NODE_LOG=%s\n' "${filter}" >>"${tmp}"
+    mv "${tmp}" .env
+    chmod 0600 .env
+}
+
 # --- subcommands ------------------------------------------------------
 
 cmd_up() {
-    local client_data_dir="${1:-${CLIENT_DATA_DIR:-$(macos_default_client_data_dir)}}"
+    # --log-level may appear before or after the positional CLIENT_DATA_DIR.
+    local log_filter=""
+    local positional=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+        --log-level | -l)
+            [ "$#" -ge 2 ] || fail "--log-level needs a value: error|warn|info|debug|trace, or a raw RUST_LOG filter"
+            log_filter="$(resolve_log_filter "$2")"
+            shift 2
+            ;;
+        --log-level=*)
+            log_filter="$(resolve_log_filter "${1#--log-level=}")"
+            shift
+            ;;
+        *)
+            [ -z "${positional}" ] || fail "unexpected extra argument: $1"
+            positional="$1"
+            shift
+            ;;
+        esac
+    done
+    # Precedence: explicit flag, then CUSTODY_NODE_LOG from the environment,
+    # then whatever .env already carries (a previous run's choice), then the
+    # compose-file default.
+    if [ -z "${log_filter}" ] && [ -n "${CUSTODY_NODE_LOG:-}" ]; then
+        log_filter="$(resolve_log_filter "${CUSTODY_NODE_LOG}")"
+    fi
+
+    local client_data_dir="${positional:-${CLIENT_DATA_DIR:-$(macos_default_client_data_dir)}}"
     local elastos_bin
     elastos_bin="$(resolve_host_elastos_bin)"
 
@@ -179,7 +264,19 @@ cmd_up() {
     [ -n "${issuer}" ] || fail "could not parse trusted_runtime_issuer from: ${issuer_json}"
     log "CUSTODY_TRUSTED_RUNTIME_ISSUER=${issuer}"
 
+    local previous_log_filter=""
+    if [ -f .env ]; then
+        previous_log_filter="$(sed -n 's/^CUSTODY_NODE_LOG=//p' .env | tail -1)"
+    fi
     printf 'CUSTODY_TRUSTED_RUNTIME_ISSUER=%s\n' "${issuer}" >.env
+    chmod 0600 .env
+    [ -n "${log_filter}" ] || log_filter="${previous_log_filter}"
+    if [ -n "${log_filter}" ]; then
+        write_env_log_filter "${log_filter}"
+        log "CUSTODY_NODE_LOG=${log_filter}"
+    else
+        log "CUSTODY_NODE_LOG unset -- nodes use the docker-compose.yml default (elastos=debug,elastos_server=debug)"
+    fi
     mkdir -p shared
     # shared/ is bind-mounted into the containers, which run as an
     # unprivileged uid (10001) that does not exist on the host. A bind mount
@@ -426,6 +523,30 @@ cmd_destroy() {
     log "  docker buildx prune --filter type=exec.cachemount"
 }
 
+# Changes the nodes' log filter without re-running the whole `up` ceremony
+# (no rebuild, no re-provisioning, no descriptor re-export). RUST_LOG is read
+# once at process start, so the containers must be recreated to pick it up --
+# `compose up -d` does exactly that for the services whose env changed, and
+# the named volumes carry all custody state across, so each node re-enters
+# entrypoint.sh's already-provisioned branch.
+cmd_log_level() {
+    local level="${1:-}"
+    [ -n "${level}" ] || fail "usage: $(basename "$0") log-level <error|warn|info|debug|trace | raw RUST_LOG filter>"
+    [ "$#" -le 1 ] || fail "unexpected extra argument: $2"
+
+    local filter
+    filter="$(resolve_log_filter "${level}")"
+    [ -f .env ] || fail ".env is missing -- run '$(basename "$0") up' first (it writes CUSTODY_TRUSTED_RUNTIME_ISSUER, which the nodes need)"
+    write_env_log_filter "${filter}"
+    log "CUSTODY_NODE_LOG=${filter}"
+
+    log "== docker compose up -d (recreating the three nodes to apply RUST_LOG) =="
+    compose up -d
+    log ""
+    log "Applied. Follow the nodes with:"
+    log "  docker compose -f ${SCRIPT_DIR}/docker-compose.yml logs -f"
+}
+
 main() {
     local sub="${1:-}"
     case "${sub}" in
@@ -443,8 +564,14 @@ main() {
         shift
         cmd_sync_chain_config "$@"
         ;;
+    log-level)
+        shift
+        cmd_log_level "$@"
+        ;;
     *)
-        fail "usage: $(basename "$0") up [CLIENT_DATA_DIR] | sync-chain-config [CLIENT_DATA_DIR] | down | destroy"
+        fail "usage: $(basename "$0") up [--log-level LEVEL] [CLIENT_DATA_DIR] | log-level LEVEL | sync-chain-config [CLIENT_DATA_DIR] | down | destroy
+  LEVEL is error|warn|info|debug|trace (expanded to elastos=LEVEL,elastos_server=LEVEL),
+  or a raw RUST_LOG filter passed through verbatim. Nodes default to debug."
         ;;
     esac
 }
