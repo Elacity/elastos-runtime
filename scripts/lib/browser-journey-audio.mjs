@@ -1,6 +1,9 @@
 // Test-only observation of the product receiver. The Engine fixture generates
 // the tone; this probe reads decoded PCM and never creates playback audio.
-export function installBrowserJourneyAudioProbe() {
+export function installBrowserJourneyAudioProbe(options) {
+  const windowMs = Number.isFinite(options?.windowMs) ? Math.max(500, options.windowMs) : 2500;
+  const maxSamples = Math.max(60, Math.floor(windowMs / 50) + 4);
+  const rtpLimit = Math.max(13, Math.floor(windowMs / 200) + 1);
   const elements = [];
   const peers = [];
   const NativePeer = window.RTCPeerConnection;
@@ -30,9 +33,13 @@ export function installBrowserJourneyAudioProbe() {
     const context = new AudioContext();
     let source, analyser, resumeTimer;
     const samples = [], started = performance.now();
-    const result = { ok: false, samples, track_id: track.id,
+    const result = { ok: false, samples, track_id: track.id, window_ms: windowMs,
       receiver_metrics_before: window.__elastosBrowserRemoteDisplayMetrics || null };
     const rtp = result.inbound_audio_rtp = { status: "receiver_unavailable", receiver_match_count: 0,
+      requests: 0, samples: [] };
+    const outbound = result.remote_outbound_audio_rtp = { status: "receiver_unavailable",
+      requests: 0, samples: [] };
+    const ice = result.audio_ice_pair = { status: "receiver_unavailable",
       requests: 0, samples: [] };
     let binding, rtpStopped = false, rtpPending = false, nextRtpAt = 0, reportId;
     try {
@@ -54,23 +61,33 @@ export function installBrowserJourneyAudioProbe() {
     const sampleRtp = async () => {
       const requestedAt = performance.now() - started;
       if (!binding || rtpStopped || rtpPending || requestedAt < nextRtpAt ||
-          requestedAt >= 2500 || rtp.requests >= 13) return;
+          requestedAt >= windowMs || rtp.requests >= rtpLimit) return;
       nextRtpAt = requestedAt + 200;
       rtp.requests++;
       rtpPending = true;
       try {
         if (!receiverCurrent()) { rtp.status = "receiver_changed"; binding = null; return; }
         const reports = await binding.receiver.getStats();
-        if (rtpStopped || performance.now() - started >= 2500) return;
+        if (rtpStopped || performance.now() - started >= windowMs) return;
         if (!receiverCurrent()) { rtp.status = "receiver_changed"; binding = null; return; }
         const inbound = [...reports.values()].filter(item => item.type === "inbound-rtp" &&
           (item.kind === "audio" || item.mediaType === "audio"));
+        const remoteOut = [...reports.values()].filter(item => item.type === "remote-outbound-rtp" &&
+          (item.kind === "audio" || item.mediaType === "audio"));
+        const pairs = [...reports.values()].filter(item => item.type === "candidate-pair" &&
+          item.state === "succeeded" && item.nominated === true);
         const sample = { requested_at_ms: requestedAt, at_ms: performance.now() - started };
+        const sent = { requested_at_ms: requestedAt, at_ms: sample.at_ms };
+        const iceSample = { requested_at_ms: requestedAt, at_ms: sample.at_ms };
         const item = inbound[0];
         if (inbound.length !== 1 || (item.trackIdentifier !== undefined && item.trackIdentifier !== track.id)) {
           sample.status = "report_unavailable";
+          sent.status = "report_unavailable";
+          iceSample.status = "report_unavailable";
         } else if (reportId !== undefined && item.id !== reportId) {
           sample.status = "report_changed";
+          sent.status = "report_changed";
+          iceSample.status = "report_changed";
           binding = null;
         } else {
           reportId = item.id;
@@ -82,11 +99,46 @@ export function installBrowserJourneyAudioProbe() {
             "silentConcealedSamples", "concealmentEvents", "jitterBufferDelay", "jitterBufferEmittedCount"]) {
             if (typeof item[key] === "number" && Number.isFinite(item[key])) sample[key] = item[key];
           }
+          if (remoteOut.length !== 1) {
+            sent.status = "report_unavailable";
+          } else {
+            const remote = remoteOut[0];
+            sent.status = "observed";
+            for (const key of ["timestamp", "remoteTimestamp", "bytesSent", "packetsSent"]) {
+              if (typeof remote[key] === "number" && Number.isFinite(remote[key])) sent[key] = remote[key];
+            }
+          }
+          if (pairs.length !== 1) {
+            iceSample.status = "report_unavailable";
+          } else {
+            const pair = pairs[0];
+            iceSample.status = "observed";
+            for (const key of ["bytesReceived", "bytesSent", "packetsReceived", "packetsSent",
+              "currentRoundTripTime", "availableIncomingBitrate"]) {
+              if (typeof pair[key] === "number" && Number.isFinite(pair[key])) iceSample[key] = pair[key];
+            }
+            const remoteCandidate = [...reports.values()].find(entry =>
+              entry.type === "remote-candidate" && entry.id === pair.remoteCandidateId);
+            if (Number.isInteger(remoteCandidate?.port) && remoteCandidate.port > 0 &&
+                remoteCandidate.port <= 65535) {
+              iceSample.remote_port = remoteCandidate.port;
+            }
+            if (typeof remoteCandidate?.candidateType === "string" &&
+                remoteCandidate.candidateType.length <= 16) {
+              iceSample.remote_candidate_type = remoteCandidate.candidateType;
+            }
+          }
         }
         rtp.samples.push(sample);
         rtp.status = sample.status;
+        outbound.samples.push(sent);
+        outbound.status = sent.status;
+        outbound.requests = rtp.requests;
+        ice.samples.push(iceSample);
+        ice.status = iceSample.status;
+        ice.requests = rtp.requests;
       } catch {
-        if (!rtpStopped && performance.now() - started < 2500) rtp.status = "get_stats_failed";
+        if (!rtpStopped && performance.now() - started < windowMs) rtp.status = "get_stats_failed";
       } finally { rtpPending = false; }
     };
     try {
@@ -101,7 +153,7 @@ export function installBrowserJourneyAudioProbe() {
       source.connect(analyser);
       const pcm = new Float32Array(analyser.fftSize);
       const spectrum = new Float32Array(analyser.frequencyBinCount);
-      while (performance.now() - started < 2500 && samples.length < 60) {
+      while (performance.now() - started < windowMs && samples.length < maxSamples) {
         if (audio.srcObject !== stream || track.readyState !== "live") {
           throw new Error("product audio receiver changed");
         }

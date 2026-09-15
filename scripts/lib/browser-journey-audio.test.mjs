@@ -148,6 +148,78 @@ function rtpReport(state, patch = {}) {
     sdp: "PRIVATE-SDP", candidate: "PRIVATE-CANDIDATE", codecId: "PRIVATE-CODEC", ...patch }]]);
 }
 
+test("remote-outbound RTP is sampled from the same getStats report and never changes tone acceptance", async () => {
+  const state = audioProbeFixture({ stats(state) {
+    const reports = rtpReport(state);
+    reports.set("remote-out", { id: "remote-out", type: "remote-outbound-rtp", kind: "audio",
+      timestamp: 100000 + state.now, remoteTimestamp: 200000 + state.now,
+      bytesSent: 2000 + state.now, packetsSent: 80 + state.now / 10,
+      sdp: "PRIVATE-SDP", candidate: "PRIVATE-CANDIDATE", codecId: "PRIVATE-CODEC" });
+    return reports;
+  } });
+  const result = await state.run();
+  assert.equal(controlledTonePresent(result), true);
+  const outbound = result.remote_outbound_audio_rtp;
+  assert.equal(outbound.status, "observed");
+  assert.equal(outbound.requests, 13);
+  assert.equal(outbound.samples.length, 13);
+  assert.ok(outbound.samples.at(-1).bytesSent > outbound.samples[0].bytesSent);
+  assert.doesNotMatch(JSON.stringify(outbound), /PRIVATE|remote-out|codecId|candidate|sdp/);
+});
+
+test("a missing remote-outbound report stays diagnostic and keeps the 440 Hz gate unchanged", async () => {
+  const state = audioProbeFixture();
+  const result = await state.run();
+  assert.equal(controlledTonePresent(result), true);
+  assert.equal(result.remote_outbound_audio_rtp.status, "report_unavailable");
+  assert.ok(result.remote_outbound_audio_rtp.samples.every(sample => !Object.hasOwn(sample, "bytesSent")));
+});
+
+test("audio ICE pair bytes come from the same getStats report and never change tone acceptance", async () => {
+  const state = audioProbeFixture({ stats(state) {
+    const reports = rtpReport(state);
+    reports.set("pair", { id: "pair", type: "candidate-pair", state: "succeeded", nominated: true,
+      bytesReceived: 8000 + state.now, bytesSent: 400 + state.now,
+      packetsReceived: 40 + state.now / 10, packetsSent: 4,
+      currentRoundTripTime: 0.02, availableIncomingBitrate: 120000,
+      remoteCandidateId: "remote-cand", localCandidateId: "local-cand",
+      ip: "203.0.113.9", address: "203.0.113.9", candidate: "PRIVATE-CANDIDATE" });
+    reports.set("remote-cand", { id: "remote-cand", type: "remote-candidate", port: 49160,
+      candidateType: "relay", address: "203.0.113.9", ip: "203.0.113.9",
+      relatedAddress: "198.51.100.4", usernameFragment: "PRIVATE-ICE" });
+    return reports;
+  } });
+  const result = await state.run();
+  assert.equal(controlledTonePresent(result), true);
+  const ice = result.audio_ice_pair;
+  assert.equal(ice.status, "observed");
+  assert.equal(ice.requests, 13);
+  assert.equal(ice.samples.length, 13);
+  assert.equal(ice.samples[0].remote_port, 49160);
+  assert.equal(ice.samples[0].remote_candidate_type, "relay");
+  assert.ok(ice.samples.at(-1).bytesReceived > ice.samples[0].bytesReceived);
+  assert.doesNotMatch(JSON.stringify(ice), /PRIVATE|203\.0\.113|198\.51\.100|pair|remote-cand|usernameFragment|relatedAddress/);
+});
+
+test("missing or ambiguous ICE pairs stay diagnostic and keep the 440 Hz gate unchanged", async () => {
+  for (const kind of ["missing", "ambiguous"]) {
+    const state = audioProbeFixture({ stats(state) {
+      const reports = rtpReport(state);
+      if (kind === "ambiguous") {
+        reports.set("pair-a", { id: "pair-a", type: "candidate-pair", state: "succeeded",
+          nominated: true, bytesReceived: 1 });
+        reports.set("pair-b", { id: "pair-b", type: "candidate-pair", state: "succeeded",
+          nominated: true, bytesReceived: 2 });
+      }
+      return reports;
+    } });
+    const result = await state.run();
+    assert.equal(controlledTonePresent(result), true);
+    assert.equal(result.audio_ice_pair.status, "report_unavailable");
+    assert.ok(result.audio_ice_pair.samples.every(sample => !Object.hasOwn(sample, "bytesReceived")));
+  }
+});
+
 test("RTP samples use the exact observed receiver, preserve zero counters and leave PCM cadence unchanged", async () => {
   const state = audioProbeFixture({ setup(state) {
     new state.window.RTCPeerConnection([{ track: { ...state.track }, getStats() {
