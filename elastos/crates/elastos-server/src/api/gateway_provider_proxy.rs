@@ -126,6 +126,25 @@ macro_rules! creator_mint_unavailable {
     };
 }
 
+/// Raise the creator tail's non-terminal waiting state, typed.
+///
+/// The stable sentence stays outermost so nothing matching on it breaks; the
+/// typed answer beneath it says what is actually being waited for and whether
+/// anyone has to act. `WalletApproval` on an external signer is the only case
+/// that asks anything of the creator.
+fn runtime_custody_creator_effect_pending(
+    pending: crate::protected_content_runtime::RuntimeCustodyEffectPending,
+    line: u32,
+) -> anyhow::Error {
+    tracing::debug!(
+        line,
+        reason = pending.reason_label(),
+        awaits_person = pending.awaits_person(),
+        "runtime custody creator tail: pending exact Wallet or Chain settlement"
+    );
+    anyhow::Error::new(pending).context(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE)
+}
+
 /// Chain-provider answers on the creator tail. A `*_pending` code (the
 /// mint receipt or verified listing not yet finalized on enough evidence
 /// sources) is the Chain half of "pending exact Wallet or Chain settlement":
@@ -135,7 +154,13 @@ fn creator_mint_chain_error(error: (StatusCode, String), line: u32) -> anyhow::E
     let (status, message) = error;
     let code = message.split(':').next().unwrap_or_default().trim();
     if status == StatusCode::BAD_REQUEST && code.ends_with("_pending") {
-        return anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        // The chain half of the wait: evidence not yet finalized across enough
+        // sources. Approved already, so nobody need act.
+        return runtime_custody_creator_effect_pending(
+            crate::protected_content_runtime::RuntimeCustodyEffectPending::awaiting_chain_settlement(
+            ),
+            line,
+        );
     }
     tracing::warn!(
         line,
@@ -320,6 +345,11 @@ struct RuntimeCustodyCreatorMetadata<'a> {
 struct RuntimeCustodyCreatorAccount {
     account_id: String,
     address: String,
+    /// Not an authority decision -- `signing_available` already made that. This
+    /// only lets a pending answer say whose turn it is: an external signer's
+    /// outstanding approval is waiting on the person, a managed one is not.
+    external_signer: bool,
+    connector_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2105,7 +2135,12 @@ async fn resolve_runtime_custody_creator_account(
         .iter()
         .find(|account| account.account_id == wallet_account_id)
         .ok_or_else(creator_mint_unavailable_missing!())?;
-    if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
+    // `signing_available` is the whole precondition: it is already false for an
+    // external account with no connector linked and true for a linked one,
+    // which signs through the handoff. The tail past this point needs an
+    // address and a completed approval — it never asks the Wallet to sign — so
+    // requiring a managed proof type here only shut out linked external wallets.
+    if !account.signing_available {
         return Err(creator_mint_unavailable_missing!()());
     }
     validate_wallet_evm_address(&account.address, "creator")
@@ -2113,6 +2148,8 @@ async fn resolve_runtime_custody_creator_account(
     Ok(RuntimeCustodyCreatorAccount {
         account_id: account.account_id.clone(),
         address: account.address.to_ascii_lowercase(),
+        external_signer: !is_managed_wallet_proof_type(&account.proof_type),
+        connector_id: account.connector_id.clone(),
     })
 }
 
@@ -2122,7 +2159,24 @@ async fn resolve_runtime_custody_wallet_default_account(
     chain_namespace: &str,
     unavailable_message: &'static str,
 ) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
+    // Every arm below fails closed with the caller's one opaque message, per
+    // this file's discipline, and keeps it outermost so nothing that matches on
+    // that sentence breaks. Each arm names WHICH precondition failed twice over,
+    // because the two readers differ: in the operator log, without which the
+    // five causes are indistinguishable and a live failure reads as an
+    // unexplained "unavailable"; and as a typed reason beneath the sentence,
+    // which is what an app branches on to offer the one action that fixes it.
+    // Reason codes and the chain namespace only -- never an account id,
+    // address, or balance.
+    use crate::protected_content_runtime::{
+        RuntimeCustodyWalletDefaultReason, RuntimeCustodyWalletDefaultUnusable,
+    };
     let accounts = system_wallet_accounts_summary(state, authority).await;
+    let namespace_accounts = accounts
+        .accounts
+        .iter()
+        .filter(|account| account.chain_namespace == chain_namespace)
+        .count();
     let latest_default = accounts
         .default_accounts
         .iter()
@@ -2130,14 +2184,38 @@ async fn resolve_runtime_custody_wallet_default_account(
             default.intent == "transaction_intent" && default.chain_namespace == chain_namespace
         })
         .max_by_key(|default| default.set_at)
-        .ok_or_else(|| anyhow::anyhow!(unavailable_message))?;
+        .ok_or_else(|| {
+            let unusable = RuntimeCustodyWalletDefaultUnusable::new(
+                RuntimeCustodyWalletDefaultReason::NoTransactionDefaultForChainNamespace,
+                chain_namespace,
+            );
+            tracing::warn!(
+                line = line!(),
+                reason = unusable.reason_label(),
+                chain_namespace,
+                wallet_accounts_total = accounts.accounts.len(),
+                wallet_accounts_on_chain_namespace = namespace_accounts,
+                "Runtime custody wallet default account failed closed"
+            );
+            anyhow::Error::new(unusable).context(unavailable_message)
+        })?;
     if accounts.default_accounts.iter().any(|default| {
         default.intent == "transaction_intent"
             && default.chain_namespace == chain_namespace
             && default.set_at == latest_default.set_at
             && default.account_id != latest_default.account_id
     }) {
-        anyhow::bail!(unavailable_message);
+        let unusable = RuntimeCustodyWalletDefaultUnusable::new(
+            RuntimeCustodyWalletDefaultReason::AmbiguousTransactionDefault,
+            chain_namespace,
+        );
+        tracing::warn!(
+            line = line!(),
+            reason = unusable.reason_label(),
+            chain_namespace,
+            "Runtime custody wallet default account failed closed"
+        );
+        return Err(anyhow::Error::new(unusable).context(unavailable_message));
     }
     let account = accounts
         .accounts
@@ -2146,15 +2224,56 @@ async fn resolve_runtime_custody_wallet_default_account(
             account.account_id == latest_default.account_id
                 && account.chain_namespace == chain_namespace
         })
-        .ok_or_else(|| anyhow::anyhow!(unavailable_message))?;
-    if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
-        anyhow::bail!(unavailable_message);
+        .ok_or_else(|| {
+            let unusable = RuntimeCustodyWalletDefaultUnusable::new(
+                RuntimeCustodyWalletDefaultReason::DefaultAccountNotInWallet,
+                chain_namespace,
+            );
+            tracing::warn!(
+                line = line!(),
+                reason = unusable.reason_label(),
+                chain_namespace,
+                wallet_accounts_on_chain_namespace = namespace_accounts,
+                "Runtime custody wallet default account failed closed"
+            );
+            anyhow::Error::new(unusable).context(unavailable_message)
+        })?;
+    // `signing_available` is the whole precondition, and it already tells a
+    // connector-linked external account (signable through the handoff) apart
+    // from an unlinked one (not signable). The tail past this point needs an
+    // address and a completed approval — it never asks the Wallet to sign — so
+    // requiring a managed proof type here only shut out linked external wallets.
+    if !account.signing_available {
+        let unusable = RuntimeCustodyWalletDefaultUnusable::new(
+            RuntimeCustodyWalletDefaultReason::DefaultAccountSigningUnavailable,
+            chain_namespace,
+        );
+        tracing::warn!(
+            line = line!(),
+            reason = unusable.reason_label(),
+            chain_namespace,
+            "Runtime custody wallet default account failed closed"
+        );
+        return Err(anyhow::Error::new(unusable).context(unavailable_message));
     }
-    validate_wallet_evm_address(&account.address, "wallet")
-        .map_err(|_| anyhow::anyhow!(unavailable_message))?;
+    validate_wallet_evm_address(&account.address, "wallet").map_err(|_| {
+        let unusable = RuntimeCustodyWalletDefaultUnusable::new(
+            RuntimeCustodyWalletDefaultReason::DefaultAccountAddressInvalid,
+            chain_namespace,
+        );
+        tracing::warn!(
+            line = line!(),
+            reason = unusable.reason_label(),
+            chain_namespace,
+            "Runtime custody wallet default account failed closed"
+        );
+        anyhow::Error::new(unusable).context(unavailable_message)
+    })?;
     Ok(RuntimeCustodyCreatorAccount {
         account_id: account.account_id.clone(),
         address: account.address.to_ascii_lowercase(),
+        external_signer: !is_managed_wallet_proof_type(&account.proof_type),
+        connector_id: account.connector_id.clone(),
     })
 }
 
@@ -2199,6 +2318,20 @@ async fn resolve_runtime_custody_creator_mint_source(
     Ok(source)
 }
 
+/// Resolve the account a mint already under way recorded.
+///
+/// `request_id` is derived from the principal, the object uri and its storage —
+/// the content and where it lives, never the wallet. So re-publishing the same
+/// object after switching wallets lands here with `account_id` naming the
+/// account the first attempt recorded, and binding to it is deliberate: an
+/// effect identity that changed payer on retry would not be durable.
+///
+/// Whether that pin is still the creator's intent is decided later, in the
+/// creator tail, where the mint's stage is known — a mint with an effect
+/// already in flight must finish on the account that raised it, and one that
+/// has already settled is a replay, not a refusal. Only a mint that has
+/// recorded terms and raised nothing can safely be stopped over a changed
+/// default, which is why the question is not asked here.
 async fn resolve_runtime_custody_bound_creator_account(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
@@ -2741,6 +2874,26 @@ fn confirmed_stage(
 /// from the same two strings, and `verify_runtime_portable_metadata` already
 /// asserts the published document matches the identity), so the emitted bytes
 /// do not move; for an object there is no caller-side codecs string at all.
+/// Publish the metadata DIRECTORY a mint's token URI resolves to.
+///
+/// Returns `(cid, "ipfs://{cid}")` — the FOLDER, never a file inside it. The
+/// Operative appends to whatever base URI it is given
+/// (`OperativePrimitive.uri(id)` is `base + "/{id}.json"`, `metadataURI()` is
+/// `base + "/contract.json"`), so a base that already names `metadata.json`
+/// makes every derived URI a doubled path that resolves to nothing. That is
+/// exactly what shipped: `ipfs://Qm…/metadata.json/0000…0001.json`.
+///
+/// The directory holds the Elacity listing files a marketplace indexes, plus
+/// the runtime's own document as `manifest.json`. The runtime document cannot
+/// keep the name `metadata.json` because that is the one the token URI
+/// resolves to, and it is the Elacity document that has to be there.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "these are the facts the folder states, each read from a different \
+              authority -- the mint draft, the resolved chain source, the \
+              creator's account and their listing terms; bundling them into a \
+              struct would only move the same list one call further out"
+)]
 async fn publish_runtime_custody_creator_metadata(
     registry: &ProviderRegistry,
     data_dir: &std::path::Path,
@@ -2748,6 +2901,12 @@ async fn publish_runtime_custody_creator_metadata(
     facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
     mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
     publisher_profile_did: &str,
+    listing: Option<&crate::library::RuntimeCustodyListingTerms>,
+    plaintext_bytes: u64,
+    creator_address: &str,
+    source: &ResolvedProtectedContentCreatorMintSource,
+    copies_hex: &str,
+    price_hex: &str,
 ) -> anyhow::Result<(String, String)> {
     let draft = mint.draft();
     let (media_identity_base64, content_identity_base64) =
@@ -2781,7 +2940,57 @@ async fn publish_runtime_custody_creator_metadata(
     let staging = tempfile::Builder::new()
         .prefix("creator-metadata-")
         .tempdir_in(&parent)?;
-    std::fs::write(staging.path().join("metadata.json"), bytes)?;
+
+    // The cover is pinned first and separately: it is the one part of the
+    // listing that is bytes rather than a statement, and `metadata.json` has to
+    // name its CID. Absent means the indexer falls back to its own type icon,
+    // which is better than a broken image.
+    let image = match listing.and_then(|listing| listing.thumbnail.as_ref()) {
+        None => String::new(),
+        Some(thumbnail) => {
+            let filename = format!("cover{}", runtime_custody_cover_extension(&thumbnail.mime));
+            let cover_cid = crate::content::publish_bytes_via_provider(
+                registry,
+                &filename,
+                &thumbnail.bytes,
+                None,
+                None,
+            )
+            .await?;
+            format!("ipfs://{cover_cid}")
+        }
+    };
+
+    let threshold = draft.threshold();
+    let inputs = crate::protected_content_elacity_metadata::ElacityMetadataInputs {
+        encrypted_content_cid: &facts.content_cid,
+        content_type: draft.content_identity().content_type(),
+        plaintext_bytes,
+        kid_0x: &format!("0x{}", hex::encode(draft.content_access_id().as_bytes())),
+        publisher_address: creator_address,
+        chain_id: runtime_custody_creator_chain_id(&source.chain_namespace)
+            .map_err(creator_mint_unavailable!())?,
+        ledger: &source.ledger,
+        copies: runtime_custody_hex_quantity_to_u64(copies_hex)?,
+        price: &runtime_custody_hex_quantity_to_decimal(price_hex)?,
+        image: &image,
+        protection: crate::protected_content_elacity_metadata::runtime_custody_protection(
+            u32::from(threshold.required()),
+            u32::from(threshold.total()),
+            &base64::engine::general_purpose::STANDARD.encode(draft.policy().canonical_bytes()?),
+        ),
+        fallback_name: runtime_custody_metadata_name(object_uri),
+    };
+    for (name, file_bytes) in
+        crate::protected_content_elacity_metadata::elacity_metadata_files(listing, &inputs)?
+    {
+        std::fs::write(staging.path().join(name), file_bytes)?;
+    }
+
+    // The runtime's own document, unchanged in content, under the name the
+    // Elacity one displaced.
+    std::fs::write(staging.path().join("manifest.json"), bytes)?;
+
     let metadata_cid = crate::content::publish_directory_via_provider_with_kind(
         registry,
         staging.path(),
@@ -2790,10 +2999,38 @@ async fn publish_runtime_custody_creator_metadata(
         None,
     )
     .await?;
-    Ok((
-        metadata_cid.clone(),
-        format!("ipfs://{metadata_cid}/metadata.json"),
-    ))
+    Ok((metadata_cid.clone(), format!("ipfs://{metadata_cid}")))
+}
+
+/// A file extension for the pinned cover, from its declared image type.
+///
+/// The extension is cosmetic — readers follow the CID, not the name — so an
+/// unrecognised image type gets none rather than a guess.
+fn runtime_custody_cover_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => ".png",
+        "image/jpeg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        "image/svg+xml" => ".svg",
+        "image/avif" => ".avif",
+        _ => "",
+    }
+}
+
+/// Decimal count from a canonical `0x` quantity, for the listing documents.
+fn runtime_custody_hex_quantity_to_u64(value: &str) -> anyhow::Result<u64> {
+    u64::from_str_radix(value.trim().trim_start_matches("0x"), 16)
+        .map_err(|_| creator_mint_unavailable_missing!()())
+}
+
+/// Decimal string from a canonical `0x` quantity. A price is `uint256` on
+/// chain, so it is widened to `u128` and rendered as text rather than parsed
+/// into anything narrower.
+fn runtime_custody_hex_quantity_to_decimal(value: &str) -> anyhow::Result<String> {
+    u128::from_str_radix(value.trim().trim_start_matches("0x"), 16)
+        .map(|parsed| parsed.to_string())
+        .map_err(|_| creator_mint_unavailable_missing!()())
 }
 
 async fn publish_runtime_custody_creator_listing(
@@ -2853,264 +3090,6 @@ fn runtime_custody_metadata_name(object_uri: &str) -> &str {
         .unwrap_or("protected-content")
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentMarketSource {
-    schema: String,
-    network: String,
-    authority_gateway_contract: String,
-    #[allow(dead_code)]
-    evidence_rpc_sources: u64,
-}
-
-const ERC1155_IS_APPROVED_FOR_ALL_SELECTOR: &str = "e985e9c5";
-const ERC1155_SET_APPROVAL_FOR_ALL_SELECTOR: &str = "a22cb465";
-
-fn abi_word_from_address(address: &str) -> anyhow::Result<String> {
-    let raw = address
-        .strip_prefix("0x")
-        .filter(|raw| raw.len() == 40 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| anyhow::anyhow!("invalid EVM address for ABI encoding"))?;
-    Ok(format!("{:0>64}", raw.to_ascii_lowercase()))
-}
-
-fn erc1155_is_approved_for_all_call_data(owner: &str, operator: &str) -> anyhow::Result<String> {
-    Ok(format!(
-        "0x{ERC1155_IS_APPROVED_FOR_ALL_SELECTOR}{}{}",
-        abi_word_from_address(owner)?,
-        abi_word_from_address(operator)?
-    ))
-}
-
-fn erc1155_set_approval_for_all_call_data(
-    operator: &str,
-    approved: bool,
-) -> anyhow::Result<String> {
-    Ok(format!(
-        "0x{ERC1155_SET_APPROVAL_FOR_ALL_SELECTOR}{}{:0>64}",
-        abi_word_from_address(operator)?,
-        if approved { "1" } else { "0" }
-    ))
-}
-
-/// Decodes the single `bool` word an `isApprovedForAll` call returns.
-/// Anything other than an exact 32-byte 0/1 word is treated as unknown,
-/// which the caller resolves by raising the approval (a spurious second
-/// `setApprovalForAll(true)` is harmless; a missed one breaks every buy).
-fn erc1155_bool_result(result: &str) -> Option<bool> {
-    let raw = result.strip_prefix("0x")?;
-    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    match raw.trim_start_matches('0') {
-        "" => Some(false),
-        "1" => Some(true),
-        _ => None,
-    }
-}
-
-async fn resolve_runtime_custody_market_gateway(
-    state: &GatewayState,
-    network: &str,
-) -> anyhow::Result<String> {
-    let response = wallet_chain_provider_data(
-        state,
-        serde_json::json!({
-            "op": "describe_protected_content_market_source",
-            "network": network,
-        }),
-    )
-    .await
-    .map_err(creator_mint_unavailable!())?;
-    let source: ResolvedProtectedContentMarketSource =
-        serde_json::from_value(response).map_err(creator_mint_unavailable!())?;
-    if source.schema != "elastos.chain.protected-content-market-source/v1"
-        || source.network != network
-    {
-        return Err(creator_mint_unavailable_missing!()());
-    }
-    validate_wallet_evm_address(&source.authority_gateway_contract, "market gateway")
-        .map_err(creator_mint_unavailable!())?;
-    Ok(source.authority_gateway_contract.to_ascii_lowercase())
-}
-
-/// Builds the exact `setApprovalForAll(gateway, true)` transaction on the
-/// mint's operative: the ERC-1155 contract the market gateway resolves from
-/// `(ledger, token_id)` and transfers the sold copies from. The asset ledger
-/// only records the mint; an approval granted there never reaches the
-/// operative, and every purchase reverts with
-/// `ERC1155MissingApprovalForAll(gateway, creator)`.
-fn runtime_custody_creator_operator_approval_request(
-    principal_id: &str,
-    creator_account: &RuntimeCustodyCreatorAccount,
-    chain_plan: &RuntimeCustodyCreatorChainPlan,
-    operative: &str,
-    gateway: &str,
-    mint_id: elastos_protected_content_contracts::Digest32,
-) -> anyhow::Result<RuntimeTransactionRequest> {
-    let data = erc1155_set_approval_for_all_call_data(gateway, true)?;
-    let stable_request = serde_json::json!({
-        "domain": "elastos.protected-content.creator-operator-approval/v1",
-        "effect_id": "",
-        "wallet_account_id": creator_account.account_id,
-        "address": creator_account.address,
-        "chain_namespace": chain_plan.chain_namespace,
-        "network": chain_plan.network,
-        "to": operative,
-        "value": "0x0",
-        "data": data,
-        "ledger": chain_plan.ledger,
-        "operative": operative,
-        "gateway": gateway,
-        "mint_id": hex::encode(mint_id.as_bytes()),
-    });
-    let request_sha256 = runtime_transaction_request_sha256(&stable_request)?;
-    let mut request = RuntimeTransactionRequest {
-        source: NATIVE_TRANSACTION_SOURCE,
-        effect_id: String::new(),
-        request_sha256,
-        account_id: creator_account.account_id.clone(),
-        address: creator_account.address.clone(),
-        chain_namespace: chain_plan.chain_namespace.clone(),
-        network: chain_plan.network.clone(),
-        to: operative.to_string(),
-        value: "0x0".to_string(),
-        data,
-        approval_reason: "Allow the marketplace gateway to deliver sold copies".to_string(),
-        metadata: serde_json::json!({
-            "product_operation": "protected_content_creator_operator_approval",
-            "ledger": chain_plan.ledger,
-            "operative": operative,
-            "gateway": gateway,
-            "mint_id": hex::encode(mint_id.as_bytes()),
-        }),
-    };
-    let request_binding = transaction_request_binding(&request);
-    request.effect_id = exact_runtime_transaction_effect_id(
-        NATIVE_TRANSACTION_SOURCE,
-        principal_id,
-        &request.request_sha256,
-        &request_binding,
-    )?;
-    Ok(request)
-}
-
-/// Ensures the mint's operative lets the market gateway move the creator's
-/// copies (ERC-1155 operator approval on the contract `buyAccess` transfers
-/// from). Returns Ok when the chain already reports the approval or the
-/// approval effect has settled; bails with the creator-pending message while
-/// the wallet approval or chain settlement is outstanding.
-#[allow(clippy::too_many_arguments)]
-async fn ensure_runtime_custody_creator_operator_approval(
-    state: &GatewayState,
-    authority: &RuntimeWalletAuthority,
-    mint_journal: &elastos_protected_content_runtime::RuntimeMintJournal,
-    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
-    mint_id: elastos_protected_content_contracts::Digest32,
-    principal_id: &str,
-    creator_account: &RuntimeCustodyCreatorAccount,
-    chain_plan: &RuntimeCustodyCreatorChainPlan,
-    operative: &str,
-) -> anyhow::Result<()> {
-    validate_wallet_evm_address(operative, "mint operative")
-        .map_err(creator_mint_unavailable!())?;
-    let operative = operative.to_ascii_lowercase();
-    let gateway = resolve_runtime_custody_market_gateway(state, &chain_plan.network).await?;
-    let probe = wallet_chain_provider_data(
-        state,
-        serde_json::json!({
-            "op": "contract_call",
-            "network": chain_plan.network,
-            "to": operative,
-            "data": erc1155_is_approved_for_all_call_data(&creator_account.address, &gateway)?,
-        }),
-    )
-    .await
-    .map_err(creator_mint_unavailable!())?;
-    let approved = probe
-        .get("result")
-        .and_then(serde_json::Value::as_str)
-        .and_then(erc1155_bool_result)
-        .unwrap_or(false);
-    tracing::debug!(
-        mint_id = %hex::encode(mint_id.as_bytes()),
-        creator = %creator_account.address,
-        %operative,
-        %gateway,
-        approved,
-        "runtime custody creator tail: operative operator approval probed"
-    );
-    if approved {
-        return Ok(());
-    }
-    let request = runtime_custody_creator_operator_approval_request(
-        principal_id,
-        creator_account,
-        chain_plan,
-        &operative,
-        &gateway,
-        mint_id,
-    )?;
-    let effect_binding = runtime_custody_creator_effect_binding(&request)?;
-    if let Some(existing) = mint
-        .creator_state()
-        .and_then(|creator_state| creator_state.operator_approval())
-    {
-        if existing != &effect_binding {
-            return Err(creator_mint_unavailable_missing!()());
-        }
-    } else {
-        mint_journal
-            .bind_creator_operator_approval(mint_id, effect_binding.clone())
-            .map_err(creator_mint_unavailable!())?;
-    }
-    let approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
-        .await
-        .map_err(|(_, message)| anyhow::anyhow!(message))?;
-    tracing::debug!(
-        effect_id = %approval.effect_id,
-        "runtime custody creator tail: exact wallet effect ensured"
-    );
-    let completion = match complete_runtime_transaction_effect(
-        state,
-        authority,
-        RuntimeTransactionLookup::ApprovalId(effect_binding.approval_request_id()),
-        Some(&request),
-        None,
-    )
-    .await
-    {
-        Ok(completion) => completion,
-        Err((status, message))
-            if status == StatusCode::BAD_REQUEST
-                && message == "transaction approval is not completed" =>
-        {
-            let _ = approval;
-            {
-                tracing::debug!(
-                    line = line!(),
-                    "runtime custody creator tail: pending exact Wallet or Chain settlement"
-                );
-                anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
-            }
-        }
-        Err((_, message)) => return Err(anyhow::anyhow!(message)),
-    };
-    if completion.receipt.is_none() || completion.completion_pending {
-        {
-            tracing::debug!(
-                line = line!(),
-                "runtime custody creator tail: pending exact Wallet or Chain settlement"
-            );
-            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
-        }
-    }
-    if completion.completion_error.is_some() {
-        return Err(creator_mint_unavailable_missing!()());
-    }
-    Ok(())
-}
-
 fn runtime_custody_creator_effect_binding(
     request: &RuntimeTransactionRequest,
 ) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorEffectBinding> {
@@ -3152,6 +3131,19 @@ async fn resolve_runtime_custody_creator_chain_plan(
             "content_access_id": format!("0x{}", hex::encode(content_access_id.as_bytes())),
             "copies": creator_state.desired_terms().copies(),
             "price": creator_state.desired_terms().price(),
+            // From the RECORDED terms, not the request: a retry re-encodes the
+            // chain call here, and the payees have to be the ones the mint was
+            // bound to rather than whatever the latest attempt happened to
+            // carry. Empty is the chain default, the whole share to the creator.
+            "royalties": creator_state
+                .desired_terms()
+                .royalties()
+                .iter()
+                .map(|royalty| serde_json::json!({
+                    "address": royalty.address(),
+                    "units": royalty.units(),
+                }))
+                .collect::<Vec<_>>(),
         }),
     )
     .await
@@ -3457,6 +3449,12 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         let buyer_account = RuntimeCustodyCreatorAccount {
             account_id: existing.account_id.clone(),
             address: existing.address.clone(),
+            // Rebuilt from the recorded purchase, which stores the identity and
+            // not the wallet surface it came from. Nothing downstream of here
+            // raises a pending answer for this account, so the signer fields
+            // stay at the value that claims the least.
+            external_signer: false,
+            connector_id: None,
         };
         let expected_identity = RuntimeCustodyExpectedPurchaseIdentity {
             principal_id: &input.principal_id,
@@ -3783,10 +3781,34 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     if creator_account.address != input.wallet_account_address {
         return Err(creator_mint_unavailable_missing!()());
     }
+    // The creator's royalty split is part of the recorded terms, not of the
+    // request alone: a retry compares desired terms and re-encodes the chain
+    // call from them, so a split held only in the request could differ between
+    // attempts and silently change what the transaction pays out. Absent means
+    // the chain default, a single payee.
+    let royalties = input
+        .listing
+        .as_ref()
+        .map(|listing| {
+            listing
+                .royalties
+                .iter()
+                .map(|royalty| {
+                    elastos_protected_content_runtime::RuntimeMintRoyaltyShare::new(
+                        royalty.address.clone(),
+                        royalty.units,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(creator_mint_unavailable!())?
+        .unwrap_or_default();
     let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
         creator_account.account_id.clone(),
         input.copies.clone(),
         input.price.clone(),
+        royalties,
     )
     .map_err(creator_mint_unavailable!())?;
     if let Some(existing) = mint.creator_state() {
@@ -3795,6 +3817,50 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 facts.mint_id,
                 existing,
             ));
+        }
+        // A mint keeps the account it started with, so a creator who changed
+        // their transaction default after starting one would otherwise have it
+        // settle, silently, on the account they stopped choosing.
+        //
+        // Only `Recorded` may be stopped over that. `EffectRaised` has an
+        // approval out -- possibly signed, possibly already broadcast -- and
+        // refusing there would strand a transaction that is in flight on the
+        // bound account rather than protect anyone from it. `Settled` is a
+        // replay: the chain effect is done, and refusing would leave the
+        // listing permanently unpublishable. Both of those keep the account
+        // they have; this one is still free.
+        if existing.stage() == elastos_protected_content_runtime::RuntimeMintCreatorStage::Recorded
+        {
+            if let Ok(default_account) = resolve_runtime_custody_wallet_default_account(
+                state,
+                authority,
+                &source.chain_namespace,
+                RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE,
+            )
+            .await
+            {
+                if !default_account
+                    .address
+                    .eq_ignore_ascii_case(&creator_account.address)
+                {
+                    let drift =
+                        crate::protected_content_runtime::RuntimeCustodyCreatorWalletDrift::new(
+                            &source.chain_namespace,
+                            &creator_account.address,
+                            &default_account.address,
+                        );
+                    // Reason code only: the two addresses belong in the
+                    // creator's answer, not in the operator log.
+                    tracing::warn!(
+                        reason = drift.reason_label(),
+                        chain_namespace = %source.chain_namespace,
+                        "runtime custody creator tail: recorded terms name an account that is no \
+                         longer the transaction default; refusing before raising the effect"
+                    );
+                    return Err(anyhow::Error::new(drift)
+                        .context(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE));
+                }
+            }
         }
         if let Some(terminal) = existing.terminal() {
             if !terminal
@@ -3814,6 +3880,27 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 )
                 .await?,
             );
+            // This request settled nothing: the mint was already terminal, so
+            // no effect was raised and no transaction was sent. Without saying
+            // so the answer is indistinguishable from a fresh mint, and the
+            // Creator reported "Listed for sale" for work that happened over
+            // an hour earlier -- including, in the case that surfaced this,
+            // under a wallet the creator had since stopped using.
+            //
+            // Additive: `mint_id` and every other field a caller already reads
+            // are unchanged, so an older client behaves exactly as before.
+            facts.content_security["settled_before_this_request"] = serde_json::Value::Bool(true);
+            facts.content_security["settled_at"] = serde_json::Value::from(terminal.published_at());
+            facts.content_security["transaction_hash"] =
+                serde_json::Value::from(terminal.transaction_hash());
+            // Which account it actually minted on. A settled mint is never
+            // refused over a changed transaction default -- the chain effect is
+            // done and refusing would leave the listing unpublishable -- so
+            // naming the seller is the only way a creator who has since
+            // switched wallets can see that this listing is not on the account
+            // they would choose today.
+            facts.content_security["settled_seller_address"] =
+                serde_json::Value::from(terminal.seller());
             return Ok(facts);
         }
     }
@@ -3832,6 +3919,12 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 &facts,
                 &mint,
                 &publisher_profile_did,
+                input.listing.as_ref(),
+                input.plaintext_bytes,
+                &creator_account.address,
+                &source,
+                &input.copies,
+                &input.price,
             )
             .await?;
             let creator_state = elastos_protected_content_runtime::RuntimeMintCreatorState::new(
@@ -3903,60 +3996,83 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 && message == "transaction approval is not completed" =>
         {
             let _ = approval;
-            {
-                tracing::debug!(
-                    line = line!(),
-                    "runtime custody creator tail: pending exact Wallet or Chain settlement"
-                );
-                anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
-            }
+            return Err(runtime_custody_creator_effect_pending(
+                crate::protected_content_runtime::RuntimeCustodyEffectPending::awaiting_wallet_approval(
+                    creator_account.external_signer,
+                    creator_account.connector_id.as_deref(),
+                )
+                .with_progress(crate::protected_content_runtime::runtime_custody_creator_progress(
+                    &mint,
+                )),
+                line!(),
+            ));
+        }
+        // Finished, and not successfully. Neither of these ever produced a
+        // signature, so no transaction can result and there is nothing left to
+        // wait for -- which is precisely what the shared "not completed"
+        // answer could not say.
+        Err((status, message))
+            if status == StatusCode::BAD_REQUEST
+                && (message
+                    == super::gateway_transaction_effects::TRANSACTION_APPROVAL_REJECTED
+                    || message
+                        == super::gateway_transaction_effects::TRANSACTION_APPROVAL_EXPIRED) =>
+        {
+            let _ = approval;
+            let closed = crate::protected_content_runtime::RuntimeCustodyApprovalClosed::new(
+                if message == super::gateway_transaction_effects::TRANSACTION_APPROVAL_REJECTED {
+                    crate::protected_content_runtime::RuntimeCustodyApprovalClosedReason::Rejected
+                } else {
+                    crate::protected_content_runtime::RuntimeCustodyApprovalClosedReason::Expired
+                },
+            );
+            tracing::warn!(
+                line = line!(),
+                reason = closed.reason_label(),
+                "runtime custody creator tail: wallet approval closed without completing"
+            );
+            return Err(
+                anyhow::Error::new(closed).context(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE)
+            );
         }
         Err((_, message)) => return Err(anyhow::anyhow!(message)),
     };
-    if completion.receipt.is_none() {
-        {
-            tracing::debug!(
-                line = line!(),
-                "runtime custody creator tail: pending exact Wallet or Chain settlement"
-            );
-            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
-        }
-    }
-    if completion.completion_pending {
-        {
-            tracing::debug!(
-                line = line!(),
-                "runtime custody creator tail: pending exact Wallet or Chain settlement"
-            );
-            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
-        }
+    // Approved, and the chain has not produced the evidence yet. Nobody need
+    // act, which is exactly what the old shared "pending" could not say.
+    if completion.receipt.is_none() || completion.completion_pending {
+        return Err(runtime_custody_creator_effect_pending(
+            crate::protected_content_runtime::RuntimeCustodyEffectPending::awaiting_chain_settlement()
+                .with_progress(
+                    crate::protected_content_runtime::runtime_custody_creator_progress(&mint),
+                ),
+            line!(),
+        ));
     }
     if completion.completion_error.is_some() {
         return Err(creator_mint_unavailable_missing!()());
     }
     // The finalized receipt names the operative that holds the minted copies.
-    // A listing only becomes deliverable once that operative lets the market
-    // gateway move them (ERC-1155 operator approval); the mint itself never
-    // grants that, so raise it here as a second exact wallet effect when the
-    // chain does not already report it, then verify the listing.
+    // The market gateway moves them without a separate ERC-1155 operator
+    // approval -- the contract grants that itself -- so the mint is the ONE
+    // wallet effect this tail raises. It previously raised a second
+    // `setApprovalForAll` here, gated on an `isApprovedForAll` probe that
+    // treated any undecodable answer as "not approved"; that asked the creator
+    // to approve again on every mint, and the Creator disables its button at
+    // this stage, so the prompt could not even be answered.
+    //
+    // Scope: this is about MINTING only. An operator approval is still the
+    // mechanism for secondary trading -- an owner listing some of the Access
+    // Tokens or Royalty Shares they hold has to authorize the operator that
+    // moves them, and that flow will need one. What the contract change
+    // removed is the need to ask for it while minting, where the creator is
+    // not selling anything yet. The ERC-1155 call-data helpers went with the
+    // probe rather than being kept unused; a resale path builds what it needs.
     let receipt = resolve_runtime_custody_creator_mint_receipt(
         state,
         &creator_state,
         &creator_account.address,
         &chain_plan,
         &completion.transaction_hash,
-    )
-    .await?;
-    ensure_runtime_custody_creator_operator_approval(
-        state,
-        authority,
-        &mint_journal,
-        &mint,
-        facts.mint_id,
-        &input.principal_id,
-        &creator_account,
-        &chain_plan,
-        &receipt.operative,
     )
     .await?;
     let terminal = finalize_runtime_custody_creator_listing(
@@ -4374,40 +4490,6 @@ mod tests {
     }
 
     #[test]
-    fn erc1155_operator_approval_abi_helpers_encode_and_decode_exactly() {
-        let owner = "0xF36C114c19F96b4174B6D71E392c00dB95093a1E";
-        let gateway = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
-        assert_eq!(
-            super::erc1155_is_approved_for_all_call_data(owner, gateway).unwrap(),
-            "0xe985e9c5000000000000000000000000f36c114c19f96b4174b6d71e392c00db95093a1e00000000000000000000000009dbe796f40eceffeaccf243c3d758c4c1d8d87d"
-        );
-        assert_eq!(
-            super::erc1155_set_approval_for_all_call_data(gateway, true).unwrap(),
-            "0xa22cb46500000000000000000000000009dbe796f40eceffeaccf243c3d758c4c1d8d87d0000000000000000000000000000000000000000000000000000000000000001"
-        );
-        assert!(super::erc1155_is_approved_for_all_call_data("0x1234", gateway).is_err());
-        assert_eq!(
-            super::erc1155_bool_result(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            ),
-            Some(true)
-        );
-        assert_eq!(
-            super::erc1155_bool_result(
-                "0x0000000000000000000000000000000000000000000000000000000000000000"
-            ),
-            Some(false)
-        );
-        assert_eq!(super::erc1155_bool_result("0x01"), None);
-        assert_eq!(
-            super::erc1155_bool_result(
-                "0x0000000000000000000000000000000000000000000000000000000000000042"
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn creator_mint_chain_error_maps_pending_codes_to_pending_and_others_to_unavailable() {
         let pending = super::creator_mint_chain_error(
             (
@@ -4449,6 +4531,7 @@ mod tests {
             "wallet-account-1".to_string(),
             "0x2".to_string(),
             "0x5".to_string(),
+            Vec::new(),
         )
         .unwrap();
         elastos_protected_content_runtime::RuntimeMintCreatorState::new(
@@ -4617,6 +4700,7 @@ mod tests {
                 "wallet-account-1",
                 "0x02",
                 "0x05",
+                Vec::new(),
             )
             .unwrap(),
             "bafycreatorcid",
@@ -4646,6 +4730,8 @@ mod tests {
         let creator_account = RuntimeCustodyCreatorAccount {
             account_id: "wallet:eip155:8453:0x00000000000000000000000000000000000000ee".to_string(),
             address: "0x00000000000000000000000000000000000000ee".to_string(),
+            external_signer: false,
+            connector_id: None,
         };
         let request = runtime_custody_creator_transaction_request(
             "did:key:z6Mkcreatorprincipal1111111111111111111111111111111",

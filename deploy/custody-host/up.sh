@@ -5,9 +5,14 @@
 #   up.sh up [CLIENT_DATA_DIR]   Bring up custody-a/b/c, verify 3 distinct
 #                                DID-keyed descriptors landed in shared/,
 #                                export a per-node Carrier connect ticket,
-#                                and print the exact host-client commands to
-#                                register them (`elastos node peer add`) and
-#                                assemble the pool (`generate-custody-composition`).
+#                                write shared/ipfs-peering.json (the kubo
+#                                peering list that stops a fresh mint racing
+#                                DHT propagation -- restart the nodes to
+#                                apply it), and print the exact host-client
+#                                commands to register them
+#                                (`elastos node peer add`, with --provides
+#                                and --ipfs-peer-id) and assemble the pool
+#                                (`generate-custody-composition`).
 #   up.sh sync-chain-config [CLIENT_DATA_DIR]
 #                                Re-derive shared/chain-provider.json (the
 #                                client's protected-content network config
@@ -39,6 +44,11 @@ cd "${SCRIPT_DIR}"
 
 SERVICES=(custody-a custody-b custody-c)
 declare -A HOST_PORT=([custody-a]=14431 [custody-b]=14432 [custody-c]=14433)
+# Filled by cmd_up from each node's readiness receipt, read by
+# write_ipfs_peering. A global rather than a passed-by-name local so this
+# script keeps working on any bash that runs the HOST_PORT line above
+# (associative arrays, bash 4.0) without also needing namerefs (bash 4.3).
+declare -A NODE_KUBO_PEER_ID=()
 CONTAINER_DATA_ROOT=/home/custody/.local/share/elastos
 CONTAINER_ELASTOS_BIN="${CONTAINER_DATA_ROOT}/bin/elastos"
 POLL_BUDGET_SECS=120
@@ -147,6 +157,44 @@ print(value)
 ' "$1"
 }
 
+json_field_optional() {
+    # json_field_optional <json-on-stdin> <dotted.field.path> -- prints the
+    # string at that path, or nothing when any segment is absent. For the
+    # readiness receipt's additive fields: a node whose kubo did not come up
+    # writes no `ipfs` block at all, which is a fact to report, not an error.
+    python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    if not isinstance(value, dict) or part not in value:
+        print("")
+        raise SystemExit(0)
+    value = value[part]
+print(value if isinstance(value, str) else "")
+' "$1"
+}
+
+# The kubo libp2p identity of the HOST client's own node, read straight from
+# its repo config. That file carries the key pair kubo derives its PeerID
+# from, so this is correct whether or not the host's kubo happens to be
+# running -- unlike asking a daemon that is started lazily. Prints nothing
+# (never fails) when the host has no repo yet; the caller warns and carries
+# on with the container-to-container entries.
+host_kubo_peer_id() {
+    local client_data_dir="$1"
+    python3 - "${client_data_dir}/ipfs-repo/config" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as handle:
+        peer_id = json.load(handle)["Identity"]["PeerID"]
+except Exception:
+    peer_id = ""
+print(peer_id if isinstance(peer_id, str) else "")
+PY
+}
+
 # docker-compose.yml substitutes ${CUSTODY_NODE_LOG} into each node's
 # RUST_LOG. elastos-server's tracing init is
 # `EnvFilter::from_default_env().add_directive("elastos=info")`
@@ -202,6 +250,117 @@ write_env_log_filter() {
     printf 'CUSTODY_NODE_LOG=%s\n' "${filter}" >>"${tmp}"
     mv "${tmp}" .env
     chmod 0600 .env
+}
+
+# write_ipfs_peering CLIENT_DATA_DIR -- derive shared/ipfs-peering.json from
+# NODE_KUBO_PEER_ID (filled from the nodes' readiness receipts) plus the host
+# client's own kubo id.
+#
+# Why this file exists at all. Each ElastOS node runs its own kubo, `kubo
+# init`-ed with stock defaults and no configured relationship with any other
+# node. A protected-content mint publishes a fresh CID and immediately
+# requires remote replicas to pin it -- but a peer that has never met the
+# publisher cannot locate a CID whose DHT provider record has not propagated,
+# and stock kubo drops an untagged connection within seconds of crossing its
+# ConnMgr high-water mark. Measured: a custody node's pin hung past 240s with
+# no partners, where the same flow took ~50ms once discovery had had time.
+# Peering tags the connection permanently, which is what closes that gap.
+#
+# Addresses, and why they differ by direction:
+#   - the host gateway is reachable FROM a container as
+#     host.docker.internal (Docker Desktop resolves it; the compose file's
+#     extra_hosts maps it to host-gateway on a Linux engine), over both
+#     tcp/4001 and udp/4001 quic-v1 -- both measured reachable from inside.
+#   - containers reach each other by compose service name on the compose
+#     network, /dns4/custody-<x>/tcp/4001.
+#   - the HOST cannot dial into the bridge (measured), so it gets no addrs
+#     for these nodes at all: `node peer add --ipfs-peer-id <id>` with no
+#     --ipfs-addr. Peering by id alone still protects the inbound connection
+#     the container opens (measured: survived 105s, versus ~3-5s unprotected).
+#
+# This one file is mounted into all three containers, so each container's
+# list includes an entry for itself. That is harmless and deliberate rather
+# than a wart: kubo answers `swarm/peering/add` for its own id with
+# {"Status":"success"} and never dials itself (measured against a running
+# node), so no error path is taken and no per-container file is needed.
+#
+# entrypoint.sh syncs the file into each node's private data root on every
+# boot, so it takes effect on the NEXT restart, not on the run that wrote it
+# (this script can only write it after the nodes are up, because it is their
+# readiness receipts that carry the peer ids).
+write_ipfs_peering() {
+    local client_data_dir="$1"
+    local host_peer_id
+    host_peer_id="$(host_kubo_peer_id "${client_data_dir}")"
+
+    local svc peer_entries=()
+    for svc in "${SERVICES[@]}"; do
+        if [ -n "${NODE_KUBO_PEER_ID[${svc}]:-}" ]; then
+            peer_entries+=("${svc}=${NODE_KUBO_PEER_ID[${svc}]}")
+        fi
+    done
+
+    if [ -z "${host_peer_id}" ] && [ "${#peer_entries[@]}" -eq 0 ]; then
+        # Nothing to peer with: the custody-only role runs no kubo anywhere,
+        # and the host has no repo either. Remove a list left by an earlier
+        # run rather than leave the nodes peering with kubos nobody is
+        # claiming any more.
+        rm -f shared/ipfs-peering.json
+        log "no kubo peer ids to publish (custody-only role, or no node brought kubo up);"
+        log "shared/ipfs-peering.json not written -- nodes keep stock kubo defaults"
+        return 0
+    fi
+
+    if [ -z "${host_peer_id}" ]; then
+        log "WARNING: no kubo identity at '${client_data_dir}/ipfs-repo/config'; writing shared/ipfs-peering.json"
+        log "         with the container-to-container entries only. The nodes will not peer with the host"
+        log "         gateway, so the first mint after a cold gateway kubo can still race DHT propagation."
+        log "         Re-run '$0 up' once the host client has published something (which creates its repo)."
+    fi
+
+    python3 - shared/ipfs-peering.json "${host_peer_id}" \
+        ${peer_entries[@]+"${peer_entries[@]}"} <<'PY' \
+        || fail "could not write shared/ipfs-peering.json"
+import json
+import sys
+
+dst, host_peer_id = sys.argv[1], sys.argv[2]
+entries = []
+if host_peer_id:
+    entries.append(
+        {
+            "id": host_peer_id,
+            "addrs": [
+                "/dns4/host.docker.internal/tcp/4001",
+                "/dns4/host.docker.internal/udp/4001/quic-v1",
+            ],
+        }
+    )
+for pair in sys.argv[3:]:
+    service, peer_id = pair.split("=", 1)
+    entries.append({"id": peer_id, "addrs": [f"/dns4/{service}/tcp/4001"]})
+
+# The provider parses this as extra.peering verbatim and fails closed on a
+# malformed entry, so a duplicate id would be a genuine misconfiguration
+# (two services reporting the same kubo identity) rather than something to
+# quietly collapse.
+seen = set()
+for entry in entries:
+    if entry["id"] in seen:
+        raise SystemExit(f"duplicate kubo peer id in the peering list: {entry['id']}")
+    seen.add(entry["id"])
+
+with open(dst, "w") as handle:
+    json.dump(entries, handle, indent=2)
+    handle.write("\n")
+PY
+    # Read by the containers' unprivileged user through the bind mount, same
+    # rule as chain-provider.json: public libp2p peer ids and multiaddrs,
+    # nothing secret, so world-readable is the right mode.
+    chmod 0644 shared/ipfs-peering.json
+    log "wrote shared/ipfs-peering.json (host gateway: ${host_peer_id:-<none>}; nodes: ${peer_entries[*]:-<none>}; mode 0644)"
+    log "NOTE: entrypoint.sh syncs this at boot, so restart the nodes to apply it:"
+    log "      docker compose -f ${SCRIPT_DIR}/docker-compose.yml restart"
 }
 
 # --- subcommands ------------------------------------------------------
@@ -322,6 +481,20 @@ cmd_up() {
     log "3 distinct descriptors: ${descriptor_dids[*]}"
 
     log "== per-node ready receipt, ticket export, and node peer add commands =="
+    # docker-compose.yml passes `--role ${CUSTODY_HOST_ROLE:-storage}` to every
+    # node, so the same default decides what this script may claim about them:
+    # which provider targets to declare in `node peer add --provides`, and
+    # whether a kubo peer id is expected at all (a custody-only node runs no
+    # kubo by design -- see entrypoint.sh's role block).
+    local custody_role="${CUSTODY_HOST_ROLE:-storage}"
+    local node_provides
+    case "${custody_role}" in
+    storage) node_provides="custody,chain,ipfs,availability" ;;
+    custody) node_provides="custody,chain" ;;
+    *) fail "CUSTODY_HOST_ROLE must be 'storage' or 'custody' (got '${custody_role}')" ;;
+    esac
+    log "node role: ${custody_role} (provides: ${node_provides})"
+
     local svc did carrier_bound ready_json state ticket node_info_json
     local peer_add_lines=()
     local descriptor_paths=()
@@ -382,9 +555,37 @@ cmd_up() {
         printf '%s\n' "${ticket}" >"shared/${did}.ticket"
         log "${svc}: wrote shared/${did}.ticket (host route 127.0.0.1:${HOST_PORT[${svc}]}/udp, docker-simulation glue -- see build_ticket())"
 
-        peer_add_lines+=("elastos node peer add --did ${did} --label ${svc} --ticket \"\$(cat '${SCRIPT_DIR}/shared/${did}.ticket')\"")
+        # provider_host.rs writes `ipfs.peer_id` only when the node hosts the
+        # ipfs plane AND its kubo answered `ensure_started`. Absent in the
+        # custody role is expected; absent in the storage role means that
+        # node's kubo did not come up, which is worth saying out loud because
+        # the other nodes then cannot peer with it.
+        local node_peer_id
+        node_peer_id="$(printf '%s' "${ready_json}" | json_field_optional ipfs.peer_id)"
+        if [ -n "${node_peer_id}" ]; then
+            NODE_KUBO_PEER_ID["${svc}"]="${node_peer_id}"
+            log "${svc}: kubo peer id ${node_peer_id}"
+        elif [ "${custody_role}" = "storage" ]; then
+            log "WARNING: ${svc} is in the 'storage' role but its ready receipt carries no ipfs.peer_id;"
+            log "         no other node will peer with its kubo. Inspect with: $(logs_hint "${svc}")"
+        else
+            log "${svc}: no kubo peer id (custody role runs no kubo -- expected)"
+        fi
+
+        local peer_add_line="elastos node peer add --did ${did} --label ${svc} --provides ${node_provides}"
+        if [ -n "${node_peer_id}" ]; then
+            # --ipfs-peer-id with no --ipfs-addr on purpose: the host cannot
+            # dial into the Docker bridge (measured), so it has no honest
+            # multiaddr to record. Peering by id alone still protects the
+            # INBOUND connection the container opens, which is the direction
+            # that matters here.
+            peer_add_line="${peer_add_line} --ipfs-peer-id ${node_peer_id}"
+        fi
+        peer_add_lines+=("${peer_add_line} --ticket \"\$(cat '${SCRIPT_DIR}/shared/${did}.ticket')\"")
         descriptor_paths+=("${SCRIPT_DIR}/shared/${did}.descriptor.json")
     done
+
+    write_ipfs_peering "${client_data_dir}"
 
     log ""
     log "== next: register the 3 nodes and assemble the pool from the host client =="
@@ -514,7 +715,7 @@ cmd_down() {
 cmd_destroy() {
     log "== docker compose down -v (named volumes + containers removed) =="
     compose down -v
-    rm -f shared/*.descriptor.json shared/*.ticket shared/chain-provider.json
+    rm -f shared/*.descriptor.json shared/*.ticket shared/chain-provider.json shared/ipfs-peering.json
     log ""
     log "Builder cache and the elastos-custody-host image were left in place"
     log "(shared across any other image built from this repo). To reclaim that"

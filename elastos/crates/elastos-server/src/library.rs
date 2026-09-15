@@ -436,12 +436,117 @@ enum ObjectProviderRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum LibraryPublishProtectionRequest {
-    RuntimeCustody { copies: String, price: String },
+    RuntimeCustody {
+        copies: String,
+        price: String,
+        /// The listing a marketplace actually displays. Optional: absent means
+        /// the pre-listing behaviour, a mint with no Elacity metadata folder,
+        /// so an existing caller keeps working unchanged.
+        #[serde(default)]
+        listing: Option<LibraryPublishListingRequest>,
+    },
+}
+
+/// Creator-supplied listing terms.
+///
+/// `deny_unknown_fields` on purpose: a caller that sends a field this build
+/// does not understand is asking for something it will not get, and silently
+/// dropping it is how a listing ends up claiming terms nobody applied.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryPublishListingRequest {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    thumbnail: Option<LibraryPublishThumbnailRequest>,
+    /// Must total exactly `RUNTIME_CUSTODY_ROYALTY_TOTAL_UNITS`. The protocol's
+    /// own 50 units are minted by the contracts and are not the creator's to
+    /// set, so they never appear here.
+    #[serde(default)]
+    royalties: Vec<LibraryPublishRoyaltyRequest>,
+    #[serde(default)]
+    adult: bool,
+    #[serde(default)]
+    licensing: Option<Value>,
+    #[serde(default)]
+    legal_attestation: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryPublishThumbnailRequest {
+    mime: String,
+    bytes_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryPublishRoyaltyRequest {
+    address: String,
+    units: u32,
+}
+
+/// The creator's whole share of a primary sale, in ERC-1155 `ROYALTY_SHARE`
+/// units. 1000 exist per asset and one unit is 0.1% of the sale: the creator
+/// splits 950 and the protocol owner's 50 are minted by the contracts
+/// themselves. A split that does not total this is not one the chain can
+/// honour, and a listing showing it would describe a payout that will not
+/// happen.
+const RUNTIME_CUSTODY_ROYALTY_TOTAL_UNITS: u32 = 950;
+
+/// Upper bound on a cover thumbnail, before base64. Large enough for a real
+/// cover, small enough that a publish cannot be used to push arbitrary bulk
+/// through the metadata directory.
+const RUNTIME_CUSTODY_THUMBNAIL_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Validated listing terms. Distinct from the request type so nothing
+/// downstream can reach an unvalidated field.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyListingTerms {
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) category: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) thumbnail: Option<RuntimeCustodyListingThumbnail>,
+    pub(crate) royalties: Vec<RuntimeCustodyListingRoyalty>,
+    pub(crate) adult: bool,
+    pub(crate) licensing: Option<Value>,
+    pub(crate) legal_attestation: Option<Value>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeCustodyListingThumbnail {
+    pub(crate) mime: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Never renders the image bytes: a debug line is for an operator, and an
+/// operator needs the size, not the picture.
+impl std::fmt::Debug for RuntimeCustodyListingThumbnail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyListingThumbnail")
+            .field("mime", &self.mime)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyListingRoyalty {
+    pub(crate) address: String,
+    pub(crate) units: u32,
 }
 
 struct LoadedRuntimeCustodyPublishInput {
     copies: String,
     price: String,
+    listing: Option<RuntimeCustodyListingTerms>,
 }
 
 pub struct ObjectProvider {
@@ -1907,6 +2012,7 @@ async fn library_publish(
                     creator_mint_source_digest: creator_binding.source_digest,
                     copies: loaded.copies,
                     price: loaded.price,
+                    listing: loaded.listing,
                     source_storage,
                 };
             crate::api::gateway::runtime_custody_publish_via_gateway(
@@ -1933,6 +2039,7 @@ async fn library_publish(
                     creator_mint_source_digest: creator_binding.source_digest,
                     copies: loaded.copies,
                     price: loaded.price,
+                    listing: loaded.listing,
                     clear_plaintext,
                     source_storage,
                 };
@@ -5750,14 +5857,110 @@ fn validate_runtime_custody_publish_input(
     target: &LibraryTarget,
     protection: LibraryPublishProtectionRequest,
 ) -> anyhow::Result<LoadedRuntimeCustodyPublishInput> {
-    let LibraryPublishProtectionRequest::RuntimeCustody { copies, price } = protection;
+    let LibraryPublishProtectionRequest::RuntimeCustody {
+        copies,
+        price,
+        listing,
+    } = protection;
     let target_metadata = fs::symlink_metadata(&target.path)
         .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
     if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
         bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
     }
     let _ = (data_dir, principal_id);
-    Ok(LoadedRuntimeCustodyPublishInput { copies, price })
+    let listing = listing.map(validate_runtime_custody_listing).transpose()?;
+    Ok(LoadedRuntimeCustodyPublishInput {
+        copies,
+        price,
+        listing,
+    })
+}
+
+/// `0x` followed by exactly 40 hex digits.
+fn is_evm_address(value: &str) -> bool {
+    let Some(body) = value.strip_prefix("0x") else {
+        return false;
+    };
+    body.len() == 40 && body.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Validate creator-supplied listing terms, failing closed on each rule.
+///
+/// Every one of these is a claim the listing will make publicly, so an invalid
+/// one is refused rather than normalised: a silently corrected royalty split or
+/// a dropped over-size thumbnail produces a listing that says something the
+/// creator did not ask for. Nothing here is logged — it is the creator's own
+/// title, description and payees.
+fn validate_runtime_custody_listing(
+    listing: LibraryPublishListingRequest,
+) -> anyhow::Result<RuntimeCustodyListingTerms> {
+    let title = listing.title.trim().to_string();
+    if title.is_empty() {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+
+    let thumbnail = match listing.thumbnail {
+        None => None,
+        Some(thumbnail) => {
+            let mime = thumbnail.mime.trim().to_ascii_lowercase();
+            if !mime.starts_with("image/") {
+                bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(thumbnail.bytes_base64.trim())
+                .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+            if bytes.is_empty() || bytes.len() > RUNTIME_CUSTODY_THUMBNAIL_MAX_BYTES {
+                bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+            }
+            Some(RuntimeCustodyListingThumbnail { mime, bytes })
+        }
+    };
+
+    // An empty split is not "no royalties": it is a caller that did not say.
+    // Absent stays absent; present must be exactly what the chain applies.
+    let mut royalties = Vec::with_capacity(listing.royalties.len());
+    if !listing.royalties.is_empty() {
+        let mut total: u32 = 0;
+        for royalty in listing.royalties {
+            let address = royalty.address.trim().to_ascii_lowercase();
+            // 0x + 40 lowercase hex. Kept local rather than reaching into the
+            // gateway's wallet module: this validates a creator-supplied payee
+            // for a metadata document, not a wallet the Runtime will act on.
+            if !is_evm_address(&address) {
+                bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+            }
+            if royalty.units == 0 {
+                bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+            }
+            total = total
+                .checked_add(royalty.units)
+                .ok_or_else(|| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+            royalties.push(RuntimeCustodyListingRoyalty {
+                address,
+                units: royalty.units,
+            });
+        }
+        if total != RUNTIME_CUSTODY_ROYALTY_TOTAL_UNITS {
+            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+        }
+    }
+
+    Ok(RuntimeCustodyListingTerms {
+        title,
+        description: listing.description.trim().to_string(),
+        category: listing.category.trim().to_string(),
+        tags: listing
+            .tags
+            .into_iter()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty())
+            .collect(),
+        thumbnail,
+        royalties,
+        adult: listing.adult,
+        licensing: listing.licensing,
+        legal_attestation: listing.legal_attestation,
+    })
 }
 
 fn normalized_key_release_policy(policy: Option<&str>) -> anyhow::Result<Value> {
@@ -6796,6 +6999,35 @@ fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
     {
         response["creator_mint"] = blocked.as_json();
     }
+    if let Some(unusable) = error
+        .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyWalletDefaultUnusable>(
+    ) {
+        response["wallet_default"] = unusable.as_json();
+    }
+    // A mint bound to an account the wallet no longer defaults to. Its own key,
+    // not `wallet_default`: the default here is fine, and an app that conflated
+    // the two would tell the creator to set a default they have already set.
+    if let Some(drift) =
+        error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorWalletDrift>()
+    {
+        response["wallet_drift"] = drift.as_json();
+    }
+    // A waiting state, not a failure. Carried as data so an app stops deciding
+    // control flow by matching the word "pending" in a sentence written for a
+    // person to read.
+    if let Some(pending) =
+        error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyEffectPending>()
+    {
+        response["effect_pending"] = pending.as_json();
+    }
+    // The opposite of pending: an approval that is finished and did not
+    // succeed. Its own key, so an app polling for completion can tell "stop
+    // waiting" from "keep waiting" without reading either sentence.
+    if let Some(closed) =
+        error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyApprovalClosed>()
+    {
+        response["approval_closed"] = closed.as_json();
+    }
     response
 }
 
@@ -6859,6 +7091,7 @@ mod tests {
                 "wallet-account-1",
                 "0xa",
                 "0xf4240",
+                Vec::new(),
             )
             .unwrap(),
             "bafycreatorcid",
@@ -6882,6 +7115,377 @@ mod tests {
         // Every other failure keeps the envelope it always had.
         let plain = super::provider_error_from("library_error", &anyhow!("only"));
         assert!(plain.get("creator_mint").is_none());
+    }
+
+    /// The wallet-default refusal is additive: the opaque sentence every caller
+    /// already matches on stays the `message`, and the typed field beneath it
+    /// says which of the five conditions failed and names the network, so an
+    /// app can offer "link your wallet" rather than "unavailable".
+    #[test]
+    fn provider_error_from_carries_the_typed_wallet_default_refusal() {
+        let unusable =
+            crate::protected_content_runtime::RuntimeCustodyWalletDefaultUnusable::new(
+                crate::protected_content_runtime::RuntimeCustodyWalletDefaultReason::DefaultAccountSigningUnavailable,
+                "eip155:8453",
+            );
+        let actionable = unusable.to_string();
+        let value = super::provider_error_from(
+            "library_error",
+            &anyhow::Error::new(unusable).context("Runtime custody creator mint is unavailable"),
+        );
+
+        assert_eq!(value["status"], "error");
+        assert_eq!(
+            value["message"],
+            "Runtime custody creator mint is unavailable"
+        );
+        assert_eq!(
+            value["wallet_default"]["schema"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_WALLET_DEFAULT_UNUSABLE_SCHEMA_V1
+        );
+        assert_eq!(
+            value["wallet_default"]["reason"],
+            "default_account_signing_unavailable"
+        );
+        assert_eq!(value["wallet_default"]["chain_namespace"], "eip155:8453");
+
+        // The actionable sentence rides in the cause chain, never displacing
+        // the stable one, and it names the way out rather than the cause only.
+        assert_eq!(value["detail"], actionable);
+        assert!(actionable.contains("eip155:8453"));
+        assert!(actionable.contains("link it in Wallet"));
+
+        // Nothing sensitive travels: the answer is a reason and a network.
+        let fields = value["wallet_default"]
+            .as_object()
+            .expect("the typed answer must be an object");
+        assert_eq!(fields.len(), 3);
+
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("wallet_default").is_none());
+    }
+
+    /// Wallet drift gets its own key, not `wallet_default`. The default is
+    /// perfectly usable in this case -- it is simply not the account the mint
+    /// already started on -- so an app that read this as a default problem
+    /// would tell the creator to set a default they have already set.
+    #[test]
+    fn provider_error_from_carries_the_typed_wallet_drift_refusal() {
+        let bound = "0x7ba979fa244b930c01bdc84de851e5bca64b9f81";
+        let current_default = "0xab5028bdbb0826ad6f1885478e421db677b0001a";
+        let drift = crate::protected_content_runtime::RuntimeCustodyCreatorWalletDrift::new(
+            "eip155:8453",
+            bound,
+            current_default,
+        );
+        let actionable = drift.to_string();
+        let value = super::provider_error_from(
+            "library_error",
+            &anyhow::Error::new(drift).context("Runtime custody creator mint is unavailable"),
+        );
+
+        assert_eq!(value["status"], "error");
+        assert_eq!(
+            value["message"],
+            "Runtime custody creator mint is unavailable"
+        );
+        assert_eq!(
+            value["wallet_drift"]["schema"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_CREATOR_WALLET_DRIFT_SCHEMA_V1
+        );
+        assert_eq!(
+            value["wallet_drift"]["reason"],
+            "creator_mint_bound_account_is_not_the_transaction_default"
+        );
+        assert_eq!(value["wallet_drift"]["chain_namespace"], "eip155:8453");
+
+        // Both accounts travel, and they are the point: a refusal that says
+        // "these two differ" without naming them leaves an app nothing to show.
+        assert_eq!(value["wallet_drift"]["bound_address"], bound);
+        assert_eq!(value["wallet_drift"]["default_address"], current_default);
+
+        // The sentence names both ways out, not just the cause.
+        assert_eq!(value["detail"], actionable);
+        assert!(actionable.contains(bound), "{actionable}");
+        assert!(actionable.contains(current_default), "{actionable}");
+        assert!(
+            actionable.contains("discard the recorded terms"),
+            "{actionable}"
+        );
+
+        // Drift is not a default problem; the two answers stay separate so an
+        // app branching on one never sees the other.
+        assert!(value.get("wallet_default").is_none());
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("wallet_drift").is_none());
+    }
+
+    /// A waiting state carried as data. The distinction the typed answer adds
+    /// over the old shared sentence is `awaits_person`: one of these needs the
+    /// creator to go and approve something, and the other needs them to do
+    /// nothing at all.
+    #[test]
+    fn provider_error_from_carries_the_typed_effect_pending_state() {
+        let external =
+            crate::protected_content_runtime::RuntimeCustodyEffectPending::awaiting_wallet_approval(
+                true,
+                Some("metamask"),
+            );
+        assert!(external.awaits_person());
+        let actionable = external.to_string();
+        let value = super::provider_error_from(
+            "library_error",
+            &anyhow::Error::new(external).context(
+                "Runtime custody creator mint is pending exact Wallet or Chain settlement",
+            ),
+        );
+        assert_eq!(
+            value["message"],
+            "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+        );
+        assert_eq!(
+            value["effect_pending"]["schema"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_EFFECT_PENDING_SCHEMA_V1
+        );
+        assert_eq!(value["effect_pending"]["reason"], "wallet_approval");
+        assert_eq!(value["effect_pending"]["awaits_person"], true);
+        assert_eq!(value["effect_pending"]["connector_id"], "metamask");
+        // Names where to go, not merely that something is pending.
+        assert_eq!(value["detail"], actionable);
+        assert!(actionable.contains("metamask"), "{actionable}");
+
+        // A managed approval is outstanding too, but nobody has to act on it.
+        let managed =
+            crate::protected_content_runtime::RuntimeCustodyEffectPending::awaiting_wallet_approval(
+                false, None,
+            );
+        assert!(!managed.awaits_person());
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(managed));
+        assert_eq!(value["effect_pending"]["awaits_person"], false);
+
+        // A chain wait states no signer at all: the signer already did their
+        // part, and the site that raises it has no account in hand to describe.
+        let chain = crate::protected_content_runtime::RuntimeCustodyEffectPending::
+            awaiting_chain_settlement();
+        assert!(!chain.awaits_person());
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(chain));
+        assert_eq!(value["effect_pending"]["reason"], "chain_settlement");
+        assert_eq!(value["effect_pending"]["awaits_person"], false);
+        assert!(value["effect_pending"].get("external_signer").is_none());
+        assert!(value["effect_pending"].get("connector_id").is_none());
+
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("effect_pending").is_none());
+    }
+
+    fn listing_request(json: serde_json::Value) -> super::LibraryPublishListingRequest {
+        serde_json::from_value(json).expect("fixture must parse")
+    }
+
+    fn valid_listing_json() -> serde_json::Value {
+        json!({
+            "title": "  My asset  ",
+            "description": " What it is ",
+            "category": "art",
+            "tags": ["one", "  ", "two"],
+            "royalties": [
+                { "address": "0xAB5028BDBB0826AD6F1885478E421DB677B0001A", "units": 900 },
+                { "address": "0x7ba979fa244b930c01bdc84de851e5bca64b9f81", "units": 50 }
+            ],
+            "adult": false
+        })
+    }
+
+    /// Listing terms are claims the listing makes publicly, so each rule fails
+    /// closed rather than normalising: a silently corrected royalty split or a
+    /// dropped over-size cover produces a listing that says something the
+    /// creator never asked for.
+    #[test]
+    fn listing_terms_are_normalised_and_accepted_when_every_rule_holds() {
+        let terms = super::validate_runtime_custody_listing(listing_request(valid_listing_json()))
+            .expect("a complete, consistent listing must be accepted");
+        assert_eq!(terms.title, "My asset");
+        assert_eq!(terms.description, "What it is");
+        // Blank tags are dropped, real ones trimmed and kept in order.
+        assert_eq!(terms.tags, vec!["one".to_string(), "two".to_string()]);
+        // Addresses are lowercased so two spellings of one payee cannot read
+        // as two payees downstream.
+        assert_eq!(
+            terms.royalties[0].address,
+            "0xab5028bdbb0826ad6f1885478e421db677b0001a"
+        );
+        assert_eq!(terms.royalties.len(), 2);
+    }
+
+    #[test]
+    fn listing_terms_require_a_title() {
+        for title in ["", "   "] {
+            let mut value = valid_listing_json();
+            value["title"] = json!(title);
+            super::validate_runtime_custody_listing(listing_request(value))
+                .expect_err("a listing with no title must fail closed");
+        }
+    }
+
+    #[test]
+    fn listing_royalties_must_total_exactly_the_creator_share() {
+        // The chain applies 9500 to the creator and 500 to the protocol. A
+        // split that does not total 9500 is not one the chain can honour, so
+        // showing it would describe a payout that will not happen.
+        for total in [949_u32, 951, 1000] {
+            let mut value = valid_listing_json();
+            value["royalties"] = json!([
+                { "address": "0xab5028bdbb0826ad6f1885478e421db677b0001a", "units": total }
+            ]);
+            super::validate_runtime_custody_listing(listing_request(value))
+                .expect_err("a split that does not total the creator share must fail closed");
+        }
+        let mut value = valid_listing_json();
+        value["royalties"] = json!([
+            { "address": "0xab5028bdbb0826ad6f1885478e421db677b0001a", "units": 950 }
+        ]);
+        super::validate_runtime_custody_listing(listing_request(value))
+            .expect("a split totalling exactly the creator share is accepted");
+    }
+
+    #[test]
+    fn listing_royalties_reject_a_malformed_payee_or_an_empty_share() {
+        for address in [
+            "0xnothex",
+            "ab5028bdbb0826ad6f1885478e421db677b0001a",
+            "0xab50",
+            "",
+        ] {
+            let mut value = valid_listing_json();
+            value["royalties"] = json!([
+                { "address": address, "units": 950 }
+            ]);
+            super::validate_runtime_custody_listing(listing_request(value))
+                .expect_err("a malformed payee address must fail closed");
+        }
+        // A zero share is a payee who is owed nothing: almost certainly a
+        // mistake, and never something to encode on chain.
+        let mut value = valid_listing_json();
+        value["royalties"] = json!([
+            { "address": "0xab5028bdbb0826ad6f1885478e421db677b0001a", "units": 950 },
+            { "address": "0x7ba979fa244b930c01bdc84de851e5bca64b9f81", "units": 0 }
+        ]);
+        super::validate_runtime_custody_listing(listing_request(value))
+            .expect_err("a zero-share payee must fail closed");
+    }
+
+    #[test]
+    fn listing_royalties_may_be_omitted_entirely() {
+        // Absent is not the same as an invalid split: a caller that says
+        // nothing gets the chain's own default, and nothing is claimed.
+        let mut value = valid_listing_json();
+        value["royalties"] = json!([]);
+        let terms = super::validate_runtime_custody_listing(listing_request(value))
+            .expect("an absent split is not an invalid one");
+        assert!(terms.royalties.is_empty());
+    }
+
+    #[test]
+    fn listing_thumbnail_must_be_an_image_within_the_byte_cap() {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        let mut value = valid_listing_json();
+        value["thumbnail"] = json!({ "mime": "image/png", "bytes_base64": encode(b"cover") });
+        let terms = super::validate_runtime_custody_listing(listing_request(value))
+            .expect("a small image cover is accepted");
+        assert_eq!(terms.thumbnail.as_ref().unwrap().mime, "image/png");
+        assert_eq!(terms.thumbnail.as_ref().unwrap().bytes, b"cover");
+
+        // Not an image: the cover is published, so its type is a claim too.
+        let mut value = valid_listing_json();
+        value["thumbnail"] = json!({ "mime": "application/pdf", "bytes_base64": encode(b"x") });
+        super::validate_runtime_custody_listing(listing_request(value))
+            .expect_err("a non-image cover must fail closed");
+
+        // Empty, unparseable, and over the cap.
+        for bad in [
+            json!({ "mime": "image/png", "bytes_base64": "" }),
+            json!({ "mime": "image/png", "bytes_base64": "!!not base64!!" }),
+        ] {
+            let mut value = valid_listing_json();
+            value["thumbnail"] = bad;
+            super::validate_runtime_custody_listing(listing_request(value))
+                .expect_err("an unusable cover must fail closed");
+        }
+        let mut value = valid_listing_json();
+        value["thumbnail"] = json!({
+            "mime": "image/png",
+            "bytes_base64": encode(&vec![0u8; super::RUNTIME_CUSTODY_THUMBNAIL_MAX_BYTES + 1]),
+        });
+        super::validate_runtime_custody_listing(listing_request(value))
+            .expect_err("a cover past the byte cap must fail closed");
+    }
+
+    /// A caller that sends a field this build does not understand is asking
+    /// for something it will not get; dropping it silently is how a listing
+    /// ends up claiming terms nobody applied.
+    #[test]
+    fn listing_terms_reject_an_unknown_field() {
+        let mut value = valid_listing_json();
+        value["resale_royalty_percent"] = json!(10);
+        serde_json::from_value::<super::LibraryPublishListingRequest>(value)
+            .expect_err("an unknown listing field must be refused, not ignored");
+    }
+
+    /// A publish with no listing block keeps the pre-listing behaviour, so an
+    /// existing caller is unaffected.
+    #[test]
+    fn a_publish_without_listing_terms_still_parses() {
+        let request: super::LibraryPublishProtectionRequest = serde_json::from_value(json!({
+            "mode": "runtime_custody",
+            "copies": "0x1",
+            "price": "0x1"
+        }))
+        .expect("the pre-listing shape must still parse");
+        let super::LibraryPublishProtectionRequest::RuntimeCustody { listing, .. } = request;
+        assert!(listing.is_none());
+    }
+
+    /// The opposite of pending, and it used to be indistinguishable from it: a
+    /// declined transaction answered "transaction approval is not completed",
+    /// exactly like one the person simply had not got to, so anything polling
+    /// for completion waited on it forever.
+    #[test]
+    fn provider_error_from_carries_a_closed_wallet_approval() {
+        for (reason, wire, expected_words) in [
+            (
+                crate::protected_content_runtime::RuntimeCustodyApprovalClosedReason::Rejected,
+                "approval_rejected",
+                "declined",
+            ),
+            (
+                crate::protected_content_runtime::RuntimeCustodyApprovalClosedReason::Expired,
+                "approval_expired",
+                "expired",
+            ),
+        ] {
+            let closed =
+                crate::protected_content_runtime::RuntimeCustodyApprovalClosed::new(reason);
+            let actionable = closed.to_string();
+            let value = super::provider_error_from(
+                "library_error",
+                &anyhow::Error::new(closed).context("Runtime custody creator mint is unavailable"),
+            );
+            assert_eq!(
+                value["approval_closed"]["schema"],
+                crate::protected_content_runtime::RUNTIME_CUSTODY_APPROVAL_CLOSED_SCHEMA_V1
+            );
+            assert_eq!(value["approval_closed"]["reason"], wire);
+            assert_eq!(value["detail"], actionable);
+            assert!(actionable.contains(expected_words), "{actionable}");
+            // Terminal and pending are separate answers, so an app polling for
+            // completion can stop on one without parsing the other.
+            assert!(value.get("effect_pending").is_none());
+        }
+
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("approval_closed").is_none());
     }
 
     use super::*;

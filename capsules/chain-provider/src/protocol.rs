@@ -177,6 +177,18 @@ pub(super) enum RightsMethodAbi {
     HasAccessByContentIdAddressBytes16,
 }
 
+/// One royalty payee, in ERC-1155 `ROYALTY_SHARE` units.
+///
+/// Units are what the mint encodes, so units are what crosses this boundary:
+/// 1000 exist per asset, one unit is 0.1% of the sale, and the creator splits
+/// 950 of them. Nothing is converted here, so nothing can be converted wrongly.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentRoyaltyShare {
+    pub address: String,
+    pub units: u32,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
@@ -268,6 +280,10 @@ pub(super) enum Request {
         content_access_id: String,
         copies: String,
         price: String,
+        /// Who the creator's royalty share is paid to. Absent or empty means
+        /// the default: the whole creator share to the creator.
+        #[serde(default)]
+        royalties: Vec<ProtectedContentRoyaltyShare>,
     },
     ResolveProtectedContentMintReceipt {
         network: String,

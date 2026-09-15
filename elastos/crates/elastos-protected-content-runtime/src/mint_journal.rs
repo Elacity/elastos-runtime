@@ -1548,12 +1548,73 @@ struct MintNodeState {
     receipt: Option<RuntimeMintNodeReceipt>,
 }
 
+/// One creator-side royalty payee, in ERC-1155 `ROYALTY_SHARE` units.
+///
+/// Units are what the chain carries, so they are what is recorded: 1000 exist
+/// per asset and one unit is 0.1% of the sale. The creator side is 950 of them
+/// and the protocol owner's 50 are minted by the contracts themselves from
+/// `CentralStorage.protocolShares()`, so a creator splits 950 and never sees
+/// the other 50. Recording units rather than a percentage means no conversion
+/// stands between what is agreed and what is encoded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMintRoyaltyShare {
+    address: String,
+    units: u32,
+}
+
+impl RuntimeMintRoyaltyShare {
+    pub fn new(address: impl Into<String>, units: u32) -> Result<Self, RuntimeMintJournalError> {
+        let value = Self {
+            address: address.into().to_ascii_lowercase(),
+            units,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        // Lowercase `0x` + 40 hex, the same spelling every other address in
+        // this journal is held to.
+        validate_intent_evm_address(&self.address)?;
+        // A payee owed nothing is a mistake, not a split.
+        if self.units == 0 {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        Ok(())
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub const fn units(&self) -> u32 {
+        self.units
+    }
+}
+
+/// The creator's whole share of a primary sale, in `ROYALTY_SHARE` units.
+pub const RUNTIME_MINT_CREATOR_ROYALTY_UNITS: u32 = 950;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeMintCreatorDesiredTerms {
     wallet_account_id: String,
     copies: String,
     price: String,
+    /// Who the creator's share is paid to. Empty means the chain default, a
+    /// single payee: the creator.
+    ///
+    /// Recorded rather than derived at mint time because a retry compares
+    /// desired terms and re-encodes the chain call from them. A split held
+    /// only in the request could differ between attempts and silently change
+    /// what the transaction pays out.
+    ///
+    /// Defaulted so every record written before this field existed decodes as
+    /// "chain default" — the creator state is JSON inside the record, so a
+    /// missing key needs no format change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    royalties: Vec<RuntimeMintRoyaltyShare>,
 }
 
 impl RuntimeMintCreatorDesiredTerms {
@@ -1561,6 +1622,7 @@ impl RuntimeMintCreatorDesiredTerms {
         wallet_account_id: impl Into<String>,
         copies: impl Into<String>,
         price: impl Into<String>,
+        royalties: Vec<RuntimeMintRoyaltyShare>,
     ) -> Result<Self, RuntimeMintJournalError> {
         let wallet_account_id = wallet_account_id.into();
         let copies = normalize_intent_hex_quantity(&copies.into())?;
@@ -1569,6 +1631,7 @@ impl RuntimeMintCreatorDesiredTerms {
             wallet_account_id,
             copies,
             price,
+            royalties,
         };
         value.validate()?;
         Ok(value)
@@ -1578,6 +1641,22 @@ impl RuntimeMintCreatorDesiredTerms {
         validate_intent_text(&self.wallet_account_id)?;
         validate_canonical_intent_hex_quantity(&self.copies)?;
         validate_canonical_intent_hex_quantity(&self.price)?;
+        // Absent is the chain default and always allowed. Present must be
+        // exactly the creator share: a split that does not total it is not one
+        // the chain can honour, so recording it would describe a payout that
+        // will not happen.
+        if !self.royalties.is_empty() {
+            let mut total: u32 = 0;
+            for royalty in &self.royalties {
+                royalty.validate()?;
+                total = total
+                    .checked_add(royalty.units)
+                    .ok_or(RuntimeMintJournalError::InvalidSelection)?;
+            }
+            if total != RUNTIME_MINT_CREATOR_ROYALTY_UNITS {
+                return Err(RuntimeMintJournalError::InvalidSelection);
+            }
+        }
         Ok(())
     }
 
@@ -1591,6 +1670,10 @@ impl RuntimeMintCreatorDesiredTerms {
 
     pub fn price(&self) -> &str {
         &self.price
+    }
+
+    pub fn royalties(&self) -> &[RuntimeMintRoyaltyShare] {
+        &self.royalties
     }
 }
 
@@ -3788,8 +3871,20 @@ impl ExclusiveFileLock {
     }
 }
 
+/// Recursive so that the FIRST journal operation on a data dir works: the
+/// store lives two levels down (`protected-content/runtime-mint`), and
+/// `ExclusiveFileLock::acquire` creates only its own parent, before
+/// `ensure_root_dir` — the one place that knew to create both — has run. A
+/// non-recursive create therefore failed with `Unavailable` on a data dir
+/// that had no `protected-content/` yet, which a read path then reported as
+/// "mint intent is unavailable" rather than "nothing recorded".
+///
+/// `DirBuilder`'s mode applies to every directory it creates, so each level is
+/// still owner-only, and every caller re-checks with
+/// `validate_owner_only_directory`.
 fn create_owner_only_directory(path: &Path) -> Result<(), RuntimeMintJournalError> {
     let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -4092,7 +4187,7 @@ mod tests {
     }
 
     fn creator_desired_terms() -> RuntimeMintCreatorDesiredTerms {
-        RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x3", "0x5").unwrap()
+        RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x3", "0x5", Vec::new()).unwrap()
     }
 
     fn creator_effect_binding() -> RuntimeMintCreatorEffectBinding {
@@ -4754,7 +4849,8 @@ mod tests {
 
         // Re-terming after a discard is what start over means.
         let restarted = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x64", "0x186a0").unwrap(),
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x64", "0x186a0", Vec::new())
+                .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )
@@ -4798,7 +4894,8 @@ mod tests {
     #[test]
     fn creator_desired_terms_normalize_hex_quantities() {
         let terms =
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x05", "0x000A").unwrap();
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x05", "0x000A", Vec::new())
+                .unwrap();
         assert_eq!(terms.wallet_account_id(), "wallet-account-1");
         assert_eq!(terms.copies(), "0x5");
         assert_eq!(terms.price(), "0xa");
@@ -4823,10 +4920,120 @@ mod tests {
             ("0x1", oversized.as_str()),
         ] {
             assert!(matches!(
-                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", copies, price),
+                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", copies, price, Vec::new()),
                 Err(RuntimeMintJournalError::InvalidSelection)
             ));
         }
+    }
+
+    fn payee(byte: u8, units: u32) -> RuntimeMintRoyaltyShare {
+        RuntimeMintRoyaltyShare::new(format!("0x{}", hex::encode([byte; 20])), units).unwrap()
+    }
+
+    /// Records written before royalties existed decode as "chain default".
+    ///
+    /// This is why the store magic does not move: the creator state is JSON
+    /// inside the binary record, and `deny_unknown_fields` rejects unknown
+    /// keys, never missing ones. A defaulted field is therefore backward
+    /// compatible on its own, unlike the positional content identity that
+    /// forced the `mj05` fallback.
+    #[test]
+    fn creator_terms_without_royalties_decode_as_the_chain_default() {
+        let legacy = serde_json::json!({
+            "wallet_account_id": "wallet-account-1",
+            "copies": "0x2",
+            "price": "0x5",
+        });
+        let terms: RuntimeMintCreatorDesiredTerms = serde_json::from_value(legacy).unwrap();
+        assert!(terms.royalties().is_empty());
+        assert_eq!(terms.copies(), "0x2");
+
+        // And a defaulted split is not re-serialised, so a record written by
+        // this build is byte-identical to one written before the field.
+        let encoded = serde_json::to_value(&terms).unwrap();
+        assert!(encoded.get("royalties").is_none(), "{encoded}");
+    }
+
+    #[test]
+    fn creator_terms_round_trip_explicit_payees() {
+        let terms = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0xab, 900), payee(0x7b, 50)],
+        )
+        .unwrap();
+        let decoded: RuntimeMintCreatorDesiredTerms =
+            serde_json::from_slice(&serde_json::to_vec(&terms).unwrap()).unwrap();
+        assert!(decoded == terms);
+        assert_eq!(decoded.royalties().len(), 2);
+        assert_eq!(decoded.royalties()[0].units(), 900);
+    }
+
+    /// The chain applies 9500 basis points to the creator side. A split that
+    /// does not total it is not one the chain can honour, so recording it
+    /// would describe a payout that will not happen.
+    #[test]
+    fn creator_terms_reject_a_split_that_is_not_the_creator_share() {
+        for royalties in [
+            vec![payee(0xab, 949)],
+            vec![payee(0xab, 951)],
+            vec![payee(0xab, 900), payee(0x7b, 40)],
+            vec![payee(0xab, 1000)],
+        ] {
+            assert!(matches!(
+                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", royalties),
+                Err(RuntimeMintJournalError::InvalidSelection)
+            ));
+        }
+        // Exactly the creator share is accepted, split any number of ways.
+        RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0xab, 950)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn creator_royalty_payees_reject_a_bad_address_or_an_unpayable_share() {
+        // Not an address.
+        for address in [
+            "0xnothex",
+            "ab5028bdbb0826ad6f1885478e421db677b0001a",
+            "0xab50",
+            "",
+        ] {
+            assert!(RuntimeMintRoyaltyShare::new(address, 950).is_err());
+        }
+        // A payee owed nothing is a mistake, not a split.
+        assert!(RuntimeMintRoyaltyShare::new(format!("0x{}", hex::encode([0xab; 20])), 0).is_err());
+    }
+
+    /// A retry re-encodes the chain call from the recorded terms, so terms that
+    /// differ only in payees must not compare equal.
+    #[test]
+    fn creator_terms_equality_distinguishes_payees() {
+        let one = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0xab, 950)],
+        )
+        .unwrap();
+        let other = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0x7b, 950)],
+        )
+        .unwrap();
+        let default =
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", Vec::new())
+                .unwrap();
+        assert!(one != other);
+        assert!(one != default);
     }
 
     #[test]
@@ -4843,13 +5050,15 @@ mod tests {
             .unwrap();
 
         let initial_state = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x02", "0x05").unwrap(),
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x02", "0x05", Vec::new())
+                .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )
         .unwrap();
         let replay_state = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5").unwrap(),
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", Vec::new())
+                .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )

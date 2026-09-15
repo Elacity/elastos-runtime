@@ -312,6 +312,28 @@ PHASE=""
 SERVICES=(custody-a custody-b custody-c)
 CONTAINER_READY_PATH=/home/custody/.local/share/elastos/run/provider-host.ready.json
 
+# The provider role the custody-host containers were started in, resolved
+# exactly the way deploy/custody-host/docker-compose.yml resolves it
+# (`command: ["--role", "${CUSTODY_HOST_ROLE:-storage}"]`). Two roles ship,
+# and which one is running decides what this driver may assert:
+#
+#   storage  custody + chain + availability + ipfs. The three containers ARE
+#            the deployment's remote content replicas, so the 3-replica
+#            availability contract and the replica-loss drill below are
+#            meaningful proofs.
+#   custody  custody + chain only -- entrypoint.sh's own default, because
+#            key-share custody and release is the custody provider's whole
+#            job and it never reads ciphertext. Such a node runs no kubo and
+#            holds no replica, so this deployment has NO remote replica
+#            holder and nothing here can prove content availability.
+#
+# Previously the availability and replica-loss phases simply assumed the
+# storage role. They still require it -- coverage is unchanged in the default
+# configuration -- but they now say so up front, through
+# require_replica_holding_custody_nodes, instead of failing further in with a
+# "replicas>=3" message that names the symptom rather than the cause.
+CUSTODY_HOST_ROLE="${CUSTODY_HOST_ROLE:-storage}"
+
 # Restore stack for the drill/negative phases (Important 4 in the fix
 # round): every docker_stop_service call and every negative_tamper
 # byte-flip pushes its own inverse action here (parallel arrays -- bash 3.2
@@ -1377,6 +1399,29 @@ assert_content_status_healthy() {
     log "content status for $cid healthy: replicas=$replicas live_multi_peer_proof=$live"
 }
 
+# Gate for the phases that can only prove anything when the custody-host
+# containers are also the deployment's content replicas -- i.e. when they
+# were started in the 'storage' role (see CUSTODY_HOST_ROLE up top).
+#
+# This does not narrow coverage: in the default configuration every caller
+# proceeds exactly as before. It replaces an unstated assumption with a
+# named prerequisite, so a custody-only stack fails on the real cause
+# instead of on a downstream "replicas>=3" assertion.
+require_replica_holding_custody_nodes() {
+    local phase="$1"
+    case "$CUSTODY_HOST_ROLE" in
+    storage)
+        log "$phase: custody-host role is 'storage' -- the 3 containers hold the remote replicas, so the availability contract below is theirs to satisfy"
+        ;;
+    custody)
+        fail "the $phase phase proves content availability against the custody-host containers, but CUSTODY_HOST_ROLE=custody starts them with the custody + chain planes only (no kubo, no availability plane -- entrypoint.sh's role block), so they hold no replica and the 3-replica contract cannot be met by anything in this deployment. Bring the stack up in the storage role (docker-compose.yml's default) and re-run: CUSTODY_HOST_ROLE=storage deploy/custody-host/up.sh up"
+        ;;
+    *)
+        fail "CUSTODY_HOST_ROLE must be 'storage' or 'custody' (got '$CUSTODY_HOST_ROLE'); it has to name the same role deploy/custody-host/docker-compose.yml passed to these containers as --role"
+        ;;
+    esac
+}
+
 # --- provision phase ------------------------------------------------------
 
 verify_install_state() {
@@ -1755,15 +1800,22 @@ except Exception:
     providers_ok="$(printf '%s' "$out" | python3 -c '
 import json
 import sys
+
+role = sys.argv[1]
 try:
     d = json.load(sys.stdin)
     providers = set(d.get("providers", []))
-    expected = {"custody-provider", "availability-provider", "ipfs-provider"}
+    # entrypoint.sh: both roles run custody + chain (a committee member
+    # settles every release through its own chain rights evidence); only the
+    # storage role adds the two content planes on top.
+    expected = {"custody-provider", "chain-provider"}
+    if role == "storage":
+        expected |= {"availability-provider", "ipfs-provider"}
     print("true" if expected.issubset(providers) else "false")
 except Exception:
     print("false")
-' 2>/dev/null || echo false)"
-    [ "$providers_ok" = "true" ] || fail "$svc ready receipt is missing an expected provider; diagnostic: docker compose -f '$COMPOSE_FILE' exec -T $svc cat $CONTAINER_READY_PATH"
+' "$CUSTODY_HOST_ROLE" 2>/dev/null || echo false)"
+    [ "$providers_ok" = "true" ] || fail "$svc ready receipt is missing a provider the '$CUSTODY_HOST_ROLE' role must host; diagnostic: docker compose -f '$COMPOSE_FILE' exec -T $svc cat $CONTAINER_READY_PATH"
     READY_RECEIPT_JSON="$out"
     log "$svc ready receipt ok: $out"
 }
@@ -2513,6 +2565,8 @@ print(json.dumps({
 # --- availability phase --------------------------------------------------
 
 phase_availability() {
+    CURRENT_STEP="require_replica_holding_custody_nodes"
+    require_replica_holding_custody_nodes availability
     CURRENT_STEP="check_git_clean"
     check_git_clean
     CURRENT_STEP="resolve_cid"
@@ -2532,14 +2586,17 @@ phase_availability() {
 import json
 import sys
 
-(commit, tree, clean, cid, status_json, ok) = sys.argv[1:7]
+(commit, tree, clean, cid, status_json, custody_host_role, ok) = sys.argv[1:8]
 print(json.dumps({
     "ok": json.loads(ok),
     "git": {"commit": commit, "tree": tree, "clean": json.loads(clean)},
     "cid": cid,
+    # Which nodes the replicas were proven on: only the storage role makes
+    # the custody-host containers replica holders at all.
+    "custody_host_role": custody_host_role,
     "content_status": json.loads(status_json),
 }))
-' "$GIT_COMMIT" "$GIT_TREE" "$GIT_CLEAN" "$CID" "$CONTENT_STATUS_JSON" "$ok")"
+' "$GIT_COMMIT" "$GIT_TREE" "$GIT_CLEAN" "$CID" "$CONTENT_STATUS_JSON" "$CUSTODY_HOST_ROLE" "$ok")"
     write_receipt_block availability "$block_json"
 
     log "availability phase complete: cid=$CID"
@@ -2944,13 +3001,21 @@ print(json.dumps({
 # replica-holding container -- an arbitrary but documented choice, since
 # each of the 3 SERVICES containers also runs availability-provider/
 # ipfs-provider alongside custody-provider (preflight's ready-receipt
-# check). The degraded-buy assertion uses the DENIAL principal (a fresh,
+# check).
+#
+# That last clause is true only in the 'storage' role, which is exactly what
+# this drill needs and why it now says so explicitly:
+# require_replica_holding_custody_nodes below. A custody-only stack runs no
+# kubo on any node, so stopping one removes no replica and the drill would
+# be proving nothing. The degraded-buy assertion uses the DENIAL principal (a fresh,
 # not-yet-purchasing principal) rather than the buyer: a second buy() call
 # from an already-Complete purchase returns its terminal response before
 # ever touching availability (protected_content_runtime.rs), so only a
 # FRESH purchase attempt actually exercises the fresh-availability check
 # this drill is proving.
 phase_drill_replica() {
+    CURRENT_STEP="require_replica_holding_custody_nodes"
+    require_replica_holding_custody_nodes drill-replica
     CURRENT_STEP="check_git_clean"
     check_git_clean
     CURRENT_STEP="resolve_mint_id"
@@ -3083,12 +3148,15 @@ import json
 import sys
 
 (commit, tree, clean, cid, mint_id, degraded_json, degraded_buy_json,
- degraded_open_json, repair_json, healed_status_json, healed_open_json, ok) = sys.argv[1:13]
+ degraded_open_json, repair_json, healed_status_json, healed_open_json,
+ custody_host_role, ok) = sys.argv[1:14]
 print(json.dumps({
     "ok": json.loads(ok),
     "git": {"commit": commit, "tree": tree, "clean": json.loads(clean)},
     "cid": cid,
     "mint_id": mint_id,
+    # The stopped container removes a replica only in the storage role.
+    "custody_host_role": custody_host_role,
     "degraded_content_status": json.loads(degraded_json),
     "degraded_buy_failed": json.loads(degraded_buy_json) if degraded_buy_json.strip().startswith("{") else degraded_buy_json,
     "degraded_open_failed": json.loads(degraded_open_json) if degraded_open_json.strip().startswith("{") else degraded_open_json,
@@ -3098,7 +3166,8 @@ print(json.dumps({
 }))
 ' \
         "$GIT_COMMIT" "$GIT_TREE" "$GIT_CLEAN" "$CID" "$MINT_ID" "$degraded_json" "$degraded_buy_json" \
-        "$degraded_open_json" "$repair_json" "$CONTENT_STATUS_JSON" "$healed_open_json" "$ok")"
+        "$degraded_open_json" "$repair_json" "$CONTENT_STATUS_JSON" "$healed_open_json" \
+        "$CUSTODY_HOST_ROLE" "$ok")"
     write_receipt_block drill_replica "$block_json"
 
     log "drill-replica phase complete: degraded buy/open recorded, repair-worker healed, status healthy, open succeeds"

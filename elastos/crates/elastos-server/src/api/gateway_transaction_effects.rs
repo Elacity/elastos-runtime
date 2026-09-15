@@ -17,6 +17,14 @@ use tokio::sync::Mutex;
 use super::*;
 
 const TRANSACTION_EFFECT_STORE_SCHEMA: &str = "elastos.runtime.transaction-effect-store/v1";
+
+/// A wallet approval that will never complete. Callers that poll for
+/// completion match on these to stop waiting, so they are constants rather
+/// than literals repeated at each end.
+pub(in crate::api::gateway) const TRANSACTION_APPROVAL_REJECTED: &str =
+    "transaction approval was rejected";
+pub(in crate::api::gateway) const TRANSACTION_APPROVAL_EXPIRED: &str =
+    "transaction approval expired";
 const TRANSACTION_EFFECT_SCHEMA: &str = "elastos.runtime.transaction-effect/v1";
 const TRANSACTION_EFFECT_STORE_RELATIVE_PATH: &str =
     ".AppData/ElastOS/Runtime/transaction-effects.json";
@@ -1082,10 +1090,24 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
             .await?
         };
         validate_approval_snapshot(&store.effects[effect_index], authority, &approval)?;
-        if approval.get("status").and_then(Value::as_str) != Some("completed") {
+        // "not completed" used to cover all three of pending, rejected and
+        // expired, so a caller polling for completion could not tell a wait
+        // from a dead end and waited on an approval that would never complete.
+        // Only `pending` is a wait; the other two are terminal, because a
+        // declined or lapsed approval never produced a signature and so can
+        // never produce a transaction.
+        let approval_status = approval
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if approval_status != "completed" {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "transaction approval is not completed".to_string(),
+                match approval_status {
+                    "rejected" => TRANSACTION_APPROVAL_REJECTED.to_string(),
+                    "expired" => TRANSACTION_APPROVAL_EXPIRED.to_string(),
+                    _ => "transaction approval is not completed".to_string(),
+                },
             ));
         }
         let signed_result = approval

@@ -6,9 +6,11 @@ import {
   classifyProtection,
   decimalIntegerToHexQuantity,
   humanSize,
-  isRuntimeCustodyPendingMessage,
+  effectPendingFrom,
   resolveMime,
   scalePriceToBaseUnits,
+  stagesFromProgress,
+  settledFrom,
   summarizeRoyaltyRows,
   targetUriFor,
   uploadPlan,
@@ -96,20 +98,73 @@ test("uploadPlan chooses chunked upload above the threshold", () => {
   assert.deepEqual(uploadPlan(512 * 1024 + 1), { mode: "chunked" });
 });
 
-test("isRuntimeCustodyPendingMessage recognizes a pending Wallet or Chain settlement message", () => {
-  assert.equal(
-    isRuntimeCustodyPendingMessage("Runtime custody creator mint is pending exact Wallet or Chain settlement"),
-    true,
-  );
+test("effectPendingFrom reads an external approval that is waiting on the person", () => {
+  const pending = effectPendingFrom({
+    status: "error",
+    message: "Runtime custody creator mint is pending exact Wallet or Chain settlement",
+    effect_pending: {
+      schema: "elastos.protected-content.effect-pending/v1",
+      reason: "wallet_approval",
+      awaits_person: true,
+      external_signer: true,
+      connector_id: "metamask",
+    },
+  });
+  assert.deepEqual(pending, {
+    reason: "wallet_approval",
+    awaitsPerson: true,
+    connectorId: "metamask",
+  });
 });
 
-test("isRuntimeCustodyPendingMessage does not treat an unrelated failure as pending", () => {
+test("effectPendingFrom reads a chain wait as needing nobody", () => {
+  // The distinction that matters: this one must never tell the creator to go
+  // and approve something. It is already approved.
+  const pending = effectPendingFrom({
+    status: "error",
+    message: "Runtime custody creator mint is pending exact Wallet or Chain settlement",
+    effect_pending: {
+      schema: "elastos.protected-content.effect-pending/v1",
+      reason: "chain_settlement",
+      awaits_person: false,
+    },
+  });
+  assert.equal(pending.reason, "chain_settlement");
+  assert.equal(pending.awaitsPerson, false);
+  assert.equal(pending.connectorId, "");
+});
+
+test("effectPendingFrom treats a managed approval as needing nobody", () => {
+  const pending = effectPendingFrom({
+    effect_pending: {
+      reason: "wallet_approval",
+      awaits_person: false,
+      external_signer: false,
+      connector_id: null,
+    },
+  });
+  assert.equal(pending.awaitsPerson, false);
+  assert.equal(pending.connectorId, "");
+});
+
+test("effectPendingFrom treats an unrelated failure, and any older server, as not pending", () => {
+  // A real failure carries no waiting state.
   assert.equal(
-    isRuntimeCustodyPendingMessage("Runtime custody media preparation provider is unavailable"),
-    false,
+    effectPendingFrom({
+      status: "error",
+      message: "Runtime custody media preparation provider is unavailable",
+    }),
+    null,
   );
-  assert.equal(isRuntimeCustodyPendingMessage(""), false);
-  assert.equal(isRuntimeCustodyPendingMessage(undefined), false);
+  // Absence must mean "not pending", never "unknown": an older server sends no
+  // effect_pending at all, and treating that as pending would spin forever.
+  assert.equal(effectPendingFrom({}), null);
+  assert.equal(effectPendingFrom(undefined), null);
+  assert.equal(effectPendingFrom(null), null);
+  // Only a real object counts; the old detector matched a bare word anywhere
+  // in the prose, which is exactly what this replaces.
+  assert.equal(effectPendingFrom({ effect_pending: "pending" }), null);
+  assert.equal(effectPendingFrom({ message: "something pending happened" }), null);
 });
 
 test("humanSize renders sub-kilobyte counts in bytes", () => {
@@ -260,4 +315,145 @@ test("buildPublishBody never carries unwired form state (title, category, royalt
   });
   assert.deepEqual(Object.keys(body).sort(), ["if_revision", "protection", "uri"]);
   assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "mode", "price"]);
+});
+
+// A mint that was already terminal when the request arrived raised no effect
+// and sent no transaction. Reporting that as "Listed for sale" is what made a
+// replay read as fresh work, so the marker has to survive the trip intact.
+test("settledFrom reports a mint that was already settled before this request", () => {
+  const settled = settledFrom({
+    schema: "elastos.library.published-content-security/v1",
+    mint_id: "620b246a",
+    settled_before_this_request: true,
+    settled_at: 1789479788,
+    transaction_hash: "0x0994b5af",
+    settled_seller_address: "0x7ba979fa244b930c01bdc84de851e5bca64b9f81",
+  });
+  assert.deepEqual(settled, {
+    before: true,
+    at: 1789479788,
+    transactionHash: "0x0994b5af",
+    sellerAddress: "0x7ba979fa244b930c01bdc84de851e5bca64b9f81",
+  });
+});
+
+test("settledFrom treats a fresh mint, and any server without the marker, as fresh", () => {
+  // A fresh mint: the server omits the marker entirely.
+  assert.equal(settledFrom({ mint_id: "620b246a" }), null);
+  // Absent content_security at all.
+  assert.equal(settledFrom(undefined), null);
+  assert.equal(settledFrom(null), null);
+  // Only the exact boolean true counts. Anything else is not a claim that the
+  // mint predates this request, and must not suppress the fresh-mint report.
+  assert.equal(settledFrom({ settled_before_this_request: false }), null);
+  assert.equal(settledFrom({ settled_before_this_request: "true" }), null);
+  assert.equal(settledFrom({ settled_before_this_request: 1 }), null);
+});
+
+test("settledFrom tolerates a settled mint with no transaction hash", () => {
+  const settled = settledFrom({
+    settled_before_this_request: true,
+    settled_at: 1789479788,
+  });
+  assert.equal(settled.before, true);
+  assert.equal(settled.transactionHash, "");
+  assert.equal(settled.sellerAddress, "");
+});
+
+// The publish stage used to be a dot labelled "(not tracked)" while the two
+// around it went green — the client had no way to know, because the whole
+// server pipeline ran inside one request. It is journal-derived now.
+test("stagesFromProgress maps the server's phases onto this page's stages", () => {
+  const mapped = stagesFromProgress({
+    schema: "elastos.protected-content.creator-progress/v1",
+    stages: [
+      { id: "escrow", state: "done" },
+      { id: "publish", state: "done" },
+      { id: "listing", state: "active" },
+    ],
+  });
+  assert.deepEqual(mapped, [
+    { name: "encrypt", state: "done" },
+    { name: "publish", state: "done" },
+    { name: "assemble", state: "active" },
+  ]);
+});
+
+test("stagesFromProgress ignores a phase this page does not render", () => {
+  // A server that grows a phase must degrade to one stage fewer, never throw
+  // and never invent a name for it.
+  const mapped = stagesFromProgress({
+    stages: [
+      { id: "escrow", state: "active" },
+      { id: "some-future-phase", state: "done" },
+    ],
+  });
+  assert.deepEqual(mapped, [{ name: "encrypt", state: "active" }]);
+});
+
+test("stagesFromProgress tolerates a missing or malformed progress block", () => {
+  // Absent on every server that predates it, so this must be empty rather
+  // than an error.
+  assert.deepEqual(stagesFromProgress(undefined), []);
+  assert.deepEqual(stagesFromProgress(null), []);
+  assert.deepEqual(stagesFromProgress({}), []);
+  assert.deepEqual(stagesFromProgress({ stages: "escrow" }), []);
+  assert.deepEqual(stagesFromProgress({ stages: [null, {}, { state: "done" }] }), []);
+});
+
+// The listing block is what turns a completed mint into a listing a
+// marketplace can show. Absent it, the mint still works and publishes no
+// Elacity folder — which is why absence has to be distinguishable from a
+// listing whose fields are blank.
+test("buildPublishBody carries listing terms when given", () => {
+  const body = buildPublishBody({
+    uri: "localhost://root/Creator/clip.png",
+    ifRevision: 1,
+    copies: "0x1",
+    price: "0x1",
+    listing: {
+      title: "My asset",
+      description: "What it is",
+      category: "art",
+      tags: [],
+      adult: false,
+      licensing: { ai_training: true },
+      legal_attestation: { owns_distribution_rights: true },
+    },
+  });
+  assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "listing", "mode", "price"]);
+  assert.equal(body.protection.listing.title, "My asset");
+  assert.equal(body.protection.listing.licensing.ai_training, true);
+});
+
+test("buildPublishBody omits the listing entirely when there is none", () => {
+  const body = buildPublishBody({
+    uri: "localhost://root/Creator/clip.png",
+    ifRevision: 1,
+    copies: "0x1",
+    price: "0x1",
+  });
+  assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "mode", "price"]);
+  assert.equal("listing" in body.protection, false);
+});
+
+// A royalty split reaches the server as ERC-1155 ROYALTY_SHARE units, which is
+// the chain's own denomination: 1 unit = 0.1%, the creator's share is 950, and
+// the protocol's 50 are minted by the contract and never sent as a payee.
+test("buildPublishBody carries a royalty split in chain units", () => {
+  const body = buildPublishBody({
+    uri: "localhost://root/Creator/clip.png",
+    ifRevision: 1,
+    copies: "0x1",
+    price: "0x1",
+    listing: {
+      title: "My asset",
+      royalties: [
+        { address: "0xab5028bdbb0826ad6f1885478e421db677b0001a", units: 900 },
+        { address: "0x7ba979fa244b930c01bdc84de851e5bca64b9f81", units: 50 },
+      ],
+    },
+  });
+  const total = body.protection.listing.royalties.reduce((sum, row) => sum + row.units, 0);
+  assert.equal(total, 950, "a split must come to the creator share exactly");
 });

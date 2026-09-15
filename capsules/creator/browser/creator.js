@@ -11,14 +11,34 @@
 // This is a faithful structural port of the dkms Creator UI (title,
 // description, cover thumbnail, access-method grid, category, resale
 // royalty, royalty split, AI-licensing/adult/legal checkboxes, free-preview
-// settings, the encode/publish tech-progress panel, and the enable-trading
-// step). Today's publish API accepts exactly
-// `{ uri, if_revision, protection: { mode: "runtime_custody", copies, price } }`
-// (elastos-server/src/library.rs:378-380), so every one of those fields is
-// rendered and interactive but NOT sent — each carries its own "Not sent —"
-// hint so the page never claims to do more than it does. The one dkms
-// surface omitted outright is the wallet/channel picker: those routes do not
-// exist here and there is nothing to populate them from.
+// settings, and the encode/publish tech-progress panel). dkms's separate
+// enable-trading step is deliberately NOT ported into the MINT flow: the
+// contract fulfils the mint without an ERC-1155 operator approval, so a mint
+// raises exactly one wallet effect and there is no second step to offer while
+// listing. An operator approval is still how secondary trading works -- an
+// owner selling some of the Access Tokens or Royalty Shares they hold must
+// authorize the operator that moves them -- so a resale surface will need its
+// own equivalent of this step. It just does not belong here.
+//
+// The publish request carries `protection.listing` with the title,
+// description, cover, category and the adult/licensing/legal flags, which
+// become the Elacity metadata folder the mint's token URI resolves to. Four
+// fields are still rendered without being sent — currency (the price is
+// scaled locally; the chain mints against the native token), and resale
+// royalty and free-preview, neither supported yet. Each keeps a hint saying
+// so, and no field claims more than it does. The royalty split IS sent, but
+// only the creator's own rows and only when they name real addresses: see
+// collectRoyaltyUnits. The one dkms surface omitted outright is the
+// wallet/channel picker: those routes do not exist here.
+
+// How a pending publish is resumed. The person budget is the generous one:
+// approving in a connector means leaving this page, finding the wallet and
+// coming back. The chain budget is short because nothing is being asked of
+// anyone — if Base has not produced evidence in two minutes, something is
+// wrong and saying so beats spinning.
+const PENDING_POLL_INTERVAL_MS = 3000;
+const PENDING_PERSON_BUDGET_MS = 5 * 60 * 1000;
+const PENDING_CHAIN_BUDGET_MS = 2 * 60 * 1000;
 
 const CHUNKED_UPLOAD_THRESHOLD_BYTES = 512 * 1024;
 const CHUNKED_UPLOAD_BYTES = 512 * 1024;
@@ -27,7 +47,6 @@ const CHUNKED_UPLOAD_TRANSPORT = "http-chunk-session";
 const MAX_UINT256 = (1n << 256n) - 1n;
 const POSITIVE_DECIMAL_INTEGER_RE = /^[0-9]+$/;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
-const RUNTIME_CUSTODY_PENDING_MESSAGE_RE = /pending/i;
 
 // Extension -> MIME for types browsers report unreliably (often "" or
 // octet-stream). Ported from dkms's EXT_MIME table.
@@ -48,13 +67,18 @@ const EXT_MIME = {
 };
 
 // The real default primary-sale split applied when an asset is listed: the
-// creator receives 950 of 1000 royalty units and the protocol owner 50.
-// Cosmetic here (see summarizeRoyaltyRows) — no publish field carries a
-// royalty split — but the default rows shown to the creator reflect the
-// distribution actually applied rather than an invented one.
+// creator receives 950 of 1000 royalty units and the protocol owner 50. The
+// rows show both so the running total means something; only the creator's own
+// rows are ever sent, and only when they name real addresses.
 const DEFAULT_CREATOR_ROYALTY_PERCENT = 95;
 const DEFAULT_PROTOCOL_ROYALTY_PERCENT = 5;
 const ROYALTY_TOTAL_TARGET_PERCENT = 100;
+
+// The creator's whole share in ERC-1155 ROYALTY_SHARE units: 950 of the 1000
+// that exist per asset, the protocol's 50 being minted by the contracts. One
+// unit is 0.1% of the sale.
+const CREATOR_ROYALTY_UNITS = 950;
+const EVM_ADDRESS_RE = /^0x[0-9a-f]{40}$/;
 
 // Decimal places each listed currency uses for its smallest base unit. Only
 // used client-side to scale the human-entered price into the integer this
@@ -113,6 +137,28 @@ export function decimalIntegerToHexQuantity(value) {
     throw new Error("Enter a whole number from 1 to 2^256-1.");
   }
   return `0x${parsed.toString(16)}`;
+}
+
+/**
+ * Reads the server's "this request settled nothing" marker off a publish
+ * answer's `content_security`.
+ *
+ * The server sets `settled_before_this_request` only when the mint was already
+ * terminal on arrival: no effect raised, no transaction sent, just the listing
+ * re-published from the existing record. Returns null for a fresh mint — and
+ * for every server that predates the marker, which is why absence has to mean
+ * "fresh" rather than "unknown".
+ */
+export function settledFrom(contentSecurity) {
+  if (!contentSecurity || contentSecurity.settled_before_this_request !== true) {
+    return null;
+  }
+  return {
+    before: true,
+    at: contentSecurity.settled_at,
+    transactionHash: contentSecurity.transaction_hash || "",
+    sellerAddress: contentSecurity.settled_seller_address || "",
+  };
 }
 
 /** Describes how a file of this size will upload, for the status copy. */
@@ -207,25 +253,78 @@ export function scalePriceToBaseUnits(amount, currency) {
  * category/reseller-cut/royalties/checkbox state into this object, publishing
  * breaks immediately and loudly instead of silently leaking form state.
  */
-export function buildPublishBody({ uri, ifRevision, copies, price }) {
+export function buildPublishBody({ uri, ifRevision, copies, price, listing }) {
+  const protection = {
+    mode: "runtime_custody",
+    copies,
+    price,
+  };
+  // Omitted rather than sent empty: absent means "no Elacity listing folder",
+  // which is a different thing from a listing whose every field is blank.
+  if (listing) {
+    protection.listing = listing;
+  }
   return {
     uri,
     if_revision: ifRevision,
-    protection: {
-      mode: "runtime_custody",
-      copies,
-      price,
-    },
+    protection,
   };
 }
 
 /**
- * A runtime-custody publish that has not yet settled Wallet/Chain approval
- * is a non-terminal waiting state, not a failure: the creator approves the
- * transaction in Wallet, then retries the same publish.
+ * Maps the server's journal-derived publish progress onto this page's stage
+ * list.
+ *
+ * The server names the phases it owns; this page's list also carries
+ * "analyze", which is the client's own upload and which no server record
+ * describes. Keeping the two vocabularies separate and mapping between them
+ * is deliberate: the alternative is the page inventing server-side stage names
+ * and drifting from the journal the moment either side changes.
+ *
+ * Unknown ids are ignored rather than guessed at, so a server that grows a
+ * phase this page does not render degrades to showing one stage fewer instead
+ * of throwing.
  */
-export function isRuntimeCustodyPendingMessage(message) {
-  return RUNTIME_CUSTODY_PENDING_MESSAGE_RE.test(String(message || ""));
+export function stagesFromProgress(progress) {
+  const stages = progress && Array.isArray(progress.stages) ? progress.stages : [];
+  const byServerId = { escrow: "encrypt", publish: "publish", listing: "assemble" };
+  const mapped = [];
+  for (const stage of stages) {
+    const name = byServerId[stage && stage.id];
+    if (!name) continue;
+    mapped.push({ name, state: String((stage && stage.state) || "") });
+  }
+  return mapped;
+}
+
+/**
+ * Reads the server's typed waiting state off an error envelope.
+ *
+ * A runtime-custody publish that has not settled Wallet/Chain approval is a
+ * non-terminal waiting state, not a failure. This used to be detected by
+ * testing the message against /pending/i — control flow decided by matching an
+ * English word in a sentence written for a person, which no test pinned and
+ * which any rewording would have broken silently.
+ *
+ * `awaitsPerson` is the part that matters: only an external wallet with an
+ * outstanding approval needs the creator to do anything. A managed approval and
+ * a chain wait both resolve on their own, and telling someone to go and approve
+ * something they already approved is how the old shared message misled.
+ *
+ * Returns null when the envelope carries no waiting state, which includes every
+ * server that predates the typed answer — so absence means "not pending"
+ * rather than "unknown".
+ */
+export function effectPendingFrom(envelope) {
+  const pending = envelope && envelope.effect_pending;
+  if (!pending || typeof pending !== "object") {
+    return null;
+  }
+  return {
+    reason: String(pending.reason || ""),
+    awaitsPerson: pending.awaits_person === true,
+    connectorId: pending.connector_id ? String(pending.connector_id) : "",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -286,12 +385,10 @@ function bootCreatorApp() {
     submitButton: document.querySelector("#submit-button"),
     progressSteps: document.querySelector("#progress-steps"),
     statusText: document.querySelector("#status-text"),
-    // #enable-trading-button is intentionally not cached here: it stays
-    // permanently `disabled` in the markup (see its own hint) with no JS
-    // behavior — this runtime has no separate trading-approval step, so
-    // there is nothing for it to do.
 
     successPanel: document.querySelector("#success-panel"),
+    successTitle: document.querySelector("#success-title"),
+    successDetail: document.querySelector("#success-detail"),
     mintIdText: document.querySelector("#mint-id-text"),
     openLibraryButton: document.querySelector("#open-library-button"),
     resetButton: document.querySelector("#reset-button"),
@@ -408,7 +505,7 @@ function bootCreatorApp() {
     els.submitButton.addEventListener("click", () => {
       protectAndList().catch((error) => {
         if (error?.pending) {
-          showPending();
+          showPending(error.pending);
         } else {
           showFailure(error);
         }
@@ -445,6 +542,81 @@ function bootCreatorApp() {
     setStatus("");
     els.successPanel.classList.add("hidden");
     refreshSubmitEnabled();
+  }
+
+  // The listing a marketplace displays, read from the form.
+  //
+  // The cover is the only field that is bytes rather than a statement, so it is
+  // the only one that has to be read asynchronously; everything else is a
+  // value already on the page. Royalties are deliberately absent — see the
+  // royalty hint: the rows describe all 1000 units (95 to the creator, 5 to
+  // the protocol) while the publish contract takes the creator's 950 alone, so
+  // sending them as entered would describe a payout the chain will not make.
+  async function collectListing() {
+    const listing = {
+      title: els.title.value.trim(),
+      description: els.desc.value.trim(),
+      category: els.category.value.trim(),
+      tags: [],
+      adult: els.adultFlag.checked,
+      licensing: { ai_training: els.aiLicensing.checked },
+      legal_attestation: { owns_distribution_rights: els.legalAttest.checked },
+    };
+    if (customThumbnail) {
+      listing.thumbnail = {
+        mime: customThumbnail.type,
+        bytes_base64: await fileToBase64(customThumbnail),
+      };
+    }
+    const royalties = collectRoyaltyUnits();
+    if (royalties) {
+      listing.royalties = royalties;
+    }
+    return listing;
+  }
+
+  /**
+   * The creator's own royalty split, as ERC-1155 ROYALTY_SHARE units.
+   *
+   * The rows show all 1000 units — 950 the creator's, 50 the protocol's, which
+   * the contracts mint themselves — so the protocol row is excluded and what
+   * remains must come to the creator's 950. One unit is 0.1%, so a row's
+   * percent times ten is its units, and no other conversion happens anywhere.
+   *
+   * The protocol row is excluded and fixed, and the total is capped at 100%,
+   * so whenever the rows do add up the rest come to exactly 950.
+   *
+   * Returns null, meaning "say nothing and let the chain default apply", when
+   * the rows are still the seeded default: "You" is a label rather than an
+   * address, and the chain default already pays the creator's whole share to
+   * the creator. Only a split naming real addresses is worth sending.
+   */
+  function collectRoyaltyUnits() {
+    const rows = Array.from(els.royaltyRows.querySelectorAll(".royalty-row"))
+      .filter((row) => row.dataset.protocol !== "true")
+      .map((row) => ({
+        address: row.querySelector(".ry-addr").value.trim().toLowerCase(),
+        units: Math.round((Number.parseFloat(row.querySelector(".ry-pct").value) || 0) * 10),
+      }));
+    if (!rows.length || !rows.every((row) => EVM_ADDRESS_RE.test(row.address))) {
+      return null;
+    }
+    const total = rows.reduce((sum, row) => sum + row.units, 0);
+    if (total !== CREATOR_ROYALTY_UNITS) {
+      return null;
+    }
+    return rows;
+  }
+
+  // Base64 without a data: URL round trip, and in chunks: a single
+  // String.fromCharCode over a whole image blows the argument limit.
+  async function fileToBase64(file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    return btoa(binary);
   }
 
   // -- Cover thumbnail: local preview only (see #thumb-drop's hint) --------
@@ -485,7 +657,7 @@ function bootCreatorApp() {
     refreshSubmitEnabled();
   }
 
-  // -- Royalty split: cosmetic, never sent (see #royalty-field's hint) -----
+  // -- Royalty split (see #royalty-field's hint and collectRoyaltyUnits) --
   //
   // Seeded with the chain's real default distribution (95% creator / 5%
   // protocol — see DEFAULT_CREATOR_ROYALTY_PERCENT above) so "+ Add payee"
@@ -496,9 +668,14 @@ function bootCreatorApp() {
   // creator's own address client-side, so that row is honestly labeled "You"
   // rather than carrying an invented 0x address.
 
-  function addRoyaltyRow(address, percent) {
+  function addRoyaltyRow(address, percent, isProtocol = false) {
     const row = document.createElement("div");
     row.className = "royalty-row";
+    // The protocol's share is minted by the contracts themselves; it is shown
+    // so the running total means something, and never sent as a payee.
+    if (isProtocol) {
+      row.dataset.protocol = "true";
+    }
     const addr = document.createElement("input");
     addr.type = "text";
     addr.className = "ry-addr";
@@ -523,10 +700,22 @@ function bootCreatorApp() {
       row.remove();
       refreshRoyaltyTotal();
     });
-    addr.addEventListener("input", refreshRoyaltyTotal);
-    pct.addEventListener("input", refreshRoyaltyTotal);
-    pct.addEventListener("change", () => enforceRoyaltyCap(pct));
-    row.append(addr, pct, del);
+    if (isProtocol) {
+      // The contracts mint this share from CentralStorage.protocolShares()
+      // whatever the creator does, so an input that accepted edits would be
+      // lying — and an edit would silently change what the other rows have to
+      // come to. Shown, counted in the total, and fixed.
+      addr.readOnly = true;
+      pct.readOnly = true;
+      del.disabled = true;
+      del.title = "The protocol share is set by the contract";
+      row.append(addr, pct, del);
+    } else {
+      addr.addEventListener("input", refreshRoyaltyTotal);
+      pct.addEventListener("input", refreshRoyaltyTotal);
+      pct.addEventListener("change", () => enforceRoyaltyCap(pct));
+      row.append(addr, pct, del);
+    }
     els.royaltyRows.appendChild(row);
     refreshRoyaltyTotal();
   }
@@ -534,7 +723,7 @@ function bootCreatorApp() {
   function seedDefaultRoyaltyRows() {
     els.royaltyRows.innerHTML = "";
     addRoyaltyRow("You", DEFAULT_CREATOR_ROYALTY_PERCENT);
-    addRoyaltyRow("Elacity", DEFAULT_PROTOCOL_ROYALTY_PERCENT);
+    addRoyaltyRow("Elacity", DEFAULT_PROTOCOL_ROYALTY_PERCENT, true);
   }
 
   function collectRoyaltyRows() {
@@ -631,9 +820,20 @@ function bootCreatorApp() {
     if (li) li.className = state || "";
   }
 
+  // Paint what the server's journal says, rather than what this page guessed.
+  // "pending" leaves the dot untouched: a stage the server has not started is
+  // not a stage this page should mark, and blanking it would undo "analyze",
+  // which the server does not describe at all.
+  function applyServerProgress(progress) {
+    for (const stage of stagesFromProgress(progress)) {
+      if (stage.state === "pending") continue;
+      setStage(stage.name, stage.state === "done" ? "done" : stage.state);
+    }
+  }
+
   function resetStages() {
     activeStageName = "";
-    ["analyze", "encrypt", "assemble"].forEach((stage) => setStage(stage, ""));
+    ["analyze", "encrypt", "publish", "assemble"].forEach((stage) => setStage(stage, ""));
   }
 
   function setStatus(text, kind) {
@@ -645,6 +845,7 @@ function bootCreatorApp() {
     if (submitting || !selectedFile) return;
     const terms = validCopiesAndPrice();
     if (!terms) return;
+    terms.listing = await collectListing();
 
     submitting = true;
     refreshSubmitEnabled();
@@ -680,16 +881,75 @@ function bootCreatorApp() {
       // its "(not tracked)" label) rather than guessing at its timing.
       setStage("encrypt", "active");
       setStatus("Protecting and listing...");
-      const published = await publishWithRevisionRetry(targetUri, terms);
+      const published = await publishUntilSettled(targetUri, terms);
+      // A returned listing is the proof for all three server stages at once:
+      // the escrow settled, the ciphertext is verifiably available, and the
+      // listing projected. "publish" is no longer exempt from this.
       setStage("encrypt", "done");
+      setStage("publish", "done");
       setStage("assemble", "done");
 
       const mintId = published?.content_security?.mint_id || "";
-      showSuccess(mintId);
+      showSuccess(mintId, settledFrom(published?.content_security));
     } finally {
       submitting = false;
       refreshSubmitEnabled();
     }
+  }
+
+  // Resume a pending publish on its own instead of asking for another click.
+  //
+  // A publish that comes back pending is not finished and not failed: the
+  // wallet approval or the chain evidence is still outstanding. The Creator
+  // used to stop here and tell the creator to click "Protect and list" again,
+  // which is work the page can do itself — and which read as a dead end,
+  // because the same message appeared whether the creator had something to do
+  // or not.
+  //
+  // So: poll the same publish. Say whose turn it is, from the server's typed
+  // answer rather than from the prose. Stop at a bound rather than forever,
+  // and when the bound is reached say plainly that the listing will finish on
+  // its own and can be picked up by protecting the same file again — which is
+  // true, because the mint keeps its identity across retries.
+  async function publishUntilSettled(targetUri, terms) {
+    const started = Date.now();
+    for (;;) {
+      try {
+        return await publishWithRevisionRetry(targetUri, terms);
+      } catch (error) {
+        const pending = error?.pending;
+        if (!pending) {
+          throw error;
+        }
+        const waited = Date.now() - started;
+        const budget = pending.awaitsPerson
+          ? PENDING_PERSON_BUDGET_MS
+          : PENDING_CHAIN_BUDGET_MS;
+        if (waited >= budget) {
+          throw error;
+        }
+        applyServerProgress(error.progress);
+        setStatus(pendingStatusText(pending, waited));
+        await sleep(PENDING_POLL_INTERVAL_MS);
+      }
+    }
+  }
+
+  function pendingStatusText(pending, waitedMs) {
+    const seconds = Math.round(waitedMs / 1000);
+    const elapsed = seconds >= 5 ? ` (${seconds}s)` : "";
+    if (pending.awaitsPerson) {
+      const where = pending.connectorId || "your wallet";
+      return `Waiting for you to approve this transaction in ${where}${elapsed}...`;
+    }
+    if (pending.reason === "chain_settlement") {
+      return `Approved. Waiting for the network to confirm the transaction${elapsed}...`;
+    }
+    return `Completing the wallet approval${elapsed}...`;
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async function publishWithRevisionRetry(targetUri, terms) {
@@ -708,38 +968,121 @@ function bootCreatorApp() {
   async function publishOnce(targetUri, revision, terms) {
     const response = await providerApiEnvelope(
       "publish",
-      buildPublishBody({ uri: targetUri, ifRevision: revision, copies: terms.copies, price: terms.price }),
+      buildPublishBody({
+        uri: targetUri,
+        ifRevision: revision,
+        copies: terms.copies,
+        price: terms.price,
+        listing: terms.listing,
+      }),
     );
     if (response.status === "error") {
       const message = response.message || "Protecting this file failed.";
       const error = new Error(message);
-      if (isRuntimeCustodyPendingMessage(message)) {
-        error.pending = true;
+      // The actionable sentence the server puts beneath the stable one. Set
+      // before any branch below returns, so every failure carries it.
+      if (response.detail) {
+        error.detail = String(response.detail);
+      }
+      // Typed refusals an app can act on rather than re-read.
+      if (response.wallet_default) {
+        error.walletDefault = response.wallet_default;
+      }
+      if (response.wallet_drift) {
+        error.walletDrift = response.wallet_drift;
+      }
+      // A closed approval is terminal, and deliberately NOT read as pending:
+      // polling on it would wait out the whole budget for something that can
+      // never complete.
+      if (response.approval_closed) {
+        error.approvalClosed = response.approval_closed;
+        throw error;
+      }
+      const pending = effectPendingFrom(response);
+      if (pending) {
+        error.pending = pending;
+        // Rides the pending answer, which is the poll response — see
+        // RuntimeCustodyEffectPending's own note on why it is not a second
+        // channel.
+        error.progress = response.effect_pending.progress;
       }
       throw error;
     }
     return response.data || {};
   }
 
-  function showSuccess(mintId) {
+  // `settledBefore` means the server raised no effect and sent no transaction:
+  // the mint was already terminal when this request arrived, and all that
+  // happened was the listing being re-published from the existing record.
+  //
+  // Saying "Listed for sale" for that is what made a replay read as fresh
+  // work. The listing IS live either way, so this is not an error -- but the
+  // creator has to be able to tell the two apart, especially since a mint
+  // keeps the account it started with and that account may no longer be the
+  // one they would choose today.
+  function showSuccess(mintId, settled) {
     listed = true;
-    setStatus("Listed for sale.", "ok");
+    if (settled && settled.before) {
+      setStatus("Already listed.", "ok");
+      els.successTitle.textContent = "Already listed.";
+      els.successDetail.textContent = settledDetail(settled);
+      els.successDetail.hidden = false;
+    } else {
+      setStatus("Listed for sale.", "ok");
+      els.successTitle.textContent = "Listed for sale.";
+      els.successDetail.textContent = "";
+      els.successDetail.hidden = true;
+    }
     els.mintIdText.textContent = mintId ? `Listing ${mintId}` : "";
     els.successPanel.classList.remove("hidden");
     refreshSubmitEnabled();
   }
 
-  // A pending publish is waiting on the creator's approval in Wallet, not a
-  // failure: the Protect step stays in its in-progress state (set by
-  // protectAndList before the publish call) and the file, copies, and price
-  // stay in place so clicking "Protect and list" again resumes the listing.
-  function showPending() {
-    setStatus("Approve this transaction in Wallet, then click Protect and list again.");
+  // Seconds since the epoch, as the mint journal records it.
+  function settledDetail(settled) {
+    const when = Number(settled.at);
+    const on = Number.isFinite(when) && when > 0
+      ? ` on ${new Date(when * 1000).toLocaleString()}`
+      : "";
+    const tx = settled.transactionHash
+      ? ` Transaction ${settled.transactionHash}.`
+      : "";
+    // A settled mint is never refused over a changed transaction default --
+    // the chain effect is done -- so naming the account it minted on is the
+    // only way a creator who has switched wallets since can see that this
+    // listing is not on the account they would pick today.
+    const seller = settled.sellerAddress
+      ? ` It was minted on ${settled.sellerAddress}.`
+      : "";
+    return `This file was already minted${on}, so nothing new was sent to the chain.${seller}${tx}`;
   }
 
+
+  // Reached only after the poll budget is spent, so this is "still waiting",
+  // not "your turn and nobody told you". The Protect step stays in its
+  // in-progress state and the file, copies and price stay in place, so
+  // protecting the same file again picks the same mint back up — the mint
+  // keeps its identity across retries, which is what makes that safe.
+  function showPending(pending) {
+    if (pending && pending.awaitsPerson) {
+      const where = pending.connectorId || "your wallet";
+      setStatus(
+        `Still waiting for approval in ${where}. Approve it there and protect this file again to finish the listing.`,
+      );
+      return;
+    }
+    setStatus(
+      "The transaction is approved and the network has not confirmed it yet. Protect this file again in a moment to finish the listing.",
+    );
+  }
+
+  // Prefer the server's actionable sentence over its stable one: the stable
+  // message is deliberately the same across many causes, so on its own it
+  // tells the creator nothing they can act on.
   function showFailure(error) {
     if (activeStageName) setStage(activeStageName, "err");
-    setStatus(String(error?.message || error || "Protecting this file failed."), "err");
+    const actionable = error?.detail || error?.message;
+    setStatus(String(actionable || error || "Protecting this file failed."), "err");
   }
 
   function resetForAnotherFile() {

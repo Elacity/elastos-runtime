@@ -53,6 +53,9 @@ const PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE: u16 = 1;
 const PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE: u64 = 1;
 const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE: u64 = 2;
 const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS: &str = "0x3b6";
+/// The creator's whole share in `ROYALTY_SHARE` units, matching the hex
+/// constant above. One unit is 0.1% of the sale.
+const PROTECTED_CONTENT_CREATOR_ROYALTY_UNITS: u32 = 950;
 const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS: u64 = 30 * 60;
 const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS: u64 = 30;
 const PROTECTED_CONTENT_UNBOUND_CONTENT_ID_SELECTOR: [u8; 4] = [0xca, 0xd8, 0x82, 0x23];
@@ -175,12 +178,14 @@ impl ChainProvider {
                 content_access_id,
                 copies,
                 price,
+                royalties,
             } => self.resolve_protected_content_creator_mint(
                 &creator,
                 &token_uri,
                 &content_access_id,
                 &copies,
                 &price,
+                &royalties,
             ),
             Request::ResolveProtectedContentMintReceipt {
                 network,
@@ -1141,6 +1146,7 @@ impl ChainProvider {
         content_access_id: &str,
         copies: &str,
         price: &str,
+        royalties: &[ProtectedContentRoyaltyShare],
     ) -> Response {
         let (network, mint) = match self.configured_global_protected_content_creator_mint_source() {
             Ok(source) => source,
@@ -1194,18 +1200,32 @@ impl ChainProvider {
             );
         }
         let creator = normalize_evm_address(creator);
+        // The access token always mints to the creator. The royalty share is
+        // split across the payees the creator named, or goes wholly to them
+        // when they named none.
+        let (mut addresses, mut roles, mut amounts) = (
+            vec![creator.clone()],
+            vec![PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE],
+            vec![copies.clone()],
+        );
+        match protected_content_royalty_units(royalties, &creator) {
+            Ok(shares) => {
+                for (address, units) in shares {
+                    addresses.push(address);
+                    roles.push(PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE);
+                    amounts.push(units);
+                }
+            }
+            Err(err) => {
+                return Response::error("invalid_protected_content_creator_mint_request", &err);
+            }
+        }
         let op_raw_bytes = match encode_protected_content_mint_op_raw_paid(
             &content_access_id,
             token_uri,
-            &[creator.clone(), creator.clone()],
-            &[
-                PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE,
-                PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE,
-            ],
-            &[
-                copies.clone(),
-                PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS.to_string(),
-            ],
+            &addresses,
+            &roles,
+            &amounts,
             None,
         ) {
             Ok(value) => value,
@@ -2906,6 +2926,51 @@ fn decode_protected_content_unbound_content_id(
         return None;
     }
     ContentAccessIdV1::new(bytes[4..20].try_into().ok()?).ok()
+}
+
+/// The `ROYALTY_SHARE` entries a mint carries, one per payee.
+///
+/// 1000 units exist per asset: the creator splits 950 and the protocol owner's
+/// 50 are minted by the contracts from `CentralStorage.protocolShares()`. Units
+/// arrive already in the chain's own denomination, so this validates and
+/// formats them and converts nothing.
+///
+/// An empty list is the default rather than an error: the whole creator share
+/// to the creator, which is what every mint did before payees existed.
+///
+/// Amounts are `0x` quantities — `abi_encode_uint_array_decimal` reads them
+/// with `abi_word_hex_quantity` despite its name.
+fn protected_content_royalty_units(
+    royalties: &[ProtectedContentRoyaltyShare],
+    creator: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if royalties.is_empty() {
+        return Ok(vec![(
+            creator.to_string(),
+            PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_UNITS.to_string(),
+        )]);
+    }
+    let mut total_units: u32 = 0;
+    let mut shares = Vec::with_capacity(royalties.len());
+    for royalty in royalties {
+        validate_evm_address(&royalty.address)?;
+        if royalty.units == 0 {
+            return Err("royalty payee share must be greater than zero".to_string());
+        }
+        total_units = total_units
+            .checked_add(royalty.units)
+            .ok_or_else(|| "royalty shares overflow".to_string())?;
+        shares.push((
+            normalize_evm_address(&royalty.address),
+            format!("0x{:x}", royalty.units),
+        ));
+    }
+    if total_units != PROTECTED_CONTENT_CREATOR_ROYALTY_UNITS {
+        return Err(format!(
+            "royalty shares must total {PROTECTED_CONTENT_CREATOR_ROYALTY_UNITS} units"
+        ));
+    }
+    Ok(shares)
 }
 
 fn protected_content_revert_data(error: &Value) -> Option<&str> {

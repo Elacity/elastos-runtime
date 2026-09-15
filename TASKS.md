@@ -119,8 +119,38 @@ review package are landed in source and recorded under Unreleased in
 Contract: [Protected content](docs/PROTECTED_CONTENT.md). What is and is not
 proven is in [state.md](state.md).
 
+Second slice, `feat/protected-content-0.7.1-followup` above `58686dd4`
+(PR [#62](https://github.com/Elacity/elastos-runtime/pull/62)), source-verified
+and not installed-proven: a mint that could not complete from the Creator now
+does. External wallets are accepted where signability, not proof type, is the
+precondition; the creator tail raises exactly one wallet effect; custody nodes
+carry `--role <storage|custody>` and a kubo peering mesh proven by block
+transfer; failures and waits answer as typed data rather than one shared
+sentence. [state.md](state.md#071-follow-up-second-slice-mint-path-repairs)
+records what is verified and what is not.
+
 Open:
 
+- [ ] Let a mint recover from a declined wallet approval. A rejected or expired
+  approval is reported accurately now instead of reading as "pending" forever,
+  but it leaves the mint at `EffectRaised`, and `discard_creator_state` refuses
+  that stage, so the object cannot be minted again. Allowing the discard means
+  asserting the raised effect is provably dead, which moves a safety guarantee
+  from the journal to its caller — an owner decision, not a repair to make in
+  passing.
+- [ ] Track the media transcode stage. Publish progress is read from the mint
+  journal now and "Publish to storage" is no longer untracked, but
+  "Transcode & fragment" still is: deriving it needs the media preparation
+  record by request id, which the creator tail does not hold.
+- [ ] Run `custody-harness-smoke` against this branch. Its path filter matches
+  the custody, proof-driver and `server_infra`/`provider_host` changes here, so
+  CI will run it; it was not run locally because it stops any live
+  `custody-host` compose project.
+- [ ] Update the installed proof driver for Base mainnet. Anders approved Base
+  mainnet for the bounded J5 acceptance journey, so
+  `scripts/protected-content-installed-e2e-proof.sh` and its receipt labels
+  need to match the chosen network, with the chain id, contract addresses and
+  RPC configuration recorded and a spending limit agreed before funded runs.
 - [ ] Prove the three journeys on an installed home with funded principals:
   Creator to Library to Player, Creator to Marketplace to Reader, and audio
   playback. None has ever been run. The deferred proofs from the object,

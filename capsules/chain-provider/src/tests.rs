@@ -2879,6 +2879,126 @@ fn protected_content_creator_royalty_share_value_is_pinned() {
     );
 }
 
+/// Named payees replace the single default royalty entry, one ERC-1155
+/// `ROYALTY_SHARE` entry each, while the access token still mints to the
+/// creator.
+#[test]
+fn resolve_protected_content_creator_mint_encodes_named_royalty_payees() {
+    let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
+    let access_id = [0x41; 16];
+    let creator = "0x0000000000000000000000000000000000000011";
+    let payee = "0x0000000000000000000000000000000000000044";
+    let token_uri = "ipfs://protected-content";
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentCreatorMint {
+            creator: creator.to_string(),
+            token_uri: token_uri.to_string(),
+            content_access_id: format!("0x{}", encode_hex(&access_id)),
+            copies: "0x7".to_string(),
+            price: "0x5".to_string(),
+            royalties: vec![
+                ProtectedContentRoyaltyShare {
+                    address: creator.to_string(),
+                    units: 900,
+                },
+                ProtectedContentRoyaltyShare {
+                    address: payee.to_string(),
+                    units: 50,
+                },
+            ],
+        }),
+    );
+    // 900 + 50 = 950 units, exactly the creator share the contracts expect.
+    // Units cross the boundary already in the chain's denomination, so the
+    // encoded amounts are the same numbers the caller sent.
+    assert_eq!(
+        data["data"],
+        encode_protected_content_creator_mint_call(
+            ProtectedContentCreatorMintAbi::ElacityMintV1.selector(),
+            token_uri,
+            PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE,
+            &encode_protected_content_mint_op_raw_paid(
+                &access_id,
+                token_uri,
+                &[creator.to_string(), creator.to_string(), payee.to_string()],
+                &[
+                    PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE,
+                    PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE,
+                    PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE,
+                ],
+                &["0x7".to_string(), "0x384".to_string(), "0x32".to_string()],
+                None,
+            )
+            .unwrap(),
+            &encode_protected_content_sell_raw_data(
+                "0x7",
+                "0x5",
+                "0x0000000000000000000000000000000000000033"
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    );
+}
+
+/// A split the chain cannot honour is refused rather than rounded or trimmed:
+/// paying someone an amount they did not agree to is worse than not minting.
+#[test]
+fn resolve_protected_content_creator_mint_rejects_an_unpayable_royalty_split() {
+    let creator = "0x0000000000000000000000000000000000000011";
+    let access_id = [0x41; 16];
+    for royalties in [
+        // Does not total the creator's 950 units.
+        vec![ProtectedContentRoyaltyShare {
+            address: creator.to_string(),
+            units: 900,
+        }],
+        // Overshoots it.
+        vec![
+            ProtectedContentRoyaltyShare {
+                address: creator.to_string(),
+                units: 900,
+            },
+            ProtectedContentRoyaltyShare {
+                address: "0x0000000000000000000000000000000000000044".to_string(),
+                units: 100,
+            },
+        ],
+        // A payee owed nothing.
+        vec![
+            ProtectedContentRoyaltyShare {
+                address: creator.to_string(),
+                units: 950,
+            },
+            ProtectedContentRoyaltyShare {
+                address: "0x0000000000000000000000000000000000000044".to_string(),
+                units: 0,
+            },
+        ],
+        // Not an address.
+        vec![ProtectedContentRoyaltyShare {
+            address: "0xnothex".to_string(),
+            units: 950,
+        }],
+    ] {
+        let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
+        let response = provider.handle(Request::ResolveProtectedContentCreatorMint {
+            creator: creator.to_string(),
+            token_uri: "ipfs://protected-content".to_string(),
+            content_access_id: format!("0x{}", encode_hex(&access_id)),
+            copies: "0x7".to_string(),
+            price: "0x5".to_string(),
+            royalties,
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["status"], "error", "{value}");
+        assert_eq!(
+            value["code"], "invalid_protected_content_creator_mint_request",
+            "{value}"
+        );
+    }
+}
+
 #[test]
 fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_id() {
     let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
@@ -2891,6 +3011,7 @@ fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_
             content_access_id: format!("0x{}", encode_hex(&access_id)),
             copies: "0x7".to_string(),
             price: "0x5".to_string(),
+            royalties: Vec::new(),
         }),
     );
     assert_eq!(data["schema"], PROTECTED_CONTENT_CREATOR_MINT_SCHEMA);
@@ -3001,6 +3122,7 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_competing_creator_n
                 content_access_id: format!("0x{}", encode_hex(&[0x41; 16])),
                 copies: "0x1".to_string(),
                 price: "0x5".to_string(),
+                royalties: Vec::new(),
             })
         ),
         "protected_content_creator_mint_not_configured"
@@ -3064,6 +3186,7 @@ fn resolve_protected_content_creator_mint_rejects_missing_or_competing_creator_n
                 content_access_id: format!("0x{}", encode_hex(&[0x41; 16])),
                 copies: "0x1".to_string(),
                 price: "0x5".to_string(),
+                royalties: Vec::new(),
             })
         ),
         "protected_content_creator_mint_not_configured"

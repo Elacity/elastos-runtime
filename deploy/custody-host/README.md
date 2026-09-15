@@ -243,7 +243,7 @@ service separator) into a file this host user creates owner-only, then
 replaces the node's copy with it, so the ceremony and the proof driver
 read it on either host.
 
-One thing crosses **in**: `/shared/chain-provider.json`, the client's
+Two things cross **in**. The first is `/shared/chain-provider.json`, the client's
 protected-content network configuration (the same schema as the client's
 `protected-content/chain-provider.json`) with evidence RPC URLs that this
 container can reach. The entrypoint syncs it into the node's private
@@ -262,6 +262,65 @@ chain configuration yet (the CI ceremony brings the nodes up before the
 client is provisioned), `up` falls back to the proof driver's placeholder
 network with a loud NOTE — such nodes cannot settle a release until the real
 file is synced and they are restarted.
+
+The second is `/shared/ipfs-peering.json` — see [IPFS peering](#ipfs-peering).
+
+## IPFS peering
+
+A `storage`-role node is a ciphertext replica, so the ciphertext has to reach
+it. Left alone, kubo would find it the slow way: the publishing client
+announces the CID to the public DHT, and each node discovers the provider
+record some seconds later. A mint does not wait that long, and the fan-out
+was failing on exactly that race.
+
+`Peering.Peers` removes it. A peered connection is protected from the
+connection manager and redialed automatically, so the client and the nodes
+hold an open link before any CID exists, and the blocks move over Bitswap on
+a connection that is already up.
+
+`up.sh up` writes `shared/ipfs-peering.json` after the nodes report ready —
+it cannot be written earlier, because a node's kubo identity does not exist
+until that node has booted. It lists every node's kubo peer id plus the
+client gateway's own, so the mesh includes the host that publishes the
+ciphertext, not just the nodes that replicate it. The file is written `0644`
+for the same reason `chain-provider.json` is: a libp2p peer id is a public
+identity, and the nodes' user has to read it.
+
+`entrypoint.sh` syncs it into the node's private data root at boot, image
+style. **A file written after the nodes started is therefore not yet in
+effect** — `up.sh` says so and prints the remedy:
+
+```sh
+docker compose -f deploy/custody-host/docker-compose.yml restart
+```
+
+Peering is by peer id alone, with no addresses attached for the nodes. That
+is deliberate: a peer id is stable and routable through discovery, whereas a
+container's address is not stable across a recreate, and a stale address
+list is worse than none. Peering by id still protects an *inbound*
+connection, which is the direction that matters here — the client dials the
+nodes.
+
+On the client side the peering list is not read from this file at all. It is
+built from the operator peer store, which is why `up.sh up` prints a
+`node peer add` line per node carrying `--ipfs-peer-id`:
+
+```sh
+elastos node peer add --did <did> --label custody-a \
+  --provides custody,chain,ipfs,availability \
+  --ipfs-peer-id <12D3Koo...> --ticket "$(cat shared/<did>.ticket)"
+```
+
+Run those and the client gateway hands the list to its own `ipfs-provider`
+at init. A node registered without `--ipfs-peer-id` still works as a custody
+committee member; it is only absent from the peering mesh, and its replica
+fan-out falls back to the DHT race described above.
+
+The gateway also merges an optional `ipfs-peering.json` placed in its own
+data root, for deployments where the peers are not operator peers. Both
+sources are unioned by peer id. A malformed file fails closed naming the
+file rather than starting with peering silently off — silent absence is the
+failure peering exists to prevent.
 
 ## 3-node bring-up
 

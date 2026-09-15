@@ -258,6 +258,42 @@ if [ ! -f "${chain_config}" ] \
     echo "INFO: synced protected-content/chain-provider.json from ${shared_chain_config}" >&2
 fi
 
+# Kubo peering list, synced exactly like chain-provider.json above -- same
+# bind-mount readability rule, same sha256 compare, same owner-only private
+# copy -- with one difference: ABSENT IS FINE. Peering is an optimisation,
+# not a prerequisite; a node without the file boots with stock kubo defaults
+# and behaves exactly as it did before peering existed. It is only ever
+# missing on a first `up` (up.sh writes it after the nodes are already
+# running, because it needs their peer ids to write it at all), so the node
+# picks it up on the restart that follows.
+#
+# Why it exists: co-operating kubos that have never met cannot locate a CID
+# whose DHT provider record has not propagated yet, and stock kubo drops an
+# untagged connection seconds after crossing its ConnMgr high-water mark.
+# Peering tags the connection permanently, so a mint's remote pin resolves
+# instead of hanging.
+shared_peering="${shared}/ipfs-peering.json"
+node_peering="${data_root}/ipfs-peering.json"
+if [ -f "${shared_peering}" ]; then
+    if [ ! -r "${shared_peering}" ]; then
+        fail "${shared_peering} is not readable by uid $(id -u) (this container's custody user) -- the host must make it group/world-readable (chmod 0644; deploy/custody-host/up.sh up does this)"
+    fi
+    if [ ! -f "${node_peering}" ] \
+        || [ "$(sha256sum <"${shared_peering}")" != "$(sha256sum <"${node_peering}")" ]; then
+        cp "${shared_peering}" "${node_peering}.tmp"
+        chmod 0600 "${node_peering}.tmp"
+        mv "${node_peering}.tmp" "${node_peering}"
+        echo "INFO: synced ipfs-peering.json from ${shared_peering}" >&2
+    fi
+elif [ -f "${node_peering}" ]; then
+    # The deployment withdrew the list: drop the stale private copy rather
+    # than keep peering with nodes the operator has stopped naming.
+    rm -f "${node_peering}"
+    echo "INFO: ${shared_peering} is gone; removed the stale ${node_peering}" >&2
+else
+    echo "INFO: no ${shared_peering}; kubo peering is unconfigured (stock defaults)" >&2
+fi
+
 # --carrier-addr falls back to an ephemeral bind if 0.0.0.0:4433 is taken;
 # callers must check the readiness receipt's carrier_bound rather than
 # assume the requested port. ELASTOS_AVAILABILITY_ENSURE_URL is in the

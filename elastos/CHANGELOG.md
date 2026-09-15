@@ -27,7 +27,18 @@ All notable changes to the public ElastOS Runtime repository.
   model naming the test that pins each claim, a build card, and committed
   golden vectors replayed against the shipped code.
 
+- A minted asset publishes the Elacity listing metadata a marketplace reads:
+  `metadata.json`, `content.json`, `contract.json` and the per-token-type
+  documents, carrying the creator's title, description, cover, category and
+  content flags. A creator-named royalty split reaches the chain in ERC-1155
+  `ROYALTY_SHARE` units.
+
 ### Fixed
+- A mint's on-chain token URI names the metadata directory rather than a file
+  inside it. The Operative appends its own suffixes, so the previous URI
+  produced `…/metadata.json/0000…0001.json` and resolved to nothing: the mint
+  completed and the asset was unlistable. The Runtime's own document moved to
+  `manifest.json`, and listings published before the rename still verify.
 - Library opens protected video through the shell instead of a dead route,
   and the phantom viewer ids are gone.
 - Library offers protection on any file the Runtime accepts and routes by

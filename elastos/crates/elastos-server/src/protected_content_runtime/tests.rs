@@ -8418,6 +8418,7 @@ fn media_preparation_source_input(
     principal_id: &str,
 ) -> RuntimeCustodyLibrarySourceInput {
     RuntimeCustodyLibrarySourceInput {
+        listing: None,
         object_uri: format!(
             "{}/Documents/source.mp4",
             crate::auth::principal_localhost_root(principal_id)
@@ -8698,6 +8699,7 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
         &data_dir,
         Arc::new(ProviderRegistry::new()),
         RuntimeCustodyLibraryPublishInput {
+            listing: None,
             object_uri: "localhost://Users/test/Documents/media".to_string(),
             principal_id: "person:local:runtime-custody-missing-composition".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8752,6 +8754,7 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
         &data_dir,
         Arc::new(ProviderRegistry::new()),
         RuntimeCustodyLibraryPublishInput {
+            listing: None,
             object_uri: "localhost://Users/test/Documents/media".to_string(),
             principal_id: "person:local:runtime-custody-missing-device-key".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8799,6 +8802,7 @@ fn library_publish_test_routes(
 fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublishInput {
     let (clear_init_segment, clear_segments) = clear_media_components(0x41);
     RuntimeCustodyLibraryPublishInput {
+        listing: None,
         object_uri: "localhost://Users/test/Documents/media".to_string(),
         principal_id: principal_id.to_string(),
         mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -9305,6 +9309,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     )
     .unwrap();
     let source = RuntimeCustodyLibrarySourceInput {
+        listing: None,
         object_uri: retry_object_uri.clone(),
         principal_id: retry_principal.to_string(),
         source_file_path: source_file_path.clone(),

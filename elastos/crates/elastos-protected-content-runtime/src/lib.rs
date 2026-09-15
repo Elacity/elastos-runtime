@@ -38,7 +38,8 @@ pub use mint_journal::{
     RuntimeMintCreatorStage, RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence,
     RuntimeMintDraft, RuntimeMintIntent, RuntimeMintIntentContentV1, RuntimeMintJournal,
     RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
-    RuntimeVerifiedContentAvailability, RuntimeVerifiedContentIdentityRootV1,
+    RuntimeMintRoyaltyShare, RuntimeVerifiedContentAvailability,
+    RuntimeVerifiedContentIdentityRootV1, RUNTIME_MINT_CREATOR_ROYALTY_UNITS,
 };
 pub use open::{
     bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,

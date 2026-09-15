@@ -500,10 +500,6 @@ textarea {
   color: var(--danger);
 }
 
-#enable-trading-button {
-  margin-top: 10px;
-}
-
 .success-panel {
   margin-top: 14px;
   padding-top: 14px;
