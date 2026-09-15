@@ -295,6 +295,265 @@ test("bounded evidence still rejects a close after event overflow", async () => 
   assert.ok(evidence.dropped_requests > 0);
 });
 test("a new page load cannot be hidden by an input receipt", () => fails({ reload: true }, "page_reloaded"));
+test("baseline reuses the last matching binding when the next binding read misses the shared deadline", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding, readVideo = f.args.readVideo;
+  let videos = 0, bindings = 0;
+  f.args.readVideo = async budget => {
+    const value = await readVideo(budget);
+    videos++;
+    if (videos <= 2) {
+      return { ...value, decoded_frames: 10, video_bytes_received: 100 };
+    }
+    return value;
+  };
+  f.args.readBinding = async budget => {
+    bindings++;
+    if (bindings === 3) {
+      await new Promise(resolve => {
+        const timer = f.args.clock.setTimeout(resolve, 10_000);
+        budget.signal.addEventListener("abort", () => {
+          f.args.clock.clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+    }
+    return readBinding(budget);
+  };
+  const evidence = await f.run();
+  assert.equal(evidence.ok, true);
+  assert.ok(evidence.cut_ms >= 5000);
+  assert.ok(evidence.recovery_ms <= 5000);
+  assert.ok(bindings >= 3);
+  assertRestoredAndDetached(f);
+});
+test("recovery reuses the last matching binding when remaining time cannot finish another binding read", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  let recoveryReads = 0;
+  f.args.readBinding = async budget => {
+    if (f.calls.some(call => call.params?.offline === false)) {
+      recoveryReads++;
+      if (recoveryReads === 1) {
+        await new Promise(resolve => {
+          const timer = f.args.clock.setTimeout(resolve, 4000);
+          budget.signal.addEventListener("abort", () => {
+            f.args.clock.clearTimeout(timer);
+            resolve();
+          }, { once: true });
+        });
+      }
+      assert.equal(recoveryReads, 1, "must reuse the first recovery binding");
+    }
+    return readBinding(budget);
+  };
+  const evidence = await f.run();
+  assert.equal(evidence.ok, true);
+  assert.equal(recoveryReads, 1);
+  assert.ok(evidence.binding_observation_ms >= 4000);
+  assert.ok(evidence.recovery_ms <= 5000);
+  assertRestoredAndDetached(f);
+});
+test("a completed post-restore binding observation leaves a full five-second media window", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  const extendInput = f.args.extendInput;
+  f.args.readBinding = async budget => {
+    if (f.calls.some(call => call.params?.offline === false)) {
+      await new Promise(resolve => {
+        const timer = f.args.clock.setTimeout(resolve, 4000);
+        budget.signal.addEventListener("abort", () => {
+          f.args.clock.clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+    }
+    return readBinding(budget);
+  };
+  f.args.extendInput = async (suffix, budget) => {
+    assert.ok(budget.timeoutMs >= 4000, "observation latency must not shrink the media window");
+    return extendInput(suffix, budget);
+  };
+  const evidence = await f.run();
+  assert.equal(evidence.ok, true);
+  assert.ok(evidence.binding_observation_ms >= 4000);
+  assert.ok(evidence.recovery_ms <= 5000);
+  assertRestoredAndDetached(f);
+});
+test("a baseline binding timeout cannot hide a changed owner after restore", async () => {
+  const f = fixture({ changeBinding(value) {
+    value.page_id = value.sessions.recoverable_page.page_id = "replacement";
+  } });
+  const readBinding = f.args.readBinding, readVideo = f.args.readVideo;
+  let videos = 0, bindings = 0;
+  f.args.readVideo = async budget => {
+    const value = await readVideo(budget);
+    videos++;
+    if (videos <= 2) return { ...value, decoded_frames: 10, video_bytes_received: 100 };
+    return value;
+  };
+  f.args.readBinding = async budget => {
+    bindings++;
+    if (bindings === 3) {
+      await new Promise(resolve => {
+        const timer = f.args.clock.setTimeout(resolve, 10_000);
+        budget.signal.addEventListener("abort", () => {
+          f.args.clock.clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+    }
+    return readBinding(budget);
+  };
+  await assert.rejects(f.run(), error => error.evidence.failure === "binding_changed" ||
+    error.evidence.failure === "binding_unavailable_or_cleanup");
+  assertRestoredAndDetached(f);
+});
+test("an aborted binding read after the deadline is binding_deadline", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  f.args.readBinding = async budget => {
+    if (f.calls.some(call => call.params?.offline === false)) {
+      await new Promise((_, reject) => {
+        const fail = () => {
+          const error = new Error("The operation was aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        if (budget.signal.aborted) {
+          fail();
+          return;
+        }
+        budget.signal.addEventListener("abort", fail, { once: true });
+      });
+    }
+    return readBinding(budget);
+  };
+  await assert.rejects(f.run(), error => {
+    assert.equal(error.evidence.failure, "binding_deadline");
+    assert.notEqual(error.evidence.failure, "observation_failed");
+    return true;
+  });
+  assertRestoredAndDetached(f);
+});
+test("a reused Engine status after restore is page_status_stale", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  f.args.readBinding = async budget => {
+    const value = await readBinding(budget);
+    if (f.calls.some(call => call.params?.offline === false)) {
+      return { ...value, page_status_fresh: false };
+    }
+    return value;
+  };
+  await assert.rejects(f.run(), error => {
+    assert.equal(error.evidence.failure, "page_status_stale");
+    assert.equal(error.evidence.page_status_fresh, false);
+    return true;
+  });
+  assertRestoredAndDetached(f);
+});
+test("HTTP page_status errors after restore stay observation failures", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  f.args.readBinding = async budget => {
+    if (f.calls.some(call => call.params?.offline === false)) {
+      const error = new Error("Recovery page status failed: 403");
+      error.name = "PageStatusHttpError";
+      error.status = 403;
+      throw error;
+    }
+    return readBinding(budget);
+  };
+  await assert.rejects(f.run(), error => {
+    assert.equal(error.evidence.failure, "observation_failed");
+    return true;
+  });
+  assertRestoredAndDetached(f);
+});
+test("a later reused Engine status does not count as a matching binding", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  let recoveryReads = 0;
+  f.args.readBinding = async budget => {
+    const value = await readBinding(budget);
+    if (!f.calls.some(call => call.params?.offline === false)) return value;
+    recoveryReads++;
+    return { ...value, page_status_fresh: recoveryReads === 1 };
+  };
+  const evidence = await f.run();
+  assert.equal(evidence.ok, true);
+  assert.equal(evidence.page_status_fresh, true);
+  for (const sample of evidence.samples) {
+    if (sample.page_status_fresh === false) assert.equal(sample.binding_matches, false);
+  }
+  assertRestoredAndDetached(f);
+});
+test("a hung cut binding still proves the media stall from video samples", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  f.args.readBinding = async budget => {
+    if (f.calls.some(call => call.params?.offline === true) &&
+      !f.calls.some(call => call.params?.offline === false)) {
+      await new Promise(resolve => {
+        const timer = f.args.clock.setTimeout(resolve, 10_000);
+        budget.signal.addEventListener("abort", () => {
+          f.args.clock.clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+    }
+    return readBinding(budget);
+  };
+  const evidence = await f.run();
+  assert.equal(evidence.ok, true);
+  assert.ok(evidence.stall_ms >= 1000);
+  assert.ok(evidence.samples.some(sample => sample.phase === "cut" && sample.binding_source === "cached"));
+  assertRestoredAndDetached(f);
+});
+test("a completed cut binding that changes the owner still fails", async () => {
+  const f = fixture();
+  const readBinding = f.args.readBinding;
+  f.args.readBinding = async budget => {
+    const value = await readBinding(budget);
+    if (f.calls.some(call => call.params?.offline === true) &&
+      !f.calls.some(call => call.params?.offline === false)) {
+      value.page_id = value.sessions.recoverable_page.page_id = "replacement";
+    }
+    return value;
+  };
+  await assert.rejects(f.run(), error => error.evidence.failure === "binding_changed" ||
+    error.evidence.failure === "binding_unavailable_or_cleanup");
+  assertRestoredAndDetached(f);
+});
+test("a hung first recovery binding read cannot pass on the cut binding", async () => {
+  const f = fixture({ changeBinding(value) {
+    value.page_id = value.sessions.recoverable_page.page_id = "replacement";
+  } });
+  const readBinding = f.args.readBinding;
+  f.args.readBinding = async budget => {
+    if (f.calls.some(call => call.params?.offline === false)) {
+      await new Promise(resolve => {
+        const timer = f.args.clock.setTimeout(resolve, 10_000);
+        budget.signal.addEventListener("abort", () => {
+          f.args.clock.clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+    }
+    return readBinding(budget);
+  };
+  await assert.rejects(f.run(), error => error.evidence.failure === "binding_deadline");
+  assertRestoredAndDetached(f);
+});
+test("a completed first recovery binding still rejects a changed owner", async () => {
+  const f = fixture({ changeBinding(value) {
+    value.page_id = value.sessions.recoverable_page.page_id = "replacement";
+  } });
+  await assert.rejects(f.run(), error => error.evidence.failure === "binding_changed" ||
+    error.evidence.failure === "binding_unavailable_or_cleanup");
+  assertRestoredAndDetached(f);
+});
 test("input receives only the remaining shared recovery budget", async () => {
   const f = fixture();
   const readVideo = f.args.readVideo;
