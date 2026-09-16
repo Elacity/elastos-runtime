@@ -1541,10 +1541,61 @@ impl RuntimeMintDraft {
     }
 }
 
+/// What is known about one node's provisioning call.
+///
+/// This replaces a bare `effect_started: bool`, which could not tell *we do not
+/// know what happened* apart from *the node says it did nothing*. The
+/// difference decides whether a share may be stranded on that node, which is
+/// the only question an operator reading a failed mint actually has.
+///
+/// `RefusedWithoutEffect` is **node-asserted, not proven**. The capsule's error
+/// frame is unsigned and unbound to the node key, so this describes an outcome
+/// and must never authorize re-dispatching a share to that node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMintNodeEffectV1 {
+    /// No call was dispatched. Nothing can be stored.
+    NotDispatched,
+    /// A call was dispatched and no usable answer came back. The node may hold
+    /// the share and only the node can say.
+    Uncertain,
+    /// The node answered that it refused before its durable write.
+    RefusedWithoutEffect,
+}
+
+impl RuntimeMintNodeEffectV1 {
+    /// The wire byte. `0`/`1` are exactly the old `false`/`true`, so an
+    /// `epc-mj06` record written before this existed decodes unchanged: a
+    /// legacy `effect_started == true` means precisely `Uncertain`.
+    const fn wire_byte(self) -> u8 {
+        match self {
+            Self::NotDispatched => 0,
+            Self::Uncertain => 1,
+            Self::RefusedWithoutEffect => 2,
+        }
+    }
+
+    /// Decode, treating anything unrecognised as `Uncertain` rather than
+    /// rejecting the record. A byte this Runtime does not know was written by a
+    /// newer one that could describe an outcome more precisely; the safe
+    /// reading of "some call happened" is that its effect is unknown.
+    const fn from_wire_byte(byte: u8) -> Self {
+        match byte {
+            0 => Self::NotDispatched,
+            2 => Self::RefusedWithoutEffect,
+            _ => Self::Uncertain,
+        }
+    }
+
+    /// Whether this node might be holding the share.
+    pub const fn may_hold_share(self) -> bool {
+        matches!(self, Self::Uncertain)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct MintNodeState {
     binding: RuntimeMintNodeBinding,
-    effect_started: bool,
+    effect: RuntimeMintNodeEffectV1,
     receipt: Option<RuntimeMintNodeReceipt>,
 }
 
@@ -2101,8 +2152,20 @@ impl PersistedRuntimeMint {
             .collect()
     }
 
-    pub fn any_effect_started(&self) -> bool {
-        self.node_states.iter().any(|state| state.effect_started)
+    /// Nodes that were called and may be holding a share.
+    ///
+    /// This is the record-level question: a node that was never called, or that
+    /// said it refused before writing, strands nothing. Only an unknown outcome
+    /// does.
+    pub fn uncertain_node_count(&self) -> usize {
+        self.node_states
+            .iter()
+            .filter(|state| state.receipt.is_none() && state.effect.may_hold_share())
+            .count()
+    }
+
+    pub fn any_effect_uncertain(&self) -> bool {
+        self.uncertain_node_count() > 0
     }
 
     pub fn all_receipts_present(&self) -> bool {
@@ -2146,7 +2209,7 @@ impl RuntimeMintJournal {
                 .iter()
                 .map(|binding| MintNodeState {
                     binding: binding.clone(),
-                    effect_started: false,
+                    effect: RuntimeMintNodeEffectV1::NotDispatched,
                     receipt: None,
                 })
                 .collect(),
@@ -2192,13 +2255,14 @@ impl RuntimeMintJournal {
     pub fn find_mint_record_for_intent(
         &self,
         request_id: Digest32,
-    ) -> Result<Option<PersistedRuntimeMint>, RuntimeMintJournalError> {
+    ) -> Result<RuntimeMintIntentRecordScanV1, RuntimeMintJournalError> {
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.ensure_root_dir()?;
         let intent = self.read_intent(request_id)?;
         let entries =
             fs::read_dir(&self.root_dir).map_err(|_| RuntimeMintJournalError::Unavailable)?;
-        let mut matched: Option<PersistedRuntimeMint> = None;
+        let mut open: Option<PersistedRuntimeMint> = None;
+        let mut abandoned = Vec::new();
         let mut scanned = 0usize;
         for entry in entries {
             let entry = entry.map_err(|_| RuntimeMintJournalError::Unavailable)?;
@@ -2213,12 +2277,31 @@ impl RuntimeMintJournal {
             if !record_matches_intent(&record, &intent) {
                 continue;
             }
-            if matched.is_some() {
+            // An aborted fan-out can never be continued: the envelope its
+            // shares were sealed against does not outlive the request that
+            // produced them. Such a record is history, not a candidate, and
+            // leaving it in the running is what made a second attempt collide
+            // with the first and strand the intent for good. It is carried out
+            // of here rather than dropped, because what it left on the nodes
+            // still has to be reported.
+            if record.custody_terminal == Some(RuntimeCustodyTerminalKind::AbortedPartialProvision)
+            {
+                abandoned.push(RuntimeMintAbandonedRecordV1 {
+                    mint_id,
+                    accepted_orphan_count: record.accepted_orphans().len(),
+                    uncertain_node_count: record.uncertain_node_count(),
+                });
+                continue;
+            }
+            // Two live records for one intent is still ambiguity nothing can
+            // resolve, and the guard stays exactly as strict for that case.
+            if open.is_some() {
                 return Err(RuntimeMintJournalError::Conflict);
             }
-            matched = Some(record);
+            open = Some(record);
         }
-        Ok(matched)
+        abandoned.sort_by_key(|record| record.mint_id);
+        Ok(RuntimeMintIntentRecordScanV1 { open, abandoned })
     }
 
     pub fn persist_media_preparation(
@@ -2491,7 +2574,51 @@ impl RuntimeMintJournal {
             .iter_mut()
             .find(|state| state.binding.node_public_key == node_public_key)
             .ok_or(RuntimeMintJournalError::InvalidSelection)?;
-        node.effect_started = true;
+        if node.receipt.is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        node.effect = RuntimeMintNodeEffectV1::Uncertain;
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    /// Record that a node answered that it refused before storing anything.
+    ///
+    /// The only transition that walks a node's effect back, and it narrows the
+    /// record rather than reopening it: the node is no longer counted as
+    /// possibly holding a share. It does **not** make the node dispatchable
+    /// again — the assertion is unsigned, and the envelope needed to re-dispatch
+    /// is gone once the publish request ends.
+    pub fn mark_node_refused_without_effect(
+        &self,
+        mint_id: Digest32,
+        node_public_key: NodePublicKey,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        if record.custody_terminal.is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        let node = record
+            .node_states
+            .iter_mut()
+            .find(|state| state.binding.node_public_key == node_public_key)
+            .ok_or(RuntimeMintJournalError::InvalidSelection)?;
+        // A node that returned a receipt cannot also have refused before
+        // writing. One of the two is a lie, so neither is trusted.
+        if node.receipt.is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        match node.effect {
+            RuntimeMintNodeEffectV1::RefusedWithoutEffect => return Ok(record),
+            RuntimeMintNodeEffectV1::Uncertain => {}
+            // Nothing was dispatched, so nothing can have been refused.
+            RuntimeMintNodeEffectV1::NotDispatched => {
+                return Err(RuntimeMintJournalError::Conflict)
+            }
+        }
+        node.effect = RuntimeMintNodeEffectV1::RefusedWithoutEffect;
         self.write_replace(&record)?;
         Ok(record)
     }
@@ -2512,7 +2639,10 @@ impl RuntimeMintJournal {
             .iter_mut()
             .find(|state| state.binding.node_public_key == receipt.node_public_key)
             .ok_or(RuntimeMintJournalError::InvalidSelection)?;
-        if !node.effect_started {
+        // A receipt is admissible only for a call whose outcome was open. A
+        // node that was never called cannot produce one, and a node that said
+        // it refused before writing is now contradicting itself.
+        if !matches!(node.effect, RuntimeMintNodeEffectV1::Uncertain) {
             return Err(RuntimeMintJournalError::Conflict);
         }
         if node.binding.owner_state_root != receipt.owner_state_root {
@@ -2619,17 +2749,23 @@ impl RuntimeMintJournal {
     pub fn bind_creator_effect(
         &self,
         mint_id: Digest32,
+        expected: &RuntimeMintCreatorState,
         effect: RuntimeMintCreatorEffectBinding,
     ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.ensure_root_dir()?;
         let mut record = self.read_record(mint_id)?;
-        let creator_state = record
+        let current = record
             .creator_state
-            .take()
-            .ok_or(RuntimeMintJournalError::Conflict)?
-            .with_effect(effect)?;
-        record.creator_state = Some(creator_state);
+            .as_ref()
+            .ok_or(RuntimeMintJournalError::Conflict)?;
+        let bound = expected.clone().with_effect(effect)?;
+        // Planning happens outside the lock. Discarding or changing terms must
+        // invalidate a request planned against the previous creator state.
+        if current != expected && current != &bound {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        record.creator_state = Some(bound);
         self.write_replace(&record)?;
         Ok(record)
     }
@@ -2961,7 +3097,7 @@ fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJo
         payload.extend_from_slice(state.binding.operator_id.as_bytes());
         payload.extend_from_slice(state.binding.failure_domain_id.as_bytes());
         payload.extend_from_slice(state.binding.owner_state_root.as_bytes());
-        payload.push(u8::from(state.effect_started));
+        payload.push(state.effect.wire_byte());
         match &state.receipt {
             None => payload.push(0),
             Some(receipt) => {
@@ -3049,6 +3185,42 @@ fn mint_id_from_record_file_name(name: &std::ffi::OsStr) -> Option<Digest32> {
     Some(Digest32::new(bytes))
 }
 
+/// What a closed attempt left behind on the custody nodes.
+///
+/// Both numbers are needed and they mean different things: an accepted receipt
+/// is a share this Runtime knows is held, while an uncertain node is one that
+/// was called and never answered, which may be holding one without ever having
+/// said so. Neither can be reused -- they are sealed against an envelope that
+/// no longer exists -- so they are inert, but they occupy node storage until
+/// something retires them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeMintAbandonedRecordV1 {
+    pub mint_id: Digest32,
+    pub accepted_orphan_count: usize,
+    pub uncertain_node_count: usize,
+}
+
+/// Every mint record bound to one intent, separated into the one that can still
+/// go somewhere and the ones that cannot.
+#[derive(Clone, Debug)]
+pub struct RuntimeMintIntentRecordScanV1 {
+    open: Option<PersistedRuntimeMint>,
+    abandoned: Vec<RuntimeMintAbandonedRecordV1>,
+}
+
+impl RuntimeMintIntentRecordScanV1 {
+    /// The record a caller may still act on, if there is one.
+    pub const fn open(&self) -> Option<&PersistedRuntimeMint> {
+        self.open.as_ref()
+    }
+
+    /// Closed attempts, oldest mint id first. A caller must report these rather
+    /// than skip them: they are the only trace of custody state left stranded.
+    pub fn abandoned(&self) -> &[RuntimeMintAbandonedRecordV1] {
+        &self.abandoned
+    }
+}
+
 fn record_matches_intent(record: &PersistedRuntimeMint, intent: &RuntimeMintIntent) -> bool {
     let draft = &record.draft;
     draft.content_access_id == intent.content_access_id
@@ -3119,7 +3291,7 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
             failure_domain_id,
             owner_state_root,
         )?;
-        let effect_started = read_u8(payload, &mut off)? != 0;
+        let effect = RuntimeMintNodeEffectV1::from_wire_byte(read_u8(payload, &mut off)?);
         let has_receipt = read_u8(payload, &mut off)? != 0;
         let receipt = if has_receipt {
             let provisioning_id =
@@ -3140,7 +3312,7 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
         nodes.push(binding.clone());
         node_states.push(MintNodeState {
             binding,
-            effect_started,
+            effect,
             receipt,
         });
     }
@@ -4402,6 +4574,123 @@ mod tests {
         );
     }
 
+    /// The three node effects, and the two contradictions that must fail closed.
+    ///
+    /// A refusal is only meaningful for a call that was actually dispatched,
+    /// and a node cannot both return a receipt and claim it stored nothing.
+    #[test]
+    fn node_effects_separate_no_receipt_from_no_effect() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let draft = draft();
+        journal.persist_bound(&draft).unwrap();
+
+        // Nothing dispatched: nobody can be holding anything.
+        assert_eq!(
+            journal
+                .load(draft.mint_id())
+                .unwrap()
+                .uncertain_node_count(),
+            0
+        );
+
+        // A refusal for a node that was never called is a contradiction.
+        assert_eq!(
+            journal.mark_node_refused_without_effect(draft.mint_id(), node_public_key(1)),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_public_key(1))
+            .unwrap();
+        assert_eq!(
+            journal
+                .load(draft.mint_id())
+                .unwrap()
+                .uncertain_node_count(),
+            1,
+            "dispatched and unanswered is the only state that strands anything"
+        );
+
+        journal
+            .mark_node_refused_without_effect(draft.mint_id(), node_public_key(1))
+            .unwrap();
+        let narrowed = journal.load(draft.mint_id()).unwrap();
+        assert_eq!(narrowed.uncertain_node_count(), 0);
+        assert!(narrowed.accepted_orphans().is_empty());
+
+        // Idempotent, and still not a receipt.
+        journal
+            .mark_node_refused_without_effect(draft.mint_id(), node_public_key(1))
+            .unwrap();
+        assert_eq!(
+            journal.mark_node_receipt(draft.mint_id(), receipt(&binding(1), 0x81)),
+            Err(RuntimeMintJournalError::Conflict),
+            "a node that said it stored nothing cannot then produce a receipt"
+        );
+
+        // And the reverse contradiction.
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_public_key(2))
+            .unwrap();
+        journal
+            .mark_node_receipt(draft.mint_id(), receipt(&binding(2), 0x82))
+            .unwrap();
+        assert_eq!(
+            journal.mark_node_refused_without_effect(draft.mint_id(), node_public_key(2)),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert_eq!(
+            journal.mark_node_effect_started(draft.mint_id(), node_public_key(2)),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+    }
+
+    /// The widened byte needs no `STORE_MAGIC` bump, and this is why: a record
+    /// written before the third state existed still decodes, and a legacy
+    /// `effect_started == true` means exactly `Uncertain` -- the reading that
+    /// keeps a possibly-stranded share visible.
+    #[test]
+    fn a_record_written_before_the_third_node_state_still_decodes() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let draft = draft();
+        journal.persist_bound(&draft).unwrap();
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_public_key(1))
+            .unwrap();
+
+        // The byte a pre-change Runtime would have written for this state is
+        // the same `1` written today, so the encoded record is byte-identical.
+        let path = root.join(hex::encode(draft.mint_id().as_bytes()));
+        let encoded = fs::read(&path).unwrap();
+        assert!(
+            encoded.windows(8).any(|window| window == STORE_MAGIC),
+            "still an epc-mj06 record; the widening did not need a new magic"
+        );
+        let reloaded = RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap();
+        assert_eq!(reloaded.uncertain_node_count(), 1);
+
+        // An unrecognised byte from some future Runtime reads as uncertain
+        // rather than corrupting the record: "a call happened, effect unknown"
+        // is the safe reading of anything we cannot interpret.
+        assert_eq!(
+            RuntimeMintNodeEffectV1::from_wire_byte(7),
+            RuntimeMintNodeEffectV1::Uncertain
+        );
+        assert_eq!(
+            RuntimeMintNodeEffectV1::from_wire_byte(0),
+            RuntimeMintNodeEffectV1::NotDispatched
+        );
+        assert_eq!(
+            RuntimeMintNodeEffectV1::from_wire_byte(2),
+            RuntimeMintNodeEffectV1::RefusedWithoutEffect
+        );
+    }
+
     #[test]
     fn persist_before_effects_replays_exactly_and_never_provisions_partial_abort() {
         let temp = tempdir().unwrap();
@@ -4410,7 +4699,7 @@ mod tests {
 
         let persisted = journal.persist_bound(&draft).unwrap();
         assert!(persisted.custody_terminal().is_none());
-        assert!(!persisted.any_effect_started());
+        assert!(!persisted.any_effect_uncertain());
         assert_eq!(
             journal.persist_bound(&draft).unwrap().draft(),
             persisted.draft()
@@ -4577,7 +4866,9 @@ mod tests {
 
         let found = journal
             .find_mint_record_for_intent(settled.request_id())
-            .unwrap()
+            .unwrap();
+        let found = found
+            .open()
             .expect("record sharing access id and custody selection must be found");
         assert_eq!(found.draft().mint_id(), matching.mint_id());
         assert_eq!(
@@ -4594,12 +4885,74 @@ mod tests {
         // Same content-access id, different custody pool identity.
         custody_provision_all(&journal, &draft_with(0x21, 0x52, 0x75));
 
+        assert!(journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap()
+            .open()
+            .is_none());
+    }
+
+    /// A second attempt after a failed one must be possible.
+    ///
+    /// A failed fan-out can never be continued — the envelope its shares were
+    /// sealed against does not outlive the request — so re-protecting is the
+    /// only way forward, and re-protecting produces a *different* mint id
+    /// because `compute_mint_id` hashes the envelope. Both records then match
+    /// the one intent. Counting the closed one as a candidate made that
+    /// ambiguous and stranded the intent permanently; it is now history, and
+    /// what it left on the nodes is carried out for the caller to report.
+    #[test]
+    fn a_fresh_attempt_after_an_abort_is_not_ambiguous() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+
+        // First attempt: one node accepted, a second was called and never
+        // answered, then the fan-out closed.
+        let first = draft_with(0x21, 0x52, 0x35);
+        journal.persist_bound(&first).unwrap();
+        journal
+            .mark_node_effect_started(first.mint_id(), node_public_key(1))
+            .unwrap();
+        journal
+            .mark_node_receipt(first.mint_id(), receipt(&binding(1), 0x81))
+            .unwrap();
+        journal
+            .mark_node_effect_started(first.mint_id(), node_public_key(2))
+            .unwrap();
+        journal
+            .mark_aborted_partial_provision(first.mint_id())
+            .unwrap();
+
+        // With only the closed attempt on disk the intent has nothing open.
+        let scan = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        assert!(scan.open().is_none());
         assert_eq!(
-            journal
-                .find_mint_record_for_intent(settled.request_id())
-                .unwrap(),
-            None
+            scan.abandoned(),
+            &[RuntimeMintAbandonedRecordV1 {
+                mint_id: first.mint_id(),
+                accepted_orphan_count: 1,
+                uncertain_node_count: 1,
+            }],
+            "the closed attempt is reported, never silently skipped"
         );
+
+        // Second attempt, a different envelope and so a different mint id.
+        let second = draft_with(0x27, 0x52, 0x35);
+        assert_ne!(second.mint_id(), first.mint_id());
+        custody_provision_all(&journal, &second);
+
+        let scan = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        assert_eq!(
+            scan.open().map(|record| record.draft().mint_id()),
+            Some(second.mint_id()),
+            "the live attempt resolves even though a closed one shares the intent"
+        );
+        assert_eq!(scan.abandoned().len(), 1);
     }
 
     #[test]
@@ -4611,8 +4964,10 @@ mod tests {
         custody_provision_all(&journal, &draft_with(0x27, 0x52, 0x35));
 
         assert_eq!(
-            journal.find_mint_record_for_intent(settled.request_id()),
-            Err(RuntimeMintJournalError::Conflict)
+            journal
+                .find_mint_record_for_intent(settled.request_id())
+                .err(),
+            Some(RuntimeMintJournalError::Conflict)
         );
     }
 
@@ -4630,8 +4985,10 @@ mod tests {
         fs::set_permissions(&bogus, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert_eq!(
-            journal.find_mint_record_for_intent(settled.request_id()),
-            Err(RuntimeMintJournalError::Corrupt)
+            journal
+                .find_mint_record_for_intent(settled.request_id())
+                .err(),
+            Some(RuntimeMintJournalError::Corrupt)
         );
     }
 
@@ -4642,8 +4999,8 @@ mod tests {
         custody_provision_all(&journal, &draft());
 
         assert_eq!(
-            journal.find_mint_record_for_intent(digest(0x5b)),
-            Err(RuntimeMintJournalError::NotFound)
+            journal.find_mint_record_for_intent(digest(0x5b)).err(),
+            Some(RuntimeMintJournalError::NotFound)
         );
     }
 
@@ -4776,7 +5133,7 @@ mod tests {
         );
 
         let with_effect = journal
-            .bind_creator_effect(draft.mint_id(), creator_effect_binding())
+            .bind_creator_effect(draft.mint_id(), &creator_state, creator_effect_binding())
             .unwrap();
         assert!(
             with_effect
@@ -4847,6 +5204,12 @@ mod tests {
             .creator_state()
             .is_none());
 
+        // An in-flight request planned before the discard cannot bind an effect.
+        assert_eq!(
+            journal.bind_creator_effect(draft.mint_id(), &creator_state, creator_effect_binding()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+
         // Re-terming after a discard is what start over means.
         let restarted = RuntimeMintCreatorState::new(
             RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x64", "0x186a0", Vec::new())
@@ -4856,12 +5219,19 @@ mod tests {
         )
         .unwrap();
         journal
-            .bind_creator_state(draft.mint_id(), restarted)
+            .bind_creator_state(draft.mint_id(), restarted.clone())
             .unwrap();
+
+        // The old request also cannot attach its effect to newly recorded terms.
+        assert_eq!(
+            journal.bind_creator_effect(draft.mint_id(), &creator_state, creator_effect_binding()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert!(journal.load(draft.mint_id()).unwrap().creator_state() == Some(&restarted));
 
         // A raised transaction may still settle, so the record must stay.
         let raised = journal
-            .bind_creator_effect(draft.mint_id(), creator_effect_binding())
+            .bind_creator_effect(draft.mint_id(), &restarted, creator_effect_binding())
             .unwrap();
         assert_eq!(
             raised.creator_state().map(RuntimeMintCreatorState::stage),
@@ -4870,6 +5240,14 @@ mod tests {
         assert_eq!(
             journal.discard_creator_state(draft.mint_id()),
             Err(RuntimeMintJournalError::Conflict)
+        );
+
+        // Replaying the same plan is idempotent.
+        assert_eq!(
+            journal
+                .bind_creator_effect(draft.mint_id(), &restarted, creator_effect_binding())
+                .unwrap(),
+            raised
         );
 
         // A settled mint has a holder; nothing about it can change.
@@ -5323,7 +5701,7 @@ mod tests {
             .iter()
             .map(|binding| MintNodeState {
                 binding: binding.clone(),
-                effect_started: false,
+                effect: RuntimeMintNodeEffectV1::NotDispatched,
                 receipt: None,
             })
             .collect();

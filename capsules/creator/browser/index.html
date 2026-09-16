@@ -185,7 +185,7 @@
         <summary>Protection progress</summary>
         <ul id="progress-steps" class="steps" aria-label="Progress">
           <li data-stage="analyze"><span class="dot"></span> Analyze source</li>
-          <li data-stage="transcode" class="hidden"><span class="dot"></span> Transcode &amp; fragment <span class="not-tracked">(not tracked)</span></li>
+          <li data-stage="transcode" class="hidden"><span class="dot"></span> Transcode &amp; fragment</li>
           <li data-stage="encrypt"><span class="dot"></span> Encrypt &amp; escrow</li>
           <li data-stage="publish"><span class="dot"></span> Publish to storage</li>
           <li data-stage="assemble"><span class="dot"></span> Assemble listing</li>
@@ -193,6 +193,13 @@
       </details>
 
       <p id="status-text" class="status" aria-live="polite"></p>
+
+      <details id="failure-details" class="failure-details hidden">
+        <summary>Details</summary>
+        <dl id="failure-details-list" class="failure-details-list"></dl>
+      </details>
+
+      <div id="recovery-actions" class="success-actions hidden"></div>
 
       <section id="success-panel" class="success-panel hidden">
         <p id="success-title" class="success-title">Listed for sale.</p>

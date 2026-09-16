@@ -263,10 +263,24 @@ fn runtime_custody_creator_source_digest() -> elastos_protected_content_contract
     elastos_protected_content_contracts::Digest32::new(hasher.finalize().into())
 }
 
-fn seed_completed_runtime_custody_mint(
+/// Everything a mint record needs before its custody fan-out: the composition,
+/// the draft, and the intent recorded against it.
+///
+/// Extracted so a seeder can stop at the fan-out and take a different ending.
+/// The two seeders must share this part or they stop testing the same mint.
+struct SeededRuntimeCustodyMintDraft {
+    journal: elastos_protected_content_runtime::RuntimeMintJournal,
+    draft: elastos_protected_content_runtime::RuntimeMintDraft,
+    node_bindings: Vec<elastos_protected_content_runtime::RuntimeMintNodeBinding>,
+    request_id: elastos_protected_content_contracts::Digest32,
+    protected_init_segment: Vec<u8>,
+    protected_segments: Vec<Vec<u8>>,
+}
+
+fn seed_runtime_custody_mint_draft(
     data_dir: &std::path::Path,
     input: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
-) -> crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+) -> SeededRuntimeCustodyMintDraft {
     let protected_content_root = data_dir.join("protected-content");
     std::fs::create_dir_all(&protected_content_root).unwrap();
     #[cfg(unix)]
@@ -363,6 +377,75 @@ fn seed_completed_runtime_custody_mint(
     journal
         .mark_intent_protect_closed_before_draft(request_id)
         .unwrap();
+    SeededRuntimeCustodyMintDraft {
+        journal,
+        draft,
+        node_bindings,
+        request_id,
+        protected_init_segment,
+        protected_segments,
+    }
+}
+
+/// A mint that took a receipt from one node and then aborted, the shape the
+/// owner's own failed mints left on disk.
+///
+/// Returns the mint id. The record is terminal: the journal refuses every
+/// further custody transition against it.
+fn seed_aborted_runtime_custody_mint(
+    data_dir: &std::path::Path,
+    input: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+) -> elastos_protected_content_contracts::Digest32 {
+    let SeededRuntimeCustodyMintDraft {
+        journal,
+        draft,
+        node_bindings,
+        ..
+    } = seed_runtime_custody_mint_draft(data_dir, input);
+    let first = &node_bindings[0];
+    journal
+        .mark_node_effect_started(draft.mint_id(), first.node_public_key())
+        .unwrap();
+    journal
+        .mark_node_receipt(
+            draft.mint_id(),
+            elastos_protected_content_runtime::RuntimeMintNodeReceipt::new(
+                first.node_public_key(),
+                elastos_protected_content_contracts::RuntimeCustodyProvisioningIdV1::new(
+                    elastos_protected_content_contracts::Digest32::new([0x71; 32]),
+                )
+                .unwrap(),
+                elastos_protected_content_contracts::CustodyNodeProvisioningRecordIdentityV1::new(
+                    elastos_protected_content_contracts::Digest32::new([0x81; 32]),
+                    128,
+                )
+                .unwrap(),
+                first.owner_state_root(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    journal
+        .mark_node_effect_started(draft.mint_id(), node_bindings[1].node_public_key())
+        .unwrap();
+    journal
+        .mark_aborted_partial_provision(draft.mint_id())
+        .unwrap();
+    draft.mint_id()
+}
+
+fn seed_completed_runtime_custody_mint(
+    data_dir: &std::path::Path,
+    input: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+) -> crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+    let SeededRuntimeCustodyMintDraft {
+        journal,
+        draft,
+        node_bindings,
+        request_id,
+        protected_init_segment,
+        protected_segments,
+    } = seed_runtime_custody_mint_draft(data_dir, input);
     for (index, node) in node_bindings.iter().enumerate() {
         journal
             .mark_node_effect_started(draft.mint_id(), node.node_public_key())
@@ -6222,6 +6305,21 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
         err.to_string(),
         "Runtime custody creator mint is pending exact Wallet or Chain settlement"
     );
+    // The wait carries how far the publish actually got, as fields. Without
+    // this the tail could stop attaching progress entirely and every other
+    // assertion in the suite would still pass, because nothing else reads it.
+    let pending = err
+        .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyEffectPending>()
+        .expect("a wait must reach the caller as data, not as prose");
+    assert_eq!(
+        pending.as_json()["progress"]["stages"],
+        serde_json::json!([
+            { "id": "escrow", "state": "done" },
+            { "id": "publish", "state": "done" },
+            { "id": "listing", "state": "active" },
+        ]),
+        "custody and availability are durable here; only the listing is still running"
+    );
     assert_eq!(mock_content_publish_request_count(), 1);
     assert!(
         crate::protected_content_runtime::load_runtime_custody_listing(dir.path(), mint_id)
@@ -6721,6 +6819,74 @@ async fn test_runtime_custody_creator_progress_is_read_from_the_mint_journal() {
     assert_eq!(stage(&progress, "escrow"), "done");
     assert_eq!(stage(&progress, "publish"), "done");
     assert_eq!(stage(&progress, "listing"), "active");
+}
+
+/// A terminal custody state is not a successful one.
+///
+/// `custody_terminal()` is `Some` for `AbortedPartialProvision` as much as for
+/// `CustodyProvisioned`, and the projection used to read it as a bare
+/// `is_some()`. The result told a creator their escrow had completed at the
+/// exact moment their mint became unrecoverable, and nothing downstream of
+/// escrow had begun or ever would.
+#[tokio::test]
+async fn test_runtime_custody_creator_progress_reports_an_aborted_mint_as_failed() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let _ = &state;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-aborted",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x8e, &wallet_account_id);
+    let mint_id = seed_aborted_runtime_custody_mint(dir.path(), &input);
+    let journal = crate::protected_content_runtime::runtime_mint_journal(dir.path());
+    let record = journal.load(mint_id).unwrap();
+    assert_eq!(
+        record.custody_terminal(),
+        Some(
+            elastos_protected_content_runtime::RuntimeCustodyTerminalKind::AbortedPartialProvision
+        )
+    );
+    assert_eq!(
+        record.accepted_orphans().len(),
+        1,
+        "the fixture must be the shape a real abort leaves: one share stranded"
+    );
+
+    let progress = crate::protected_content_runtime::runtime_custody_creator_progress(&record);
+    let stage = |value: &serde_json::Value, id: &str| -> String {
+        value["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("progress must carry the {id} stage"))["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_ne!(
+        stage(&progress, "escrow"),
+        "done",
+        "an aborted partial provision is not a completed escrow"
+    );
+    assert_eq!(stage(&progress, "escrow"), "failed");
+    assert_eq!(
+        stage(&progress, "publish"),
+        "pending",
+        "availability work never started and never will under this mint"
+    );
+    assert_eq!(stage(&progress, "listing"), "pending");
 }
 
 /// A mint that has recorded its terms and raised nothing yet is refused when

@@ -253,6 +253,7 @@ pub(crate) struct RuntimeCustodyCreatorMintBlocked {
     mint_id: String,
     copies: String,
     price: String,
+    progress: Option<Value>,
 }
 
 impl RuntimeCustodyCreatorMintBlocked {
@@ -273,7 +274,20 @@ impl RuntimeCustodyCreatorMintBlocked {
             mint_id: hex::encode(mint_id.as_bytes()),
             copies: recorded.desired_terms().copies().to_string(),
             price: recorded.desired_terms().price().to_string(),
+            progress: None,
         }
+    }
+
+    /// Attach how far the blocked mint actually got.
+    ///
+    /// Opt-in for the same reason the waiting state's is: only a caller holding
+    /// the mint record can say, and a caller that cannot must not fill it with
+    /// a guess. It is what lets an app show which stage a blocked attempt
+    /// reached instead of only that one exists.
+    #[must_use]
+    pub(crate) fn with_progress(mut self, progress: Value) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     /// Stage name for the operator log. Carries no terms and no account.
@@ -282,7 +296,7 @@ impl RuntimeCustodyCreatorMintBlocked {
     }
 
     pub(crate) fn as_json(&self) -> Value {
-        json!({
+        let mut answer = json!({
             "schema": RUNTIME_CUSTODY_CREATOR_MINT_BLOCKED_SCHEMA_V1,
             "state": self.state.wire_value(),
             "mint_id": self.mint_id,
@@ -290,7 +304,11 @@ impl RuntimeCustodyCreatorMintBlocked {
             "recorded_price": self.price,
             "can_discard": self.state.can_discard(),
             "can_resume": self.state.can_resume(),
-        })
+        });
+        if let Some(progress) = self.progress.as_ref() {
+            answer["progress"] = progress.clone();
+        }
+        answer
     }
 }
 
@@ -586,24 +604,38 @@ pub(crate) const RUNTIME_CUSTODY_CREATOR_PROGRESS_SCHEMA_V1: &str =
 /// * `escrow`  the custody envelope. The mint record exists at all only once
 ///   protection produced an encrypted content identity, so reaching this
 ///   function means encryption is done; `custody_terminal` says whether the
-///   2-of-3 envelope has settled.
+///   2-of-3 envelope settled or aborted.
 /// * `publish` the ciphertext reaching content availability, which is exactly
 ///   `content_availability` -- a verified receipt, not a hopeful one. This is
 ///   the stage that was untracked.
 /// * `listing` the chain mint and listing projection, which is the creator
 ///   state's own three-stage lifecycle.
+///
+/// The vocabulary is `pending` (has not begun), `active` (running), `done`
+/// (durably finished) and `failed` (finished badly). A stage never claims to be
+/// running when its input has not arrived, and never claims to be done because
+/// it merely stopped.
 pub(crate) fn runtime_custody_creator_progress(
     mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
 ) -> Value {
-    let escrow = if mint.custody_terminal().is_some() {
-        "done"
-    } else {
-        "active"
+    use elastos_protected_content_runtime::RuntimeCustodyTerminalKind;
+
+    // A terminal is not a success. `custody_terminal` is `Some` for an aborted
+    // partial provision too, and reporting that as "done" told a creator their
+    // escrow had settled at the exact moment the mint became unrecoverable.
+    let escrow = match mint.custody_terminal() {
+        Some(RuntimeCustodyTerminalKind::CustodyProvisioned) => "done",
+        Some(RuntimeCustodyTerminalKind::AbortedPartialProvision) => "failed",
+        None => "active",
     };
-    let publish = if mint.content_availability().is_some() {
-        "done"
-    } else {
-        "active"
+    // Availability work begins only once the envelope has settled, so before
+    // that this stage has not started. Saying "active" for work that has not
+    // begun — and for work that now never will — is the same untruth one stage
+    // along.
+    let publish = match (escrow, mint.content_availability().is_some()) {
+        (_, true) => "done",
+        ("done", false) => "active",
+        _ => "pending",
     };
     let listing = match mint
         .creator_state()
@@ -1357,13 +1389,14 @@ impl RuntimeCustodyRegistryAdapter {
         elastos_protected_content_provider_contracts::CustodyProviderResponseV1,
         RuntimeProviderCallError,
     > {
+        // Encoding happens entirely here; a failure means nothing was sent.
         let request_value = serde_json::from_slice(
             &request
                 .to_json_vec()
-                .map_err(|_| RuntimeProviderCallError::NoExactResult)?,
+                .map_err(|_| RuntimeProviderCallError::NotDispatched)?,
         )
-        .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
-        let response_value = invoke_json_provider_with_transport(
+        .map_err(|_| RuntimeProviderCallError::NotDispatched)?;
+        let response_value = invoke_json_provider_classified(
             self.registry.as_ref(),
             CUSTODY_PROVIDER_ID,
             op,
@@ -1371,12 +1404,65 @@ impl RuntimeCustodyRegistryAdapter {
             self.transport.clone(),
         )
         .await
-        .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
+        .map_err(|failure| classify_custody_failure(op, &failure))?;
+        // The node answered `ok`; only this Runtime can still fail to read it,
+        // and by then the node has already acted.
         elastos_protected_content_provider_contracts::CustodyProviderResponseV1::from_json_slice(
             &serde_json::to_vec(&response_value)
                 .map_err(|_| RuntimeProviderCallError::NoExactResult)?,
         )
         .map_err(|_| RuntimeProviderCallError::NoExactResult)
+    }
+}
+
+/// Codes the custody capsule emits only from paths that precede its durable
+/// write, so a refusal carrying one proves the share was not stored.
+///
+/// `invalid_request` covers frame and request-validation refusals,
+/// `rights_denied` the rights decision, and `provisioning_refused` everything
+/// the share store rejects before it is touched — expiry above all. All three
+/// are structurally before `NodeLocalShareStoreV1` writes. `backend_unavailable`
+/// is deliberately absent: the capsule returns it from refusals before the
+/// write, from failures after it, and from the `hard_link` that is the write,
+/// so it proves nothing about the share.
+///
+/// A closed list, and the compatibility story runs the safe way in both
+/// directions: an older capsule still answers `backend_unavailable` and this
+/// Runtime keeps treating it as uncertain, and a code this Runtime does not
+/// recognise is uncertain rather than effect-free.
+const CUSTODY_EFFECT_FREE_REFUSAL_CODES: [&str; 3] =
+    ["invalid_request", "provisioning_refused", "rights_denied"];
+
+fn classify_custody_failure(
+    op: &str,
+    failure: &ProviderInvocationFailure,
+) -> RuntimeProviderCallError {
+    match failure {
+        ProviderInvocationFailure::Refused { code, .. }
+            if CUSTODY_EFFECT_FREE_REFUSAL_CODES.contains(&code.as_str()) =>
+        {
+            tracing::warn!(
+                %op,
+                %code,
+                "custody provider refused before acting"
+            );
+            RuntimeProviderCallError::RefusedWithoutEffect
+        }
+        ProviderInvocationFailure::Refused { code, .. } => {
+            tracing::warn!(
+                %op,
+                %code,
+                "custody provider refused with an effect-uncertain code"
+            );
+            RuntimeProviderCallError::NoExactResult
+        }
+        // A lost reply is indistinguishable from a node that never heard us,
+        // and the capsule can complete its write and then fail to answer.
+        ProviderInvocationFailure::NotCompleted { .. }
+        | ProviderInvocationFailure::MalformedResponse { .. } => {
+            tracing::warn!(%op, "custody provider effect is uncertain");
+            RuntimeProviderCallError::NoExactResult
+        }
     }
 }
 
@@ -1891,10 +1977,25 @@ fn adopt_settled_runtime_mint_record(
     journal: &RuntimeMintJournal,
     mint_intent: &RuntimeMintIntent,
 ) -> anyhow::Result<Option<Digest32>> {
-    let record = journal
+    let scan = journal
         .find_mint_record_for_intent(mint_intent.request_id())
         .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
-    let Some(record) = record else {
+    // Closed attempts cannot be continued, but what they left on the nodes is
+    // real and nothing else reports it. Say so every time this intent is looked
+    // at, whatever happens next.
+    for abandoned in scan.abandoned() {
+        tracing::warn!(
+            request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+            mint_id = %hex::encode(abandoned.mint_id.as_bytes()),
+            node_receipts_accepted = abandoned.accepted_orphan_count,
+            nodes_possibly_holding_a_share = abandoned.uncertain_node_count,
+            "abandoned runtime custody mint attempt left custody state on nodes; cleanup reconciliation required"
+        );
+    }
+    let Some(record) = scan.open() else {
+        // Every attempt for this intent is closed, so a fresh one is the only
+        // way forward and is safe: new shares seal against a new envelope and
+        // cannot combine with what any earlier attempt left behind.
         return Ok(None);
     };
     let fully_terminal = record.custody_terminal()
@@ -1912,8 +2013,11 @@ fn adopt_settled_runtime_mint_record(
         mint_id = %hex::encode(record.draft().mint_id().as_bytes()),
         custody_terminal = ?record.custody_terminal(),
         content_availability_recorded = record.content_availability().is_some(),
-        node_effects_started = record.any_effect_started(),
+        // What an operator needs is not "did anything start" but what was left
+        // behind: shares this Runtime knows are held, and nodes that may be
+        // holding one without ever having said so.
         node_receipts_accepted = record.accepted_orphans().len(),
+        nodes_possibly_holding_a_share = record.uncertain_node_count(),
         "settled runtime custody mint record is not fully terminal; orphaned custody state requires cleanup reconciliation"
     );
     anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
@@ -3408,6 +3512,42 @@ pub(crate) async fn invoke_json_provider(
     .await
 }
 
+/// Why a provider invocation did not yield data, keeping the distinction the
+/// formatted-string form throws away.
+///
+/// The distinction that matters to a caller holding a durable journal is
+/// whether the provider can have acted. `NotCompleted` is the only variant that
+/// says nothing either way: the registry call failed, which covers a provider
+/// that was never reached *and* a reply that was lost after the provider did
+/// its work. `Refused` carries the provider's own code, which is the sole
+/// evidence a caller has for classifying the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderInvocationFailure {
+    /// The registry call itself failed. The request may or may not have reached
+    /// the provider, and a reply may have been lost on the way back.
+    NotCompleted { detail: String },
+    /// The provider answered `status: "error"` with its own code and message.
+    Refused { code: String, message: String },
+    /// The provider answered, but the frame was not a usable response.
+    MalformedResponse { detail: String },
+}
+
+impl ProviderInvocationFailure {
+    /// The formatted form the string-returning callers have always seen. Kept
+    /// byte-identical so widening the typed layer changes no existing message.
+    fn into_message(self, target: &str, op: &str) -> String {
+        match self {
+            Self::NotCompleted { detail } => {
+                format!("{target} provider {op} invocation failed: {detail}")
+            }
+            Self::Refused { code, message } => {
+                format!("{target} provider {op} rejected the request: {code}: {message}")
+            }
+            Self::MalformedResponse { detail } => detail,
+        }
+    }
+}
+
 pub(crate) async fn invoke_json_provider_with_transport(
     registry: &ProviderRegistry,
     target: &str,
@@ -3415,6 +3555,19 @@ pub(crate) async fn invoke_json_provider_with_transport(
     request: Value,
     transport: ProviderInvocationTransport,
 ) -> Result<Value, String> {
+    invoke_json_provider_classified(registry, target, op, request, transport)
+        .await
+        .map_err(|failure| failure.into_message(target, op))
+}
+
+/// The same invocation, with the failure kept as data.
+pub(crate) async fn invoke_json_provider_classified(
+    registry: &ProviderRegistry,
+    target: &str,
+    op: &str,
+    request: Value,
+    transport: ProviderInvocationTransport,
+) -> Result<Value, ProviderInvocationFailure> {
     let response = registry
         .invoke_provider(ProviderInvocation {
             source: RUNTIME_PROVIDER_ID.to_string(),
@@ -3434,21 +3587,25 @@ pub(crate) async fn invoke_json_provider_with_transport(
                 error = %error,
                 "provider invocation failed"
             );
-            format!("{target} provider {op} invocation failed: {error}")
+            ProviderInvocationFailure::NotCompleted {
+                detail: error.to_string(),
+            }
         })?;
-    let status = response
-        .get("status")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{target} provider {op} response is missing status"))?;
+    let Some(status) = response.get("status").and_then(Value::as_str) else {
+        return Err(ProviderInvocationFailure::MalformedResponse {
+            detail: format!("{target} provider {op} response is missing status"),
+        });
+    };
     match status {
-        "ok" => response
-            .get("data")
-            .cloned()
-            .ok_or_else(|| format!("{target} provider {op} response is missing data")),
+        "ok" => response.get("data").cloned().ok_or_else(|| {
+            ProviderInvocationFailure::MalformedResponse {
+                detail: format!("{target} provider {op} response is missing data"),
+            }
+        }),
         "error" => {
-            // Keep the provider's own code/message: this string travels back
-            // to the caller (over Carrier for a committee member) and is the
-            // only trace of why a node refused.
+            // Keep the provider's own code/message: this travels back to the
+            // caller (over Carrier for a committee member) and is the only
+            // trace of why a node refused.
             let code = response
                 .get("code")
                 .and_then(Value::as_str)
@@ -3458,13 +3615,14 @@ pub(crate) async fn invoke_json_provider_with_transport(
                 .and_then(Value::as_str)
                 .unwrap_or("no message");
             tracing::warn!(%target, %op, %code, %message, "provider rejected the request");
-            Err(format!(
-                "{target} provider {op} rejected the request: {code}: {message}"
-            ))
+            Err(ProviderInvocationFailure::Refused {
+                code: code.to_string(),
+                message: message.to_string(),
+            })
         }
-        _ => Err(format!(
-            "{target} provider {op} response has unsupported status"
-        )),
+        _ => Err(ProviderInvocationFailure::MalformedResponse {
+            detail: format!("{target} provider {op} response has unsupported status"),
+        }),
     }
 }
 
@@ -5274,7 +5432,8 @@ pub(crate) async fn publish_runtime_custody_library_object(
         move |bytes| sign_key.sign(bytes).to_bytes(),
         selected,
     )
-    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?;
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?
+    .with_dispatch_clock(crate::auth::now_ts);
     match coordinator
         .provision(&mint_draft, &protected.envelope, now)
         .await
@@ -5449,7 +5608,8 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
         move |bytes| sign_key.sign(bytes).to_bytes(),
         selected,
     )
-    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?;
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?
+    .with_dispatch_clock(crate::auth::now_ts);
     match coordinator
         .provision(&mint_draft, &protected.envelope, now)
         .await

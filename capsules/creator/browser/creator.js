@@ -288,13 +288,52 @@ export function buildPublishBody({ uri, ifRevision, copies, price, listing }) {
 export function stagesFromProgress(progress) {
   const stages = progress && Array.isArray(progress.stages) ? progress.stages : [];
   const byServerId = { escrow: "encrypt", publish: "publish", listing: "assemble" };
+  // The server's vocabulary is pending/active/done/failed; this page's is the
+  // CSS class on the row. They are mapped rather than shared so that a state
+  // this page cannot draw is dropped instead of being written into `className`,
+  // where it would silently render as nothing at all.
+  const byServerState = {
+    pending: "pending",
+    active: "active",
+    done: "done",
+    failed: "err",
+  };
   const mapped = [];
   for (const stage of stages) {
     const name = byServerId[stage && stage.id];
-    if (!name) continue;
-    mapped.push({ name, state: String((stage && stage.state) || "") });
+    const state = byServerState[String((stage && stage.state) || "")];
+    if (!name || !state) continue;
+    mapped.push({ name, state });
   }
   return mapped;
+}
+
+/**
+ * Reads the server's typed refusal of a mint already on record.
+ *
+ * The refusal itself is not new: terms on an in-flight mint cannot move. What
+ * is new here is that this page reads what to offer out of `can_discard` and
+ * `can_resume` instead of out of the sentence. The three states need three
+ * different things from the creator — discard and start over, wait for an
+ * approval that is already out, or nothing at all because it is already
+ * listed — and a single "it failed" told them none of that.
+ *
+ * Returns null when the envelope carries no such refusal, including from a
+ * server that predates the typed answer.
+ */
+export function creatorMintFrom(envelope) {
+  const blocked = envelope && envelope.creator_mint;
+  if (!blocked || typeof blocked !== "object") {
+    return null;
+  }
+  return {
+    state: String(blocked.state || ""),
+    mintId: String(blocked.mint_id || ""),
+    recordedCopies: String(blocked.recorded_copies || ""),
+    recordedPrice: String(blocked.recorded_price || ""),
+    canDiscard: blocked.can_discard === true,
+    canResume: blocked.can_resume === true,
+  };
 }
 
 /**
@@ -325,6 +364,90 @@ export function effectPendingFrom(envelope) {
     awaitsPerson: pending.awaits_person === true,
     connectorId: pending.connector_id ? String(pending.connector_id) : "",
   };
+}
+
+/**
+ * The breakdown behind a failure, as rows rather than prose.
+ *
+ * What a creator needs first is one sentence they can act on; what they need
+ * when that is not enough — or when they are reporting it to someone else — is
+ * everything the server actually said. Those are different audiences for the
+ * same failure, so the sentence stays in the status line and this goes behind a
+ * disclosure.
+ *
+ * Every row is drawn from a typed field. Nothing here is parsed out of a
+ * message, so a reworded sentence cannot change what is shown, and a field the
+ * server did not send is simply absent rather than rendered empty.
+ */
+export function failureDetailRows(error) {
+  const rows = [];
+  const push = (label, value) => {
+    const text = value == null ? "" : String(value).trim();
+    if (text) rows.push({ label, value: text });
+  };
+
+  push("Reported", error?.message);
+  // The stable message is the same across many causes; the detail is the
+  // sentence written for this one. Showing both is only noise when they agree.
+  if (error?.detail && String(error.detail) !== String(error?.message || "")) {
+    push("Cause", error.detail);
+  }
+
+  const stages = stagesFromProgress(error?.progress);
+  if (stages.length) {
+    const naming = { encrypt: "Encrypt & escrow", publish: "Publish to storage", assemble: "Assemble listing" };
+    const reading = { pending: "not started", active: "in progress", done: "done", err: "failed" };
+    push(
+      "Progress",
+      stages.map((stage) => `${naming[stage.name] || stage.name}: ${reading[stage.state] || stage.state}`).join(", "),
+    );
+  }
+
+  const mint = error?.creatorMint;
+  if (mint) {
+    const states = {
+      recorded_only: "terms recorded, nothing sent to the chain",
+      approval_outstanding: "waiting for a wallet approval already raised",
+      already_minted: "already minted and listed",
+    };
+    push("Existing attempt", states[mint.state] || mint.state);
+    push("Its listing id", mint.mintId);
+    if (mint.recordedCopies || mint.recordedPrice) {
+      push("Its recorded terms", `${mint.recordedCopies} copies at ${mint.recordedPrice}`);
+    }
+  }
+
+  const pending = error?.pending;
+  if (pending) {
+    push(
+      "Waiting for",
+      pending.reason === "chain_settlement"
+        ? "the network to confirm the transaction"
+        : `a wallet approval${pending.connectorId ? ` in ${pending.connectorId}` : ""}`,
+    );
+  }
+
+  if (error?.walletDrift) {
+    push("Wallet", "the mint is bound to an account your wallet no longer defaults to");
+  }
+  if (error?.walletDefault) {
+    push("Wallet", "no usable default account for this chain");
+  }
+  if (error?.approvalClosed) {
+    push("Approval", "closed without completing, so this attempt can never settle");
+  }
+
+  return rows;
+}
+
+// Retry only after Runtime confirms the reset for this exact source object.
+export async function discardProtectionAndRetry(uri, request, retry) {
+  const receipt = await request("discard_protection", { uri });
+  if (receipt?.schema !== "elastos.library.protection-discarded/v1" ||
+      receipt.uri !== uri || typeof receipt.discarded !== "boolean") {
+    throw new Error("Runtime did not confirm that the recorded terms were discarded. Try again.");
+  }
+  await retry();
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +507,9 @@ function bootCreatorApp() {
 
     submitButton: document.querySelector("#submit-button"),
     progressSteps: document.querySelector("#progress-steps"),
+    failureDetails: document.querySelector("#failure-details"),
+    failureDetailsList: document.querySelector("#failure-details-list"),
+    recoveryActions: document.querySelector("#recovery-actions"),
     statusText: document.querySelector("#status-text"),
 
     successPanel: document.querySelector("#success-panel"),
@@ -404,6 +530,9 @@ function bootCreatorApp() {
   let listed = false;
   let homeChromeReady = false;
   let activeStageName = "";
+  // The object this run is protecting, so a recovery action targets the same
+  // one the failure was about.
+  let lastTargetUri = "";
 
   boot();
 
@@ -518,6 +647,8 @@ function bootCreatorApp() {
   function onFile(file) {
     if (!file || submitting) return;
     selectedFile = file;
+    lastTargetUri = "";
+    clearFailureDetails();
     listed = false;
     const mime = resolveMime(file);
     const kind = classifyProtection(mime);
@@ -825,15 +956,26 @@ function bootCreatorApp() {
   // not a stage this page should mark, and blanking it would undo "analyze",
   // which the server does not describe at all.
   function applyServerProgress(progress) {
-    for (const stage of stagesFromProgress(progress)) {
+    const mapped = stagesFromProgress(progress);
+    if (!mapped.length) return;
+    // "Transcode & fragment" has no stage of its own on the server, and it does
+    // not need one: a mint record exists only once protection produced an
+    // encrypted content identity, so the arrival of any progress at all is
+    // itself the proof that fragmenting finished. That is why this row no
+    // longer carries a "(not tracked)" note -- it is tracked, by implication
+    // rather than by a field. Non-media never shows the row.
+    setStage("transcode", "done");
+    for (const stage of mapped) {
       if (stage.state === "pending") continue;
-      setStage(stage.name, stage.state === "done" ? "done" : stage.state);
+      setStage(stage.name, stage.state);
     }
   }
 
   function resetStages() {
     activeStageName = "";
-    ["analyze", "encrypt", "publish", "assemble"].forEach((stage) => setStage(stage, ""));
+    ["analyze", "transcode", "encrypt", "publish", "assemble"].forEach((stage) =>
+      setStage(stage, ""),
+    );
   }
 
   function setStatus(text, kind) {
@@ -845,13 +987,13 @@ function bootCreatorApp() {
     if (submitting || !selectedFile) return;
     const terms = validCopiesAndPrice();
     if (!terms) return;
-    terms.listing = await collectListing();
-
     submitting = true;
     refreshSubmitEnabled();
     setStatus("");
+    clearFailureDetails();
 
     try {
+      terms.listing = await collectListing();
       // "Analyze source" covers everything up to and including the upload:
       // this client did inspect the file (resolveMime/classifyProtection)
       // and transport it to Library storage.
@@ -862,6 +1004,9 @@ function bootCreatorApp() {
         throw new Error("Could not find your Library folder.");
       }
       const targetUri = targetUriFor(homeRoot.uri, selectedFile.name);
+      // Held so a recovery action can name the same object without recomputing
+      // it from a file input the creator may have changed since.
+      lastTargetUri = targetUri;
       const mime = resolveMime(selectedFile);
       const plan = uploadPlan(selectedFile.size);
       setStatus(
@@ -991,6 +1136,11 @@ function bootCreatorApp() {
       if (response.wallet_drift) {
         error.walletDrift = response.wallet_drift;
       }
+      // A mint already on record, with what this page may offer to do about it.
+      const creatorMint = creatorMintFrom(response);
+      if (creatorMint) {
+        error.creatorMint = creatorMint;
+      }
       // A closed approval is terminal, and deliberately NOT read as pending:
       // polling on it would wait out the whole budget for something that can
       // never complete.
@@ -1076,16 +1226,114 @@ function bootCreatorApp() {
     );
   }
 
+  /**
+   * Blame the stage that actually failed.
+   *
+   * This page drives one stage active -- "encrypt" -- for the whole
+   * protect-and-list round trip, because from here that is a single request.
+   * So `activeStageName` is only ever a guess, and for a listing failure it is
+   * a wrong one: it painted "Encrypt & escrow" red for a mint whose escrow had
+   * settled perfectly. When the server sends its progress with the refusal,
+   * that guess is replaced by the journal's own account, and the failed stage
+   * is the first one the server does not call done.
+   */
+  function failedStageFrom(progress) {
+    const mapped = stagesFromProgress(progress);
+    if (!mapped.length) return activeStageName;
+    const explicit = mapped.find((stage) => stage.state === "err");
+    if (explicit) return explicit.name;
+    const unfinished = mapped.find((stage) => stage.state !== "done");
+    return unfinished ? unfinished.name : activeStageName;
+  }
+
+  function clearFailureDetails() {
+    els.failureDetailsList.replaceChildren();
+    els.failureDetails.classList.add("hidden");
+    els.failureDetails.open = false;
+    els.recoveryActions.replaceChildren();
+    els.recoveryActions.classList.add("hidden");
+  }
+
+  function renderFailureDetails(error) {
+    const rows = failureDetailRows(error);
+    if (!rows.length) return;
+    for (const row of rows) {
+      const term = document.createElement("dt");
+      term.textContent = row.label;
+      const description = document.createElement("dd");
+      description.textContent = row.value;
+      els.failureDetailsList.append(term, description);
+    }
+    els.failureDetails.classList.remove("hidden");
+  }
+
+  // Only offer what there is a working operation behind. A button that
+  // explains itself and then does nothing is worse than no button, and the
+  // three blocked states genuinely differ: one can be discarded, one is
+  // waiting on an approval that is already out, and one is simply done.
+  function renderRecoveryActions(error) {
+    const mint = error?.creatorMint;
+    if (!mint || !mint.canDiscard || !lastTargetUri) return;
+    const targetUri = lastTargetUri;
+    const sourceFile = selectedFile;
+    const discard = document.createElement("button");
+    discard.className = "btn";
+    discard.type = "button";
+    discard.textContent = "Discard those terms and try again";
+    discard.addEventListener("click", () => {
+      void discardAndRetry(discard, targetUri, sourceFile);
+    });
+    els.recoveryActions.append(discard);
+    els.recoveryActions.classList.remove("hidden");
+  }
+
+  async function discardAndRetry(button, targetUri, sourceFile) {
+    if (submitting || button.disabled || selectedFile !== sourceFile || lastTargetUri !== targetUri) return;
+    if (!validCopiesAndPrice()) {
+      setStatus("Enter valid copies and a price before discarding the recorded terms.", "err");
+      return;
+    }
+    submitting = true;
+    button.disabled = true;
+    refreshSubmitEnabled();
+    try {
+      setStatus("Discarding the recorded terms...");
+      await discardProtectionAndRetry(targetUri, providerApi, async () => {
+        clearFailureDetails();
+        resetStages();
+        // Hand the same operation guard to the retry before its first await.
+        submitting = false;
+        await protectAndList();
+      });
+    } catch (error) {
+      if (error?.pending) showPending(error.pending);
+      else showFailure(error);
+    } finally {
+      submitting = false;
+      button.disabled = false;
+      refreshSubmitEnabled();
+    }
+  }
+
   // Prefer the server's actionable sentence over its stable one: the stable
   // message is deliberately the same across many causes, so on its own it
-  // tells the creator nothing they can act on.
+  // tells the creator nothing they can act on. Everything else the server said
+  // goes behind the disclosure rather than into the sentence.
   function showFailure(error) {
-    if (activeStageName) setStage(activeStageName, "err");
+    // Paint how far it got before blaming a stage, so the stages that did
+    // finish keep saying so.
+    applyServerProgress(error?.progress);
+    const failed = failedStageFrom(error?.progress);
+    if (failed) setStage(failed, "err");
     const actionable = error?.detail || error?.message;
     setStatus(String(actionable || error || "Protecting this file failed."), "err");
+    clearFailureDetails();
+    renderFailureDetails(error);
+    renderRecoveryActions(error);
   }
 
   function resetForAnotherFile() {
+    if (submitting) return;
     selectedFile = null;
     listed = false;
     els.fileInput.value = "";
@@ -1123,6 +1371,8 @@ function bootCreatorApp() {
     if (transcodeStage) transcodeStage.classList.add("hidden");
 
     els.successPanel.classList.add("hidden");
+    lastTargetUri = "";
+    clearFailureDetails();
     resetStages();
     setStatus("");
     refreshSubmitEnabled();

@@ -34,11 +34,12 @@ pub use mint::{
 pub use mint_journal::{
     ExclusiveFileLock, PersistedRuntimeMint, RuntimeContentAvailabilityRequirement,
     RuntimeContentIdentityV1, RuntimeCustodyTerminalKind, RuntimeMediaPreparationRecord,
-    RuntimeMediaPreparationState, RuntimeMintCreatorDesiredTerms, RuntimeMintCreatorEffectBinding,
-    RuntimeMintCreatorStage, RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence,
-    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintIntentContentV1, RuntimeMintJournal,
-    RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
-    RuntimeMintRoyaltyShare, RuntimeVerifiedContentAvailability,
+    RuntimeMediaPreparationState, RuntimeMintAbandonedRecordV1, RuntimeMintCreatorDesiredTerms,
+    RuntimeMintCreatorEffectBinding, RuntimeMintCreatorStage, RuntimeMintCreatorState,
+    RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft, RuntimeMintIntent,
+    RuntimeMintIntentContentV1, RuntimeMintIntentRecordScanV1, RuntimeMintJournal,
+    RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeEffectV1,
+    RuntimeMintNodeReceipt, RuntimeMintRoyaltyShare, RuntimeVerifiedContentAvailability,
     RuntimeVerifiedContentIdentityRootV1, RUNTIME_MINT_CREATOR_ROYALTY_UNITS,
 };
 pub use open::{

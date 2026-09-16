@@ -3748,9 +3748,13 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
 fn runtime_custody_creator_mint_blocked(
     mint_id: Digest32,
     existing: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+    progress: Option<serde_json::Value>,
 ) -> anyhow::Error {
-    let blocked =
+    let mut blocked =
         crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked::new(mint_id, existing);
+    if let Some(progress) = progress {
+        blocked = blocked.with_progress(progress);
+    }
     tracing::warn!(
         line = line!(),
         state = blocked.state_label(),
@@ -3816,6 +3820,7 @@ async fn runtime_custody_publish_creator_tail_from_facts(
             return Err(runtime_custody_creator_mint_blocked(
                 facts.mint_id,
                 existing,
+                Some(crate::protected_content_runtime::runtime_custody_creator_progress(&mint)),
             ));
         }
         // A mint keeps the account it started with, so a creator who changed
@@ -3971,7 +3976,7 @@ async fn runtime_custody_publish_creator_tail_from_facts(
         }
     } else {
         mint_journal
-            .bind_creator_effect(facts.mint_id, effect_binding.clone())
+            .bind_creator_effect(facts.mint_id, &creator_state, effect_binding.clone())
             .map_err(creator_mint_unavailable!())?;
     }
     let approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
@@ -4586,7 +4591,7 @@ mod tests {
         let recorded = test_creator_state();
 
         // Nothing raised: the recorded attempt may be dropped, or repeated.
-        let error = super::runtime_custody_creator_mint_blocked(mint_id, &recorded);
+        let error = super::runtime_custody_creator_mint_blocked(mint_id, &recorded, None);
         let blocked = error
             .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
             .expect("refusal must carry its reason as data");
@@ -4619,7 +4624,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let json = super::runtime_custody_creator_mint_blocked(mint_id, &raised)
+        let json = super::runtime_custody_creator_mint_blocked(mint_id, &raised, None)
             .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
             .expect("refusal must carry its reason as data")
             .as_json();
@@ -4631,7 +4636,7 @@ mod tests {
         let settled = raised
             .with_terminal(creator_terminal_evidence_for_test())
             .unwrap();
-        let json = super::runtime_custody_creator_mint_blocked(mint_id, &settled)
+        let json = super::runtime_custody_creator_mint_blocked(mint_id, &settled, None)
             .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
             .expect("refusal must carry its reason as data")
             .as_json();
@@ -4642,11 +4647,45 @@ mod tests {
 
     /// The refusal's own sentence stays plain, and no app is expected to read
     /// it: it is a fallback for surfaces that predate the typed answer.
+    /// A blocked mint says how far it got, so an app can show which stage the
+    /// existing attempt reached instead of only that one exists.
+    #[test]
+    fn runtime_custody_creator_mint_blocked_carries_progress_when_the_caller_has_it() {
+        let mint_id = elastos_protected_content_contracts::Digest32::new([0x11; 32]);
+        let progress = serde_json::json!({
+            "schema": crate::protected_content_runtime::RUNTIME_CUSTODY_CREATOR_PROGRESS_SCHEMA_V1,
+            "stages": [
+                { "id": "escrow", "state": "done" },
+                { "id": "publish", "state": "done" },
+                { "id": "listing", "state": "active" },
+            ],
+        });
+        let json = super::runtime_custody_creator_mint_blocked(
+            mint_id,
+            &test_creator_state(),
+            Some(progress.clone()),
+        )
+        .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>()
+        .expect("the refusal must stay typed")
+        .as_json();
+        assert_eq!(json["progress"], progress);
+
+        // A caller without the record leaves it out rather than guessing.
+        let without =
+            super::runtime_custody_creator_mint_blocked(mint_id, &test_creator_state(), None)
+                .downcast_ref::<crate::protected_content_runtime::RuntimeCustodyCreatorMintBlocked>(
+                )
+                .expect("the refusal must stay typed")
+                .as_json();
+        assert!(without.get("progress").is_none());
+    }
+
     #[test]
     fn runtime_custody_creator_mint_blocked_never_reuses_the_unavailable_sentence() {
         let error = super::runtime_custody_creator_mint_blocked(
             elastos_protected_content_contracts::Digest32::new([0x11; 32]),
             &test_creator_state(),
+            None,
         );
         assert_ne!(
             error.to_string(),

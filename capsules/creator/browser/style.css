@@ -404,9 +404,10 @@ textarea {
 
 /* The single progress tracker (dkms's collapsible encode/publish detail
    panel, repurposed as the one real stepper — the separate Upload/Protect/
-   List list this used to sit above was removed). Two of its five stages
-   ("Transcode & fragment", "Publish to storage") have no client-observable
-   signal and are marked .not-tracked; the rest are driven live. */
+   List list this used to sit above was removed). Every stage is now driven by
+   something real: "analyze" by this client's own upload, "encrypt", "publish"
+   and "assemble" by the server's journal, and "transcode" by the arrival of
+   that journal at all, which cannot happen before fragmenting finished. */
 .tech-progress {
   margin-top: 12px;
   padding: 10px 12px;
@@ -428,16 +429,6 @@ textarea {
 
 .tech-progress .hint {
   margin-top: 8px;
-}
-
-/* Marks a stage this client has no way to observe — its dot never becomes
-   active or done, so this note is the only signal for why it stays neutral
-   the whole time, instead of looking broken or forgotten. */
-.not-tracked {
-  color: var(--muted);
-  font-size: 0.7rem;
-  font-style: italic;
-  margin-left: 2px;
 }
 
 .steps {
@@ -527,4 +518,46 @@ textarea {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* The breakdown behind a failure. The status line above carries the one
+   sentence a creator can act on; this carries everything the server actually
+   said, for when that is not enough or when they are passing it on. Closed by
+   default so the common case stays one line. */
+.failure-details {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--el-radius-md);
+  background: var(--panel-soft);
+}
+
+.failure-details > summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.failure-details[open] > summary {
+  margin-bottom: 6px;
+}
+
+.failure-details-list {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  font-size: 0.78rem;
+}
+
+.failure-details-list dt {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.failure-details-list dd {
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
 }

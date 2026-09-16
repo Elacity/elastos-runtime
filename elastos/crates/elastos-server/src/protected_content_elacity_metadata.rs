@@ -40,6 +40,7 @@
 //! `verify_runtime_portable_metadata` reads `manifest.json` first and falls
 //! back to `metadata.json` for listings published before the rename.
 
+use elastos_protected_content_provider_contracts::ELASTOS_PQ_PROTECTION_SCHEME_V1;
 use serde_json::{json, Value};
 
 use crate::library::RuntimeCustodyListingTerms;
@@ -62,17 +63,6 @@ pub(crate) const ACCESS_TOKEN_FILE: &str =
     "0000000000000000000000000000000000000000000000000000000000000001.json";
 pub(crate) const ROYALTY_SHARE_FILE: &str =
     "0000000000000000000000000000000000000000000000000000000000000002.json";
-
-/// This Runtime's CEK-custody scheme, as named in the metadata.
-///
-/// A new value rather than a reuse: the Lit-shaped `protections[0]` the wiki
-/// schema describes, and the dKMS threshold type the sibling branch emits, both
-/// describe custody this Runtime does not perform. Protected content here is a
-/// 2-of-3 committee over independent custody nodes, so a reader that recognises
-/// the string knows which release protocol to speak, and one that does not is
-/// not misled into trying the wrong one.
-const RUNTIME_CUSTODY_PROTECTION_TYPE: &str = "cenc:elastos-runtime-custody-2of3-v1";
-const RUNTIME_CUSTODY_SCHEME: &str = "elastos-runtime-custody-2of3-v1";
 
 /// Everything the folder needs that is not the creator's own listing copy.
 pub(crate) struct ElacityMetadataInputs<'a> {
@@ -110,14 +100,28 @@ pub(crate) struct ElacityMetadataInputs<'a> {
 /// commitment stay in the runtime's own document and in the custody nodes: a
 /// buyer needs to know which committee to ask and under what policy, never any
 /// material that could shortcut asking.
+///
+/// `protectionType` is [`ELASTOS_PQ_PROTECTION_SCHEME_V1`] itself rather than a
+/// copy of its text. It is the same fact the `pssh` box in the init segment
+/// states as its `protection_scheme`, and the two must agree or a reader that
+/// found the folder first would speak a release protocol the box does not
+/// implement. Naming it twice is how they drifted once already, so there is now
+/// one definition and a test that holds the folder to it.
+///
+/// There is deliberately no second name for the scheme beside it. The threshold
+/// and node count are carried here as numbers, so a string that also spelled
+/// them out could contradict the data next to it; and the suites — how the
+/// samples are encrypted, and which key encapsulation the released key arrives
+/// under — are already stated canonically in the `pssh` payload
+/// (`content_encryption`, `key_encapsulation`). Restating either here would be
+/// a second source for a fact that already has one.
 pub(crate) fn runtime_custody_protection(
     threshold: u32,
     node_count: u32,
     rights_policy_identity_base64: &str,
 ) -> Value {
     json!({
-        "protectionType": RUNTIME_CUSTODY_PROTECTION_TYPE,
-        "scheme": RUNTIME_CUSTODY_SCHEME,
+        "protectionType": ELASTOS_PQ_PROTECTION_SCHEME_V1,
         // How many of how many must agree before a release happens.
         "threshold": threshold,
         "node_count": node_count,
@@ -208,7 +212,7 @@ fn metadata_json(
             "contentType": inputs.content_type,
             "mimeType": inputs.content_type,
             "object": "self://content.json",
-            "protectionType": [RUNTIME_CUSTODY_PROTECTION_TYPE],
+            "protectionType": [ELASTOS_PQ_PROTECTION_SCHEME_V1],
             "size": inputs.plaintext_bytes,
         },
         "asset": {
@@ -254,7 +258,7 @@ fn content_json(inputs: &ElacityMetadataInputs<'_>, title: &str) -> Value {
         "image": inputs.image,
         "properties": {
             "size": inputs.plaintext_bytes,
-            "protectionType": [RUNTIME_CUSTODY_PROTECTION_TYPE],
+            "protectionType": [ELASTOS_PQ_PROTECTION_SCHEME_V1],
             "kid": inputs.kid_0x,
         },
         "attributes": [
@@ -411,15 +415,27 @@ mod tests {
     fn the_protection_descriptor_carries_identity_and_no_material() {
         let files = elacity_metadata_files(None, &inputs()).unwrap();
         let protection = &parse(&files, "metadata.json")["asset"]["protections"][0];
+        // The same fact the `pssh` box states, from the same definition. A
+        // reader that finds the folder first and the box second must not be
+        // told two different release protocols -- which is exactly what
+        // happened while these were two constants.
         assert_eq!(
             protection["protectionType"],
-            RUNTIME_CUSTODY_PROTECTION_TYPE
+            elastos_protected_content_provider_contracts::ELASTOS_PQ_PROTECTION_SCHEME_V1
         );
         assert_eq!(protection["threshold"], 2);
         assert_eq!(protection["node_count"], 3);
         assert_eq!(protection["rights_policy_identity_base64"], "cG9saWN5");
+        // Four fields, not five: there is no second name for the scheme. The
+        // threshold is data here, so a string spelling "2of3" could contradict
+        // the numbers beside it, and the suites already have one home in the
+        // `pssh` payload.
         let fields: Vec<&String> = protection.as_object().unwrap().keys().collect();
-        assert_eq!(fields.len(), 5, "{protection}");
+        assert_eq!(fields.len(), 4, "{protection}");
+        assert!(
+            !protection.as_object().unwrap().contains_key("scheme"),
+            "{protection}"
+        );
         for forbidden in ["shares", "key_envelope", "commitment", "cek", "secret"] {
             assert!(
                 protection.get(forbidden).is_none(),

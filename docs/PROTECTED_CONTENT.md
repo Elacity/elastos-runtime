@@ -157,12 +157,25 @@ siblings, and still verify — the verifier tries `manifest.json` first and
 accepts the older layout only when the document there really is the runtime's.
 
 `asset.protections[0]` describes this Runtime's own custody, not the Lit-shaped
-slot the wiki schema describes nor the dKMS threshold type: a reader that
-recognises `cenc:elastos-runtime-custody-2of3-v1` knows which release protocol
-to speak, and one that does not is not misled into trying the wrong one. It
-carries identity only — the threshold, the node count and the rights policy
-that governs release — and never sealed shares, the key envelope or the
-commitment, which stay in the runtime's own document and in the custody nodes.
+slot the wiki schema describes: a reader that recognises
+`cenc:elastos-pq-hybrid-threshold-v1` knows which release protocol to speak, and
+one that does not is not misled into trying the wrong one. That string is not
+written here — the descriptor carries
+`ELASTOS_PQ_PROTECTION_SCHEME_V1`, the same constant the `pssh` box in the init
+segment states as its `protection_scheme`. The folder and the box name one
+protocol from one definition, because while they were two constants they drifted
+apart, and a reader that found the folder first would have spoken a protocol the
+box does not implement.
+
+The descriptor carries identity only — the threshold, the node count and the
+rights policy that governs release — and never sealed shares, the key envelope
+or the commitment, which stay in the runtime's own document and in the custody
+nodes. It deliberately carries no second name for the scheme beside the
+protection type: the threshold is here as numbers, so a string also spelling out
+"2 of 3" could contradict the data next to it, and the suites — how the samples
+are encrypted, and which key encapsulation the released key arrives under — are
+already stated once in the `pssh` payload as `content_encryption` and
+`key_encapsulation`.
 
 Royalties are carried in ERC-1155 `ROYALTY_SHARE` units, the chain's own
 denomination: 1000 exist per asset and one unit is 0.1% of the sale. A creator

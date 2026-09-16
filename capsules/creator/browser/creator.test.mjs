@@ -3,12 +3,15 @@ import test from "node:test";
 
 import {
   buildPublishBody,
+  discardProtectionAndRetry,
   classifyProtection,
   decimalIntegerToHexQuantity,
   humanSize,
   effectPendingFrom,
   resolveMime,
   scalePriceToBaseUnits,
+  creatorMintFrom,
+  failureDetailRows,
   stagesFromProgress,
   settledFrom,
   summarizeRoyaltyRows,
@@ -456,4 +459,158 @@ test("buildPublishBody carries a royalty split in chain units", () => {
   });
   const total = body.protection.listing.royalties.reduce((sum, row) => sum + row.units, 0);
   assert.equal(total, 950, "a split must come to the creator share exactly");
+});
+
+test("stagesFromProgress carries a failed stage across as the error class", () => {
+  // The server gained "failed" when an aborted custody terminal stopped being
+  // read as success. Without a mapping it would reach className verbatim and
+  // render as nothing at all, which is how a dead mint looked fine.
+  const mapped = stagesFromProgress({
+    stages: [
+      { id: "escrow", state: "failed" },
+      { id: "publish", state: "pending" },
+      { id: "listing", state: "pending" },
+    ],
+  });
+  assert.deepEqual(mapped, [
+    { name: "encrypt", state: "err" },
+    { name: "publish", state: "pending" },
+    { name: "assemble", state: "pending" },
+  ]);
+});
+
+test("stagesFromProgress drops a state this page cannot draw", () => {
+  const mapped = stagesFromProgress({
+    stages: [
+      { id: "escrow", state: "done" },
+      { id: "publish", state: "quantum" },
+    ],
+  });
+  assert.deepEqual(mapped, [{ name: "encrypt", state: "done" }]);
+});
+
+test("creatorMintFrom reads the typed refusal, not the sentence", () => {
+  assert.deepEqual(
+    creatorMintFrom({
+      status: "error",
+      message: "An earlier attempt to protect this file is still on record at different terms",
+      creator_mint: {
+        schema: "elastos.protected-content.creator-mint-blocked/v1",
+        state: "recorded_only",
+        mint_id: "ab12",
+        recorded_copies: "3",
+        recorded_price: "0.001",
+        can_discard: true,
+        can_resume: true,
+      },
+    }),
+    {
+      state: "recorded_only",
+      mintId: "ab12",
+      recordedCopies: "3",
+      recordedPrice: "0.001",
+      canDiscard: true,
+      canResume: true,
+    },
+  );
+});
+
+test("creatorMintFrom returns null when the server sent no such refusal", () => {
+  assert.equal(creatorMintFrom({ status: "error", message: "nope" }), null);
+  assert.equal(creatorMintFrom(null), null);
+});
+
+test("failureDetailRows breaks a failure down from typed fields only", () => {
+  const rows = failureDetailRows({
+    message: "Runtime custody creator mint is unavailable",
+    detail: "Discard the recorded terms to start over.",
+    progress: {
+      stages: [
+        { id: "escrow", state: "done" },
+        { id: "publish", state: "done" },
+        { id: "listing", state: "failed" },
+      ],
+    },
+    creatorMint: {
+      state: "recorded_only",
+      mintId: "ab12",
+      recordedCopies: "3",
+      recordedPrice: "0.001",
+      canDiscard: true,
+      canResume: true,
+    },
+  });
+  assert.deepEqual(rows, [
+    { label: "Reported", value: "Runtime custody creator mint is unavailable" },
+    { label: "Cause", value: "Discard the recorded terms to start over." },
+    {
+      label: "Progress",
+      value: "Encrypt & escrow: done, Publish to storage: done, Assemble listing: failed",
+    },
+    { label: "Existing attempt", value: "terms recorded, nothing sent to the chain" },
+    { label: "Its listing id", value: "ab12" },
+    { label: "Its recorded terms", value: "3 copies at 0.001" },
+  ]);
+});
+
+test("failureDetailRows does not repeat the stable message as its own cause", () => {
+  const rows = failureDetailRows({
+    message: "Protecting this file failed.",
+    detail: "Protecting this file failed.",
+  });
+  assert.deepEqual(rows, [{ label: "Reported", value: "Protecting this file failed." }]);
+});
+
+test("failureDetailRows names what a wait is waiting for", () => {
+  assert.deepEqual(
+    failureDetailRows({
+      message: "pending",
+      pending: { reason: "wallet_approval", awaitsPerson: true, connectorId: "metamask" },
+    }),
+    [
+      { label: "Reported", value: "pending" },
+      { label: "Waiting for", value: "a wallet approval in metamask" },
+    ],
+  );
+  assert.deepEqual(
+    failureDetailRows({
+      message: "pending",
+      pending: { reason: "chain_settlement", awaitsPerson: false, connectorId: "" },
+    }),
+    [
+      { label: "Reported", value: "pending" },
+      { label: "Waiting for", value: "the network to confirm the transaction" },
+    ],
+  );
+});
+
+test("failureDetailRows omits a field the server did not send", () => {
+  assert.deepEqual(failureDetailRows({}), []);
+  assert.deepEqual(failureDetailRows(null), []);
+});
+
+
+test("discard retries only after a receipt for the selected source", async () => {
+  const calls = [];
+  await discardProtectionAndRetry("localhost://owner/Creator/a.txt", async (op, body) => {
+    calls.push([op, body]);
+    return { schema: "elastos.library.protection-discarded/v1", uri: body.uri, discarded: true };
+  }, async () => calls.push("retry"));
+  assert.deepEqual(calls, [["discard_protection", { uri: "localhost://owner/Creator/a.txt" }], "retry"]);
+});
+
+test("discard refusal and malformed receipts never retry", async () => {
+  let retries = 0;
+  const retry = async () => { retries += 1; };
+  await assert.rejects(discardProtectionAndRetry("source", async () => { throw new Error("approval outstanding"); }, retry), /approval outstanding/);
+  for (const receipt of [{}, { schema: "elastos.library.protection-discarded/v1", uri: "other", discarded: true }, { schema: "elastos.library.protection-discarded/v1", uri: "source" }]) {
+    await assert.rejects(discardProtectionAndRetry("source", async () => receipt, retry), /confirm/);
+  }
+  assert.equal(retries, 0);
+});
+
+test("already discarded receipt safely permits retry", async () => {
+  let retried = false;
+  await discardProtectionAndRetry("source", async () => ({ schema: "elastos.library.protection-discarded/v1", uri: "source", discarded: false }), async () => { retried = true; });
+  assert.equal(retried, true);
 });

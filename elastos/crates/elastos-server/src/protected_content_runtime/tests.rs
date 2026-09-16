@@ -7315,8 +7315,12 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     }
     let mint_journal = RuntimeMintJournal::new(mint_root.clone());
     let custody_provisioned = mint_journal.load(mint_draft.mint_id()).unwrap();
-    assert!(custody_provisioned.any_effect_started());
     assert!(custody_provisioned.all_receipts_present());
+    assert_eq!(
+        custody_provisioned.uncertain_node_count(),
+        0,
+        "every node answered with a receipt, so none is left possibly holding a share"
+    );
     assert_eq!(custody_provisioned.accepted_orphans().len(), 3);
     let sealed_share_bytes = envelope.stored_shares()[0].canonical_bytes().unwrap();
     assert!(!any_file_contains(&mint_root, &sealed_share_bytes));
@@ -14380,4 +14384,94 @@ fn object_chunk_admission_bounds_the_request_by_the_chunk_count() {
         .is_err());
     // A previously released chunk is still refused by the ordering rule.
     assert!(record.require_object_chunk_index(0, CHUNK_COUNT).is_err());
+}
+
+/// The two codes the custody capsule emits only from paths that precede its
+/// durable write. Everything else — `backend_unavailable` above all, which the
+/// capsule returns both for a refusal before the write and for a failure after
+/// it — must stay uncertain.
+#[test]
+fn custody_refusal_codes_claim_no_effect_only_where_the_capsule_proves_it() {
+    for code in ["invalid_request", "provisioning_refused", "rights_denied"] {
+        assert_eq!(
+            super::classify_custody_failure(
+                "provision_node_share",
+                &super::ProviderInvocationFailure::Refused {
+                    code: code.to_string(),
+                    message: "refused".to_string(),
+                },
+            ),
+            RuntimeProviderCallError::RefusedWithoutEffect,
+            "{code} is emitted only before the durable write"
+        );
+    }
+    for code in ["backend_unavailable", "invalid_config", "unknown", ""] {
+        // `backend_unavailable` is the one that matters here: the capsule
+        // returns it both for a refusal before the write and for a failure
+        // after it.
+        assert_eq!(
+            super::classify_custody_failure(
+                "provision_node_share",
+                &super::ProviderInvocationFailure::Refused {
+                    code: code.to_string(),
+                    message: "refused".to_string(),
+                },
+            ),
+            RuntimeProviderCallError::NoExactResult,
+            "{code} spans acted and did-not-act paths"
+        );
+    }
+}
+
+/// A reply that never arrived is not a node that never acted: the capsule can
+/// complete its write and then fail to answer.
+#[test]
+fn a_missing_or_malformed_custody_reply_is_effect_uncertain() {
+    assert_eq!(
+        super::classify_custody_failure(
+            "provision_node_share",
+            &super::ProviderInvocationFailure::NotCompleted {
+                detail: "transport closed".to_string(),
+            },
+        ),
+        RuntimeProviderCallError::NoExactResult
+    );
+    assert_eq!(
+        super::classify_custody_failure(
+            "provision_node_share",
+            &super::ProviderInvocationFailure::MalformedResponse {
+                detail: "custody provider provision_node_share response is missing status"
+                    .to_string(),
+            },
+        ),
+        RuntimeProviderCallError::NoExactResult
+    );
+}
+
+/// Widening the typed layer must not change a single message the
+/// string-returning callers have always produced.
+#[test]
+fn classified_failures_format_exactly_as_before() {
+    assert_eq!(
+        super::ProviderInvocationFailure::NotCompleted {
+            detail: "boom".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share invocation failed: boom"
+    );
+    assert_eq!(
+        super::ProviderInvocationFailure::Refused {
+            code: "rights_denied".to_string(),
+            message: "no".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share rejected the request: rights_denied: no"
+    );
+    assert_eq!(
+        super::ProviderInvocationFailure::MalformedResponse {
+            detail: "custody provider provision_node_share response is missing data".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share response is missing data"
+    );
 }
