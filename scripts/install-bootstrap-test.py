@@ -686,47 +686,95 @@ class InstallationTests(unittest.TestCase):
                         self.assert_no_installation_effects(sandbox, before, result)
                 sandbox.respond("binary", RUNTIME_STUB)
                 sandbox.respond("components", COMPONENTS)
-                result, requests = sandbox.run("--install-only", transport=transport)
                 with self.subTest(transport=transport, case="clean rerun"):
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(requests, expected)
-                    self.assertIn("Runtime installed:", result.stdout)
-                    self.assertNotIn("Setting up Home", result.stdout)
-                    advertised = json.loads(release)["payload"]["platforms"]["x86_64-linux"]
-                    installed = sandbox.binary.read_bytes()
-                    self.assertEqual(installed, RUNTIME_STUB)
-                    self.assertEqual(hashlib.sha256(installed).hexdigest(), advertised["binary"]["sha256"])
-                    self.assertTrue(sandbox.binary.stat().st_mode & 0o100)
-                    self.assertTrue(os.access(sandbox.binary, os.X_OK))
-                    self.assertFalse((sandbox.binary.parent / ".elastos.install.tmp").exists())
-                    manifest = (sandbox.data / "components.json").read_bytes()
-                    self.assertEqual(manifest, COMPONENTS)
-                    self.assertEqual(hashlib.sha256(manifest).hexdigest(), advertised["components"]["sha256"])
-                    calls = sandbox.runtime_calls()
-                    self.assertEqual(calls[0], "--version")
-                    self.assertRegex(calls[1], "^principal-root-upgrade --data-dir %s --backup-dir %s/backups/principal-root-upgrade-[0-9]+-[0-9]+$"
-                                     % (re.escape(str(sandbox.data)), re.escape(str(sandbox.data))))
-                    self.assertEqual(len(calls), 2, "setup and Home launch stay out of --install-only")
-                    sources = json.loads((sandbox.data / "sources.json").read_text())
-                    self.assertEqual(sources["schema"], "elastos.trusted-sources/v1")
-                    source = sources["sources"][0]
-                    self.assertEqual((source["publisher_dids"], source["channel"], source["installed_version"], source["install_path"]),
-                                     ([did], "stable", "0.7.1", str(sandbox.binary)))
-                    self.assertEqual(source["discovery_uri"],
-                                     "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
-                    registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
-                    self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node")
-                                     if transport == "publisher" else ([], "head-a", "", ""))
-                    publisher = sandbox.data / "ElastOS/SystemServices/Publisher"
-                    self.assertEqual((publisher / "release-head.json").read_bytes(), head)
-                    self.assertEqual((publisher / "release.json").read_bytes(), release)
-                    after = sandbox.home_state()
-                    changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
-                    self.assertEqual(changed, {
-                        ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/sources.json",
-                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
-                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
-                    self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+                    self.assert_clean_install(sandbox, transport, did, head, release, before)
+
+    def assert_clean_install(self, sandbox, transport, did, head, release, before):
+        """A valid --install-only run in a sandbox that already holds an installation."""
+        sandbox.calls.unlink(missing_ok=True)
+        result, requests = sandbox.run("--install-only", transport=transport)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(requests, self.REQUESTS[transport])
+        self.assertIn("Runtime installed:", result.stdout)
+        self.assertNotIn("Setting up Home", result.stdout)
+        advertised = json.loads(release)["payload"]["platforms"]["x86_64-linux"]
+        installed = sandbox.binary.read_bytes()
+        self.assertEqual(installed, RUNTIME_STUB)
+        self.assertEqual(hashlib.sha256(installed).hexdigest(), advertised["binary"]["sha256"])
+        self.assertTrue(sandbox.binary.stat().st_mode & 0o100)
+        self.assertTrue(os.access(sandbox.binary, os.X_OK))
+        self.assertFalse((sandbox.binary.parent / ".elastos.install.tmp").exists())
+        manifest = (sandbox.data / "components.json").read_bytes()
+        self.assertEqual(manifest, COMPONENTS)
+        self.assertEqual(hashlib.sha256(manifest).hexdigest(), advertised["components"]["sha256"])
+        calls = sandbox.runtime_calls()
+        self.assertEqual(calls[0], "--version")
+        self.assertRegex(calls[1], "^principal-root-upgrade --data-dir %s --backup-dir %s/backups/principal-root-upgrade-[0-9]+-[0-9]+$"
+                         % (re.escape(str(sandbox.data)), re.escape(str(sandbox.data))))
+        self.assertEqual(len(calls), 2, "setup and Home launch stay out of --install-only")
+        sources = json.loads((sandbox.data / "sources.json").read_text())
+        self.assertEqual(sources["schema"], "elastos.trusted-sources/v1")
+        source = sources["sources"][0]
+        self.assertEqual((source["publisher_dids"], source["channel"], source["installed_version"], source["install_path"]),
+                         ([did], "stable", "0.7.1", str(sandbox.binary)))
+        self.assertEqual(source["discovery_uri"],
+                         "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
+        registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
+        self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node")
+                         if transport == "publisher" else ([], "head-a", "", ""))
+        publisher = sandbox.data / "ElastOS/SystemServices/Publisher"
+        self.assertEqual((publisher / "release-head.json").read_bytes(), head)
+        self.assertEqual((publisher / "release.json").read_bytes(), release)
+        after = sandbox.home_state()
+        changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+        self.assertEqual(changed, {
+            ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/sources.json",
+            "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
+            "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
+        self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_staged_executable_refusal_preserves_installation_then_valid_retry_installs(self):
+        # These binaries carry the signed, advertised hash; only the staged
+        # executable's own behavior can reject them, and that must happen
+        # before the current binary is replaced.
+        cases = [
+            ("wrong version", RUNTIME_STUB.replace(b"elastos 0.7.1", b"elastos 0.6.0"),
+             "version mismatch", ["--version"]),
+            ("nonzero exit with expected version in output",
+             RUNTIME_STUB.replace(b'echo "elastos 0.7.1" ;;', b'echo "elastos 0.7.1"; exit 3 ;;'),
+             "failed its version check (exit 3)", ["--version"]),
+            ("invalid executable", b"\x00\x01\x02 not an executable\n", "failed its version check", []),
+        ]
+        did, head, release = installable_fixture()
+        for transport in ["publisher", "cid"]:
+            with InstallerSandbox(head, release, did) as sandbox:
+                self.existing_installation(sandbox)
+                sandbox.respond("components", COMPONENTS)
+                sandbox.respond("bootstrap", BOOTSTRAP)
+                before = sandbox.home_state()
+                for name, binary, message, expected_calls in cases:
+                    _, served_head, served_release = installable_fixture(runtime=binary)
+                    sandbox.respond("release-head.json", served_head)
+                    sandbox.respond("release.json", served_release)
+                    sandbox.respond("binary", binary)
+                    sandbox.calls.unlink(missing_ok=True)
+                    result, requests = sandbox.run("--install-only", transport=transport)
+                    with self.subTest(transport=transport, case=name):
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(message, result.stderr)
+                        self.assertIn("the current installation was preserved", result.stderr)
+                        self.assertEqual(requests, self.REQUESTS[transport][:4])
+                        self.assertIn("Installing binary to", result.stdout)
+                        self.assertNotIn("Installing components.json", result.stdout)
+                        self.assertEqual(sandbox.runtime_calls(), expected_calls)
+                        self.assertFalse((sandbox.binary.parent / ".elastos.install.tmp").exists())
+                        self.assertEqual(sandbox.home_state(), before)
+                        self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+                sandbox.respond("release-head.json", head)
+                sandbox.respond("release.json", release)
+                sandbox.respond("binary", RUNTIME_STUB)
+                with self.subTest(transport=transport, case="valid retry"):
+                    self.assert_clean_install(sandbox, transport, did, head, release, before)
 
     def test_signature_and_binding_failures_reject_before_artifacts_in_populated_installation(self):
         did, head, release = installable_fixture()

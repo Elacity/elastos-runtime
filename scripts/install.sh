@@ -983,12 +983,20 @@ mkdir -p "$INSTALL_DIR"
 TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
 cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
 chmod +x "${TMP_INSTALL_BIN}"
-mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
 
-INSTALLED_VERSION_OUTPUT="$("${INSTALL_DIR}/elastos" --version 2>&1 || true)"
-if ! printf '%s' "${INSTALLED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; then
-    die "Installed binary version mismatch at ${INSTALL_DIR}/elastos\n  Expected: ${RELEASE_VERSION}\n  Got:      ${INSTALLED_VERSION_OUTPUT:-<no output>}"
+# The staged executable must run and report the release version before it
+# replaces the current binary. A refusal removes only this staged copy.
+STAGED_VERSION_STATUS=0
+STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>&1)" || STAGED_VERSION_STATUS=$?
+if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
+    rm -f "${TMP_INSTALL_BIN}"
+    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}"
 fi
+if ! printf '%s' "${STAGED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; then
+    rm -f "${TMP_INSTALL_BIN}"
+    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}"
+fi
+mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
 
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")
