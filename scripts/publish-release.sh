@@ -1183,6 +1183,226 @@ publish_prepared_platform_inputs() {
     SHELL_CID='' SHELL_SHA256=''
 }
 
+# The Publisher root serves stable paths: release-head.json, release.json,
+# install.sh and artifacts/<name>. A prepared set is checked against its own
+# signed metadata, staged beside the current publication, then promoted by
+# per-file rename with release-head.json last, so a reader sees the previous
+# head until every advertised byte is in place. Renames are atomic per file,
+# not per release: a reader that already holds the previous head can still meet
+# replaced artifact bytes at a stable path and fails closed on its checksum.
+verify_release_publication_set() {
+    local head="$1" release="$2" install="$3" artifact_dir="$4"
+    python3 - "$head" "$release" "$install" "$artifact_dir" <<'PY'
+import hashlib
+import importlib.util
+import json
+import stat
+import sys
+from pathlib import Path
+
+head_path, release_path, install_path, artifact_root = (Path(p) for p in sys.argv[1:5])
+spec = importlib.util.spec_from_file_location(
+    "components_integrity", "scripts/components-release-integrity-check.py")
+integrity = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(integrity)
+
+
+def regular(path, label):
+    if path.is_symlink() or not path.exists() or not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError(f"{label} must be a regular file: {path}")
+    data = path.read_bytes()
+    if not data:
+        raise ValueError(f"{label} is empty: {path}")
+    return data
+
+
+def envelope(data, schema, label):
+    try:
+        value = json.loads(data)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not valid JSON: {exc}")
+    payload = value.get("payload") if isinstance(value, dict) else None
+    if not isinstance(payload, dict) or payload.get("schema") != schema:
+        raise ValueError(f"{label} is not a {schema} envelope")
+    if any(not isinstance(value.get(k), str) or not value[k] for k in ("signature", "signer_did")):
+        raise ValueError(f"{label} is missing its signature or signer")
+    return payload
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+try:
+    release_bytes = regular(release_path, "release.json")
+    head = envelope(regular(head_path, "release-head.json"), "elastos.release.head/v1", "release-head.json")
+    release = envelope(release_bytes, "elastos.release/v1", "release.json")
+    regular(install_path, "install.sh")
+    if head.get("release_sha256") != digest(release_bytes):
+        raise ValueError("release-head.json does not bind these release.json bytes")
+    for field in ("version", "channel"):
+        if not isinstance(head.get(field), str) or not head[field] or release.get(field) != head[field]:
+            raise ValueError(f"release-head.json and release.json {field} differ")
+    if artifact_root.is_symlink() or not artifact_root.is_dir():
+        raise ValueError(f"artifact directory must be a regular directory: {artifact_root}")
+    present = {}
+    for entry in artifact_root.iterdir():
+        if (entry.name.startswith(".") or "\\" in entry.name or entry.is_symlink()
+                or not stat.S_ISREG(entry.lstat().st_mode)):
+            raise ValueError(f"artifact entries must be plain regular files: {entry.name}")
+        present[entry.name] = entry
+    platforms = release.get("platforms")
+    if not isinstance(platforms, dict) or not platforms:
+        raise ValueError("release.json advertises no platforms")
+    referenced = set()
+    errors = []
+    for platform, descriptor in sorted(platforms.items()):
+        setup = next((s for s, r in integrity.RELEASE_PLATFORMS.items() if r == platform), None)
+        if setup is None:
+            raise ValueError(f"release.json advertises an unknown platform: {platform}")
+        for kind, name in (("binary", f"elastos-{platform}"), ("components", f"components-{platform}.json")):
+            if name not in present:
+                raise ValueError(f"advertised artifact is missing: {name}")
+            data = present[name].read_bytes()
+            info = descriptor.get(kind) if isinstance(descriptor, dict) else None
+            if not isinstance(info, dict) or info.get("sha256") != digest(data) or info.get("size") != len(data):
+                raise ValueError(f"advertised {kind} differs from its bytes: {name}")
+            referenced.add(name)
+        try:
+            manifest = json.loads(present[f"components-{platform}.json"].read_bytes())
+        except ValueError as exc:
+            raise ValueError(f"components-{platform}.json is not valid JSON: {exc}")
+        errors += integrity.audit_release_artifacts(manifest, [setup], artifact_root)
+        for component in (manifest.get("external") or {}).values():
+            if not isinstance(component, dict):
+                continue
+            for entry in (component, component.get("capsule_metadata")):
+                if isinstance(entry, dict):
+                    _, info = integrity.resolve_platform_info(entry, setup)
+                    if isinstance(info, dict) and isinstance(info.get("release_path"), str):
+                        referenced.add(info["release_path"])
+        for name, entry in (manifest.get("capsules") or {}).items():
+            if isinstance(entry, dict) and platform in (entry.get("platforms") or []):
+                referenced.add(f"{name}-{platform}.capsule.tar.gz")
+    if errors:
+        raise ValueError("; ".join(errors))
+    extra = sorted(set(present) - referenced)
+    if extra:
+        raise ValueError(f"prepared artifacts are not advertised by this release: {extra}")
+except (OSError, ValueError, TypeError, AttributeError) as exc:
+    raise SystemExit(f"Release publication set rejected: {exc}")
+PY
+}
+
+reject_release_publication_collision() {
+    if [[ -L "$1" ]] || [[ -e "$1" && ! -f "$1" ]]; then
+        die "Publisher destination must be a regular file or absent: $1"
+    fi
+}
+
+check_release_publication_destinations() {
+    local publisher_root="$1" artifact_dir="$2"
+    local source destination
+    if [[ -e "$publisher_root" || -L "$publisher_root" ]] && [[ ! -d "$publisher_root" ]]; then
+        die "Publisher root is not a directory: ${publisher_root}"
+    fi
+    if [[ -L "${publisher_root}/artifacts" ]] || \
+       [[ -e "${publisher_root}/artifacts" && ! -d "${publisher_root}/artifacts" ]]; then
+        die "Publisher artifacts path must be a regular directory: ${publisher_root}/artifacts"
+    fi
+    for source in "${artifact_dir}"/*; do
+        reject_release_publication_collision "${publisher_root}/artifacts/$(basename "$source")"
+    done
+    for destination in install.sh release.json release-head.json; do
+        reject_release_publication_collision "${publisher_root}/${destination}"
+    done
+}
+
+copy_release_publication_file() {
+    cp "$1" "$2" || return
+    cmp -s "$1" "$2"
+}
+
+stage_release_publication() {
+    local scratch="$1" head="$2" release="$3" install="$4" artifact_dir="$5"
+    local source
+    mkdir -p "${scratch}/staged/artifacts" "${scratch}/previous/artifacts" || return
+    for source in "${artifact_dir}"/*; do
+        copy_release_publication_file "$source" "${scratch}/staged/artifacts/$(basename "$source")" || return
+    done
+    copy_release_publication_file "$install" "${scratch}/staged/install.sh" || return
+    copy_release_publication_file "$release" "${scratch}/staged/release.json" || return
+    copy_release_publication_file "$head" "${scratch}/staged/release-head.json" || return
+}
+
+# The current file keeps a hard link under the attempt's scratch so a failed
+# rename can put it back without a moment where the path is absent. The path
+# is recorded as pending before its rename, so restore always sees a replaced
+# file even when bookkeeping fails afterwards.
+promote_release_publication_file() {
+    local scratch="$1" relative="$2" destination="$3"
+    if [[ -f "$destination" ]]; then
+        ln "$destination" "${scratch}/previous/${relative}" || return
+    fi
+    printf '%s\n' "$relative" >> "${scratch}/promoted" || return
+    mv -f "${scratch}/staged/${relative}" "$destination"
+}
+
+promote_release_publication() {
+    local scratch="$1" publisher_root="$2"
+    local staged relative
+    : > "${scratch}/promoted" || return
+    for staged in "${scratch}/staged/artifacts"/* "${scratch}/staged/install.sh" \
+        "${scratch}/staged/release.json" "${scratch}/staged/release-head.json"; do
+        relative="${staged#"${scratch}/staged/"}"
+        promote_release_publication_file "$scratch" "$relative" "${publisher_root}/${relative}" || return
+    done
+}
+
+restore_release_publication() {
+    local scratch="$1" publisher_root="$2"
+    local relative previous status=0
+    [[ -f "${scratch}/promoted" ]] || return 0
+    while IFS= read -r relative; do
+        previous="${scratch}/previous/${relative}"
+        if [[ -f "$previous" ]]; then
+            # A pending path whose rename never ran still shares the saved inode.
+            if [[ ! "$previous" -ef "${publisher_root}/${relative}" ]]; then
+                mv -f "$previous" "${publisher_root}/${relative}" || status=1
+            fi
+        else
+            rm -f "${publisher_root}/${relative}" || status=1
+        fi
+    done < "${scratch}/promoted"
+    return "$status"
+}
+
+export_release_publication() {
+    local publisher_root="$1" head="$2" release="$3" install="$4" artifact_dir="$5"
+    local scratch stale
+    verify_release_publication_set "$head" "$release" "$install" "$artifact_dir" || return
+    check_release_publication_destinations "$publisher_root" "$artifact_dir" || return
+    mkdir -p "${publisher_root}/artifacts" || return
+    for stale in "${publisher_root}"/.publish-release.*; do
+        if [[ -e "$stale" ]]; then
+            warn "Staging from an interrupted publication attempt remains: ${stale}"
+        fi
+    done
+    scratch=$(mktemp -d "${publisher_root}/.publish-release.XXXXXX") || return
+    if ! stage_release_publication "$scratch" "$head" "$release" "$install" "$artifact_dir"; then
+        rm -rf "$scratch"
+        die "Failed to stage the release publication set; the current publication is unchanged"
+    fi
+    if ! promote_release_publication "$scratch" "$publisher_root"; then
+        if restore_release_publication "$scratch" "$publisher_root"; then
+            rm -rf "$scratch"
+            die "Failed to promote the release publication set; the previous publication was restored"
+        fi
+        die "Failed to promote the release publication set and could not restore every previous file; inspect ${scratch}"
+    fi
+    rm -rf "$scratch"
+}
+
 # Sourcing exposes local builders without invoking the publisher.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
@@ -2441,12 +2661,8 @@ info "Installer CID: ${INSTALL_SCRIPT_CID}"
 # Save release metadata to runtime-owned publisher state for gateway serving.
 RUNTIME_DATA_DIR="${HOST_DATA_DIR}"
 PUBLISHER_ROOT="${RUNTIME_DATA_DIR}/ElastOS/SystemServices/Publisher"
-PUBLISHER_ARTIFACTS_DIR="${PUBLISHER_ROOT}/artifacts"
-mkdir -p "${PUBLISHER_ARTIFACTS_DIR}"
-cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
-cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
-cp "$STAMPED_INSTALL" "${PUBLISHER_ROOT}/install.sh"
-cp "${PREPARED_ARTIFACTS_DIR}"/* "${PUBLISHER_ARTIFACTS_DIR}/"
+export_release_publication "$PUBLISHER_ROOT" \
+    "${TMPDIR}/release-head.json" "${TMPDIR}/release.json" "$STAMPED_INSTALL" "$PREPARED_ARTIFACTS_DIR"
 info "Saved release artifacts to ${PUBLISHER_ROOT} for gateway serving"
 
 # ── Step 10: Start public gateway URL (best-effort) ──────────────────
