@@ -2051,9 +2051,20 @@ async fn library_publish(
             )
             .await?
         };
+        // The minted item is the capsule, filed on the shelf its kind belongs
+        // to -- that is what the creator opens, and what carries the mint the
+        // viewer binds its session to. The source file is left untouched.
+        let capsule_uri = write_runtime_custody_capsule(
+            data_dir,
+            principal_id,
+            &target.localhost_root,
+            &target.uri,
+            content_type,
+            &facts,
+        )?;
         let record = LibraryPublishRecord {
             schema: "elastos.library.publish-record/v1".to_string(),
-            object_uri: target.uri.clone(),
+            object_uri: capsule_uri.clone(),
             cid: facts.content_cid.clone(),
             published_at: now_ts(),
             unpublished_at: None,
@@ -2066,16 +2077,26 @@ async fn library_publish(
             listing_uri: facts.listing_uri,
         };
         write_publish_record(data_dir, principal_id, &record)?;
-        let object = library_object(data_dir, principal_id, &target.uri)?;
+        // The capsule is the item, but the source keeps a marker of its own so
+        // it still reads as minted: without one it would look like an ordinary
+        // unpublished file and the Library would offer to mint it all over
+        // again. The marker names the capsule it produced, so the two are
+        // never mistaken for independent mints of the same bytes.
+        let mut source_marker = record.clone();
+        source_marker.object_uri = target.uri.clone();
+        source_marker.content_security["minted_capsule_uri"] = json!(capsule_uri);
+        write_publish_record(data_dir, principal_id, &source_marker)?;
+        let object = library_object(data_dir, principal_id, &capsule_uri)?;
         append_library_event(
             data_dir,
             principal_id,
             "publish",
-            &target.uri,
+            &capsule_uri,
             json!({
                 "cid": facts.content_cid,
                 "content_id": facts.content_id,
                 "mint_id": hex::encode(facts.mint_id.as_bytes()),
+                "source_object_uri": target.uri,
                 "listing_uri": record.listing_uri,
                 "availability": record.availability,
                 "object": object,
@@ -5755,6 +5776,7 @@ pub(crate) fn principal_root_protected_object_inventory(
         "Documents",
         "Pictures",
         "Videos",
+        "Music",
         "Downloads",
         "Public",
         ".Trash",
@@ -5822,12 +5844,134 @@ fn record_is_runtime_custody(record: &LibraryPublishRecord) -> bool {
         == Some(RUNTIME_CUSTODY_PUBLISHED_PAYLOAD)
 }
 
+/// The Library folder a freshly minted protected item is filed under, so it
+/// lands where the shelf for its kind already is: images in Pictures, video in
+/// Videos, audio in Music, and everything else -- PDF, text, EPUB, 3D, source
+/// -- in Documents.
+///
+/// Placement keys off the ORIGINAL asset mime, never off the on-disk name: the
+/// item written is a `.ddrm` capsule whose own extension says nothing about
+/// what it protects. Every folder named here must also be a `library_roots`
+/// entry, or the item lands somewhere the sidebar cannot reach.
+/// The on-disk shape of a minted Library item.
+const RUNTIME_CUSTODY_CAPSULE_SCHEMA: &str = "elastos.library.protected-content-capsule/v1";
+/// A capsule is a JSON document; its `.ddrm` suffix names the kind of item it
+/// is, not a media type the Library can render on its own.
+const RUNTIME_CUSTODY_CAPSULE_MIME: &str = "application/json";
+/// How many names a capsule tries before giving up, so a collision suffixes
+/// rather than overwrites and a pathological loop still terminates.
+const RUNTIME_CUSTODY_CAPSULE_NAME_ATTEMPTS: usize = 64;
+
+pub(crate) fn library_folder_for_mime(mime: &str) -> &'static str {
+    let mime = mime.trim().to_ascii_lowercase();
+    if mime.starts_with("image/") {
+        "Pictures"
+    } else if mime.starts_with("video/") {
+        "Videos"
+    } else if mime.starts_with("audio/") {
+        "Music"
+    } else {
+        "Documents"
+    }
+}
+
+/// The Library name for a minted capsule: the source object's name with its
+/// original extension dropped, since the capsule carries the real MIME in its
+/// record and its own `.ddrm` suffix is what names the kind of file it is.
+fn runtime_custody_capsule_base_name(display_name: &str) -> String {
+    // `file_stem` drops the source extension and, on anything that still looks
+    // like a path, keeps only the final segment -- so a name can never walk out
+    // of the folder the capsule is being filed into.
+    let stem = Path::new(display_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let cleaned = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.is_empty() || cleaned.chars().all(|ch| ch == '.') {
+        "protected-content".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Write the minted asset into the Library as a `.ddrm` capsule, filed on the
+/// shelf its kind belongs to, and answer the URI it landed at.
+///
+/// The capsule is the openable item: it carries the mint identity the viewer
+/// binds a session to, and it names the encrypted content by CID rather than
+/// carrying any of it, so no plaintext and no second copy of the ciphertext
+/// comes to rest here. The creator's original file is left exactly where it
+/// was -- publishing is not a reason to move or delete someone's file.
+///
+/// A name already taken is suffixed rather than overwritten, so minting the
+/// same source twice produces two items instead of silently replacing one.
+fn write_runtime_custody_capsule(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    source_object_uri: &str,
+    asset_mime: &str,
+    facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+) -> anyhow::Result<String> {
+    let folder = library_folder_for_mime(asset_mime);
+    let base = runtime_custody_capsule_base_name(&facts.display_name);
+    let capsule = json!({
+        "schema": RUNTIME_CUSTODY_CAPSULE_SCHEMA,
+        "display_name": facts.display_name,
+        "asset_mime": asset_mime,
+        "source_object_uri": source_object_uri,
+        "mint_id": hex::encode(facts.mint_id.as_bytes()),
+        "content_id": facts.content_id,
+        "content_cid": facts.content_cid,
+        "listing_uri": facts.listing_uri,
+        "availability": facts.availability,
+    });
+    let bytes = serde_json::to_vec_pretty(&capsule)?;
+    let mut last_error = None;
+    for attempt in 1..=RUNTIME_CUSTODY_CAPSULE_NAME_ATTEMPTS {
+        let name = if attempt == 1 {
+            format!("{base}.ddrm")
+        } else {
+            format!("{base} ({attempt}).ddrm")
+        };
+        let uri = format!("{localhost_root}/{folder}/{name}");
+        match write_library_file_bytes(
+            data_dir,
+            principal_id,
+            &uri,
+            Some(RUNTIME_CUSTODY_CAPSULE_MIME),
+            None,
+            true,
+            &bytes,
+        ) {
+            Ok(_) => return Ok(uri),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("library could not write the protected capsule")))
+}
+
 fn runtime_custody_library_identity_metadata(record: &LibraryPublishRecord) -> Option<Value> {
     record_is_runtime_custody(record).then(|| {
         json!({
             "schema": "elastos.library.protected-content-identity/v1",
             "content_id": record.content_security.get("content_id"),
             "mint_id": record.content_security.get("mint_id"),
+            // What the capsule protects. `mime_for_name` can only see a
+            // `.ddrm` extension, so without this the viewer would have no way
+            // to tell a protected film from a protected PDF.
+            "asset_mime": record.content_security.get("asset_mime"),
             "published_cid": record.cid,
             "availability": record.availability,
         })
@@ -6264,6 +6408,7 @@ fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
             "directory",
         ),
         ("videos", "Videos", format!("{root}/Videos"), "directory"),
+        ("music", "Music", format!("{root}/Music"), "directory"),
         (
             "downloads",
             "Downloads",
@@ -7046,6 +7191,53 @@ fn anyhow_error_detail(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A minted item must land on the shelf its own kind lives on, and every
+    /// shelf named here must be reachable from the sidebar -- an item filed
+    /// into a folder that is not a Library root is an item the creator cannot
+    /// get to.
+    #[test]
+    fn minted_items_are_filed_by_kind_onto_reachable_shelves() {
+        for (mime, expected) in [
+            ("image/png", "Pictures"),
+            ("IMAGE/JPEG", "Pictures"),
+            ("video/mp4", "Videos"),
+            ("audio/mpeg", "Music"),
+            ("  audio/aac  ", "Music"),
+            ("application/pdf", "Documents"),
+            ("text/plain", "Documents"),
+            ("", "Documents"),
+        ] {
+            let folder = super::library_folder_for_mime(mime);
+            assert_eq!(folder, expected, "mime={mime}");
+            let roots = super::library_roots(std::path::Path::new("/tmp"), "person:local:shelf");
+            assert!(
+                roots
+                    .iter()
+                    .any(|root| root.uri.ends_with(&format!("/{folder}"))),
+                "{folder} must be a Library root, or a {mime} mint lands out of reach"
+            );
+        }
+    }
+
+    /// The capsule drops the source extension (its own `.ddrm` names the kind
+    /// of item it is) and never lets a name escape its folder.
+    #[test]
+    fn capsule_names_drop_the_source_extension_and_cannot_traverse() {
+        for (display_name, expected) in [
+            ("holiday.jpeg", "holiday"),
+            ("report.final.pdf", "report.final"),
+            ("no-extension", "no-extension"),
+            ("../../etc/passwd", "passwd"),
+            ("..", "protected-content"),
+            (".hidden", ".hidden"),
+            ("", "protected-content"),
+        ] {
+            let base = super::runtime_custody_capsule_base_name(display_name);
+            assert_eq!(base, expected, "display_name={display_name}");
+            assert!(!base.contains('/'), "display_name={display_name}");
+        }
+    }
+
     #[test]
     fn viewer_ids_for_name_only_names_installed_capsule_ids() {
         for name in ["clip.mp4", "photo.png", "photo.jpg", "art.gif", "song.mp3"] {

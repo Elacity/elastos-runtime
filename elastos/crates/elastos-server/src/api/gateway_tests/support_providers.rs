@@ -765,6 +765,18 @@ impl Provider for MockChainProvider {
                         "message": "mock protected-content mint receipt requires BUY_ONCE op type"
                     }));
                 }
+                // The mint emits its own `ItemListed`, so a receipt carries the
+                // listing it created. The fixture mirrors what the verified
+                // listing below reports, because on chain they are one event.
+                let fixture = mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let pay_token = if fixture.native_purchase {
+                    "0x0000000000000000000000000000000000000000".to_string()
+                } else {
+                    MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_string()
+                };
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -772,7 +784,10 @@ impl Provider for MockChainProvider {
                         "network": required_test_str(request, "network")?,
                         "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
                         "token_id": MOCK_PROTECTED_CONTENT_TOKEN_ID,
-                        "operative": MOCK_PROTECTED_CONTENT_OPERATIVE
+                        "operative": MOCK_PROTECTED_CONTENT_OPERATIVE,
+                        "quantity": fixture.listing_quantity,
+                        "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+                        "pay_token": pay_token
                     }
                 }))
             }

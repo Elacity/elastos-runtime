@@ -47,7 +47,7 @@ Section 2 states both.
 **A CENC `pssh` box now ships inside the public media file.** Protected fMP4
 init segments carry a Protection System Specific Header for DRM system id
 `b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0`, protection scheme
-`cenc:elastos-pq-hybrid-threshold-v0`. Its `Data` payload is JSON describing
+`cenc:elastos-pq-hybrid-threshold-v1`. Its `Data` payload is JSON describing
 the scheme. It is a public descriptor by design and carries no key material —
 see the threat model in section 3.
 
@@ -243,7 +243,7 @@ not of the cipher.
 Built and parsed only in
 `elastos-protected-content-provider-contracts/src/pssh.rs`. System id
 `b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0`, protection scheme
-`cenc:elastos-pq-hybrid-threshold-v0`, payload schema
+`cenc:elastos-pq-hybrid-threshold-v1`, payload schema
 `elastos.protected-content.cenc-pssh-data/v1`. The `Data` payload is JSON with
 a fixed field set: the two suite ids, the 16-byte content access id (which is
 also the `tenc` default KID), and the custody pool, epoch, and

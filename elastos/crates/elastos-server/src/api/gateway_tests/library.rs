@@ -10135,6 +10135,43 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     let mint_id = elastos_protected_content_contracts::Digest32::new(
         hex::decode(&mint_id_hex).unwrap().try_into().unwrap(),
     );
+    // The minted item is a `.ddrm` capsule filed by the asset's own kind -- a
+    // PDF belongs on the Documents shelf -- and it, not the source file, is
+    // what the publish hands back as the Library object.
+    let capsule_uri = publish_ok["data"]["object"]["uri"].as_str().unwrap();
+    assert_eq!(
+        capsule_uri,
+        format!("{creator_root}/Documents/protected-object-proof.ddrm"),
+        "{publish_ok}"
+    );
+    // The capsule's extension cannot say what it protects, so the viewer routes
+    // on the mime the gateway recorded instead.
+    assert_eq!(
+        publish_ok["data"]["object"]["metadata"]["protected_content"]["asset_mime"],
+        "application/pdf",
+        "{publish_ok}"
+    );
+    // Publishing is not a reason to move or delete the creator's own file --
+    // and the source keeps a marker of its own, so it still reads as minted
+    // and the Library will not offer to mint the same bytes a second time.
+    let (source_status, source) =
+        post_library(app.clone(), &creator_token, "stat", json!({ "uri": uri })).await;
+    assert_eq!(source_status, StatusCode::OK);
+    assert_eq!(
+        source["status"], "ok",
+        "the source object must survive its own publish: {source}"
+    );
+    assert_eq!(source["data"]["object"]["published"], true, "{source}");
+    assert_eq!(
+        source["data"]["object"]["metadata"]["protected_content"]["mint_id"],
+        serde_json::Value::String(
+            publish_ok["data"]["content_security"]["mint_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        ),
+        "{source}"
+    );
     // An object publish now runs the SAME creator tail as media: encrypted
     // content, metadata document and portable listing are all published.
     assert_eq!(mock_content_publish_request_count(), 3);

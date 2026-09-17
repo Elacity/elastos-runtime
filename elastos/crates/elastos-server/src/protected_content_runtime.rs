@@ -141,6 +141,106 @@ struct RuntimeMediaToolImport {
     path: PathBuf,
     created: bool,
 }
+/// One critical step of a mint, traced at both ends.
+///
+/// Every trace on this path used to be an *end* marker -- "protected",
+/// "provisioned", "verified". With only those, a step that is slow and a step
+/// that is stuck look identical until it finishes, which is why a publish that
+/// took nineteen minutes could not be attributed to any phase afterwards. A
+/// step now announces itself before it begins and reports how long it took when
+/// it stops.
+///
+/// It reports even when it stops by failing: the end is logged from `Drop`, so
+/// an early `?` return still leaves a boundary in the log, marked `abandoned`
+/// rather than `ok`. That is the case worth seeing, and it is the one an
+/// explicit call at the end of the happy path would always miss.
+///
+/// DEBUG on purpose. An operator at INFO wants the outcome, not the itinerary;
+/// this is for whoever is asking where the time went.
+pub(crate) struct RuntimeMintStep {
+    name: &'static str,
+    request_id: String,
+    started: std::time::Instant,
+    outcome: &'static str,
+    repeating: bool,
+}
+
+impl RuntimeMintStep {
+    /// A step that happens once in a publish.
+    pub(crate) fn begin(name: &'static str, request_id: &str) -> Self {
+        tracing::debug!(step = name, %request_id, "runtime custody step: begin");
+        Self {
+            name,
+            request_id: request_id.to_string(),
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+            repeating: false,
+        }
+    }
+
+    /// A step re-run by every poll of a wait.
+    ///
+    /// TRACE, not DEBUG. Waiting for a wallet approval or for a block to
+    /// finalise means re-entering the same three steps every few seconds for
+    /// minutes on end, and at DEBUG that repetition buries the things that
+    /// happen once. What a reader needs from a wait is when it started and when
+    /// it ended -- both of which are logged at DEBUG elsewhere -- not a
+    /// transcript of every time nothing changed.
+    pub(crate) fn begin_repeating(name: &'static str, request_id: &str) -> Self {
+        tracing::trace!(step = name, %request_id, "runtime custody step: begin");
+        Self {
+            name,
+            request_id: request_id.to_string(),
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+            repeating: true,
+        }
+    }
+
+    /// Mark the step as having run to completion. Anything that returns before
+    /// this is reached is reported as abandoned.
+    pub(crate) fn ok(mut self) {
+        self.outcome = "ok";
+    }
+
+    /// Mark the step as having stopped because what it waits for has not
+    /// happened yet.
+    ///
+    /// Without this, a chain answer of "not finalized yet" -- the expected
+    /// shape of that wait, repeated every few seconds -- reads identically to a
+    /// step that fell over. Distinguishing them is the whole point of recording
+    /// an outcome, and `abandoned` is only useful if it stays rare.
+    pub(crate) fn pending(mut self) {
+        self.outcome = "pending";
+    }
+}
+
+impl Drop for RuntimeMintStep {
+    fn drop(&mut self) {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        // A repeating step that ends badly is still worth DEBUG: the point of
+        // quietening the loop is to hide the times nothing happened, not the
+        // time something did.
+        if self.repeating && self.outcome != "abandoned" {
+            tracing::trace!(
+                step = self.name,
+                request_id = %self.request_id,
+                outcome = self.outcome,
+                elapsed_ms,
+                "runtime custody step: end"
+            );
+            return;
+        }
+        tracing::debug!(
+            step = self.name,
+            request_id = %self.request_id,
+            outcome = self.outcome,
+            elapsed_ms,
+            "runtime custody step: end"
+        );
+    }
+}
+
 pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
     "Runtime custody composition is not configured";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
@@ -5562,6 +5662,8 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
             return load_completed_runtime_mint_object_facts(&mint_journal, &input, mint_id);
         }
     }
+    let request_id = hex::encode(mint_intent.request_id().as_bytes());
+    let step = RuntimeMintStep::begin("protect", &request_id);
     let protected = protect_runtime_custody_object(
         &registry,
         &mint_journal,
@@ -5571,12 +5673,16 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
         &mint_intent,
     )
     .await?;
-    tracing::info!(
-        request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+    step.ok();
+    // DEBUG, like its media twin: at INFO an operator wants the mint's outcome,
+    // not each phase of it.
+    tracing::debug!(
+        request_id = %request_id,
         content_kind = "object",
         framed_bytes = protected.framed_bytes.len(),
         "runtime custody publish: object protected"
     );
+    let step = RuntimeMintStep::begin("rights_policy", &request_id);
     let policy = resolve_runtime_rights_policy(
         registry.as_ref(),
         protected.object_identity.encrypted_content(),
@@ -5588,6 +5694,7 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
         tracing::warn!(%error, "Runtime custody rights policy resolution failed");
         error.context("Runtime custody rights policy is unavailable")
     })?;
+    step.ok();
     let mint_draft = RuntimeMintDraft::new_from_identity(
         RuntimeContentIdentityV1::Object(protected.object_identity.clone()),
         mint_intent.content_access_id(),
@@ -5610,8 +5717,9 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
     )
     .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?
     .with_dispatch_clock(crate::auth::now_ts);
+    let step = RuntimeMintStep::begin("custody_provision", &request_id);
     match coordinator
-        .provision(&mint_draft, &protected.envelope, now)
+        .provision(&mint_draft, &protected.envelope, crate::auth::now_ts())
         .await
         .map_err(|_| anyhow::anyhow!("Runtime custody mint failed"))?
     {
@@ -5621,6 +5729,7 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
             if mint_id == mint_draft.mint_id() => {}
         _ => anyhow::bail!("Runtime custody mint failed"),
     }
+    step.ok();
     tracing::debug!(
         mint_id = %hex::encode(mint_draft.mint_id().as_bytes()),
         "runtime custody publish: object custody provisioned"
@@ -5637,7 +5746,13 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
         PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
     )
     .map_err(|_| anyhow::anyhow!("Runtime custody availability requirement is invalid"))?;
+    let step = RuntimeMintStep::begin("staging", &request_id);
     let staging = write_protected_content_object_staging_directory(data_dir, &protected)?;
+    step.ok();
+    // The long one. Publishing the ciphertext and proving it replicated is what
+    // a creator sees as a stalled "Encrypt & escrow", because the whole server
+    // round trip is one request from the browser's side.
+    let step = RuntimeMintStep::begin("availability_publish", &request_id);
     let evidence = publish_and_verify_protected_content_object_availability(
         registry.as_ref(),
         staging.path(),
@@ -5654,6 +5769,7 @@ pub(crate) async fn publish_runtime_custody_library_object_content(
         );
         error.context(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE)
     })?;
+    step.ok();
     match coordinator
         .record_content_availability(&mint_draft, &requirement, evidence.clone())
         .map_err(|_| anyhow::anyhow!("Runtime custody availability record failed"))?
@@ -6482,6 +6598,10 @@ fn runtime_custody_library_publish_facts(
             "status": "runtime_custody_available",
             "content_id": content_id,
             "mint_id": mint_id_hex,
+            // What the capsule protects. The Library item is a `.ddrm`, whose
+            // name cannot say whether it holds a film or a PDF, so the viewer
+            // routes on this rather than on the item's own extension.
+            "asset_mime": draft.content_identity().content_type(),
             "required_providers": [],
         }),
         listing_uri: None,

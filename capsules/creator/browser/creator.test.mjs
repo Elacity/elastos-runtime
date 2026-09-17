@@ -11,6 +11,8 @@ import {
   resolveMime,
   scalePriceToBaseUnits,
   creatorMintFrom,
+  pendingBudgetMs,
+  pendingPhase,
   failureDetailRows,
   stagesFromProgress,
   settledFrom,
@@ -613,4 +615,50 @@ test("already discarded receipt safely permits retry", async () => {
   let retried = false;
   await discardProtectionAndRetry("source", async () => ({ schema: "elastos.library.protection-discarded/v1", uri: "source", discarded: false }), async () => { retried = true; });
   assert.equal(retried, true);
+});
+
+// Acceptance case: a publish that takes longer than the approval budget, then a
+// first approval-pending answer. The wait for the person must still get its own
+// budget -- this is the defect that told a creator to approve a transaction
+// which had already settled on Base.
+test("a long publish does not spend the approval budget before approval begins", () => {
+  const person = { awaitsPerson: true, reason: "wallet_approval", connectorId: "metamask" };
+  // 310s of encrypting, uploading and pinning happened before this answer.
+  const first = pendingPhase(null, person, 310_000);
+  assert.equal(first.reason, "person");
+  assert.equal(first.waitedMs, 0, "the approval wait starts when approval starts");
+  assert.ok(first.waitedMs < pendingBudgetMs(first), "polling must not be over before it begins");
+});
+
+test("pendingPhase accumulates only the time spent in the same wait", () => {
+  const person = { awaitsPerson: true };
+  const first = pendingPhase(null, person, 1_000);
+  const later = pendingPhase(first, person, 4_000);
+  assert.equal(later.startedAt, first.startedAt);
+  assert.equal(later.waitedMs, 3_000);
+});
+
+// Acceptance case: the person-to-chain transition.
+test("crossing from waiting on a person to waiting on the chain starts a fresh clock", () => {
+  const person = { awaitsPerson: true };
+  const chain = { awaitsPerson: false, reason: "chain_settlement" };
+  const waited = pendingPhase(pendingPhase(null, person, 0), person, 290_000);
+  assert.equal(waited.waitedMs, 290_000, "nearly the whole person budget is spent");
+
+  const crossed = pendingPhase(waited, chain, 290_000);
+  assert.equal(crossed.reason, "chain");
+  assert.equal(crossed.waitedMs, 0, "the chain wait does not inherit the person's spent time");
+  assert.ok(crossed.waitedMs < pendingBudgetMs(crossed));
+});
+
+test("each wait has its own budget", () => {
+  assert.equal(pendingBudgetMs({ reason: "person" }), 5 * 60 * 1000);
+  assert.equal(pendingBudgetMs({ reason: "chain" }), 2 * 60 * 1000);
+});
+
+test("a wait that really does exceed its own budget still stops", () => {
+  const person = { awaitsPerson: true };
+  const started = pendingPhase(null, person, 0);
+  const expired = pendingPhase(started, person, 5 * 60 * 1000);
+  assert.ok(expired.waitedMs >= pendingBudgetMs(expired));
 });

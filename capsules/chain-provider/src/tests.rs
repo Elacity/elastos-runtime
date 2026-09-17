@@ -711,6 +711,32 @@ fn protected_content_asset_created_log(
     })
 }
 
+/// The `ItemListed` the trade gateway emits inside the mint, which is where the
+/// creator tail now reads the listing from.
+fn protected_content_item_listed_log(
+    gateway: &str,
+    seller: &str,
+    operative: &str,
+    token_id: u128,
+    quantity: u128,
+    price: u128,
+    pay_token: &str,
+) -> Value {
+    let mut encoded = abi_word_u128(quantity).to_vec();
+    encoded.extend_from_slice(&abi_word_u128(price));
+    encoded.extend_from_slice(&abi_word_address(pay_token).unwrap());
+    json!({
+        "address": gateway,
+        "topics": [
+            PROTECTED_CONTENT_ITEM_LISTED_TOPIC0,
+            format!("0x{}", encode_hex(&abi_word_address(seller).unwrap())),
+            format!("0x{}", encode_hex(&abi_word_address(operative).unwrap())),
+            format!("0x{}", encode_hex(&abi_word_u128(token_id))),
+        ],
+        "data": format!("0x{}", encode_hex(&encoded)),
+    })
+}
+
 fn protected_content_mint_receipt_json(
     transaction_hash: &str,
     from: &str,
@@ -3240,7 +3266,6 @@ fn resolve_protected_content_mint_receipt_requires_two_finalized_agreeing_receip
     let emitter = "0x00000000000000000000000000000000000000dd";
     let token_uri = "ipfs://protected-content/metadata.json";
     let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let finalized_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let receipt = protected_content_mint_receipt_json(
         hash,
         creator,
@@ -3248,9 +3273,22 @@ fn resolve_protected_content_mint_receipt_requires_two_finalized_agreeing_receip
         "0x2a",
         receipt_block_hash,
         "0x1",
-        vec![protected_content_asset_created_log(
-            emitter, creator, ledger, operative, "0x03", token_uri, 0,
-        )],
+        vec![
+            protected_content_asset_created_log(
+                emitter, creator, ledger, operative, "0x03", token_uri, 0,
+            ),
+            // The mint lists in the same transaction, so its receipt carries
+            // the listing the creator tail used to read back separately.
+            protected_content_item_listed_log(
+                "0x00000000000000000000000000000000000000aa",
+                creator,
+                operative,
+                3,
+                7,
+                1_000_000,
+                "0x0000000000000000000000000000000000000000",
+            ),
+        ],
     );
     let sequence = vec![
         ("eth_chainId", json!([]), json!("0x2105")),
@@ -3260,11 +3298,11 @@ fn resolve_protected_content_mint_receipt_requires_two_finalized_agreeing_receip
             json!(["0x2a", false]),
             canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
         ),
-        (
-            "eth_getBlockByNumber",
-            json!(["finalized", false]),
-            finalized_block_json("0x2b", finalized_hash),
-        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
     ];
     let mut provider = provider_with_creator_mint_rpc_and_market_sources(
         "http://127.0.0.1:9".to_string(),
@@ -3290,6 +3328,430 @@ fn resolve_protected_content_mint_receipt_requires_two_finalized_agreeing_receip
     assert_eq!(data["operative"], operative);
 }
 
+/// A mint settles on confirmation depth, not on L1 finality.
+///
+/// Observed on Base: the mint was minted, successful and already indexed
+/// downstream, while the runtime refused to record it because the block was not
+/// yet `finalized` -- twelve minutes on a good night, thirty-six on the night
+/// this was written, because Ethereum finality lagged. Nothing is signed or
+/// spent after this point: the mint emits its own `ItemListed`, so what the
+/// gate protects is a local record.
+#[test]
+fn resolve_protected_content_mint_receipt_settles_on_confirmations_not_finality() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        ledger,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![
+            protected_content_asset_created_log(
+                emitter, creator, ledger, operative, "0x03", token_uri, 0,
+            ),
+            protected_content_item_listed_log(
+                "0x00000000000000000000000000000000000000aa",
+                creator,
+                operative,
+                3,
+                7,
+                1_000_000,
+                "0x0000000000000000000000000000000000000000",
+            ),
+        ],
+    );
+    // Head exactly `mint_confirmations` past the mint's block: the shallowest
+    // depth that must settle. No `finalized` is ever requested -- a sequence
+    // server asserts the exact calls, so asking for one would fail here.
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        ("eth_blockNumber", json!([]), json!("0x35")),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentMintReceipt {
+            network: "base-local".to_string(),
+            hash: hash.to_string(),
+            creator: creator.to_string(),
+            ledger: ledger.to_string(),
+            token_uri: token_uri.to_string(),
+            op_type_code: 0,
+        }),
+    );
+    assert_eq!(data["token_id"], "0x3");
+    // The listing travels with the receipt, so a caller needs no second read.
+    assert_eq!(data["quantity"], "0x7");
+    assert_eq!(data["price"], "0xf4240");
+    assert_eq!(
+        data["pay_token"],
+        "0x0000000000000000000000000000000000000000"
+    );
+}
+
+/// One block short of the depth is still pending, so the bar is a real one.
+#[test]
+fn resolve_protected_content_mint_receipt_is_pending_below_the_confirmation_depth() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        ledger,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![
+            protected_content_asset_created_log(
+                emitter, creator, ledger, operative, "0x03", token_uri, 0,
+            ),
+            protected_content_item_listed_log(
+                "0x00000000000000000000000000000000000000aa",
+                creator,
+                operative,
+                3,
+                7,
+                1_000_000,
+                "0x0000000000000000000000000000000000000000",
+            ),
+        ],
+    );
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        // 0x34 is eleven confirmations where twelve are required.
+        ("eth_blockNumber", json!([]), json!("0x34")),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "protected_content_mint_receipt_pending"
+    );
+}
+
+/// One source ahead of the other is waiting, not refusing.
+///
+/// Two independent RPCs reach a given confirmation depth at their own pace, so
+/// for a few seconds after a fresh mint exactly one of them can corroborate it.
+/// Observed on Base the night confirmation depth replaced finality: the mint
+/// was signed, mined and already indexed downstream, and the creator was shown
+/// a red terminal error while the only thing wrong was that the second RPC had
+/// not caught up. Retrying by hand succeeded every time, which is the signature
+/// of a wait misreported as a failure. The caller distinguishes the two solely
+/// by the `_pending` suffix, so an incomplete quorum must carry it -- otherwise
+/// the tail abandons a mint that is already on chain.
+#[test]
+fn resolve_protected_content_mint_receipt_is_pending_when_only_one_source_has_caught_up() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        ledger,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![
+            protected_content_asset_created_log(
+                emitter, creator, ledger, operative, "0x03", token_uri, 0,
+            ),
+            protected_content_item_listed_log(
+                "0x00000000000000000000000000000000000000aa",
+                creator,
+                operative,
+                3,
+                7,
+                1_000_000,
+                "0x0000000000000000000000000000000000000000",
+            ),
+        ],
+    );
+    let source_sequence = |head: &'static str| {
+        vec![
+            ("eth_chainId", json!([]), json!("0x2105")),
+            ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+            (
+                "eth_getBlockByNumber",
+                json!(["0x2a", false]),
+                canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+            ),
+            ("eth_blockNumber", json!([]), json!(head)),
+        ]
+    };
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            // Past the depth: this source can corroborate the mint.
+            spawn_rpc_sequence_asserting_server(source_sequence("0x40")),
+            // Eleven confirmations where twelve are required: still catching up.
+            spawn_rpc_sequence_asserting_server(source_sequence("0x34")),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "protected_content_mint_receipt_pending"
+    );
+}
+
+/// A mint whose receipt carries no `ItemListed` is refused rather than guessed
+/// at: since the v3 protocol bundled listing into minting, a mint without one
+/// is not the shape this Runtime knows how to record.
+#[test]
+fn resolve_protected_content_mint_receipt_requires_the_listing_it_minted() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        ledger,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![protected_content_asset_created_log(
+            emitter, creator, ledger, operative, "0x03", token_uri, 0,
+        )],
+    );
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        ("eth_blockNumber", json!([]), json!("0x40")),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "protected_content_mint_receipt_not_bound"
+    );
+}
+
+/// A creator signing from an EIP-7702 delegated account settles like any other.
+///
+/// Observed on Base: MetaMask upgraded the creator's account, so
+/// `eth_sendTransaction` went to the delegation executor, which then called the
+/// ledger. The mint succeeded -- the configured emitter logged `AssetCreated`
+/// naming this exact ledger, creator, token URI and op type -- but the receipt
+/// was refused because its `to` was the executor rather than the ledger. The
+/// transaction's target names whichever contract the account called first and
+/// binds nothing else, so it is not what proves a mint.
+#[test]
+fn resolve_protected_content_mint_receipt_accepts_a_delegated_account_target() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    // Not the ledger: the account's 7702 delegation executor.
+    let delegation_executor = "0x00000000000000000000000000000000000000ee";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        delegation_executor,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![
+            protected_content_asset_created_log(
+                emitter, creator, ledger, operative, "0x03", token_uri, 0,
+            ),
+            // The mint lists in the same transaction, so its receipt carries
+            // the listing the creator tail used to read back separately.
+            protected_content_item_listed_log(
+                "0x00000000000000000000000000000000000000aa",
+                creator,
+                operative,
+                3,
+                7,
+                1_000_000,
+                "0x0000000000000000000000000000000000000000",
+            ),
+        ],
+    );
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentMintReceipt {
+            network: "base-local".to_string(),
+            hash: hash.to_string(),
+            creator: creator.to_string(),
+            ledger: ledger.to_string(),
+            token_uri: token_uri.to_string(),
+            op_type_code: 0,
+        }),
+    );
+    assert_eq!(data["token_id"], "0x3");
+    assert_eq!(data["operative"], operative);
+}
+
+/// Dropping the target check gives nothing away: the ledger is still bound, by
+/// the event rather than by the transport. A receipt sent straight to the
+/// ledger whose `AssetCreated` names a different one is still refused.
+#[test]
+fn resolve_protected_content_mint_receipt_still_binds_the_ledger_through_the_event() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let foreign_ledger = "0x0000000000000000000000000000000000000099";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    // The transaction went straight to the ledger, so the old check would have
+    // been satisfied; the event names someone else's channel.
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        ledger,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![protected_content_asset_created_log(
+            emitter,
+            creator,
+            foreign_ledger,
+            operative,
+            "0x03",
+            token_uri,
+            0,
+        )],
+    );
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "invalid_protected_content_mint_receipt"
+    );
+}
+
 #[test]
 fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts() {
     let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
@@ -3301,7 +3763,6 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
     let emitter = "0x00000000000000000000000000000000000000dd";
     let token_uri = "ipfs://protected-content/metadata.json";
     let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let finalized_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn mutate_asset_created_log_data(mut log: Value, mutate: impl FnOnce(&mut Vec<u8>)) -> Value {
         let data = log
@@ -3425,9 +3886,20 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 "0x2a",
                 receipt_block_hash,
                 "0x1",
-                vec![protected_content_asset_created_log(
-                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
-                )],
+                vec![
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    protected_content_item_listed_log(
+                        "0x00000000000000000000000000000000000000aa",
+                        creator,
+                        operative,
+                        3,
+                        7,
+                        1_000_000,
+                        "0x0000000000000000000000000000000000000000",
+                    ),
+                ],
             ),
             "invalid_protected_content_mint_receipt",
         ),
@@ -3440,9 +3912,20 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 "0x2a",
                 receipt_block_hash,
                 "0x2",
-                vec![protected_content_asset_created_log(
-                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
-                )],
+                vec![
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    protected_content_item_listed_log(
+                        "0x00000000000000000000000000000000000000aa",
+                        creator,
+                        operative,
+                        3,
+                        7,
+                        1_000_000,
+                        "0x0000000000000000000000000000000000000000",
+                    ),
+                ],
             ),
             "invalid_protected_content_mint_receipt",
         ),
@@ -3531,11 +4014,8 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 json!(["0x2a", false]),
                 canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
             ),
-            (
-                "eth_getBlockByNumber",
-                json!(["finalized", false]),
-                finalized_block_json("0x2b", finalized_hash),
-            ),
+            // Depth rather than finality; see the note on the accepting test.
+            ("eth_blockNumber", json!([]), json!("0x40")),
         ];
         let mut provider = provider_with_creator_mint_rpc_and_market_sources(
             "http://127.0.0.1:9".to_string(),
@@ -3572,9 +4052,20 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 "0x2a",
                 receipt_block_hash,
                 "0x1",
-                vec![protected_content_asset_created_log(
-                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
-                )],
+                vec![
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    protected_content_item_listed_log(
+                        "0x00000000000000000000000000000000000000aa",
+                        creator,
+                        operative,
+                        3,
+                        7,
+                        1_000_000,
+                        "0x0000000000000000000000000000000000000000",
+                    ),
+                ],
             ),
         ),
         (
@@ -3582,11 +4073,11 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
             json!(["0x2a", false]),
             canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
         ),
-        (
-            "eth_getBlockByNumber",
-            json!(["finalized", false]),
-            finalized_block_json("0x2b", finalized_hash),
-        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
     ];
     let conflicting_b = vec![
         ("eth_chainId", json!([]), json!("0x2105")),
@@ -3600,15 +4091,26 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 "0x2a",
                 receipt_block_hash,
                 "0x1",
-                vec![protected_content_asset_created_log(
-                    emitter,
-                    creator,
-                    ledger,
-                    "0x0000000000000000000000000000000000000055",
-                    "0x04",
-                    token_uri,
-                    0,
-                )],
+                vec![
+                    protected_content_asset_created_log(
+                        emitter,
+                        creator,
+                        ledger,
+                        "0x0000000000000000000000000000000000000055",
+                        "0x04",
+                        token_uri,
+                        0,
+                    ),
+                    protected_content_item_listed_log(
+                        "0x00000000000000000000000000000000000000aa",
+                        creator,
+                        "0x0000000000000000000000000000000000000055",
+                        4,
+                        7,
+                        1_000_000,
+                        "0x0000000000000000000000000000000000000000",
+                    ),
+                ],
             ),
         ),
         (
@@ -3616,11 +4118,11 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
             json!(["0x2a", false]),
             canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
         ),
-        (
-            "eth_getBlockByNumber",
-            json!(["finalized", false]),
-            finalized_block_json("0x2b", finalized_hash),
-        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
     ];
     let mut conflicting_provider = provider_with_creator_mint_rpc_and_market_sources(
         "http://127.0.0.1:9".to_string(),
@@ -3685,11 +4187,8 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 json!(["0x2a", false]),
                 canonical_block,
             ),
-            (
-                "eth_getBlockByNumber",
-                json!(["finalized", false]),
-                finalized_block_json("0x2b", finalized_hash),
-            ),
+            // Depth rather than finality; see the note on the accepting test.
+            ("eth_blockNumber", json!([]), json!("0x40")),
         ];
         let mut provider = provider_with_creator_mint_rpc_and_market_sources(
             "http://127.0.0.1:9".to_string(),
@@ -3726,9 +4225,20 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
                 "0x2a",
                 receipt_block_hash,
                 "0x0",
-                vec![protected_content_asset_created_log(
-                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
-                )],
+                vec![
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    protected_content_item_listed_log(
+                        "0x00000000000000000000000000000000000000aa",
+                        creator,
+                        operative,
+                        3,
+                        7,
+                        1_000_000,
+                        "0x0000000000000000000000000000000000000000",
+                    ),
+                ],
             ),
         ),
     ];
@@ -3783,11 +4293,11 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
             json!(["0x2a", false]),
             canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
         ),
-        (
-            "eth_getBlockByNumber",
-            json!(["finalized", false]),
-            finalized_block_json("0x2b", finalized_hash),
-        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
     ];
     let mut extra_topics_provider = provider_with_creator_mint_rpc_and_market_sources(
         "http://127.0.0.1:9".to_string(),
@@ -4950,7 +5460,6 @@ fn resolve_protected_content_mint_receipt_rejects_huge_token_uri_length_without_
     let emitter = "0x00000000000000000000000000000000000000dd";
     let token_uri = "ipfs://protected-content/metadata.json";
     let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let finalized_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let huge_length_log = mutated_asset_created_log_data(
         protected_content_asset_created_log(
             emitter, creator, ledger, operative, "0x03", token_uri, 0,
@@ -4979,11 +5488,11 @@ fn resolve_protected_content_mint_receipt_rejects_huge_token_uri_length_without_
             json!(["0x2a", false]),
             canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
         ),
-        (
-            "eth_getBlockByNumber",
-            json!(["finalized", false]),
-            finalized_block_json("0x2b", finalized_hash),
-        ),
+        // Head far enough past the mint's block to satisfy the confirmation
+        // depth. The receipt no longer waits for L1 finality: the mint carries
+        // its own ItemListed, so nothing is read back and nothing is spent
+        // after this point.
+        ("eth_blockNumber", json!([]), json!("0x40")),
     ];
     let mut provider = provider_with_creator_mint_rpc_and_market_sources(
         "http://127.0.0.1:9".to_string(),

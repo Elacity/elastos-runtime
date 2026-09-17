@@ -136,7 +136,7 @@ fn runtime_custody_creator_effect_pending(
     pending: crate::protected_content_runtime::RuntimeCustodyEffectPending,
     line: u32,
 ) -> anyhow::Error {
-    tracing::debug!(
+    tracing::trace!(
         line,
         reason = pending.reason_label(),
         awaits_person = pending.awaits_person(),
@@ -150,10 +150,27 @@ fn runtime_custody_creator_effect_pending(
 /// sources) is the Chain half of "pending exact Wallet or Chain settlement":
 /// the caller re-polls, exactly as it does while the Wallet approval is
 /// outstanding. Anything else fails closed with the cause in the log.
-fn creator_mint_chain_error(error: (StatusCode, String), line: u32) -> anyhow::Error {
+/// Whether a chain-provider refusal means "not yet", rather than "no".
+///
+/// One definition, used both to shape the error a caller sees and to record
+/// why a step stopped. Two copies of this rule would eventually disagree, and
+/// the disagreement would show up as a step logged as broken while the caller
+/// was told to keep waiting.
+fn runtime_custody_chain_answer_is_pending(error: &(StatusCode, String)) -> bool {
     let (status, message) = error;
-    let code = message.split(':').next().unwrap_or_default().trim();
-    if status == StatusCode::BAD_REQUEST && code.ends_with("_pending") {
+    *status == StatusCode::BAD_REQUEST
+        && message
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .ends_with("_pending")
+}
+
+fn creator_mint_chain_error(error: (StatusCode, String), line: u32) -> anyhow::Error {
+    let pending = runtime_custody_chain_answer_is_pending(&error);
+    let (status, message) = error;
+    if pending {
         // The chain half of the wait: evidence not yet finalized across enough
         // sources. Approved already, so nobody need act.
         return runtime_custody_creator_effect_pending(
@@ -236,6 +253,13 @@ macro_rules! creator_mint_unavailable_missing {
     };
 }
 const RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE: u16 = 1;
+/// The zero address, which is how a listing says it is priced in the chain's
+/// own coin rather than in an ERC-20.
+const RUNTIME_CUSTODY_NATIVE_PAY_TOKEN: &str = "0x0000000000000000000000000000000000000000";
+/// The schema a chain-provider verified listing must carry, whether it was read
+/// back from chain state or taken from the `ItemListed` the mint itself emitted.
+const RUNTIME_CUSTODY_VERIFIED_LISTING_SCHEMA: &str =
+    "elastos.chain.protected-content-verified-listing/v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,6 +285,15 @@ pub(crate) struct ResolvedProtectedContentMintReceipt {
     pub(crate) chain_id: u64,
     pub(crate) token_id: String,
     pub(crate) operative: String,
+    /// The listing the mint created, carried on the receipt because the mint
+    /// emits `ItemListed` in the same transaction. Reading it back from chain
+    /// state was a second round trip for facts this receipt already proves --
+    /// and, because that read was pinned to a finalized block, the reason a
+    /// settled mint could sit unrecorded for the length of an L1 finality
+    /// delay.
+    pub(crate) quantity: String,
+    pub(crate) price: String,
+    pub(crate) pay_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3259,7 +3292,14 @@ async fn resolve_runtime_custody_creator_mint_receipt(
     chain_plan: &RuntimeCustodyCreatorChainPlan,
     transaction_hash: &str,
 ) -> anyhow::Result<ResolvedProtectedContentMintReceipt> {
-    let receipt_response = wallet_chain_provider_data(
+    // Keyed by the transaction rather than the mint: this step is asking the
+    // chain about one specific effect, and a reader chasing a stuck listing has
+    // the hash in hand.
+    let step = crate::protected_content_runtime::RuntimeMintStep::begin_repeating(
+        "mint_receipt",
+        transaction_hash,
+    );
+    let answer = wallet_chain_provider_data(
         state,
         serde_json::json!({
             "op": "resolve_protected_content_mint_receipt",
@@ -3271,16 +3311,58 @@ async fn resolve_runtime_custody_creator_mint_receipt(
             "op_type_code": RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE,
         }),
     )
-    .await
-    .map_err(|error| creator_mint_chain_error(error, line!()))?;
+    .await;
+    let receipt_response = match answer {
+        Ok(value) => value,
+        Err(error) => {
+            // "Not finalized yet" is this wait working, repeated every few
+            // seconds until the chain catches up. Recording it as an
+            // abandonment would bury the one case worth looking at.
+            if runtime_custody_chain_answer_is_pending(&error) {
+                step.pending();
+            }
+            return Err(creator_mint_chain_error(error, line!()));
+        }
+    };
     let receipt: ResolvedProtectedContentMintReceipt =
         serde_json::from_value(receipt_response).map_err(creator_mint_unavailable!())?;
+    step.ok();
     tracing::debug!(
         token_id = %receipt.token_id,
         operative = %receipt.operative,
         "runtime custody creator tail: mint receipt resolved"
     );
     Ok(receipt)
+}
+
+/// The listing a native-priced mint proved by emitting `ItemListed` in its own
+/// transaction.
+///
+/// The seller is the caller's address rather than a value read back from the
+/// event because the chain provider already refused any receipt whose
+/// `ItemListed` named a different seller or a different operative; restating it
+/// here would only re-check what the capsule bound. Everything a reader still
+/// has to be convinced of -- quantity, price, pay token -- comes from the
+/// receipt, and `validate_runtime_custody_creator_terminal_bindings` is what
+/// holds it to the creator's recorded terms.
+fn runtime_custody_listing_from_mint_receipt(
+    creator_address: &str,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    receipt: &ResolvedProtectedContentMintReceipt,
+) -> ResolvedProtectedContentVerifiedListing {
+    ResolvedProtectedContentVerifiedListing {
+        schema: RUNTIME_CUSTODY_VERIFIED_LISTING_SCHEMA.to_string(),
+        network: chain_plan.network.clone(),
+        chain_id: receipt.chain_id,
+        seller: creator_address.to_string(),
+        ledger: chain_plan.ledger.clone(),
+        token_id: receipt.token_id.clone(),
+        operative: receipt.operative.clone(),
+        quantity: receipt.quantity.clone(),
+        price: receipt.price.clone(),
+        pay_token: receipt.pay_token.clone(),
+        payment_processor: None,
+    }
 }
 
 async fn finalize_runtime_custody_creator_listing(
@@ -3291,20 +3373,29 @@ async fn finalize_runtime_custody_creator_listing(
     receipt: &ResolvedProtectedContentMintReceipt,
     transaction_hash: &str,
 ) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence> {
-    let listing_response = wallet_chain_provider_data(
-        state,
-        serde_json::json!({
-            "op": "resolve_protected_content_verified_listing",
-            "network": chain_plan.network,
-            "seller": creator_address,
-            "ledger": chain_plan.ledger,
-            "token_id": receipt.token_id,
-        }),
-    )
-    .await
-    .map_err(|error| creator_mint_chain_error(error, line!()))?;
-    let listing: ResolvedProtectedContentVerifiedListing =
-        serde_json::from_value(listing_response).map_err(creator_mint_unavailable!())?;
+    // The listing came with the receipt: the mint emits `ItemListed` in the same
+    // transaction, so the quantity, price and pay token are already proven by
+    // the evidence this tail has in hand. Only a non-native pay token needs
+    // anything further, and only because its payment processor lives in chain
+    // state rather than in the event.
+    let listing = if receipt.pay_token == RUNTIME_CUSTODY_NATIVE_PAY_TOKEN {
+        runtime_custody_listing_from_mint_receipt(creator_address, chain_plan, receipt)
+    } else {
+        let listing_response = wallet_chain_provider_data(
+            state,
+            serde_json::json!({
+                "op": "resolve_protected_content_verified_listing",
+                "network": chain_plan.network,
+                "seller": creator_address,
+                "ledger": chain_plan.ledger,
+                "token_id": receipt.token_id,
+            }),
+        )
+        .await
+        .map_err(|error| creator_mint_chain_error(error, line!()))?;
+        serde_json::from_value::<ResolvedProtectedContentVerifiedListing>(listing_response)
+            .map_err(creator_mint_unavailable!())?
+    };
     validate_runtime_custody_creator_terminal_bindings(
         creator_state,
         creator_address,
@@ -3347,7 +3438,7 @@ fn validate_runtime_custody_creator_terminal_bindings(
     {
         return Err(creator_mint_unavailable_missing!()());
     }
-    if listing.schema != "elastos.chain.protected-content-verified-listing/v1"
+    if listing.schema != RUNTIME_CUSTODY_VERIFIED_LISTING_SCHEMA
         || listing.network != chain_plan.network
         || listing.chain_id != expected_chain_id
         || listing.chain_id != receipt.chain_id
@@ -3944,6 +4035,9 @@ async fn runtime_custody_publish_creator_tail_from_facts(
             creator_state
         }
     };
+    let mint_ref = hex::encode(facts.mint_id.as_bytes());
+    let step =
+        crate::protected_content_runtime::RuntimeMintStep::begin_repeating("chain_plan", &mint_ref);
     let chain_plan = resolve_runtime_custody_creator_chain_plan(
         state,
         input.creator_mint_source_digest,
@@ -3954,7 +4048,8 @@ async fn runtime_custody_publish_creator_tail_from_facts(
         creator_state.token_uri(),
     )
     .await?;
-    tracing::debug!(
+    step.ok();
+    tracing::trace!(
         mint_id = %hex::encode(facts.mint_id.as_bytes()),
         network = %chain_plan.network,
         to = %chain_plan.to,
@@ -3978,11 +4073,25 @@ async fn runtime_custody_publish_creator_tail_from_facts(
         mint_journal
             .bind_creator_effect(facts.mint_id, &creator_state, effect_binding.clone())
             .map_err(creator_mint_unavailable!())?;
+        // The wait starts here and is polled from the browser, so the server
+        // sees it as many separate requests rather than a loop. These two
+        // lines -- this one and "mint receipt resolved" -- are its start and
+        // its end; everything in between repeats and lives at TRACE.
+        tracing::debug!(
+            mint_id = %mint_ref,
+            effect_id = %effect_binding.effect_id(),
+            "runtime custody creator tail: settlement wait began"
+        );
     }
+    let step = crate::protected_content_runtime::RuntimeMintStep::begin_repeating(
+        "wallet_approval",
+        &mint_ref,
+    );
     let approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
         .await
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
-    tracing::debug!(
+    step.ok();
+    tracing::trace!(
         effect_id = %approval.effect_id,
         "runtime custody creator tail: exact wallet effect ensured"
     );
@@ -4566,12 +4675,15 @@ mod tests {
             chain_id,
             token_id: "0x77".to_string(),
             operative: "0x00000000000000000000000000000000000000dd".to_string(),
+            quantity: "0x7".to_string(),
+            price: "0xf4240".to_string(),
+            pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
         }
     }
 
     fn test_listing(chain_id: u64) -> ResolvedProtectedContentVerifiedListing {
         ResolvedProtectedContentVerifiedListing {
-            schema: "elastos.chain.protected-content-verified-listing/v1".to_string(),
+            schema: RUNTIME_CUSTODY_VERIFIED_LISTING_SCHEMA.to_string(),
             network: "base-mainnet".to_string(),
             chain_id,
             seller: "0x00000000000000000000000000000000000000ee".to_string(),
@@ -4730,6 +4842,75 @@ mod tests {
             &listing,
         )
         .is_ok());
+    }
+
+    /// The native pay-token path builds its own listing instead of reading one
+    /// back from chain state, so it has to satisfy the same bindings a fetched
+    /// listing does. A field left unset here fails closed at the terminal --
+    /// after the mint has already settled on chain -- which is the worst place
+    /// to find out.
+    #[test]
+    fn runtime_custody_native_listing_from_receipt_satisfies_terminal_bindings() {
+        let creator_state = test_creator_state();
+        let chain_plan = RuntimeCustodyCreatorChainPlan {
+            pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+            ..test_chain_plan()
+        };
+        let receipt = ResolvedProtectedContentMintReceipt {
+            quantity: creator_state.desired_terms().copies().to_string(),
+            price: creator_state.desired_terms().price().to_string(),
+            pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+            ..test_receipt(8453)
+        };
+        let creator_address = "0x00000000000000000000000000000000000000ee";
+
+        let listing =
+            runtime_custody_listing_from_mint_receipt(creator_address, &chain_plan, &receipt);
+
+        assert_eq!(listing.schema, RUNTIME_CUSTODY_VERIFIED_LISTING_SCHEMA);
+        assert!(validate_runtime_custody_creator_terminal_bindings(
+            &creator_state,
+            creator_address,
+            &chain_plan,
+            &receipt,
+            &listing,
+        )
+        .is_ok());
+    }
+
+    /// The synthesized listing must not become a way to launder terms the
+    /// creator never asked for: a receipt whose `ItemListed` priced the token
+    /// differently is still refused.
+    #[test]
+    fn runtime_custody_native_listing_from_receipt_refuses_unrecorded_terms() {
+        let creator_state = test_creator_state();
+        let chain_plan = RuntimeCustodyCreatorChainPlan {
+            pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+            ..test_chain_plan()
+        };
+        let creator_address = "0x00000000000000000000000000000000000000ee";
+        for (quantity, price) in [
+            ("0x3", creator_state.desired_terms().price().to_string()),
+            (creator_state.desired_terms().copies(), "0x6".to_string()),
+        ] {
+            let receipt = ResolvedProtectedContentMintReceipt {
+                quantity: quantity.to_string(),
+                price,
+                pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+                ..test_receipt(8453)
+            };
+            let listing =
+                runtime_custody_listing_from_mint_receipt(creator_address, &chain_plan, &receipt);
+
+            assert!(validate_runtime_custody_creator_terminal_bindings(
+                &creator_state,
+                creator_address,
+                &chain_plan,
+                &receipt,
+                &listing,
+            )
+            .is_err());
+        }
     }
 
     #[test]

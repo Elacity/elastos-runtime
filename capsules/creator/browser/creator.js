@@ -367,6 +367,36 @@ export function effectPendingFrom(envelope) {
 }
 
 /**
+ * Which wait a pending answer is in, and how long *that wait* has lasted.
+ *
+ * The budget for a wait has to be measured from the moment that wait began, not
+ * from the moment the whole publish began. Getting this wrong had a precise and
+ * awful consequence: a metadata pin that took longer than the approval budget
+ * spent the entire budget before the wallet request even existed, so the first
+ * pending answer arrived already over budget, polling never started once, and
+ * the creator was told to go and approve a transaction that had in fact already
+ * settled on chain.
+ *
+ * The two waits are different in kind — one needs the person, one needs the
+ * network — so crossing from one to the other starts a fresh clock rather than
+ * inheriting the time spent waiting for something else.
+ */
+export function pendingPhase(previous, pending, nowMs) {
+  const reason = pending && pending.awaitsPerson ? "person" : "chain";
+  const startedAt = previous && previous.reason === reason ? previous.startedAt : nowMs;
+  return { reason, startedAt, waitedMs: Math.max(0, nowMs - startedAt) };
+}
+
+/**
+ * How long this page will keep asking, for the wait it is actually in.
+ */
+export function pendingBudgetMs(phase) {
+  return phase && phase.reason === "person"
+    ? PENDING_PERSON_BUDGET_MS
+    : PENDING_CHAIN_BUDGET_MS;
+}
+
+/**
  * The breakdown behind a failure, as rows rather than prose.
  *
  * What a creator needs first is one sentence they can act on; what they need
@@ -634,7 +664,7 @@ function bootCreatorApp() {
     els.submitButton.addEventListener("click", () => {
       protectAndList().catch((error) => {
         if (error?.pending) {
-          showPending(error.pending);
+          showPending(error.pending, error);
         } else {
           showFailure(error);
         }
@@ -1057,7 +1087,7 @@ function bootCreatorApp() {
   // its own and can be picked up by protecting the same file again — which is
   // true, because the mint keeps its identity across retries.
   async function publishUntilSettled(targetUri, terms) {
-    const started = Date.now();
+    let phase = null;
     for (;;) {
       try {
         return await publishWithRevisionRetry(targetUri, terms);
@@ -1066,15 +1096,21 @@ function bootCreatorApp() {
         if (!pending) {
           throw error;
         }
-        const waited = Date.now() - started;
-        const budget = pending.awaitsPerson
-          ? PENDING_PERSON_BUDGET_MS
-          : PENDING_CHAIN_BUDGET_MS;
-        if (waited >= budget) {
+        // Before any decision about whether to keep asking. The answer carries
+        // the journal's own account of how far this got, and that account is
+        // true whether or not this page goes on polling -- showing a settled
+        // escrow as still running, because the budget happened to be spent, is
+        // how a finished stage came to look unfinished.
+        applyServerProgress(error.progress);
+        phase = pendingPhase(phase, pending, Date.now());
+        if (phase.waitedMs >= pendingBudgetMs(phase)) {
+          // Say what actually happened: this page stopped asking. The wait may
+          // well be over by now, and claiming otherwise from a stale answer is
+          // what told a creator to approve a transaction that had settled.
+          error.pollingPaused = phase;
           throw error;
         }
-        applyServerProgress(error.progress);
-        setStatus(pendingStatusText(pending, waited));
+        setStatus(pendingStatusText(pending, phase.waitedMs));
         await sleep(PENDING_POLL_INTERVAL_MS);
       }
     }
@@ -1213,17 +1249,50 @@ function bootCreatorApp() {
   // in-progress state and the file, copies and price stay in place, so
   // protecting the same file again picks the same mint back up — the mint
   // keeps its identity across retries, which is what makes that safe.
-  function showPending(pending) {
-    if (pending && pending.awaitsPerson) {
-      const where = pending.connectorId || "your wallet";
+  function showPending(pending, error) {
+    // This page stopped asking; that is not the same as the wait still being
+    // on. The last answer is as old as the moment polling stopped, and stating
+    // it as current is how a creator was told to approve a transaction that had
+    // already settled on chain. Say what is actually known -- what it was
+    // waiting for, and that checking paused -- and offer to look again.
+    const paused = Boolean(error && error.pollingPaused);
+    const where = pending && pending.connectorId ? pending.connectorId : "your wallet";
+    const was =
+      pending && pending.awaitsPerson
+        ? `an approval in ${where}`
+        : "the network to confirm the transaction";
+    if (paused) {
       setStatus(
-        `Still waiting for approval in ${where}. Approve it there and protect this file again to finish the listing.`,
+        `Checking paused. The last thing this was waiting for was ${was}; it may have finished since. Check again to pick up the same listing.`,
       );
-      return;
+    } else if (pending && pending.awaitsPerson) {
+      setStatus(`Waiting for ${was}. The listing continues on its own once you approve it.`);
+    } else {
+      setStatus("The transaction is approved and the network has not confirmed it yet.");
     }
-    setStatus(
-      "The transaction is approved and the network has not confirmed it yet. Protect this file again in a moment to finish the listing.",
-    );
+    clearFailureDetails();
+    renderFailureDetails(error);
+    renderResumeAction();
+  }
+
+  // Resuming is protecting the same file again, which picks the same mint back
+  // up: the mint keeps its identity across retries, so this raises no second
+  // effect and signs nothing new. That is what makes offering it safe, and it
+  // is what the old message asked the creator to do by hand.
+  function renderResumeAction() {
+    if (!selectedFile) return;
+    const resume = document.createElement("button");
+    resume.className = "btn";
+    resume.type = "button";
+    resume.textContent = "Check again";
+    resume.addEventListener("click", () => {
+      resume.disabled = true;
+      void protectAndList().finally(() => {
+        resume.disabled = false;
+      });
+    });
+    els.recoveryActions.append(resume);
+    els.recoveryActions.classList.remove("hidden");
   }
 
   /**
@@ -1306,7 +1375,7 @@ function bootCreatorApp() {
         await protectAndList();
       });
     } catch (error) {
-      if (error?.pending) showPending(error.pending);
+      if (error?.pending) showPending(error.pending, error);
       else showFailure(error);
     } finally {
       submitting = false;

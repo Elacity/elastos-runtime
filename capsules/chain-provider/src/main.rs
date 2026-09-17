@@ -1330,6 +1330,11 @@ impl ChainProvider {
             "chain_id": observation.chain_id,
             "token_id": observation.token_id,
             "operative": observation.operative,
+            // The listing the mint emitted, so the caller does not read back
+            // what this receipt already proves.
+            "quantity": observation.listing.quantity,
+            "price": observation.listing.price,
+            "pay_token": observation.listing.pay_token,
         }))
     }
 
@@ -1815,12 +1820,12 @@ impl ChainProvider {
     ) -> Result<ProtectedContentMintReceiptObservation, Response> {
         let mut successful = Vec::new();
         let mut first_error = None;
-        let mut saw_pending = false;
         for rpc_url in &market.evidence_rpc_urls {
             match self.observe_protected_content_mint_receipt_source(
                 network,
                 rpc_url,
                 mint,
+                market,
                 hash,
                 creator,
                 ledger,
@@ -1828,7 +1833,8 @@ impl ChainProvider {
                 op_type_code,
             ) {
                 Ok(Some(observation)) => successful.push(observation),
-                Ok(None) => saw_pending = true,
+                // This source has not reached the confirmation depth yet.
+                Ok(None) => {}
                 Err(response) => {
                     if first_error.is_none() {
                         first_error = Some(response);
@@ -1858,20 +1864,20 @@ impl ChainProvider {
             }
             return Ok(reference);
         }
-        if successful.is_empty() {
-            if let Some(response) = first_error {
-                return Err(response);
-            }
-            if saw_pending {
-                return Err(Response::error(
-                    "protected_content_mint_receipt_pending",
-                    "protected-content mint receipt is not finalized on enough configured sources",
-                ));
-            }
+        // A source that refused outright is the only thing worth reporting as a
+        // failure: it says something about this receipt that waiting will not
+        // change.
+        if let Some(response) = first_error {
+            return Err(response);
         }
+        // Otherwise the corroborating quorum simply has not caught up. Two
+        // independent RPCs confirm a block at their own pace, so one source
+        // ahead of the other is the ORDINARY shape of a fresh mint, not a
+        // refusal -- and the transaction it describes may already be on chain.
+        // Reporting it as anything but pending abandons a settled mint.
         Err(Response::error(
-            "insufficient_protected_content_mint_receipt_observations",
-            "protected-content mint receipt sources produced fewer than two matching finalized binds",
+            "protected_content_mint_receipt_pending",
+            "protected-content mint receipt is not yet confirmed on enough configured sources",
         ))
     }
 
@@ -1884,6 +1890,7 @@ impl ChainProvider {
         network: &ChainNetwork,
         rpc_url: &str,
         mint: &ProtectedContentCreatorMintMethod,
+        market: &ProtectedContentMarketMethod,
         hash: &str,
         creator: &str,
         ledger: &str,
@@ -1953,18 +1960,20 @@ impl ChainProvider {
                 "protected-content mint receipt signer does not match creator",
             ));
         }
-        let Some(receipt_to) = receipt.get("to").and_then(Value::as_str) else {
-            return Err(Response::error(
-                "invalid_protected_content_mint_receipt",
-                "protected-content mint receipt target is missing",
-            ));
-        };
-        if !receipt_to.eq_ignore_ascii_case(ledger) {
-            return Err(Response::error(
-                "invalid_protected_content_mint_receipt",
-                "protected-content mint receipt target does not match ledger",
-            ));
-        }
+        // The transaction's own target is deliberately NOT checked against the
+        // ledger. It names whichever contract the signer's account called
+        // first, which is the ledger only for a plain EOA: an EIP-7702
+        // delegated account -- now the default for a MetaMask user who has
+        // upgraded -- sends to its delegation executor, which then calls the
+        // ledger. Requiring `to == ledger` rejected mints that had in fact
+        // settled, and would reject every smart-account creator.
+        //
+        // Nothing is given up by dropping it. The ledger binding is proven
+        // below, and far more strongly: the loop accepts a log only from the
+        // configured `asset_created_emitter`, and the decoded `AssetCreated`
+        // must carry this exact ledger, this creator, this token URI and this
+        // op type. `to` bound none of those. What the receipt still fixes here
+        // is the signer (`from`), the transaction hash, and the status.
         let receipt_block_number = receipt
             .get("blockNumber")
             .and_then(Value::as_str)
@@ -2089,19 +2098,22 @@ impl ChainProvider {
                 "canonical block does not contain the protected-content mint transaction",
             ));
         }
-        let finalized = match self
-            .evm_rpc(
-                &source_network,
-                "eth_getBlockByNumber",
-                json!(["finalized", false]),
-            )
+        // Depth, not finality. The mint carries its own listing -- `ItemListed`
+        // is emitted inside this very transaction -- so nothing is spent or
+        // signed after this check; what it guards is a local record. Requiring
+        // L1 finality made a creator wait twelve minutes for that record on a
+        // good day, and far longer whenever Ethereum finality lagged, while
+        // their asset was already live and already indexed.
+        let head = match self
+            .evm_rpc(&source_network, "eth_blockNumber", json!([]))
             .ok()
-            .and_then(|value| evm_finalized_block(&value).ok())
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))
         {
-            Some(finalized) => finalized,
+            Some(head) => head,
             None => return Ok(None),
         };
-        if receipt_block_number > finalized.finalized_block_number {
+        let confirmations = head.saturating_sub(receipt_block_number).saturating_add(1);
+        if confirmations < mint.mint_confirmations {
             return Ok(None);
         }
         let logs = match receipt.get("logs").and_then(Value::as_array) {
@@ -2168,16 +2180,82 @@ impl ChainProvider {
                 "protected_content_mint_receipt_not_bound",
                 "receipt does not contain the configured AssetCreated bind for this mint",
             )),
-            [decoded] => Ok(Some(ProtectedContentMintReceiptObservation {
-                chain_id,
-                receipt_block_number,
-                receipt_block_hash,
-                token_id: decoded.token_id.clone(),
-                operative: decoded.operative.clone(),
-            })),
+            [decoded] => {
+                let listing = self.protected_content_item_listed_in_receipt(
+                    logs,
+                    market,
+                    creator,
+                    &decoded.operative,
+                )?;
+                Ok(Some(ProtectedContentMintReceiptObservation {
+                    chain_id,
+                    receipt_block_number,
+                    receipt_block_hash,
+                    token_id: decoded.token_id.clone(),
+                    operative: decoded.operative.clone(),
+                    listing,
+                }))
+            }
             _ => Err(Response::error(
                 "ambiguous_protected_content_mint_receipt",
                 "receipt contains multiple matching AssetCreated binds",
+            )),
+        }
+    }
+
+    /// The listing this mint created, taken from its own receipt.
+    ///
+    /// Bound as tightly as the `AssetCreated` check above: the event must come
+    /// from the configured trade gateway, and must name this creator as seller
+    /// and the operative the mint just produced. A receipt that mints without
+    /// listing is refused rather than guessed at -- since the v3 protocol
+    /// bundled the two, a mint without an `ItemListed` is not the shape this
+    /// Runtime knows how to record.
+    fn protected_content_item_listed_in_receipt(
+        &self,
+        logs: &[Value],
+        market: &ProtectedContentMarketMethod,
+        creator: &str,
+        operative: &str,
+    ) -> Result<ProtectedContentListingRead, Response> {
+        let mut matches = Vec::new();
+        for log in logs {
+            let Some(address) = log.get("address").and_then(Value::as_str) else {
+                continue;
+            };
+            if !address.eq_ignore_ascii_case(&market.authority_gateway_contract) {
+                continue;
+            }
+            let Some(topic0) = log
+                .get("topics")
+                .and_then(Value::as_array)
+                .and_then(|topics| topics.first())
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if !topic0.eq_ignore_ascii_case(PROTECTED_CONTENT_ITEM_LISTED_TOPIC0) {
+                continue;
+            }
+            let decoded = decode_protected_content_item_listed_log(log)
+                .map_err(|err| Response::error("invalid_protected_content_mint_receipt", &err))?;
+            if !decoded.seller.eq_ignore_ascii_case(creator) {
+                continue;
+            }
+            if !decoded.operative.eq_ignore_ascii_case(operative) {
+                continue;
+            }
+            matches.push(decoded.listing);
+        }
+        match matches.as_slice() {
+            [] => Err(Response::error(
+                "protected_content_mint_receipt_not_bound",
+                "receipt does not contain the configured ItemListed bind for this mint",
+            )),
+            [listing] => Ok(listing.clone()),
+            _ => Err(Response::error(
+                "ambiguous_protected_content_mint_receipt",
+                "receipt contains multiple matching ItemListed binds",
             )),
         }
     }
@@ -2847,6 +2925,11 @@ struct ProtectedContentMintReceiptObservation {
     receipt_block_hash: Digest32,
     token_id: String,
     operative: String,
+    /// The listing the mint created, read from the `ItemListed` this very
+    /// transaction emitted. Carried here so it is covered by the same
+    /// two-source agreement as the rest of the receipt, and so the creator tail
+    /// needs no second read to learn what it already minted.
+    listing: ProtectedContentListingRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
