@@ -58,34 +58,40 @@ async fn caller_capsule_catalog_summary(
 ) -> CapsuleCatalogResponse {
     #[cfg(unix)]
     {
-        // Signed model catalogs currently admit exactly one entry. Observe its
-        // selected slot once, not once per ordinary app in the catalog.
-        let selected = capsule_catalog_summary(&state.data_dir)
-            .capsules
-            .into_iter()
-            .find(|row| row.model_content.is_some())
-            .and_then(|row| row.cid);
-        let projection = if let Some(cid) = selected.as_deref() {
-            Some(
-                crate::api::capsule_inventory::preparation::model_runtime_projection(
-                    &state.data_dir,
-                    state.provider_registry.as_deref(),
-                    context,
-                    cid,
-                    None,
-                )
-                .await,
-            )
-        } else {
-            None
-        };
         // Catalog trust may be revoked while the provider is answering. Rebuild
         // its signed rows while retaining ordinary installed app inventory.
+        // Each signed model CID keeps its own admission and offer projection.
+        let initial = capsule_catalog_summary(&state.data_dir);
+        let mut projections = Vec::new();
+        for row in &initial.capsules {
+            if row.model_content.is_some() {
+                if let Some(cid) = row.cid.clone() {
+                    projections.push((
+                        cid.clone(),
+                        crate::api::capsule_inventory::preparation::model_runtime_projection(
+                            &state.data_dir,
+                            state.provider_registry.as_deref(),
+                            context,
+                            &cid,
+                            None,
+                        )
+                        .await,
+                    ));
+                }
+            }
+        }
         let mut catalog = capsule_catalog_summary(&state.data_dir);
         for row in &mut catalog.capsules {
             if row.model_content.is_some() {
-                row.model_runtime = Some((if row.cid == selected { projection.clone() } else { None })
-                    .unwrap_or_else(crate::api::capsule_inventory::preparation::unavailable_model_runtime_projection));
+                row.model_runtime = Some(
+                    projections
+                        .iter()
+                        .find(|(cid, _)| row.cid.as_ref() == Some(cid))
+                        .map(|(_, projection)| projection.clone())
+                        .unwrap_or_else(
+                            crate::api::capsule_inventory::preparation::unavailable_model_runtime_projection,
+                        ),
+                );
                 let current = row.model_runtime.as_ref().unwrap();
                 if current["admitted"] == true {
                     row.state = if current["dispatch_ready"] == true {

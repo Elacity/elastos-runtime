@@ -1377,6 +1377,9 @@ mod tests {
             build_capability_resource("browser-engine", "raw_socket", &serde_json::json!({}))
                 .is_err()
         );
+        assert!(
+            build_capability_resource("browser-engine", "wallet", &serde_json::json!({})).is_err()
+        );
     }
 
     #[test]

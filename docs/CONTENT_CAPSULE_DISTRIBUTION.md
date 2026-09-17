@@ -113,8 +113,9 @@ workflow, file picker or editable model path. It uses this sequence:
    records. They show availability, Preparing with progress, Ready, or an
    actionable failed, offline or incompatible state. The intended Open handoff
    selects that model in Agent/chat and composes preparation with use; inference
-   waits for admission and provider readiness. Current Open Models instead
-   targets System and still requires the bounded adaptation below.
+   waits for admission and provider readiness. Open Models opens Marketplace
+   Models. A ready model can open Assistant with that exact CID. Inference
+   still waits for admission, provider readiness, and Send.
    A pin is retention, not evidence of trust, license acceptance or inference readiness.
    Runtime keeps paths and backend routes private. Selection preserves drafts
    and existing runs and never silently substitutes another model.
@@ -226,6 +227,20 @@ declared CID/size and model metadata, with installed and launchable both false.
 The caller's admission and exact-offer dispatch readiness determine whether the
 model state is unprepared, admitted or ready. A same-name local directory does
 not establish admission.
+
+A timed catalog carries `expires_at` and stops verifying exactly at that
+second. An explicitly pinned snapshot that omits `expires_at` is a permanent
+publisher statement; canonical publisher output omits the key, and a JSON
+`null` decodes the same way. Runtime readers older than this change require
+the field and reject a permanent snapshot, so those Runtimes update before an
+operator pins one. Re-pinning `model_catalog.head_cid` binds only new
+preparation records. An admitted package keeps its bytes and its original
+receipt, while readiness follows the current head: startup composition and
+dispatch readiness cover only records bound to the current head, so the
+package reports admitted and not ready until one explicit authorized same-CID
+Use under the new pin creates an alias record that reuses the admitted bytes
+without another payload fetch.
+
 Absent model configuration preserves ordinary installed inventory; invalid
 model configuration marks only the model catalog unavailable. Snapshot
 verification provides publisher metadata. Transfer, atomic admission and
@@ -244,9 +259,33 @@ startup, pin, retry or fallback for this mode.
 
 Runtime validates the private applied-range receipt against the exact CID,
 relative path, range and byte count. It consumes the range once and removes
-the receipt from Bytes and Stream output. Missing or conflicting receipts fail;
-bounded Content failures do not enter ordinary availability fallback. Remote
-bounded calls are outside this local contract.
+the receipt from Bytes and Stream output. Missing or conflicting receipts fail
+the local read. A bounded local miss then continues to the availability plane
+with the same CID, path and bound inside the request, and Runtime's outer
+invocation carries no range of its own, so the bytes are sliced exactly once.
+Carrier availability tries announced holders one at a time in the reputation
+order the replication path already uses, and records each holder's outcome, so
+a holder that failed one piece drops behind one that served the next. The
+verified announcement signer is the peer the hop must reach: the ticket's
+endpoint has to belong to that key, a mismatch is refused before any connect
+and counts as that signer's failure, so only the authenticated holder earns
+credit for bytes it served. For the bounded Content fetch, and only for it,
+the route timeout also bounds the holder's answer; connect and answer are
+separate budgets of that size, so a connected holder that stays silent or
+trickles costs the caller at most one answer budget on top of its connect
+before the next holder is tried, and a preparation that was cancelled or
+expired while one such read waited settles on its next check once that read
+returns. Other Carrier operations keep their open-ended answer, because
+cutting one could discard the receipt of an effect that is still running on
+the peer. Each hop forwards Content's bounded fetch to the
+holder's Runtime, which applies the bound against its own local backend under
+the same receipt checks, and the consumer accepts only a payload whose length
+is the requested range exactly, or one to `max_bytes` for metadata; a bounded
+Carrier response line above 128 KiB is refused before it is buffered.
+`local_only` reads stay local. A consumer with an empty cache therefore moves
+a package as 64 KiB pieces without any Runtime holding a whole file, and the
+caller still compares the metadata it receives against the signed catalog
+before trusting it.
 
 Complete metadata uses a maximum of 64 KiB and requests at most that cap plus
 one byte from Kubo. Success requires EOF within the cap. Runtime checks the
@@ -307,7 +346,7 @@ content CID and the consumer's typed model-run authority.
 | --- | --- |
 | `gateway_capsule_catalog/read_model.rs` already merges signed passive model entries into the capsule catalog. | Make Marketplace the primary content discovery path; retain System management and one catalog. Review the exact-one-entry validation and both helpers' at-most-one limit before broader choices. |
 | Generic `CapsuleManifest.viewer`, viewer compatibility audit and Home open-target handoff describe a content consumer. | The model profile rejects `viewer`; the current audit also requires an installed viewer-role target with a content interface. Agent/Assistant use their own roles and model interfaces. Map compatible selection explicitly rather than removing checks or relabeling execution as passive content. |
-| Library's protected-video handoff and Home launch context keep identity separate from authority. | Define the smallest exact-CID selection handoff into Agent/chat, preserving drafts, current launch binding and deliberate run intent. Current ready-only choices and Open Models to System do not provide this flow. |
+| Library's protected-video handoff and Home launch context keep identity separate from authority. | Define the smallest exact-CID selection handoff into Agent/chat, preserving drafts, current launch binding and deliberate run intent. Open Models now opens Marketplace Models, and a ready result can select that exact CID in Assistant. |
 | Runtime preparation inventory, private artifact descriptors and the existing model provider own admission, retention and execution. | Compose selection with preparation while retaining fail-closed admission, exact offer binding and cancellation/outcome ownership. The content manifest supplies no execution capability. |
 | Content/availability own delivery; Carrier is the private off-box transport. | Adapt bounded local preparation reads to that delivery contract with finite byte/time/cancellation limits. Both the ordinary whole-file materializer and `viewer_gateway::viewer_content`, which reads the entrypoint into browser-delivered bytes, are unsuitable for model weights. Reuse handoff identity, not those byte paths. |
 
@@ -407,8 +446,9 @@ Implemented source boundaries and remaining acceptance:
    Assistant/Home Agent keep exact offer/CID intent in existing workspaces and
    use current unique ready mappings. Missing choices and failed refreshes
    preserve drafts and accepted runs; new dispatch requires current readiness
-   and deliberate Send. Current Open Models uses the Home handoff to System;
-   the content-to-Agent review above covers the intended discovery/use flow.
+   and deliberate Send. Open Models uses the Home handoff to Marketplace Models.
+   A ready result can select that exact CID in Assistant;
+   the content-to-Agent review above covers the remaining discovery/use flow.
    Source fixtures cover the current boundaries. Verify the combined installed views,
    offline/incompatible states and busy-safe eviction with the exact model.
    Keep ordinary app catalog behavior and hosted configuration unchanged.

@@ -360,29 +360,37 @@ fn release_run_slot(data_dir: &Path, now: u64, key: &str) {
     }
 }
 
-/// Best-effort cancel of a run this Runtime dispatched but could not record.
+/// Best-effort cancel of a run this Runtime dispatched but could not accept.
+/// Returns true when the provider accepted the cancel request.
 async fn cancel_unrecorded_run(
     registry: &ProviderRegistry,
     context: &HomeLaunchTokenContext,
     capsule_id: &str,
     run_id: &str,
-) {
+) -> bool {
     let request = json!({ "run_id": run_id, "request_id": format!("unrecorded:{run_id}") });
     let Ok(normalized) =
         normalize_model_provider_request("runs_cancel", &request, context, capsule_id)
     else {
         tracing::warn!("unrecorded model run {run_id} could not form a cancel request");
-        return;
+        return false;
     };
     match registry.send_raw("model", &normalized).await {
         Ok(result) if provider_status_error(&result).is_none() => {
-            tracing::info!("unrecorded model run {run_id}: cancel requested")
+            tracing::info!("unrecorded model run {run_id}: cancel requested");
+            true
         }
-        Ok(result) => tracing::warn!(
-            "unrecorded model run {run_id}: cancel returned {}",
-            provider_status_error(&result).unwrap_or_default()
-        ),
-        Err(err) => tracing::warn!("unrecorded model run {run_id}: cancel failed: {err}"),
+        Ok(result) => {
+            tracing::warn!(
+                "unrecorded model run {run_id}: cancel returned {}",
+                provider_status_error(&result).unwrap_or_default()
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!("unrecorded model run {run_id}: cancel failed: {err}");
+            false
+        }
     }
 }
 
@@ -675,6 +683,110 @@ async fn read_authority(
     .context("model authority deadline")??
 }
 
+async fn grant_is_active(
+    data_dir: &Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    source: iroh::PublicKey,
+    grant_id: &str,
+    requester_principal_id: &str,
+) -> bool {
+    let now = crate::auth::now_ts();
+    match read_authority(data_dir, network, source, grant_id, requester_principal_id).await {
+        Ok(grant) => grant.validate(&source, requester_principal_id, now).is_ok(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CreateRacePoint {
+    BeforeDispatch,
+    BeforeCommit,
+}
+
+#[cfg(test)]
+struct CreateRaceBarrier {
+    prepared: Arc<tokio::sync::Barrier>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
+static CREATE_RACE_BARRIERS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::BTreeMap<(PathBuf, CreateRacePoint), Arc<CreateRaceBarrier>>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct CreateRaceBarrierGuard {
+    data_dir: PathBuf,
+    point: CreateRacePoint,
+    barrier: Arc<CreateRaceBarrier>,
+}
+
+#[cfg(test)]
+impl CreateRaceBarrierGuard {
+    pub(crate) async fn wait_prepared(&self) {
+        self.barrier.prepared.wait().await;
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self.barrier.release.send(true);
+    }
+}
+
+#[cfg(test)]
+impl Drop for CreateRaceBarrierGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = CREATE_RACE_BARRIERS.get_or_init(Default::default).lock() {
+            slots.remove(&(self.data_dir.clone(), self.point));
+        }
+        let _ = self.barrier.release.send(true);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_create_race_barrier(
+    data_dir: impl AsRef<Path>,
+    point: CreateRacePoint,
+) -> CreateRaceBarrierGuard {
+    let data_dir = data_dir.as_ref().to_path_buf();
+    let (release, _) = tokio::sync::watch::channel(false);
+    let barrier = Arc::new(CreateRaceBarrier {
+        prepared: Arc::new(tokio::sync::Barrier::new(2)),
+        release,
+    });
+    CREATE_RACE_BARRIERS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("create race barrier")
+        .insert((data_dir.clone(), point), barrier.clone());
+    CreateRaceBarrierGuard {
+        data_dir,
+        point,
+        barrier,
+    }
+}
+
+#[cfg(test)]
+async fn await_create_race_barrier(data_dir: &Path, point: CreateRacePoint) {
+    let barrier = CREATE_RACE_BARRIERS
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|slots| slots.get(&(data_dir.to_path_buf(), point)).cloned());
+    let Some(barrier) = barrier else {
+        return;
+    };
+    let mut released = barrier.release.subscribe();
+    barrier.prepared.wait().await;
+    while !*released.borrow() {
+        if released.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 /// Whether a typed model reply shows the run has settled. `runs_create`,
 /// `runs_get` and `runs_cancel` answer with a run view whose `status` is one of
 /// the terminal statuses (a `terminal` outcome accompanies it). `runs_events`
@@ -708,6 +820,130 @@ pub(super) fn run_result_terminal_status(result: &Value) -> Option<String> {
                 })
             })
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NormalizedRemoteModelReply {
+    pub run_id: Option<String>,
+    pub offer_id: Option<String>,
+    pub terminal_status: Option<String>,
+}
+
+fn unique_string_pointers(
+    result: &Value,
+    pointers: &[&str],
+) -> Result<Option<String>, &'static str> {
+    let mut found = None;
+    for pointer in pointers {
+        let Some(text) = result.pointer(pointer).and_then(Value::as_str) else {
+            continue;
+        };
+        match &found {
+            None => found = Some(text.to_string()),
+            Some(existing) if existing == text => {}
+            Some(_) => return Err("ambiguous remote model reply"),
+        }
+    }
+    Ok(found)
+}
+
+fn protocol_offer_list(result: &Value) -> Result<Option<&Vec<Value>>, &'static str> {
+    let nested = result.pointer("/data/offers");
+    let top = result.get("offers");
+    match (nested, top) {
+        (Some(left), Some(right)) if left != right => Err("ambiguous remote model reply"),
+        (Some(Value::Array(items)), _) | (_, Some(Value::Array(items))) => Ok(Some(items)),
+        (Some(_), _) | (_, Some(_)) => Err("ambiguous remote model reply"),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Read run id, offer id, and terminal status from a supported peer reply.
+/// Nested user and output objects stay on the original value. Two disagreeing
+/// identities are an ambiguous envelope.
+pub(super) fn normalize_remote_model_reply(
+    result: &Value,
+) -> Result<NormalizedRemoteModelReply, &'static str> {
+    let run_id = unique_string_pointers(result, &REMOTE_RUN_ID_POINTERS)?;
+    let offer_id = unique_string_pointers(result, &["/data/offer_id", "/offer_id"])?;
+    protocol_offer_list(result)?;
+    Ok(NormalizedRemoteModelReply {
+        run_id,
+        offer_id,
+        terminal_status: run_result_terminal_status(result),
+    })
+}
+
+const REMOTE_RUN_ID_POINTERS: [&str; 4] = ["/data/run/id", "/data/run_id", "/run/id", "/run_id"];
+
+/// After dispatch, keep ownership of accepted work. A trustworthy run ID is
+/// recorded and cancelled. A reservation without a run ID stays held so a
+/// retry cannot dispatch again.
+async fn reject_dispatched_create(
+    registry: &ProviderRegistry,
+    data_dir: &Path,
+    now: u64,
+    reservation_key: &str,
+    held_slot: bool,
+    context: &HomeLaunchTokenContext,
+    capsule_id: &str,
+    grant_id: &str,
+    source_did: &str,
+    requester_principal_id: &str,
+    request_id: &str,
+    normalized: &Value,
+    result: &Value,
+) -> Value {
+    let trustworthy_run_id = unique_string_pointers(result, &REMOTE_RUN_ID_POINTERS)
+        .ok()
+        .flatten();
+    if let Some(run_id) = trustworthy_run_id {
+        let record = RemoteModelRunRecord {
+            grant_id: grant_id.to_string(),
+            source_endpoint_did: source_did.to_string(),
+            requester_principal_id: requester_principal_id.to_string(),
+            remote_principal_id: context.principal_id.clone(),
+            capsule_id: capsule_id.to_string(),
+            offer_id: normalized["offer_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            operation: normalized["operation"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            request_id: request_id.to_string(),
+            input_hash: normalized
+                .pointer("/runtime_binding/input_hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            created_at: now,
+            terminal_status: None,
+            terminal_at: None,
+        };
+        match commit_run_slot(data_dir, now, reservation_key, &run_id, record) {
+            Ok(()) => {
+                let status = if cancel_unrecorded_run(registry, context, capsule_id, &run_id).await
+                {
+                    "cancelled"
+                } else {
+                    "settlement_unknown"
+                };
+                mark_run_settled(data_dir, now, &run_id, status);
+            }
+            Err(err) => {
+                tracing::warn!("remote model run index write failed: {err}");
+                let _ = cancel_unrecorded_run(registry, context, capsule_id, &run_id).await;
+                if held_slot {
+                    release_run_slot(data_dir, now, reservation_key);
+                }
+            }
+        }
+    } else {
+        tracing::warn!("dispatched model create kept its reservation without a trustworthy run id");
+    }
+    denied("invalid_provider_invocation", "model reply is ambiguous")
 }
 
 /// Serve one model operation for a remote consumer. Every path returns a
@@ -926,6 +1162,15 @@ pub(crate) async fn invoke(
         false
     };
 
+    if held_slot {
+        #[cfg(test)]
+        await_create_race_barrier(data_dir, CreateRacePoint::BeforeDispatch).await;
+        if !grant_is_active(data_dir, &network, source, grant_id, requester_principal_id).await {
+            release_run_slot(data_dir, now, &reservation_key);
+            return denied("denied", "model grant is not active for this requester");
+        }
+    }
+
     let result = match registry.send_raw("model", &normalized).await {
         Ok(result) => result,
         Err(err) => {
@@ -964,17 +1209,50 @@ pub(crate) async fn invoke(
         return denied(class, "model provider rejected the operation");
     }
 
+    if held_slot {
+        #[cfg(test)]
+        await_create_race_barrier(data_dir, CreateRacePoint::BeforeCommit).await;
+    }
+
+    let reply = normalize_remote_model_reply(&result);
+    if operation == "runs_create" {
+        let expected_offer = normalized["offer_id"].as_str().unwrap_or_default();
+        let offer_mismatch = reply.as_ref().ok().is_some_and(|reply| {
+            reply
+                .offer_id
+                .as_deref()
+                .is_some_and(|got| !expected_offer.is_empty() && got != expected_offer)
+        });
+        if reply.is_err() || offer_mismatch {
+            return reject_dispatched_create(
+                &registry,
+                data_dir,
+                now,
+                &reservation_key,
+                held_slot,
+                &context,
+                capsule_id,
+                grant_id,
+                &source_did,
+                requester_principal_id,
+                &request_id,
+                &normalized,
+                &result,
+            )
+            .await;
+        }
+    }
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(_) => {
+            return denied("invalid_provider_invocation", "model reply is ambiguous");
+        }
+    };
+
     let result = match operation {
         "offers_list" => with_offers(result.clone(), shareable_offers(&result)),
         "runs_create" => {
-            let run_id = result
-                .pointer("/data/run/id")
-                .or_else(|| result.pointer("/data/run_id"))
-                .or_else(|| result.pointer("/run/id"))
-                .or_else(|| result.get("run_id"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if let Some(run_id) = run_id {
+            if let Some(run_id) = reply.run_id.clone() {
                 let record = RemoteModelRunRecord {
                     grant_id: grant_id.to_string(),
                     source_endpoint_did: source_did.clone(),
@@ -996,15 +1274,15 @@ pub(crate) async fn invoke(
                         .unwrap_or_default()
                         .to_string(),
                     created_at: now,
-                    terminal_status: run_result_terminal_status(&result),
-                    terminal_at: run_result_is_terminal(&result).then_some(now),
+                    terminal_status: reply.terminal_status.clone(),
+                    terminal_at: reply.terminal_status.is_some().then_some(now),
                 };
                 if let Err(err) = commit_run_slot(data_dir, now, &reservation_key, &run_id, record)
                 {
                     // The run exists on this Runtime but has no owner record;
                     // settle it now rather than leave it running unaccounted.
                     tracing::warn!("remote model run index write failed: {err}");
-                    cancel_unrecorded_run(&registry, &context, capsule_id, &run_id).await;
+                    let _ = cancel_unrecorded_run(&registry, &context, capsule_id, &run_id).await;
                     if held_slot {
                         release_run_slot(data_dir, now, &reservation_key);
                     }
@@ -1020,8 +1298,10 @@ pub(crate) async fn invoke(
         }
         _ => {
             if let Some((run_id, record)) = indexed_run {
-                if let Some(status) =
-                    run_result_terminal_status(&result).filter(|_| record.terminal_at.is_none())
+                if let Some(status) = reply
+                    .terminal_status
+                    .clone()
+                    .filter(|_| record.terminal_at.is_none())
                 {
                     let _ = update_run_index(data_dir, now, |index| {
                         if let Some(entry) = index.runs.get_mut(&run_id) {
@@ -1035,6 +1315,11 @@ pub(crate) async fn invoke(
             result
         }
     };
+    if held_slot
+        && !grant_is_active(data_dir, &network, source, grant_id, requester_principal_id).await
+    {
+        let _ = cancel_grant_runs(registry, data_dir, grant_id).await;
+    }
     json!({ "ok": true, "result": result })
 }
 
@@ -1196,6 +1481,47 @@ mod tests {
         assert_eq!(ids, vec!["qwen", "local-2"]);
         let filtered = with_offers(result.clone(), shareable_offers(&result));
         assert_eq!(filtered["data"]["offers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn remote_reply_keeps_matching_identities_and_nested_output() {
+        let result = json!({
+            "status": "ok",
+            "data": {
+                "run_id": "run:sha256:aa",
+                "run": { "id": "run:sha256:aa" },
+                "offer_id": "qwen-local",
+                "status": "completed",
+                "terminal": {
+                    "status": "completed",
+                    "output": { "schema": "elastos.model.output.text/v1", "text": "hello" }
+                }
+            },
+            "run_id": "run:sha256:aa",
+            "offer_id": "qwen-local"
+        });
+        let reply = normalize_remote_model_reply(&result).expect("matching identities");
+        assert_eq!(reply.run_id.as_deref(), Some("run:sha256:aa"));
+        assert_eq!(reply.offer_id.as_deref(), Some("qwen-local"));
+        assert_eq!(reply.terminal_status.as_deref(), Some("completed"));
+        assert_eq!(
+            result["data"]["terminal"]["output"]["text"], "hello",
+            "normalization must leave nested output on the original reply"
+        );
+    }
+
+    #[test]
+    fn remote_reply_rejects_disagreeing_run_ids_and_offer_lists() {
+        assert!(normalize_remote_model_reply(&json!({
+            "data": { "run_id": "run:a" },
+            "run_id": "run:b"
+        }))
+        .is_err());
+        assert!(normalize_remote_model_reply(&json!({
+            "data": { "offers": [{ "id": "qwen" }] },
+            "offers": [{ "id": "other" }]
+        }))
+        .is_err());
     }
 
     #[test]

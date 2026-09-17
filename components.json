@@ -1448,8 +1448,9 @@
         "linux-amd64": {
           "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-ubuntu-x64.tar.gz",
           "checksum": "sha256:f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35",
-          "extract_path": "llama-b10516/llama-server",
-          "install_path": "bin/llama-server"
+          "extract_path": "llama-b10516",
+          "install_path": "libexec/llama.cpp/b10516/linux-amd64",
+          "binary_path": "llama-server"
         },
         "linux-arm64": {
           "strategy": "source-build",
@@ -1558,7 +1559,9 @@
         "marketplace",
         "archive-manager",
         "inbox",
-        "assistant"
+        "assistant",
+        "model-provider",
+        "llama-server"
       ]
     },
     "demo": {
@@ -1609,7 +1612,9 @@
         "marketplace",
         "archive-manager",
         "inbox",
-        "assistant"
+        "assistant",
+        "model-provider",
+        "llama-server"
       ]
     },
     "operator": {
@@ -1797,6 +1802,16 @@
         "model-qwen3.5-4b",
         "model-qwen3.5-9b"
       ]
+    }
+  },
+  "model_catalog": {
+    "head_cid": "bafkreigidvbvotnjdljhqmao3jmtgdh56h6wveso6lv7mnsyvmhcmhjpfq",
+    "publisher_dids": [
+      "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
+    ],
+    "local_use": {
+      "max_cache_bytes": 21474836480,
+      "max_model_memory_bytes": 8589934592
     }
   }
 }

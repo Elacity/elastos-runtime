@@ -29,6 +29,9 @@
   const pendingMediaBuys = new Set();
   let detailPreviousFocus = null;
   let detailModels = null;
+  let pendingModelLaunch = null;
+  const MODEL_CONTENT_CID = /^bafybei[a-z2-7]{51}[aeimquy4]$/;
+  const MODEL_OFFER_ID = /^model:[0-9a-f]{64}$/;
   let homeChromeReady = false;
   let lastHomeMenuManifestSignature = "";
 
@@ -76,6 +79,7 @@
     announceHomeChrome();
     await loadData();
     render();
+    applyModelsLaunch(modelsQueryFromLocation());
   }
 
   function announceHomeChrome() {
@@ -180,10 +184,86 @@
       return;
     }
     const data = event.data;
+    if (data?.type === "elastos.marketplace.navigate/v1") {
+      const keys = data && typeof data === "object" ? Object.keys(data).sort() : [];
+      if (data.homeToken !== homeToken || keys.length !== 3
+          || keys[0] !== "homeToken" || keys[1] !== "query" || keys[2] !== "type") {
+        return;
+      }
+      applyModelsLaunch(data.query);
+      return;
+    }
     if (data?.type !== "elastos:menu-command" || typeof data.cmd !== "string") {
       return;
     }
     handleHomeMenuCommand(data.cmd);
+  }
+
+  function modelsQueryFromLocation() {
+    const query = {};
+    const category = params.get("category");
+    const modelCid = params.get("model_cid");
+    if (category) query.category = category;
+    if (modelCid) query.model_cid = modelCid;
+    return query;
+  }
+
+  function modelsLaunchQuery(query) {
+    if (!query || typeof query !== "object" || Array.isArray(query) || query.category !== "models") {
+      return null;
+    }
+    const keys = Object.keys(query);
+    if (keys.length === 1 && keys[0] === "category") {
+      return { category: "models" };
+    }
+    if (keys.length === 2 && Object.prototype.hasOwnProperty.call(query, "model_cid")
+        && MODEL_CONTENT_CID.test(query.model_cid)) {
+      return { category: "models", model_cid: query.model_cid };
+    }
+    return null;
+  }
+
+  function applyModelsLaunch(query) {
+    const launch = modelsLaunchQuery(query);
+    if (!launch) {
+      return;
+    }
+    pendingModelLaunch = launch.model_cid ? launch : null;
+    selectDestination("models");
+    openPendingModelDetail();
+  }
+
+  function openPendingModelDetail() {
+    const launch = pendingModelLaunch;
+    if (!launch?.model_cid) {
+      return;
+    }
+    const app = state.apps.find((candidate) => candidate.modelCid === launch.model_cid);
+    if (!app) {
+      return;
+    }
+    pendingModelLaunch = null;
+    showAppDetail(app.id);
+  }
+
+  function openReadyModelInAssistant({ cid, offer_id }) {
+    if (!MODEL_CONTENT_CID.test(cid || "")) {
+      return;
+    }
+    if (window.top === window || !homeParentOrigin) {
+      showToast("Open Apps from Home to use this model.", true);
+      return;
+    }
+    const query = { model_cid: cid };
+    if (MODEL_OFFER_ID.test(offer_id || "")) {
+      query.offer_id = offer_id;
+    }
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "assistant",
+      query,
+      homeToken,
+    }, homeParentOrigin);
   }
 
   function handleHomeMenuCommand(command) {
@@ -466,6 +546,7 @@
       renderSections();
     }
     syncHomeMenuManifest();
+    openPendingModelDetail();
   }
 
   function normalizeDestination(id) {
@@ -909,6 +990,7 @@
       detailModels = window.ElastosModelManagement.create({
         root: els.detailContent.querySelector("[data-model-management]"), capsule: "marketplace", token: homeToken,
         buttonClass: "modal-btn secondary", cid: app.modelCid, compact: true,
+        onReadyOpen: openReadyModelInAssistant,
       });
       detailModels.setVisible(true);
     }

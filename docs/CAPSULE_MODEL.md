@@ -48,6 +48,27 @@ an inference offer after Runtime admits the model. The full Get, bootstrap, and
 external-gateway contract is in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
+## Capability placement
+
+An app composes typed capabilities whose execution and state can have different
+placements. Runtime acquires verified capsules for local execution or binds
+approved remote services. It checks interfaces, host support, resources and
+authority before effects, preserves explicit selections and explains missing
+requirements. Package availability, execution grants and state access remain
+separate decisions. Capsule code uses the same contract across placements.
+
+A local Browser UI can use a remote Chromium VM Engine, a local Exit and local
+durable state. A local Assistant or Builder can use remote inference, a local
+sandbox and local durable state. The inference result proposes local actions;
+Runtime authorises each tool operation independently. Each advertised combination
+needs compatible providers and installed proof. A provider manifest or a model
+reply alone does not establish working sandbox support.
+
+The [shared state contract](STORAGE_AND_ACCESS.md#shared-application-state)
+defines checkpoints and handoff when execution and durable storage are on
+different nodes. Current accepted placements remain in state.md and the release
+plan; broad placement support is a target, not a claim of hardware qualification.
+
 ## Isolation boundary
 
 Runtime admits an executable artifact for a session and binds the instance to

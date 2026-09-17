@@ -152,7 +152,7 @@ try {
     assert.equal(await menu.locator('[role="option"][aria-selected="true"]').count(), 0, "failed refresh leaves no selectable current model");
     await menu.getByRole("button", { name: "Open Models", exact: true }).click();
     const message = await page.waitForFunction(() => window.messages.find(m => m.type === "home:open-target"));
-    assert.deepEqual(await message.jsonValue(), { type: "home:open-target", homeToken: "fixture", target: "system", query: { settings: "models" } });
+    assert.deepEqual(await message.jsonValue(), { type: "home:open-target", homeToken: "fixture", target: "marketplace", query: { category: "models" } });
     assert.equal(await draft.inputValue(), "Keep my draft");
     assert.deepEqual(pageErrors, []);
     await page.close();

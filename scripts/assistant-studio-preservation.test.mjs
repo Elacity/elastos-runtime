@@ -10,7 +10,8 @@ const asset = path => new URL(`../capsules/${path}`, import.meta.url).href;
 const source = readFileSync(new URL("../capsules/assistant/browser/assistant.js", import.meta.url), "utf8")
   .replace('"/apps/home/home-clipboard-client.js?v=home-20260726a"', JSON.stringify(asset("home/browser/home-clipboard-client.js")))
   .replace('"./vendor/katex/katex.mjs"', JSON.stringify(asset("assistant/browser/vendor/katex/katex.mjs")))
-  .replace('"./model-selection.js"', JSON.stringify(asset("_shared/model-selection.js")));
+  .replace('"./model-selection.js"', JSON.stringify(asset("_shared/model-selection.js")))
+  .replace('"./model-contract.js"', JSON.stringify(asset("assistant/browser/model-contract.js")));
 const { createAssistantApp } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
 const clone = value => structuredClone(value);
 const runId = `run:sha256:${"a".repeat(64)}`;

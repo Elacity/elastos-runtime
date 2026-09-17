@@ -41,7 +41,7 @@ use futures_lite::StreamExt;
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -122,10 +122,18 @@ const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const GOSSIP_JOIN_PEERS_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// A consumer that joins a CID topic after the holder announced still needs a
+/// window for DHT/mDNS to form a gossip neighbor and for the signed fetch
+/// ticket to arrive. One absolute deadline covers late holders. Operator peer
+/// tickets remain the fallback when this window stays empty. Installed late-join
+/// on LAN needed more than 8s (2026-09-16).
+const CONTENT_AVAILABILITY_DISCOVERY_WAIT: Duration = Duration::from_secs(30);
+const CONTENT_AVAILABILITY_DISCOVERY_POLL: Duration = Duration::from_millis(100);
 const GOSSIP_JOIN_EXACT_MAX_PEERS: usize = 16;
 const GOSSIP_CARRIER_PUSH_MAX_TOPIC_LEN: usize = 256;
 // Maximum complete JSON GossipMessage admitted to the iroh-gossip wire.
 const GOSSIP_WIRE_MESSAGE_MAX_BYTES: usize = 192 * 1024;
+const CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 const GOSSIP_TOPIC_BUFFER_MAX_BYTES: usize = 12 * 1024 * 1024;
 const GOSSIP_CURSOR_MAX_CONSUMER_ID_BYTES: usize = 128;
 const GOSSIP_PEEK_MAX_MESSAGES: usize = 256;
@@ -523,6 +531,8 @@ fn add_ticket_endpoints(
 /// node peer add --did ... --ticket ...`) into the endpoint's
 /// `MemoryLookup`, so a later `connect_resolved_peer` by peer DID can
 /// resolve an address without waiting on gossip/mDNS/DHT discovery.
+/// Returns those endpoint IDs as gossip bootstrap peers so a content-topic
+/// join can reach an operator-named holder.
 ///
 /// Never aborts Carrier startup: an absent or empty store is normal, and a
 /// malformed ticket is skipped with a warning rather than failing the
@@ -530,7 +540,7 @@ fn add_ticket_endpoints(
 fn seed_address_book_from_operator_peer_store(
     memory_lookup: &MemoryLookup,
     data_dir: &std::path::Path,
-) {
+) -> Vec<iroh::EndpointId> {
     let config = match load_operator_control(data_dir) {
         Ok(config) => config,
         Err(err) => {
@@ -538,7 +548,7 @@ fn seed_address_book_from_operator_peer_store(
                 "carrier: no operator peer store to seed address book from: {}",
                 err
             );
-            return;
+            return Vec::new();
         }
     };
 
@@ -559,12 +569,13 @@ fn seed_address_book_from_operator_peer_store(
             continue;
         }
 
-        add_ticket_endpoints(memory_lookup, &mut bootstrap_peers, &endpoints, false);
+        add_ticket_endpoints(memory_lookup, &mut bootstrap_peers, &endpoints, true);
         debug!(
             peer_did,
             "seeded Carrier address book from operator peer store"
         );
     }
+    bootstrap_peers
 }
 
 #[derive(Deserialize)]
@@ -789,6 +800,8 @@ async fn join_gossip_topic_direct(
     let peers = state.peers.clone();
     let topic_peers = state.topic_peers.clone();
     let topic_key = topic_name.to_string();
+    let sender_for_recv = dtt_sender.clone();
+    let local_did = state.did.clone();
     let receiver_task = tokio::spawn(async move {
         recv_loop(
             CarrierGossipReceiver::Direct(iroh_receiver),
@@ -796,6 +809,8 @@ async fn join_gossip_topic_direct(
             peers,
             topic_peers,
             topic_key,
+            sender_for_recv,
+            local_did,
         )
         .await;
     });
@@ -846,6 +861,8 @@ async fn join_gossip_topic(
     let peers = state.peers.clone();
     let topic_peers = state.topic_peers.clone();
     let topic_key = topic_name.to_string();
+    let sender_for_recv = sender.clone();
+    let local_did = state.did.clone();
     let receiver_task = tokio::spawn(async move {
         recv_loop(
             CarrierGossipReceiver::Discovered(receiver),
@@ -853,6 +870,8 @@ async fn join_gossip_topic(
             peers,
             topic_peers,
             topic_key,
+            sender_for_recv,
+            local_did,
         )
         .await;
     });
@@ -1083,7 +1102,7 @@ async fn start_carrier_node_with_network(
     // so a peer-DID custody dial can resolve without a live discovery
     // round trip. Shared by every caller of this startup path (serve,
     // gateway, and future custody-node roles).
-    seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir);
+    let bootstrap_peers = seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir);
 
     let gossip = spawn_carrier_gossip(&endpoint);
 
@@ -1094,6 +1113,10 @@ async fn start_carrier_node_with_network(
         Some(signing_key.clone()),
         Some(did.to_string()),
     )));
+    {
+        let mut state = gossip_state.lock().await;
+        state.bootstrap_peers = bootstrap_peers;
+    }
 
     let file_handler = FileHandler {
         data_dir: data_dir.clone(),
@@ -2190,6 +2213,7 @@ pub struct CarrierAvailabilityProvider {
     peer_reputation: Arc<Mutex<HashMap<String, CarrierPeerReputation>>>,
     data_dir: Option<PathBuf>,
     peer_attestation_exchange: Option<CarrierPeerAttestationExchangeClient>,
+    discovery_wait: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -2214,6 +2238,7 @@ impl CarrierAvailabilityProvider {
             peer_reputation: Arc::new(Mutex::new(HashMap::new())),
             data_dir: None,
             peer_attestation_exchange: None,
+            discovery_wait: CONTENT_AVAILABILITY_DISCOVERY_WAIT,
         }
     }
 
@@ -2227,6 +2252,7 @@ impl CarrierAvailabilityProvider {
             peer_reputation: Arc::new(Mutex::new(HashMap::new())),
             data_dir: None,
             peer_attestation_exchange: None,
+            discovery_wait: CONTENT_AVAILABILITY_DISCOVERY_WAIT,
         }
     }
 
@@ -2265,7 +2291,14 @@ impl CarrierAvailabilityProvider {
             peer_reputation: Arc::new(Mutex::new(peer_reputation)),
             data_dir: Some(data_dir),
             peer_attestation_exchange,
+            discovery_wait: CONTENT_AVAILABILITY_DISCOVERY_WAIT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_discovery_wait(mut self, wait: Duration) -> Self {
+        self.discovery_wait = wait;
+        self
     }
 
     async fn record_peer_reputation(&self, node_did: &str, success: bool) {
@@ -3467,8 +3500,12 @@ impl CarrierAvailabilityProvider {
         if let Err(err) = validate_carrier_content_path(path) {
             return Ok(carrier_availability_error("invalid_path", err));
         }
+        let bound = match BoundedContentRead::from_request(request) {
+            Ok(bound) => bound,
+            Err(err) => return Ok(carrier_availability_error("invalid_request", err)),
+        };
         let topic_name = content_availability_topic_name(cid);
-        let messages = {
+        {
             let mut state = self.state.lock().await;
             if !state.joined_topics.contains(&topic_name) {
                 if state.joined_topics.len() >= MAX_TOPICS {
@@ -3478,26 +3515,11 @@ impl CarrierAvailabilityProvider {
                     ));
                 }
                 if let Err(err) = join_gossip_topic(&mut state, &topic_name, false).await {
-                    return Ok(carrier_availability_error(
-                        "join_failed",
-                        format!("Carrier availability topic join failed: {err}"),
-                    ));
+                    tracing::debug!(
+                        "Carrier availability topic join failed; announced holders are unavailable: {err}"
+                    );
                 }
             }
-            let buffers = state.buffers.clone();
-            drop(state);
-            let buffers = buffers.lock().await;
-            buffers
-                .get(&topic_name)
-                .map(|buffer| buffer.messages.iter().rev().cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-        let tickets = content_availability_fetch_tickets(&messages, cid);
-        if tickets.is_empty() {
-            return Ok(carrier_availability_error(
-                "carrier_fetch_unavailable",
-                "no Carrier availability announcement with a fetch ticket is available for this CID",
-            ));
         }
 
         let Some(registry) = self
@@ -3511,29 +3533,91 @@ impl CarrierAvailabilityProvider {
             ));
         };
 
+        let deadline = tokio::time::Instant::now() + self.discovery_wait;
+        let mut tried = HashSet::new();
         let mut errors = Vec::new();
-        for ticket in tickets {
-            match fetch_content_via_carrier_provider_invocation(&registry, &ticket, cid, path).await
-            {
-                Ok((bytes, remote_transfer)) => {
-                    return Ok(serde_json::json!({
-                        "status": "ok",
-                        "data": {
-                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                            "availability": {
-                                "status": "network_available",
-                                "provider": "carrier-availability",
-                                "policy": "carrier_provider_invoke",
-                                "replicas": 1,
-                                "transport": "carrier-provider-plane",
-                                "remote_transfer": remote_transfer,
-                                "checked_at": now_secs(),
-                            }
-                        }
-                    }))
-                }
-                Err(err) => errors.push(err.to_string()),
+        loop {
+            let (messages, self_did) = {
+                let state = self.state.lock().await;
+                let self_did = state.did.clone().unwrap_or_default();
+                let buffers = state.buffers.lock().await;
+                let messages = buffers
+                    .get(&topic_name)
+                    .map(|buffer| buffer.messages.iter().rev().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (messages, self_did)
+            };
+            // Holders are tried one at a time in the same reputation order the
+            // replication path uses, so a holder that failed a previous piece drops
+            // behind one that served, instead of costing its timeout on every piece.
+            let reputation = self.peer_reputation.lock().await.clone();
+            let mut replicas =
+                content_availability_replicas_with_reputation(&messages, cid, &reputation);
+            // Signed announcements are the product holder set. Operator-named
+            // peers fill the same gap they fill on ensure: a known holder that
+            // has not yet announced this CID can still serve a bounded fetch.
+            if let Some(data_dir) = self.data_dir.as_deref() {
+                append_operator_peer_store_replica_candidates(
+                    &mut replicas,
+                    data_dir,
+                    &self_did,
+                    &reputation,
+                    now_secs(),
+                );
             }
+            let next = replicas
+                .into_iter()
+                .find(|replica| !tried.contains(&replica.node_did));
+            if let Some(replica) = next {
+                if tried.len() >= MAX_CARRIER_REPLICATION_CANDIDATES {
+                    break;
+                }
+                tried.insert(replica.node_did.clone());
+                match fetch_content_via_carrier_provider_invocation(
+                    &registry,
+                    &replica.node_did,
+                    &replica.connect_ticket,
+                    cid,
+                    path,
+                    bound,
+                )
+                .await
+                {
+                    Ok((bytes, remote_transfer)) => {
+                        self.record_peer_reputation(&replica.node_did, true).await;
+                        return Ok(serde_json::json!({
+                            "status": "ok",
+                            "data": {
+                                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                                "availability": {
+                                    "status": "network_available",
+                                    "provider": "carrier-availability",
+                                    "policy": "carrier_provider_invoke",
+                                    "replicas": 1,
+                                    "transport": "carrier-provider-plane",
+                                    "remote_transfer": remote_transfer,
+                                    "checked_at": now_secs(),
+                                }
+                            }
+                        }));
+                    }
+                    Err(err) => {
+                        self.record_peer_reputation(&replica.node_did, false).await;
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(CONTENT_AVAILABILITY_DISCOVERY_POLL).await;
+        }
+        if errors.is_empty() {
+            return Ok(carrier_availability_error(
+                "carrier_fetch_unavailable",
+                "no Carrier availability announcement with a fetch ticket is available for this CID",
+            ));
         }
 
         Ok(carrier_availability_error(
@@ -3543,11 +3627,88 @@ impl CarrierAvailabilityProvider {
     }
 }
 
+/// Bound one Content read forwarded to a holder: a closed file range or a
+/// complete-metadata byte limit. The holder's Runtime applies it once, so a
+/// consumer moves a large package as 64 KiB pieces instead of whole files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundedContentRead {
+    Range { start: u64, end: u64 },
+    Metadata { max_bytes: u64 },
+}
+
+const MAX_BOUNDED_CONTENT_READ_BYTES: u64 = 64 * 1024;
+
+impl BoundedContentRead {
+    fn from_request(request: &serde_json::Value) -> std::result::Result<Option<Self>, String> {
+        match request.get("bounded_read") {
+            None | Some(serde_json::Value::Bool(false)) => return Ok(None),
+            Some(serde_json::Value::Bool(true)) => {}
+            Some(_) => return Err("bounded_read must be a boolean".to_string()),
+        }
+        let range = request.get("range");
+        let max_bytes = request.get("max_bytes");
+        match (range, max_bytes) {
+            (Some(range), None) => {
+                let start = range.get("start").and_then(serde_json::Value::as_u64);
+                let end = range.get("end").and_then(serde_json::Value::as_u64);
+                let (Some(start), Some(end)) = (start, end) else {
+                    return Err("bounded read requires a closed range".to_string());
+                };
+                let length = end
+                    .checked_sub(start)
+                    .and_then(|size| size.checked_add(1))
+                    .filter(|size| *size <= MAX_BOUNDED_CONTENT_READ_BYTES);
+                if length.is_none() {
+                    return Err("bounded read range exceeds limit".to_string());
+                }
+                Ok(Some(Self::Range { start, end }))
+            }
+            (None, Some(max_bytes)) => {
+                let max_bytes = max_bytes
+                    .as_u64()
+                    .filter(|n| (1..=MAX_BOUNDED_CONTENT_READ_BYTES).contains(n))
+                    .ok_or_else(|| "bounded metadata read exceeds limit".to_string())?;
+                if request.get("path").and_then(serde_json::Value::as_str)
+                    != Some(crate::content::CONTENT_OBJECT_MANIFEST_PATH)
+                {
+                    return Err("bounded metadata read requires the object manifest path".into());
+                }
+                Ok(Some(Self::Metadata { max_bytes }))
+            }
+            _ => Err("bounded read requires a range or a metadata bound, not both".to_string()),
+        }
+    }
+
+    fn apply(self, request: &mut serde_json::Value) {
+        request["bounded_read"] = serde_json::Value::Bool(true);
+        match self {
+            Self::Range { start, end } => {
+                request["range"] = serde_json::json!({ "start": start, "end": end });
+            }
+            Self::Metadata { max_bytes } => {
+                request["max_bytes"] = serde_json::json!(max_bytes);
+            }
+        }
+    }
+
+    fn accepts(self, length: u64) -> bool {
+        match self {
+            Self::Range { start, end } => length == end - start + 1,
+            Self::Metadata { max_bytes } => (1..=max_bytes).contains(&length),
+        }
+    }
+}
+
+/// The announcement's verified signer is the peer the ticket must reach. The
+/// invoker rejects a ticket whose endpoint is another key before connecting,
+/// so a holder is credited only for bytes its own authenticated peer served.
 async fn fetch_content_via_carrier_provider_invocation(
     registry: &ProviderRegistry,
+    holder_did: &str,
     ticket: &str,
     cid: &str,
     path: &str,
+    bound: Option<BoundedContentRead>,
 ) -> Result<(Vec<u8>, Option<serde_json::Value>)> {
     validate_content_cid(cid).map_err(anyhow::Error::msg)?;
     validate_carrier_content_path(path).map_err(anyhow::Error::msg)?;
@@ -3561,6 +3722,9 @@ async fn fetch_content_via_carrier_provider_invocation(
     if !path.is_empty() {
         request["path"] = serde_json::Value::String(path.to_string());
     }
+    if let Some(bound) = bound {
+        bound.apply(&mut request);
+    }
 
     let response = registry
         .invoke_provider(ProviderInvocation {
@@ -3573,7 +3737,7 @@ async fn fetch_content_via_carrier_provider_invocation(
             progress: None,
             transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
                 connect_ticket: ticket.to_string(),
-                peer_did: None,
+                peer_did: Some(holder_did.to_string()),
                 timeout_ms: Some(5_000),
             }),
         })
@@ -3589,6 +3753,13 @@ async fn fetch_content_via_carrier_provider_invocation(
     }
     let remote_transfer = response.get("_runtime_transfer").cloned();
     let bytes = remote_content_provider_response_bytes(&response)?;
+    if let Some(bound) = bound {
+        anyhow::ensure!(
+            bound.accepts(bytes.len() as u64),
+            "holder returned {} bytes for a bounded read of {bound:?}",
+            bytes.len()
+        );
+    }
     Ok((bytes, remote_transfer))
 }
 
@@ -4432,6 +4603,13 @@ async fn import_content_via_carrier_provider_invocation(
     .await
     {
         Ok(response) => Ok(response),
+        Err(object_err)
+            if object_err
+                .to_string()
+                .contains("local content object import exceeds") =>
+        {
+            Err(object_err)
+        }
         Err(object_err) => import_exact_content_via_carrier_provider_invocation(
             registry,
             replica,
@@ -4625,6 +4803,20 @@ async fn local_content_fetch_bytes_for_import(
     remote_content_provider_response_bytes(&response)
 }
 
+fn carrier_legacy_object_import_declared_bytes(manifest: &ContentObjectManifest) -> Result<u64> {
+    let mut total_bytes = 0_u64;
+    for file in &manifest.files {
+        total_bytes = total_bytes.saturating_add(file.size);
+        if total_bytes > MAX_CARRIER_OBJECT_IMPORT_BYTES as u64 {
+            anyhow::bail!(
+                "local content object import exceeds {} bytes",
+                MAX_CARRIER_OBJECT_IMPORT_BYTES
+            );
+        }
+    }
+    Ok(total_bytes)
+}
+
 async fn import_object_content_via_carrier_provider_invocation(
     registry: &ProviderRegistry,
     replica: &CarrierAvailabilityReplica,
@@ -4648,6 +4840,7 @@ async fn import_object_content_via_carrier_provider_invocation(
             MAX_CARRIER_OBJECT_IMPORT_FILES
         );
     }
+    carrier_legacy_object_import_declared_bytes(&manifest)?;
     let mut files = Vec::with_capacity(manifest.files.len());
     let mut total_bytes = 0_usize;
     for file in &manifest.files {
@@ -5355,6 +5548,7 @@ fn carrier_repair_reason(
     }
 }
 
+#[cfg(test)]
 fn content_availability_replicas(
     messages: &[GossipMessage],
     cid: &str,
@@ -5429,7 +5623,7 @@ fn content_availability_replicas_with_reputation(
             carrier_replica_candidate_score(
                 endpoint_id.as_deref(),
                 announced_at,
-                message.ts,
+                now_secs(),
                 reputation.get(&node_did),
             );
         replicas.push(CarrierAvailabilityReplica {
@@ -5456,7 +5650,8 @@ fn sort_replica_candidates(replicas: &mut [CarrierAvailabilityReplica]) {
     });
 }
 
-/// Operator-registered peers as replication candidates. They rank below a
+/// Operator-registered peers as replication candidates and as fetch
+/// holders when the CID has no signed announcement yet. They rank below a
 /// signed announcement of the same CID (base score 40 vs 50) so an actual
 /// holder is always preferred, carry the local reputation adjustment like
 /// every other candidate, and are skipped when the DID is this node or is
@@ -5515,7 +5710,7 @@ fn append_operator_peer_store_replica_candidates(
 fn carrier_replica_candidate_score(
     endpoint_id: Option<&str>,
     announced_at: u64,
-    message_ts: u64,
+    observed_at: u64,
     reputation: Option<&CarrierPeerReputation>,
 ) -> (u32, String, i32, String) {
     let mut score = 50_u32;
@@ -5527,7 +5722,7 @@ fn carrier_replica_candidate_score(
         score = score.saturating_add(20);
         reasons.push("endpoint_advertised");
     }
-    if announced_at >= message_ts.saturating_sub(60 * 60) {
+    if observed_at.saturating_sub(announced_at) <= 60 * 60 {
         score = score.saturating_add(20);
         reasons.push("fresh");
     } else {
@@ -5615,13 +5810,6 @@ fn save_carrier_peer_reputation(
     let bytes = serde_json::to_vec_pretty(&store)?;
     std::fs::write(path, bytes)?;
     Ok(())
-}
-
-fn content_availability_fetch_tickets(messages: &[GossipMessage], cid: &str) -> Vec<String> {
-    content_availability_replicas(messages, cid)
-        .into_iter()
-        .map(|replica| replica.connect_ticket)
-        .collect()
 }
 
 fn gossip_cursor_error(code: &str, message: &str) -> serde_json::Value {
@@ -6475,6 +6663,79 @@ impl Provider for CarrierGossipProvider {
     }
 }
 
+fn is_content_availability_topic(topic: &str) -> bool {
+    topic.starts_with("__elastos_content/v1/")
+}
+
+fn gossip_message_is_local_fetch_announcement(message: &GossipMessage, local_did: &str) -> bool {
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+        return false;
+    };
+    let Some(cid) = envelope
+        .get("payload")
+        .and_then(|payload| payload.get("cid"))
+        .and_then(|cid| cid.as_str())
+    else {
+        return false;
+    };
+    content_availability_replicas_with_reputation(
+        std::slice::from_ref(message),
+        cid,
+        &HashMap::new(),
+    )
+    .iter()
+    .any(|replica| replica.node_did == local_did)
+}
+
+fn local_content_availability_catchup_message(
+    messages: &VecDeque<GossipMessage>,
+    local_did: &str,
+) -> Option<GossipMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| gossip_message_is_local_fetch_announcement(message, local_did))
+        .cloned()
+}
+
+async fn rebroadcast_local_content_availability_catchup(
+    buffers: &Arc<Mutex<HashMap<String, TopicBuffer>>>,
+    topic: &str,
+    sender: &distributed_topic_tracker::GossipSender,
+    local_did: Option<&str>,
+) {
+    if !is_content_availability_topic(topic) {
+        return;
+    }
+    let Some(local_did) = local_did.filter(|did| !did.is_empty()) else {
+        return;
+    };
+    let message = {
+        let buffers = buffers.lock().await;
+        let Some(buffer) = buffers.get(topic) else {
+            return;
+        };
+        local_content_availability_catchup_message(&buffer.messages, local_did)
+    };
+    let Some(message) = message else {
+        return;
+    };
+    let Ok(bytes) = serialize_gossip_wire_message(&message) else {
+        return;
+    };
+    match tokio::time::timeout(GOSSIP_SEND_TIMEOUT, sender.broadcast(bytes)).await {
+        Ok(Ok(())) => {
+            tracing::debug!("Carrier availability catch-up broadcast on neighbor up");
+        }
+        Ok(Err(err)) => {
+            tracing::debug!("Carrier availability catch-up broadcast failed: {err}");
+        }
+        Err(_) => {
+            tracing::debug!("Carrier availability catch-up broadcast timed out");
+        }
+    }
+}
+
 /// Background task: receive gossip messages and buffer them.
 async fn handle_gossip_event(
     event: iroh_gossip::api::Event,
@@ -6559,11 +6820,23 @@ async fn recv_loop(
     peers: Arc<Mutex<Vec<String>>>,
     topic_peers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     topic: String,
+    sender: distributed_topic_tracker::GossipSender,
+    local_did: Option<String>,
 ) {
     loop {
         match receiver.next().await {
             Ok(Some(event)) => {
+                let neighbor_up = matches!(&event, iroh_gossip::api::Event::NeighborUp(_));
                 handle_gossip_event(event, &buffers, &peers, &topic_peers, &topic).await;
+                if neighbor_up {
+                    rebroadcast_local_content_availability_catchup(
+                        &buffers,
+                        &topic,
+                        &sender,
+                        local_did.as_deref(),
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 tracing::warn!("carrier recv_loop error on '{}': {}", topic, e);
@@ -6592,6 +6865,7 @@ async fn recv_loop(
 pub struct CarrierProviderInvoker {
     peer_endpoint: Option<Endpoint>,
     provider_registry: Weak<ProviderRegistry>,
+    peer_clients: Mutex<BTreeMap<iroh::PublicKey, Arc<CarrierClient>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -6615,10 +6889,7 @@ pub struct BrowserCarrierStream {
 
 impl CarrierProviderInvoker {
     pub fn new() -> Self {
-        Self {
-            peer_endpoint: None,
-            provider_registry: Weak::new(),
-        }
+        Self::default()
     }
 
     /// Binds the invoker to the long-lived Carrier endpoint that owns peer
@@ -6627,7 +6898,7 @@ impl CarrierProviderInvoker {
     pub fn with_carrier_endpoint(endpoint: Endpoint) -> Self {
         Self {
             peer_endpoint: Some(endpoint),
-            provider_registry: Weak::new(),
+            ..Self::default()
         }
     }
 
@@ -6641,7 +6912,34 @@ impl CarrierProviderInvoker {
         Self {
             peer_endpoint: Some(endpoint),
             provider_registry,
+            ..Self::default()
         }
+    }
+
+    async fn connected_client(
+        &self,
+        peer_endpoint: &Endpoint,
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+    ) -> Result<Arc<CarrierClient>> {
+        let peer = addr.id;
+        if let Some(client) = self.peer_clients.lock().await.get(&peer).cloned() {
+            return Ok(client);
+        }
+        let client = Arc::new(
+            CarrierClient::connect_known_endpoint(peer_endpoint, addr, timeout_secs).await?,
+        );
+        let mut peers = self.peer_clients.lock().await;
+        Ok(peers.entry(peer).or_insert_with(|| client.clone()).clone())
+    }
+
+    async fn forget_peer(&self, peer: iroh::PublicKey) {
+        self.peer_clients.lock().await.remove(&peer);
+    }
+
+    #[cfg(test)]
+    async fn retained_peer_count(&self) -> usize {
+        self.peer_clients.lock().await.len()
     }
 
     async fn invoke_loopback_provider(
@@ -6746,17 +7044,41 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
 
                 let mut errors = Vec::new();
                 for (index, endpoint) in endpoints.into_iter().enumerate() {
-                    match CarrierClient::connect_known_endpoint(
-                        peer_endpoint,
-                        endpoint,
-                        timeout_secs,
-                    )
-                    .await
+                    let peer = endpoint.id;
+                    match self
+                        .connected_client(peer_endpoint, endpoint, timeout_secs)
+                        .await
                     {
                         Ok(client) => {
-                            match client.invoke_provider(invocation, request.clone()).await {
+                            let invoke = client.invoke_provider(invocation, request.clone());
+                            // A bounded Content read carries no effect, so its answer
+                            // gets the same budget as the connect and a silent holder
+                            // yields to the next one. Every other operation keeps its
+                            // open-ended answer: cutting it could discard a receipt for
+                            // an effect that is still running on the peer.
+                            let result = if bounded_content_fetch(invocation, &request) {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(timeout_secs),
+                                    invoke,
+                                )
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        self.forget_peer(peer).await;
+                                        errors.push(format!(
+                                            "ticket[{index}] response deadline of {timeout_secs}s passed"
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                invoke.await
+                            };
+                            match result {
                                 Ok(response) => return Ok(response),
                                 Err(err) => {
+                                    self.forget_peer(peer).await;
                                     errors.push(carrier_provider_public_invoke_error(index, &err))
                                 }
                             }
@@ -6789,35 +7111,40 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                         .invoke_loopback_provider(peer_endpoint, invocation, request)
                         .await;
                 }
-                let client =
-                    CarrierClient::connect_resolved_peer(peer_endpoint, public_key, timeout_secs)
-                        .await
-                        .map_err(|err| {
-                            // Keep the cause. A message that will not send is
-                            // hard enough to diagnose without the Runtime
-                            // throwing away the reason on its way out.
-                            tracing::debug!(
-                                peer = %peer_did,
-                                error = %err,
-                                "Carrier peer connect failed"
-                            );
-                            ProviderError::Unavailable(
-                                "no verified Carrier route to the requested peer".to_string(),
-                            )
-                        })?;
-                client
-                    .invoke_provider(invocation, request)
+                let client = self
+                    .connected_client(
+                        peer_endpoint,
+                        iroh::EndpointAddr::from(public_key),
+                        timeout_secs,
+                    )
                     .await
                     .map_err(|err| {
+                        // Keep the cause. A message that will not send is
+                        // hard enough to diagnose without the Runtime
+                        // throwing away the reason on its way out.
+                        tracing::debug!(
+                            peer = %peer_did,
+                            error = %err,
+                            "Carrier peer connect failed"
+                        );
+                        ProviderError::Unavailable(
+                            "no verified Carrier route to the requested peer".to_string(),
+                        )
+                    })?;
+                match client.invoke_provider(invocation, request).await {
+                    Ok(response) => Ok(response),
+                    Err(err) => {
+                        self.forget_peer(public_key).await;
                         tracing::debug!(
                             peer = %peer_did,
                             error = %err,
                             "Carrier peer invocation failed"
                         );
-                        ProviderError::Provider(
+                        Err(ProviderError::Provider(
                             "Carrier provider invocation peer_did route failed".to_string(),
-                        )
-                    })
+                        ))
+                    }
+                }
             }
         }
     }
@@ -6881,6 +7208,14 @@ pub async fn open_browser_carrier_stream_on_endpoint(
 fn carrier_route_timeout_secs(route: &ProviderCarrierRoute) -> u64 {
     let timeout_ms = route.timeout_ms().unwrap_or(5_000).clamp(1, 60_000);
     timeout_ms.div_ceil(1_000)
+}
+
+/// The one Carrier operation whose answer is bounded by its request: Content's
+/// validated bounded fetch of a closed range or a metadata bound.
+fn bounded_content_fetch(invocation: &ProviderInvocation, request: &serde_json::Value) -> bool {
+    invocation.target == "content"
+        && invocation.op == "fetch"
+        && request.get("bounded_read") == Some(&serde_json::Value::Bool(true))
 }
 
 fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) -> bool {
@@ -7152,6 +7487,7 @@ impl CarrierClient {
         invocation: &ProviderInvocation,
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let bounded = request.get("bounded_read") == Some(&serde_json::Value::Bool(true));
         let (mut send, recv) = self.conn.open_bi().await?;
         let msg = carrier_provider_invoke_message(invocation, request);
         let mut bytes = serde_json::to_vec(&msg)?;
@@ -7161,7 +7497,18 @@ impl CarrierClient {
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        if bounded {
+            // A bounded read holds at most 64 KiB of base64 plus its envelope;
+            // a holder that sends more is refused before it is buffered.
+            let mut limited = (&mut reader).take(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES);
+            limited.read_line(&mut line).await?;
+            anyhow::ensure!(
+                line.ends_with('\n'),
+                "bounded Carrier provider response exceeds {CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES} bytes"
+            );
+        } else {
+            reader.read_line(&mut line).await?;
+        }
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         carrier_provider_invoke_result(response)
     }
@@ -7368,7 +7715,7 @@ pub async fn try_p2p_discovery(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
@@ -7427,7 +7774,7 @@ mod tests {
         message
     }
 
-    async fn shutdown_test_carrier_node(node: CarrierNode) {
+    pub(crate) async fn shutdown_test_carrier_node(node: CarrierNode) {
         let tasks = {
             let mut state = node.gossip_state.lock().await;
             let tasks = state
@@ -7975,6 +8322,9 @@ mod tests {
                 "request": request,
             }));
             if invocation.transfer == ProviderTransfer::Stream {
+                if self.fail_tickets.iter().any(|dead| dead == ticket) {
+                    return Err(ProviderError::Provider("mock remote fetch failed".into()));
+                }
                 return Ok(serde_json::json!({
                     "status": "ok",
                     "data": {
@@ -8364,6 +8714,77 @@ mod tests {
         assert!(uri.ends_with("/availability"));
         assert!(!topic.contains(cid));
         assert!(!uri.contains(cid));
+        assert!(is_content_availability_topic(&topic));
+        assert!(!is_content_availability_topic(
+            "__elastos_internal/chat-presence-v1/#general"
+        ));
+    }
+
+    #[test]
+    fn test_local_content_availability_catchup_selects_own_fetch_ticket() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (message, did) = signed_content_availability_message(
+            cid,
+            [26u8; 32],
+            "ticket:holder",
+            "holder-endpoint",
+            1_700_000_000,
+        );
+        let (foreign, _) = signed_content_availability_message(
+            cid,
+            [27u8; 32],
+            "ticket:foreign",
+            "foreign-endpoint",
+            1_700_000_001,
+        );
+        let buffer = test_topic_buffer([foreign, message.clone()], 0);
+        let selected = local_content_availability_catchup_message(&buffer.messages, &did)
+            .expect("holder announcement with a fetch ticket is selected");
+        assert_eq!(selected.sender_id, did);
+        assert!(selected.content.contains("ticket:holder"));
+    }
+
+    #[test]
+    fn test_local_content_availability_catchup_skips_ticketless_local_announce() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (sk, did) = elastos_identity::derive_did(&[28u8; 32]);
+        let payload = serde_json::json!({
+            "schema": CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA,
+            "cid": cid,
+            "uri": format!("elastos://{cid}"),
+            "policy": "network_default",
+            "provider": "carrier-availability",
+            "node_did": did,
+            "topic": content_availability_topic_uri(cid),
+            "local": {
+                "status": "local_pinned",
+                "provider": "ipfs-provider",
+                "replicas": 0
+            },
+            "announced_at": 1_700_000_000
+        });
+        let canonical = serde_json::to_string(&payload).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &sk,
+            CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN,
+            canonical.as_bytes(),
+        );
+        let message = GossipMessage {
+            sender_id: signer_did.clone(),
+            sender_nick: "content-provider".to_string(),
+            content: serde_json::json!({
+                "payload": payload,
+                "signature": signature,
+                "signer_did": signer_did,
+            })
+            .to_string(),
+            ts: 1_700_000_000,
+            nonce: 1,
+            signature: None,
+            sender_session_id: None,
+        };
+        let buffer = test_topic_buffer([message], 0);
+        assert!(local_content_availability_catchup_message(&buffer.messages, &did).is_none());
     }
 
     #[test]
@@ -8441,7 +8862,11 @@ mod tests {
             ..signed_message.clone()
         };
 
-        let tickets = content_availability_fetch_tickets(&[unsigned_message, signed_message], cid);
+        let tickets: Vec<String> =
+            content_availability_replicas(&[unsigned_message, signed_message], cid)
+                .into_iter()
+                .map(|replica| replica.connect_ticket)
+                .collect();
 
         assert_eq!(tickets, vec!["ticket:test".to_string()]);
     }
@@ -8521,15 +8946,20 @@ mod tests {
     #[test]
     fn test_content_availability_replicas_are_scored_and_sorted() {
         let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
-        let (mut stale, stale_did) =
-            signed_content_availability_message(cid, [26u8; 32], "ticket:stale", "", 10);
-        stale.ts = 1_700_000_000;
+        let now = now_secs();
+        let (stale, stale_did) = signed_content_availability_message(
+            cid,
+            [26u8; 32],
+            "ticket:stale",
+            "",
+            now.saturating_sub(2 * 60 * 60),
+        );
         let (fresh, fresh_did) = signed_content_availability_message(
             cid,
             [27u8; 32],
             "ticket:fresh",
             "remote-endpoint",
-            1_700_000_000,
+            now,
         );
 
         let replicas = content_availability_replicas(&[stale, fresh], cid);
@@ -8553,21 +8983,62 @@ mod tests {
     }
 
     #[test]
+    fn test_carrier_legacy_object_import_rejects_declared_oversize_before_allocation() {
+        let oversized = ContentObjectManifest {
+            schema: "elastos.content.object.manifest/v1".into(),
+            kind: "capsule".into(),
+            content_digest: "sha256:00".into(),
+            files: vec![crate::content::ContentObjectFile {
+                path: "weights.gguf".into(),
+                sha256: "00".into(),
+                size: MAX_CARRIER_OBJECT_IMPORT_BYTES as u64 + 1,
+            }],
+            links: Vec::new(),
+            object_did: None,
+            publisher_did: None,
+        };
+        let err = carrier_legacy_object_import_declared_bytes(&oversized).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("local content object import exceeds"),
+            "{err}"
+        );
+        let small = ContentObjectManifest {
+            schema: "elastos.content.object.manifest/v1".into(),
+            kind: "capsule".into(),
+            content_digest: "sha256:00".into(),
+            files: vec![crate::content::ContentObjectFile {
+                path: "capsule.json".into(),
+                sha256: "00".into(),
+                size: 12,
+            }],
+            links: Vec::new(),
+            object_did: None,
+            publisher_did: None,
+        };
+        assert_eq!(
+            carrier_legacy_object_import_declared_bytes(&small).unwrap(),
+            12
+        );
+    }
+
+    #[test]
     fn test_content_availability_replicas_apply_local_runtime_reputation() {
         let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let now = now_secs();
         let (preferred, preferred_did) = signed_content_availability_message(
             cid,
             [28u8; 32],
             "ticket:preferred",
             "remote-endpoint",
-            1_700_000_000,
+            now,
         );
         let (penalized, penalized_did) = signed_content_availability_message(
             cid,
             [29u8; 32],
             "ticket:penalized",
             "remote-endpoint",
-            1_700_000_000,
+            now,
         );
         let mut reputation = HashMap::new();
         reputation.insert(
@@ -8625,7 +9096,7 @@ mod tests {
         assert!(carrier_peer_reputation_path(data_dir.path()).is_file());
     }
 
-    fn signed_content_availability_message(
+    pub(crate) fn signed_content_availability_message(
         cid: &str,
         key_seed: [u8; 32],
         connect_ticket: &str,
@@ -9146,7 +9617,7 @@ mod tests {
     /// publication under load and hand out an id with no dialable address.
     /// Production waits for `endpoint.online()` before snapshotting; tests
     /// only need a direct IP transport address, so wait for exactly that.
-    async fn wait_for_direct_endpoint_addr(endpoint: &Endpoint) -> iroh::EndpointAddr {
+    pub(crate) async fn wait_for_direct_endpoint_addr(endpoint: &Endpoint) -> iroh::EndpointAddr {
         let mut watcher = endpoint.watch_addr();
         for _ in 0..100 {
             let addr = watcher.get();
@@ -9160,6 +9631,803 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("carrier test endpoint never published a direct address");
+    }
+
+    /// A holder's local IPFS backend for one synthetic closure. It answers only
+    /// bounded reads with the Runtime receipts a real ipfs-provider returns.
+    pub(crate) struct BoundedClosureBackend {
+        pub(crate) files: std::collections::BTreeMap<String, Vec<u8>>,
+        pub(crate) requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BoundedClosureBackend {
+        async fn handle(
+            &self,
+            _: elastos_runtime::provider::ResourceRequest,
+        ) -> std::result::Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("fixture raw only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            "bounded-closure-backend"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            if request["op"] != "cat" || request["bounded_read"] != true {
+                return Ok(serde_json::json!({"status":"error","code":"unbounded",
+                    "message":"fixture holder serves bounded reads only"}));
+            }
+            let path = request["path"].as_str().unwrap_or_default();
+            let Some(file) = self.files.get(path) else {
+                return Ok(serde_json::json!({"status":"error","code":"not_found",
+                    "message":"fixture path missing"}));
+            };
+            let (bytes, receipt) = if let Some(max) = request.get("max_bytes") {
+                (
+                    file.clone(),
+                    serde_json::json!({"_runtime_complete_metadata":{
+                        "schema":"elastos.provider.complete-metadata/v1", "cid":request["cid"],
+                        "path":path, "max_bytes":max, "actual_bytes":file.len(), "completed":true
+                    }}),
+                )
+            } else {
+                let range = &request["_runtime_invocation"]["range"];
+                let start = range["start"].as_u64().unwrap() as usize;
+                let end = range["end"].as_u64().unwrap() as usize;
+                if end >= file.len() || start > end {
+                    return Ok(serde_json::json!({"status":"error","code":"range",
+                        "message":"fixture range exceeds the file"}));
+                }
+                (
+                    file[start..=end].to_vec(),
+                    serde_json::json!({"_runtime_applied_range":{
+                        "schema":"elastos.provider.applied-range/v1", "cid":request["cid"],
+                        "path":path, "start":start, "end":end
+                    }}),
+                )
+            };
+            let mut data = receipt;
+            data["data"] =
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+            Ok(serde_json::json!({"status":"ok","data":data}))
+        }
+    }
+
+    /// An empty consumer cache: every local read misses.
+    pub(crate) struct EmptyIpfsBackend;
+
+    #[async_trait::async_trait]
+    impl Provider for EmptyIpfsBackend {
+        async fn handle(
+            &self,
+            _: elastos_runtime::provider::ResourceRequest,
+        ) -> std::result::Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("fixture raw only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            "empty-ipfs-backend"
+        }
+        async fn send_raw(
+            &self,
+            _: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            Ok(serde_json::json!({"status":"error","code":"not_found",
+                "message":"consumer cache is empty"}))
+        }
+    }
+
+    /// A holder whose Content answers a bounded read with more bytes than asked.
+    struct OversizedContentProvider {
+        extra: usize,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OversizedContentProvider {
+        async fn handle(
+            &self,
+            _: elastos_runtime::provider::ResourceRequest,
+        ) -> std::result::Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("fixture raw only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            "oversized-content"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let range = &request["range"];
+            let asked =
+                range["end"].as_u64().unwrap_or(0) - range["start"].as_u64().unwrap_or(0) + 1;
+            let bytes = vec![b'x'; asked as usize + self.extra];
+            Ok(serde_json::json!({"status":"ok","data":{
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes)
+            }}))
+        }
+    }
+
+    /// A connected holder that accepts the invocation and never answers.
+    pub(crate) struct SilentContentProvider {
+        pub(crate) requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SilentContentProvider {
+        async fn handle(
+            &self,
+            _: elastos_runtime::provider::ResourceRequest,
+        ) -> std::result::Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("fixture raw only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            "silent-content"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            std::future::pending().await
+        }
+    }
+
+    /// Signed holder announcements placed in the consumer's topic buffer, newest
+    /// last in the slice; the consumer ranks them by score, then newest first.
+    pub(crate) async fn seed_content_availability_announcements(
+        node: &CarrierNode,
+        cid: &str,
+        announcements: &[(String, [u8; 32], String, u64)],
+    ) {
+        let messages: Vec<GossipMessage> = announcements
+            .iter()
+            .map(|(ticket, seed, endpoint, announced_at)| {
+                signed_content_availability_message(cid, *seed, ticket, endpoint, *announced_at).0
+            })
+            .collect();
+        let topic = content_availability_topic_name(cid);
+        let mut guard = node.gossip_state.lock().await;
+        guard.joined_topics.insert(topic.clone());
+        guard
+            .buffers
+            .lock()
+            .await
+            .insert(topic, test_topic_buffer(messages, 0));
+    }
+
+    /// A holder Runtime with real Content over a bounded closure backend.
+    pub(crate) async fn start_content_holder_runtime(
+        seed: u8,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    ) -> HolderRuntime {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider(
+                "content",
+                Arc::new(crate::content::ContentProvider::new(
+                    dir.path().to_path_buf(),
+                    Arc::downgrade(&registry),
+                )),
+            )
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("ipfs", Arc::new(BoundedClosureBackend { files, requests }))
+            .await
+            .unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[seed; 32]);
+        let node = start_isolated_carrier_node_with_registry(
+            &sk,
+            &did,
+            dir.path().to_path_buf(),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        let addr = wait_for_direct_endpoint_addr(&node.endpoint).await;
+        HolderRuntime {
+            ticket: encode_ticket_for(addr.clone()),
+            node,
+            did,
+            addr,
+            _registry: registry,
+            _dir: dir,
+        }
+    }
+
+    pub(crate) struct HolderRuntime {
+        pub(crate) node: CarrierNode,
+        pub(crate) did: String,
+        pub(crate) ticket: String,
+        pub(crate) addr: iroh::EndpointAddr,
+        _registry: Arc<ProviderRegistry>,
+        _dir: tempfile::TempDir,
+    }
+
+    pub(crate) async fn start_holder_runtime(
+        seed: u8,
+        content: Arc<dyn Provider>,
+        backend: Option<Arc<dyn Provider>>,
+    ) -> HolderRuntime {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("content", content)
+            .await
+            .unwrap();
+        if let Some(backend) = backend {
+            registry
+                .register_sub_provider("ipfs", backend)
+                .await
+                .unwrap();
+        }
+        let (sk, did) = elastos_identity::derive_did(&[seed; 32]);
+        let node = start_isolated_carrier_node_with_registry(
+            &sk,
+            &did,
+            dir.path().to_path_buf(),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        let addr = wait_for_direct_endpoint_addr(&node.endpoint).await;
+        HolderRuntime {
+            ticket: encode_ticket_for(addr.clone()),
+            node,
+            did,
+            addr,
+            _registry: registry,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bounded_content_transfer_between_runtimes_fails_over_holders_and_stays_bounded() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let weights: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema":"elastos.content.object.manifest/v1", "kind":"capsule",
+            "files":[{"path":"weights.gguf","size":weights.len()}]
+        }))
+        .unwrap();
+        let files = std::collections::BTreeMap::from([
+            ("weights.gguf".to_string(), weights.clone()),
+            (
+                crate::content::CONTENT_OBJECT_MANIFEST_PATH.to_string(),
+                index.clone(),
+            ),
+        ]);
+
+        // Consumer Runtime: empty cache, real Content, real Carrier availability.
+        let consumer_dir = tempfile::tempdir().unwrap();
+        let consumer_registry = Arc::new(ProviderRegistry::new());
+        let (consumer_sk, consumer_did) = elastos_identity::derive_did(&[80u8; 32]);
+        let consumer_node = start_isolated_carrier_node_with_registry(
+            &consumer_sk,
+            &consumer_did,
+            consumer_dir.path().to_path_buf(),
+            Some(Arc::downgrade(&consumer_registry)),
+        )
+        .await
+        .unwrap();
+        consumer_registry
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    consumer_node.endpoint.clone(),
+                    Arc::downgrade(&consumer_registry),
+                ),
+            ))
+            .await;
+        consumer_registry
+            .register_sub_provider("ipfs", Arc::new(EmptyIpfsBackend))
+            .await
+            .unwrap();
+        consumer_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(crate::content::ContentProvider::new(
+                    consumer_dir.path().to_path_buf(),
+                    Arc::downgrade(&consumer_registry),
+                )),
+            )
+            .await
+            .unwrap();
+        let availability = Arc::new(CarrierAvailabilityProvider::with_provider_registry(
+            consumer_node.gossip_state.clone(),
+            Arc::downgrade(&consumer_registry),
+        ));
+        consumer_registry.register(availability.clone()).await;
+
+        // Holders: one that announced and is gone, one that oversizes, one real.
+        let dead = start_holder_runtime(81, Arc::new(EmptyIpfsBackend), None).await;
+        let dead_ticket = dead.ticket.clone();
+        let dead_did = dead.did.clone();
+        shutdown_test_carrier_node(dead.node).await;
+        let oversized_requests = Arc::new(StdMutex::new(Vec::new()));
+        let oversized = start_holder_runtime(
+            82,
+            Arc::new(OversizedContentProvider {
+                extra: 1,
+                requests: oversized_requests.clone(),
+            }),
+            None,
+        )
+        .await;
+        let holder_requests = Arc::new(StdMutex::new(Vec::new()));
+        let holder = start_content_holder_runtime(83, files, holder_requests.clone()).await;
+        consumer_node
+            .memory_lookup
+            .add_endpoint_info(holder.addr.clone());
+
+        let now = now_secs();
+        let announce = |ticket: &str, seed: u8, did: &str, at: u64| {
+            (ticket.to_string(), [seed; 32], did.to_string(), at)
+        };
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[
+                announce(&holder.ticket, 83, &holder.did, now - 20),
+                announce(&oversized.ticket, 82, &oversized.did, now - 10),
+                announce(&dead_ticket, 81, &dead_did, now),
+            ],
+        )
+        .await;
+
+        // Exact bytes at every boundary, assembled from 64 KiB pieces.
+        let started = std::time::Instant::now();
+        let mut assembled = Vec::new();
+        let mut offset = 0u64;
+        while offset < weights.len() as u64 {
+            let length = (weights.len() as u64 - offset).min(65536);
+            let piece = crate::content::fetch_model_part(
+                &consumer_registry,
+                cid,
+                "weights.gguf",
+                Some((offset, length)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(piece.len() as u64, length);
+            assembled.extend_from_slice(&piece);
+            offset += length;
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(assembled, weights);
+        assert_eq!(
+            Sha256::digest(&assembled).as_slice(),
+            Sha256::digest(&weights).as_slice()
+        );
+        let last = crate::content::fetch_model_part(
+            &consumer_registry,
+            cid,
+            "weights.gguf",
+            Some((weights.len() as u64 - 1, 1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(last, weights[weights.len() - 1..]);
+        assert!(crate::content::fetch_model_part(
+            &consumer_registry,
+            cid,
+            "weights.gguf",
+            Some((weights.len() as u64 - 1, 2)),
+        )
+        .await
+        .is_err());
+        // Complete metadata is bounded by a maximum, so a holder ranked ahead
+        // of the real one can answer within bound with the wrong bytes; the
+        // transport layer delivers them and the caller's comparison against
+        // the signed catalog is what rejects them (prepare() does exactly that).
+        let metadata = crate::content::fetch_model_part(
+            &consumer_registry,
+            cid,
+            crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metadata.len() <= 65536);
+        let metadata_from_real_holder = metadata == index;
+
+        // The real holder saw only bounded reads, one per piece, none whole-file.
+        let served = holder_requests.lock().unwrap().clone();
+        assert_eq!(
+            served.len(),
+            4 + 1 + 1 + usize::from(metadata_from_real_holder),
+            "{served:#?}"
+        );
+        for request in &served {
+            assert_eq!(request["op"], "cat");
+            assert_eq!(request["bounded_read"], true);
+            if request["path"] == "weights.gguf" {
+                let range = &request["_runtime_invocation"]["range"];
+                let length = range["end"].as_u64().unwrap() - range["start"].as_u64().unwrap() + 1;
+                assert!(length <= 65536, "{range}");
+            } else {
+                assert_eq!(request["max_bytes"], 65536);
+            }
+        }
+        // The oversizing holder was consulted before the real one and refused.
+        assert!(!oversized_requests.lock().unwrap().is_empty());
+        for request in oversized_requests.lock().unwrap().iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(request["local_only"], true);
+        }
+        eprintln!(
+            "bounded transfer: {} bytes in 4 pieces over real Carrier with dead+oversized holders first: {:?}",
+            weights.len(),
+            elapsed
+        );
+
+        // With only misbehaving holders the read fails closed, at the payload
+        // bound and at the wire cap.
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[announce(&oversized.ticket, 82, &oversized.did, now)],
+        )
+        .await;
+        let bounded_probe = serde_json::json!({"op":"fetch","cid":cid,"path":"weights.gguf",
+            "bounded_read":true,"range":{"start":0,"end":3}});
+        let refusal = consumer_registry
+            .send_raw("availability", &bounded_probe)
+            .await
+            .unwrap();
+        assert_eq!(refusal["code"], "carrier_fetch_failed", "{refusal}");
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains("holder returned 5 bytes"),
+            "{refusal}"
+        );
+        assert!(crate::content::fetch_model_part(
+            &consumer_registry,
+            cid,
+            "weights.gguf",
+            Some((0, 4))
+        )
+        .await
+        .is_err());
+        let flood_requests = Arc::new(StdMutex::new(Vec::new()));
+        let flood = start_holder_runtime(
+            84,
+            Arc::new(OversizedContentProvider {
+                extra: 200_000,
+                requests: flood_requests.clone(),
+            }),
+            None,
+        )
+        .await;
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[announce(&flood.ticket, 84, &flood.did, now)],
+        )
+        .await;
+        let refusal = consumer_registry
+            .send_raw("availability", &bounded_probe)
+            .await
+            .unwrap();
+        assert_eq!(refusal["code"], "carrier_fetch_failed", "{refusal}");
+        assert_eq!(flood_requests.lock().unwrap().len(), 1);
+        assert!(crate::content::fetch_model_part(
+            &consumer_registry,
+            cid,
+            "weights.gguf",
+            Some((0, 4))
+        )
+        .await
+        .is_err());
+        // The public invocation error is redacted; the cap itself is visible
+        // on the direct client hop, before the flood is buffered.
+        let client =
+            CarrierClient::connect_known_endpoint(&consumer_node.endpoint, flood.addr.clone(), 5)
+                .await
+                .unwrap();
+        let mut flood_request = bounded_probe.clone();
+        flood_request["local_only"] = serde_json::json!(true);
+        flood_request["transfer"] = serde_json::json!("bytes");
+        flood_request["_runtime_invocation"] = serde_json::json!({
+            "schema": "elastos.provider.invocation/v1",
+            "source": "carrier-availability",
+            "target": "content",
+            "op": "fetch",
+            "capability": "provider:carrier-availability->content:fetch",
+            "transport": "carrier-provider-plane",
+            "carrier": null,
+            "transfer": "bytes",
+            "range": null,
+            "progress": null
+        });
+        let invocation = ProviderInvocation {
+            source: "carrier-availability".into(),
+            target: "content".into(),
+            op: "fetch".into(),
+            request: flood_request.clone(),
+            transfer: ProviderTransfer::Bytes,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        };
+        let err = client
+            .invoke_provider(&invocation, flood_request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "exceeds {CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES} bytes"
+            )),
+            "{err}"
+        );
+
+        // A connected holder that never answers holds the caller for its answer
+        // budget (connect already succeeded), then the next holder serves the piece.
+        let silent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let silent = start_holder_runtime(
+            85,
+            Arc::new(SilentContentProvider {
+                requests: silent_requests.clone(),
+            }),
+            None,
+        )
+        .await;
+        // A fresh consumer has no history, so the newest announcement is tried first.
+        availability.peer_reputation.lock().await.clear();
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[
+                announce(&holder.ticket, 83, &holder.did, now - 20),
+                announce(&silent.ticket, 85, &silent.did, now),
+            ],
+        )
+        .await;
+        let before = holder_requests.lock().unwrap().len();
+        let started = std::time::Instant::now();
+        let piece =
+            crate::content::fetch_model_part(&consumer_registry, cid, "weights.gguf", Some((0, 4)))
+                .await
+                .unwrap();
+        let waited = started.elapsed();
+        assert_eq!(piece, weights[..4]);
+        assert_eq!(silent_requests.lock().unwrap().len(), 1);
+        assert_eq!(holder_requests.lock().unwrap().len(), before + 1);
+        assert!(
+            waited >= std::time::Duration::from_secs(5)
+                && waited < std::time::Duration::from_secs(9),
+            "a connected silent holder costs its answer budget, then the next holder serves: {waited:?}"
+        );
+        eprintln!("silent connected holder failed over to the real holder after {waited:?}");
+
+        // An announcement signed by one key that points its ticket at another
+        // peer is refused before connecting and earns that signer no credit.
+        let (_, impostor_did) = elastos_identity::derive_did(&[86u8; 32]);
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[announce(&holder.ticket, 86, &impostor_did, now)],
+        )
+        .await;
+        let before = holder_requests.lock().unwrap().len();
+        let refusal = consumer_registry
+            .send_raw("availability", &bounded_probe)
+            .await
+            .unwrap();
+        assert_eq!(refusal["code"], "carrier_fetch_failed", "{refusal}");
+        assert_eq!(
+            holder_requests.lock().unwrap().len(),
+            before,
+            "the real holder must not be reached through a foreign signer's announcement"
+        );
+        {
+            let reputation = availability.peer_reputation.lock().await;
+            let impostor = reputation.get(&impostor_did).expect("mismatch is recorded");
+            assert_eq!((impostor.successes, impostor.failures), (0, 1));
+            let real = reputation
+                .get(&holder.did)
+                .expect("the real holder has history");
+            assert!(real.successes >= 1);
+            assert_eq!(real.failures, 0);
+            assert_eq!(
+                reputation
+                    .get(&silent.did)
+                    .map(|r| (r.successes, r.failures)),
+                Some((0, 1))
+            );
+        }
+
+        // Cancellation drops an in-flight attempt against the dead holder; the
+        // retry against the real holder completes with one more bounded read.
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[announce(&dead_ticket, 81, &dead_did, now)],
+        )
+        .await;
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            crate::content::fetch_model_part(&consumer_registry, cid, "weights.gguf", Some((0, 4))),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the attempt must still be waiting on the dead holder"
+        );
+        seed_content_availability_announcements(
+            &consumer_node,
+            cid,
+            &[announce(&holder.ticket, 83, &holder.did, now)],
+        )
+        .await;
+        let before = holder_requests.lock().unwrap().len();
+        let retried =
+            crate::content::fetch_model_part(&consumer_registry, cid, "weights.gguf", Some((0, 4)))
+                .await
+                .unwrap();
+        assert_eq!(retried, weights[..4]);
+        assert_eq!(holder_requests.lock().unwrap().len(), before + 1);
+        let metadata = crate::content::fetch_model_part(
+            &consumer_registry,
+            cid,
+            crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            metadata, index,
+            "the real holder's index arrives exactly within its bound"
+        );
+
+        shutdown_test_carrier_node(silent.node).await;
+        shutdown_test_carrier_node(flood.node).await;
+        shutdown_test_carrier_node(oversized.node).await;
+        shutdown_test_carrier_node(holder.node).await;
+        shutdown_test_carrier_node(consumer_node).await;
+    }
+
+    /// A holder whose Content answers every operation after a fixed delay.
+    struct SlowContentProvider {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SlowContentProvider {
+        async fn handle(
+            &self,
+            _: elastos_runtime::provider::ResourceRequest,
+        ) -> std::result::Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("fixture raw only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![]
+        }
+        fn name(&self) -> &'static str {
+            "slow-content"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(serde_json::json!({"status":"ok","data":{
+                "op": request["op"], "receipt": "effect-completed"
+            }}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_deadline_applies_only_to_bounded_content_fetch() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_registry = Arc::new(ProviderRegistry::new());
+        let (local_sk, local_did) = elastos_identity::derive_did(&[87u8; 32]);
+        let local_node = start_isolated_carrier_node_with_registry(
+            &local_sk,
+            &local_did,
+            local_dir.path().to_path_buf(),
+            Some(Arc::downgrade(&local_registry)),
+        )
+        .await
+        .unwrap();
+        local_registry
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    local_node.endpoint.clone(),
+                    Arc::downgrade(&local_registry),
+                ),
+            ))
+            .await;
+        let slow = start_holder_runtime(
+            88,
+            Arc::new(SlowContentProvider {
+                delay: std::time::Duration::from_millis(2_500),
+            }),
+            None,
+        )
+        .await;
+        let route =
+            |op: &str, request: serde_json::Value, transfer: ProviderTransfer| ProviderInvocation {
+                source: "carrier-availability".into(),
+                target: "content".into(),
+                op: op.into(),
+                request,
+                transfer,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Carrier(
+                    ProviderCarrierRoute::ConnectTicket {
+                        connect_ticket: slow.ticket.clone(),
+                        peer_did: Some(slow.did.clone()),
+                        timeout_ms: Some(1_000),
+                    },
+                ),
+            };
+
+        // An effectful operation keeps its open-ended answer past the route budget.
+        let started = std::time::Instant::now();
+        let response = local_registry
+            .invoke_provider(route(
+                "import_object",
+                serde_json::json!({"op":"import_object","cid":"bafyfixture"}),
+                ProviderTransfer::Json,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["data"]["receipt"], "effect-completed",
+            "{response}"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(2_500),
+            "the receipt arrived after the route budget without being cut"
+        );
+
+        // The bounded fetch to the same holder is cut at the route budget.
+        let started = std::time::Instant::now();
+        let err = local_registry
+            .invoke_provider(route(
+                "fetch",
+                serde_json::json!({"op":"fetch","cid":"bafyfixture","path":"weights.gguf",
+                    "local_only":true,"bounded_read":true,"range":{"start":0,"end":3},
+                    "transfer":"bytes"}),
+                ProviderTransfer::Bytes,
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        let cut_after = started.elapsed();
+        assert!(err.contains("response deadline of 1s passed"), "{err}");
+        assert!(
+            cut_after >= std::time::Duration::from_secs(1)
+                && cut_after < std::time::Duration::from_millis(2_400),
+            "bounded fetch is cut at its budget, before the slow answer: {cut_after:?}"
+        );
+
+        shutdown_test_carrier_node(slow.node).await;
+        shutdown_test_carrier_node(local_node).await;
     }
 
     /// Deterministic peer-DID resolver setup.
@@ -9446,6 +10714,10 @@ mod tests {
 
         assert_eq!(response["status"], "ok");
         assert_eq!(response["data"]["op"], "evaluate");
+        assert_eq!(
+            local_node.gossip_state.lock().await.bootstrap_peers,
+            vec![remote_addr.id]
+        );
         let requests = remote_requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["_runtime_invocation"]["target"], "custody");
@@ -9668,6 +10940,36 @@ mod tests {
             );
             assert!(!fixture.local_node.endpoint.is_closed());
         }
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_route_retains_one_peer_connection_across_invokes() {
+        let fixture = peer_did_route_fixture(80, 81).await;
+        let invoker = Arc::new(CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+            fixture.local_node.endpoint.clone(),
+            Arc::downgrade(&fixture.local_registry),
+        ));
+        fixture
+            .local_registry
+            .set_carrier_invoker(invoker.clone())
+            .await;
+
+        for expected in 1..=2usize {
+            let response = fixture
+                .local_registry
+                .invoke_provider(connect_ticket_invocation(
+                    fixture.remote_addr.clone(),
+                    &fixture.remote_did,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response["status"], "ok");
+            assert_eq!(fixture.remote_requests.lock().unwrap().len(), expected);
+        }
+        assert_eq!(invoker.retained_peer_count().await, 1);
 
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
@@ -10225,9 +11527,11 @@ mod tests {
 
         let (bytes, remote_transfer) = fetch_content_via_carrier_provider_invocation(
             &registry,
+            "did:key:z6MkholderFixture",
             "ticket:internal-secret",
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
             "docs/readme.md",
+            None,
         )
         .await
         .unwrap();
@@ -10273,9 +11577,11 @@ mod tests {
 
         let err = fetch_content_via_carrier_provider_invocation(
             &registry,
+            "did:key:z6MkholderFixture",
             "ticket:internal-secret",
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
             "docs/readme.md",
+            None,
         )
         .await
         .expect_err("failing carrier invocation must stay bounded");
@@ -11416,6 +12722,418 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_carrier_availability_fetch_uses_operator_peer_store_without_announcements() {
+        // A consumer Get has no signed announcement until a holder publishes
+        // one. The peers registered through `elastos node peer add` are the
+        // holders this node was told to use, so `fetch` must invoke them.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (_remote_sk, remote_did) = elastos_identity::derive_did(&[22u8; 32]);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[21u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let remote_ticket = carrier_connect_ticket(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::operator_control::upsert_peer(
+            data_dir.path(),
+            crate::operator_control::OperatorPeer {
+                did: remote_did.clone(),
+                label: "holder-a".to_string(),
+                connect_ticket: remote_ticket.clone(),
+                allow: Vec::new(),
+            },
+        )
+        .unwrap();
+        crate::operator_control::upsert_peer(
+            data_dir.path(),
+            crate::operator_control::OperatorPeer {
+                did: local_did.clone(),
+                label: "self".to_string(),
+                connect_ticket: remote_ticket.clone(),
+                allow: Vec::new(),
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(
+            response["data"]["availability"]["policy"],
+            "carrier_provider_invoke"
+        );
+        let requests = invoker.requests.lock().await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["ticket"] == remote_ticket),
+            "{requests:?}"
+        );
+        assert!(requests.iter().any(|request| request["op"] == "fetch"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_waits_for_a_late_signed_announcement() {
+        // A consumer that joins after the holder announced still has an empty
+        // local buffer. The fetch waits for the signed announcement instead of
+        // returning carrier_fetch_unavailable before gossip delivers it.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[25u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let holder_ticket = carrier_connect_ticket(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name.clone(), test_topic_buffer([], 0));
+        }
+        let buffers = state.lock().await.buffers.clone();
+        let ticket = holder_ticket.clone();
+        let topic = topic_name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let (message, _) =
+                signed_content_availability_message(cid, [26u8; 32], &ticket, "", now_secs());
+            let mut buffers = buffers.lock().await;
+            let buffer = buffers.get_mut(&topic).expect("topic buffer");
+            assert!(push_gossip_buffer_message(buffer, message));
+        });
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let started = std::time::Instant::now();
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let requests = invoker.requests.lock().await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["ticket"] == holder_ticket),
+            "{requests:?}"
+        );
+        assert!(requests.iter().any(|request| request["op"] == "fetch"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_waits_past_a_non_holder_neighbor_for_a_later_holder() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[31u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let holder_ticket = carrier_connect_ticket(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name.clone(), test_topic_buffer([], 0));
+            guard
+                .topic_peers
+                .lock()
+                .await
+                .entry(topic_name.clone())
+                .or_default()
+                .insert("did:key:zNonHolder".to_string());
+        }
+        let buffers = state.lock().await.buffers.clone();
+        let ticket = holder_ticket.clone();
+        let topic = topic_name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let (message, _) =
+                signed_content_availability_message(cid, [32u8; 32], &ticket, "", now_secs());
+            let mut buffers = buffers.lock().await;
+            let buffer = buffers.get_mut(&topic).expect("topic buffer");
+            assert!(push_gossip_buffer_message(buffer, message));
+        });
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        )
+        .with_discovery_wait(Duration::from_secs(4));
+        let started = std::time::Instant::now();
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert!(started.elapsed() >= Duration::from_millis(2500));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["ticket"], holder_ticket);
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_walks_a_stale_candidate_then_a_later_live_holder() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[33u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let live_ticket = carrier_connect_ticket(&endpoint);
+        let (stale_message, _) = signed_content_availability_message(
+            cid,
+            [34u8; 32],
+            "ticket:stale",
+            "",
+            now_secs().saturating_sub(2 * 60 * 60),
+        );
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name.clone(), test_topic_buffer([stale_message], 0));
+        }
+        let buffers = state.lock().await.buffers.clone();
+        let ticket = live_ticket.clone();
+        let topic = topic_name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let (message, _) =
+                signed_content_availability_message(cid, [35u8; 32], &ticket, "", now_secs());
+            let mut buffers = buffers.lock().await;
+            let buffer = buffers.get_mut(&topic).expect("topic buffer");
+            assert!(push_gossip_buffer_message(buffer, message));
+        });
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            fail_tickets: vec!["ticket:stale".to_string()],
+            ..Default::default()
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        )
+        .with_discovery_wait(Duration::from_secs(2));
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        let requests = invoker.requests.lock().await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["ticket"] == "ticket:stale"),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["ticket"] == live_ticket),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_ends_at_the_deadline_when_holders_stay_unavailable() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[36u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let (dead_message, _) =
+            signed_content_availability_message(cid, [37u8; 32], "ticket:dead", "", now_secs());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([dead_message], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            fail_tickets: vec!["ticket:dead".to_string()],
+            ..Default::default()
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        )
+        .with_discovery_wait(Duration::from_millis(400));
+        let started = std::time::Instant::now();
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "error", "{response}");
+        assert_eq!(response["code"], "carrier_fetch_failed");
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
     async fn test_carrier_availability_ensure_walks_past_a_dead_announced_holder_to_an_operator_peer(
     ) {
         // Regression for the live single-node-loss case: the shortfall is
@@ -11881,7 +13599,7 @@ mod tests {
         assert!(decoded["endpoints"].is_array());
     }
 
-    fn encode_ticket_for(endpoint: iroh::EndpointAddr) -> String {
+    pub(crate) fn encode_ticket_for(endpoint: iroh::EndpointAddr) -> String {
         let ticket_json = serde_json::json!({
             "topic": null,
             "endpoints": [endpoint],

@@ -58,6 +58,9 @@ assert(
 assert(
   js.includes('if (event.origin !== "null" || event.source !== window.parent) {')
     && js.includes('if (data?.type !== "elastos:menu-command" || typeof data.cmd !== "string") {')
+    && js.includes('data?.type === "elastos.marketplace.navigate/v1"')
+    && js.includes('target: "assistant"')
+    && js.includes("function applyModelsLaunch")
     && !js.includes("window.location.origin")
     && !js.includes('event.source !== window.top'),
   "Marketplace must accept inbound Home commands only from the opaque parent boundary.",

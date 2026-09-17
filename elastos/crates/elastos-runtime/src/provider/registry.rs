@@ -1692,12 +1692,29 @@ fn apply_provider_transfer_response(
 
 const MAX_BOUNDED_PROVIDER_READ_BYTES: u64 = 64 * 1024;
 
+/// Content and the availability plane carry a bounded read to the backend or
+/// holder that applies it once; Runtime does not slice their responses again.
+/// Content may make that hop over Carrier to a remote holder, whose own
+/// Runtime applies the bound locally. Only local IPFS Cat applies a range.
+fn bounded_read_nested_owner(invocation: &ProviderInvocation) -> bool {
+    match (invocation.target.as_str(), invocation.op.as_str()) {
+        ("content", "fetch") => matches!(
+            invocation.transport,
+            ProviderInvocationTransport::Local | ProviderInvocationTransport::Carrier(_)
+        ),
+        ("availability", "fetch") => {
+            matches!(invocation.transport, ProviderInvocationTransport::Local)
+        }
+        _ => false,
+    }
+}
+
 fn bounded_provider_metadata_max(
     invocation: &ProviderInvocation,
 ) -> Result<Option<u64>, ProviderError> {
     if !matches!(
         (invocation.target.as_str(), invocation.op.as_str()),
-        ("ipfs", "cat") | ("content", "fetch")
+        ("ipfs", "cat") | ("content", "fetch") | ("availability", "fetch")
     ) {
         return Ok(None);
     }
@@ -1722,14 +1739,17 @@ fn bounded_provider_metadata_max(
             .as_ref()
             .and_then(|p| p.expected_bytes)
             .is_some()
-        || !matches!(invocation.transport, ProviderInvocationTransport::Local)
+        || !(matches!(invocation.transport, ProviderInvocationTransport::Local)
+            || bounded_read_nested_owner(invocation))
         || invocation.transfer == ProviderTransfer::Json
     {
         return Err(invalid());
     }
     match (invocation.target.as_str(), invocation.op.as_str()) {
         ("ipfs", "cat") => Ok(Some(max)),
-        ("content", "fetch") => Ok(None), // Content validates its own nested request/receipt.
+        // Content validates its own nested request/receipt; the availability
+        // plane forwards Content's bound to the holder.
+        ("content", "fetch") | ("availability", "fetch") => Ok(None),
         _ => Err(invalid()),
     }
 }
@@ -1796,7 +1816,7 @@ fn bounded_provider_read_range(
     if invocation.request.get("max_bytes").is_some()
         && matches!(
             (invocation.target.as_str(), invocation.op.as_str()),
-            ("ipfs", "cat") | ("content", "fetch")
+            ("ipfs", "cat") | ("content", "fetch") | ("availability", "fetch")
         )
     {
         bounded_provider_metadata_max(invocation)?;
@@ -1811,13 +1831,7 @@ fn bounded_provider_read_range(
             ))
         }
     }
-    // Content owns its nested fetch range. Its outer call must not
-    // slice the already-normalized backend response again.
-    if invocation.target == "content"
-        && invocation.op == "fetch"
-        && invocation.range.is_none()
-        && matches!(invocation.transport, ProviderInvocationTransport::Local)
-    {
+    if invocation.range.is_none() && bounded_read_nested_owner(invocation) {
         return Ok(None);
     }
     if invocation.target != "ipfs"
@@ -3484,23 +3498,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_metadata_rejects_carrier_before_dispatch() {
+    async fn complete_metadata_rejects_raw_carrier_backend_but_forwards_content() {
         let registry = ProviderRegistry::new();
         let carrier = Arc::new(MockCarrierInvoker::default());
         registry.set_carrier_invoker(carrier.clone()).await;
-        for (target, op) in [("ipfs", "cat"), ("content", "fetch")] {
-            let (mut invocation, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
-            invocation.target = target.into();
-            invocation.op = op.into();
-            invocation.request["op"] = serde_json::json!(op);
-            invocation.transport =
-                ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
-                    peer_did: "did:key:zFixture".into(),
-                    timeout_ms: Some(5000),
-                });
-            assert!(registry.invoke_provider(invocation).await.is_err());
-        }
+        let route = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did: "did:key:zFixture".into(),
+            timeout_ms: Some(5000),
+        });
+        let (mut raw, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
+        raw.transport = route.clone();
+        assert!(registry.invoke_provider(raw).await.is_err());
         assert!(carrier.requests.lock().await.is_empty());
+        // Content carries the metadata bound to the holder's Runtime, which
+        // applies it against its own local backend.
+        let (mut content, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
+        content.target = "content".into();
+        content.op = "fetch".into();
+        content.request["op"] = serde_json::json!("fetch");
+        content.transport = route;
+        let _ = registry.invoke_provider(content).await;
+        let requests = carrier.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["request"]["max_bytes"], 65536);
+        assert_eq!(requests[0]["request"]["bounded_read"], true);
     }
 
     #[test]
@@ -3597,7 +3618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_read_rejects_remote_content_and_outer_range_before_dispatch() {
+    async fn bounded_read_forwards_remote_content_but_rejects_outer_range_and_raw_backend() {
         let registry = ProviderRegistry::new();
         let carrier = Arc::new(MockCarrierInvoker::default());
         registry.set_carrier_invoker(carrier.clone()).await;
@@ -3607,12 +3628,38 @@ mod tests {
         invocation.request["op"] = serde_json::json!("fetch");
         invocation.range = None;
         assert!(bounded_provider_read_range(&invocation).is_ok());
-        let mut remote = invocation.clone();
-        remote.transport = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+        let route = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did: "did:key:zFixture".into(),
             timeout_ms: Some(5000),
         });
-        assert!(matches!(registry.invoke_provider(remote).await,
+        // Content carries the bound inside its request; the holder's Runtime
+        // applies it, so the hop reaches the Carrier invoker unchanged.
+        let mut remote = invocation.clone();
+        remote.transport = route.clone();
+        assert!(bounded_provider_read_range(&remote).is_ok());
+        let _ = registry.invoke_provider(remote).await;
+        {
+            let requests = carrier.requests.lock().await;
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["request"]["bounded_read"], true);
+            assert!(requests[0]["request"]["_runtime_invocation"]["range"].is_null());
+        }
+        let mut availability = invocation.clone();
+        availability.target = "availability".into();
+        assert!(bounded_provider_read_range(&availability).is_ok());
+        availability.transport = route.clone();
+        assert!(matches!(bounded_provider_read_range(&availability),
+            Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
+        let mut raw = invocation.clone();
+        raw.target = "ipfs".into();
+        raw.op = "cat".into();
+        raw.request["op"] = serde_json::json!("cat");
+        raw.range = Some(ProviderByteRange {
+            start: 8,
+            end: Some(11),
+        });
+        raw.transport = route;
+        assert!(matches!(registry.invoke_provider(raw).await,
             Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
         invocation.range = Some(ProviderByteRange {
             start: 8,
@@ -3620,7 +3667,7 @@ mod tests {
         });
         assert!(matches!(registry.invoke_provider(invocation).await,
             Err(ProviderError::Provider(message)) if message.contains("bounded read requires local IPFS")));
-        assert!(carrier.requests.lock().await.is_empty());
+        assert_eq!(carrier.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

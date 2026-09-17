@@ -4,7 +4,8 @@ use super::home_system::{
 };
 use super::*;
 use crate::api::gateway::gateway_model_service::{
-    cancel_grant_runs, model_grant_id, remote_principal_id,
+    cancel_grant_runs, install_create_race_barrier, model_grant_id, remote_principal_id,
+    CreateRacePoint,
 };
 use crate::collaboration_contact_store::CollaborationContactStore;
 use crate::collaboration_discovery::*;
@@ -92,6 +93,10 @@ struct FakeModelProvider {
     run_status: std::sync::Mutex<BTreeMap<String, String>>,
     /// Injected once onto the next `runs_get` or `runs_events` reply.
     next_error: std::sync::Mutex<Option<String>>,
+    /// Overlay applied to the next `runs_create` reply `data` object.
+    next_create_data: std::sync::Mutex<Option<Value>>,
+    /// Extra top-level `run_id` that disagrees with `data.run_id`.
+    next_create_alias_run_id: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -146,7 +151,20 @@ impl Provider for FakeModelProvider {
                 .lock()
                 .unwrap()
                 .insert(run_id.clone(), "running".to_string());
-            return Ok(run_view(&run_id, "running"));
+            let mut reply = run_view(&run_id, "running");
+            if let Some(overlay) = self.next_create_data.lock().unwrap().take() {
+                if let Some(data) = reply.get_mut("data").and_then(Value::as_object_mut) {
+                    if let Some(object) = overlay.as_object() {
+                        for (key, value) in object {
+                            data.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(alias) = self.next_create_alias_run_id.lock().unwrap().take() {
+                reply["run_id"] = json!(alias);
+            }
+            return Ok(reply);
         }
         let binding: RuntimeAccessBinding =
             serde_json::from_value(request["runtime_binding"].clone()).map_err(provider_error)?;
@@ -591,6 +609,11 @@ impl TwoRuntimes {
             .count()
     }
 
+    async fn revoke_grant(&self) -> anyhow::Result<Vec<String>> {
+        self.write_request_record("denied");
+        cancel_grant_runs(self.registry.clone(), self.owner.path(), &self.grant_id).await
+    }
+
     async fn shutdown(mut self) {
         self.owner_service.shutdown().await.unwrap();
         self.seed_node.shutdown().await;
@@ -720,6 +743,109 @@ async fn run_lifecycle_stays_with_the_creating_principal_through_denial_and_revo
     fx.shutdown().await;
 }
 
+#[tokio::test]
+async fn revoke_before_dispatch_sends_no_create() {
+    let fx = TwoRuntimes::start().await;
+    let barrier = install_create_race_barrier(fx.owner.path(), CreateRacePoint::BeforeDispatch);
+    let (created, _) = tokio::join!(
+        fx.create_run("seed-req-revoke-before", "qwen-local"),
+        async {
+            barrier.wait_prepared().await;
+            fx.revoke_grant().await.unwrap();
+            barrier.release();
+        }
+    );
+    assert_eq!(created["ok"], false, "{created}");
+    assert_eq!(created["code"], "denied");
+    assert_eq!(fx.provider_ops().await, vec!["offers_list"]);
+    assert!(fx
+        .run_record(&run_id_for(
+            &fx.remote_principal(),
+            "seed-req-revoke-before"
+        ))
+        .is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoke_after_dispatch_keeps_ownership_and_cancels() {
+    let fx = TwoRuntimes::start().await;
+    let barrier = install_create_race_barrier(fx.owner.path(), CreateRacePoint::BeforeCommit);
+    let (created, _) = tokio::join!(
+        fx.create_run("seed-req-revoke-after", "qwen-local"),
+        async {
+            barrier.wait_prepared().await;
+            fx.revoke_grant().await.unwrap();
+            barrier.release();
+        }
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-revoke-after");
+    let record = fx.run_record(&run_id);
+    assert_eq!(record["grant_id"], fx.grant_id);
+    assert_eq!(record["request_id"], "seed-req-revoke-after");
+    assert_eq!(record["terminal_status"], "cancelled");
+    let ops = fx.provider_ops().await;
+    assert_eq!(
+        ops.iter().filter(|op| *op == "runs_create").count(),
+        1,
+        "{ops:?}"
+    );
+    assert!(ops.iter().any(|op| op == "runs_cancel"), "{ops:?}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_mismatched_create_reply_keeps_the_run_and_cancels() {
+    let fx = TwoRuntimes::start().await;
+    *fx.provider.next_create_data.lock().unwrap() = Some(json!({ "offer_id": "other-local" }));
+    let created = fx.create_run("seed-req-mismatch", "qwen-local").await;
+    assert_eq!(created["ok"], false, "{created}");
+    assert_eq!(created["code"], "invalid_provider_invocation", "{created}");
+    let run_id = run_id_for(&fx.remote_principal(), "seed-req-mismatch");
+    let record = fx.run_record(&run_id);
+    assert_eq!(record["request_id"], "seed-req-mismatch");
+    assert_eq!(record["offer_id"], "qwen-local");
+    assert_eq!(record["terminal_status"], "cancelled");
+    assert_eq!(fx.pending_len(), 0);
+    assert_eq!(fx.create_count().await, 1);
+    let ops = fx.provider_ops().await;
+    assert!(ops.iter().any(|op| op == "runs_cancel"), "{ops:?}");
+    let retried = fx.create_run("seed-req-mismatch", "qwen-local").await;
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_eq!(retried["result"]["data"]["run_id"], run_id);
+    assert_eq!(fx.create_count().await, 1, "retry must not dispatch again");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ambiguous_create_reply_keeps_the_reservation() {
+    let fx = TwoRuntimes::start().await;
+    *fx.provider.next_create_alias_run_id.lock().unwrap() =
+        Some("run:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+    let created = fx.create_run("seed-req-ambiguous", "qwen-local").await;
+    assert_eq!(created["ok"], false, "{created}");
+    assert_eq!(created["code"], "invalid_provider_invocation", "{created}");
+    assert!(fx
+        .run_record(&run_id_for(&fx.remote_principal(), "seed-req-ambiguous"))
+        .is_null());
+    assert_eq!(fx.pending_len(), 1);
+    assert_eq!(fx.create_count().await, 1);
+    let ops = fx.provider_ops().await;
+    assert!(
+        ops.iter().all(|op| op != "runs_cancel"),
+        "no trustworthy run id, no cancel: {ops:?}"
+    );
+    let retried = fx.create_run("seed-req-ambiguous", "qwen-local").await;
+    assert_eq!(retried["ok"], false, "{retried}");
+    assert_eq!(
+        fx.create_count().await,
+        1,
+        "held reservation blocks redispatch"
+    );
+    fx.shutdown().await;
+}
+
 impl TwoRuntimes {
     /// Fill the owner's run index with `count` open records, optionally
     /// including the record a specific earlier request would have left.
@@ -770,6 +896,12 @@ impl TwoRuntimes {
         let index: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         index["runs"].as_object().unwrap().len()
             + index["pending"].as_object().map_or(0, |p| p.len())
+    }
+
+    fn pending_len(&self) -> usize {
+        let path = self.owner.path().join("services-model-runs.json");
+        let index: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        index["pending"].as_object().map_or(0, |p| p.len())
     }
 }
 
@@ -950,6 +1082,37 @@ mod consumer_path {
     fn access(op: &str, run_id: &str, request_id: &str) -> Value {
         json!({ "op": op, "run_id": run_id, "after_sequence": 0,
             "runtime_binding": { "principal_id": SEED_PRINCIPAL, "request_id": request_id } })
+    }
+
+    #[tokio::test]
+    async fn route_run_operation_rewrites_protocol_offer_ids_only() {
+        let fx = TwoRuntimes::start().await;
+        let grant = fx.consumer_grant();
+        *fx.provider.next_create_data.lock().unwrap() = Some(json!({
+            "output": { "offer_id": "nested-user-offer", "text": "keep" }
+        }));
+        let created = fx
+            .route(
+                std::slice::from_ref(&grant),
+                "runs_create",
+                json!({
+                    "op": "runs_create",
+                    "offer_id": remote_offer_id(&fx.grant_id, "qwen-local"),
+                    "operation": "text.generate",
+                    "input": { "prompt": "hello" },
+                    "runtime_binding": { "principal_id": SEED_PRINCIPAL, "request_id": "seed-req-offer" }
+                }),
+            )
+            .await
+            .unwrap()
+            .expect("remote route");
+        assert_eq!(
+            created["data"]["offer_id"],
+            remote_offer_id(&fx.grant_id, "qwen-local")
+        );
+        assert_eq!(created["data"]["output"]["offer_id"], "nested-user-offer");
+        assert_eq!(created["data"]["output"]["text"], "keep");
+        fx.shutdown().await;
     }
 
     #[tokio::test]

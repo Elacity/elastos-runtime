@@ -1,9 +1,91 @@
-// Opt-in proof only. The caller supplies read-only operator artifacts; the
+// Opt-in proofs only. The caller supplies read-only operator artifacts; the
 // existing disposable process proof owns every import, journal and child.
-const QWEN_BYTES: u64 = 6_169_341_984;
-const QWEN_SHA: &str = "d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43";
-const QWEN_LICENSE_SHA: &str = "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a";
-const QWEN_ENGINE_SHA: &str = "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713";
+//
+// Model bytes are platform-independent, so one pinned model runs on every
+// proved host profile. The engine executable has its own identity per
+// platform: the same llama.cpp release ships a different bundle per host.
+struct PinnedModel {
+    /// `ELASTOS_TEST_<prefix>_PATH`, `_LICENSE_PATH` and `_ENGINE_DATA` name
+    /// the caller-owned read-only inputs.
+    env_prefix: &'static str,
+    capsule_name: &'static str,
+    bytes: u64,
+    sha: &'static str,
+    license_bytes: u64,
+    license_sha: &'static str,
+    quantization: &'static str,
+    minimum_memory_mb: u64,
+    base_repository: &'static str,
+    base_revision: &'static str,
+    quantized_repository: &'static str,
+    quantized_revision: &'static str,
+    provenance: &'static str,
+    /// Whole-proof budget: import, loopback transfer, admission, reply/restart.
+    deadline_secs: u64,
+    /// Accepts the completed text of the first reply.
+    reply_accepts: fn(&str) -> bool,
+    /// Keeps this model generating long enough for an active cancellation
+    /// to be observed while text deltas stream.
+    long_prompt: &'static str,
+}
+
+const QWEN: PinnedModel = PinnedModel {
+    env_prefix: "QWEN",
+    capsule_name: "qwen-isolated-proof",
+    bytes: 6_169_341_984,
+    sha: "d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43",
+    license_bytes: 11544,
+    license_sha: "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+    quantization: "Q4_K_M",
+    minimum_memory_mb: 8192,
+    base_repository: "Qwen/Qwen3.5-9B",
+    base_revision: "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    quantized_repository: "bartowski/Qwen_Qwen3.5-9B-GGUF",
+    quantized_revision: "bc658f7a1ae222ee901a565aafd2f5b8c839e176",
+    provenance: "Isolated operator/test publisher attestation, not an upstream signature. Weights match the pinned bartowski quantization. Its README names Qwen/Qwen3.5-9B and llama.cpp b9222 but does not attest a base conversion revision or include a standalone license. The base_revision is an independently checked upstream reference with Apache-2.0 license, not an asserted conversion input. LICENSE and LICENSE.base reproduce that checked license for this isolated proof.\n",
+    deadline_secs: 3500,
+    // A 9B instruct model follows the one-word instruction exactly.
+    reply_accepts: |text| {
+        text.trim()
+            .trim_end_matches(['.', '!'])
+            .eq_ignore_ascii_case("ready")
+    },
+    long_prompt: "Write a continuous numbered list of detailed, distinct sentences about ordinary garden plants. Produce at least 12000 characters of text. Continue the list without a summary or closing remarks.",
+};
+
+const SMOLLM2: PinnedModel = PinnedModel {
+    env_prefix: "SMOLLM2",
+    capsule_name: "smollm2-isolated-proof",
+    bytes: 144_811_072,
+    sha: "c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a",
+    // Canonical Apache License 2.0 text (apache.org/licenses/LICENSE-2.0.txt).
+    license_bytes: 11358,
+    license_sha: "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    quantization: "Q8_0",
+    minimum_memory_mb: 1024,
+    base_repository: "HuggingFaceTB/SmolLM2-135M-Instruct",
+    base_revision: "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+    quantized_repository: "unsloth/SmolLM2-135M-Instruct-GGUF",
+    quantized_revision: "9e6855bc4be717fca1ef21360a1db4b29d5c559a",
+    provenance: "Isolated operator/test publisher attestation, not an upstream signature. Weights match the pinned unsloth Q8_0 quantization, whose README names HuggingFaceTB/SmolLM2-135M-Instruct as base_model under license apache-2.0. Neither repository ships a standalone LICENSE file; LICENSE and LICENSE.base reproduce the canonical Apache License 2.0 text for this isolated proof. The base_revision is the independently checked upstream head, not an asserted conversion input.\n",
+    deadline_secs: 900,
+    // A 135M model answers freely under the provider's default sampling; the
+    // proof binds a completed, non-empty streamed reply, not its wording.
+    reply_accepts: |text| !text.trim().is_empty(),
+    // A small model ignores length instructions but keeps narrating a story
+    // for well over a thousand tokens.
+    long_prompt: "Write a very long story about a lighthouse keeper. Keep writing new chapters and never stop.",
+};
+
+/// SHA-256 of the verified `llama-server` executable inside the pinned
+/// b10516 bundle for each proved host profile.
+fn pinned_engine_sha(platform: &str) -> &'static str {
+    match platform {
+        "darwin-arm64" => "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
+        "linux-amd64" => "fa24fc90877d1edc68990af5f4f8e476256959357d7f58cf59910e5657f7403f",
+        other => panic!("no pinned b10516 engine identity for {other}"),
+    }
+}
 
 const PACKAGE_ADD_ARGS: &[&str] = &[
     "add",
@@ -262,7 +344,8 @@ async fn model_preparation_streamed_bootstrap_matches_directory_cid() {
     );
 }
 
-struct QwenProof {
+struct PinnedModelProof {
+    model: &'static PinnedModel,
     weights: File,
     license: Vec<u8>,
     engine_data: PathBuf,
@@ -321,30 +404,42 @@ fn streamed_sha(file: &mut File) -> String {
     hex::encode(digest.finalize())
 }
 
-fn assert_qwen_file(path: &Path) {
-    let mut file = proof_file(path, QWEN_BYTES);
-    assert_eq!(file.metadata().unwrap().len(), QWEN_BYTES);
-    assert_eq!(streamed_sha(&mut file), QWEN_SHA);
+impl PinnedModel {
+    fn assert_weights(&self, path: &Path) {
+        let mut file = proof_file(path, self.bytes);
+        assert_eq!(file.metadata().unwrap().len(), self.bytes);
+        assert_eq!(streamed_sha(&mut file), self.sha);
+    }
+
+    fn env_path(&self, suffix: &str) -> PathBuf {
+        let name = format!("ELASTOS_TEST_{}_{suffix}", self.env_prefix);
+        PathBuf::from(
+            std::env::var_os(&name)
+                .unwrap_or_else(|| panic!("explicit {name} proof prerequisite")),
+        )
+    }
 }
 
-impl QwenProof {
-    fn from_env() -> Self {
-        let path =
-            |name| PathBuf::from(std::env::var_os(name).expect("explicit Qwen proof prerequisite"));
-        let mut weights = proof_file(&path("ELASTOS_TEST_QWEN_PATH"), QWEN_BYTES);
-        assert_eq!(weights.metadata().unwrap().len(), QWEN_BYTES);
-        assert_eq!(streamed_sha(&mut weights), QWEN_SHA);
+impl PinnedModelProof {
+    fn from_env(model: &'static PinnedModel) -> Self {
+        let mut weights = proof_file(&model.env_path("PATH"), model.bytes);
+        assert_eq!(weights.metadata().unwrap().len(), model.bytes);
+        assert_eq!(streamed_sha(&mut weights), model.sha);
         let mut license = Vec::new();
-        proof_file(&path("ELASTOS_TEST_QWEN_LICENSE_PATH"), 11544)
+        proof_file(&model.env_path("LICENSE_PATH"), model.license_bytes)
             .read_to_end(&mut license)
             .unwrap();
-        assert_eq!(license.len(), 11544);
-        assert_eq!(hex::encode(Sha256::digest(&license)), QWEN_LICENSE_SHA);
+        assert_eq!(license.len() as u64, model.license_bytes);
+        assert_eq!(hex::encode(Sha256::digest(&license)), model.license_sha);
         Self {
+            model,
             weights,
             license,
-            engine_data: path("ELASTOS_TEST_QWEN_ENGINE_DATA"),
-            provider: path("ELASTOS_TEST_MODEL_PROVIDER_PATH"),
+            engine_data: model.env_path("ENGINE_DATA"),
+            provider: PathBuf::from(
+                std::env::var_os("ELASTOS_TEST_MODEL_PROVIDER_PATH")
+                    .expect("explicit ELASTOS_TEST_MODEL_PROVIDER_PATH proof prerequisite"),
+            ),
         }
     }
 
@@ -354,18 +449,20 @@ impl QwenProof {
         serde_json::Value,
         std::collections::BTreeMap<String, Vec<u8>>,
     ) {
+        let model = self.model;
         let mut payload = super::super::super::tests::model_catalog_fixture();
         let capsule = &mut payload["entries"][0]["capsule_manifest"];
-        capsule["name"] = serde_json::json!("qwen-isolated-proof");
+        capsule["name"] = serde_json::json!(model.capsule_name);
+        capsule["model_content"]["quantization"] = serde_json::json!(model.quantization);
+        capsule["model_content"]["minimum_memory_mb"] = serde_json::json!(model.minimum_memory_mb);
         let provenance = &mut capsule["model_content"]["provenance"];
-        provenance["base_repository"] = serde_json::json!("Qwen/Qwen3.5-9B");
-        provenance["base_revision"] = serde_json::json!("c202236235762e1c871ad0ccb60c8ee5ba337b9a");
-        provenance["quantized_repository"] = serde_json::json!("bartowski/Qwen_Qwen3.5-9B-GGUF");
-        provenance["quantized_revision"] =
-            serde_json::json!("bc658f7a1ae222ee901a565aafd2f5b8c839e176");
+        provenance["base_repository"] = serde_json::json!(model.base_repository);
+        provenance["base_revision"] = serde_json::json!(model.base_revision);
+        provenance["quantized_repository"] = serde_json::json!(model.quantized_repository);
+        provenance["quantized_revision"] = serde_json::json!(model.quantized_revision);
         let mut files = std::collections::BTreeMap::from([
             ("LICENSE".into(), self.license.clone()), ("LICENSE.base".into(), self.license.clone()),
-            ("PROVENANCE.md".into(), b"Isolated operator/test publisher attestation, not an upstream signature. Weights match the pinned bartowski quantization. Its README names Qwen/Qwen3.5-9B and llama.cpp b9222 but does not attest a base conversion revision or include a standalone license. The base_revision is an independently checked upstream reference with Apache-2.0 license, not an asserted conversion input. LICENSE and LICENSE.base reproduce that checked license for this isolated proof.\n".to_vec()),
+            ("PROVENANCE.md".into(), model.provenance.as_bytes().to_vec()),
             ("capsule.json".into(), serde_json::to_vec(capsule).unwrap()),
         ]);
         let object = &mut payload["entries"][0]["object_manifest"];
@@ -373,7 +470,7 @@ impl QwenProof {
         for file in object["files"].as_array_mut().unwrap() {
             let path = file["path"].as_str().unwrap().to_owned();
             let (size, sha) = if path == "weights.gguf" {
-                (QWEN_BYTES, QWEN_SHA.to_owned())
+                (model.bytes, model.sha.to_owned())
             } else {
                 (
                     files[&path].len() as u64,
@@ -413,7 +510,7 @@ impl QwenProof {
             crate::setup::verified_local_model_engine(&self.engine_data, &manifest).unwrap();
         assert_eq!(
             identity.sha256.trim_start_matches("sha256:"),
-            QWEN_ENGINE_SHA
+            pinned_engine_sha(&crate::setup::detect_platform())
         );
         let source = identity.path.parent().unwrap();
         let receipt: serde_json::Value =
@@ -422,6 +519,8 @@ impl QwenProof {
         assert_eq!(receipt["version"], "b10516");
         // This pinned bundle has a root executable. Bound copies from its
         // verified receipt, including directories and relative library links.
+        // The Linux bundle carries one CPU backend library per
+        // microarchitecture, so its bound is wider than the Metal bundle.
         let entries = receipt["entries"].as_array().unwrap();
         assert!(entries.len() <= 128);
         let total = entries
@@ -433,7 +532,7 @@ impl QwenProof {
                     .len()
             })
             .sum::<u64>();
-        assert!(total + 256 * 1024 <= 28 * 1024 * 1024);
+        assert!(total + 256 * 1024 <= 96 * 1024 * 1024);
         let bundle = data.join("proof-engine");
         let mut copy = Command::new("/bin/cp");
         copy.args(["-pR"])
@@ -482,22 +581,36 @@ fn proof_rss_kib() -> u64 {
         unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
         0
     );
-    // macOS reports bytes; this opt-in profile is Darwin-arm64 only.
-    (unsafe { usage.assume_init() }.ru_maxrss as u64) / 1024
+    let maxrss = unsafe { usage.assume_init() }.ru_maxrss as u64;
+    // macOS reports bytes; Linux already reports KiB.
+    if cfg!(target_os = "macos") {
+        maxrss / 1024
+    } else {
+        maxrss
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires exact read-only Qwen weights, verified engine and native provider"]
 async fn model_native_qwen_exact_profile_lifecycle() {
+    native_exact_profile_lifecycle(&QWEN).await;
+}
+
+#[tokio::test]
+#[ignore = "requires exact read-only SmolLM2 weights, verified engine and native provider"]
+async fn model_native_smollm2_exact_profile_lifecycle() {
+    native_exact_profile_lifecycle(&SMOLLM2).await;
+}
+
+async fn native_exact_profile_lifecycle(model: &'static PinnedModel) {
     use elastos_runtime::provider::{bridge::ProviderConfig, ProviderBridge};
-    let path =
-        |name| PathBuf::from(std::env::var_os(name).expect("explicit native proof prerequisite"));
-    let weights = path("ELASTOS_TEST_QWEN_PATH").canonicalize().unwrap();
+    let platform = crate::setup::detect_platform();
+    let weights = model.env_path("PATH").canonicalize().unwrap();
     assert_eq!(
-        proof_file(&weights, QWEN_BYTES).metadata().unwrap().len(),
-        QWEN_BYTES
+        proof_file(&weights, model.bytes).metadata().unwrap().len(),
+        model.bytes
     );
-    let engine_data = path("ELASTOS_TEST_QWEN_ENGINE_DATA");
+    let engine_data = model.env_path("ENGINE_DATA");
     let mut manifest_bytes = Vec::new();
     proof_file(&engine_data.join("components.json"), 4 * 1024 * 1024)
         .read_to_end(&mut manifest_bytes)
@@ -505,7 +618,10 @@ async fn model_native_qwen_exact_profile_lifecycle() {
     let manifest: crate::setup::ComponentsManifest =
         serde_json::from_slice(&manifest_bytes).unwrap();
     let engine = crate::setup::verified_local_model_engine(&engine_data, &manifest).unwrap();
-    assert_eq!(engine.sha256.trim_start_matches("sha256:"), QWEN_ENGINE_SHA);
+    assert_eq!(
+        engine.sha256.trim_start_matches("sha256:"),
+        pinned_engine_sha(&platform)
+    );
     let engine_path = engine.path.canonicalize().unwrap();
     let base = weights
         .ancestors()
@@ -517,13 +633,14 @@ async fn model_native_qwen_exact_profile_lifecycle() {
     );
     // This is native startup proof, not Content delivery/admission. Reuse the
     // exact Runtime policy while granting read-only access to just two files.
+    let name = model.capsule_name;
     let mut offer = bound_model_offer(
         "native-only-fixture",
         "weights.gguf",
-        QWEN_SHA,
+        model.sha,
         &engine.receipt_sha256,
         &engine.sha256,
-        "Qwen native proof",
+        &format!("{name} native"),
     )
     .unwrap();
     offer.as_object_mut().unwrap().remove("stream_output");
@@ -532,15 +649,15 @@ async fn model_native_qwen_exact_profile_lifecycle() {
     offer["adapter"] = serde_json::json!({
         "kind":"local_llama_cpp_text",
         "engine":{"path":engine_path,"sha256":engine.sha256},
-        "model":{"path":weights,"sha256":format!("sha256:{QWEN_SHA}")},
-        "settings":local_model_startup_profile(&crate::setup::detect_platform()).unwrap()
+        "model":{"path":weights,"sha256":format!("sha256:{}", model.sha)},
+        "settings":local_model_startup_profile(&platform).unwrap()
     });
     assert_eq!(offer["policy"]["runtime_ms_limit"], 120000);
     let id = offer["id"].as_str().unwrap().to_owned();
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let cleanup_path = root.path().to_owned();
-    eprintln!("Qwen native proof journal: {}", cleanup_path.display());
+    eprintln!("{name} native proof journal: {}", cleanup_path.display());
     let config = ProviderConfig {
         base_path: base.to_string_lossy().into_owned(),
         allowed_paths: [&weights, &engine_path]
@@ -553,21 +670,25 @@ async fn model_native_qwen_exact_profile_lifecycle() {
         ..Default::default()
     };
     let started = Instant::now();
-    let binary = path("ELASTOS_TEST_MODEL_PROVIDER_PATH");
+    let binary = PathBuf::from(
+        std::env::var_os("ELASTOS_TEST_MODEL_PROVIDER_PATH")
+            .expect("explicit ELASTOS_TEST_MODEL_PROVIDER_PATH proof prerequisite"),
+    );
     let bridge = Arc::new(
         ProviderBridge::spawn(&binary, config.clone())
             .await
             .unwrap(),
     );
     eprintln!(
-        "Qwen native Init elapsed_ms={}",
+        "{name} native Init elapsed_ms={}",
         started.elapsed().as_millis()
     );
     let children = Arc::new(Mutex::new(vec![bridge.clone()]));
     let task_children = children.clone();
     // Two independently bounded 120 s runs, plus startup/replay/cleanup margin.
     let mut task = tokio::spawn(async move {
-        let proof = qwen_runs_and_active_cancel(
+        let proof = pinned_runs_and_active_cancel(
+            model,
             bridge.clone(),
             id,
             Instant::now() + Duration::from_secs(300),
@@ -579,7 +700,7 @@ async fn model_native_qwen_exact_profile_lifecycle() {
             .expect("native model provider reaped");
         let restarted = Arc::new(ProviderBridge::spawn(&binary, config).await.unwrap());
         task_children.lock().unwrap().push(restarted.clone());
-        assert_qwen_replay(&restarted, &proof).await;
+        assert_pinned_replay(&restarted, &proof).await;
         proof.active_delta_bytes
     });
     let result = tokio::time::timeout(Duration::from_secs(300), &mut task).await;
@@ -588,7 +709,7 @@ async fn model_native_qwen_exact_profile_lifecycle() {
         let _ = task.await;
     }
     eprintln!(
-        "Qwen native terminal elapsed_ms={}",
+        "{name} native terminal elapsed_ms={}",
         started.elapsed().as_millis()
     );
     let mut shutdowns = Vec::new();
@@ -602,15 +723,15 @@ async fn model_native_qwen_exact_profile_lifecycle() {
     }
     cleanup.expect("native proof journal cleanup");
     assert!(!cleanup_path.exists());
-    eprintln!("Qwen native proof provider reaped and journal removed");
+    eprintln!("{name} native proof provider reaped and journal removed");
     let delta_bytes = result
         .expect("native proof waiter deadline")
         .expect("native proof task");
     assert!(delta_bytes > 0);
-    eprintln!("Qwen native active_delta_bytes={delta_bytes}; exact restart replay passed");
+    eprintln!("{name} native active_delta_bytes={delta_bytes}; exact restart replay passed");
 }
 
-async fn qwen_first_reply(
+async fn pinned_first_reply(
     bridge: Arc<elastos_runtime::provider::ProviderBridge>,
     offer: String,
     deadline: Instant,
@@ -627,7 +748,7 @@ async fn qwen_first_reply(
         session_id: ctx.session_id.clone(),
         capsule_id: "assistant".into(),
         grant_id: ctx.grant_id.clone(),
-        request_id: "qwen-proof-reply".into(),
+        request_id: "pinned-proof-reply".into(),
         offer_id: offer.clone(),
         operation: "text.generate".into(),
         input_hash: model_input_hash(&input).unwrap(),
@@ -658,11 +779,11 @@ async fn qwen_first_reply(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    report_qwen_terminal(&terminal);
+    report_terminal(&terminal);
     (get, terminal)
 }
 
-fn report_qwen_terminal(terminal: &serde_json::Value) {
+fn report_terminal(terminal: &serde_json::Value) {
     // Preserve bounded public failure facts before cleanup; never dump paths,
     // prompts, provider config or the complete private response.
     let bounded = |value: &serde_json::Value| {
@@ -674,7 +795,7 @@ fn report_qwen_terminal(terminal: &serde_json::Value) {
             .collect::<String>()
     };
     eprintln!(
-        "Qwen terminal {}",
+        "pinned model terminal {}",
         serde_json::json!({
             "status": bounded(&terminal["data"]["status"]),
             "error_class": bounded(&terminal["data"]["terminal"]["error"]["class"]),
@@ -684,43 +805,49 @@ fn report_qwen_terminal(terminal: &serde_json::Value) {
     );
 }
 
-fn assert_qwen_reply(terminal: &serde_json::Value) {
+fn assert_pinned_reply(model: &PinnedModel, terminal: &serde_json::Value) {
     assert_eq!(terminal["data"]["status"], "completed");
     let text = terminal["data"]["terminal"]["output"]["text"]
         .as_str()
         .unwrap()
         .trim();
-    assert!(text
-        .trim_end_matches(['.', '!'])
-        .eq_ignore_ascii_case("ready"));
+    // The reply is the only model output this proof records; keep it short.
+    eprintln!(
+        "{} completed reply chars={} head={:?}",
+        model.capsule_name,
+        text.chars().count(),
+        text.chars().take(64).collect::<String>()
+    );
+    assert!((model.reply_accepts)(text), "reply rejected by pinned model check");
 }
 
-struct QwenRunProof {
+struct PinnedRunProof {
     replay: [(serde_json::Value, serde_json::Value); 4],
     active_delta_bytes: usize,
 }
 
-async fn qwen_runs_and_active_cancel(
+async fn pinned_runs_and_active_cancel(
+    model: &PinnedModel,
     bridge: Arc<elastos_runtime::provider::ProviderBridge>,
     offer: String,
     deadline: Instant,
-) -> QwenRunProof {
+) -> PinnedRunProof {
     use elastos_model_contract::{
         model_input_hash, RuntimeAccessBinding, RuntimeCreateBinding,
         RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA,
     };
-    let (get, terminal) = qwen_first_reply(bridge.clone(), offer.clone(), deadline).await;
-    assert_qwen_reply(&terminal);
+    let (get, terminal) = pinned_first_reply(bridge.clone(), offer.clone(), deadline).await;
+    assert_pinned_reply(model, &terminal);
     let ctx = context();
     let input = serde_json::json!({"schema":"elastos.model.input.text/v1",
-        "prompt":"Write a continuous numbered list of detailed, distinct sentences about ordinary garden plants. Produce at least 12000 characters of text. Continue the list without a summary or closing remarks."});
+        "prompt":model.long_prompt});
     let binding = RuntimeCreateBinding {
         schema: RUNTIME_CREATE_BINDING_SCHEMA.into(),
         principal_id: ctx.principal_id.clone(),
         session_id: ctx.session_id.clone(),
         capsule_id: "assistant".into(),
         grant_id: ctx.grant_id.clone(),
-        request_id: "qwen-proof-active-cancel".into(),
+        request_id: "pinned-proof-active-cancel".into(),
         offer_id: offer.clone(),
         operation: "text.generate".into(),
         input_hash: model_input_hash(&input).unwrap(),
@@ -747,7 +874,7 @@ async fn qwen_runs_and_active_cancel(
     let active_delta_bytes = loop {
         assert!(
             Instant::now() < deadline,
-            "active Qwen delta observation deadline"
+            "active pinned model delta observation deadline"
         );
         let page = bridge
             .send_raw(&serde_json::json!({"op":"runs_events",
@@ -773,14 +900,14 @@ async fn qwen_runs_and_active_cancel(
             current["data"]["status"].as_str(),
             Some("prepared" | "running")
         ) {
-            report_qwen_terminal(&current);
+            report_terminal(&current);
         }
         assert!(
             matches!(
                 current["data"]["status"].as_str(),
                 Some("prepared" | "running")
             ),
-            "active Qwen cancellation not observed before terminal status: {}",
+            "active cancellation not observed before terminal status: {}",
             current["data"]["status"]
         );
         if delta_bytes > 0 && current["data"]["status"] == "running" {
@@ -790,20 +917,20 @@ async fn qwen_runs_and_active_cancel(
     };
     let cancel = serde_json::json!({"op":"runs_cancel","run_id":id,"runtime_binding":access});
     let cancelled = bridge.send_raw(&cancel).await.unwrap();
-    report_qwen_terminal(&cancelled);
+    report_terminal(&cancelled);
     assert_eq!(cancelled["status"], "ok");
     assert!(
         matches!(
             cancelled["data"]["status"].as_str(),
             Some("reconciling" | "settlement_unknown")
         ),
-        "active Qwen cancellation raced terminal completion: {}",
+        "active cancellation raced terminal completion: {}",
         cancelled["data"]["status"]
     );
     let cancelled_terminal = loop {
         assert!(
             Instant::now() < deadline,
-            "Qwen cancellation settlement deadline"
+            "cancellation settlement deadline"
         );
         let result = bridge.send_raw(&cancelled_get).await.unwrap();
         assert_eq!(result["status"], "ok");
@@ -815,7 +942,7 @@ async fn qwen_runs_and_active_cancel(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    report_qwen_terminal(&cancelled_terminal);
+    report_terminal(&cancelled_terminal);
     // Preserve the unresolved run outcome. HTTP disconnect does not prove that
     // backend execution stopped; later artifact removal needs physical close proof.
     assert_eq!(cancelled_terminal["data"]["status"], "settlement_unknown");
@@ -845,7 +972,7 @@ async fn qwen_runs_and_active_cancel(
         );
         assert_eq!(bridge.send_raw(&events).await.unwrap(), settled_events);
     }
-    QwenRunProof {
+    PinnedRunProof {
         replay: [
             (get, terminal),
             (cancelled_get, cancelled_terminal.clone()),
@@ -856,9 +983,9 @@ async fn qwen_runs_and_active_cancel(
     }
 }
 
-async fn assert_qwen_replay(
+async fn assert_pinned_replay(
     bridge: &elastos_runtime::provider::ProviderBridge,
-    proof: &QwenRunProof,
+    proof: &PinnedRunProof,
 ) {
     let mut replies = Vec::new();
     for (query, _) in &proof.replay {
@@ -873,7 +1000,8 @@ async fn assert_qwen_replay(
     }
 }
 
-async fn qwen_reply_and_restart(
+async fn pinned_reply_and_restart(
+    model: &PinnedModel,
     data: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     binary: &Path,
@@ -890,14 +1018,19 @@ async fn qwen_reply_and_restart(
         config.extra["runtime_admitted_offers"],
         serde_json::json!([{"offer_id":offer}])
     );
+    assert_eq!(
+        config.extra["offers"][0]["adapter"]["settings"],
+        local_model_startup_profile(&crate::setup::detect_platform()).unwrap(),
+        "startup offer carries this host's Runtime-owned profile"
+    );
     let bridge = Arc::new(ProviderBridge::spawn(binary, config.clone()).await.unwrap());
     children.lock().unwrap().push(bridge.clone());
     drop(worker);
-    let proof = qwen_runs_and_active_cancel(bridge.clone(), offer.clone(), deadline).await;
+    let proof = pinned_runs_and_active_cancel(model, bridge.clone(), offer.clone(), deadline).await;
     bridge
         .shutdown()
         .await
-        .expect("Qwen provider shutdown/reap");
+        .expect("pinned model provider shutdown/reap");
     children.lock().unwrap().clear();
     let (restarted_config, worker) = crate::api::model_provider_config(data, registry)
         .await
@@ -910,14 +1043,14 @@ async fn qwen_reply_and_restart(
     );
     children.lock().unwrap().push(restarted.clone());
     drop(worker);
-    assert_qwen_replay(&restarted, &proof).await;
+    assert_pinned_replay(&restarted, &proof).await;
     children.lock().unwrap().clear();
     assert!(Inventory::open(data, false)
         .unwrap()
         .load()
         .unwrap()
         .kept(&context().principal_id, cid));
-    serde_json::json!({"offer_id":offer,"cid":cid,"reply":"ready","restart_replay_exact":true,
+    serde_json::json!({"offer_id":offer,"cid":cid,"reply_completed":true,"restart_replay_exact":true,
         "keep_persisted":true,"provider_shutdown_reap":true,"engine_process_group_absence":null,
         "active_text_delta_bytes":proof.active_delta_bytes,"active_cancel_unknown_replay":true,
         "per_run_backend_stop_confirmed":false})
@@ -927,5 +1060,13 @@ async fn qwen_reply_and_restart(
 #[ignore = "requires explicit read-only Qwen/license/verified engine roots and native binaries; review footprint before running"]
 async fn model_preparation_real_qwen_cold_reply_restart() {
     assert_eq!(crate::setup::detect_platform(), "darwin-arm64");
-    preparation_process_with_qwen(true, Some(QwenProof::from_env())).await;
+    preparation_process_with_model(true, Some(PinnedModelProof::from_env(&QWEN))).await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicit read-only SmolLM2/license/verified engine roots and native binaries; isolated small-model proof"]
+async fn model_preparation_real_smollm2_cold_reply_restart() {
+    // Any host with a Runtime-owned startup profile runs this small model.
+    local_model_startup_profile(&crate::setup::detect_platform()).unwrap();
+    preparation_process_with_model(true, Some(PinnedModelProof::from_env(&SMOLLM2))).await;
 }

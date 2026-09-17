@@ -251,7 +251,7 @@ export function openModelsFromAgent() {
   if (!homeToken || window.top === window) return false;
   // The top Home registers this exact nested app source before accepting its intent.
   window.top.postMessage({ type: "home:app-ready", homeToken }, origin);
-  window.top.postMessage({ type: "home:open-target", target: "system", query: { settings: "models" }, homeToken }, origin);
+  window.top.postMessage({ type: "home:open-target", target: "marketplace", query: { category: "models" }, homeToken }, origin);
   return true;
 }
 

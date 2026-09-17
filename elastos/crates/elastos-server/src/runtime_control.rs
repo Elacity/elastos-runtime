@@ -558,7 +558,16 @@ fn sync_managed_runtime_child_components_manifest(
     let child_data_dir = managed_runtime_child_data_dir(child_home);
     let child_bin_dir = child_data_dir.join("bin");
     std::fs::create_dir_all(&child_bin_dir)?;
-    std::fs::write(child_data_dir.join("components.json"), manifest_bytes)?;
+    std::fs::write(child_data_dir.join("components.json"), &manifest_bytes)?;
+    let verified_manifest: crate::setup::ComponentsManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            anyhow::anyhow!("managed home runtime requires a valid parent manifest: {error}")
+        })?;
+    crate::setup::install_signed_model_catalog(
+        &child_data_dir,
+        &verified_manifest,
+        &parent_manifest,
+    )?;
     for (name, parent_binary) in verified_binaries {
         std::fs::copy(parent_binary, child_bin_dir.join(name))?;
     }
@@ -1840,6 +1849,71 @@ mod tests {
             )
             .is_err()
         );
+        assert!(!child_data_dir.join("model-catalog.json").exists());
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_copies_signed_model_catalog_into_child_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        let catalog = br#"{"payload":{"schema":"elastos.model.catalog/v1"},"signature":"ab","signer_did":"did:key:z"}"#;
+        write_parent_signed_model_catalog(tmp.path(), catalog);
+
+        sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap();
+
+        let child_catalog = managed_runtime_child_data_dir(&home).join("model-catalog.json");
+        assert_eq!(std::fs::read(&child_catalog).unwrap(), catalog);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&child_catalog)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_rejects_missing_signed_model_catalog_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        pin_parent_model_catalog_head(
+            tmp.path(),
+            &crate::setup::catalog_head_cid(b"absent").unwrap(),
+        );
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error.to_string().contains("model-catalog.json"));
+        assert!(error.to_string().contains("missing"));
+        assert!(!managed_runtime_child_data_dir(&home)
+            .join("model-catalog.json")
+            .exists());
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_rejects_mismatched_signed_model_catalog_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+        write_managed_runtime_parent_support_artifacts(tmp.path());
+        std::fs::write(tmp.path().join("model-catalog.json"), b"catalog-a").unwrap();
+        pin_parent_model_catalog_head(
+            tmp.path(),
+            &crate::setup::catalog_head_cid(b"catalog-b").unwrap(),
+        );
+
+        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+
+        assert!(error.to_string().contains("does not match the pinned"));
+        assert!(!managed_runtime_child_data_dir(&home)
+            .join("model-catalog.json")
+            .exists());
     }
 
     #[test]
@@ -1969,6 +2043,22 @@ mod tests {
         .unwrap();
         std::fs::write(data_dir.join("components.json"), &manifest_bytes).unwrap();
         manifest_bytes
+    }
+
+    fn pin_parent_model_catalog_head(data_dir: &Path, head_cid: &str) {
+        let path = data_dir.join("components.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["model_catalog"] = serde_json::json!({
+            "head_cid": head_cid,
+            "publisher_dids": ["did:key:z6Mkabcdefghijklmnopqrstuvwxyz0123456789ABCDE"]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    fn write_parent_signed_model_catalog(data_dir: &Path, catalog: &[u8]) {
+        std::fs::write(data_dir.join("model-catalog.json"), catalog).unwrap();
+        pin_parent_model_catalog_head(data_dir, &crate::setup::catalog_head_cid(catalog).unwrap());
     }
 
     #[test]

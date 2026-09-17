@@ -22,6 +22,18 @@ test("CID intent requires exact current unique ready mapping; service intent has
   assert.equal(selectedModelOffer([hosted], hosted.id, cid, []), null);
 });
 
+test("catalog accepts distinct signed entries and exact CID selection", () => {
+  const otherCid = `bafybei${"c".repeat(51)}e`;
+  const other = { ...row, cid: otherCid, title: "Other model",
+    model_runtime: { admitted: true, dispatch_ready: true, offer_id: "other-offer-id" } };
+  const models = catalogModels(catalog([row, other]));
+  assert.equal(models.length, 2);
+  assert.equal(selectedModelOffer([offer], offer.id, cid, models), offer);
+  const otherOffer = { id: "other-offer-id" };
+  assert.equal(selectedModelOffer([otherOffer], otherOffer.id, otherCid, models), otherOffer);
+  assert.equal(selectedModelOffer([offer], offer.id, otherCid, models), null);
+});
+
 test("catalog rejects duplicate, malformed and noncanonical content identity", () => {
   assert.throws(() => catalogModels(catalog([row, row])));
   for (const value of [cid.toUpperCase(), `${cid} `, `bafybei${"a".repeat(51)}b`, "https://model.invalid"]) {

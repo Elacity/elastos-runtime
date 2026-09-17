@@ -1306,6 +1306,19 @@ function requestDocumentsWindowClose(entry) {
   return promise;
 }
 
+function postMarketplaceNavigate(entry, query) {
+  const frame = entry.node.querySelector(".window-frame");
+  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
+  if (!homeToken || !frame?.contentWindow) {
+    return;
+  }
+  frame.contentWindow.postMessage({
+    type: "elastos.marketplace.navigate/v1",
+    homeToken,
+    query,
+  }, "*");
+}
+
 function browserLaunchAuthority(route) {
   try {
     const url = new URL(route, window.location.href);
@@ -1725,6 +1738,9 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   if (targetId === SYSTEM_APP_ID && Object.keys(options.query || {}).length > 0) {
     const ok = await requestSystemWindow(entry, "navigate", options.query);
     if (!ok) throw new Error("System could not open the requested settings");
+  }
+  if (targetId === "marketplace" && Object.keys(options.query || {}).length > 0) {
+    postMarketplaceNavigate(entry, options.query);
   }
   if ((targetId === "inbox" || targetId === "wallet") && Object.keys(options.query || {}).length > 0) {
     const ok = await requestSelectionWindow(entry, options.query);
@@ -2347,6 +2363,9 @@ export async function restoreShellSession() {
   const restoredEntries = [];
   const restoredSingleSessionTargets = new Set();
   for (const restoredWindow of restoredWindows) {
+    if (restoredWindow.hidden) {
+      continue;
+    }
     if (isSingleWindowTarget(restoredWindow.target)) {
       if (restoredSingleSessionTargets.has(restoredWindow.target)) {
         continue;

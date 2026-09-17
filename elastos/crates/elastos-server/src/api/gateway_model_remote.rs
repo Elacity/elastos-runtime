@@ -344,17 +344,9 @@ fn classify_carrier_error(message: &str) -> RemoteRouteError {
     RemoteRouteError::Transport(message.to_string())
 }
 
-fn run_id_of(result: &Value) -> Option<String> {
-    result
-        .pointer("/data/run/id")
-        .or_else(|| result.pointer("/data/run_id"))
-        .or_else(|| result.pointer("/run/id"))
-        .or_else(|| result.get("run_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-use super::gateway_model_service::run_result_is_terminal as run_is_terminal;
+use super::gateway_model_service::{
+    normalize_remote_model_reply, run_result_is_terminal as run_is_terminal,
+};
 
 /// Hold one route slot for a create, or recognise a request that already has
 /// its route (a retry after a lost reply). Check and hold share one lock and
@@ -426,23 +418,35 @@ fn release_route_slot(data_dir: &Path, now: u64, key: &str) {
     }
 }
 
-fn rewrite_offer_ids(value: &mut Value, grant_id: &str) {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(offer_id)) = map.get_mut("offer_id") {
-                if parse_remote_offer_id(offer_id).is_none() {
-                    *offer_id = remote_offer_id(grant_id, offer_id);
-                }
-            }
-            for child in map.values_mut() {
-                rewrite_offer_ids(child, grant_id);
-            }
+fn rewrite_protocol_offer_id(value: &mut Value, grant_id: &str) {
+    if let Some(Value::String(offer_id)) = value.get_mut("offer_id") {
+        if parse_remote_offer_id(offer_id).is_none() {
+            *offer_id = remote_offer_id(grant_id, offer_id);
         }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| rewrite_offer_ids(item, grant_id)),
-        _ => {}
     }
+}
+
+fn rewrite_protocol_offer_list(offers: Option<&mut Value>, grant_id: &str) {
+    let Some(Value::Array(items)) = offers else {
+        return;
+    };
+    for item in items {
+        rewrite_protocol_offer_id(item, grant_id);
+    }
+}
+
+/// Prefix protocol offer identities for the consumer. User, event, and output
+/// objects keep their own fields.
+fn rewrite_offer_ids(value: &mut Value, grant_id: &str) {
+    rewrite_protocol_offer_id(value, grant_id);
+    if let Some(data) = value.get_mut("data") {
+        rewrite_protocol_offer_id(data, grant_id);
+        if let Some(run) = data.get_mut("run") {
+            rewrite_protocol_offer_id(run, grant_id);
+        }
+        rewrite_protocol_offer_list(data.get_mut("offers"), grant_id);
+    }
+    rewrite_protocol_offer_list(value.get_mut("offers"), grant_id);
 }
 
 /// Append the offers each approved grant currently shares. An unreachable
@@ -581,7 +585,18 @@ pub(crate) async fn route_run_operation(
                     return Err(err);
                 }
             };
-            if let Some(run_id) = run_id_of(&result) {
+            let reply = match normalize_remote_model_reply(&result) {
+                Ok(reply) => reply,
+                Err(_) => {
+                    if held_slot {
+                        release_route_slot(data_dir, now, &key);
+                    }
+                    return Err(RemoteRouteError::Invalid(
+                        "model reply is ambiguous".to_string(),
+                    ));
+                }
+            };
+            if let Some(run_id) = reply.run_id {
                 let route = RemoteRunRoute {
                     principal_id: context.principal_id.clone(),
                     grant_id: grant.grant_id.clone(),
@@ -757,10 +772,20 @@ mod tests {
 
     #[test]
     fn offer_ids_in_results_are_rewritten_once() {
-        let mut result = json!({ "data": { "run": { "id": "run:sha256:aa", "offer_id": "qwen" }, "offer_id": "remote:g:qwen" } });
+        let mut result = json!({
+            "data": {
+                "run": { "id": "run:sha256:aa", "offer_id": "qwen" },
+                "offer_id": "remote:g:qwen",
+                "terminal": { "output": { "offer_id": "nested-user-offer", "text": "hello" } }
+            }
+        });
         rewrite_offer_ids(&mut result, "g");
         assert_eq!(result["data"]["run"]["offer_id"], "remote:g:qwen");
         assert_eq!(result["data"]["offer_id"], "remote:g:qwen");
+        assert_eq!(
+            result["data"]["terminal"]["output"]["offer_id"],
+            "nested-user-offer"
+        );
     }
 
     #[test]

@@ -70,8 +70,8 @@ const WALLET_CONNECTOR_TARGETS = new Set(
   Object.keys(WALLET_CONNECTOR_TARGET_TITLES),
 );
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
-  assistant: new Set(["system"]),
-  "home-agent": new Set(["system"]),
+  assistant: new Set(["marketplace"]),
+  "home-agent": new Set(["marketplace"]),
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
@@ -1822,7 +1822,11 @@ window.addEventListener("message", (event) => {
   }
   if (["assistant", "home-agent"].includes(context.targetId) &&
       (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
-       !hasExactMessageKeys(data.query, ["settings"]) || data.query.settings !== "models")) return;
+       data.target !== "marketplace" ||
+       !assistantModelsMarketplaceQuery(data.query))) return;
+  if (context.targetId === "marketplace" && target === "assistant" &&
+      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
+       !marketplaceAssistantHandoffQuery(data.query))) return;
   if (
     context.kind === "app-frame" &&
     context.targetId === "wallet" &&
@@ -1957,6 +1961,37 @@ function browserInstanceFromRoute(route) {
   } catch (_error) {
     return "";
   }
+}
+
+const MODEL_CONTENT_CID = /^bafybei[a-z2-7]{51}[aeimquy4]$/;
+const MODEL_OFFER_ID = /^model:[0-9a-f]{64}$/;
+
+function assistantModelsMarketplaceQuery(query) {
+  if (!query || typeof query !== "object" || Array.isArray(query) || query.category !== "models") {
+    return false;
+  }
+  const keys = Object.keys(query);
+  if (keys.length === 1) {
+    return keys[0] === "category";
+  }
+  return keys.length === 2
+    && Object.prototype.hasOwnProperty.call(query, "category")
+    && Object.prototype.hasOwnProperty.call(query, "model_cid")
+    && MODEL_CONTENT_CID.test(query.model_cid);
+}
+
+function marketplaceAssistantHandoffQuery(query) {
+  if (!query || typeof query !== "object" || Array.isArray(query)
+      || !MODEL_CONTENT_CID.test(query.model_cid || "")) {
+    return false;
+  }
+  const keys = Object.keys(query);
+  if (keys.length === 1) {
+    return keys[0] === "model_cid";
+  }
+  return keys.length === 2
+    && Object.prototype.hasOwnProperty.call(query, "offer_id")
+    && MODEL_OFFER_ID.test(query.offer_id);
 }
 
 function hasExactMessageKeys(message, expectedKeys) {

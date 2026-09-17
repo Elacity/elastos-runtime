@@ -256,7 +256,7 @@ async fn run_with_data_dir(
     if media_tools_dir.is_some() && !prerequisites_only {
         anyhow::bail!("--media-tools-dir requires --prerequisites-only");
     }
-    let manifest = load_manifest()?;
+    let (manifest_path, manifest) = load_manifest_with_path()?;
     let platform = detect_platform();
 
     eprintln!(
@@ -525,6 +525,7 @@ async fn run_with_data_dir(
     }
 
     let stamped = write_installed_manifest(&data_dir, &manifest, &platform)?;
+    install_signed_model_catalog(&data_dir, &manifest, &manifest_path)?;
 
     println!();
     if !stamped.is_empty() {
@@ -545,9 +546,15 @@ async fn run_with_data_dir(
 
 const COMPONENTS_MANIFEST_ENV: &str = "ELASTOS_COMPONENTS_MANIFEST";
 
+#[cfg(test)]
 fn load_manifest() -> anyhow::Result<ComponentsManifest> {
+    Ok(load_manifest_with_path()?.1)
+}
+
+fn load_manifest_with_path() -> anyhow::Result<(PathBuf, ComponentsManifest)> {
     if let Some(path) = explicit_components_manifest_path() {
-        return load_manifest_from_path(&path);
+        let manifest = load_manifest_from_path(&path)?;
+        return Ok((path, manifest));
     }
 
     let exe_path = std::env::current_exe().ok();
@@ -565,7 +572,7 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
 
     for path in manifest_paths.iter().flatten() {
         if let Ok(content) = fs::read_to_string(path) {
-            return parse_manifest_at(path, &content);
+            return parse_manifest_at(path, &content).map(|manifest| (path.clone(), manifest));
         }
     }
 
@@ -1910,6 +1917,75 @@ pub fn write_installed_manifest(
     Ok(stamped)
 }
 
+const MODEL_CATALOG_FILE: &str = "model-catalog.json";
+const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
+
+pub(crate) fn catalog_head_cid(bytes: &[u8]) -> anyhow::Result<String> {
+    let hash = cid::multihash::Multihash::<64>::wrap(0x12, &sha2::Sha256::digest(bytes))
+        .map_err(|err| anyhow::anyhow!("model catalog digest is not a SHA-256 multihash: {err}"))?;
+    Ok(cid::Cid::new_v1(0x55, hash).to_string())
+}
+
+fn verify_catalog_head(head_cid: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let actual = catalog_head_cid(bytes)?;
+    if actual != head_cid {
+        anyhow::bail!(
+            "model catalog head {actual} does not match the pinned raw SHA-256 CIDv1 {head_cid}"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_model_catalog_source(manifest_path: &Path, dest: &Path) -> anyhow::Result<PathBuf> {
+    let sibling = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("components manifest has no parent directory"))?
+        .join(MODEL_CATALOG_FILE);
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    if dest.is_file() {
+        return Ok(dest.to_path_buf());
+    }
+    anyhow::bail!(
+        "model catalog pin is present but {MODEL_CATALOG_FILE} is missing beside {} and in the data directory",
+        manifest_path.display()
+    );
+}
+
+pub(crate) fn install_signed_model_catalog(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+    manifest_path: &Path,
+) -> anyhow::Result<()> {
+    let Some(trust) = &manifest.model_catalog else {
+        return Ok(());
+    };
+    if trust.head_cid.is_empty() || trust.head_cid.len() > 128 {
+        anyhow::bail!("model catalog trust head is invalid");
+    }
+    let dest = data_dir.join(MODEL_CATALOG_FILE);
+    let source = resolve_model_catalog_source(manifest_path, &dest)?;
+    let bytes = fs::read(&source)?;
+    if bytes.len() > MAX_MODEL_CATALOG_BYTES {
+        anyhow::bail!(
+            "model catalog exceeds its {}-byte bound",
+            MAX_MODEL_CATALOG_BYTES
+        );
+    }
+    verify_catalog_head(&trust.head_cid, &bytes)?;
+    if source != dest {
+        atomic_write_file(&dest, &bytes)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
+    }
+    println!("Installed signed model catalog: {}", dest.display());
+    Ok(())
+}
+
 pub fn write_installed_manifest_bytes(
     data_dir: &Path,
     manifest_bytes: &[u8],
@@ -2942,13 +3018,40 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
         let entry = entry?;
         let path = entry.path();
         let target = dest.join(entry.file_name());
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
             copy_dir_recursive(&path, &target)?;
-        } else {
+        } else if metadata.file_type().is_symlink() {
+            let link_target = fs::read_link(&path)?;
+            if link_target.is_absolute()
+                || link_target.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                anyhow::bail!("bundle symlink target is unsafe");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                symlink(&link_target, &target)?;
+            }
+            #[cfg(not(unix))]
+            anyhow::bail!("bundle symlinks are unsupported on this platform");
+        } else if metadata.file_type().is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&path, &target)?;
+        } else {
+            anyhow::bail!("bundle contains a special file");
         }
     }
     Ok(())
@@ -3002,6 +3105,50 @@ mod tests {
         let mut corrupt = bytes;
         corrupt[0] ^= 1;
         assert!(verify_checksum("home-cli", &corrupt, &info).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_from_tarball_preserves_relative_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("llama-b10516");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.0.dylib"), b"dylib\n").unwrap();
+        symlink("lib.0.dylib", src.join("lib.dylib")).unwrap();
+        let archive = temp.path().join("bundle.tar.gz");
+        let status = Command::new("tar")
+            .args([
+                "czf",
+                archive.to_str().unwrap(),
+                "-C",
+                temp.path().to_str().unwrap(),
+                "llama-b10516",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = fs::read(&archive).unwrap();
+        let info: PlatformInfo = serde_json::from_value(serde_json::json!({
+            "release_path": "llama-b10516.tar.gz",
+            "install_path": "libexec/llama.cpp/b10516/darwin-arm64",
+            "extract_path": "llama-b10516",
+            "checksum": format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
+        }))
+        .unwrap();
+        let dest = temp.path().join("libexec/llama.cpp/b10516/darwin-arm64");
+        extract_from_tarball(&bytes, &dest, &info).unwrap();
+        let link = dest.join("lib.dylib");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "installer must keep the signed dylib symlink"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("lib.0.dylib"));
+        assert_eq!(fs::read(dest.join("lib.0.dylib")).unwrap(), b"dylib\n");
     }
 
     #[test]
@@ -3350,6 +3497,37 @@ mod tests {
 
         assert!(manifest.external.contains_key("kubo"));
         assert!(manifest.external.contains_key("archive-manager"));
+        // Every prebuilt local model engine installs as a receipted bundle. The
+        // release executables load their libraries from their own directory, so
+        // a single copied executable would neither verify nor run.
+        let engine = &manifest.external["llama-server"];
+        let version = engine.version.as_deref().unwrap();
+        let mut prebuilt = 0;
+        for (platform, info) in &engine.platforms {
+            if info.url.is_none() {
+                continue;
+            }
+            prebuilt += 1;
+            assert_eq!(
+                info.binary_path.as_deref(),
+                Some("llama-server"),
+                "{platform}"
+            );
+            assert_eq!(
+                info.extract_path.as_deref(),
+                Some(format!("llama-{version}").as_str()),
+                "{platform}"
+            );
+            assert_eq!(
+                info.install_path.as_deref(),
+                Some(format!("libexec/llama.cpp/{version}/{platform}").as_str()),
+                "{platform}"
+            );
+        }
+        assert!(
+            prebuilt >= 2,
+            "darwin-arm64 and linux-amd64 engines are prebuilt"
+        );
         for provider in [
             "net-provider",
             "exit-provider",
@@ -3372,6 +3550,30 @@ mod tests {
             .components
             .iter()
             .any(|component| component == "archive-manager"));
+        for name in ["model-provider", "llama-server"] {
+            for profile_name in ["home", "demo"] {
+                assert!(
+                    manifest.profiles[profile_name]
+                        .components
+                        .iter()
+                        .any(|component| component == name),
+                    "{profile_name} profile must install {name}"
+                );
+            }
+        }
+        assert!(
+            !manifest.profiles["home"]
+                .components
+                .iter()
+                .any(|component| component.starts_with("model-qwen")),
+            "home profile must not install huggingface GGUF components"
+        );
+        let catalog = manifest
+            .model_catalog
+            .as_ref()
+            .expect("home matching install pins a signed model catalog");
+        assert!(!catalog.publisher_dids.is_empty());
+        assert!(catalog.local_use.is_some());
         for profile_name in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
             let profile = manifest
                 .profiles
@@ -5284,5 +5486,86 @@ mod tests {
             fs::read(&install_path).unwrap(),
             b"new-binary-with-more-bytes"
         );
+    }
+
+    #[test]
+    fn install_signed_model_catalog_copies_sibling_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let catalog = br#"{"payload":{"schema":"elastos.model.catalog/v1"},"signature":"ab","signer_did":"did:key:z"}"#;
+        fs::write(source_dir.join(MODEL_CATALOG_FILE), catalog).unwrap();
+        let head = catalog_head_cid(catalog).unwrap();
+        let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "external": {},
+            "profiles": {},
+            "model_catalog": {
+                "head_cid": head,
+                "publisher_dids": ["did:key:z6Mkabcdefghijklmnopqrstuvwxyz0123456789ABCDE"]
+            }
+        }))
+        .unwrap();
+        fs::write(
+            source_dir.join("components.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        install_signed_model_catalog(&data_dir, &manifest, &source_dir.join("components.json"))
+            .unwrap();
+        assert_eq!(
+            fs::read(data_dir.join(MODEL_CATALOG_FILE)).unwrap(),
+            catalog
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(data_dir.join(MODEL_CATALOG_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn install_signed_model_catalog_skips_when_unpinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "external": {},
+            "profiles": {}
+        }))
+        .unwrap();
+        install_signed_model_catalog(data_dir, &manifest, &data_dir.join("components.json"))
+            .unwrap();
+        assert!(!data_dir.join(MODEL_CATALOG_FILE).exists());
+    }
+
+    #[test]
+    fn install_signed_model_catalog_rejects_head_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("source");
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(source_dir.join(MODEL_CATALOG_FILE), b"catalog-a").unwrap();
+        let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "external": {},
+            "profiles": {},
+            "model_catalog": {
+                "head_cid": catalog_head_cid(b"catalog-b").unwrap(),
+                "publisher_dids": ["did:key:z6Mkabcdefghijklmnopqrstuvwxyz0123456789ABCDE"]
+            }
+        }))
+        .unwrap();
+        let err =
+            install_signed_model_catalog(&data_dir, &manifest, &source_dir.join("components.json"))
+                .unwrap_err();
+        assert!(err.to_string().contains("does not match the pinned"));
     }
 }

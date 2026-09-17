@@ -95,11 +95,35 @@ export function parseCursor(value) {
   return Number.isInteger(cursor) && cursor >= 0 ? cursor : null;
 }
 
+/** Studio progress on a `progress` event. Null when the payload is malformed. */
+export function parseStudioProgress(data) {
+  const phase =
+    typeof data?.phase === "string" && data.phase.trim() === data.phase ? data.phase : "";
+  const completed = Number(data?.completed);
+  const total = Number(data?.total);
+  if (
+    !phase ||
+    !Number.isInteger(completed) ||
+    !Number.isInteger(total) ||
+    completed < 0 ||
+    total < 0 ||
+    completed > total
+  ) {
+    return null;
+  }
+  return { phase, completed, total };
+}
+
 /**
  * Validate a runs_events page against the cursor we hold and reduce it to
- * what the stream needs. Throws on a page the provider should never send.
+ * what Chat and Studio need. The provider may replay events at or below the
+ * saved cursor; this function skips those. A new sequence must rise from
+ * the last newly applied event. An unseen earlier sequence is rejected. A
+ * cursor must not move backwards. Throws on a page the provider should
+ * never send.
  * @returns {{ nextCursor: number, hasMore: boolean, textDeltas: string[],
- *             terminal: null | { status: string, output: unknown, error: unknown } }}
+ *             terminal: null | { status: string, output: unknown, error: unknown },
+ *             studioProgress: null | { phase: string, completed: number, total: number } }}
  */
 export function applyRunEventsPage(page, afterSequence) {
   if (!page || typeof page !== "object" || !Array.isArray(page.events)) {
@@ -111,11 +135,21 @@ export function applyRunEventsPage(page, afterSequence) {
   }
   const textDeltas = [];
   let terminal = null;
+  let studioProgress = null;
   let lastSequence = afterSequence;
   for (const event of page.events) {
     const sequence = parseCursor(event?.sequence);
-    if (sequence === null || sequence <= lastSequence) {
+    if (sequence === null) {
       throw contractError("bad_sequence", "run events are not strictly increasing");
+    }
+    if (sequence <= afterSequence) {
+      continue;
+    }
+    if (sequence < lastSequence) {
+      throw contractError("bad_sequence", "run events arrived out of order");
+    }
+    if (sequence === lastSequence) {
+      continue;
     }
     lastSequence = sequence;
     const kind = typeof event.kind === "string" ? event.kind : "";
@@ -124,6 +158,12 @@ export function applyRunEventsPage(page, afterSequence) {
       if (typeof text === "string" && text) {
         textDeltas.push(text);
       }
+    } else if (kind === "progress") {
+      const progress = parseStudioProgress(event.data);
+      if (!progress) {
+        throw contractError("bad_progress", "studio progress event is malformed");
+      }
+      studioProgress = progress;
     } else if (kind === "output") {
       terminal = { status: "completed", output: event.data ?? null, error: null };
     } else if (kind === "completed") {
@@ -148,7 +188,13 @@ export function applyRunEventsPage(page, afterSequence) {
   if (nextCursor < lastSequence) {
     throw contractError("bad_cursor", "run events cursor behind last sequence");
   }
-  return { nextCursor, hasMore: page.has_more === true, textDeltas, terminal };
+  return {
+    nextCursor,
+    hasMore: page.has_more === true,
+    textDeltas,
+    terminal,
+    studioProgress,
+  };
 }
 
 /** Final text the provider settles with, when the output is typed text. */

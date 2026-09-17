@@ -69,6 +69,57 @@ Identity resolution and key updates remain behind existing identity contracts.
 Private keys, custody shares, bearer access secrets, and provider routes belong
 inside their private boundaries rather than public manifests.
 
+## Shared application state
+
+Browser profiles, game saves, Assistant conversations, Builder work and logs use
+the same object ownership, protection, revision, availability and recovery
+mechanics. Their mutable state stays separate from executable capsules, model
+packages and service offers. Updating a capsule preserves the identity and
+permissions of the user's state.
+
+Each payload keeps its own format and save boundary. Chromium needs a consistent
+profile checkpoint; a game supplies save bytes; conversations preserve drafts
+and message history; run journals preserve ordered events and durable operation
+identities. Reuse existing protected storage, content and authority mechanisms
+with narrow payload adapters. A common contract does not require one file layout
+or a new storage service.
+
+A successful save is acknowledged by the selected durable store after it commits
+a usable revision. Interrupted writes, exhausted
+storage and failed migration preserve the previous committed revision and report
+unsaved work. Local commit and confirmed remote retention are separate outcomes.
+Copying an actively mounted Browser disk is not a consistent checkpoint. One
+Runtime holds writable ownership of a Browser profile; transfer fences that
+writer before another begins. Other payloads declare merge or conflict behavior.
+
+Durable storage placement is separate from execution placement. With a remote
+Browser Engine and local storage, the consumer's store retains the canonical
+checkpoint and the Engine receives an authorised working copy. Checkpoints
+return through the common protected-state and content path. A remote working
+copy alone cannot satisfy a local-save claim. Host failure preserves the last
+acknowledged checkpoint; pending edits and unresolved writer ownership remain
+explicit. Availability peers retain only the objects selected by the owner's
+storage and access policy.
+
+Recovery restores the selected revision and usable keys under fresh authority on
+a compatible Runtime. Restored conversations and logs retain operation identity
+without replaying inference, tools, payments or approvals. Active authentication
+sessions and stale grants are not recovered as authority. A storage replica holds
+protected bytes; an execution provider separately needs permission to use
+readable state within an accepted execution boundary.
+
+Logs share storage and protection mechanics while retaining their own semantics.
+User history, provider settlement journals and Runtime audit records each have
+an explicit owner, integrity rule and bounded retention policy. Secret redaction,
+pruned-history reporting and pending replica cleanup are part of that policy.
+User-facing log controls confer only the rights granted over those records.
+
+The release plan's Required SA1-SA6 criteria qualify this contract for each
+shipped payload. Reuse common mechanism tests, then prove actual payload saves,
+restore and failure handling. Existing game-save checks cover the shipped GBA
+surface; this contract adds no separate emulator product. Current implementation
+and acceptance limits remain in state.md.
+
 ## The everyday object journey
 
 | Action | Required behavior |

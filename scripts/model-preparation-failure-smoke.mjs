@@ -9,8 +9,8 @@ for (const capsule of ["system", "marketplace"]) {
 }
 const context = { window: {} };
 vm.runInNewContext(source.replace("window.ElastosModelManagement = {",
-  "window.testFailure = { parseRuntime, operationRuntime, failureText }; window.ElastosModelManagement = {"), context);
-const { parseRuntime, operationRuntime, failureText } = context.window.testFailure;
+  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry }; window.ElastosModelManagement = {"), context);
+const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry } = context.window.testFailure;
 const cid = `bafybei${"a".repeat(52)}`;
 const preparation = { operation_id: "fixture", cid, state: "failed", total_bytes: 1024,
   completed_bytes: 512, cancel_requested: false, admitted: false, activation_pending: false };
@@ -37,4 +37,22 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
   preparation.failure_class = invalid;
   assert.throws(() => parseRuntime(runtime, cid), /Invalid model response/);
 }
-console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies");
+const otherCid = `bafybei${"c".repeat(51)}e`;
+const catalogRow = (id, title) => ({
+  name: title, title, role: "content", source: "signed-model-catalog", installed: false, launchable: false,
+  cid: id, publisher_did: "did:key:zFixturePublisher", content_size_bytes: 1024,
+  signature_state: "catalog-signature-verified", model_runtime: {
+    admitted: false, kept: false, dispatch_ready: false, offer_id: null, preparation: null,
+  },
+});
+const two = catalogEntries({
+  schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified",
+  capsules: [catalogRow(cid, "Qwen"), catalogRow(otherCid, "SmolLM2")],
+});
+assert.equal(two.length, 2);
+assert.equal(selectCatalogEntry(two, null), null);
+assert.equal(selectCatalogEntry(two, cid).cid, cid);
+assert.equal(selectCatalogEntry(two, otherCid).cid, otherCid);
+assert.equal(selectCatalogEntry(two, `bafybei${"d".repeat(52)}`), null);
+assert.equal(selectCatalogEntry(two.slice(0, 1), null).cid, cid);
+console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection");

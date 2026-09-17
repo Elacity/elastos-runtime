@@ -63,6 +63,10 @@ for (const gone of ["mock-agent-provider.js", "agent-grants.js", "agent-studio.j
 }
 
 assert.ok(agentLive.includes('from "./model-contract.js"'), "agent-live speaks the typed contract module");
+assert.ok(
+  readFileSync(new URL("assistant.js", capsuleDir), "utf8").includes('from "./model-contract.js"'),
+  "Assistant Chat and Studio decode events through the typed contract module",
+);
 assert.ok(agentLive.includes("after_sequence: afterSequence"), "runs_events is polled by after_sequence");
 assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: createRequestId })"));
 assert.ok(agentLive.includes('modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })'));
@@ -371,7 +375,13 @@ const page1 = contract.applyRunEventsPage(
   },
   0,
 );
-assert.deepEqual(page1, { nextCursor: 3, hasMore: true, textDeltas: ["Hel", "lo"], terminal: null });
+assert.deepEqual(page1, {
+  nextCursor: 3,
+  hasMore: true,
+  textDeltas: ["Hel", "lo"],
+  terminal: null,
+  studioProgress: null,
+});
 
 const page2 = contract.applyRunEventsPage(
   {
@@ -408,16 +418,62 @@ assert.deepEqual(failed.terminal, { status: "failed", output: null, error: { cod
 
 assert.deepEqual(
   contract.applyRunEventsPage({ events: [], next_cursor: 5 }, 5),
-  { nextCursor: 5, hasMore: false, textDeltas: [], terminal: null },
+  { nextCursor: 5, hasMore: false, textDeltas: [], terminal: null, studioProgress: null },
 );
 assert.throws(() => contract.applyRunEventsPage({ events: [], next_cursor: 2 }, 5), /cursor went backwards/);
+assert.deepEqual(
+  contract.applyRunEventsPage(
+    {
+      events: [
+        { sequence: 2, kind: "text_delta", data: { text: "a" } },
+        { sequence: 2, kind: "text_delta", data: { text: "b" } },
+      ],
+      next_cursor: 2,
+    },
+    0,
+  ),
+  { nextCursor: 2, hasMore: false, textDeltas: ["a"], terminal: null, studioProgress: null },
+);
+assert.deepEqual(
+  contract.applyRunEventsPage(
+    { events: [{ sequence: 1, kind: "text_delta", data: { text: "a" } }], next_cursor: 1 },
+    1,
+  ),
+  { nextCursor: 1, hasMore: false, textDeltas: [], terminal: null, studioProgress: null },
+);
+const replayedProgress = contract.applyRunEventsPage(
+  {
+    events: [
+      { sequence: 1, kind: "progress", data: { phase: "rendering", completed: 1, total: 4 } },
+      { sequence: 1, kind: "progress", data: { phase: "rendering", completed: 1, total: 4 } },
+      { sequence: 2, kind: "progress", data: { phase: "rendering", completed: 2, total: 4 } },
+    ],
+    next_cursor: 2,
+  },
+  0,
+);
+assert.deepEqual(replayedProgress.studioProgress, { phase: "rendering", completed: 2, total: 4 });
 assert.throws(
-  () => contract.applyRunEventsPage({ events: [{ sequence: 2, kind: "text_delta", data: { text: "a" } }, { sequence: 2, kind: "text_delta", data: { text: "b" } }], next_cursor: 2 }, 0),
-  /strictly increasing/,
+  () =>
+    contract.applyRunEventsPage(
+      { events: [{ sequence: 1, kind: "progress", data: { phase: "rendering", completed: 3, total: 2 } }], next_cursor: 1 },
+      0,
+    ),
+  /studio progress/,
 );
 assert.throws(
-  () => contract.applyRunEventsPage({ events: [{ sequence: 1, kind: "text_delta", data: { text: "a" } }], next_cursor: 1 }, 1),
-  /strictly increasing/,
+  () =>
+    contract.applyRunEventsPage(
+      {
+        events: [
+          { sequence: 2, kind: "text_delta", data: { text: "B" } },
+          { sequence: 1, kind: "text_delta", data: { text: "A" } },
+        ],
+        next_cursor: 2,
+      },
+      0,
+    ),
+  /out of order/,
 );
 assert.throws(
   () => contract.applyRunEventsPage({ events: [{ sequence: 7, kind: "text_delta", data: { text: "a" } }], next_cursor: 6 }, 0),

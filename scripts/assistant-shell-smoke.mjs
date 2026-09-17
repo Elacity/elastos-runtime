@@ -28,7 +28,8 @@ const source = `${originalSource
   .replace(
     '"./vendor/katex/katex.mjs"',
     JSON.stringify(katexModuleUrl),
-  ).replace('"./model-selection.js"', JSON.stringify(new URL("../capsules/_shared/model-selection.js", import.meta.url).href))}
+  ).replace('"./model-selection.js"', JSON.stringify(new URL("../capsules/_shared/model-selection.js", import.meta.url).href))
+  .replace('"./model-contract.js"', JSON.stringify(new URL("../capsules/assistant/browser/model-contract.js", import.meta.url).href))}
 export { renderMarkdown, renderMessageBody, readHashParam, readQueryParam, readLaunchContext };
 `;
 const assistantModule = await import(
@@ -413,7 +414,7 @@ async function buildApp(options = {}) {
   assert.equal(await app.sendDraft(), false);
   assert.equal(app.openModels(), true);
   assert.deepEqual(posts.at(-1), { origin: "https://home.example", message: {
-    type: "home:open-target", homeToken: "token-1", target: "system", query: { settings: "models" },
+    type: "home:open-target", homeToken: "token-1", target: "marketplace", query: { category: "models", model_cid: cid },
   } });
   assert.equal(app.snapshot().draft, "Keep exact text");
   failed = false;
@@ -1067,6 +1068,25 @@ for (const first of ["offers", "workspace"]) {
           ],
         },
       },
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id:
+            "run:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          next_cursor: 2,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 2,
+              kind: "output",
+              terminal: true,
+              data: { schema: "elastos.model.output.text/v1", text: "Hello " },
+            },
+          ],
+        },
+      },
     ],
   });
   app.setDraft("Do not duplicate text.");
@@ -1078,10 +1098,10 @@ for (const first of ["offers", "workspace"]) {
     .currentSession.messages.filter((message) => message.role === "assistant");
   assert.equal(assistantMessages.length, 1);
   assert.equal(assistantMessages[0].content, "Hello ");
-  assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
+  assert.equal(app.snapshot().statusMessage, "");
   assert.equal(
     fetch.fetchCalls.filter(([url]) => url === "/api/provider/model/runs_events").length,
-    2,
+    3,
   );
   assert.equal(pendingTimerCount(), 0);
 }

@@ -1932,15 +1932,19 @@ async fn verify_package_identity(
 }
 
 fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Value> {
-    ensure!(
-        platform == "darwin-arm64",
-        "admitted model host profile is unavailable"
-    );
-    // Runtime-owned profile from the verified local Qwen/engine proof. Catalog
+    // Runtime-owned profiles from verified local engine proofs. Catalog
     // metadata cannot tune execution. Other hosts require their own proof.
+    let (threads, gpu_layers) = match platform {
+        // Apple silicon offloads every layer to Metal (local Qwen proof).
+        "darwin-arm64" => (8, 99),
+        // Linux x86-64 runs on a bounded CPU thread budget without GPU offload
+        // (pinned SmolLM2 proof on the b10516 Ubuntu bundle).
+        "linux-amd64" => (4, 0),
+        _ => anyhow::bail!("admitted model host profile is unavailable"),
+    };
     Ok(serde_json::json!({
-        "context_size":4096, "parallel":1, "threads":8, "batch_threads":8,
-        "gpu_layers":99, "health_timeout_ms":120000,
+        "context_size":4096, "parallel":1, "threads":threads, "batch_threads":threads,
+        "gpu_layers":gpu_layers, "health_timeout_ms":120000,
         "shutdown_timeout_ms":5000, "enable_thinking":false
     }))
 }
@@ -2056,10 +2060,12 @@ impl ModelActivation {
         expected.as_object_mut().unwrap().remove("stream_output");
         expected["policy"].as_object_mut().unwrap().remove("schema");
         expected["enabled"] = serde_json::json!(true);
+        // A saved descriptor is bound to the host that composed it; its engine
+        // receipt already carries that platform, so the same host profile applies.
         expected["adapter"] = serde_json::json!({"kind":"local_llama_cpp_text",
             "engine":{"path":engine_path,"sha256":engine_sha},
             "model":{"path":model_path,"sha256":model_sha},
-            "settings":local_model_startup_profile("darwin-arm64")?});
+            "settings":local_model_startup_profile(&crate::setup::detect_platform())?});
         ensure!(
             self.offer == expected,
             "activation descriptor binding changed"
@@ -2381,6 +2387,7 @@ async fn append_admitted_model_offers_locked(
         .context("model startup offers unavailable")?
         .clone();
     let mut admitted = Vec::new();
+    let mut pending = Vec::new();
     for entry in entries {
         // Aliases authorize reuse of one artifact; they do not create duplicate
         // offers or transfer ownership between preparation request records.
@@ -2448,15 +2455,11 @@ async fn append_admitted_model_offers_locked(
             entrypoint: weights.path.clone(),
             engine_receipt_sha256: engine.receipt_sha256.clone(),
         };
-        let inventory = Inventory::open(data_dir, false)?;
-        let mut durable = inventory.load()?;
-        ensure!(
-            durable.records == snapshot.records,
-            "model admission changed before Init"
-        );
-        let owner = durable
+        // The selected record may be a reuse alias; the saved descriptor lives
+        // on the admission owner, so the retry comparison reads that record.
+        let owner = snapshot
             .records
-            .iter_mut()
+            .iter()
             .find(|r| r.operation_id == record.admission_id)
             .context("activation owner unavailable")?;
         activation.check_root(data_dir, owner)?;
@@ -2466,11 +2469,35 @@ async fn append_admitted_model_offers_locked(
                 "activation descriptor changed on retry"
             );
         } else {
-            owner.activation = Some(activation);
-            inventory.save(&durable)?;
+            pending.push((owner.operation_id.clone(), activation));
         }
         admitted.push(serde_json::json!({"offer_id":offer["id"]}));
         offers.push(offer);
+    }
+    // Every entry was verified against the same inventory snapshot. The new
+    // descriptors are saved together after that verification, so a later entry
+    // never mistakes this composer's own write for a concurrent admission
+    // change, and the snapshot comparison stays strict for real changes.
+    if !pending.is_empty() {
+        let inventory = Inventory::open(data_dir, false)?;
+        let mut durable = inventory.load()?;
+        ensure!(
+            durable.records == snapshot.records,
+            "model admission changed before Init"
+        );
+        for (owner_id, activation) in pending {
+            let owner = durable
+                .records
+                .iter_mut()
+                .find(|r| r.operation_id == owner_id)
+                .context("activation owner unavailable")?;
+            ensure!(
+                owner.activation.is_none(),
+                "activation descriptor changed before Init"
+            );
+            owner.activation = Some(activation);
+        }
+        inventory.save(&durable)?;
     }
     let mut extra = config.extra.clone();
     extra["offers"] = serde_json::Value::Array(offers);
@@ -2578,6 +2605,10 @@ mod tests {
     struct PreparationBackend {
         files: std::collections::BTreeMap<String, Vec<u8>>,
         cid: Mutex<String>,
+        /// Further signed packages this backend serves, keyed by CID. `files`
+        /// and `cid` remain the primary package that single-entry tests use.
+        extra_packages:
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<u8>>>,
         calls: Mutex<Vec<String>>,
         capacity_requests: Mutex<Vec<u64>>,
         capacity_volume: u64,
@@ -2589,6 +2620,7 @@ mod tests {
         cold_backend: AtomicBool,
         hold_read: AtomicBool,
         hold_hash: AtomicBool,
+        missing_cache: AtomicBool,
         read_fault: Mutex<Option<&'static str>>,
         native: Option<Arc<dyn elastos_runtime::provider::Provider>>,
         entered: tokio::sync::Notify,
@@ -2631,7 +2663,12 @@ mod tests {
             match op {
                 "cat" => {
                     use base64::Engine as _;
+                    if self.missing_cache.load(Ordering::Acquire) {
+                        return Ok(serde_json::json!({"status":"error","code":"not_found",
+                            "message":"consumer cache is empty"}));
+                    }
                     assert_eq!(request["bounded_read"], true);
+                    let files = self.package_files(request["cid"].as_str().unwrap_or_default());
                     let path = request["path"].as_str().unwrap();
                     if path == "weights.gguf" && self.hold_read.swap(false, Ordering::AcqRel) {
                         self.entered.notify_one();
@@ -2641,7 +2678,7 @@ mod tests {
                         assert_eq!(request["max_bytes"], 65536);
                         serde_json::json!({"_runtime_complete_metadata":{
                             "schema":"elastos.provider.complete-metadata/v1", "cid":request["cid"],
-                            "path":path, "max_bytes":65536, "actual_bytes":self.files[path].len(), "completed":true
+                            "path":path, "max_bytes":65536, "actual_bytes":files[path].len(), "completed":true
                         }})
                     } else {
                         let range = &request["_runtime_invocation"]["range"];
@@ -2651,13 +2688,13 @@ mod tests {
                         }})
                     };
                     let mut bytes = if path == "_elastos_object.json" {
-                        self.files[path].clone()
+                        files[path].clone()
                     } else {
                         let range = &request["_runtime_invocation"]["range"];
                         let start = range["start"].as_u64().unwrap() as usize;
                         let end = range["end"].as_u64().unwrap() as usize;
                         assert!(end >= start && end - start < 65536);
-                        self.files[path][start..=end].to_vec()
+                        files[path][start..=end].to_vec()
                     };
                     let fault = *self.read_fault.lock().unwrap();
                     match (path, fault) {
@@ -2693,7 +2730,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push(if path == "_elastos_object.json" {
-                            self.files[path].len()
+                            files[path].len()
                         } else {
                             let range = &request["_runtime_invocation"]["range"];
                             (range["end"].as_u64().unwrap() - range["start"].as_u64().unwrap() + 1)
@@ -2745,19 +2782,30 @@ mod tests {
                     }
                     let directory = &request["directory"];
                     let root = Path::new(directory["root"].as_str().unwrap());
-                    assert_eq!(
-                        directory["files"].as_array().unwrap().len(),
-                        self.files.len()
-                    );
-                    for file in directory["files"].as_array().unwrap() {
-                        let path = file["path"].as_str().unwrap();
-                        let bytes = std::fs::read(root.join(path)).unwrap();
-                        assert_eq!(file["size"].as_u64().unwrap(), bytes.len() as u64);
-                        assert_eq!(bytes, self.files[path]);
-                    }
-                    Ok(
-                        serde_json::json!({"status":"ok","data":{"cid":self.cid.lock().unwrap().clone()}}),
-                    )
+                    let listed = directory["files"].as_array().unwrap();
+                    let staged: std::collections::BTreeMap<String, Vec<u8>> = listed
+                        .iter()
+                        .map(|file| {
+                            let path = file["path"].as_str().unwrap();
+                            let bytes = std::fs::read(root.join(path)).unwrap();
+                            assert_eq!(file["size"].as_u64().unwrap(), bytes.len() as u64);
+                            (path.to_owned(), bytes)
+                        })
+                        .collect();
+                    // Extra packages are matched by exact content; the primary
+                    // package keeps its strict assertion for single-entry tests.
+                    let cid = match self
+                        .extra_packages
+                        .iter()
+                        .find(|(_, files)| **files == staged)
+                    {
+                        Some((cid, _)) => cid.clone(),
+                        None => {
+                            assert_eq!(staged, self.files);
+                            self.cid.lock().unwrap().clone()
+                        }
+                    };
+                    Ok(serde_json::json!({"status":"ok","data":{"cid":cid}}))
                 }
                 _ => panic!("reconciliation/reuse dispatched unexpected operation {op}"),
             }
@@ -2780,7 +2828,29 @@ mod tests {
         serde_json::Value,
         std::collections::BTreeMap<String, Vec<u8>>,
     ) {
+        let payload = super::super::tests::model_catalog_fixture();
+        let name = payload["entries"][0]["capsule_manifest"]["name"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+        package_fixture_named(weights, provenance, &name, &cid)
+    }
+
+    /// One signed catalog entry for a distinct package identity, so a catalog
+    /// fixture can carry several models.
+    fn package_fixture_named(
+        weights: Vec<u8>,
+        provenance: &[u8],
+        name: &str,
+        cid: &str,
+    ) -> (
+        serde_json::Value,
+        std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
         let mut payload = super::super::tests::model_catalog_fixture();
+        payload["entries"][0]["cid"] = serde_json::json!(cid);
+        payload["entries"][0]["capsule_manifest"]["name"] = serde_json::json!(name);
         let mut files: std::collections::BTreeMap<String, Vec<u8>> =
             std::collections::BTreeMap::from([
                 ("LICENSE".into(), b"fixture license".to_vec()),
@@ -2893,12 +2963,36 @@ mod tests {
                 "shutdown_timeout_ms":5000, "enable_thinking":false
             })
         );
-        for platform in ["linux-arm64", "linux-amd64", "darwin-amd64", "*"] {
-            assert!(local_model_startup_profile(platform).is_err());
+        // The Linux profile is CPU-only with a bounded thread budget; the
+        // remaining startup policy is shared by every proved host.
+        assert_eq!(
+            local_model_startup_profile("linux-amd64").unwrap(),
+            serde_json::json!({
+                "context_size":4096, "parallel":1, "threads":4, "batch_threads":4,
+                "gpu_layers":0, "health_timeout_ms":120000,
+                "shutdown_timeout_ms":5000, "enable_thinking":false
+            })
+        );
+        for platform in [
+            "linux-arm64",
+            "darwin-amd64",
+            "linux-x86_64",
+            "Linux-amd64",
+            "*",
+            "",
+        ] {
+            assert!(
+                local_model_startup_profile(platform).is_err(),
+                "{platform:?} has no proved host profile"
+            );
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // Startup binding runs wherever a Runtime-owned host profile exists.
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
     mod startup_binding {
         use super::*;
         use std::os::unix::fs::PermissionsExt as _;
@@ -4858,7 +4952,7 @@ mod tests {
             assert_eq!(offer["adapter"]["kind"], "local_llama_cpp_text");
             assert_eq!(
                 offer["adapter"]["settings"],
-                local_model_startup_profile("darwin-arm64").unwrap()
+                local_model_startup_profile(&crate::setup::detect_platform()).unwrap()
             );
             assert_eq!(
                 offer["adapter"]["model"]["sha256"],
@@ -5046,6 +5140,396 @@ mod tests {
                 "removed catalog cannot admit a persisted offer"
             );
             assert!(backend.calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn model_startup_permanent_repin_blocks_readiness_until_authorized_alias() {
+            let root = tempfile::tempdir().unwrap();
+            let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+            write_preparation_catalog(root.path(), &payload);
+            let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+            let backend = Arc::new(PreparationBackend::new(files, cid.clone()));
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            registry
+                .register_sub_provider("ipfs", backend.clone())
+                .await
+                .unwrap();
+            register_content(&registry, root.path()).await;
+            let _engine = install_engine(root.path());
+            let model = Arc::new(ModelActivationFixture::default());
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let input = serde_json::json!({"cid": cid});
+            let cats = || {
+                backend
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|op| *op == "cat")
+                    .count()
+            };
+
+            let owner = PreparationOwner::default();
+            let first = owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("use")),
+                    "permanent-first",
+                    &input,
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let record =
+                load_operation(root.path(), first["operation_id"].as_str().unwrap()).unwrap();
+            assert_eq!(record.state, PreparationState::Admitted);
+            let ready = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &cid,
+                Some(record.operation_id.as_str()),
+            )
+            .await;
+            assert_eq!(ready["dispatch_ready"], true, "{ready}");
+            let reads = cats();
+
+            // Re-pin the same package under a permanent snapshot; keep the engine
+            // component that write_preparation_catalog's fresh manifest drops.
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.path().join("components.json")).unwrap(),
+            )
+            .unwrap();
+            let engine_component = manifest["external"]["llama-server"].clone();
+            let mut permanent = payload.clone();
+            permanent.as_object_mut().unwrap().remove("expires_at");
+            write_preparation_catalog(root.path(), &permanent);
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"] = engine_component.clone()
+            });
+            let head_b = serde_json::from_slice::<crate::setup::ComponentsManifest>(
+                &std::fs::read(root.path().join("components.json")).unwrap(),
+            )
+            .unwrap()
+            .model_catalog
+            .unwrap()
+            .head_cid;
+            assert_ne!(head_b, record.catalog_head_cid);
+
+            let mut composed = config(root.path());
+            let operator_only = composed.extra.clone();
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut composed)
+                .await
+                .unwrap();
+            assert_eq!(
+                composed.extra["offers"], operator_only["offers"],
+                "an admission bound to the previous head is not composed"
+            );
+            assert_eq!(
+                composed.extra["runtime_admitted_offers"],
+                serde_json::json!([]),
+                "an admission bound to the previous head is not composed"
+            );
+            let blocked = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &cid,
+                Some(record.operation_id.as_str()),
+            )
+            .await;
+            assert_eq!(blocked["admitted"], true, "{blocked}");
+            assert_eq!(blocked["dispatch_ready"], false, "{blocked}");
+            assert_eq!(cats(), reads, "re-pinning dispatches nothing");
+            assert_eq!(
+                load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .catalog_head_cid,
+                record.catalog_head_cid
+            );
+
+            let reopened = PreparationOwner::default();
+            let reused = reopened
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("use")),
+                    "permanent-migrated",
+                    &input,
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&reopened).await;
+            let alias =
+                load_operation(root.path(), reused["operation_id"].as_str().unwrap()).unwrap();
+            assert_eq!(alias.admission_id, record.operation_id);
+            assert_eq!(alias.reserved_bytes, 0);
+            assert_eq!(alias.catalog_head_cid, head_b);
+            assert_eq!(alias.state, PreparationState::Admitted);
+            assert_eq!(cats(), reads, "the alias reuses the admitted bytes");
+            let ready_again = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &cid,
+                Some(alias.operation_id.as_str()),
+            )
+            .await;
+            assert_eq!(ready_again["dispatch_ready"], true, "{ready_again}");
+
+            let mut restarted = config(root.path());
+            let _ = append_admitted_model_startup_offers(root.path(), &registry, &mut restarted)
+                .await
+                .unwrap();
+            assert_eq!(restarted.extra["offers"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                restarted.extra["offers"][1]["adapter"]["model"]["sha256"],
+                format!("sha256:{:x}", Sha256::digest(b"GGUF\x03\0\0\0fixture"))
+            );
+            let (_, guard) = crate::api::model_provider_config(root.path(), &registry)
+                .await
+                .unwrap();
+            drop(guard);
+            let after_restart = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &cid,
+                Some(alias.operation_id.as_str()),
+            )
+            .await;
+            assert_eq!(after_restart["dispatch_ready"], true, "{after_restart}");
+            assert_eq!(cats(), reads);
+
+            // The alias is the record selected under head B; its saved
+            // descriptor lives on the admission owner. Equal reuse leaves the
+            // owner's descriptor and the inventory bytes unchanged.
+            let state_path = root.path().join("model-preparation/state.json");
+            let owner_descriptor = |root: &Path| {
+                load_operation(root, &record.operation_id)
+                    .unwrap()
+                    .activation
+                    .expect("owner keeps its saved descriptor")
+            };
+            let saved = owner_descriptor(root.path());
+            assert!(load_operation(root.path(), &alias.operation_id)
+                .unwrap()
+                .activation
+                .is_none());
+            let inventory_bytes = std::fs::read(&state_path).unwrap();
+            let mut reused_config = config(root.path());
+            let _ =
+                append_admitted_model_startup_offers(root.path(), &registry, &mut reused_config)
+                    .await
+                    .unwrap();
+            assert_eq!(reused_config.extra, restarted.extra);
+            assert_eq!(std::fs::read(&state_path).unwrap(), inventory_bytes);
+            assert_eq!(owner_descriptor(root.path()), saved);
+
+            // A structurally valid but different saved owner descriptor is a
+            // changed retry, never a silent replacement through the alias.
+            {
+                // Runtime writers refuse descriptor changes, so the changed
+                // descriptor arrives the only way it can: written from outside.
+                let mut durable: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+                let owner = durable["records"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|r| r["operation_id"] == record.operation_id)
+                    .unwrap();
+                owner["activation"]["offer"]["title"] =
+                    serde_json::json!("renamed by another writer");
+                std::fs::write(&state_path, serde_json::to_vec(&durable).unwrap()).unwrap();
+            }
+            let changed = owner_descriptor(root.path());
+            assert_ne!(changed, saved);
+            changed.check_root(root.path(), &record).unwrap();
+            let changed_bytes = std::fs::read(&state_path).unwrap();
+            let mut rejected = config(root.path());
+            let before = serde_json::to_vec(&rejected).unwrap();
+            let error = append_admitted_model_startup_offers(root.path(), &registry, &mut rejected)
+                .await
+                .err()
+                .expect("a changed owner descriptor is rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("activation descriptor changed on retry"),
+                "{error}"
+            );
+            assert_eq!(serde_json::to_vec(&rejected).unwrap(), before);
+            assert_eq!(std::fs::read(&state_path).unwrap(), changed_bytes);
+            assert_eq!(owner_descriptor(root.path()), changed);
+        }
+
+        // Two signed catalog entries, acquired in either order, compose on the
+        // first startup pass: the pass after the second admission saves both
+        // descriptors and reports both offers ready without a retry, and a
+        // Runtime restart recomposes the identical config from those saved
+        // descriptors.
+        #[tokio::test]
+        async fn model_startup_composes_every_admitted_entry_on_first_attempt_in_both_orders() {
+            use elastos_runtime::provider::ProviderRegistry;
+            let second_cid = cid::Cid::new_v1(
+                0x70,
+                cid::multihash::Multihash::<64>::wrap(
+                    0x12,
+                    &Sha256::digest(b"second fixture package"),
+                )
+                .unwrap(),
+            )
+            .to_string();
+            for order in [[0usize, 1], [1, 0]] {
+                let root = tempfile::tempdir().unwrap();
+                let (mut payload, primary) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+                let (second, second_files) = package_fixture_named(
+                    b"GGUF\x03\0\0\0second".to_vec(),
+                    b"second provenance",
+                    "second-model-fixture",
+                    &second_cid,
+                );
+                payload["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(second["entries"][0].clone());
+                write_preparation_catalog(root.path(), &payload);
+                let cids: Vec<String> = payload["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["cid"].as_str().unwrap().to_owned())
+                    .collect();
+                let mut backend = PreparationBackend::new(primary, cids[0].clone());
+                backend.extra_packages.insert(cids[1].clone(), second_files);
+                let backend = Arc::new(backend);
+                let registry = Arc::new(ProviderRegistry::new());
+                registry
+                    .register_sub_provider("ipfs", backend.clone())
+                    .await
+                    .unwrap();
+                register_content(&registry, root.path()).await;
+                let _engine = install_engine(root.path());
+                let model = Arc::new(ModelActivationFixture::default());
+                registry
+                    .register_sub_provider("model", model.clone())
+                    .await
+                    .unwrap();
+
+                let mut admitted = Vec::new();
+                for index in order {
+                    let owner = PreparationOwner::default();
+                    let response = owner
+                        .invoke(
+                            root.path(),
+                            Some(registry.clone()),
+                            caller(&context(), &method("use")),
+                            &format!("use-{index}"),
+                            &serde_json::json!({"cid": cids[index]}),
+                            Arc::new(|| Ok(())),
+                        )
+                        .unwrap();
+                    join_worker(&owner).await;
+                    let record =
+                        load_operation(root.path(), response["operation_id"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(record.state, PreparationState::Admitted, "order {order:?}");
+                    admitted.push((index, record));
+                }
+                let hashes_after_use = backend
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|op| *op == "runtime_hash_staged_directory")
+                    .count();
+
+                // First attempt: both descriptors exist and both offers are ready.
+                let state = Inventory::open(root.path(), false).unwrap().load().unwrap();
+                for (index, record) in &admitted {
+                    let owner = state
+                        .records
+                        .iter()
+                        .find(|r| r.operation_id == record.operation_id)
+                        .unwrap();
+                    assert!(
+                        owner.activation.is_some(),
+                        "order {order:?}: entry {index} has no saved descriptor after its Use"
+                    );
+                    let ready = model_runtime_projection(
+                        root.path(),
+                        Some(&registry),
+                        &context(),
+                        &cids[*index],
+                        Some(record.operation_id.as_str()),
+                    )
+                    .await;
+                    assert_eq!(
+                        ready["dispatch_ready"], true,
+                        "order {order:?}: entry {index} is not ready on the first attempt: {ready}"
+                    );
+                }
+
+                // Restart: one fresh composer pass admits both entries at once and a
+                // second pass reproduces it exactly from the saved descriptors.
+                let mut restarted = config(root.path());
+                let worker =
+                    append_admitted_model_startup_offers(root.path(), &registry, &mut restarted)
+                        .await
+                        .unwrap_or_else(|err| {
+                            panic!("order {order:?}: restart composition failed: {err}")
+                        });
+                drop(worker);
+                let offer_ids: Vec<_> = restarted.extra["runtime_admitted_offers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["offer_id"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(offer_ids.len(), 2, "order {order:?}");
+                assert_ne!(offer_ids[0], offer_ids[1]);
+                assert_eq!(
+                    restarted.extra["offers"].as_array().unwrap().len(),
+                    config(root.path()).extra["offers"]
+                        .as_array()
+                        .unwrap()
+                        .len()
+                        + 2
+                );
+                let mut again = config(root.path());
+                let worker =
+                    append_admitted_model_startup_offers(root.path(), &registry, &mut again)
+                        .await
+                        .unwrap();
+                drop(worker);
+                assert_eq!(again.extra, restarted.extra, "order {order:?}");
+                assert_eq!(
+                    Inventory::open(root.path(), false)
+                        .unwrap()
+                        .load()
+                        .unwrap()
+                        .records,
+                    state.records,
+                    "order {order:?}: restart keeps the saved descriptors"
+                );
+                // Each restart pass verifies every admitted package identity once.
+                assert_eq!(
+                    backend
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|op| *op == "runtime_hash_staged_directory")
+                        .count(),
+                    hashes_after_use + 4,
+                    "order {order:?}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -5477,10 +5961,15 @@ server.serve_forever()
     }
 
     impl PreparationBackend {
+        fn package_files(&self, cid: &str) -> &std::collections::BTreeMap<String, Vec<u8>> {
+            self.extra_packages.get(cid).unwrap_or(&self.files)
+        }
+
         fn new(files: std::collections::BTreeMap<String, Vec<u8>>, cid: String) -> Self {
             Self {
                 files,
                 cid: Mutex::new(cid),
+                extra_packages: std::collections::BTreeMap::new(),
                 calls: Mutex::new(vec![]),
                 capacity_requests: Mutex::new(vec![]),
                 capacity_volume: 7,
@@ -5492,6 +5981,7 @@ server.serve_forever()
                 cold_backend: AtomicBool::new(false),
                 hold_read: AtomicBool::new(false),
                 hold_hash: AtomicBool::new(false),
+                missing_cache: AtomicBool::new(false),
                 read_fault: Mutex::new(None),
                 native: None,
                 entered: tokio::sync::Notify::new(),
@@ -6137,7 +6627,7 @@ server.serve_forever()
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
 
-        include!("preparation/qwen_process_proof.rs");
+        include!("preparation/pinned_model_process_proof.rs");
 
         struct OwnedChild(Child);
         impl Drop for OwnedChild {
@@ -6363,10 +6853,10 @@ server.serve_forever()
         }
 
         async fn preparation_process(cold: bool) {
-            preparation_process_with_qwen(cold, None).await;
+            preparation_process_with_model(cold, None).await;
         }
 
-        async fn preparation_process_with_qwen(cold: bool, qwen: Option<QwenProof>) {
+        async fn preparation_process_with_model(cold: bool, pinned: Option<PinnedModelProof>) {
             use elastos_runtime::provider::{
                 BridgeProviderConfig, CapsuleProvider, ProviderBridge,
             };
@@ -6392,8 +6882,8 @@ server.serve_forever()
             let setup_started = Instant::now();
             // Fixed synthetic sizes only. This whole-buffer fixture is not a
             // large-model publisher or a product-memory measurement.
-            let weights_size = if qwen.is_some() {
-                QWEN_BYTES as usize
+            let weights_size = if let Some(pinned) = &pinned {
+                pinned.model.bytes as usize
             } else if cold {
                 64 * 1024 * 1024 - 65536
             } else {
@@ -6401,7 +6891,7 @@ server.serve_forever()
             };
             let package_bound = weights_size as u64 + 65536;
             let layout_charge = preparation_charge(package_bound).unwrap()
-                + (if qwen.is_some() { 2 } else { 3 }) * package_bound
+                + (if pinned.is_some() { 2 } else { 3 }) * package_bound
                 + 32 * 1024 * 1024;
             let dir = File::open(&root_path).unwrap();
             let (volume_capacity, initial_free) = volume_bytes(&dir);
@@ -6419,8 +6909,8 @@ server.serve_forever()
             // The native provider resolves the explicit fixture tool locally;
             // only this isolated directory contains the test link.
             std::os::unix::fs::symlink(&kubo, data.join("bin/kubo")).unwrap();
-            let deadline =
-                Instant::now() + Duration::from_secs(if qwen.is_some() { 3500 } else { 90 });
+            let deadline = Instant::now()
+                + Duration::from_secs(pinned.as_ref().map_or(90, |p| p.model.deadline_secs));
             assert_eq!(
                 run(
                     command(
@@ -6528,8 +7018,8 @@ server.serve_forever()
             } else {
                 None
             };
-            let (mut payload, files) = if let Some(qwen) = &qwen {
-                qwen.package()
+            let (mut payload, files) = if let Some(pinned) = &pinned {
+                pinned.package()
             } else {
                 let mut weights = vec![0; weights_size];
                 let mut random = 0x7b16_984d_3c20_a5e1u64;
@@ -6551,14 +7041,14 @@ server.serve_forever()
             args.extend(files.keys().map(String::as_str));
             // Import the borrowed real weights through stdin, never a seed copy,
             // symlink or whole-file JSON/base64 request. Metadata remains small.
-            let cid = if let Some(qwen) = &qwen {
+            let cid = if let Some(pinned) = &pinned {
                 import_streamed_package(
                     &kubo,
                     &root_path,
                     seed_repo,
                     &seed,
                     &args,
-                    &qwen.weights,
+                    &pinned.weights,
                     deadline,
                 )
                 .await
@@ -6573,8 +7063,8 @@ server.serve_forever()
             assert!(canonical_cid(&cid, 0x70));
             payload["entries"][0]["cid"] = serde_json::json!(cid);
             write_preparation_catalog(&data, &payload);
-            let engine_cleanup = if let Some(qwen) = &qwen {
-                Some(qwen.install_engine(&data, &root_path, deadline).await)
+            let engine_cleanup = if let Some(pinned) = &pinned {
+                Some(pinned.install_engine(&data, &root_path, deadline).await)
             } else {
                 None
             };
@@ -6665,7 +7155,7 @@ server.serve_forever()
                 require_peer(&kubo, &root_path, &publisher_repo, &peer_ids[0], deadline).await;
             }
             let setup_ms = setup_started.elapsed().as_millis();
-            let publisher_before = if cold && qwen.is_none() {
+            let publisher_before = if cold && pinned.is_none() {
                 disk_bytes(&publisher_repo)
             } else {
                 (0, 0)
@@ -6704,8 +7194,8 @@ server.serve_forever()
             let test_backend = backend.clone();
             let test_volume = dir.try_clone().unwrap();
             let test_publisher_repo = publisher_repo.clone();
-            let real_qwen = qwen.is_some();
-            let qwen_provider = qwen.as_ref().map(|q| q.provider.clone());
+            let real_model = pinned.is_some();
+            let pinned_model = pinned.as_ref().map(|p| (p.model, p.provider.clone()));
             let model_children = Arc::new(Mutex::new(Vec::new()));
             let test_model_children = model_children.clone();
             let mut logs = vec![stdout.try_clone().unwrap(), stderr.try_clone().unwrap()];
@@ -6743,19 +7233,19 @@ server.serve_forever()
                     .unwrap()
                     .is_finished()
                 {
-                    // A Qwen backend has tens of thousands of blocks. Sample
+                    // A real model backend has thousands of blocks. Sample
                     // volume space and owned-process RSS, not recursive trees.
-                    let stage = if real_qwen {
+                    let stage = if real_model {
                         (0, 0)
                     } else {
                         disk_bytes(&test_data.join("model-preparation/stage"))
                     };
-                    let backend = if real_qwen {
+                    let backend = if real_model {
                         (0, 0)
                     } else {
                         disk_bytes(&test_repo)
                     };
-                    let publisher = if cold && !real_qwen {
+                    let publisher = if cold && !real_model {
                         disk_bytes(&test_publisher_repo)
                     } else {
                         (0, 0)
@@ -6778,10 +7268,10 @@ server.serve_forever()
                     max_sample_gap_ms = max_sample_gap_ms.max(last_sample.elapsed().as_millis());
                     last_sample = Instant::now();
                     samples += 1;
-                    if real_qwen {
+                    if real_model {
                         rss_peak_kib = rss_peak_kib.max(proof_rss_kib());
                     }
-                    tokio::time::sleep(Duration::from_millis(if real_qwen { 1000 } else { 10 }))
+                    tokio::time::sleep(Duration::from_millis(if real_model { 1000 } else { 10 }))
                         .await;
                 }
                 join_worker(&test_owner).await;
@@ -6807,15 +7297,15 @@ server.serve_forever()
                     assert_eq!(fs::read(admitted.path.join(path)).unwrap(), *bytes);
                 }
                 let admitted_disk = disk_bytes(&admitted.path);
-                if real_qwen {
-                    assert_qwen_file(&admitted.path.join("weights.gguf"));
+                if let Some((model, _)) = &pinned_model {
+                    model.assert_weights(&admitted.path.join("weights.gguf"));
                 }
-                let backend_after = if real_qwen {
+                let backend_after = if real_model {
                     (0, 0)
                 } else {
                     disk_bytes(&test_repo)
                 };
-                let publisher_after = if cold && !real_qwen {
+                let publisher_after = if cold && !real_model {
                     disk_bytes(&test_publisher_repo)
                 } else {
                     (0, 0)
@@ -6828,7 +7318,7 @@ server.serve_forever()
                     publisher_peak.0.max(publisher_after.0),
                     publisher_peak.1.max(publisher_after.1),
                 );
-                if cold && !real_qwen {
+                if cold && !real_model {
                     assert!(
                         backend_after.0 >= backend_before.0 + weights_size as u64,
                         "cold transfer must grow consumer backend logical bytes"
@@ -6844,12 +7334,11 @@ server.serve_forever()
                 storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
                 let requests = test_backend.calls.lock().unwrap().clone();
                 let reads = requests.iter().filter(|op| *op == "cat").count();
-                let expected_reads =
-                    1 + if real_qwen {
-                        QWEN_BYTES.div_ceil(65536) as usize
-                    } else {
-                        0
-                    } + test_backend
+                let expected_reads = 1
+                    + pinned_model
+                        .as_ref()
+                        .map_or(0, |(model, _)| model.bytes.div_ceil(65536) as usize)
+                    + test_backend
                         .files
                         .iter()
                         .filter(|(path, _)| *path != "_elastos_object.json")
@@ -6858,7 +7347,7 @@ server.serve_forever()
                 assert_eq!(reads, expected_reads);
                 // The real engine enables activation composition after admission;
                 // both independently verify the exact stored package CID.
-                let admission_and_activation_hashes = if real_qwen { 2 } else { 1 };
+                let admission_and_activation_hashes = if real_model { 2 } else { 1 };
                 assert_eq!(
                     requests
                         .iter()
@@ -6867,7 +7356,7 @@ server.serve_forever()
                     admission_and_activation_hashes
                 );
                 let reopened = PreparationOwner::default();
-                if real_qwen {
+                if real_model {
                     retention_intent(&test_data, &context(), &cid, true).unwrap();
                 }
                 let reuse_started = Instant::now();
@@ -6881,7 +7370,7 @@ server.serve_forever()
                         Arc::new(|| Ok(())),
                     )
                     .unwrap();
-                if real_qwen {
+                if real_model {
                     // Reuse rehashes the full closure twice; use the existing
                     // whole-proof deadline, not the tiny-fixture five-second join.
                     let worker = reopened.worker.lock().unwrap().take().unwrap();
@@ -6920,11 +7409,12 @@ server.serve_forever()
                     2 * admission_and_activation_hashes
                 );
                 let reuse_ms = reuse_started.elapsed().as_millis();
-                let inference = if let Some(binary) = qwen_provider {
-                    qwen_reply_and_restart(
+                let inference = if let Some((model, binary)) = &pinned_model {
+                    pinned_reply_and_restart(
+                        model,
                         &test_data,
                         &test_registry,
-                        &binary,
+                        binary,
                         &cid,
                         deadline,
                         &test_model_children,
@@ -6951,7 +7441,7 @@ server.serve_forever()
                         .iter()
                         .filter(|op| *op == "runtime_hash_staged_directory")
                         .count(),
-                    2 * admission_and_activation_hashes + if real_qwen { 2 } else { 0 }
+                    2 * admission_and_activation_hashes + if real_model { 2 } else { 0 }
                 );
                 assert!(
                     logs.iter()
@@ -6961,7 +7451,7 @@ server.serve_forever()
                 serde_json::json!({"cold":cold,"setup_ms":setup_ms,"elapsed_preparation_ms":elapsed_ms,
                     "reuse_ms":reuse_ms,"content_reads":reads,
                     "layout_preflight_bytes":layout_charge,"minimum_sampled_free_bytes":minimum_free,
-                    "sample_interval_ms":if real_qwen {1000} else {10},"samples":samples,"max_sample_gap_ms":max_sample_gap_ms,
+                    "sample_interval_ms":if real_model {1000} else {10},"samples":samples,"max_sample_gap_ms":max_sample_gap_ms,
                     "test_process_sampled_rss_peak_kib":rss_peak_kib,"inference":inference,
                     "publisher_before":publisher_before,"publisher_sampled_peak":publisher_peak,
                     "publisher_after":publisher_after,
@@ -6970,7 +7460,7 @@ server.serve_forever()
                     "index_bytes":record.index_bytes,"reserved_bytes":record.reserved_bytes,
                     "seed_disk":seed_disk,"backend_before":backend_before,"backend_sampled_peak":backend_peak,
                     "staging_sampled_peak":staged_peak,"admitted_disk":admitted_disk,"backend_after":backend_after,
-                    "reuse_content_reads":0,"inference_executed":real_qwen})
+                    "reuse_content_reads":0,"inference_executed":real_model})
             });
             let outcome =
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut work).await;
@@ -7059,7 +7549,7 @@ server.serve_forever()
             receipt["kubo_children_reaped"] = serde_json::json!(if cold { 2 } else { 1 });
             receipt["consumer_package_absent_before_connect"] = serde_json::json!(cold);
             receipt["consumer_init_block"] = serde_json::json!(consumer_baseline);
-            if qwen.is_some() {
+            if let Some(pinned) = &pinned {
                 // Volume samples replace recursive large-backend scans. Do not
                 // represent the skipped measurements as zero allocations.
                 for key in [
@@ -7077,17 +7567,19 @@ server.serve_forever()
                 receipt["rss_scope"] = serde_json::json!(
                     "sampled test-process high-water RSS only; full process-tree peak remains open"
                 );
-                receipt["source_weights_sha256"] = serde_json::json!(QWEN_SHA);
+                receipt["source_weights_sha256"] = serde_json::json!(pinned.model.sha);
+                receipt["pinned_model"] = serde_json::json!(pinned.model.capsule_name);
+                receipt["declared_quantization"] = serde_json::json!(pinned.model.quantization);
                 receipt["publisher_authority"] = serde_json::json!(
                     "isolated test signing key; local operator attestation, not upstream signature"
                 );
             }
-            receipt["proof_limit"] = serde_json::json!(if qwen.is_some() {
-                "Exact Qwen, isolated publisher-attested catalog, cold loopback Content admission and native model reply/restart. Volume/RSS are samples, not continuous peaks; GUI, installed acceptance and eviction remain open."
+            receipt["proof_limit"] = serde_json::json!(if pinned.is_some() {
+                "Exact pinned model, isolated publisher-attested catalog, cold loopback Content admission and native model reply/restart. Volume/RSS are samples, not continuous peaks; GUI, installed acceptance and eviction remain open."
             } else if cold {
-                "64 MiB-capped signed synthetic cold loopback delivery through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Public-network, exact Qwen and inference remain open."
+                "64 MiB-capped signed synthetic cold loopback delivery through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Public-network, exact pinned models and inference remain open."
             } else {
-                "8 MiB signed synthetic seeded offline Kubo proof through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Cold-network, exact Qwen and inference remain open."
+                "8 MiB signed synthetic seeded offline Kubo proof through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Cold-network, exact pinned models and inference remain open."
             });
             println!("{receipt}");
         }
@@ -7382,6 +7874,282 @@ server.serve_forever()
             retention_intent(root.path(), &context(), &record.package_cid, true).unwrap(),
             serde_json::json!({"cid":record.package_cid,"kept":true,"admitted":true})
         );
+    }
+
+    #[tokio::test]
+    async fn model_head_migration_reuses_admitted_bytes_without_refetch_or_implicit_dispatch() {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry.clone()).await;
+        let admitted = load_operation(root.path(), &record.operation_id).unwrap();
+        let cats = || {
+            backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| *op == "cat")
+                .count()
+        };
+        let baseline_cats = cats();
+        let baseline_calls = backend.calls.lock().unwrap().len();
+
+        let (mut permanent, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        permanent.as_object_mut().unwrap().remove("expires_at");
+        write_preparation_catalog(root.path(), &permanent);
+        let manifest: crate::setup::ComponentsManifest =
+            serde_json::from_slice(&std::fs::read(root.path().join("components.json")).unwrap())
+                .unwrap();
+        let head_b = manifest.model_catalog.unwrap().head_cid;
+        assert_ne!(head_b, admitted.catalog_head_cid);
+        assert!(
+            current_entry(root.path(), &admitted).is_err(),
+            "the original admission stays bound to the previous head"
+        );
+        assert_eq!(
+            load_operation(root.path(), &record.operation_id).unwrap(),
+            admitted
+        );
+        assert_eq!(backend.calls.lock().unwrap().len(), baseline_calls);
+
+        let owner = PreparationOwner::default();
+        let reply = owner
+            .invoke(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("use")),
+                "migrated-use",
+                &serde_json::json!({"cid": record.package_cid}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        join_worker(&owner).await;
+        let alias = load_operation(root.path(), reply["operation_id"].as_str().unwrap()).unwrap();
+        assert_ne!(alias.operation_id, record.operation_id);
+        assert_eq!(alias.admission_id, record.operation_id);
+        assert_eq!(alias.reserved_bytes, 0);
+        assert_eq!(alias.catalog_head_cid, head_b);
+        assert_eq!(alias.state, PreparationState::Admitted);
+        assert_eq!(cats(), baseline_cats, "migration reuses the admitted bytes");
+        let original = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_eq!(original.state, PreparationState::Admitted);
+        assert_eq!(original.catalog_head_cid, admitted.catalog_head_cid);
+        assert_eq!(original.admission_id, admitted.admission_id);
+        assert_eq!(original.request_binding, admitted.request_binding);
+        assert_eq!(
+            (
+                original.total_bytes,
+                original.completed_bytes,
+                original.index_bytes
+            ),
+            (
+                admitted.total_bytes,
+                admitted.completed_bytes,
+                admitted.index_bytes
+            )
+        );
+        assert!(current_entry(root.path(), &alias).is_ok());
+
+        let reopened = Inventory::open(root.path(), false).unwrap().load().unwrap();
+        assert_eq!(reopened.records.len(), 2);
+        assert_eq!(
+            reopened
+                .records
+                .iter()
+                .find(|r| r.operation_id == alias.operation_id)
+                .unwrap()
+                .state,
+            PreparationState::Admitted
+        );
+        let projection =
+            model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                .await;
+        assert_eq!(projection["admitted"], true);
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancels_and_fails_over_within_deadline_against_silent_holder() {
+        use crate::carrier::tests as carrier_fixture;
+        let root = tempfile::tempdir().unwrap();
+        let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        write_preparation_catalog(root.path(), &payload);
+        let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+        // The consumer's own backend holds nothing; every read must come over Carrier.
+        let backend = Arc::new(PreparationBackend::new(files.clone(), cid.clone()));
+        backend.missing_cache.store(true, Ordering::Release);
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        register_content(&registry, root.path()).await;
+        let (consumer_sk, consumer_did) = elastos_identity::derive_did(&[90u8; 32]);
+        let consumer = crate::carrier::start_isolated_carrier_node_with_registry(
+            &consumer_sk,
+            &consumer_did,
+            root.path().join("carrier"),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    consumer.endpoint.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        registry
+            .register(Arc::new(
+                crate::carrier::CarrierAvailabilityProvider::with_provider_registry(
+                    consumer.gossip_state.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        let silent_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let silent = carrier_fixture::start_holder_runtime(
+            91,
+            Arc::new(carrier_fixture::SilentContentProvider {
+                requests: silent_requests.clone(),
+            }),
+            None,
+        )
+        .await;
+        let holder_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let holder = carrier_fixture::start_content_holder_runtime(
+            92,
+            files.clone(),
+            holder_requests.clone(),
+        )
+        .await;
+        consumer
+            .memory_lookup
+            .add_endpoint_info(holder.addr.clone());
+        let input = serde_json::json!({"cid": cid});
+        let join_within = |owner: &PreparationOwner, secs: u64| {
+            let task = owner
+                .worker
+                .lock()
+                .unwrap()
+                .take()
+                .expect("worker was started");
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(secs), task)
+                    .await
+                    .expect("worker settles within its bound")
+                    .unwrap();
+            }
+        };
+
+        // Only a connected silent holder is announced. The operator cancels while
+        // the index read is waiting on it; the bounded read's answer budget
+        // returns control and the preparation settles as Cancelled instead of
+        // hanging. With more holders announced, settlement waits for the read
+        // to exhaust them, one answer budget each.
+        let now = now().unwrap();
+        carrier_fixture::seed_content_availability_announcements(
+            &consumer,
+            &cid,
+            &[(silent.ticket.clone(), [91u8; 32], silent.did.clone(), now)],
+        )
+        .await;
+        let owner = PreparationOwner::default();
+        let started = std::time::Instant::now();
+        let reply = owner
+            .invoke(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("use")),
+                "silent-cancel",
+                &input,
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        let operation_id = reply["operation_id"].as_str().unwrap().to_owned();
+        for _ in 0..100 {
+            if !silent_requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            silent_requests.lock().unwrap().len(),
+            1,
+            "the read is waiting on the connected silent holder"
+        );
+        let cancelled = owner
+            .invoke(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("cancel")),
+                "silent-cancel-request",
+                &serde_json::json!({"operation_id": operation_id}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(cancelled["cancel_requested"], true);
+        join_within(&owner, 45).await;
+        let settled = started.elapsed();
+        let record = load_operation(root.path(), &operation_id).unwrap();
+        assert_eq!(record.state, PreparationState::Cancelled, "{record:?}");
+        assert_eq!(record.reserved_bytes, 0);
+        assert!(
+            settled < std::time::Duration::from_secs(35),
+            "cancellation settles within the 30s Carrier availability wait: {settled:?}"
+        );
+        assert!(holder_requests.lock().unwrap().is_empty());
+        assert!(!root.path().join("model-preparation/stage").exists());
+
+        // The silent holder announces newest, but its recorded failure already
+        // ranks it behind the real holder, so admission pays no further deadline.
+        carrier_fixture::seed_content_availability_announcements(
+            &consumer,
+            &cid,
+            &[
+                (
+                    holder.ticket.clone(),
+                    [92u8; 32],
+                    holder.did.clone(),
+                    now - 20,
+                ),
+                (silent.ticket.clone(), [91u8; 32], silent.did.clone(), now),
+            ],
+        )
+        .await;
+        let owner = PreparationOwner::default();
+        let started = std::time::Instant::now();
+        let reply = owner
+            .invoke(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("use")),
+                "silent-then-real",
+                &input,
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        join_within(&owner, 60).await;
+        let admitted = started.elapsed();
+        let record = load_operation(root.path(), reply["operation_id"].as_str().unwrap()).unwrap();
+        assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+        assert_eq!(record.completed_bytes, record.total_bytes);
+        let served = holder_requests.lock().unwrap().clone();
+        assert!(!served.is_empty());
+        assert!(served.iter().all(|request| request["bounded_read"] == true));
+        assert!(
+            admitted < std::time::Duration::from_secs(30),
+            "the demoted silent holder costs no further answer budget here: {admitted:?}"
+        );
+        eprintln!(
+            "preparation: cancelled against a silent holder in {settled:?}; admitted after failover in {admitted:?} with {} bounded holder reads and {} silent attempts",
+            served.len(),
+            silent_requests.lock().unwrap().len()
+        );
+
+        carrier_fixture::shutdown_test_carrier_node(silent.node).await;
+        carrier_fixture::shutdown_test_carrier_node(holder.node).await;
+        carrier_fixture::shutdown_test_carrier_node(consumer).await;
     }
 
     #[test]

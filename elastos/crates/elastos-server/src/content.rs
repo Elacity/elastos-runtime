@@ -3074,9 +3074,7 @@ impl ContentProvider {
         {
             Ok(result) => result,
             Err(local_err)
-                if transfer.bounded_read
-                    || request.get("local_only").and_then(|value| value.as_bool())
-                        == Some(true) =>
+                if request.get("local_only").and_then(|value| value.as_bool()) == Some(true) =>
             {
                 return Err(local_err);
             }
@@ -3180,15 +3178,24 @@ impl ContentProvider {
         if !path.is_empty() {
             request["path"] = Value::String(path.to_string());
         }
+        // A bounded read travels as its own request so the holder applies the
+        // exact range or metadata bound once and returns only those bytes.
+        // Runtime's outer invocation carries no range to slice again.
+        let mut hop = transfer.clone();
+        if transfer.bounded_read {
+            request["bounded_read"] = Value::Bool(true);
+            if let Some(range) = transfer.range {
+                request["range"] = json!({ "start": range.start, "end": range.end });
+            }
+            if let Some(max_bytes) = transfer.max_bytes {
+                request["max_bytes"] = json!(max_bytes);
+            }
+            hop.range = None;
+            hop.progress = None;
+        }
 
         let response = match self
-            .invoke_provider_with_fetch_transfer(
-                registry,
-                "availability",
-                "fetch",
-                request,
-                transfer,
-            )
+            .invoke_provider_with_fetch_transfer(registry, "availability", "fetch", request, &hop)
             .await
         {
             Ok(response) => response,
@@ -3196,7 +3203,20 @@ impl ContentProvider {
             Err(err) => return Err(err),
         };
         if response.get("status").and_then(|status| status.as_str()) == Some("error") {
-            return Ok(None);
+            let code = response
+                .get("code")
+                .and_then(|value| value.as_str())
+                .unwrap_or("availability_error");
+            let message = response
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Carrier availability fetch failed");
+            return Err(ProviderError::Provider(format!(
+                "availability fetch failed ({code}): {message}"
+            )));
+        }
+        if transfer.bounded_read {
+            check_bounded_availability_payload(&response, transfer)?;
         }
         let availability = response
             .get("data")
@@ -8386,6 +8406,54 @@ fn provider_transfer_value(response: &Value) -> Option<Value> {
     response.get("_runtime_transfer").cloned()
 }
 
+/// A holder answering a bounded read returns base64 bytes whose length is the
+/// requested range exactly, or one to `max_bytes` for complete metadata.
+fn check_bounded_availability_payload(
+    response: &Value,
+    transfer: &ContentFetchTransfer,
+) -> Result<(), ProviderError> {
+    let invalid =
+        |detail: &str| ProviderError::Provider(format!("bounded availability payload {detail}"));
+    let expected = match (transfer.range, transfer.max_bytes) {
+        (Some(range), None) => range
+            .end
+            .and_then(|end| end.checked_sub(range.start))
+            .and_then(|size| size.checked_add(1))
+            .ok_or_else(|| invalid("requires a closed range"))?,
+        (None, Some(max_bytes)) => max_bytes,
+        _ => return Err(invalid("requires a range or a metadata bound")),
+    };
+    // Runtime normalized a stream transfer from the decoded bytes already;
+    // a bytes transfer still carries the holder's base64 payload.
+    let length = if let Some(stream) = response.pointer("/data/stream") {
+        stream
+            .get("total_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid("stream lacks total_bytes"))?
+    } else {
+        let encoded = response
+            .pointer("/data/data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("must be base64 data or a stream"))?;
+        if encoded.len() as u64 > expected.div_ceil(3) * 4 {
+            return Err(invalid("exceeds the requested bound"));
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| invalid("is not valid base64"))?
+            .len() as u64
+    };
+    let accepted = if transfer.range.is_some() {
+        length == expected
+    } else {
+        (1..=expected).contains(&length)
+    };
+    if !accepted {
+        return Err(invalid("length does not match the requested bound"));
+    }
+    Ok(())
+}
+
 fn is_valid_cid(value: &str) -> bool {
     cid::Cid::try_from(value).is_ok()
 }
@@ -11533,7 +11601,120 @@ mod tests {
                 .is_err());
         }
         assert_eq!(backend.requests.lock().await.len(), 6);
-        assert!(availability.requests.lock().await.is_empty());
+        // Each local failure consults the availability plane once with the
+        // same bound; its empty answer leaves the read failed.
+        let forwarded = availability.requests.lock().await;
+        assert_eq!(forwarded.len(), 3);
+        for request in forwarded.iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(request["range"], json!({ "start": 8, "end": 11 }));
+            assert!(request["_runtime_invocation"]["range"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn content_bounded_read_retrieves_exact_range_from_availability_when_local_misses() {
+        let (_root, registry, ipfs, _content) = registry_with_content_and_ipfs().await;
+        {
+            let mut missing = ipfs.missing_paths.lock().await;
+            missing.push("weights.gguf".to_string());
+            missing.push(CONTENT_OBJECT_MANIFEST_PATH.to_string());
+        }
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": encode(b"89ab"),
+                "availability": {
+                    "status": "network_available", "provider": "mock-availability",
+                    "policy": "carrier_provider_invoke", "replicas": 1
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+        let invoke = |request: Value, transfer: ProviderTransfer| {
+            registry.invoke_provider(ProviderInvocation {
+                source: "runtime-model-preparation".into(),
+                target: "content".into(),
+                op: "fetch".into(),
+                request,
+                transfer,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+        };
+        let range_request = json!({ "op": "fetch", "cid": TEST_CID, "path": "weights.gguf",
+            "bounded_read": true, "range": { "start": 8, "end": 11 }, "transfer": "bytes" });
+        let response = invoke(range_request.clone(), ProviderTransfer::Bytes)
+            .await
+            .unwrap();
+        assert_eq!(response["data"]["data"], encode(b"89ab"));
+        assert_eq!(
+            response["data"]["availability"]["provider"],
+            "mock-availability"
+        );
+        {
+            let sent = availability.requests.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["cid"], TEST_CID);
+            assert_eq!(sent[0]["path"], "weights.gguf");
+            assert_eq!(sent[0]["bounded_read"], true);
+            assert_eq!(sent[0]["range"], json!({ "start": 8, "end": 11 }));
+            assert!(
+                sent[0]["_runtime_invocation"]["range"].is_null(),
+                "the holder applies the range once; Runtime must not slice again"
+            );
+        }
+        let mut stream_request = range_request.clone();
+        stream_request["transfer"] = json!("stream");
+        let response = invoke(stream_request, ProviderTransfer::Stream)
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_test_stream_payload(&response["data"]["stream"]),
+            b"89ab"
+        );
+        for bytes in [b"89abc".as_slice(), b"89a".as_slice(), b"".as_slice()] {
+            *availability.response.lock().await = provider_ok(json!({ "data": encode(bytes) }));
+            assert!(
+                invoke(range_request.clone(), ProviderTransfer::Bytes)
+                    .await
+                    .is_err(),
+                "{} bytes for a 4-byte range",
+                bytes.len()
+            );
+        }
+        let metadata_request = json!({ "op": "fetch", "cid": TEST_CID,
+            "path": CONTENT_OBJECT_MANIFEST_PATH, "bounded_read": true,
+            "max_bytes": 65536, "transfer": "bytes" });
+        *availability.response.lock().await =
+            provider_ok(json!({ "data": encode(b"{\"schema\":\"fixture\"}") }));
+        let response = invoke(metadata_request.clone(), ProviderTransfer::Bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            response["data"]["data"],
+            encode(b"{\"schema\":\"fixture\"}")
+        );
+        assert_eq!(
+            availability.requests.lock().await.last().unwrap()["max_bytes"],
+            65536
+        );
+        *availability.response.lock().await =
+            provider_ok(json!({ "data": encode(&vec![b'x'; 65537]) }));
+        assert!(invoke(metadata_request, ProviderTransfer::Bytes)
+            .await
+            .is_err());
+        let sent_before_local_only = availability.requests.lock().await.len();
+        let mut local_only = range_request.clone();
+        local_only["local_only"] = json!(true);
+        assert!(invoke(local_only, ProviderTransfer::Bytes).await.is_err());
+        assert_eq!(
+            availability.requests.lock().await.len(),
+            sent_before_local_only,
+            "local_only never reaches the availability plane"
+        );
     }
 
     #[tokio::test]
@@ -11661,7 +11842,17 @@ mod tests {
             assert!(request["_runtime_invocation"]["range"].is_null());
             assert!(request["_runtime_invocation"]["progress"]["expected_bytes"].is_null());
         }
-        assert!(availability.requests.lock().await.is_empty());
+        drop(sent);
+        // Each local failure forwards the same metadata bound to the
+        // availability plane once; its empty answer leaves the read failed.
+        let forwarded = availability.requests.lock().await;
+        assert_eq!(forwarded.len(), count - 2);
+        for request in forwarded.iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(request["max_bytes"], 65536);
+            assert_eq!(request["path"], OBJECT_MANIFEST_PATH);
+            assert!(request["_runtime_invocation"]["range"].is_null());
+        }
     }
 
     #[tokio::test]

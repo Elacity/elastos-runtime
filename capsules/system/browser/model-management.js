@@ -28,6 +28,33 @@
     } else check(!r.admitted && !r.kept && !r.dispatch_ready);
     return r;
   }
+  function catalogEntries(catalog) {
+    check(catalog.schema === "elastos.capsules.catalog/v1" && Array.isArray(catalog.capsules) && catalog.capsules.length <= 1024);
+    check(["verified", "unconfigured", "unavailable"].includes(catalog.model_catalog_state));
+    if (catalog.model_catalog_state === "unavailable") throw new Error("Model trust unavailable");
+    const entries = catalog.capsules.filter(e => e.source === "signed-model-catalog");
+    check(entries.length <= 8);
+    if (!entries.length) return [];
+    check(catalog.model_catalog_state === "verified");
+    const seen = new Set();
+    for (const item of entries) {
+      check(typeof item.cid === "string" && !seen.has(item.cid));
+      seen.add(item.cid);
+      check(item.role === "content" && item.installed === false && item.launchable === false
+        && CID.test(item.cid) && text(item.title) && text(item.publisher_did, 256)
+        && item.publisher_did.startsWith("did:") && item.signature_state === "catalog-signature-verified"
+        && Number.isSafeInteger(item.content_size_bytes) && item.content_size_bytes > 0);
+      parseRuntime(item.model_runtime, item.cid);
+    }
+    return entries;
+  }
+  function selectCatalogEntry(entries, selectedCid) {
+    if (selectedCid) {
+      const matches = entries.filter(item => item.cid === selectedCid);
+      return matches.length === 1 ? matches[0] : null;
+    }
+    return entries.length === 1 ? entries[0] : null;
+  }
   function formatBytes(bytes) {
     const units = ["B", "KB", "MB", "GB", "TB"];
     const rank = bytes ? Math.min(4, Math.floor(Math.log(bytes) / Math.log(1000))) : 0;
@@ -48,9 +75,9 @@
       dispatch_ready: output.dispatch_ready, offer_id: output.offer_id, preparation }, cid);
   }
   window.ElastosModelManagement = {
-    create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: selectedCid = null, compact = false }) {
+    create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: requiredCid = null, compact = false, onReadyOpen = null }) {
       let visible = false, closed = false, generation = 0, busy = false, timer, reader;
-      let model = null, methods = new Map(), message = "", loading = false, polls = 0;
+      let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false, polls = 0;
       let unresolvedUse = null, reconcileRequired = false;
       let pendingFocus = null;
       root.classList.add("model-management");
@@ -82,20 +109,10 @@
         return { signal: value.signal, abort: () => value.abort(), done: () => clearTimeout(timeout) };
       }
       function parseCatalog(catalog) {
-        check(catalog.schema === "elastos.capsules.catalog/v1" && Array.isArray(catalog.capsules) && catalog.capsules.length <= 1024);
-        check(["verified", "unconfigured", "unavailable"].includes(catalog.model_catalog_state));
-        if (catalog.model_catalog_state === "unavailable") throw new Error("Model trust unavailable");
-        const entries = catalog.capsules.filter(e => e.source === "signed-model-catalog");
-        check(entries.length <= 1 && (!entries.length || catalog.model_catalog_state === "verified"));
+        const entries = catalogEntries(catalog);
+        choices = entries;
         if (!entries.length) return null;
-        const entry = entries[0];
-        if (selectedCid && entry.cid !== selectedCid) return null;
-        check(entry.role === "content" && entry.installed === false && entry.launchable === false
-          && CID.test(entry.cid) && text(entry.title) && text(entry.publisher_did, 256)
-          && entry.publisher_did.startsWith("did:") && entry.signature_state === "catalog-signature-verified"
-          && Number.isSafeInteger(entry.content_size_bytes) && entry.content_size_bytes > 0);
-        parseRuntime(entry.model_runtime, entry.cid);
-        return entry;
+        return selectCatalogEntry(entries, requiredCid || selectedCid);
       }
       function bindMethods(registry) {
         check(Array.isArray(registry.interfaces) && registry.interfaces.length <= 1024);
@@ -129,7 +146,7 @@
           if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation) unresolvedUse = null;
         } catch {
           if (epoch !== generation || !show()) return;
-          model = null; message = "Models are unavailable. Check your connection and trusted catalog, then retry.";
+          model = null; choices = []; message = "Models are unavailable. Check your connection and trusted catalog, then retry.";
         } finally {
           io.done();
           if (epoch === generation) { loading = false; render(); schedule(); }
@@ -216,6 +233,20 @@
         const status = element("p", loading ? "Loading models…" : message);
         status.setAttribute("role", "status"); root.append(status);
         if (!model) {
+          if (!loading && !message && !requiredCid && choices.length > 1) {
+            root.append(element("p", "Select a verified model. Keep and removal apply to the model you select."));
+            const list = element("ul", "", "model-list");
+            for (const item of choices) {
+              const row = element("li");
+              const pick = button(item.title, () => { selectedCid = item.cid; void load(); });
+              pick.dataset.modelControl = `select-${item.cid}`;
+              row.append(pick, element("span", formatBytes(item.content_size_bytes), "model-size"));
+              list.append(row);
+            }
+            root.append(list);
+            restoreFocus();
+            return;
+          }
           if (!loading && !message) root.append(element("p", "No verified model is available. Ask your administrator to configure a trusted catalog."));
           restoreFocus();
           return;
@@ -241,6 +272,11 @@
         const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : "Use", () => void act("use"), active(p) || reconcileRequired);
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
+        if (r.dispatch_ready && typeof onReadyOpen === "function") {
+          const open = button("Open in Assistant", () => onReadyOpen({ cid: model.cid, offer_id: r.offer_id }));
+          open.dataset.modelControl = "open-assistant";
+          controls.append(open);
+        }
         if (active(p)) { const cancel = button("Cancel preparation", () => void act("cancel"), p.cancel_requested || reconcileRequired); cancel.dataset.modelControl = "cancel"; controls.append(cancel); }
         const labelNode = element("label", "", "model-keep"), toggle = element("input");
         toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
@@ -252,6 +288,11 @@
           : "Prepared files can be removed during cache cleanup.", "model-hint"));
         row.append(element("p", "The model loads into memory when you use it in Assistant.", "model-hint"));
         root.append(row);
+        if (!requiredCid && choices.length > 1) {
+          const back = button("Choose another model", () => { selectedCid = null; model = null; void load(); });
+          back.dataset.modelControl = "choose-another";
+          root.append(back);
+        }
         restoreFocus();
       }
       function setVisible(value) {

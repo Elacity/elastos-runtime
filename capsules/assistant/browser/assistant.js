@@ -4,6 +4,7 @@ import {
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
 import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
+import { applyRunEventsPage, parseCursor } from "./model-contract.js";
 
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
@@ -190,10 +191,6 @@ function parseRunEventsPage(payload) {
   return page && typeof page === "object" && Array.isArray(page.events) ? page : null;
 }
 
-function parseCursorValue(value) {
-  const cursor = Number(value);
-  return Number.isInteger(cursor) && cursor >= 0 ? cursor : null;
-}
 
 function studioInputSchema(operation) {
   if (operation === "image.generate") {
@@ -235,25 +232,6 @@ function parseStudioOutput(output) {
   return null;
 }
 
-function parseStudioProgress(data) {
-  const phase =
-    typeof data?.phase === "string" && data.phase.trim() === data.phase
-      ? data.phase
-      : "";
-  const completed = Number(data?.completed);
-  const total = Number(data?.total);
-  if (
-    !phase ||
-    !Number.isInteger(completed) ||
-    !Number.isInteger(total) ||
-    completed < 0 ||
-    total < 0 ||
-    completed > total
-  ) {
-    return null;
-  }
-  return { phase, completed, total };
-}
 
 function createSessionRecord({ id, mode, title = "", pinned = false } = {}) {
   const nextMode = mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
@@ -1041,69 +1019,28 @@ export function createAssistantApp({
     });
   }
 
-  function applyRunEvents(events) {
+  function applyDecodedEvents(applied) {
     const run = state.activeRun;
     if (!run) {
       return false;
     }
-    let nextText = run.outputText;
-    let terminal = null;
-    for (const event of events) {
-      if (!event || typeof event !== "object") {
-        continue;
+    if (run.mode === MODE_STUDIO) {
+      if (applied.studioProgress) {
+        state.studioProgress = applied.studioProgress;
       }
-      if (run.mode !== MODE_STUDIO && event.kind === "text_delta") {
-        nextText = boundedText(
-          nextText + String(event.data?.text ?? ""),
-          MAX_MESSAGE_CONTENT_BYTES,
-        );
-      } else if (run.mode === MODE_STUDIO && event.kind === "progress") {
-        const progress = parseStudioProgress(event.data);
-        if (!progress) {
-          stopPollingUnavailable(run, "Model provider unavailable.");
-          return false;
-        }
-        state.studioProgress = progress;
-      } else if (event.kind === "output") {
-        terminal = {
-          status: "completed",
-          output: event.data ?? null,
-          error: null,
-        };
-      } else if (event.kind === "completed") {
-        terminal = {
-          status: "completed",
-          output: event.data?.output_retained === false ? null : event.data ?? null,
-          error: null,
-          outputRetained: event.data?.output_retained !== false,
-        };
-      } else if (event.kind === "failed") {
-        terminal = {
-          status: "failed",
-          output: null,
-          error: event.data ?? null,
-        };
-      } else if (event.kind === "cancelled") {
-        terminal = {
-          status: "cancelled",
-          output: null,
-          error: event.data ?? null,
-        };
-      } else if (event.kind === "settlement_unknown") {
-        terminal = {
-          status: "settlement_unknown",
-          output: null,
-          error: event.data ?? null,
-        };
+    } else if (applied.textDeltas.length) {
+      let nextText = run.outputText;
+      for (const delta of applied.textDeltas) {
+        nextText = boundedText(nextText + delta, MAX_MESSAGE_CONTENT_BYTES);
+      }
+      if (nextText !== run.outputText) {
+        run.outputText = nextText;
+        updateStreamingMessage(run.sessionId, run.runId, nextText);
+        markWorkspaceDirty();
       }
     }
-    if (run.mode !== MODE_STUDIO && nextText !== run.outputText) {
-      run.outputText = nextText;
-      updateStreamingMessage(run.sessionId, run.runId, nextText);
-      markWorkspaceDirty();
-    }
-    if (terminal) {
-      return settleTerminal(run.runId, terminal);
+    if (applied.terminal) {
+      return settleTerminal(run.runId, applied.terminal);
     }
     notify();
     return false;
@@ -1175,30 +1112,16 @@ export function createAssistantApp({
       stopPollingUnavailable(run, "Model provider unavailable.");
       return;
     }
-    const previousCursor = run.afterSequence;
-    const nextCursor = parseCursorValue(page.next_cursor);
-    if (nextCursor === null || nextCursor < previousCursor) {
-      stopPollingUnavailable(run, "Model provider unavailable.");
-      return;
-    }
-    const events = [];
-    let lastSequence = previousCursor;
-    for (const event of page.events) {
-      const sequence = parseCursorValue(event?.sequence);
-      if (sequence === null || sequence <= lastSequence) {
-        stopPollingUnavailable(run, "Model provider unavailable.");
-        return;
-      }
-      events.push(event);
-      lastSequence = sequence;
-    }
-    if (nextCursor < lastSequence) {
+    let applied;
+    try {
+      applied = applyRunEventsPage(page, run.afterSequence);
+    } catch {
       stopPollingUnavailable(run, "Model provider unavailable.");
       return;
     }
     run.pollErrorCount = 0;
-    run.afterSequence = nextCursor;
-    const settled = applyRunEvents(events);
+    run.afterSequence = applied.nextCursor;
+    const settled = applyDecodedEvents(applied);
     if (settled || run.terminal) {
       clearPollTimer();
       return;
@@ -1305,7 +1228,7 @@ export function createAssistantApp({
       sessionId: isStudio ? studioSessionId : session?.id || "",
       mode: isStudio ? MODE_STUDIO : session.mode,
       mediaLabel: offer.mediaLabel || "",
-      afterSequence: parseCursorValue(runView.sequence_cursor) ?? 0,
+      afterSequence: parseCursor(runView.sequence_cursor) ?? 0,
       outputText: "",
       terminal: false,
       cancelRequested: false,
@@ -1417,7 +1340,9 @@ export function createAssistantApp({
         if (!["http:", "https:"].includes(origin.protocol) || origin.origin !== homeOrigin) return false;
       } catch { return false; }
       if (!homeToken || !targetWindow || targetWindow === sourceWindow) return false;
-      targetWindow.postMessage({ type: "home:open-target", homeToken, target: "system", query: { settings: "models" } }, homeOrigin);
+      const query = { category: "models" };
+      if (state.selectedModelCid) query.model_cid = state.selectedModelCid;
+      targetWindow.postMessage({ type: "home:open-target", homeToken, target: "marketplace", query }, homeOrigin);
       return true;
     },
     snapshot,

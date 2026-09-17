@@ -123,7 +123,7 @@ test("nested Agent Models intent registers top Home with exact origin and leaves
   assert.equal(openModelsFromAgent(), true);
   assert.deepEqual(messages, [
     { origin: "https://home.example", message: { type: "home:app-ready", homeToken: "fixture" } },
-    { origin: "https://home.example", message: { type: "home:open-target", homeToken: "fixture", target: "system", query: { settings: "models" } } },
+    { origin: "https://home.example", message: { type: "home:open-target", homeToken: "fixture", target: "marketplace", query: { category: "models" } } },
   ]);
   window.location.href = "https://home.example/apps/home-agent/?home_origin=null";
   assert.equal(openModelsFromAgent(), false);

@@ -916,9 +916,17 @@ impl IpfsProvider {
                 .redirects(0)
                 .try_proxy_from_env(false)
                 .build();
+            // A bounded read is the local-repo probe before Carrier
+            // availability. Searching DHT here would spend the whole
+            // deadline on a miss and then still fail over. Kubo path cat
+            // of a missing DAG also keeps the HTTP call open with
+            // offline=true; a 1ms API timeout fails that miss immediately.
+            // A local hit still returns the bounded range.
             let mut request = agent
                 .post(&format!("{}/api/v0/cat", self.api_url()))
                 .query("arg", &arg)
+                .query("offline", "true")
+                .query("timeout", "1ms")
                 .set("Accept-Encoding", "identity")
                 .timeout(BOUNDED_READ_TIMEOUT);
             if let Some(range) = &range {
@@ -2027,6 +2035,8 @@ mod tests {
         assert_eq!(provider.state, KuboState::Ready);
         assert!(version_headers.starts_with("POST /api/v0/version"));
         assert!(headers.starts_with("POST /api/v0/cat?"));
+        assert!(headers.contains("offline=true"));
+        assert!(headers.contains("timeout=1ms"));
         assert!(headers.contains("offset=8") && headers.contains("length=4"));
         let Response::Ok { data: Some(data) } = result else {
             panic!("bounded read failed");
@@ -2373,6 +2383,8 @@ mod tests {
         );
         for (headers, offset) in [(first, "offset=8"), (second, "offset=12")] {
             assert!(headers.starts_with("POST /api/v0/cat?"));
+            assert!(headers.contains("offline=true"));
+            assert!(headers.contains("timeout=1ms"));
             assert!(headers.contains(offset) && headers.contains("length=4"));
         }
         let Response::Ok { data: Some(data) } = next else {
@@ -2422,6 +2434,8 @@ mod tests {
             let requests = backend.join().unwrap();
             assert_eq!(requests.len(), 1, "bounded failure must not follow, retry or prefetch");
             assert!(requests[0].starts_with("POST /api/v0/cat?"));
+            assert!(requests[0].contains("offline=true"));
+            assert!(requests[0].contains("timeout=1ms"));
             assert!(matches!(result, Response::Error { .. }));
         }
     }
@@ -2554,6 +2568,8 @@ mod tests {
                 "bounded Cat must not pin, prefetch or retry"
             );
             assert!(requests[0].0.starts_with("POST /api/v0/cat?"));
+            assert!(requests[0].0.contains("offline=true"));
+            assert!(requests[0].0.contains("timeout=1ms"));
             assert!(requests[0].1, "bounded Cat must send offset=8 and length=4");
             if ignore_range {
                 assert!(

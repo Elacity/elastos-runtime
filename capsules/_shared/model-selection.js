@@ -6,7 +6,12 @@ export function catalogModels(catalog) {
   if (catalog?.schema !== "elastos.capsules.catalog/v1" || !Array.isArray(catalog.capsules) || catalog.capsules.length > 1024 ||
       !["verified", "unavailable", "unconfigured"].includes(catalog.model_catalog_state)) throw new Error("Model catalog unavailable");
   const rows = catalog.capsules.filter(row => row?.source === "signed-model-catalog");
-  if (rows.length > 1) throw new Error("Model catalog unavailable");
+  if (rows.length > 8) throw new Error("Model catalog unavailable");
+  const seen = new Set();
+  for (const row of rows) {
+    if (typeof row.cid !== "string" || seen.has(row.cid)) throw new Error("Model catalog unavailable");
+    seen.add(row.cid);
+  }
   if (catalog.model_catalog_state !== "verified") return [];
   return rows.map(row => {
     const facts = row.model_runtime;

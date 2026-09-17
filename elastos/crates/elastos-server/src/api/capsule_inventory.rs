@@ -14,6 +14,7 @@ const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../c
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
 const MODEL_CATALOG_DOMAIN: &str = "elastos.model.catalog.v1";
 const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
+const MAX_MODEL_CATALOG_ENTRIES: usize = 8;
 
 pub(crate) struct VerifiedModelCatalogEntry {
     pub cid: String,
@@ -36,7 +37,8 @@ struct SignedModelCatalog {
 struct ModelCatalogPayload {
     schema: String,
     published_at: u64,
-    expires_at: u64,
+    /// `None` is a permanent publisher statement for the pinned snapshot.
+    expires_at: Option<u64>,
     entries: Vec<ModelCatalogEntry>,
 }
 
@@ -151,13 +153,16 @@ fn verify_model_catalog(
     let payload = signed.payload;
     if payload.schema != "elastos.model.catalog/v1"
         || payload.published_at > now
-        || payload.expires_at <= now
-        || payload.expires_at <= payload.published_at
-        || payload.entries.len() != 1
+        || payload
+            .expires_at
+            .is_some_and(|expires| expires <= now || expires <= payload.published_at)
+        || !(1..=MAX_MODEL_CATALOG_ENTRIES).contains(&payload.entries.len())
     {
-        anyhow::bail!("model catalog requires one current signed entry");
+        anyhow::bail!("model catalog requires 1 to 8 unique current signed entries");
     }
-    let mut verified = Vec::with_capacity(1);
+    let mut verified = Vec::with_capacity(payload.entries.len());
+    let mut seen_cids = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
     for entry in payload.entries {
         if entry.cid.len() > 128 {
             anyhow::bail!("model package CID exceeds its bound");
@@ -170,6 +175,9 @@ fn verify_model_catalog(
             || cid.hash().digest().len() != 32
         {
             anyhow::bail!("model package requires a canonical DAG-PB SHA-256 closure CIDv1");
+        }
+        if !seen_cids.insert(entry.cid.clone()) {
+            anyhow::bail!("model catalog entries require unique package CIDs");
         }
         if entry
             .object_manifest
@@ -184,6 +192,9 @@ fn verify_model_catalog(
             &entry.capsule_manifest,
             &entry.object_manifest,
         )?;
+        if !seen_names.insert(manifest.name.clone()) {
+            anyhow::bail!("model catalog entries require unique capsule names");
+        }
         verified.push(VerifiedModelCatalogEntry {
             cid: entry.cid,
             publisher_did: signed.signer_did.clone(),
@@ -387,6 +398,28 @@ pub(crate) mod tests {
         cid::Cid::new_v1(0x55, hash).to_string()
     }
 
+    fn refresh_catalog_entry_object_manifest(entry: &mut Value) {
+        let capsule_bytes = serde_json::to_vec(&entry["capsule_manifest"]).unwrap();
+        let files = entry["object_manifest"]["files"].as_array_mut().unwrap();
+        for file in files.iter_mut() {
+            if file["path"] == "capsule.json" {
+                file["size"] = serde_json::json!(capsule_bytes.len() as u64);
+                file["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(&capsule_bytes)));
+            }
+        }
+        let mut digest = Sha256::new();
+        for file in files {
+            digest.update(file["path"].as_str().unwrap().as_bytes());
+            digest.update(b"\0");
+            digest.update(file["sha256"].as_str().unwrap().as_bytes());
+            digest.update(b"\0");
+            digest.update(file["size"].to_string().as_bytes());
+            digest.update(b"\0");
+        }
+        entry["object_manifest"]["content_digest"] =
+            serde_json::json!(format!("sha256:{:x}", digest.finalize()));
+    }
+
     fn sign_model_catalog(payload: &Value) -> (crate::setup::ModelCatalogConfig, Vec<u8>) {
         let key = elastos_runtime::signature::SigningKey::from_bytes(&[7; 32]);
         let (signature, signer_did) = crate::crypto::domain_separated_sign(
@@ -430,6 +463,44 @@ pub(crate) mod tests {
         assert_eq!(entries[0].manifest.name, "model-fixture");
         assert!(entries[0].size_bytes > 0);
         assert!(!root.path().join("capsules/model-fixture").exists());
+    }
+
+    #[test]
+    fn model_catalog_accepts_two_distinct_entries_and_rejects_duplicate_identity() {
+        let mut payload = model_catalog_fixture();
+        let mut second = payload["entries"][0].clone();
+        second["cid"] =
+            serde_json::json!("bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm");
+        second["capsule_manifest"]["name"] = "model-fixture-b".into();
+        refresh_catalog_entry_object_manifest(&mut second);
+        payload["entries"].as_array_mut().unwrap().push(second);
+        let (trust, bytes) = sign_model_catalog(&payload);
+        let entries = verify_model_catalog(&trust, &bytes, 2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].manifest.name, "model-fixture");
+        assert_eq!(entries[1].manifest.name, "model-fixture-b");
+
+        let mut duplicate_cid = model_catalog_fixture();
+        let entry = duplicate_cid["entries"][0].clone();
+        duplicate_cid["entries"].as_array_mut().unwrap().push(entry);
+        let (trust, bytes) = sign_model_catalog(&duplicate_cid);
+        assert!(verify_model_catalog(&trust, &bytes, 2).is_err());
+
+        let mut duplicate_name = model_catalog_fixture();
+        let mut second = duplicate_name["entries"][0].clone();
+        second["cid"] =
+            serde_json::json!("bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm");
+        duplicate_name["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        let (trust, bytes) = sign_model_catalog(&duplicate_name);
+        assert!(verify_model_catalog(&trust, &bytes, 2).is_err());
+
+        let mut empty = model_catalog_fixture();
+        empty["entries"] = serde_json::json!([]);
+        let (trust, bytes) = sign_model_catalog(&empty);
+        assert!(verify_model_catalog(&trust, &bytes, 2).is_err());
     }
 
     #[test]
@@ -525,6 +596,109 @@ pub(crate) mod tests {
         payload["entries"].as_array_mut().unwrap().push(entry);
         let (trust, bytes) = sign_model_catalog(&payload);
         assert!(verify_model_catalog(&trust, &bytes, 2).is_err());
+    }
+
+    fn permanent_model_catalog_fixture() -> Value {
+        let mut payload = model_catalog_fixture();
+        payload.as_object_mut().unwrap().remove("expires_at");
+        payload
+    }
+
+    #[test]
+    fn model_catalog_permanent_snapshot_verifies_at_any_later_time() {
+        let (trust, bytes) = sign_model_catalog(&permanent_model_catalog_fixture());
+        for now in [1, 2, 4_000_000_001, u64::MAX] {
+            let entries = verify_model_catalog(&trust, &bytes, now).unwrap();
+            assert_eq!(entries.len(), 1, "now={now}");
+            assert_eq!(entries[0].manifest.name, "model-fixture", "now={now}");
+        }
+        assert!(
+            verify_model_catalog(&trust, &bytes, 0).is_err(),
+            "publication in the future stays rejected"
+        );
+    }
+
+    #[test]
+    fn model_catalog_null_expires_at_decodes_as_permanent() {
+        let mut payload = model_catalog_fixture();
+        payload["expires_at"] = Value::Null;
+        let (trust, bytes) = sign_model_catalog(&payload);
+        let signed: SignedModelCatalog = serde_json::from_slice(&bytes).unwrap();
+        assert!(signed.payload.expires_at.is_none());
+        let entries = verify_model_catalog(&trust, &bytes, u64::MAX).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].manifest.name, "model-fixture");
+    }
+
+    #[test]
+    fn model_catalog_timed_snapshot_rejects_exactly_at_expiry() {
+        let mut payload = model_catalog_fixture();
+        payload["expires_at"] = serde_json::json!(10);
+        let (trust, bytes) = sign_model_catalog(&payload);
+        let entries = verify_model_catalog(&trust, &bytes, 9).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].manifest.name, "model-fixture");
+        assert!(verify_model_catalog(&trust, &bytes, 10).is_err());
+        assert!(verify_model_catalog(&trust, &bytes, 11).is_err());
+        for expires_at in [1, 0] {
+            let mut payload = model_catalog_fixture();
+            payload["expires_at"] = serde_json::json!(expires_at);
+            let (trust, bytes) = sign_model_catalog(&payload);
+            assert!(
+                verify_model_catalog(&trust, &bytes, 1).is_err(),
+                "expires_at={expires_at} never postdates published_at=1"
+            );
+        }
+    }
+
+    #[test]
+    fn model_catalog_permanent_snapshot_keeps_pin_signature_and_publisher_checks() {
+        let (trust, bytes) = sign_model_catalog(&permanent_model_catalog_fixture());
+        let entries = verify_model_catalog(&trust, &bytes, u64::MAX).unwrap();
+        assert_eq!(entries[0].manifest.name, "model-fixture");
+        let untrusted = "did:key:untrusted";
+        let mut changed = trust.clone();
+        changed.head_cid = head_cid(b"different");
+        assert!(verify_model_catalog(&changed, &bytes, u64::MAX).is_err());
+        for publishers in [vec![untrusted.to_owned()], Vec::new()] {
+            let mut changed = trust.clone();
+            changed.publisher_dids = publishers;
+            assert!(verify_model_catalog(&changed, &bytes, u64::MAX).is_err());
+        }
+        let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+        envelope["payload"]["entries"][0]["capsule_manifest"]["name"] = "tampered".into();
+        let tampered = serde_json::to_vec(&envelope).unwrap();
+        let mut repinned = trust.clone();
+        repinned.head_cid = head_cid(&tampered);
+        assert!(
+            verify_model_catalog(&repinned, &tampered, u64::MAX).is_err(),
+            "a repinned permanent payload still needs the configured signature"
+        );
+        let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+        envelope["signer_did"] = untrusted.into();
+        let reassigned = serde_json::to_vec(&envelope).unwrap();
+        repinned.head_cid = head_cid(&reassigned);
+        assert!(verify_model_catalog(&repinned, &reassigned, u64::MAX).is_err());
+        let mut payload = permanent_model_catalog_fixture();
+        payload["renewal"] = true.into();
+        let (trust, bytes) = sign_model_catalog(&payload);
+        assert!(
+            verify_model_catalog(&trust, &bytes, u64::MAX).is_err(),
+            "unknown payload fields stay rejected for permanent snapshots"
+        );
+    }
+
+    #[test]
+    fn model_catalog_permanent_snapshot_verifies_after_reread() {
+        let root = tempfile::tempdir().unwrap();
+        write_model_catalog_fixture(root.path(), &permanent_model_catalog_fixture());
+        let first = model_catalog_entries(root.path()).unwrap().unwrap();
+        let second = model_catalog_entries(root.path()).unwrap().unwrap();
+        for entries in [&first, &second] {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].manifest.name, "model-fixture");
+        }
+        assert_eq!(first[0].cid, second[0].cid);
     }
 
     #[cfg(unix)]
@@ -655,5 +829,37 @@ pub(crate) mod tests {
             active_capsule_names(data_dir.path()).unwrap(),
             BTreeSet::from(["object-provider".to_string()])
         );
+    }
+
+    #[test]
+    fn checkout_permanent_catalog_matches_components_pin() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let components: crate::setup::ComponentsManifest =
+            serde_json::from_slice(&std::fs::read(root.join("components.json")).unwrap()).unwrap();
+        let trust = components
+            .model_catalog
+            .expect("matching install pins a signed model catalog");
+        let bytes = std::fs::read(root.join(MODEL_CATALOG_FILE)).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let entries = verify_model_catalog(&trust, &bytes, now).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].cid,
+            "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi"
+        );
+        assert_eq!(entries[0].manifest.name, "qwen3-5-9b-q4-k-m-local");
+        assert_eq!(
+            entries[1].cid,
+            "bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y"
+        );
+        assert_eq!(entries[1].manifest.name, "smollm2-135m-instruct-q8-0-local");
+        assert_eq!(
+            entries[0].publisher_did,
+            "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
+        );
+        assert_eq!(entries[1].publisher_did, entries[0].publisher_did);
     }
 }
