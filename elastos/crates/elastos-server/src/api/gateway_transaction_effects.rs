@@ -730,14 +730,59 @@ pub(in crate::api::gateway) async fn ensure_exact_runtime_transaction_approval(
             Some(approval) => {
                 let effect = &store.effects[effect_index];
                 validate_approval_snapshot(effect, authority, &approval)?;
-                let effect = &mut store.effects[effect_index];
-                effect.approval_snapshot = Some(approval.clone());
-                if effect.state == TransactionEffectState::Prepared {
-                    effect.state = TransactionEffectState::ApprovalPending;
+                // A lapsed approval is asked again rather than kept forever.
+                //
+                // An approval that expired never produced a signature, so no
+                // transaction can ever come of it -- but the effect stays
+                // bound to it, and every later attempt finds it, reports it
+                // expired, and gives up. The work the effect stands for is
+                // already done and paid for: for a mint, the content is
+                // published and custody provisioned, and only the chain
+                // transaction is missing. Refusing forever would strand all
+                // of it because nobody reached a wallet prompt in ten
+                // minutes.
+                //
+                // Only when the effect produced nothing durable. Past that,
+                // something was signed or sent, and asking again could put a
+                // second transaction on chain for one intent. A rejected
+                // approval is never re-raised either: the person answered.
+                let lapsed = approval.get("status").and_then(Value::as_str) == Some("expired");
+                let produced_nothing = effect.signed_transaction.is_none()
+                    && effect.wallet_transaction_hash.is_none()
+                    && effect.signed_result.is_none()
+                    && effect.receipt.is_none()
+                    && matches!(
+                        effect.state,
+                        TransactionEffectState::Prepared | TransactionEffectState::ApprovalPending
+                    );
+                if lapsed && produced_nothing {
+                    let effect = &mut store.effects[effect_index];
+                    // The approval operation carries its own expiry, so the
+                    // request binding has to be recomputed against the new
+                    // one or the wallet is asked to honour a stale digest.
+                    effect.approval_expires_at =
+                        now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS);
+                    effect.approval_snapshot = None;
+                    effect.state = TransactionEffectState::Prepared;
+                    rebind_prepared_exact_effect(effect, authority, &request)
+                        .map_err(internal_error)?;
+                    save_transaction_effect_store(state, &store)?;
+                    tracing::debug!(
+                        effect_id = %request.effect_id,
+                        "exact Runtime transaction approval lapsed and was raised again"
+                    );
+                    ensure_effect_wallet_approval(state, authority, &mut store, effect_index)
+                        .await?
+                } else {
+                    let effect = &mut store.effects[effect_index];
+                    effect.approval_snapshot = Some(approval.clone());
+                    if effect.state == TransactionEffectState::Prepared {
+                        effect.state = TransactionEffectState::ApprovalPending;
+                    }
+                    effect.updated_at = now_ts();
+                    save_transaction_effect_store(state, &store)?;
+                    approval
                 }
-                effect.updated_at = now_ts();
-                save_transaction_effect_store(state, &store)?;
-                approval
             }
             None => {
                 let effect = &mut store.effects[effect_index];
