@@ -25,6 +25,7 @@ const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const BOUNDED_READ_KUBO_TIMEOUT: &str = "100ms";
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
 const MAX_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
@@ -920,13 +921,13 @@ impl IpfsProvider {
             // availability. Searching DHT here would spend the whole
             // deadline on a miss and then still fail over. Kubo path cat
             // of a missing DAG also keeps the HTTP call open with
-            // offline=true; a 1ms API timeout fails that miss immediately.
-            // A local hit still returns the bounded range.
+            // offline=true; a short API timeout fails that miss. A local
+            // 64 KiB hit still returns the bounded range after Ready.
             let mut request = agent
                 .post(&format!("{}/api/v0/cat", self.api_url()))
                 .query("arg", &arg)
                 .query("offline", "true")
-                .query("timeout", "1ms")
+                .query("timeout", BOUNDED_READ_KUBO_TIMEOUT)
                 .set("Accept-Encoding", "identity")
                 .timeout(BOUNDED_READ_TIMEOUT);
             if let Some(range) = &range {
@@ -1303,7 +1304,7 @@ impl IpfsProvider {
         write!(body, "--{}--\r\n", boundary).unwrap();
 
         let url = format!(
-            "{}/api/v0/add?wrap-with-directory=true&pin={}",
+            "{}/api/v0/add?wrap-with-directory=true&pin={}&cid-version=1&hash=sha2-256&raw-leaves=true&chunker=size-262144&trickle=false&max-file-links=174&max-directory-links=0&max-hamt-fanout=256&inline=false&inline-limit=32&nocopy=false&fscache=false&preserve-mode=false&preserve-mtime=false&empty-dirs=false&progress=false&fast-provide-root=false&fast-provide-wait=false",
             self.api_url(),
             pin
         );
@@ -2036,7 +2037,7 @@ mod tests {
         assert!(version_headers.starts_with("POST /api/v0/version"));
         assert!(headers.starts_with("POST /api/v0/cat?"));
         assert!(headers.contains("offline=true"));
-        assert!(headers.contains("timeout=1ms"));
+        assert!(headers.contains("timeout=100ms"));
         assert!(headers.contains("offset=8") && headers.contains("length=4"));
         let Response::Ok { data: Some(data) } = result else {
             panic!("bounded read failed");
@@ -2384,7 +2385,7 @@ mod tests {
         for (headers, offset) in [(first, "offset=8"), (second, "offset=12")] {
             assert!(headers.starts_with("POST /api/v0/cat?"));
             assert!(headers.contains("offline=true"));
-            assert!(headers.contains("timeout=1ms"));
+            assert!(headers.contains("timeout=100ms"));
             assert!(headers.contains(offset) && headers.contains("length=4"));
         }
         let Response::Ok { data: Some(data) } = next else {
@@ -2435,7 +2436,7 @@ mod tests {
             assert_eq!(requests.len(), 1, "bounded failure must not follow, retry or prefetch");
             assert!(requests[0].starts_with("POST /api/v0/cat?"));
             assert!(requests[0].contains("offline=true"));
-            assert!(requests[0].contains("timeout=1ms"));
+            assert!(requests[0].contains("timeout=100ms"));
             assert!(matches!(result, Response::Error { .. }));
         }
     }
@@ -2569,7 +2570,7 @@ mod tests {
             );
             assert!(requests[0].0.starts_with("POST /api/v0/cat?"));
             assert!(requests[0].0.contains("offline=true"));
-            assert!(requests[0].0.contains("timeout=1ms"));
+            assert!(requests[0].0.contains("timeout=100ms"));
             assert!(requests[0].1, "bounded Cat must send offset=8 and length=4");
             if ignore_range {
                 assert!(
