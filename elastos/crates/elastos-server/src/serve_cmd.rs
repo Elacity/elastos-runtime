@@ -134,12 +134,7 @@ pub async fn run_serve(
                             .map_err(|e| anyhow::anyhow!("Failed to set token: {}", e))?;
                     }
 
-                    tracing::info!(
-                        "Created session for VM {}: token={}... tap={}",
-                        vm_id,
-                        &shell_session.token[..8],
-                        needs_tap,
-                    );
+                    tracing::info!("Created session for VM {}: tap={}", vm_id, needs_tap,);
                 }
 
                 vm_provider
@@ -317,7 +312,7 @@ pub async fn run_serve(
         .session_registry
         .create_session(session::SessionType::Shell, None)
         .await;
-    let app_session = infra
+    let _app_session = infra
         .session_registry
         .create_session(session::SessionType::Capsule, None)
         .await;
@@ -368,7 +363,6 @@ pub async fn run_serve(
     if let Some(ref cid) = infra.shell_cid {
         println!("  Capsule  shell           {}", cid);
     }
-    println!("  App:     {}", app_session.token);
     println!("  API:     http://{}", addr);
 
     let components_path = data_dir.join("components.json");
