@@ -2,6 +2,7 @@
 """Record and verify unsigned native build inputs. This tool never publishes."""
 
 import argparse
+import base64
 import copy
 from datetime import datetime, timezone
 import hashlib
@@ -58,6 +59,23 @@ def regular_file(root, relative):
     if not stat.S_ISREG(path.stat().st_mode):
         raise ValueError(f"artifact is not a regular file: {relative}")
     return path
+
+
+def catalog_head_cid(data):
+    return "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
+
+
+def admit_model_catalog_artifact(manifest, artifact_root, referenced):
+    pin = manifest.get("model_catalog")
+    if pin is None:
+        return
+    if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
+        raise ValueError("model_catalog.head_cid is required")
+    data = regular_file(artifact_root, "model-catalog.json").read_bytes()
+    actual = catalog_head_cid(data)
+    if actual != pin["head_cid"]:
+        raise ValueError(f"model-catalog.json head {actual} does not match pin {pin['head_cid']}")
+    referenced.add("model-catalog.json")
 
 
 def file_record(path):
@@ -301,6 +319,7 @@ def check_contents(root, platform, omissions):
     check_binary(regular_file(root / "artifacts", f"elastos-{platform}"), platform)
     actual = {str(path.relative_to(root / "artifacts"))
               for path in (root / "artifacts").rglob("*") if not path.is_dir() or path.is_symlink()}
+    admit_model_catalog_artifact(manifest, root / "artifacts", referenced)
     if actual != referenced:
         raise ValueError(f"artifact inventory mismatch: {sorted(actual ^ referenced)}")
     return manifest, template
@@ -397,12 +416,24 @@ def verify(root):
     return receipt
 
 
-def validate_inputs(values, version=None):
+def selected_platforms(preview_platform=None):
+    """The platform set one publication admits: every release platform, or one explicit preview."""
+    if preview_platform is None:
+        return set(PLATFORMS)
+    if preview_platform not in PLATFORMS:
+        raise ValueError(f"preview platform is not a release platform: {preview_platform}")
+    return {preview_platform}
+
+
+def validate_inputs(values, version=None, preview_platform=None):
+    selected = selected_platforms(preview_platform)
     inputs = {}
     for value in values:
         name, sep, path = value.partition("=")
         if not sep or name not in PLATFORMS or name in inputs:
             raise ValueError("inputs require each full release platform exactly once")
+        if name not in selected:
+            raise ValueError(f"input platform is outside the selected publication: {name}")
         receipt = verify(Path(path))
         if receipt["platform"] != name:
             raise ValueError("input label differs from receipt platform")
@@ -420,8 +451,10 @@ def validate_inputs(values, version=None):
             elif not any(info.get(key) for key in ("release_path", "url")):
                 raise ValueError(f"{name}: required Home component has no prepared delivery path: {component_name}")
         inputs[name] = receipt
-    if set(inputs) != set(PLATFORMS):
-        raise ValueError("candidate input requires all three platforms")
+    if set(inputs) != selected:
+        if preview_platform is None:
+            raise ValueError("candidate input requires all three platforms")
+        raise ValueError(f"preview input requires exactly one {preview_platform} input")
     first = next(iter(inputs.values()))
     if version is not None and first["version"] != version:
         raise ValueError("platform input version differs from requested release")
@@ -482,11 +515,20 @@ def merged_input_components(values, receipts):
                     if {k: v for k, v in target.items() if k != "platforms"} != contract:
                         raise ValueError(f"conflicting provider metadata contract: {name}")
                 target.setdefault("platforms", {})[key] = copy.deepcopy(info)
+    # A publication advertises only the platforms it admitted. Template
+    # descriptors for the other release platforms would name artifacts this
+    # publication never stages, so they leave the merged manifest here.
+    unselected = {PLATFORMS[platform][0] for platform in PLATFORMS if platform not in receipts}
+    for component in merged["external"].values():
+        for entry in (component, component.get("capsule_metadata")):
+            if isinstance(entry, dict):
+                for setup in unselected:
+                    entry.get("platforms", {}).pop(setup, None)
     return merged
 
 
-def stage_inputs(values, version, output):
-    receipts = validate_inputs(values, version)
+def stage_inputs(values, version, output, preview_platform=None):
+    receipts = validate_inputs(values, version, preview_platform)
     if output.exists() or output.is_symlink():
         raise ValueError("publication input staging output already exists")
     merged = merged_input_components(values, receipts)
@@ -516,24 +558,26 @@ def stage_inputs(values, version, output):
         (stage / "components.json").write_text(json.dumps(merged, indent=2) + "\n")
         first = next(iter(receipts.values()))
         record = {"version": version, "source": first["source"],
-                  "platforms": list(PLATFORMS), "files": files,
+                  "platforms": sorted(receipts), "files": files,
                   "components": file_record(stage / "components.json")}
         (stage / "assembly.json").write_text(json.dumps(record, indent=2) + "\n")
-        verify_staged_inputs(stage)
+        verify_staged_inputs(stage, preview_platform=preview_platform)
         stage.rename(output)
     return record
 
 
-def verify_staged_inputs(stage, allow_generated=False):
+def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
     record = json.loads(regular_file(stage, "assembly.json").read_text())
     source = record["source"]
     if source_identity(source["commit"], source["tree"]) != source:
         raise ValueError("publication staging source differs from candidate checkout")
-    if set(record["platforms"]) != set(PLATFORMS):
-        raise ValueError("publication staging requires all three platforms")
+    if set(record["platforms"]) != selected_platforms(preview_platform):
+        if preview_platform is None:
+            raise ValueError("publication staging requires all three platforms")
+        raise ValueError(f"publication staging is not the {preview_platform} preview")
     actual = {str(path.relative_to(stage / "artifacts"))
               for path in (stage / "artifacts").rglob("*") if not path.is_dir() or path.is_symlink()}
-    generated = {f"components-{platform}.json" for platform in PLATFORMS} if allow_generated else set()
+    generated = {f"components-{platform}.json" for platform in record["platforms"]} if allow_generated else set()
     if not set(record["files"]) <= actual or actual - set(record["files"]) - generated:
         raise ValueError("staged artifact inventory differs from admitted inputs")
     for name, expected in record["files"].items():
@@ -543,7 +587,8 @@ def verify_staged_inputs(stage, allow_generated=False):
     if file_record(components) != record["components"]:
         raise ValueError("staged components changed after admission")
     manifest = json.loads(components.read_text())
-    for platform, (setup, _, _) in PLATFORMS.items():
+    for platform in record["platforms"]:
+        setup = PLATFORMS[platform][0]
         check_binary(regular_file(stage / "artifacts", f"elastos-{platform}"), platform)
         errors = integrity.audit_manifest(manifest, [setup])
         errors += integrity.audit_release_artifacts(manifest, [setup], stage / "artifacts")
@@ -552,8 +597,8 @@ def verify_staged_inputs(stage, allow_generated=False):
     return record
 
 
-def attach_input_cids(stage, cids_path):
-    record = verify_staged_inputs(stage, allow_generated=True)
+def attach_input_cids(stage, cids_path, preview_platform=None):
+    record = verify_staged_inputs(stage, allow_generated=True, preview_platform=preview_platform)
     cids = json.loads(cids_path.read_text())
     if set(cids) != set(record["files"]) or any(
             not isinstance(cid, str) or not re.fullmatch(r"[A-Za-z0-9]+", cid) for cid in cids.values()):
@@ -564,10 +609,11 @@ def attach_input_cids(stage, cids_path):
             for info in entry.get("platforms", {}).values():
                 if info.get("release_path"):
                     info["cid"] = cids[info["release_path"]]
-    # Each platform gets the same complete manifest. Descriptors were replaced
-    # as units during staging; pinned external URL records remain unchanged.
+    # Each selected platform gets the same complete manifest. Descriptors were
+    # replaced as units during staging; pinned external URL records remain unchanged.
     output_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
-    for platform, (setup, _, _) in PLATFORMS.items():
+    for platform in record["platforms"]:
+        setup = PLATFORMS[platform][0]
         existing = stage / "artifacts" / f"components-{platform}.json"
         if existing.exists() or existing.is_symlink():
             if regular_file(stage / "artifacts", existing.name).read_bytes() != output_bytes:
@@ -576,7 +622,7 @@ def attach_input_cids(stage, cids_path):
         errors += integrity.audit_release_artifacts(manifest, [setup], stage / "artifacts")
         if errors:
             raise ValueError("; ".join(errors))
-    for platform in PLATFORMS:
+    for platform in record["platforms"]:
         output = stage / "artifacts" / f"components-{platform}.json"
         if not output.exists():
             output.write_bytes(output_bytes)
@@ -606,6 +652,9 @@ def main():
     attach = commands.add_parser("attach-cids")
     attach.add_argument("root", type=Path)
     attach.add_argument("--cids", required=True, type=Path)
+    for command in (combined, stage, staged, attach):
+        command.add_argument("--preview-platform", choices=PLATFORMS,
+                             help="admit exactly this one native input instead of all release platforms")
     args = parser.parse_args()
     try:
         if args.command == "record":
@@ -613,13 +662,13 @@ def main():
         elif args.command == "verify":
             print(json.dumps(verify(args.root), sort_keys=True))
         elif args.command == "stage-inputs":
-            stage_inputs(args.input, args.version, args.output)
+            stage_inputs(args.input, args.version, args.output, args.preview_platform)
         elif args.command == "verify-staged":
-            verify_staged_inputs(args.root)
+            verify_staged_inputs(args.root, preview_platform=args.preview_platform)
         elif args.command == "attach-cids":
-            attach_input_cids(args.root, args.cids)
+            attach_input_cids(args.root, args.cids, args.preview_platform)
         else:
-            receipts = validate_inputs(args.input, args.version)
+            receipts = validate_inputs(args.input, args.version, args.preview_platform)
             print(f"Verified source and local bytes for {len(receipts)} platform inputs; publication and installed acceptance remain separate.")
     except (ValueError, OSError, KeyError, TypeError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"Error: {exc}\n")

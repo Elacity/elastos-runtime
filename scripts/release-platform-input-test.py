@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import shutil
 from pathlib import Path
 import struct
@@ -268,6 +269,148 @@ printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
                     self.assertNotIn("shell_cid", release)
                     self.assertNotIn("shell_sha256", release)
                     self.assertTrue((prepared / "later-effect").exists())
+
+    def pin_catalogue(self):
+        """Pin a signed catalogue snapshot in the template and every bundle, as the candidate source does."""
+        catalog = b'{"payload":{"schema":"elastos.model.catalog/v1","entries":[]},"signature":"00","signer_did":"did:key:z6Mkfixture"}\n'
+        pin = {"head_cid": inputs.catalog_head_cid(catalog), "publisher_dids": ["did:key:z6Mkfixture"]}
+        self.template["model_catalog"] = pin
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        for root in self.bundles.values():
+            manifest = json.loads((root / "components.json").read_text())
+            manifest["model_catalog"] = pin
+            self.write_json(root / "components.json", manifest)
+            self.write_json(root / "components-template.json", self.template)
+            (root / "artifacts/model-catalog.json").write_bytes(catalog)
+            self.refresh(root)
+        return pin
+
+    def test_default_admission_rejects_a_single_platform_input(self):
+        darwin = [f"aarch64-darwin={self.bundles['aarch64-darwin']}"]
+        stage = self.root / "publication"
+        with self.assertRaisesRegex(ValueError, "all three platforms"):
+            inputs.validate_inputs(darwin)
+        with self.assertRaisesRegex(ValueError, "all three platforms"):
+            inputs.stage_inputs(darwin, "0.7.1", stage)
+        self.assertFalse(stage.exists())
+
+    def test_mac_preview_admits_one_input_and_keeps_catalogue_and_selected_platform(self):
+        pin = self.pin_catalogue()
+        darwin = [f"aarch64-darwin={self.bundles['aarch64-darwin']}"]
+        linux = [f"x86_64-linux={self.bundles['x86_64-linux']}"]
+        self.assertEqual(set(inputs.validate_inputs(darwin, "0.7.1", "aarch64-darwin")), {"aarch64-darwin"})
+        for values, preview, message in [
+                (darwin, "x86_64-linux", "outside the selected publication"),
+                (darwin + linux, "aarch64-darwin", "outside the selected publication"),
+                ([], "aarch64-darwin", "exactly one aarch64-darwin input"),
+                (darwin, "riscv64-linux", "not a release platform")]:
+            with self.subTest(preview=preview, count=len(values)):
+                with self.assertRaisesRegex(ValueError, message):
+                    inputs.validate_inputs(values, "0.7.1", preview)
+        stage = self.root / "publication"
+        record = inputs.stage_inputs(darwin, "0.7.1", stage, "aarch64-darwin")
+        self.assertEqual(record["platforms"], ["aarch64-darwin"])
+        self.assertEqual(set(record["files"]), {"elastos-aarch64-darwin", "shell-darwin-arm64", "home.tar.gz",
+                                                "shell-metadata.tar.gz", "model-catalog.json"})
+        self.assertEqual(json.loads((stage / "assembly.json").read_text())["platforms"], ["aarch64-darwin"])
+        inputs.verify_staged_inputs(stage, preview_platform="aarch64-darwin")
+        with self.assertRaisesRegex(ValueError, "all three platforms"):
+            inputs.verify_staged_inputs(stage)
+        with self.assertRaisesRegex(ValueError, "not the x86_64-linux preview"):
+            inputs.verify_staged_inputs(stage, preview_platform="x86_64-linux")
+        merged = json.loads((stage / "components.json").read_text())
+        self.assertEqual(merged["model_catalog"], pin)
+        self.assertEqual(set(merged["external"]["shell"]["platforms"]), {"darwin-arm64"})
+        cids = self.root / "cids.json"
+        self.write_json(cids, {name: "bafy" + entry["sha256"] for name, entry in record["files"].items()})
+        with self.assertRaisesRegex(ValueError, "all three platforms"):
+            inputs.attach_input_cids(stage, cids)
+        inputs.attach_input_cids(stage, cids, "aarch64-darwin")
+        generated = sorted(path.name for path in (stage / "artifacts").glob("components-*.json"))
+        self.assertEqual(generated, ["components-aarch64-darwin.json"])
+        final = json.loads((stage / "artifacts/components-aarch64-darwin.json").read_text())
+        self.assertEqual(final["model_catalog"], pin)
+        self.assertTrue(final["external"]["shell"]["platforms"]["darwin-arm64"]["cid"].startswith("bafy"))
+        self.assertEqual((stage / "artifacts/model-catalog.json").read_bytes(),
+                         (self.bundles["aarch64-darwin"] / "artifacts/model-catalog.json").read_bytes())
+        # A tampered input is refused at admission, before any staging output exists.
+        binary_path = self.bundles["aarch64-darwin"] / "artifacts/elastos-aarch64-darwin"
+        binary_path.write_bytes(binary_path.read_bytes()[:-1] + b"!")
+        with self.assertRaisesRegex(ValueError, "differs from receipt"):
+            inputs.stage_inputs(darwin, "0.7.1", self.root / "publication-2", "aarch64-darwin")
+        self.assertFalse((self.root / "publication-2").exists())
+
+    def test_actual_publisher_preview_publishes_only_the_selected_platform(self):
+        pin = self.pin_catalogue()
+        source = self.actual_source_fixture()
+        publisher = (source / "scripts/publish-release.sh").read_text()
+        payload = "RELEASE_PAYLOAD=" + publisher.split("\nRELEASE_PAYLOAD=", 1)[1].split(
+            '\ninfo "Signing release payload', 1)[0]
+        work = self.root / "publisher-preview"
+        work.mkdir()
+        body = r'''source "$1"
+VERSION=0.7.1
+CHANNEL=canary
+TMPDIR="$2/work"
+mkdir "$TMPDIR"
+PLATFORM=aarch64-darwin
+PREVIEW_PLATFORM=aarch64-darwin
+PREVIEW_ARGS=(--preview-platform aarch64-darwin)
+shift 2
+stage_platform_inputs "$TMPDIR/staged" "$@"
+ipfs_add() {
+    printf '%s\n' "$(basename "$1")" >> "$TMPDIR/uploads"
+    printf 'bafy%s\n' "$(sha256 "$1")"
+}
+publish_prepared_platform_inputs "$TMPDIR/staged"
+printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
+PREV_RELEASE_CID=null
+''' + payload + r'''
+printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
+'''
+        result = subprocess.run(["/bin/bash", "-euc", body, "publisher-fixture",
+                                 str(source / "scripts/publish-release.sh"), str(work),
+                                 f"aarch64-darwin={self.bundles['aarch64-darwin']}"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        prepared = work / "work"
+        platforms = json.loads((prepared / "platforms.json").read_text())
+        self.assertEqual(set(platforms), {"aarch64-darwin"})
+        self.assertEqual(sorted((prepared / "uploads").read_text().splitlines()),
+                         ["components-aarch64-darwin.json", "elastos-aarch64-darwin", "home.tar.gz",
+                          "model-catalog.json", "shell-darwin-arm64", "shell-metadata.tar.gz"])
+        release = json.loads((prepared / "release-payload.json").read_text())
+        self.assertEqual((release["channel"], set(release["platforms"])), ("canary", {"aarch64-darwin"}))
+        self.assertEqual(json.loads((prepared / "components.json").read_text())["model_catalog"], pin)
+        self.assertEqual(platforms["aarch64-darwin"]["binary"]["sha256"],
+                         inputs.digest(self.bundles["aarch64-darwin"] / "artifacts/elastos-aarch64-darwin"))
+
+    def test_actual_publisher_preview_rejects_channel_input_count_and_host(self):
+        source = self.actual_source_fixture()
+        darwin = f"aarch64-darwin={os.path.relpath(self.bundles['aarch64-darwin'], self.root)}"
+        linux = f"x86_64-linux={os.path.relpath(self.bundles['x86_64-linux'], self.root)}"
+        base = ["/bin/bash", str(source / "scripts/publish-release.sh"), "--version", "0.7.1",
+                "--key", str(self.root / "missing-key"), "--preview-platform", "aarch64-darwin"]
+        state = self.root / "publisher-state"
+        cases = [
+            ("stable channel", ["--channel", "stable", "--platform-input", darwin], "requires --channel canary"),
+            ("no input", ["--channel", "canary"], "exactly one --platform-input aarch64-darwin=DIR"),
+            ("two inputs", ["--channel", "canary", "--platform-input", darwin, "--platform-input", linux],
+             "exactly one --platform-input aarch64-darwin=DIR"),
+            ("other platform input", ["--channel", "canary", "--platform-input", linux],
+             "exactly one --platform-input aarch64-darwin=DIR"),
+        ]
+        if platform.system() != "Darwin":
+            cases.append(("wrong host", ["--channel", "canary", "--platform-input", darwin],
+                          "must be published from a aarch64-darwin host"))
+        for name, options, message in cases:
+            with self.subTest(case=name):
+                result = subprocess.run(base + options, cwd=self.root,
+                                        env={**os.environ, "ELASTOS_PUBLISH_STATE_DIR": str(state)},
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(state.exists())
 
     def test_actual_publisher_rejects_input_before_state_or_key_inspection(self):
         source = self.actual_source_fixture()

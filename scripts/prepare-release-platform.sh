@@ -134,20 +134,29 @@ for value in sys.argv[1:]:
 PY
 export CARGO_TARGET_DIR ELASTOS_RELEASE_VERSION="$VERSION"
 rustup target list --installed | grep -Fxq "$TARGET" || die "Required Rust target is not installed: $TARGET"
+# Native macOS uses the same Cargo cache as normal source-home builds. Linux
+# keeps its explicit musl target; the receipt still records the actual target.
+BUILD_TARGET="$TARGET"
+if [[ "$PLATFORM" == aarch64-darwin ]]; then
+    [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$TARGET" ]] || die "Rust host differs from native Mac target"
+    BUILD_TARGET=""
+fi
+BUILD_TARGET_ARGS=()
+[[ -z "$BUILD_TARGET" ]] || BUILD_TARGET_ARGS=(--target "$BUILD_TARGET")
 RELEASE_PREPARE_LOCKED=true
 RELEASE_PREPARE_SOURCE_COMMIT="$SOURCE_COMMIT"
 SKIP_BUILD=false
 ARTIFACTS_DIR=""
 info "Preparing ${PLATFORM} from ${SOURCE_COMMIT} (native cache: ${CARGO_TARGET_DIR})"
-(cd elastos && cargo build --locked --release --target "$TARGET" -p elastos-server --bin elastos)
-RUNTIME="$CARGO_TARGET_DIR/$TARGET/release/elastos"
+(cd elastos && cargo build --locked --release ${BUILD_TARGET_ARGS[@]+"${BUILD_TARGET_ARGS[@]}"} -p elastos-server --bin elastos)
+RUNTIME="$CARGO_TARGET_DIR/${BUILD_TARGET:+$BUILD_TARGET/}release/elastos"
 [[ -x "$RUNTIME" ]] || die "Built Runtime is missing: $RUNTIME"
 if [[ "$PLATFORM" == *-linux ]]; then
     scripts/audit-linux-runtime-portability.sh --platform "$PLATFORM" --binary "$RUNTIME" --label "prepared native Runtime"
 fi
 assert_runtime_binary_embeds_release_version "$RUNTIME" "$PLATFORM" "$VERSION"
 cp "$RUNTIME" "$STAGING/artifacts/elastos-$PLATFORM"
-NATIVE_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$TARGET")
+NATIVE_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$BUILD_TARGET")
 APP_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
 PROVIDER_METADATA=$(build_platform_independent_provider_capsule_metadata_assets)
 DIRECT_ASSETS=$(merge_direct_assets "$(merge_direct_assets "$NATIVE_ASSETS" "$APP_ASSETS")" "$PROVIDER_METADATA")
@@ -178,6 +187,9 @@ for asset in "$TMPDIR/supported-assets-$PLATFORM"/* \
     [[ -f "$asset" ]] || continue
     cp "$asset" "$STAGING/artifacts/"
 done
+if [[ -f "$SOURCE_ROOT/model-catalog.json" ]]; then
+    cp "$SOURCE_ROOT/model-catalog.json" "$STAGING/artifacts/model-catalog.json"
+fi
 python3 scripts/release-platform-input.py record \
     --root "$STAGING" --version "$VERSION" --platform "$PLATFORM" --target "$TARGET" \
     --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \

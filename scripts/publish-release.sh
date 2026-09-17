@@ -77,6 +77,7 @@ DEFAULT_CAPSULES=(
     inbox
     assistant
     elacity-player
+    model-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -110,6 +111,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     inbox
     assistant
     elacity-player
+    model-provider
 )
 SUPPORT_BINARY_ASSETS=(
     shell
@@ -177,6 +179,7 @@ show_help() {
     echo "  --allow-signer-rotation  Allow signer DID to differ from the current canonical publisher signer"
     echo "  --gateway-addr     Gateway listen addr for auto-public URL (default: 127.0.0.1:8090)"
     echo "  --platform-input PLATFORM=DIR  Import each of the three reviewed native inputs (repeat three times)"
+    echo "  --preview-platform PLATFORM  Canary preview from exactly one native input for PLATFORM, published from that host"
     echo "  --cross ARCH       Also cross-compile for ARCH (e.g., aarch64). Creates multi-platform release."
     echo "  --public-timeout   Seconds to wait for trycloudflare URL (default: 60)"
     echo "  --help             Show this help"
@@ -186,7 +189,7 @@ show_help() {
     echo -e "${BOLD}Output:${NC}"
     echo "  Publishes per-capsule artifacts + runtime binary as raw CIDs."
     echo "  Creates signed release.json/release-head.json plus content-object sidecars."
-    echo "  Installer downloads only: binary + components.json (2 files)."
+    echo "  Installer downloads the Runtime, components.json, and the pinned model catalog."
     echo "  Use --cross aarch64 when publishing from x86_64 for Jetson installs."
     echo ""
     echo -e "${BOLD}Trust model:${NC}"
@@ -282,10 +285,15 @@ canonical_publisher_gateway() {
 
 inspect_signer_did() {
     if [[ -n "${PREPARED_INPUT_ROOT:-}" ]]; then
+        # The shell has already admitted the native inputs. The prepared Runtime's
+        # dry run only reports the key's signer; a preview passes no inputs because
+        # the Runtime plan admits three platforms and this run selects one.
         local value args=()
-        for value in "${PLATFORM_INPUTS[@]}"; do args+=(--platform-input "$value"); done
+        if [[ -z "$PREVIEW_PLATFORM" ]]; then
+            for value in "${PLATFORM_INPUTS[@]}"; do args+=(--platform-input "$value"); done
+        fi
         "$ELASTOS" publish-release --version "$VERSION" --channel "$CHANNEL" \
-            --key "$KEY_PATH" --dry-run "${args[@]}" \
+            --key "$KEY_PATH" --dry-run ${args[@]+"${args[@]}"} \
             | sed -n 's/^  Signer:[[:space:]]*//p' | head -n1
         return
     fi
@@ -975,6 +983,9 @@ stage_release_artifacts() {
         base=$(basename "$f" .capsule.tar.gz)
         cp -f "$f" "${artifact_dir}/${base}-${PLATFORM}.capsule.tar.gz"
     done
+    if [[ -f model-catalog.json ]]; then
+        cp -f model-catalog.json "${artifact_dir}/model-catalog.json"
+    fi
     if [[ -n "${CROSS_PLATFORM:-}" ]]; then
         CROSS_SRC="${TMPDIR}/artifacts-${CROSS_ARCH}"
         [ -d "$CROSS_SRC" ] || CROSS_SRC="artifacts-${CROSS_ARCH}"
@@ -1099,16 +1110,18 @@ merge_direct_assets() {
 generate_components_json() {
     local capsule_entries="$1"
     local direct_assets="$2"
-    local external profiles
+    local external profiles catalog
     external=$(jq '.external' components.json)
     profiles=$(jq '.profiles' components.json)
+    catalog=$(jq -c '.model_catalog // null' components.json)
     jq -n \
         --arg schema "elastos.components/v1" \
         --argjson capsules "$capsule_entries" \
         --argjson external "$external" \
         --argjson profiles "$profiles" \
         --argjson direct "$direct_assets" \
-        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles}'
+        --argjson catalog "$catalog" \
+        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles} + (if $catalog == null then {} else {model_catalog: $catalog} end)'
 }
 
 runtime_tunnel_url() {
@@ -1142,13 +1155,13 @@ stage_platform_inputs() {
     local value args=()
     for value in "$@"; do args+=(--input "$value"); done
     python3 scripts/release-platform-input.py stage-inputs \
-        --version "$VERSION" --output "$output" "${args[@]}"
+        --version "$VERSION" --output "$output" "${args[@]}" ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"}
 }
 
 publish_prepared_platform_inputs() {
     local root="$1"
     local path cid components_cid components_sha components_size
-    python3 scripts/release-platform-input.py verify-staged "$root" || return
+    python3 scripts/release-platform-input.py verify-staged "$root" ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"} || return
     : > "${TMPDIR}/input-cids.jsonl"
     while IFS= read -r path; do
         cid=$(ipfs_add "$root/artifacts/$path") || return
@@ -1156,7 +1169,7 @@ publish_prepared_platform_inputs() {
     done < <(jq -r '.files | keys[]' "$root/assembly.json")
     jq -s 'add' "${TMPDIR}/input-cids.jsonl" > "${TMPDIR}/input-cids.json" || return
     python3 scripts/release-platform-input.py attach-cids "$root" \
-        --cids "${TMPDIR}/input-cids.json" || return
+        --cids "${TMPDIR}/input-cids.json" ${PREVIEW_ARGS[@]+"${PREVIEW_ARGS[@]}"} || return
     PREPARED_ARTIFACTS_DIR="$root/artifacts"
     components_cid=$(ipfs_add "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
     components_sha=$(sha256 "$PREPARED_ARTIFACTS_DIR/components-${PLATFORM}.json") || return
@@ -1287,6 +1300,30 @@ try:
     if errors:
         raise ValueError("; ".join(errors))
     extra = sorted(set(present) - referenced)
+    pin = None
+    for name in present:
+        if name.startswith("components-") and name.endswith(".json"):
+            try:
+                candidate = json.loads(present[name].read_bytes()).get("model_catalog")
+            except ValueError as exc:
+                raise ValueError(f"{name} is not valid JSON: {exc}")
+            if pin is None:
+                pin = candidate
+            elif pin != candidate:
+                raise ValueError("prepared components disagree on model_catalog")
+    if isinstance(pin, dict):
+        head = pin.get("head_cid")
+        if not isinstance(head, str) or not head:
+            raise ValueError("model_catalog.head_cid is required")
+        if "model-catalog.json" not in present:
+            raise ValueError("advertised model catalog pin is missing model-catalog.json")
+        data = present["model-catalog.json"].read_bytes()
+        digest = hashlib.sha256(data).digest()
+        actual = "b" + __import__("base64").b32encode(b"\x01\x55\x12\x20" + digest).decode("ascii").lower().rstrip("=")
+        if actual != head:
+            raise ValueError(f"model-catalog.json head {actual} does not match pin {head}")
+        referenced.add("model-catalog.json")
+        extra = sorted(set(present) - referenced)
     if extra:
         raise ValueError(f"prepared artifacts are not advertised by this release: {extra}")
 except (OSError, ValueError, TypeError, AttributeError) as exc:
@@ -1423,6 +1460,7 @@ GATEWAY_ADDR="127.0.0.1:8090"
 PUBLIC_URL_TIMEOUT=60
 CROSS_ARCH=""
 PLATFORM_INPUTS=()
+PREVIEW_PLATFORM=""
 CAPSULES_EXPLICIT=false
 STATE_DIR="${ELASTOS_PUBLISH_STATE_DIR:-.}"
 
@@ -1463,6 +1501,9 @@ while [[ $# -gt 0 ]]; do
             [[ "$2" == *=* && -n "$input_path" ]] || die "Usage: --platform-input PLATFORM=DIR"
             [[ "$input_path" == /* ]] || input_path="$PUBLISH_CALLER_DIR/$input_path"
             PLATFORM_INPUTS+=("${input_name}=${input_path}"); shift 2 ;;
+        --preview-platform)
+            [[ -z "${2:-}" ]] && die "Usage: --preview-platform PLATFORM"
+            PREVIEW_PLATFORM="$2"; shift 2 ;;
         --capsules)
             CAPSULES_EXPLICIT=true
             [[ -z "${2:-}" ]] && die "Usage: --capsules name1,name2,..."
@@ -1491,18 +1532,30 @@ if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
     [[ "$SKIP_BUILD" == false && "$SKIP_ROOTFS" == false && -z "$CROSS_ARCH" && "$CAPSULES_EXPLICIT" == false ]] \
         || die "--platform-input conflicts with --skip-build, --skip-rootfs, --cross and --capsules"
 fi
+# A preview publishes one explicitly named native input on the canary channel
+# from that platform's own host. Default admission keeps all three platforms.
+PREVIEW_ARGS=()
+if [[ -n "$PREVIEW_PLATFORM" ]]; then
+    [[ "$CHANNEL" == canary ]] || die "--preview-platform requires --channel canary"
+    [[ ${#PLATFORM_INPUTS[@]} -eq 1 && "${PLATFORM_INPUTS[0]%%=*}" == "$PREVIEW_PLATFORM" ]] \
+        || die "--preview-platform ${PREVIEW_PLATFORM} requires exactly one --platform-input ${PREVIEW_PLATFORM}=DIR"
+    PREVIEW_ARGS=(--preview-platform "$PREVIEW_PLATFORM")
+fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 PREPARED_INPUT_ROOT=""
 if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
     PREPARED_INPUT_ROOT="${TMPDIR}/native-inputs"
-    stage_platform_inputs "$PREPARED_INPUT_ROOT" "${PLATFORM_INPUTS[@]}"
     case "$(uname -s):$(uname -m)" in
         Linux:x86_64) PLATFORM=x86_64-linux; SETUP_PLATFORM=linux-amd64 ;;
         Linux:aarch64|Linux:arm64) PLATFORM=aarch64-linux; SETUP_PLATFORM=linux-arm64 ;;
         Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64 ;;
         *) die "Prepared input publication requires a supported native coordinator" ;;
     esac
+    if [[ -n "$PREVIEW_PLATFORM" && "$PLATFORM" != "$PREVIEW_PLATFORM" ]]; then
+        die "--preview-platform ${PREVIEW_PLATFORM} must be published from a ${PREVIEW_PLATFORM} host (this host is ${PLATFORM})"
+    fi
+    stage_platform_inputs "$PREPARED_INPUT_ROOT" "${PLATFORM_INPUTS[@]}"
     ELASTOS="$PREPARED_INPUT_ROOT/artifacts/elastos-${PLATFORM}"
     HOST_DATA_DIR="$(default_elastos_data_dir)"
     if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
@@ -2205,6 +2258,22 @@ COMPONENTS_JSON=$(generate_components_json "$CAPSULE_ENTRIES" "$HOST_DIRECT_ASSE
 
 echo "$COMPONENTS_JSON" > "${TMPDIR}/components.json"
 validate_generated_components_json "${TMPDIR}/components.json" "$SETUP_PLATFORM"
+python3 - "${TMPDIR}/components.json" model-catalog.json <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+pin = manifest.get("model_catalog")
+if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
+    raise SystemExit("generated components.json dropped model_catalog.head_cid")
+data = pathlib.Path(sys.argv[2]).read_bytes()
+head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
+if head != pin["head_cid"]:
+    raise SystemExit(f"model-catalog.json head {head} does not match pin {pin['head_cid']}")
+PY
 
 COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components.json")
 COMPONENTS_SIZE=$(file_size "${TMPDIR}/components.json")
@@ -2924,7 +2993,7 @@ if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
 else
 echo -e "${DIM}  Capsule artifacts published: ${TOTAL_ARTIFACTS} (${#CAPSULES[@]} capsules × $([ -n "$CROSS_BINARY_CID" ] && echo "2 platforms" || echo "1 platform"))${NC}"
 fi
-echo -e "${DIM}  Installer downloads: binary + components.json (2 files, platform-specific)${NC}"
+echo -e "${DIM}  Installer downloads: Runtime, components.json, and the pinned model catalog${NC}"
 echo -e "${DIM}  Native setup assets are stamped per platform in components.json${NC}"
 echo -e "${DIM}  Browser/static/WASM capsule assets are stamped once under '*' in components.json${NC}"
 echo -e "${DIM}  Capsules downloaded on-demand by supervisor${NC}"
