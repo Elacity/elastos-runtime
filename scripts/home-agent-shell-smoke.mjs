@@ -126,6 +126,12 @@ assert.ok(
 
 assert.ok(homeFace.includes('const TARGET_ID = "assistant"'));
 assert.ok(
+  homeFace.includes("function onAssistantFrameDocumentLoad(") &&
+    homeFace.includes('frame?.addEventListener("load", onAssistantFrameDocumentLoad)') &&
+    homeFace.includes("frameReady = false"),
+  "a replaced Assistant document must handshake ready again so Home can raise the room",
+);
+assert.ok(
   homeWindows.includes('const HOME_AGENT_TARGET_ID = "assistant"') &&
     (homeWindows.match(/targetId === HOME_AGENT_TARGET_ID/g) || []).length === 3 &&
     (homeWindows.match(/showAssistantFace\((?:normalizedLaunchQuery\(options\.query\))?\);/g) || []).length === 2,

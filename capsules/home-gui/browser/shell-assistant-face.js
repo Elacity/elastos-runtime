@@ -218,10 +218,17 @@ function postToFrame(message) {
   target.postMessage(message, "*");
 }
 
-function markFrameReady() {
-  if (frameReady) {
+function onAssistantFrameDocumentLoad() {
+  if (!frame?.dataset.route) {
     return;
   }
+  /* Home keeps dataset.route across a capsule document reload. The new
+     document must handshake ready again, or the room stays empty. */
+  frameReady = false;
+  frame.classList.remove("is-ready");
+}
+
+function markFrameReady() {
   frameReady = true;
   frame?.classList.add("is-ready");
   deps.pushUiPreferencesToFrameWindow(frame?.contentWindow);
@@ -573,6 +580,7 @@ export function bindAssistantFace(dependencies) {
   deps = dependencies;
   spaceEl = document.querySelector("#assistant-space");
   frame = document.querySelector("#assistant-space-frame");
+  frame?.addEventListener("load", onAssistantFrameDocumentLoad);
   registerShellPopover(FACE_ID, () => hideAssistantFace({ instant: true }));
   bindAgentSpace({
     available: () => Boolean(toggleEl()) && !toggleEl().hidden,
