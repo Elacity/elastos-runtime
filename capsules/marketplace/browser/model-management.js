@@ -13,6 +13,29 @@
     preparation_unavailable: "Preparation failed.",
   });
   const failureText = p => FAILURE_TEXT[p.failure_class] || "Preparation failed.";
+  // One phase per Runtime projection. The full view (System) and the compact
+  // Marketplace detail read their copy from the same phase.
+  function phaseOf(r, p, message) {
+    if (message) return "unavailable";
+    if (r.dispatch_ready) return "ready";
+    if (r.admitted) return "service_unavailable";
+    if (active(p)) return p.cancel_requested ? "cancelling" : p.state === "capacity_pending" ? "capacity" : p.state === "uncertain" ? "settling" : p.state === "verifying" ? "verifying" : "preparing";
+    if (!p) return "absent";
+    return p.state;
+  }
+  const PHASE_TEXT = Object.freeze({
+    unavailable: "Current status unavailable", ready: "Available on this device",
+    service_unavailable: "Available on this device. Model service unavailable.",
+    cancelling: "Cancelling preparation…", capacity: "Waiting for local capacity…", settling: "Waiting for preparation to settle…",
+    verifying: "Checking model files…", preparing: "Preparing local files…", absent: "Ready to prepare",
+    reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", expired: "Preparation expired.",
+  });
+  // The compact detail sits under the model's own title, so it speaks about
+  // this device and the Get action instead of the preparation mechanism.
+  const COMPACT_PHASE_TEXT = Object.freeze({
+    ...PHASE_TEXT, absent: "Not on this device yet", preparing: "Getting the model…",
+    reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time",
+  });
   const text = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f]/.test(v);
   function check(ok) { if (!ok) throw new Error("Invalid model response"); }
   function parseRuntime(r, cid) {
@@ -229,9 +252,10 @@
         };
         root.replaceChildren();
         const refresh = button("Refresh models", () => void load(), loading);
-        refresh.dataset.modelControl = "refresh"; root.append(refresh);
+        refresh.dataset.modelControl = "refresh";
+        if (!compact) root.append(refresh);
         const status = element("p", loading ? "Loading models…" : message);
-        status.setAttribute("role", "status"); root.append(status);
+        status.setAttribute("role", "status"); status.hidden = compact && !status.textContent; root.append(status);
         if (!model) {
           if (!loading && !message && !requiredCid && choices.length > 1) {
             root.append(element("p", "Select a verified model. Keep and removal apply to the model you select."));
@@ -244,10 +268,12 @@
               list.append(row);
             }
             root.append(list);
+            if (compact) root.append(refresh);
             restoreFocus();
             return;
           }
           if (!loading && !message) root.append(element("p", "No verified model is available. Ask your administrator to configure a trusted catalog."));
+          if (compact) root.append(refresh);
           restoreFocus();
           return;
         }
@@ -260,16 +286,15 @@
             element("p", `Content ID: ${model.cid}`, "model-identity"));
           row.append(identity);
         }
-        const label = message ? "Current status unavailable" : r.dispatch_ready ? "Available on this device" : r.admitted ? "Available on this device. Model service unavailable."
-          : active(p) ? (p.cancel_requested ? "Cancelling preparation…" : p.state === "capacity_pending" ? "Waiting for local capacity…" : p.state === "uncertain" ? "Waiting for preparation to settle…" : p.state === "verifying" ? "Checking model files…" : "Preparing local files…")
-            : p ? ({ reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", failed: failureText(p), expired: "Preparation expired." }[p.state] || "Waiting to prepare…") : "Ready to prepare";
+        const phase = phaseOf(r, p, message);
+        const label = phase === "failed" ? failureText(p) : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
         row.append(element("p", label));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;
           progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${formatBytes(p.completed_bytes)} of ${formatBytes(p.total_bytes)} prepared`));
         }
         const controls = element("div", "", "model-controls");
-        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : "Use", () => void act("use"), active(p) || reconcileRequired);
+        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Use", () => void act("use"), active(p) || reconcileRequired);
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
@@ -283,11 +308,14 @@
         toggle.addEventListener("change", () => void act("retention", toggle.checked));
         labelNode.append(toggle, document.createTextNode("Keep on this device")); controls.append(labelNode);
         row.append(controls);
-        row.append(element("p", r.kept
-          ? (r.admitted ? "Kept on this device. Release this choice to allow cache cleanup." : "Keep choice saved for this preparation.")
-          : "Prepared files can be removed during cache cleanup.", "model-hint"));
-        row.append(element("p", "The model loads into memory when you use it in Assistant.", "model-hint"));
+        if (!compact) {
+          row.append(element("p", r.kept
+            ? (r.admitted ? "Kept on this device. Release this choice to allow cache cleanup." : "Keep choice saved for this preparation.")
+            : "Prepared files can be removed during cache cleanup.", "model-hint"));
+          row.append(element("p", "The model loads into memory when you use it in Assistant.", "model-hint"));
+        }
         root.append(row);
+        if (compact) root.append(refresh);
         if (!requiredCid && choices.length > 1) {
           const back = button("Choose another model", () => { selectedCid = null; model = null; void load(); });
           back.dataset.modelControl = "choose-another";

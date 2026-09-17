@@ -9,8 +9,8 @@ for (const capsule of ["system", "marketplace"]) {
 }
 const context = { window: {} };
 vm.runInNewContext(source.replace("window.ElastosModelManagement = {",
-  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry }; window.ElastosModelManagement = {"), context);
-const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry } = context.window.testFailure;
+  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT }; window.ElastosModelManagement = {"), context);
+const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT } = context.window.testFailure;
 const cid = `bafybei${"a".repeat(52)}`;
 const preparation = { operation_id: "fixture", cid, state: "failed", total_bytes: 1024,
   completed_bytes: 512, cancel_requested: false, admitted: false, activation_pending: false };
@@ -55,4 +55,35 @@ assert.equal(selectCatalogEntry(two, cid).cid, cid);
 assert.equal(selectCatalogEntry(two, otherCid).cid, otherCid);
 assert.equal(selectCatalogEntry(two, `bafybei${"d".repeat(52)}`), null);
 assert.equal(selectCatalogEntry(two.slice(0, 1), null).cid, cid);
-console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection");
+// One phase per projection. The full view keeps its established copy; the
+// compact Marketplace detail changes only the device-centred lines.
+const projection = (state, extra = {}) => ({ admitted: false, dispatch_ready: false, offer_id: null,
+  preparation: state === null ? null : { ...preparation, state, cancel_requested: false, failure_class: undefined, ...extra } });
+const phases = {
+  absent: [projection(null), null], ready: [{ ...projection("admitted"), admitted: true, dispatch_ready: true, offer_id: `model:${"b".repeat(64)}` }, null],
+  service_unavailable: [{ ...projection("admitted"), admitted: true }, null],
+  cancelling: [projection("preparing", { cancel_requested: true }), null], capacity: [projection("capacity_pending"), null],
+  settling: [projection("uncertain"), null], verifying: [projection("verifying"), null], preparing: [projection("preparing"), null],
+  failed: [projection("failed", { failure_class: "verification_failed" }), null], reclaimed: [projection("reclaimed"), null],
+  cancelled: [projection("cancelled"), null], expired: [projection("expired"), null],
+  unavailable: [projection("preparing"), "Status is unavailable. Refresh to check before trying again."],
+};
+for (const [expected, [r, message]] of Object.entries(phases)) {
+  assert.equal(phaseOf(r, r.preparation, message), expected);
+}
+for (const reservedLike of ["reserved", "admission_pending"]) {
+  assert.equal(phaseOf(projection(reservedLike), projection(reservedLike).preparation, ""), "preparing", `${reservedLike} is an active preparation`);
+}
+// Table values cross the vm realm; compare their entries, not their prototype.
+const plain = table => Object.fromEntries(Object.entries(table));
+assert.deepEqual(plain(PHASE_TEXT), {
+  unavailable: "Current status unavailable", ready: "Available on this device",
+  service_unavailable: "Available on this device. Model service unavailable.",
+  cancelling: "Cancelling preparation…", capacity: "Waiting for local capacity…", settling: "Waiting for preparation to settle…",
+  verifying: "Checking model files…", preparing: "Preparing local files…", absent: "Ready to prepare",
+  reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", expired: "Preparation expired.",
+});
+assert.deepEqual(plain(COMPACT_PHASE_TEXT), { ...plain(PHASE_TEXT), absent: "Not on this device yet", preparing: "Getting the model…",
+  reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time" });
+assert.deepEqual(Object.keys(PHASE_TEXT).sort(), Object.keys(phases).filter(name => name !== "failed").sort(), "every phase except failed reads its copy from the table");
+console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection, phase copy tables");

@@ -116,6 +116,11 @@ const browser = await chromium.launch({ executablePath: brave, headless: true })
 let activePage;
 try {
   for (const app of ["marketplace", "system"]) {
+    // Marketplace renders the compact detail: Get instead of Use, device-centred phase copy, no hints.
+    const acquire = app === "marketplace" ? "Get" : "Use";
+    const copy = app === "marketplace"
+      ? { absent: "Not on this device yet", reclaimed: "Removed from this device" }
+      : { absent: "Ready to prepare", reclaimed: "Model removed from local cache." };
     phase = "unprepared"; kept = false; failure = false; calls.length = 0;
     selectedCid = cid; executable = true; trust = "verified";
     const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
@@ -151,22 +156,23 @@ try {
     assert.equal(calls.filter(c => c.method === "content.use").length, 0, "pending status never starts another Use");
     phase = "reclaimed";
     await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByText("Model removed from local cache.", { exact: true }).waitFor();
-    assert.equal(await frame.getByRole("button", { name: "Use", exact: true }).isEnabled(), true);
+    await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isEnabled(), true);
     assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isEnabled(), false);
     phase = "unprepared";
     await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByText("Ready to prepare", { exact: true }).waitFor();
+    await frame.getByText(copy.absent, { exact: true }).waitFor();
     let releaseUse;
     const useReceived = new Promise(resolveUse => { delayUse = reply => { releaseUse = reply; resolveUse(); }; });
-    await frame.getByRole("button", { name: "Use", exact: true }).evaluate(button => { button.click(); button.click(); });
+    await frame.getByRole("button", { name: acquire, exact: true }).evaluate(button => { button.click(); button.click(); });
     await useReceived;
     assert.equal(calls.filter(c => c.method === "content.use").length, 1, "double-click dispatches once");
     delayUse = null; releaseUse();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, 1);
     await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
-    await frame.getByText("Keep choice saved for this preparation.", { exact: true }).waitFor();
+    if (app === "marketplace") await frame.locator('[data-model-control="keep"]:enabled:checked').waitFor();
+    else await frame.getByText("Keep choice saved for this preparation.", { exact: true }).waitFor();
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.locator('[data-model-management] input:enabled:checked').waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, 1, "retention never starts another preparation");
@@ -246,20 +252,20 @@ try {
     await page.setViewportSize({ width: 1100, height: 800 });
     phase = "unprepared"; kept = false;
     await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByRole("button", { name: "Use", exact: true }).waitFor();
+    await frame.getByRole("button", { name: acquire, exact: true }).waitFor();
     let releaseCatalog;
     const catalogReceived = new Promise(resolveCatalog => { delayCatalog = reply => { releaseCatalog = reply; resolveCatalog(); }; });
     const beforeRefreshUses = calls.filter(c => c.method === "content.use").length;
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await catalogReceived;
-    assert.equal(await frame.getByRole("button", { name: "Use", exact: true }).isDisabled(), true);
-    await frame.getByRole("button", { name: "Use", exact: true }).evaluate(n => n.click());
+    assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isDisabled(), true);
+    await frame.getByRole("button", { name: acquire, exact: true }).evaluate(n => n.click());
     assert.equal(calls.filter(c => c.method === "content.use").length, beforeRefreshUses, "catalog refresh blocks old-model mutation");
     delayCatalog = null; releaseCatalog();
     await frame.locator('[data-model-control="use"]:enabled').waitFor();
     loseUseResponse = true;
     const usesBeforeLoss = calls.filter(c => c.method === "content.use").length;
-    await frame.getByRole("button", { name: "Use", exact: true }).click();
+    await frame.getByRole("button", { name: acquire, exact: true }).click();
     await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).isDisabled(), true);
     loseUseResponse = false;
@@ -270,16 +276,16 @@ try {
     assert.equal(new Set(lostRequests.map(c => c.request_id)).size, 1, "transport retries and reconciliation preserve the same Use identity");
     phase = "unprepared"; kept = false;
     await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByRole("button", { name: "Use", exact: true }).waitFor();
+    await frame.getByRole("button", { name: acquire, exact: true }).waitFor();
     wrongIdentity = true;
-    await frame.getByRole("button", { name: "Use", exact: true }).click();
+    await frame.getByRole("button", { name: acquire, exact: true }).click();
     await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "mismatched response cannot install an operation");
     wrongIdentity = false;
     executable = false;
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByText("Models are unavailable. Check your connection and trusted catalog, then retry.", { exact: true }).waitFor();
-    assert.equal(await frame.getByRole("button", { name: "Use", exact: true }).count(), 0);
+    assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).count(), 0);
     executable = true; trust = "unavailable";
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByText("Models are unavailable. Check your connection and trusted catalog, then retry.", { exact: true }).waitFor();
@@ -355,7 +361,7 @@ try {
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "late old operation cannot replace new identity");
     assert.match(await frame.locator(app === "marketplace" ? ".model-content-identity" : ".model-identity").innerText(), new RegExp(selectedCid));
     if (app === "marketplace") {
-      await frame.getByRole("button", { name: "Use", exact: true }).waitFor();
+      await frame.getByRole("button", { name: acquire, exact: true }).waitFor();
       const detailCid = selectedCid;
       await frame.locator("[data-model-management]").evaluate(node => {
         window.fixtureOpenModelDetail = node;
