@@ -283,7 +283,7 @@ async fn test_chat_room_summary_is_available_without_shell_launch_token() {
 async fn test_chat_room_session_start_connects_open_room_local_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
 
     let launch = app
         .clone()
@@ -323,14 +323,14 @@ async fn test_chat_room_session_start_connects_open_room_local_runtime() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["status"], "connected");
-    assert_eq!(payload["display_name"], "anders");
+    assert_eq!(payload["display_name"], "owner");
 }
 
 #[tokio::test]
 async fn test_chat_room_join_link_create_returns_elastos_join_object() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
     let profile = load_profile_for_authority(dir.path(), &authority);
 
     let launch = app
@@ -417,7 +417,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
 async fn test_chat_room_join_link_create_rejects_caller_supplied_issuer_gateway() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
 
     let launch = app
         .clone()
@@ -479,7 +479,7 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
     )
     .unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
 
     let launch = app
         .clone()
@@ -527,7 +527,7 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
 #[tokio::test]
 async fn test_chat_room_session_start_connects_active_local_member() {
     let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
     let profile = load_profile_for_authority(dir.path(), &authority);
     crate::room_service::seed_room_owner(
         dir.path(),
@@ -579,7 +579,7 @@ async fn test_chat_room_session_start_connects_active_local_member() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert!(cookie.starts_with("room-session="));
     assert_eq!(payload["status"], "connected");
-    assert_eq!(payload["display_name"], "anders");
+    assert_eq!(payload["display_name"], "owner");
     assert!(payload["poll"]["participants"]
         .as_array()
         .unwrap()
@@ -627,7 +627,7 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
             .into_iter()
             .filter(|object| object.get("collaboration_scope").is_none())
             .count();
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
     let port = crate::collaboration_product::test_chat_product_port(
         dir.path(),
         "route-network",
@@ -1129,7 +1129,7 @@ async fn configured_chat_rejects_every_legacy_control_and_guest_route_before_mut
 #[tokio::test]
 async fn unconfigured_chat_room_access_policy_uses_strict_post_guard_decoding() {
     let dir = tempfile::tempdir().unwrap();
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
     let profile = load_profile_for_authority(dir.path(), &authority);
     crate::room_service::seed_room_owner(
         dir.path(),
@@ -1321,7 +1321,7 @@ async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
 async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_session() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
 
     let launch = app
         .clone()
@@ -1412,7 +1412,7 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
     let objects = payload["objects"].as_array().cloned().unwrap_or_default();
     assert!(objects.iter().any(|object| {
         object["kind"].as_str() == Some("text")
-            && object["sender"].as_str() == Some("anders")
+            && object["sender"].as_str() == Some("owner")
             && object["body"].as_str() == Some("home identity wins")
     }));
 }

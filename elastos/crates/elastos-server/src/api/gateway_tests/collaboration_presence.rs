@@ -268,8 +268,8 @@ async fn configured_room_poll_renders_signed_profile_names_only() {
         .await
         .unwrap(),
     );
-    let authority = passkey_authority_with_name(dir.path(), Some("Anders"));
-    install_signed_profile(dir.path(), &authority, "Anders Signed");
+    let authority = passkey_authority_with_name(dir.path(), Some("Owner"));
+    install_signed_profile(dir.path(), &authority, "Owner Signed");
     let now = crate::auth::now_ts();
     let app = gateway_router(state);
 
@@ -366,7 +366,7 @@ async fn configured_room_poll_renders_signed_profile_names_only() {
         .iter()
         .find(|object| object["body"].as_str() == Some("local hello"))
         .expect("local text projected");
-    assert_eq!(local_object["sender"].as_str(), Some("Anders Signed"));
+    assert_eq!(local_object["sender"].as_str(), Some("Owner Signed"));
     assert_eq!(local_object["sender_profile_verified"], json!(true));
     let remote_object = objects
         .iter()
@@ -393,11 +393,11 @@ async fn configured_room_poll_renders_signed_profile_names_only() {
     assert_eq!(remote_participant["profile_verified"], json!(true));
     let local_participant = participants
         .iter()
-        .find(|participant| participant["display_name"].as_str() == Some("Anders Signed"))
+        .find(|participant| participant["display_name"].as_str() == Some("Owner Signed"))
         .expect("local participant listed");
     assert_eq!(
         local_participant["display_name"].as_str(),
-        Some("Anders Signed")
+        Some("Owner Signed")
     );
     assert_eq!(local_participant["profile_verified"], json!(true));
 }

@@ -4528,13 +4528,13 @@ mod tests {
             },
             "identity": {
                 "profile": {
-                    "display_name": "Anders",
-                    "handle": "person:anders"
+                    "display_name": "Owner",
+                    "handle": "person:owner"
                 }
             },
             "authority": {
                 "signed_in": true,
-                "principal_id": "person:anders"
+                "principal_id": "person:owner"
             },
             "active_shell": {
                 "schema": "elastos.home.active-shell/v1",
@@ -4545,7 +4545,7 @@ mod tests {
                 "contact_count": 1,
                 "contacts": [{
                     "contact_id": "contact-a",
-                    "display_name": "Anders",
+                    "display_name": "Owner",
                     "relationship": "accepted",
                     "route": "elastos://peer/contact-a",
                     "can_message": true
@@ -4607,11 +4607,11 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .display_name,
-            "Anders"
+            "Owner"
         );
         assert_eq!(
             projection.authority.as_ref().unwrap().principal_id,
-            "person:anders"
+            "person:owner"
         );
         assert!(projection.authority.as_ref().unwrap().signed_in);
         assert_eq!(

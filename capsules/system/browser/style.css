@@ -1735,7 +1735,7 @@ code {
 }
 
 /* ---- Freeze additions kept over the original sheet ----
-   Anders' post-split features (detail view / lock screen / sidebar icons)
+   Post-split features (detail view / lock screen / sidebar icons)
    that the original sheet predates. Pinned by home-entropy-check. ---- */
 
 .system-locked {

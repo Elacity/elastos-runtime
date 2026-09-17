@@ -6536,15 +6536,15 @@ mod tests {
         let first = start_local_runtime_session(tmp.path(), &did, "Local runtime", "ElastOS shell")
             .unwrap();
         let second =
-            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+            start_local_runtime_session(tmp.path(), &did, "owner", "ElastOS shell").unwrap();
 
         assert_eq!(first.token, second.token);
-        assert_eq!(second.display_name, "anders");
+        assert_eq!(second.display_name, "owner");
 
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 1);
         assert_eq!(summary.active_participants.len(), 1);
-        assert_eq!(summary.active_participants[0].display_name, "anders");
+        assert_eq!(summary.active_participants[0].display_name, "owner");
         assert_eq!(
             summary.active_participants[0].member_did.as_deref(),
             Some(did.as_str())
@@ -6557,7 +6557,7 @@ mod tests {
         let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
 
         let local =
-            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+            start_local_runtime_session(tmp.path(), &did, "owner", "ElastOS shell").unwrap();
         let _ = append_object(tmp.path(), &local.token, "hello from shell").unwrap();
 
         let request =
@@ -6575,7 +6575,7 @@ mod tests {
         assert!(poll
             .participants
             .iter()
-            .any(|participant| participant.display_name == "anders"
+            .any(|participant| participant.display_name == "owner"
                 && !participant.is_current_session));
         assert!(poll
             .objects
@@ -6590,16 +6590,14 @@ mod tests {
         let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
 
         let local =
-            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+            start_local_runtime_session(tmp.path(), &did, "owner", "ElastOS shell").unwrap();
         let sent = append_object(tmp.path(), &local.token, "hello from shell").unwrap();
         assert!(sent.from_current_session);
 
         let poll = room_poll(tmp.path(), &local.token, 0).unwrap();
-        assert!(poll
-            .participants
-            .iter()
-            .any(|participant| participant.display_name == "anders"
-                && participant.is_current_session));
+        assert!(poll.participants.iter().any(
+            |participant| participant.display_name == "owner" && participant.is_current_session
+        ));
         assert!(poll
             .objects
             .iter()

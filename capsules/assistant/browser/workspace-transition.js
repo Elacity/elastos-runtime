@@ -118,7 +118,7 @@ export function migrateLegacyWorkspaces(legacy = {}, canonicalDocument = {}) {
   result.projects = list(result.projects);
   result.legacyImports = object(result.legacyImports) ? result.legacyImports : {};
   const existingIds = new Set([...result.sessions, ...result.projects].map(record => record.id));
-  // The current Sash workspace supplies the active view; every other selection
+  // The current Home Agent workspace supplies the active view; every other selection
   // remains in its source snapshot instead of silently replacing that choice.
   for (const source of ["homeAgent", "assistant", "homeSessionAgent"]) {
     const raw = legacy[source];

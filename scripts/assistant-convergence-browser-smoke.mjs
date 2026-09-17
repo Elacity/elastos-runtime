@@ -32,8 +32,8 @@ const legacy = {
     document: {
       v: 1, activeSessionId: "collision", sessionMode: "chat",
       liveOfferId: offerId, selectedModelCid: cid,
-      sessions: [{ id: "collision", title: "Sash imported conversation", messages: [
-        { id: "message-0", role: "user", text: "Sash history survives" },
+      sessions: [{ id: "collision", title: "Home Agent imported conversation", messages: [
+        { id: "message-0", role: "user", text: "Home Agent history survives" },
         { id: "grant-0", role: "grant", text: "Historical grant record survives", decision: "approved" },
         { id: "tool-0", role: "tool", text: "Historical tool result survives" },
         { id: "system-0", role: "system", text: "Historical system context survives" },
@@ -172,7 +172,7 @@ try {
   assertComplete(stored.document);
   assert.equal(await frame.locator("#agent-harness-sidebar").count(), 1);
   assert.equal(await frame.locator("#assistant-sidebar").count(), 0);
-  for (const title of ["Assistant complete history", "Sash imported conversation", "Home session imported conversation",
+  for (const title of ["Assistant complete history", "Home Agent imported conversation", "Home session imported conversation",
     "Assistant saved draft", "Home Agent saved draft", "Home saved draft"]) {
     assert.equal(await frame.locator(".agent-harness-session-btn").filter({ hasText: title }).count(), 1, title);
   }
@@ -181,7 +181,7 @@ try {
   await frame.locator("#agent-harness-stream-column").getByText("END-63", {exact:false}).first().waitFor({state:"attached"});
   const transcript = await frame.locator("#agent-harness-stream-column").textContent();
   for (let index = 0; index < 64; index++) assert.ok(transcript.includes(`END-${index}`), `Missing rendered message ${index}`);
-  await choose(frame, "Sash imported conversation");
+  await choose(frame, "Home Agent imported conversation");
   for (const role of ["grant", "tool", "system"]) {
     await frame.locator(`#agent-harness-stream-column .agent-msg-${role}`).getByText(`Historical ${role}`, {exact:false}).waitFor({state:"attached"});
   }

@@ -887,7 +887,7 @@ assert(
   assistantIndex.includes('<script type="module" src="./home-agent.js"></script>') &&
     assistantEntry.includes('from "./assistant-modes.js"') &&
     assistantModes.includes('from "./assistant.js"') && assistantModes.includes("studioOnly: true"),
-  "Assistant boots the Sash shell and uses the typed controller for Studio",
+  "Assistant boots the canonical shell and uses the typed controller for Studio",
 );
 assert(
   assistantController.includes('from "./model-contract.js"'),

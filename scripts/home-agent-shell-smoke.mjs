@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-/* Canonical Assistant Sash capsule gate.
+/* Canonical Assistant capsule gate.
 
-   Encodes what the capsule owes the Runtime and Home GUI, in Anders' terms:
+   Encodes what the capsule owes the Runtime and Home GUI, through these contracts:
    - inference runs only through the typed model contract (offers_list,
      runs_create with a typed input, runs_events by after_sequence, runs_cancel);
      no offer is named in source, no ping, no mock provider, no mock reply,
@@ -169,7 +169,7 @@ assert.ok(!indexHtml.includes('data-sidebar-nav="studio"'), "Studio uses the sha
 for (const mode of ["chat", "build", "studio"]) {
   assert.ok(indexHtml.includes(`data-assistant-mode="${mode}"`), `${mode} is a canonical Assistant mode`);
 }
-assert.equal((indexHtml.match(/id="agent-harness-sidebar"/g) || []).length, 1, "one Sash sidebar");
+assert.equal((indexHtml.match(/id="agent-harness-sidebar"/g) || []).length, 1, "one Assistant sidebar");
 const modes = read("capsules/assistant/browser/assistant-modes.js");
 assert.ok(modes.includes('from "./assistant.js"') && modes.includes("studioOnly: true"), "Studio uses the typed controller");
 for (const theatre of [
@@ -482,4 +482,4 @@ assert.throws(
 assert.throws(() => contract.applyRunEventsPage({ events: "nope" }, 0), /malformed/);
 assert.throws(() => contract.applyRunEventsPage(null, 0), /malformed/);
 
-console.log("canonical Assistant Sash shell smoke: ok");
+console.log("canonical Assistant shell smoke: ok");

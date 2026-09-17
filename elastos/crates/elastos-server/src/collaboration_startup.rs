@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn bounded_presence_projection_diagnostic_flattens_multiline_errors() {
-        let raw = "presence projection failed\n/Users/anders/secret\nretry\tlater";
+        let raw = "presence projection failed\n/Users/owner/secret\nretry\tlater";
         let bounded = bounded_presence_projection_diagnostic(&raw);
         assert_eq!(bounded, "presence projection failed <path> retry later");
         assert!(!bounded.contains('\n'));

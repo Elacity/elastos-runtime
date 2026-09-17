@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn nickname_validation_accepts_simple_value() {
-        assert!(elastos_identity::validate_nickname("anders").is_ok());
+        assert!(elastos_identity::validate_nickname("owner").is_ok());
     }
 
     #[test]

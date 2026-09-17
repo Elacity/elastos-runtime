@@ -2330,10 +2330,10 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let ui = ChatTerminalUi::buffer(Arc::clone(&output));
 
-        report_chat_send_outcome(ChatSendOutcome::Delivered, "anders", "hello", Some(&ui));
+        report_chat_send_outcome(ChatSendOutcome::Delivered, "owner", "hello", Some(&ui));
 
         let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert!(rendered.contains("<anders> hello"));
+        assert!(rendered.contains("<owner> hello"));
     }
 
     #[test]
@@ -2341,10 +2341,10 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let ui = ChatTerminalUi::buffer(Arc::clone(&output));
 
-        report_chat_send_outcome(ChatSendOutcome::LocalOnly, "anders", "hello", Some(&ui));
+        report_chat_send_outcome(ChatSendOutcome::LocalOnly, "owner", "hello", Some(&ui));
 
         let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert!(rendered.contains("<anders> hello"));
+        assert!(rendered.contains("<owner> hello"));
         assert!(rendered.contains("message stayed local"));
     }
 
@@ -2370,7 +2370,7 @@ mod tests {
     fn incoming_message_from_same_nick_but_different_did_is_rendered() {
         let msg = serde_json::json!({
             "sender_id": "did:key:peer",
-            "sender_nick": "anders",
+            "sender_nick": "owner",
             "content": "hello",
         });
         assert!(should_render_incoming_message(
@@ -2385,7 +2385,7 @@ mod tests {
         let msg = serde_json::json!({
             "sender_id": "did:key:self",
             "sender_session_id": "session-self",
-            "sender_nick": "anders",
+            "sender_nick": "owner",
             "content": "hello",
         });
         assert!(!should_render_incoming_message(

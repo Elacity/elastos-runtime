@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import runpy
 import unittest
@@ -10,7 +11,13 @@ from types import SimpleNamespace
 
 
 HELPER = runpy.run_path(str(Path(__file__).with_name("browser-webrtc-send-diagnostic.py")))
-DUMPED = Path("/Users/anders/Code/elastos-runtime/.git/browser-analysis/u9-r8-gstwebrtc-app-76967c5b.py")
+
+
+def dumped_source():
+    path = os.environ.get("ELASTOS_BROWSER_GST_SOURCE")
+    if not path:
+        raise RuntimeError("Set ELASTOS_BROWSER_GST_SOURCE to the pinned gstwebrtc_app.py fixture")
+    return Path(path).read_text()
 
 
 class Pad:
@@ -64,11 +71,11 @@ class Buffer:
 
 class TestPatch(unittest.TestCase):
     def test_dumped_image_source_matches_pin(self):
-        text = DUMPED.read_text()
+        text = dumped_source()
         self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), HELPER["BASE_SHA256"])
 
     def test_patch_is_idempotent_on_dumped_source(self):
-        text = DUMPED.read_text()
+        text = dumped_source()
         once = HELPER["patch_source"](text)
         twice = HELPER["patch_source"](once)
         self.assertEqual(once, twice)

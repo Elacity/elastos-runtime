@@ -8189,7 +8189,7 @@ mod tests {
             &admission,
             &ceremony,
             Some(&response),
-            Some("Anders"),
+            Some("Owner"),
             crate::auth::now_ts(),
         )
         .unwrap()
@@ -8201,7 +8201,7 @@ mod tests {
             &registered.proof_binding_id,
         )
         .unwrap();
-        assert_eq!(principal.display_name, "Anders");
+        assert_eq!(principal.display_name, "Owner");
         let legacy_record = serde_json::to_value(&principal).unwrap();
         assert!(legacy_record.get("initial_profile_display_name").is_none());
         assert!(

@@ -41,29 +41,6 @@ Portable packages can contain compatible platform payloads selected by Runtime.
 Remote service use invokes an instance on another Runtime. Both paths need proof;
 one successful remote session does not prove package portability.
 
-## Evidence that sets the initial priorities
-
-The initial analysis found these repair targets. Its exact source revision is
-recorded in the [Browser maturity workstream](../TASKS.md#browser-maturity-workstream).
-
-- Artifact setup can report success with required Engine artifacts missing.
-  Home can offer an Engine from configuration or binary presence before launch
-  readiness is established.
-- Continuous wheel input uses a trailing delay that can withhold events until
-  the gesture stops. Horizontal input also needs a regression case.
-- A temporary heartbeat or status request failure can close the display and
-  trigger page cleanup before reconnection has a chance to recover.
-- Shared synchronous provider request handling can delay unrelated session
-  operations behind an Engine launch.
-- Remote Engine setup still needs operator transport machinery, while the
-  user service-request path handles Exit. Engine needs the same Runtime service
-  model.
-
-These findings set the order below. They do not establish the cause of another
-person's failure without that installation's diagnostic receipt. The inspected
-Brave session failed before an active Browser page; it supplied startup evidence,
-not media or usability acceptance evidence.
-
 ## Execution order
 
 B01-B16 define release acceptance areas. Current execution slices, owners and

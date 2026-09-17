@@ -14,7 +14,7 @@ function legacyFixture() {
     v: 1, activeSessionId: "same", liveOfferId: "chosen", selectedModelCid: cid,
     projects: [{ id: "project", title: "Project", extra: true }],
     composerDraft: { text: "Home Agent draft", parts: [{ id: "attachment", text, uri: "localhost://Users/user/notes", authority: "untrusted_content", extra: "retain" }] },
-    sessions: [{ id: "same", projectId: "project", title: "Sash chat", archived: true, branchId: "branch", messages: [
+    sessions: [{ id: "same", projectId: "project", title: "Home Agent chat", archived: true, branchId: "branch", messages: [
       { id: "m", branchId: "branch", role: "user", text, parts: [{ uri: "localhost://notes", text, extra: true }] },
       { id: "m2", parentId: "m", branchId: "branch", role: "grant", summary: "Pending", args: { exact: true }, requestId: "original-grant-request" },
     ], lastTurn: { providerRunId: "original-run", createRequestId: "original-request", turnId: "turn", state: "settlement_unknown" } }],
@@ -41,14 +41,14 @@ test("imports all stores, full history, unknown fields and each draft without mu
   assert.equal(assistant.messages[3].role, "tool");
   assert.equal(assistant.messages[63].run_id, "run-63");
   assert.equal(assistant.messages[63].futureMessage, 63);
-  const sash = doc.sessions.find(s => s.legacyOrigin.source === "homeAgent" && s.legacyOrigin.id === "same");
-  assert.equal(sash.archived, true);
-  assert.equal(sash.messages[1].role, "grant");
-  assert.equal(sash.messages[1].requestId, "original-grant-request");
-  assert.deepEqual(sash.lastTurn, { ...legacy.homeAgent.document.sessions[0].lastTurn, actorCapsule: "home-agent" });
-  assert.equal(sash.messages[1].parentId, sash.messages[0].id);
-  assert.equal(sash.messages[1].branchId, sash.branchId);
-  assert.equal(doc.projects.find(p => p.id === sash.projectId).extra, true);
+  const homeAgentSession = doc.sessions.find(s => s.legacyOrigin.source === "homeAgent" && s.legacyOrigin.id === "same");
+  assert.equal(homeAgentSession.archived, true);
+  assert.equal(homeAgentSession.messages[1].role, "grant");
+  assert.equal(homeAgentSession.messages[1].requestId, "original-grant-request");
+  assert.deepEqual(homeAgentSession.lastTurn, { ...legacy.homeAgent.document.sessions[0].lastTurn, actorCapsule: "home-agent" });
+  assert.equal(homeAgentSession.messages[1].parentId, homeAgentSession.messages[0].id);
+  assert.equal(homeAgentSession.messages[1].branchId, homeAgentSession.branchId);
+  assert.equal(doc.projects.find(p => p.id === homeAgentSession.projectId).extra, true);
   assert.equal(new Set(doc.sessions.map(s => s.id)).size, doc.sessions.length);
   assert.equal(new Set(doc.projects.map(p => p.id)).size, doc.projects.length);
   const drafts = doc.sessions.filter(s => s.composerDraft);

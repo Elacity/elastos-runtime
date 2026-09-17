@@ -230,13 +230,10 @@ leaves `components.json` alone. Removing the `model_catalog` key from
 `components.json` and restarting the Runtime withdraws the catalog trust pin
 and leaves the Kubo pin alone.
 
-## Limits
+## Verification scope
 
-The helper and this document are verified against a synthetic closure and a
-test-only signing key on two offline Kubo 0.40.1 daemons
-(`scripts/model-package-handoff-test.py`). The Runtime side is proved by unit
-tests: permanent-snapshot verification and same-CID alias reuse run on Linux,
-and the readiness and startup-composer test for a permanent re-pin is gated to
-`darwin-arm64` and waits for a Mac run. The real Qwen package, the production
-signing key, installation on a target Home and a second-Home reply proof are
-operator work and are recorded as evidence when they happen.
+`scripts/model-package-handoff-test.py` checks block-closure transfer, catalogue
+trust and failure handling with isolated Kubo instances and test signing keys.
+This operator utility does not replace installed Marketplace acquisition tests.
+Current target verification and remaining work belong in [state.md](../state.md)
+and [TASKS.md](../TASKS.md).

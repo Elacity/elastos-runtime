@@ -152,8 +152,7 @@ async function resources(roots, tracked, child = {}) {
     cpu_percent: rows.reduce((n, p) => n + p.cpu_percent, 0) };
 }
 export function journeyEnvironment(plan, index) {
-  // Matches the coordinator's proven run-installed-journey.py. Explicit values
-  // keep unrelated inherited Home test modes out of this one journey.
+  // Explicit values keep inherited Home test modes out of this journey.
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith("HOME_VIRTUAL_AUTH_")) delete env[key];
   const p = plan.runtime;

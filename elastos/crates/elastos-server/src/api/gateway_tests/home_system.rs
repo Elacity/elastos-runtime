@@ -1137,7 +1137,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
 
     let state = library_test_state(dir.path()).await;
     let app = gateway_router(state);
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let library_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let public = app
         .clone()
@@ -1254,7 +1254,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["authority"]["signed_in"], true);
     assert!(payload["identity"]["profile"].is_null());
-    assert_eq!(payload["identity"]["profile_setup_display_name"], "anders");
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "owner");
     // Decided under invariant 1: the local device DID reaches exactly one
     // browser surface, System (asserted below at /api/apps/system/summary).
     // The Home shell has no consumer for it, so the Home summary strips it.
@@ -3579,7 +3579,7 @@ async fn test_home_summary_does_not_turn_conversation_members_into_people_contac
     let guest = tempfile::tempdir().unwrap();
     let state = library_test_state(dir.path()).await;
     let app = gateway_router(state);
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     std::fs::create_dir_all(dir.path().join("config")).unwrap();
     std::fs::write(
         dir.path().join("config/browser-engine-adapter.json"),
@@ -3677,7 +3677,7 @@ async fn test_root_only_recovery_export_preserves_later_profile_consent() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
             .unwrap();
@@ -3763,7 +3763,7 @@ async fn test_root_only_recovery_export_preserves_later_profile_consent() {
                 .uri("/api/apps/people/profile")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .body(Body::from(r#"{"display_name":"Owner"}"#))
                 .unwrap(),
         )
         .await
@@ -3787,7 +3787,7 @@ async fn test_root_only_recovery_export_preserves_later_profile_consent() {
         .unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
-    assert_eq!(payload["identity"]["profile"]["display_name"], "Anders");
+    assert_eq!(payload["identity"]["profile"]["display_name"], "Owner");
 }
 
 fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &str) {
@@ -3947,7 +3947,7 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let before_summary = file_snapshot(dir.path());
 
     for (path, token, origin) in [
@@ -3994,11 +3994,11 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
         "/api/apps/people/profile",
         authority.people_token.as_str(),
         "null",
-        json!({ "display_name": "Anders" }),
+        json!({ "display_name": "Owner" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["profile"]["display_name"], "Anders");
+    assert_eq!(payload["profile"]["display_name"], "Owner");
     assert_eq!(payload["profile_readiness"]["status"], "ready");
 }
 
@@ -4007,7 +4007,7 @@ async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_cl
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let mut protection =
         crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     protection.protectors.clear();
@@ -4043,7 +4043,7 @@ async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_cl
                 .uri("/api/apps/people/profile")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .body(Body::from(r#"{"display_name":"Owner"}"#))
                 .unwrap(),
         )
         .await
@@ -4070,7 +4070,7 @@ async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_cl
 async fn test_people_invite_create_route_is_absent_and_read_only() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let profile = app
         .clone()
@@ -4080,7 +4080,7 @@ async fn test_people_invite_create_route_is_absent_and_read_only() {
                 .uri("/api/apps/people/profile")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .body(Body::from(r#"{"display_name":"Owner"}"#))
                 .unwrap(),
         )
         .await
@@ -4108,7 +4108,7 @@ async fn test_people_invite_create_route_is_absent_and_read_only() {
 async fn test_people_contact_remove_requires_profile_contact_authority() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
 
     let response = app
         .oneshot(
@@ -4958,7 +4958,7 @@ async fn test_system_summary_reports_identity_and_app_id() {
     let dir = tempfile::tempdir().unwrap();
 
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let resp = app
         .clone()
         .oneshot(
@@ -4988,7 +4988,7 @@ async fn test_system_summary_reports_identity_and_app_id() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(payload["identity"]["profile"].is_null());
-    assert_eq!(payload["identity"]["profile_setup_display_name"], "anders");
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "owner");
     assert!(payload["identity"]["device_did"].is_string());
     assert_eq!(payload["home"]["id"], "home");
     assert_eq!(payload["home"]["route"], "/home/");
@@ -5040,7 +5040,7 @@ async fn test_system_summary_reports_trusted_source_update_policy() {
     .unwrap();
 
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let resp = app
         .oneshot(
             test_browser_request("localhost:61180", "null")
@@ -5235,7 +5235,7 @@ async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state()
                     .method("POST")
                     .uri(uri)
                     .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"display_name":"anders"}"#))
+                    .body(Body::from(r#"{"display_name":"owner"}"#))
                     .unwrap(),
             )
             .await
@@ -5275,7 +5275,7 @@ async fn test_people_profile_update_rejects_proofless_launch_token() {
                 .header("origin", "null")
                 .header("x-elastos-home-token", people_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"anders"}"#))
+                .body(Body::from(r#"{"display_name":"owner"}"#))
                 .unwrap(),
         )
         .await
@@ -5297,7 +5297,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "principal-handle-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("Anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("Owner"));
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 
     let summary = app
@@ -5318,7 +5318,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["identity"]["profile_setup_display_name"], "Anders");
+    assert_eq!(payload["identity"]["profile_setup_display_name"], "Owner");
     assert!(payload["identity"]["profile"].is_null());
     assert_eq!(
         payload["identity"]["profile_readiness"],
@@ -5338,7 +5338,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
                 .header("origin", "null")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"display_name":"Anders Admin"}"#))
+                .body(Body::from(r#"{"display_name":"Owner Admin"}"#))
                 .unwrap(),
         )
         .await
@@ -5349,7 +5349,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["profile"]["schema"], "elastos.profile-summary/v1");
-    assert_eq!(payload["profile"]["display_name"], "Anders Admin");
+    assert_eq!(payload["profile"]["display_name"], "Owner Admin");
     assert_eq!(payload["profile_readiness"]["status"], "ready");
     assert!(payload["profile"]["handle"].is_null());
     assert!(payload["profile"].get("profile_did").is_none());
@@ -5366,7 +5366,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
     let principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
             .unwrap();
-    assert_eq!(principal.display_name, "Anders");
+    assert_eq!(principal.display_name, "Owner");
 
     let summary = app
         .clone()
@@ -5388,7 +5388,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         payload["identity"]["profile"]["display_name"],
-        "Anders Admin"
+        "Owner Admin"
     );
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
     assert!(payload["identity"]["profile_setup_display_name"].is_null());
@@ -5442,7 +5442,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["display_name"], "Anders Admin");
+    assert_eq!(payload["display_name"], "Owner Admin");
 
     let restarted_app = gateway_router(test_state(dir.path()));
     let (status, payload) = home_test_get_json(
@@ -5456,7 +5456,7 @@ async fn test_people_profile_update_creates_signed_profile_under_passkey_princip
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
     assert_eq!(
         payload["identity"]["profile"]["display_name"],
-        "Anders Admin"
+        "Owner Admin"
     );
 }
 
@@ -5466,7 +5466,7 @@ async fn test_people_profile_update_uses_people_launch_token() {
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "people-profile-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("Anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("Owner"));
     crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
 
     let update = app

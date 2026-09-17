@@ -1571,7 +1571,7 @@ mod tests {
             "rate_limited"
         );
         assert_eq!(
-            redact_provider_error("unknown offer 'x' at /Users/anders/models"),
+            redact_provider_error("unknown offer 'x' at /Users/owner/models"),
             "offer_unavailable"
         );
         assert_eq!(redact_provider_error("run owner mismatch"), "denied");
