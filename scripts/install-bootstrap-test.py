@@ -7,6 +7,7 @@ bytes. Capture those separately with a request/hash receipt; this test never fet
 """
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -105,6 +106,21 @@ COMPONENTS = json.dumps({"schema": "elastos.components/v1", "capsules": {}, "ext
                          "profiles": {}}, sort_keys=True).encode() + b"\n"
 BOOTSTRAP = (b'{"schema":"elastos.carrier.bootstrap/v1","role":"publisher",'
              b'"ticket":"fixture-ticket","node_id":"fixture-node"}\n')
+
+
+CATALOG = b'{"payload":{"schema":"elastos.model.catalog/v1","entries":[]},"note":"fixture catalog"}\n'
+
+
+def catalog_head_cid(data):
+    """Raw SHA-256 CIDv1 of the catalogue bytes, the form components.json pins."""
+    return "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode().lower().rstrip("=")
+
+
+def pinned_components(catalog=CATALOG):
+    manifest = json.loads(COMPONENTS)
+    manifest["model_catalog"] = {"head_cid": catalog_head_cid(catalog),
+                                 "publisher_dids": ["did:key:z6MkfixturePublisher"]}
+    return json.dumps(manifest, sort_keys=True).encode() + b"\n"
 
 
 def installable_fixture(runtime=RUNTIME_STUB, components=COMPONENTS, version="0.7.1"):
@@ -349,10 +365,11 @@ class InstallerSandbox:
     and any request for a response that is absent, fails and is logged.
     """
 
-    def __init__(self, head, release, did, system="Linux", machine="x86_64"):
+    def __init__(self, head, release, did, system="Linux", machine="x86_64", catalog_cid=""):
         self.directory = tempfile.TemporaryDirectory(prefix="installer-sandbox-")
         self.root = Path(self.directory.name)
         self.did, self.system, self.machine = did, system, machine
+        self.catalog_cid = catalog_cid
         self.home = self.root / "home"
         self.data = self.home / "xdg-data/elastos"
         self.binary = self.home / ".local/bin/elastos"
@@ -381,6 +398,7 @@ case "$url" in
   */release.json|*/ipfs/"$FIXTURE_RELEASE_CID") response=release.json;;
   */artifacts/elastos-*|*/ipfs/"$FIXTURE_BINARY_CID") response=binary;;
   */artifacts/components-*.json|*/ipfs/"$FIXTURE_COMPONENTS_CID") response=components;;
+  */artifacts/model-catalog.json|*/ipfs/"$FIXTURE_CATALOG_CID") response=catalog;;
   */.well-known/elastos/carrier-bootstrap.json*) response=bootstrap;;
   *) echo unexpected-request-blocked >&2; exit 93;;
 esac
@@ -412,9 +430,10 @@ export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="" ELASTOS_IPFS_GATEWAYS=""
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
 export ELASTOS_TEST_CALLS="$1/calls" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 export FIXTURE_HEAD_CID="$6" FIXTURE_RELEASE_CID="$7" FIXTURE_BINARY_CID="$8" FIXTURE_COMPONENTS_CID="$9"
-exec "$2" --noprofile --norc "$3" "${@:10}"
+export FIXTURE_CATALOG_CID="${10}"
+exec "$2" --noprofile --norc "$3" "${@:11}"
 ''', self.root, OPTIONS.bash, INSTALLER, self.system, self.machine, self.head_cid, self.release_cid,
-                       self.binary_cid, self.components_cid, "--maintainer-did", self.did, *options)
+                       self.binary_cid, self.components_cid, self.catalog_cid, "--maintainer-did", self.did, *options)
         return result, self.requests()[seen:]
 
     def runtime_calls(self):
@@ -656,6 +675,69 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(sandbox.runtime_calls(), [])
         self.assertEqual(sandbox.home_state(), before)
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_pinned_catalogue_is_verified_before_any_installation_change(self):
+        # A release whose components.json pins a signed model catalogue advertises
+        # three files. A missing or mismatched catalogue is refused like a bad
+        # binary: before Runtime processes are stopped and before the current
+        # binary, components.json or catalogue change.
+        components = pinned_components()
+        catalog_cid = catalog_head_cid(CATALOG)
+        did, head, release = installable_fixture(components=components)
+        previous_catalog = b'{"note":"previous catalog"}\n'
+        catalog_url = {"publisher": "https://test.invalid/artifacts/model-catalog.json",
+                       "cid": f"https://test.invalid/ipfs/{catalog_cid}"}
+        for transport in ["publisher", "cid"]:
+            with InstallerSandbox(head, release, did, catalog_cid=catalog_cid) as sandbox:
+                self.existing_installation(sandbox)
+                (sandbox.data / "model-catalog.json").write_bytes(previous_catalog)
+                (sandbox.data / "model-catalog.json").chmod(0o600)
+                sandbox.respond("components", components)
+                sandbox.respond("binary", RUNTIME_STUB)
+                sandbox.respond("bootstrap", BOOTSTRAP)
+                before = sandbox.home_state()
+                expected = self.REQUESTS[transport][:4] + [catalog_url[transport]]
+                for name, served in [("missing catalogue", None),
+                                     ("catalogue differs from pin", CATALOG.replace(b"fixture", b"altered"))]:
+                    (sandbox.responses / "catalog").unlink(missing_ok=True)
+                    if served is not None:
+                        sandbox.respond("catalog", served)
+                    result, requests = sandbox.run("--install-only", transport=transport)
+                    with self.subTest(transport=transport, case=name):
+                        self.assert_no_installation_effects(sandbox, before, result)
+                        self.assertEqual((sandbox.data / "model-catalog.json").read_bytes(), previous_catalog)
+                        self.assertIn("Verifying components.json SHA-256", result.stdout)
+                        self.assertNotIn("Installing binary to", result.stdout)
+                        if served is None:
+                            self.assertRegex(result.stderr, "Failed to (download model catalog|fetch CID)")
+                        else:
+                            self.assertIn("does not match pin", result.stderr)
+                            self.assertIn("the current installation was preserved", result.stderr)
+                        self.assertEqual(requests, expected)
+                sandbox.respond("catalog", CATALOG)
+                sandbox.calls.unlink(missing_ok=True)
+                result, requests = sandbox.run("--install-only", transport=transport)
+                with self.subTest(transport=transport, case="exact catalogue"):
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("Runtime installed:", result.stdout)
+                    bootstrap = self.REQUESTS[transport][4:]
+                    self.assertEqual(requests, expected + bootstrap)
+                    self.assertLess(result.stdout.index("Verifying model catalog"),
+                                    result.stdout.index("Stopping verified Runtime processes"))
+                    installed = sandbox.data / "model-catalog.json"
+                    self.assertEqual(installed.read_bytes(), CATALOG)
+                    self.assertEqual(installed.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
+                    self.assertEqual((sandbox.data / "components.json").read_bytes(), components)
+                    self.assertEqual(sandbox.runtime_calls()[0], "--version")
+                    after = sandbox.home_state()
+                    changed = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+                    self.assertEqual(changed, {
+                        ".local/bin/elastos", "xdg-data/elastos/components.json", "xdg-data/elastos/model-catalog.json",
+                        "xdg-data/elastos/sources.json",
+                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release-head.json",
+                        "xdg-data/elastos/ElastOS/SystemServices/Publisher/release.json"})
+                    self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_corrupt_artifacts_fail_before_changes_then_clean_rerun_installs(self):
         did, head, release = installable_fixture()

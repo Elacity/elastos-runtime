@@ -21,9 +21,10 @@
 # Trust anchors can be provided via env vars or CLI flags. In the canonical
 # bootstrap flow, they should already be stamped into install.sh.
 #
-# Downloads exactly 2 files:
+# Downloads the signed Runtime, components.json, and the pinned model catalog:
 #   1. elastos binary → ~/.local/bin/elastos
 #   2. components.json → the platform's ElastOS application-data directory
+#   3. model-catalog.json → the same data directory, when components.json pins one
 #
 # After bootstrap, setup installs the Home profile and opens browser Home.
 # Use --install-only for automated provisioning or other profiles.
@@ -34,8 +35,9 @@
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
 #   5. Download binary + components.json, verify SHA-256
-#   6. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
-#   7. Save trusted-source Carrier metadata for later `setup` and `update`
+#   6. Download the pinned model catalog when components.json names one, verify its head
+#   7. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
+#   8. Save trusted-source Carrier metadata for later `setup` and `update`
 #
 # Fails closed if trust anchors or signature verification fail, unless the
 # operator explicitly selects --allow-unsigned.
@@ -140,6 +142,7 @@ show_help() {
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
     echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
+    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/model-catalog.json  Signed model catalog, when pinned"
     echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
@@ -970,6 +973,37 @@ fi
 info "Verifying components.json SHA-256..."
 sha256_check "${TMPDIR}/components.json" "$COMPONENTS_SHA256"
 
+# ── Download + verify the pinned model catalog ───────────────────────
+# The verified components.json names the catalog head. Every advertised file
+# is staged and verified here; nothing running or installed changes before.
+
+CATALOG_HEAD=$(json_get "${TMPDIR}/components.json" '(d.get("model_catalog") or {}).get("head_cid")')
+if [[ -n "$CATALOG_HEAD" ]]; then
+    if [[ -n "$PUBLISHER_GATEWAY" ]]; then
+        info "Downloading model catalog from bootstrap publisher URL"
+        curl -fsSL --max-time 30 -o "${TMPDIR}/model-catalog.json" "${PG}/artifacts/model-catalog.json" \
+            || die "Failed to download model catalog from ${PG}/artifacts/model-catalog.json; the current installation was preserved"
+    else
+        info "Downloading model catalog by CID: ${CATALOG_HEAD} (bootstrap mode)"
+        ipfs_fetch "$CATALOG_HEAD" "${TMPDIR}/model-catalog.json"
+    fi
+    info "Verifying model catalog head ${CATALOG_HEAD}..."
+    CATALOG_HEAD="$CATALOG_HEAD" python3 - "${TMPDIR}/model-catalog.json" <<'PY' \
+        || die "Downloaded model catalog does not match the pin in components.json; the current installation was preserved"
+import base64
+import hashlib
+import os
+import pathlib
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+expected = os.environ["CATALOG_HEAD"]
+head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
+if head != expected:
+    raise SystemExit(f"model catalog head {head} does not match pin {expected}")
+PY
+fi
+
 # ── Install (2 files) ────────────────────────────────────────────────
 
 DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
@@ -1029,6 +1063,12 @@ fi
 
 info "Installing components.json to ${DATA_DIR}/..."
 cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
+
+if [[ -n "$CATALOG_HEAD" ]]; then
+    info "Installing signed model catalog ${CATALOG_HEAD} to ${DATA_DIR}/..."
+    (umask 077; cp "${TMPDIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json")
+    chmod 600 "${DATA_DIR}/model-catalog.json"
+fi
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
 info "Verifying and upgrading configured protected roots while Runtime is stopped..."
