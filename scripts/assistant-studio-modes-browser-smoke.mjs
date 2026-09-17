@@ -9,8 +9,9 @@ import { chromium, brave } from "./system-uiux-fixture.mjs";
 
 // Studio is a mode control only while the Runtime advertises an image or video
 // offer. The real Assistant capsule runs against fixture Runtime responses to
-// prove that a late offers read never moves the person away from the chat they
-// are using.
+// prove that a late, failed or recovered offers read never moves the person
+// away from the chat they are using, and that an open Studio always keeps its
+// way back to Chat.
 const root = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const schema = "elastos.assistant.workspace/v2";
 const workspacePath = "/api/apps/assistant/workspace-v2";
@@ -28,6 +29,12 @@ const workspace = (sessions, activeSessionId, sessionMode) => ({
 });
 const studioRoom = () => session("studio-room", "Studio room", "studio", { studio: { studioDraft: "A lighthouse at dusk" } });
 const plainChat = () => session("plain-chat", "Plain chat", "chat");
+const unsettledStudioRun = () => ({
+  runId: "studio-run-open", createRequestId: "studio-request-open", sessionId: "studio-room", actorCapsule: "assistant",
+  mode: "studio", prompt: "A lighthouse at dusk", draft: "A lighthouse at dusk", offerId: imageOffer.id,
+  operation: imageOffer.operation, mediaLabel: "Image", afterSequence: 0, outputText: "", terminal: false,
+  cancelRequested: false, status: "running", output: null, error: null, progress: null,
+});
 
 // Per-scenario Runtime state: `offers` is text | image | fail | hold (answer later
 // through release()); `runs` maps a run id to open (no events yet) or complete.
@@ -204,9 +211,48 @@ try {
   assert.equal(await ui.mode(), "chat");
   assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
 
+  stage = "a failed offers read recovers through Refresh models";
+  reset({ document: workspace([plainChat()], "plain-chat", "chat"), offers: "fail" });
+  ui = await open();
+  await until(() => called("/offers_list"), "boot offers read failed");
+  await settle();
+  assert.equal(await ui.studioRow.isVisible(), false, "no offer confirmed: Studio row hidden");
+  fixture.offers = "image";
+  await ui.frame.locator("#agent-model-picker").click();
+  await ui.frame.locator("#agent-model-menu").getByRole("button", { name: "Refresh models" }).click();
+  await ui.studioRow.waitFor({ state: "visible" });
+  assert.equal(await ui.mode(), "chat", "a recovered read offers Studio without opening it");
+  await ui.studioRow.click();
+  assert.equal(await ui.mode(), "studio", "Studio opens from the recovered offer");
+  assert.equal(await ui.panel.isVisible(), true);
+
+  stage = "a restored active Studio run keeps its way back to Chat";
+  const running = studioRoom();
+  running.studio.activeRun = unsettledStudioRun();
+  reset({ document: workspace([running, plainChat()], "studio-room", "studio"), offers: "text", runs: { "studio-run-open": "open" } });
+  ui = await open();
+  await until(() => ui.mode().then(mode => mode === "studio"), "restored Studio run reopens Studio");
+  await until(() => called("/offers_list") && called("/runs_events"), "offers read and run poll");
+  await settle();
+  assert.equal(await ui.panel.isVisible(), true);
+  assert.equal(await ui.studioRow.isVisible(), true, "the Studio row stays while Studio is open without an offer");
+  assert.equal(await ui.studioRow.getAttribute("aria-pressed"), "true");
+  assert.equal(await ui.frame.locator("[data-assistant-mode-segment]").isVisible(), false, "Chat|Build segment stays hidden");
+  assert.equal(await ui.frame.locator("#studio-stop").isVisible(), true, "the unsettled run can be stopped");
+  await ui.studioRow.click();
+  assert.equal(await ui.notice.textContent(), modeNotice, "leaving waits for the unsettled run");
+  assert.equal(await ui.mode(), "studio");
+  fixture.runs["studio-run-open"] = "complete";
+  await ui.frame.locator("#studio-stop").waitFor({ state: "hidden" });
+  await ui.studioRow.click();
+  assert.equal(await ui.mode(), "chat", "the Studio row returns to Chat once the run settles");
+  assert.equal(await ui.panel.isVisible(), false);
+  assert.equal(await ui.composer.isVisible(), true);
+  await until(() => ui.studioRow.isVisible().then(visible => !visible), "Studio row hides again: no offer and no unsettled run");
+
   assert.deepEqual(errors, []);
   assert.deepEqual(pageErrors, []);
-  console.log("PASS Studio mode control: offered reopen bound to its session and intent");
+  console.log("PASS Studio mode control: offered reopen bound to its session and intent, availability recovers through Refresh models, an open Studio keeps its way back to Chat");
 } catch (error) {
   console.error(`Studio mode smoke failed at ${stage}`);
   console.error(JSON.stringify({ errors, pageErrors, calls: fixture.calls.map(call => call.path) }, null, 1));

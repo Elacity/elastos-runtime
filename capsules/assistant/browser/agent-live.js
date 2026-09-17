@@ -145,7 +145,11 @@ export async function fetchModelOffers({ force = false } = {}) {
   }
   const request = (async () => {
     const data = await modelRunCall("offers_list");
-    if (offersPromise === request) offersCache = data;
+    if (offersPromise === request) {
+      offersCache = data;
+      // Mode controls follow the same read the chat picker uses (boot, "Refresh models", probes).
+      window.dispatchEvent(new CustomEvent("assistant:model-offers", { detail: data }));
+    }
     return data;
   })()
     .finally(() => {

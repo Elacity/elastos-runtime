@@ -38,21 +38,24 @@ export async function bindAssistantModes(saved = {}) {
     const turn = getAssistantSession()?.lastTurn;
     return unresolvedModelTurn(turn) && !SETTLED_TURN_STATES.includes(turn.state);
   }
+  // A session whose Studio run is unsettled keeps Studio reachable so the run can be stopped or checked.
   function modeAvailable(mode) {
-    return mode === "studio" ? studioAvailable : Boolean(MODE_CAPABILITY[mode]);
+    if (mode !== "studio") return Boolean(MODE_CAPABILITY[mode]);
+    const run = getAssistantSession()?.studio?.activeRun;
+    return studioAvailable || Boolean(run && !run.terminal);
   }
   function syncModeControls() {
     segment.hidden = !MODE_CAPABILITY.build;
-    studioRow.hidden = !studioAvailable;
+    // While Studio is open its row stays: with the Chat|Build segment hidden it is the only way back to Chat.
+    studioRow.hidden = !(modeAvailable("studio") || document.body.dataset.assistantMode === "studio");
   }
-  async function refreshStudioAvailability() {
-    try {
-      studioAvailable = eligibleStudioOffers(await fetchModelOffers()).length > 0;
-    } catch {
-      studioAvailable = false;
-    }
+  function applyOffers(payload) {
+    studioAvailable = eligibleStudioOffers(payload).length > 0;
     syncModeControls();
   }
+  // Every offers read (boot, the chat menu's "Refresh models", liveness probes) reports here,
+  // so a failed or empty first read stops hiding Studio as soon as a later read advertises an offer.
+  window.addEventListener("assistant:model-offers", event => applyOffers(event.detail));
 
   function render(view) {
     if (draft.value !== view.studioDraft) draft.value = view.studioDraft;
@@ -160,14 +163,14 @@ export async function bindAssistantModes(saved = {}) {
       item.setAttribute("aria-pressed", String(pressed));
       item.classList.toggle("is-active", pressed);
     }
+    syncModeControls();
     setAssistantMode(mode);
     setAssistantWorkspaceField("activeMode", mode);
   }
   // A session saved in a mode this Home no longer backs opens as chat, never as an unreachable room.
   function showAvailableMode(mode) {
     const wanted = ["chat", "build", "studio"].includes(mode) ? mode : "chat";
-    const hasStudioRun = wanted === "studio" && getAssistantSession()?.studio?.activeRun && !getAssistantSession().studio.activeRun.terminal;
-    showMode(modeAvailable(wanted) || hasStudioRun ? wanted : "chat");
+    showMode(modeAvailable(wanted) ? wanted : "chat");
   }
   // Offers arrive after boot, so a saved Studio session reopens once its offer is confirmed. The
   // reopen belongs to the session it was saved in and lasts only while the person has chosen
@@ -185,7 +188,7 @@ export async function bindAssistantModes(saved = {}) {
     if (event.target?.id === "agent-composer-input") keepCurrentView();
   });
   showAvailableMode(savedMode);
-  void refreshStudioAvailability().then(() => {
+  void fetchModelOffers().then(applyOffers, () => {}).then(() => {
     if (!restorePending) return;
     restorePending = false;
     if (studioAvailable && document.body.dataset.assistantMode === "chat" && !turnInProgress() &&
