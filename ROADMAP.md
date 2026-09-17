@@ -228,6 +228,15 @@ exists. Remote install, update, and removal come only after the signed package
 and receipt contract is complete. The install contract should define the CLI
 and UI actions instead of the roadmap inventing a command in advance.
 
+Use one dependency order across capsule roles: verify the package closure and
+publisher; establish availability and any explicit Keep policy; admit the exact
+package; verify any rights needed for Buy or Use; resolve the launch closure and
+authorize the instance; publish a typed package listing or service offer; then
+prove restart, tamper rejection, update, removal, and state preservation before
+release. The shared records and action meanings are defined in
+[the capsule model](docs/CAPSULE_MODEL.md). Current 0.7.1 status remains in
+[TASKS.md](TASKS.md) and [state.md](state.md).
+
 Executable capsule isolation remains governed by
 [Principle 18](PRINCIPLES.md#18-executable-capsules-are-isolated-execution-environments)
 and [Capsule model](docs/CAPSULE_MODEL.md).

@@ -20,7 +20,10 @@ for the canonical definition.
 
 ## Runtime
 
-The minimal trusted base (`elastos` binary). Enforces isolation, signatures, and capabilities. Everything outside the runtime is a capsule.
+The minimal trusted base (`elastos` binary). It enforces isolation, signatures,
+principals, capabilities, admission, routing, and lifecycle. Apps, providers,
+and portable content are capsules. User objects, state, grants, receipts,
+listings, and external services remain distinct records or resources.
 
 ## Principal
 
@@ -54,8 +57,10 @@ name claim.
 
 A future or linked global account identity anchored by Elastos DID/EID
 infrastructure. Use it for portable profiles, credentials, publisher identity,
-service endpoints, recovery, DAO actions, and globally unique name claims. It
-is not required for a local passkey account.
+service endpoints, recovery, DAO actions, globally unique name claims, and
+rights evidence. Runtime treats EID as an optional identity, controller, and
+evidence adapter. It is not required for a local passkey account and does not
+replace Runtime authority.
 
 ## Handle / Name
 
@@ -68,11 +73,20 @@ handle string.
 
 ## Digital Capsule
 
-The portable signed package model in ElastOS. A Digital Capsule is capability-governed and explicitly described. It may be an app capsule, provider capsule, shell capsule, agent capsule, or sealed data/content capsule. User objects such as documents remain first-class objects; they become data capsules only when packaged with capsule metadata and provenance. See [CAPSULE_MODEL.md](CAPSULE_MODEL.md) for the full model.
+The portable signed package model in ElastOS. A Digital Capsule is
+capability-governed and explicitly described. It may be an app capsule,
+provider capsule, shell capsule, agent capsule, or content capsule. User
+objects such as documents remain first-class objects; they become content
+capsules only when packaged with capsule metadata and provenance. See
+[CAPSULE_MODEL.md](CAPSULE_MODEL.md) for the full model.
 
 ## Capsule
 
-Shorthand for a Digital Capsule, usually referring to an executable one. Capsules start with zero ambient authority and must request capability tokens for any action. Two main executable substrates exist today: **WASM** (lightweight) and **microVM** (full Linux sandbox via crosvm).
+Shorthand for a Digital Capsule, usually referring to an executable one.
+Capsules start with zero ambient authority and request Runtime capabilities for
+effects. Component/Wasm, microVM, web projection, and native host adapters can
+implement different parts of the contract; current support is recorded in
+[state.md](../state.md).
 
 ## Capsule Runtime (AppCapsule Runtime)
 
@@ -81,6 +95,45 @@ The per-capsule execution contract. This is the common runtime surface that make
 ## Capsule Artifact
 
 The immutable packaged form of a capsule: manifest, code or rootfs payload, and signature/provenance material.
+
+## Package Closure
+
+The canonical manifest and every immutable file covered by one package root.
+Its CID identifies exact bytes. Internal binaries and libraries are members of
+the closure; independently selected provider capsules remain separate packages.
+
+## Resolved Launch Closure
+
+The exact packages, providers, native variants, remote offers, grants, state
+revision, host evidence, principal, device, and session selected for one
+instance. Runtime records it before effects. It can change without changing the
+requesting capsule's package CID.
+
+## Admission Record
+
+Runtime's durable result for verifying and accepting one exact package closure
+under local publisher, compatibility, resource, and execution policy. Presence
+in a directory or catalog is not admission.
+
+## Rights Evidence
+
+A verified grant, lease, license, token proof, or other statement that supports
+a requested use. Runtime checks it with current policy before issuing a local
+capability. Rights evidence is not package identity, availability, or authority
+for unrelated effects.
+
+## Icon NFT
+
+A possible chain-backed controller or rights record for the stable object behind
+an application icon. It can resolve through a signed head to an exact capsule
+CID. It is distinct from the manifest `icon` artwork field and does not grant
+Runtime authority by itself.
+
+## Hardware Protector
+
+A dongle, enclave, or other hardware boundary that protects keys, verifies
+launch evidence, or authorizes key release. It complements Runtime authority
+and an attested execution environment; it does not replace either one.
 
 ## Content Capsule
 

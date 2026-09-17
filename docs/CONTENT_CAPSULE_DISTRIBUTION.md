@@ -51,6 +51,10 @@ or turn display rows into authority.
 
 `Get` is a typed Runtime operation, not a browser download:
 
+This is the target flow. [state.md](../state.md) records which product surfaces
+and installed paths currently implement and prove it. Other lifecycle actions
+retain the meanings in [the capsule model](CAPSULE_MODEL.md#lifecycle-and-marketplace-actions).
+
 ```text
 signed catalog projection
 -> person selects Get
@@ -67,6 +71,10 @@ Runtime chooses the provider and route. Home must not call
 endpoint, or an external model host directly. A failed fetch, signature,
 manifest, size, compatibility, license-policy, or availability check leaves no
 partially admitted capsule.
+
+A transactional pin or cache used during Get protects the acquisition. It does
+not create the principal's explicit `Keep` retention claim. Runtime records Keep
+separately and projects both facts without creating another package identity.
 
 The reverse operation must be explicit. Removing a local capsule updates the
 installed inventory and writes a removal receipt. Unpinning local bytes does

@@ -137,6 +137,10 @@ ElastOS must distinguish user objects, software packages, and namespaces.
   identity
 - service offers describe running provider capabilities and grants; they are
   not package identity, license evidence, or install authority
+- every capsule role uses the shared lifecycle in
+  [the capsule model](docs/CAPSULE_MODEL.md): package identity, publisher
+  provenance, availability, admission, rights, execution, and mutable state
+  remain separate facts with one owning record each
 - source packages and development projections are build inputs, not complete
   signed Digital Capsules or evidence of portable installation
 - spaces are where objects and services resolve: `localhost://...`, `elastos://...`, WebSpaces

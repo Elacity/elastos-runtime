@@ -13,6 +13,11 @@
 
 IPLD is a good fit for ElastOS, but it is not the network.
 
+This document owns byte availability, replication, repair, and explicit `Keep`
+retention. It does not own capsule identity, publisher provenance, Runtime
+admission, rights, launch resolution, execution, or mutable application state.
+Those records remain separate under [the capsule model](CAPSULE_MODEL.md).
+
 Use IPLD as the data model for content-addressed SmartWeb objects: published
 documents, sites, shares, release manifests, sealed content, channel heads,
 availability receipts, and provenance records.
@@ -170,6 +175,9 @@ paths are rejected, and manifest links are validated CIDs sorted by relation so
 the same object has one stable package shape. Availability receipts, provenance
 records, rights policies, sealed payloads, and signed channel heads remain
 separate schema-bearing objects linked by CID and provider state.
+
+`kind=capsule` describes the object graph shape. It does not by itself prove a
+publisher signature, Runtime admission, compatibility, or launch authority.
 
 Optional identity fields may be attached when they are real:
 `publisher_did` identifies the publisher/controller, and `object_did` identifies
