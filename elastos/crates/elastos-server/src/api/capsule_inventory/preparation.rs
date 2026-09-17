@@ -3040,6 +3040,16 @@ mod tests {
                 std::fs::set_permissions(bundle.join(name), std::fs::Permissions::from_mode(mode))
                     .unwrap();
             }
+            let mut parent = bundle.clone();
+            for _ in Path::new(relative).components() {
+                let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
+                std::fs::set_permissions(
+                    &parent,
+                    std::fs::Permissions::from_mode((mode & 0o7777) & !0o022),
+                )
+                .unwrap();
+                parent = parent.parent().unwrap().to_path_buf();
+            }
             std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o500)).unwrap();
             EngineFixture(bundle)
         }

@@ -349,6 +349,52 @@ except (OSError, ValueError) as error:
 PY
 }
 
+protect_engine_install_parents() {
+    python3 - "$1" "$2" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+if not root.is_absolute():
+    root = Path.cwd() / root
+relative = Path(sys.argv[2])
+if relative.is_absolute() or any(part in (os.pardir, os.curdir) for part in relative.parts):
+    raise SystemExit("llama-server bundle install path is invalid")
+if not root.is_dir():
+    raise SystemExit(f"model engine parent is not protected: {root}")
+root = root.resolve()
+uid = os.getuid()
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    flags |= os.O_CLOEXEC
+path = root
+for part in relative.parts:
+    path = path / part
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit(f"model engine parent is not protected: {path}") from exc
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise SystemExit(f"model engine parent is not protected: {path}") from exc
+    try:
+        metadata = os.fstat(fd)
+        if metadata.st_uid != uid:
+            raise SystemExit(f"model engine parent is not protected: {path}")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o022:
+            os.fchmod(fd, mode & ~0o022)
+        after = os.fstat(fd)
+        if after.st_uid != uid or stat.S_IMODE(after.st_mode) & 0o022:
+            raise SystemExit(f"model engine parent is not protected: {path}")
+    finally:
+        os.close(fd)
+PY
+}
+
 install_prebuilt_engine() {
     local platform="$1" version url checksum extract_path install_path binary_path
     local archive engine_dir engine_binary receipt stage staged_binary install_temp link_temp
@@ -435,6 +481,9 @@ PY
             write_engine_receipt "$receipt" "$engine_binary" "$version" "$platform" "$checksum"
         fi
         ok "llama-server ${version} installed and verified"
+    fi
+    if [[ -n "$binary_path" ]]; then
+        protect_engine_install_parents "$INSTALL_DIR" "$install_path"
     fi
 
     if [[ -n "$binary_path" ]]; then

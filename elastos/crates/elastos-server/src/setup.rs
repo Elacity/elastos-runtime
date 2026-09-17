@@ -1408,6 +1408,9 @@ fn write_cache_metadata(
         let (version, checksum, binary) =
             local_model_engine_receipt_args(component, platform_info.unwrap())?;
         local_model_engine_receipt::write(dest, version, platform, checksum, binary)?;
+        let install_path = resolve_install_path(component, platform_info)
+            .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
+        protect_local_model_engine_install_parents(dest, install_path)?;
         return Ok(());
     }
 
@@ -1464,6 +1467,74 @@ pub(crate) struct LocalModelEngineIdentity {
     pub receipt_sha256: String,
 }
 
+/// Clear group/other write on install_path directories under the data dir.
+/// Call this from the owned install/repair path only. Verification stays read-only.
+#[cfg(unix)]
+fn protect_local_model_engine_install_parents(
+    bundle: &Path,
+    install_path: &str,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::io::AsRawFd;
+    let relative = Path::new(install_path);
+    anyhow::ensure!(
+        !install_path.is_empty()
+            && install_path.len() <= 4096
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "local model engine install path is invalid"
+    );
+    let mut data_dir = if bundle.is_absolute() {
+        bundle.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(bundle)
+    };
+    anyhow::ensure!(
+        data_dir.ends_with(relative),
+        "model engine parent is not protected"
+    );
+    for _ in relative.components() {
+        data_dir = data_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("model engine parent is not protected"))?;
+    }
+    let data_dir = fs::canonicalize(data_dir)?;
+    let mut path = data_dir.clone();
+    for part in relative.components() {
+        path.push(part.as_os_str());
+        anyhow::ensure!(
+            path.starts_with(&data_dir),
+            "model engine parent is not protected"
+        );
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|_| anyhow::anyhow!("model engine parent is not protected"))?;
+        let metadata = dir.metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() },
+            "model engine parent is not protected"
+        );
+        let mode = metadata.mode();
+        if mode & 0o022 != 0 {
+            let rc =
+                unsafe { libc::fchmod(dir.as_raw_fd(), (mode as libc::mode_t & 0o7777) & !0o022) };
+            anyhow::ensure!(rc == 0, "model engine parent is not protected");
+        }
+        let after = dir.metadata()?;
+        anyhow::ensure!(
+            after.is_dir()
+                && after.uid() == unsafe { libc::geteuid() }
+                && after.mode() & 0o022 == 0,
+            "model engine parent is not protected"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn local_model_engine_receipt_identity(
     data_dir: &Path,
@@ -1495,7 +1566,8 @@ pub(crate) fn local_model_engine_receipt_identity(
         bundle.push(part.as_os_str());
         let metadata = fs::symlink_metadata(&bundle)?;
         anyhow::ensure!(
-            metadata.is_dir()
+            !metadata.file_type().is_symlink()
+                && metadata.is_dir()
                 && metadata.uid() == unsafe { libc::geteuid() }
                 && metadata.mode() & 0o022 == 0,
             "model engine parent is not protected"
@@ -1526,13 +1598,34 @@ pub(crate) fn verified_local_model_engine(
     manifest: &ComponentsManifest,
 ) -> anyhow::Result<LocalModelEngineIdentity> {
     let identity = local_model_engine_receipt_identity(data_dir, manifest)?;
-    let component = manifest.external.get("llama-server").unwrap();
+    let component = manifest
+        .external
+        .get("llama-server")
+        .ok_or_else(|| anyhow::anyhow!("local model engine is unavailable"))?;
     let platform = detect_platform();
-    let info = component.platforms.get(&platform).unwrap();
+    let info = component
+        .platforms
+        .get(&platform)
+        .ok_or_else(|| anyhow::anyhow!("local model engine platform is unavailable"))?;
     let (version, archive, binary) = local_model_engine_receipt_args(component, info)?;
-    let bundle = data_dir
-        .canonicalize()?
-        .join(resolve_install_path(component, Some(info)).unwrap());
+    let install_path = resolve_install_path(component, Some(info))
+        .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
+    let relative = Path::new(install_path);
+    anyhow::ensure!(
+        !install_path.is_empty()
+            && install_path.len() <= 4096
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "local model engine install path is invalid"
+    );
+    let bundle = data_dir.canonicalize()?.join(relative);
+    anyhow::ensure!(
+        identity.path == bundle.join(binary)
+            && bundle.canonicalize()? == bundle
+            && identity.path.canonicalize()? == identity.path,
+        "local model engine install path is unavailable"
+    );
     local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
     anyhow::ensure!(
         local_model_engine_receipt_identity(data_dir, manifest)? == identity
@@ -4227,6 +4320,237 @@ mod tests {
                 .to_string()
                 .contains("relative safe path")
         );
+    }
+
+    #[cfg(unix)]
+    fn restore_engine_tree_for_cleanup(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                restore_engine_tree_for_cleanup(&entry.path());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_engine_identity_fixture(root: &Path) -> (ComponentsManifest, PathBuf, PathBuf) {
+        unix_engine_identity_fixture_with_binary(root, "llama-server")
+    }
+
+    #[cfg(unix)]
+    fn unix_engine_identity_fixture_with_binary(
+        root: &Path,
+        binary_path: &str,
+    ) -> (ComponentsManifest, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let data = root.join("data");
+        let platform = detect_platform();
+        let relative = format!("libexec/llama.cpp/fixture-v1/{platform}");
+        let bundle = data.join(&relative);
+        let executable = bundle.join(binary_path);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"fixture llama-server\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = format!("sha256:{}", "a".repeat(64));
+        let manifest = serde_json::from_value(serde_json::json!({
+            "external": {
+                "llama-server": {
+                    "version": "fixture-v1",
+                    "platforms": { platform: {
+                        "url": "https://fixture.invalid/llama.tar.gz",
+                        "checksum": archive,
+                        "extract_path": "llama-fixture-v1",
+                        "install_path": relative,
+                        "binary_path": binary_path
+                    }}
+                }
+            },
+            "profiles": {}
+        }))
+        .unwrap();
+        (manifest, data, bundle)
+    }
+
+    #[cfg(unix)]
+    fn mark_engine_parents_group_writable(data: &Path, bundle: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut path = bundle.parent().unwrap().to_path_buf();
+        while path.starts_with(data) && path != data {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).unwrap();
+            path = path.parent().unwrap().to_path_buf();
+        }
+        fs::set_permissions(data.join("libexec"), fs::Permissions::from_mode(0o775)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_model_engine_identity_rejects_group_writable_install_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, data, bundle) = unix_engine_identity_fixture(tmp.path());
+        let component = &manifest.external["llama-server"];
+        let platform = detect_platform();
+        write_cache_metadata(
+            &manifest,
+            resolve_platform_info(component, &platform),
+            &platform,
+            "llama-server",
+            &bundle,
+        )
+        .unwrap();
+        restore_engine_tree_for_cleanup(&data);
+        mark_engine_parents_group_writable(&data, &bundle);
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(
+            bundle.join("llama-server"),
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        fs::set_permissions(
+            bundle.join(".elastos-engine.json"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        let error = local_model_engine_receipt_identity(&data, &manifest)
+            .err()
+            .expect("identity must fail")
+            .to_string();
+        restore_engine_tree_for_cleanup(&data);
+        assert!(
+            error.contains("model engine parent is not protected"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cache_metadata_clears_group_writable_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, data, bundle) = unix_engine_identity_fixture(tmp.path());
+        mark_engine_parents_group_writable(&data, &bundle);
+        let component = &manifest.external["llama-server"];
+        let platform = detect_platform();
+        write_cache_metadata(
+            &manifest,
+            resolve_platform_info(component, &platform),
+            &platform,
+            "llama-server",
+            &bundle,
+        )
+        .unwrap();
+        for path in [
+            data.join("libexec"),
+            data.join("libexec/llama.cpp"),
+            data.join("libexec/llama.cpp/fixture-v1"),
+        ] {
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o022,
+                0,
+                "{}",
+                path.display()
+            );
+        }
+        restore_engine_tree_for_cleanup(&data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_local_model_engine_rejects_group_writable_parents_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, data, bundle) = unix_engine_identity_fixture(tmp.path());
+        let component = &manifest.external["llama-server"];
+        let platform = detect_platform();
+        write_cache_metadata(
+            &manifest,
+            resolve_platform_info(component, &platform),
+            &platform,
+            "llama-server",
+            &bundle,
+        )
+        .unwrap();
+        restore_engine_tree_for_cleanup(&data);
+        mark_engine_parents_group_writable(&data, &bundle);
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(
+            bundle.join("llama-server"),
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        fs::set_permissions(
+            bundle.join(".elastos-engine.json"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        let libexec = data.join("libexec");
+        let before = fs::metadata(&libexec).unwrap().permissions().mode() & 0o777;
+        let error = verified_local_model_engine(&data, &manifest)
+            .err()
+            .expect("verification must stay read-only")
+            .to_string();
+        let after = fs::metadata(&libexec).unwrap().permissions().mode() & 0o777;
+        restore_engine_tree_for_cleanup(&data);
+        assert!(
+            error.contains("model engine parent is not protected"),
+            "{error}"
+        );
+        assert_eq!(before, 0o775);
+        assert_eq!(after, 0o775);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_local_model_engine_accepts_a_nested_binary_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, data, bundle) =
+            unix_engine_identity_fixture_with_binary(tmp.path(), "bin/llama-server");
+        let component = &manifest.external["llama-server"];
+        let platform = detect_platform();
+        write_cache_metadata(
+            &manifest,
+            resolve_platform_info(component, &platform),
+            &platform,
+            "llama-server",
+            &bundle,
+        )
+        .unwrap();
+        let identity = verified_local_model_engine(&data, &manifest)
+            .expect("configured install_path remains the receipt bundle root");
+        let expected = bundle.canonicalize().unwrap().join("bin/llama-server");
+        restore_engine_tree_for_cleanup(&data);
+        assert_eq!(identity.path, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protect_engine_parents_rejects_symlink_escape_without_mutating_outside() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let victim = tmp.path().join("victim");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        let sentinel = victim.join("sentinel");
+        fs::write(&sentinel, b"outside-bytes").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o775)).unwrap();
+        symlink(&victim, data.join("libexec")).unwrap();
+        let platform = detect_platform();
+        let install_path = format!("libexec/llama.cpp/fixture-v1/{platform}");
+        let dest = data.join(&install_path);
+        let error = protect_local_model_engine_install_parents(&dest, &install_path)
+            .err()
+            .expect("protect must reject an aliased install parent")
+            .to_string();
+        let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        let sentinel_bytes = fs::read(&sentinel).unwrap();
+        assert!(
+            error.contains("model engine parent is not protected"),
+            "{error}"
+        );
+        assert_eq!(victim_mode, 0o775);
+        assert_eq!(sentinel_bytes, b"outside-bytes");
     }
 
     #[cfg(target_os = "macos")]
