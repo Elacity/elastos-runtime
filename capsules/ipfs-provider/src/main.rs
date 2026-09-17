@@ -10,6 +10,8 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -20,6 +22,106 @@ const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+const PIN_PROBE_FIRST_SAMPLE: Duration = Duration::from_secs(15);
+const PIN_PROBE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Samples Kubo while a pin is in flight.
+///
+/// A pin is one blocking HTTP call, so the only thing the caller can report
+/// about a slow one is how long it took -- which says nothing about why. The
+/// interesting state lives inside Kubo and only exists *during* the call:
+/// whether the CID is still in the wantlist, whether any blocks are arriving,
+/// and how many peers are connected. Sampled after the fact it is all gone,
+/// and the question gets answered by guessing instead.
+///
+/// Runs on its own thread because the pin blocks this one, stops when the pin
+/// returns, and never fails the pin: every sample is best-effort and a probe
+/// that cannot reach Kubo simply says so.
+struct KuboPinProbe {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KuboPinProbe {
+    fn start(api_url: String, cid: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut due = PIN_PROBE_FIRST_SAMPLE;
+            while !stop_signal.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+                if started.elapsed() < due {
+                    continue;
+                }
+                due += PIN_PROBE_SAMPLE_INTERVAL;
+                let stat = kubo_probe_json(&api_url, "bitswap/stat");
+                let peers = kubo_probe_json(&api_url, "swarm/peers");
+                let wanted = stat
+                    .as_ref()
+                    .and_then(|stat| stat.get("Wantlist"))
+                    .and_then(|list| list.as_array())
+                    .map(|list| {
+                        list.iter()
+                            .any(|entry| entry.get("/").and_then(|v| v.as_str()) == Some(&cid))
+                    })
+                    .unwrap_or(false);
+                eprintln!(
+                    "ipfs-provider: pin waiting cid={} elapsed_s={} cid_in_wantlist={} wantlist={} blocks_received={} data_received={} dup_blocks={} peers_bitswap={} peers_swarm={}",
+                    cid,
+                    started.elapsed().as_secs(),
+                    wanted,
+                    kubo_probe_len(stat.as_ref(), "Wantlist"),
+                    kubo_probe_num(stat.as_ref(), "BlocksReceived"),
+                    kubo_probe_num(stat.as_ref(), "DataReceived"),
+                    kubo_probe_num(stat.as_ref(), "DupBlksReceived"),
+                    kubo_probe_len(stat.as_ref(), "Peers"),
+                    peers
+                        .as_ref()
+                        .and_then(|peers| peers.get("Peers"))
+                        .and_then(|peers| peers.as_array())
+                        .map(|peers| peers.len() as i64)
+                        .unwrap_or(-1),
+                );
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for KuboPinProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn kubo_probe_json(api_url: &str, path: &str) -> Option<serde_json::Value> {
+    ureq::post(&format!("{api_url}/api/v0/{path}"))
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()
+        .and_then(|resp| resp.into_json::<serde_json::Value>().ok())
+}
+
+fn kubo_probe_num(stat: Option<&serde_json::Value>, key: &str) -> i64 {
+    stat.and_then(|stat| stat.get(key))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(-1)
+}
+
+fn kubo_probe_len(stat: Option<&serde_json::Value>, key: &str) -> i64 {
+    stat.and_then(|stat| stat.get(key))
+        .and_then(|value| value.as_array())
+        .map(|value| value.len() as i64)
+        .unwrap_or(-1)
+}
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -993,10 +1095,44 @@ impl IpfsProvider {
             return Response::error("kubo_unavailable", &e);
         }
         let url = format!("{}/api/v0/pin/add?arg={}", self.api_url(), cid);
-        match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
-            Ok(resp) if resp.status() == 200 => Response::ok_empty(),
-            Ok(resp) => Response::error("pin_failed", &format!("HTTP {}", resp.status())),
-            Err(e) => Response::error("pin_failed", &e.to_string()),
+        let started = Instant::now();
+        // Dropped when this returns, which stops the probe.
+        let _probe = KuboPinProbe::start(self.api_url(), cid.to_string());
+        let outcome = ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call();
+        let elapsed_ms = started.elapsed().as_millis();
+        // The timeout is reported next to the elapsed time on purpose: a pin
+        // that ends a hair either side of its own deadline should never be
+        // mistaken for one that simply took that long.
+        match outcome {
+            Ok(resp) if resp.status() == 200 => {
+                eprintln!(
+                    "ipfs-provider: pin settled cid={} outcome=ok elapsed_ms={} timeout_ms={}",
+                    cid,
+                    elapsed_ms,
+                    LARGE_HTTP_TIMEOUT.as_millis()
+                );
+                Response::ok_empty()
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "ipfs-provider: pin settled cid={} outcome=http_{} elapsed_ms={} timeout_ms={}",
+                    cid,
+                    resp.status(),
+                    elapsed_ms,
+                    LARGE_HTTP_TIMEOUT.as_millis()
+                );
+                Response::error("pin_failed", &format!("HTTP {}", resp.status()))
+            }
+            Err(e) => {
+                eprintln!(
+                    "ipfs-provider: pin settled cid={} outcome=error elapsed_ms={} timeout_ms={} error={}",
+                    cid,
+                    elapsed_ms,
+                    LARGE_HTTP_TIMEOUT.as_millis(),
+                    e
+                );
+                Response::error("pin_failed", &e.to_string())
+            }
         }
     }
 

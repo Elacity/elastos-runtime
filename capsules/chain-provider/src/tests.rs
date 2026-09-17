@@ -4938,7 +4938,7 @@ fn resolve_protected_content_purchase_access_uses_view_policy_source_and_hides_t
         ("eth_chainId", json!([]), json!("0x14")),
         (
             "eth_getBlockByNumber",
-            json!(["finalized", false]),
+            json!(["latest", false]),
             json!({
                 "number": "0x2c",
                 "hash": finalized_hash,
@@ -4999,6 +4999,72 @@ fn resolve_protected_content_purchase_access_uses_view_policy_source_and_hides_t
     assert!(!rendered.contains("\"selector\""));
 }
 
+/// The upfront access check must read the chain head, not finalized state.
+///
+/// A grant is readable by `hasAccess` in the very block that carries the
+/// acquisition, while finality on an L2 trails the head by many minutes. Read
+/// at `finalized`, the call reverts as an unbound content id -- so a creator
+/// who just watched their own mint confirm is told the asset is not theirs,
+/// and no owned copy is ever recorded for it.
+///
+/// This mock answers `latest` and nothing else: were the tag to go back to
+/// `finalized`, the request assertion fails rather than this test silently
+/// passing against a different block.
+#[test]
+fn resolve_protected_content_purchase_access_reads_the_head_so_a_just_settled_grant_resolves() {
+    let access_id = content_access_id(0x51);
+    let wallet = "0x0000000000000000000000000000000000000007";
+    let expected_data =
+        encode_has_access_by_content_id_call("0x12345678", access_id.as_bytes(), wallet).unwrap();
+    let head_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["latest", false]),
+            json!({
+                "number": "0x2c",
+                "hash": head_hash,
+                "timestamp": format!("0x{:x}", RIGHTS_EVIDENCE_NOW - 2),
+            }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x0000000000000000000000000000000000000001",
+                    "data": expected_data
+                },
+                {
+                    "blockHash": head_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(true),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentPurchaseAccess {
+            request_id: "purchase-access:just-settled".to_string(),
+            network: "esc-local".to_string(),
+            wallet: wallet.to_string(),
+            content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
+        }),
+    );
+    assert_eq!(data["has_access"], true);
+}
+
 #[test]
 fn resolve_protected_content_purchase_access_rejects_non_view_policy_source() {
     let access_id = content_access_id(0x51);
@@ -5042,7 +5108,7 @@ fn resolve_protected_content_purchase_access_rejects_stale_or_future_finalized_o
             ("eth_chainId", json!([]), json!("0x14")),
             (
                 "eth_getBlockByNumber",
-                json!(["finalized", false]),
+                json!(["latest", false]),
                 json!({
                     "number": "0x2c",
                     "hash": finalized_hash,

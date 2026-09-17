@@ -14,7 +14,7 @@ use elastos_protected_content_contracts::{
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod abi;
 mod backends;
@@ -963,9 +963,15 @@ impl ChainProvider {
             network,
             &policy_source.evidence_rpc_urls,
             policy.chain_id(),
-            &method.contract,
-            &data,
-            &policy.content_access_id(),
+            ProtectedContentRightsCall {
+                contract: &method.contract,
+                data: &data,
+                expected_content_access_id: &policy.content_access_id(),
+                // Evidence that authorizes releasing a content key.
+                // Irreversible once released, so it rests only on finalized
+                // state.
+                block: ProtectedContentRightsBlock::Finalized,
+            },
         ) {
             Ok(observation) => observation,
             Err(response) => return response,
@@ -1124,6 +1130,14 @@ impl ChainProvider {
                 "configured protected-content creator mint network is missing chain id",
             );
         };
+        // The authority gateway this network's market is configured with, so a
+        // mint can state it in its own metadata rather than leaving readers to
+        // resolve it from whatever the runtime happens to have registered
+        // later. `null` when the network has no market configured at all.
+        let authority = self
+            .configured_protected_content_market_source(&network.id)
+            .ok()
+            .map(|market| normalize_evm_address(&market.authority_gateway_contract));
         Response::ok(json!({
             "schema": PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA,
             "network": network.id,
@@ -1132,6 +1146,7 @@ impl ChainProvider {
             "pay_token": mint.pay_token,
             "abi": mint.abi,
             "function": mint.abi.function(),
+            "authority_gateway_contract": authority,
         }))
     }
 
@@ -1576,9 +1591,17 @@ impl ChainProvider {
             network,
             &policy_source.evidence_rpc_urls,
             expected_chain_id,
-            &method.contract,
-            &data,
-            &content_access_id,
+            ProtectedContentRightsCall {
+                contract: &method.contract,
+                data: &data,
+                expected_content_access_id: &content_access_id,
+                // The upfront "is this copy theirs" check. The grant is
+                // readable at the block that carries the acquisition, so
+                // reading it at finality would deny a transaction the caller
+                // watched confirm. Releasing the key is gated separately, on
+                // finalized evidence.
+                block: ProtectedContentRightsBlock::Head,
+            },
         ) {
             Ok(observation) => observation,
             Err(response) => return response,
@@ -2441,19 +2464,14 @@ impl ChainProvider {
         network: &ChainNetwork,
         evidence_rpc_urls: &[String],
         expected_chain_id: u64,
-        contract: &str,
-        data: &str,
-        expected_content_access_id: &ContentAccessIdV1,
+        call: ProtectedContentRightsCall<'_>,
     ) -> Result<ProtectedContentRightsObservation, Response> {
+        let started = Instant::now();
         let mut observed: Vec<(&String, ProtectedContentRightsObservation)> = Vec::new();
         for rpc_url in evidence_rpc_urls {
-            if let Some(observation) = self.observe_protected_content_rights_source(
-                network,
-                rpc_url,
-                contract,
-                data,
-                expected_content_access_id,
-            ) {
+            if let Some(observation) =
+                self.observe_protected_content_rights_source(network, rpc_url, call)
+            {
                 observed.push((rpc_url, observation));
             }
         }
@@ -2494,14 +2512,9 @@ impl ChainProvider {
                 .expect("at least two observations");
             let mut pinned = Vec::with_capacity(observed.len());
             for (rpc_url, _) in &observed {
-                if let Some(repinned) = self.observe_protected_content_rights_source_at(
-                    network,
-                    rpc_url,
-                    contract,
-                    data,
-                    expected_content_access_id,
-                    &pin,
-                ) {
+                if let Some(repinned) =
+                    self.observe_protected_content_rights_source_at(network, rpc_url, call, &pin)
+                {
                     pinned.push(repinned);
                 }
             }
@@ -2523,6 +2536,23 @@ impl ChainProvider {
                 "protected-content evidence sources disagree on finalized rights observation",
             ));
         }
+        // Says which block answered and what it answered. A rights call that
+        // denies is otherwise indistinguishable from one that was asked about
+        // a block too old to know the content, which is exactly the confusion
+        // this line exists to remove.
+        eprintln!(
+            "chain-provider: rights observed block_tag={} block={} block_age_secs={} sources={} outcome={} elapsed_ms={}",
+            call.block.tag(),
+            reference.finalized_block_number,
+            (self.now_unix_seconds)().saturating_sub(reference.finalized_block_timestamp),
+            successful.len(),
+            match reference.outcome {
+                ProtectedContentRightsObservationKind::HasAccess(true) => "has_access",
+                ProtectedContentRightsObservationKind::HasAccess(false) => "no_access",
+                ProtectedContentRightsObservationKind::Unbound(_) => "unbound",
+            },
+            started.elapsed().as_millis()
+        );
         Ok(reference)
     }
 
@@ -2533,9 +2563,7 @@ impl ChainProvider {
         &self,
         network: &ChainNetwork,
         rpc_url: &str,
-        contract: &str,
-        data: &str,
-        expected_content_access_id: &ContentAccessIdV1,
+        call: ProtectedContentRightsCall<'_>,
         pin: &ProtectedContentRightsObservation,
     ) -> Option<ProtectedContentRightsObservation> {
         let mut source_network = network.clone();
@@ -2555,10 +2583,8 @@ impl ChainProvider {
         }
         let outcome = self.protected_content_eth_call_outcome(
             &source_network,
-            contract,
-            data,
+            call,
             &pin.finalized_block_hash,
-            expected_content_access_id,
         )?;
         Some(ProtectedContentRightsObservation {
             chain_id: pin.chain_id,
@@ -2573,9 +2599,7 @@ impl ChainProvider {
         &self,
         network: &ChainNetwork,
         rpc_url: &str,
-        contract: &str,
-        data: &str,
-        expected_content_access_id: &ContentAccessIdV1,
+        call: ProtectedContentRightsCall<'_>,
     ) -> Option<ProtectedContentRightsObservation> {
         let mut source_network = network.clone();
         source_network.rpc_url = rpc_url.to_string();
@@ -2587,16 +2611,14 @@ impl ChainProvider {
             .evm_rpc(
                 &source_network,
                 "eth_getBlockByNumber",
-                json!(["finalized", false]),
+                json!([call.block.tag(), false]),
             )
             .ok()
             .and_then(|value| evm_finalized_block(&value).ok())?;
         let outcome = self.protected_content_eth_call_outcome(
             &source_network,
-            contract,
-            data,
+            call,
             &finalized.finalized_block_hash,
-            expected_content_access_id,
         )?;
         finalized.chain_id = chain_id;
         finalized.outcome = outcome;
@@ -2606,10 +2628,8 @@ impl ChainProvider {
     fn protected_content_eth_call_outcome(
         &self,
         network: &ChainNetwork,
-        contract: &str,
-        data: &str,
+        call: ProtectedContentRightsCall<'_>,
         finalized_block_hash: &Digest32,
-        expected_content_access_id: &ContentAccessIdV1,
     ) -> Option<ProtectedContentRightsObservationKind> {
         let response = self
             .client
@@ -2619,7 +2639,7 @@ impl ChainProvider {
                 "id": 1,
                 "method": "eth_call",
                 "params": [
-                    { "to": contract, "data": data },
+                    { "to": call.contract, "data": call.data },
                     {
                         "blockHash": format!("0x{}", encode_hex(finalized_block_hash.as_bytes())),
                         "requireCanonical": true
@@ -2633,8 +2653,11 @@ impl ChainProvider {
         }
         let body = response.json::<Value>().ok()?;
         if let Some(error) = body.get("error") {
-            return decode_protected_content_unbound_content_id(error, expected_content_access_id)
-                .map(ProtectedContentRightsObservationKind::Unbound);
+            return decode_protected_content_unbound_content_id(
+                error,
+                call.expected_content_access_id,
+            )
+            .map(ProtectedContentRightsObservationKind::Unbound);
         }
         let result = body.get("result")?.clone();
         decode_evm_bool(&result)
@@ -2957,6 +2980,48 @@ struct ProtectedContentRightsObservation {
 enum ProtectedContentRightsObservationKind {
     HasAccess(bool),
     Unbound(ContentAccessIdV1),
+}
+
+/// Which block a rights call is evaluated at. The two readers of `hasAccess`
+/// want genuinely different answers, so neither may assume the other's.
+///
+/// `Finalized` is for evidence that authorizes releasing a content key: that
+/// decision is irreversible once the key is out, so it may only rest on state
+/// no reorg can take back.
+///
+/// `Head` is for the upfront check that decides whether a principal may be
+/// shown an asset as theirs. The grant lands in the very block that carries
+/// the acquisition -- a mint is readable by `hasAccess` at its own block --
+/// while finality on an L2 trails the head by many minutes. Reading that
+/// check at `Finalized` would answer "no such content" about a transaction
+/// the caller has already watched confirm, which is why this exists.
+/// Corroboration is unchanged either way: every source is pinned to one
+/// common block and must agree there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectedContentRightsBlock {
+    Finalized,
+    Head,
+}
+
+/// One `hasAccess` question: the contract that answers it, the encoded call,
+/// the content it is about, and the block it must be evaluated at. These four
+/// always travel together -- every source observing the same question must use
+/// every one of them identically, or the corroboration compares nothing.
+#[derive(Clone, Copy)]
+struct ProtectedContentRightsCall<'a> {
+    contract: &'a str,
+    data: &'a str,
+    expected_content_access_id: &'a ContentAccessIdV1,
+    block: ProtectedContentRightsBlock,
+}
+
+impl ProtectedContentRightsBlock {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Finalized => "finalized",
+            Self::Head => "latest",
+        }
+    }
 }
 
 fn evm_finalized_block(value: &Value) -> Result<ProtectedContentRightsObservation, String> {

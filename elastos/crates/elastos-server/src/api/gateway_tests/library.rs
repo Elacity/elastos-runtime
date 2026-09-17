@@ -542,6 +542,7 @@ fn seed_completed_runtime_custody_mint(
             "access": "buyer_purchase_required"
         }),
         listing_uri: None,
+        capsule_uri: None,
     }
 }
 
@@ -598,6 +599,21 @@ fn seed_runtime_custody_creator_listing_for_buy(
     crate::protected_content_runtime::load_runtime_custody_listing(data_dir, facts.mint_id)
         .unwrap()
         .unwrap()
+}
+
+fn runtime_custody_owned_copy_path_for_test(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) -> std::path::PathBuf {
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    <sha2::Sha256 as sha2::Digest>::update(&mut hasher, principal_id.as_bytes());
+    data_dir
+        .join("protected-content/runtime-purchases")
+        .join(hex::encode(<sha2::Sha256 as sha2::Digest>::finalize(
+            hasher,
+        )))
+        .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
 }
 
 fn runtime_custody_listing_path_for_test(
@@ -6349,6 +6365,7 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -6421,6 +6438,7 @@ async fn test_runtime_custody_creator_tail_raises_exactly_one_wallet_effect() {
                 receipt: facts.receipt.clone(),
                 content_security: facts.content_security.clone(),
                 listing_uri: facts.listing_uri.clone(),
+                capsule_uri: facts.capsule_uri.clone(),
             }
         };
 
@@ -6565,6 +6583,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     set_mock_runtime_listing_publish_failure(true);
     let publish_error = runtime_custody_publish_creator_tail_for_test(
@@ -6597,6 +6616,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     let ok = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -6701,6 +6721,7 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     let replay = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -7082,6 +7103,7 @@ async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_s
         receipt: facts.receipt.clone(),
         content_security: facts.content_security.clone(),
         listing_uri: None,
+        capsule_uri: None,
     };
     let refusal = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -7252,6 +7274,7 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -7311,6 +7334,7 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,
@@ -10006,6 +10030,9 @@ async fn test_runtime_custody_audio_publish_lists_the_aac_rendition() {
 #[tokio::test]
 async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    // This journey reads back the metadata document it published, the way an
+    // owned capsule does. Scoped to this test so no other one can see it.
+    let _recording = record_mock_published_content();
     let dir = tempfile::tempdir().unwrap();
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
@@ -10016,6 +10043,12 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     reset_mock_protected_content_purchase_fixture();
     registry
         .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    // Watches what owning a copy keeps on this machine.
+    let ipfs = MockPinRecordingIpfsProvider::default();
+    registry
+        .register_sub_provider("ipfs", std::sync::Arc::new(ipfs.clone()))
         .await
         .unwrap();
     registry
@@ -10175,6 +10208,57 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     // An object publish now runs the SAME creator tail as media: encrypted
     // content, metadata document and portable listing are all published.
     assert_eq!(mock_content_publish_request_count(), 3);
+
+    // The creator holds a copy from the moment the mint lands, so they open it
+    // the way anyone holding one does -- without buying their own asset. That
+    // is the point of recording the minted copy: below the entitlement check a
+    // minted copy and a bought one are the same thing, and the right itself is
+    // the chain's answer for the creator's wallet.
+    let creator_reader_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        ELACITY_READER_CAPSULE_ID_FOR_TEST,
+        &creator,
+    );
+    let (creator_open_status, creator_open) = post_library(
+        app.clone(),
+        &creator_reader_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(creator_open_status, StatusCode::OK);
+    assert_eq!(
+        creator_open["status"], "ok",
+        "a creator must be able to open the asset they minted: {creator_open}"
+    );
+
+    // An asset minted before minted copies were recorded as owned has a
+    // listing, a terminal and no owned copy -- exactly what deleting the record
+    // leaves behind. Opening it restores the record from what was already
+    // written down, without the creator being asked to do anything.
+    let owned_copy_path =
+        runtime_custody_owned_copy_path_for_test(dir.path(), &creator.principal_id, mint_id);
+    assert!(
+        owned_copy_path.is_file(),
+        "the mint must have recorded a copy"
+    );
+    std::fs::remove_file(&owned_copy_path).unwrap();
+    let (repaired_status, repaired) = post_library(
+        app.clone(),
+        &creator_reader_token,
+        "open_viewer",
+        json!({"mint_id": mint_id_hex}),
+    )
+    .await;
+    assert_eq!(repaired_status, StatusCode::OK);
+    assert_eq!(
+        repaired["status"], "ok",
+        "a copy minted before it was recorded must repair itself on open: {repaired}"
+    );
+    assert!(
+        owned_copy_path.is_file(),
+        "the restored copy must be durable, not rebuilt on every open"
+    );
     let listing_path = runtime_custody_listing_path_for_test(dir.path(), mint_id);
     let listing_before_buy = std::fs::read(&listing_path).unwrap();
     let listing_json: serde_json::Value = serde_json::from_slice(&listing_before_buy).unwrap();
@@ -10225,6 +10309,51 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     assert_eq!(buy_ok_status, StatusCode::OK);
     assert_eq!(buy_ok["status"], "ok", "{buy_ok}");
     assert_eq!(buy_ok["data"]["availability"]["status"], "buyer_owned");
+    // A bought copy is filed exactly like a minted one: the buyer gets their own
+    // `.ddrm` on the shelf its kind belongs to, describing the same asset. This
+    // is what makes "owned" one thing rather than two.
+    let buyer_root = crate::auth::principal_localhost_root(&buyer.principal_id);
+    let (buyer_documents_status, buyer_documents) = post_library(
+        app.clone(),
+        &buyer_token,
+        "list",
+        json!({ "uri": format!("{buyer_root}/Documents") }),
+    )
+    .await;
+    assert_eq!(buyer_documents_status, StatusCode::OK);
+    let buyer_capsule = buyer_documents["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| {
+            object["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".ddrm"))
+        })
+        .unwrap_or_else(|| panic!("a bought copy must be filed as a capsule: {buyer_documents}"));
+    assert_eq!(
+        buyer_capsule["metadata"]["protected_content"]["mint_id"], mint_id_hex,
+        "{buyer_capsule}"
+    );
+    assert_eq!(
+        buyer_capsule["metadata"]["protected_content"]["asset_mime"], "application/pdf",
+        "{buyer_capsule}"
+    );
+    assert_eq!(
+        buyer_capsule["metadata"]["protected_content"]["acquisition"], "bought",
+        "{buyer_capsule}"
+    );
+
+    // Owning a copy keeps its material here: the encrypted content and the
+    // metadata document are pinned locally, so reads come off this machine
+    // rather than going back to custody for every chunk. Pinned, not merely
+    // fetched -- an unpinned block is collectable, and reads would drift back
+    // onto the network without anything saying so.
+    let pinned = ipfs.pinned();
+    assert!(
+        pinned.contains(&TEST_CIDV1.to_string()),
+        "an owned copy must keep its material locally: {pinned:?}"
+    );
 
     // Kind <-> viewer: the media player must not be able to open an object.
     let (_, player_open) = post_library(
@@ -10945,6 +11074,7 @@ async fn test_runtime_custody_creator_tail_rejects_resolved_source_drift_before_
         receipt: json!({"schema": "elastos.content.availability.receipt/v1"}),
         content_security: json!({"mode": "runtime_custody"}),
         listing_uri: None,
+        capsule_uri: None,
     };
     let err = runtime_custody_publish_creator_tail_for_test(
         &state,

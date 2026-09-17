@@ -3084,6 +3084,12 @@ impl ContentProvider {
                 "content publish exceeds the principal storage quota",
             ));
         }
+        // Writing bytes into the local store and replicating them across the
+        // availability plane are different orders of magnitude -- the first is
+        // local I/O, the second waits on other nodes -- so they are timed
+        // apart. A publish that takes minutes is almost always the second, and
+        // saying so should not require inferring it.
+        let started = std::time::Instant::now();
         let ipfs_response = self
             .invoke_provider(
                 &registry,
@@ -3094,21 +3100,38 @@ impl ContentProvider {
             )
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
+        tracing::debug!(
+            phase = "ipfs_add",
+            op = %ipfs_op,
+            bytes = accounting_observation.bytes.unwrap_or_default(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "content publish phase"
+        );
         let local_outcome = AvailabilityOutcome::local_publish(pin);
         let outcome = if pin {
-            self.ensure_network_availability(
-                &registry,
-                &cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: object_did.as_deref(),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation,
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome)
+            let started = std::time::Instant::now();
+            let ensured = self
+                .ensure_network_availability(
+                    &registry,
+                    &cid,
+                    request,
+                    &local_outcome,
+                    AvailabilityRequestContext {
+                        object_did: object_did.as_deref(),
+                        publisher_did: publisher_did.as_deref(),
+                        accounting_observation,
+                    },
+                )
+                .await?
+                .unwrap_or(local_outcome);
+            tracing::debug!(
+                phase = "availability_ensure",
+                status = %ensured.status,
+                replicas = ensured.replicas,
+                elapsed_ms = started.elapsed().as_millis(),
+                "content publish phase"
+            );
+            ensured
         } else {
             local_outcome
         };

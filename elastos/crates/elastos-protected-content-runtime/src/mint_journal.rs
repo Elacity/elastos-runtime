@@ -2819,6 +2819,61 @@ impl RuntimeMintJournal {
         Ok(record)
     }
 
+    /// Forget an intent that can never produce a mint, so the object it names
+    /// can be minted again.
+    ///
+    /// An intent whose protect session was settled before any draft was
+    /// persisted is terminal: there is no draft to roll forward and no record
+    /// to adopt, so every later attempt on that object aborts at the same
+    /// point, forever. Since the intent's identity is derived from the object
+    /// path, that path stays dead until someone edits the journal by hand.
+    ///
+    /// Removing it lets the next attempt start from nothing, which is what a
+    /// creator asking to mint that file again means. Refuses an intent that
+    /// completed a mint: that one still names the record it produced.
+    pub fn discard_unmintable_intent(
+        &self,
+        request_id: Digest32,
+    ) -> Result<(), RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let intent = self.read_intent(request_id)?;
+        if intent.completed_mint_id().is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        fs::remove_file(self.intent_path(request_id))
+            .map_err(|_| RuntimeMintJournalError::Unavailable)
+    }
+
+    /// Forget an attempt that can never finish, so the object it was minted
+    /// from can be minted again.
+    ///
+    /// An attempt whose content availability was never recorded cannot be
+    /// rolled forward: the content key material does not outlive the request
+    /// that produced it. Keeping such a record only wedges the intent -- the
+    /// scan finds it, refuses to treat it as a candidate, and every later
+    /// attempt on that object path fails the same way, permanently.
+    ///
+    /// What it left on the nodes is not taken back here. Those shares seal
+    /// against an envelope that is gone and no listing will ever name them, so
+    /// they open nothing; they are storage residue, and reclaiming them is a
+    /// housekeeping job rather than a condition for minting again.
+    ///
+    /// Refuses a record that recorded availability: that one may still be
+    /// adoptable, and discarding it would throw away a mint that worked.
+    pub fn discard_unfinishable_mint(
+        &self,
+        mint_id: Digest32,
+    ) -> Result<(), RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let record = self.read_record(mint_id)?;
+        if record.content_availability().is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        fs::remove_file(self.record_path(mint_id)).map_err(|_| RuntimeMintJournalError::Unavailable)
+    }
+
     pub fn mark_creator_completed(
         &self,
         mint_id: Digest32,
@@ -4849,6 +4904,75 @@ mod tests {
         journal
             .mark_intent_protect_closed_before_draft(intent.request_id())
             .unwrap()
+    }
+
+    /// An attempt whose custody succeeded but whose availability was never
+    /// recorded can never finish, and keeping it wedges the object it was
+    /// minted from: the scan keeps finding it, and every later attempt on that
+    /// path fails the same way forever. Discarding it is what makes the path
+    /// mintable again.
+    #[test]
+    fn an_attempt_that_can_never_finish_is_discarded_and_stops_wedging_its_intent() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        let matching = draft_with(0x21, 0x52, 0x35);
+        custody_provision_all(&journal, &matching);
+
+        // Custody is provisioned; availability never was.
+        let found = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        let open = found.open().expect("the attempt must start out wedging");
+        assert_eq!(
+            open.custody_terminal(),
+            Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        );
+        assert!(open.content_availability().is_none());
+
+        journal
+            .discard_unfinishable_mint(matching.mint_id())
+            .expect("an attempt that cannot finish must be discardable");
+
+        // Nothing is left for a fresh attempt to collide with.
+        let rescanned = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        assert!(
+            rescanned.open().is_none(),
+            "a discarded attempt must not keep wedging its intent"
+        );
+        assert!(
+            journal.load(matching.mint_id()).is_err(),
+            "the discarded record must be gone from the store"
+        );
+    }
+
+    /// The discard exists to clear attempts that cannot finish, and must never
+    /// reach one that did. A record with its availability recorded is a mint
+    /// that worked and may still be adopted, so discarding it is refused.
+    #[test]
+    fn an_attempt_that_recorded_its_availability_is_never_discarded() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let draft = draft();
+        custody_provision_all(&journal, &draft);
+        journal
+            .mark_content_available(
+                draft.mint_id(),
+                &availability_requirement(),
+                availability_evidence(&draft, 0x71),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            journal.discard_unfinishable_mint(draft.mint_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        ));
+        assert!(
+            journal.load(draft.mint_id()).is_ok(),
+            "a mint that worked must survive"
+        );
     }
 
     #[test]

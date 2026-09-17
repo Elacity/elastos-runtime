@@ -2051,20 +2051,9 @@ async fn library_publish(
             )
             .await?
         };
-        // The minted item is the capsule, filed on the shelf its kind belongs
-        // to -- that is what the creator opens, and what carries the mint the
-        // viewer binds its session to. The source file is left untouched.
-        let capsule_uri = write_runtime_custody_capsule(
-            data_dir,
-            principal_id,
-            &target.localhost_root,
-            &target.uri,
-            content_type,
-            &facts,
-        )?;
         let record = LibraryPublishRecord {
             schema: "elastos.library.publish-record/v1".to_string(),
-            object_uri: capsule_uri.clone(),
+            object_uri: target.uri.clone(),
             cid: facts.content_cid.clone(),
             published_at: now_ts(),
             unpublished_at: None,
@@ -2077,26 +2066,26 @@ async fn library_publish(
             listing_uri: facts.listing_uri,
         };
         write_publish_record(data_dir, principal_id, &record)?;
-        // The capsule is the item, but the source keeps a marker of its own so
-        // it still reads as minted: without one it would look like an ordinary
-        // unpublished file and the Library would offer to mint it all over
-        // again. The marker names the capsule it produced, so the two are
-        // never mistaken for independent mints of the same bytes.
-        let mut source_marker = record.clone();
-        source_marker.object_uri = target.uri.clone();
-        source_marker.content_security["minted_capsule_uri"] = json!(capsule_uri);
-        write_publish_record(data_dir, principal_id, &source_marker)?;
-        let object = library_object(data_dir, principal_id, &capsule_uri)?;
+        // The capsule the tail filed for this mint is the openable item, so it
+        // is what the publish answers with. The source keeps its own record --
+        // which is what stops the Library offering to mint the same bytes a
+        // second time -- and stays exactly where the creator put it.
+        let capsule_uri = facts.capsule_uri.clone();
+        let object = library_object(
+            data_dir,
+            principal_id,
+            capsule_uri.as_deref().unwrap_or(&target.uri),
+        )?;
         append_library_event(
             data_dir,
             principal_id,
             "publish",
-            &capsule_uri,
+            &target.uri,
             json!({
                 "cid": facts.content_cid,
                 "content_id": facts.content_id,
                 "mint_id": hex::encode(facts.mint_id.as_bytes()),
-                "source_object_uri": target.uri,
+                "capsule_uri": capsule_uri,
                 "listing_uri": record.listing_uri,
                 "availability": record.availability,
                 "object": object,
@@ -3548,8 +3537,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         }
         metadata
     };
-    if let Some(protected_content) =
-        active_record.and_then(runtime_custody_library_identity_metadata)
+    if let Some(protected_content) = active_record
+        .and_then(runtime_custody_library_identity_metadata)
+        .or_else(|| {
+            runtime_custody_capsule_identity_metadata(data_dir, principal_id, &target, &name)
+        })
     {
         local_metadata["protected_content"] = protected_content;
     }
@@ -5853,14 +5845,15 @@ fn record_is_runtime_custody(record: &LibraryPublishRecord) -> bool {
 /// item written is a `.ddrm` capsule whose own extension says nothing about
 /// what it protects. Every folder named here must also be a `library_roots`
 /// entry, or the item lands somewhere the sidebar cannot reach.
-/// The on-disk shape of a minted Library item.
-const RUNTIME_CUSTODY_CAPSULE_SCHEMA: &str = "elastos.library.protected-content-capsule/v1";
 /// A capsule is a JSON document; its `.ddrm` suffix names the kind of item it
 /// is, not a media type the Library can render on its own.
 const RUNTIME_CUSTODY_CAPSULE_MIME: &str = "application/json";
 /// How many names a capsule tries before giving up, so a collision suffixes
 /// rather than overwrites and a pathological loop still terminates.
 const RUNTIME_CUSTODY_CAPSULE_NAME_ATTEMPTS: usize = 64;
+/// A capsule is a small JSON document. Anything larger is not one, and is not
+/// read into memory to find out.
+const RUNTIME_CUSTODY_CAPSULE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(crate) fn library_folder_for_mime(mime: &str) -> &'static str {
     let mime = mime.trim().to_ascii_lowercase();
@@ -5916,28 +5909,105 @@ fn runtime_custody_capsule_base_name(display_name: &str) -> String {
 ///
 /// A name already taken is suffixed rather than overwritten, so minting the
 /// same source twice produces two items instead of silently replacing one.
-fn write_runtime_custody_capsule(
+/// Write an owned protected item into the Library as a `.ddrm` capsule, filed
+/// on the shelf its kind belongs to, and answer the URI it landed at.
+///
+/// The capsule is the openable item and describes itself: the caller builds the
+/// document (see `runtime_custody_capsule_document`), and this places it. Which
+/// shelf is decided by what the capsule protects, never by its own `.ddrm`
+/// extension, which says nothing about whether it holds a film or a PDF.
+///
+/// Whatever the item was made from is left alone -- acquiring an asset is not a
+/// reason to move or delete someone's file. A name already taken is suffixed
+/// rather than overwritten, so owning the same asset twice produces two items
+/// instead of silently replacing one.
+/// Every shelf a capsule can be filed on, which is every folder
+/// `library_folder_for_mime` can answer.
+///
+/// The trash is deliberately not among them: a capsule the person threw away
+/// is not one to resurrect and rewrite in place. Owning that asset again puts
+/// a fresh item back on a shelf, which is what throwing it away asked for.
+const RUNTIME_CUSTODY_CAPSULE_SHELVES: [&str; 4] = ["Pictures", "Videos", "Music", "Documents"];
+
+/// Where this mint's capsule is already filed, if it is.
+///
+/// Reads each candidate's own identity rather than guessing from its name: a
+/// capsule's file name comes from the source object, so two different assets
+/// can share one, and the same asset can be filed under a name that no longer
+/// matches anything. The mint id inside the document is what actually says
+/// "this is that asset".
+fn runtime_custody_capsule_uri_for_mint(
     data_dir: &Path,
     principal_id: &str,
-    localhost_root: &str,
-    source_object_uri: &str,
-    asset_mime: &str,
-    facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    mint_id: &str,
+) -> Option<String> {
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    for folder in RUNTIME_CUSTODY_CAPSULE_SHELVES {
+        let folder_uri = format!("{localhost_root}/{folder}");
+        let Ok(folder_target) = library_target(data_dir, principal_id, &folder_uri) else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(&folder_target.path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.to_ascii_lowercase().ends_with(".ddrm") {
+                continue;
+            }
+            let uri = format!("{folder_uri}/{name}");
+            let Ok(target) = library_target(data_dir, principal_id, &uri) else {
+                continue;
+            };
+            let Some(identity) =
+                runtime_custody_capsule_identity_metadata(data_dir, principal_id, &target, &name)
+            else {
+                continue;
+            };
+            if identity.get("mint_id").and_then(Value::as_str) == Some(mint_id) {
+                return Some(uri);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn write_runtime_custody_capsule(
+    data_dir: &Path,
+    principal_id: &str,
+    display_name: &str,
+    content_type: &str,
+    capsule: &Value,
 ) -> anyhow::Result<String> {
-    let folder = library_folder_for_mime(asset_mime);
-    let base = runtime_custody_capsule_base_name(&facts.display_name);
-    let capsule = json!({
-        "schema": RUNTIME_CUSTODY_CAPSULE_SCHEMA,
-        "display_name": facts.display_name,
-        "asset_mime": asset_mime,
-        "source_object_uri": source_object_uri,
-        "mint_id": hex::encode(facts.mint_id.as_bytes()),
-        "content_id": facts.content_id,
-        "content_cid": facts.content_cid,
-        "listing_uri": facts.listing_uri,
-        "availability": facts.availability,
-    });
-    let bytes = serde_json::to_vec_pretty(&capsule)?;
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let folder = library_folder_for_mime(content_type);
+    let base = runtime_custody_capsule_base_name(display_name);
+    let bytes = serde_json::to_vec_pretty(capsule)?;
+    // Owning the same asset again is the same item, not a second one. The
+    // repair path re-files a capsule for an asset that already has one, and
+    // suffixing there leaves the person with two files where only one is
+    // current -- and the ownership record pointing at whichever was written
+    // last. Rewrite the capsule already filed for this mint instead.
+    if let Some(mint_id) = capsule
+        .get("mintId")
+        .and_then(Value::as_str)
+        .filter(|mint_id| !mint_id.is_empty())
+    {
+        if let Some(existing) =
+            runtime_custody_capsule_uri_for_mint(data_dir, principal_id, mint_id)
+        {
+            write_library_file_bytes(
+                data_dir,
+                principal_id,
+                &existing,
+                Some(RUNTIME_CUSTODY_CAPSULE_MIME),
+                None,
+                false,
+                &bytes,
+            )?;
+            return Ok(existing);
+        }
+    }
     let mut last_error = None;
     for attempt in 1..=RUNTIME_CUSTODY_CAPSULE_NAME_ATTEMPTS {
         let name = if attempt == 1 {
@@ -5962,16 +6032,71 @@ fn write_runtime_custody_capsule(
     Err(last_error.unwrap_or_else(|| anyhow!("library could not write the protected capsule")))
 }
 
+/// What a `.ddrm` says about itself.
+///
+/// A capsule is the item for an owned protected asset however it was acquired,
+/// and a buyer never publishes anything -- so there is no publish record to
+/// read this from, and inventing one would assert a publish that never
+/// happened. The capsule is self-describing instead, which is also what lets an
+/// asset be repaired by writing its file.
+///
+/// Nothing here is trusted as authority. It decides which viewer opens and what
+/// the Library shows; whether this principal may open it at all is the
+/// entitlement check, which answers from the chain. A hand-written capsule
+/// therefore buys nothing: it can only name a mint whose open is refused.
+fn runtime_custody_capsule_identity_metadata(
+    data_dir: &Path,
+    principal_id: &str,
+    target: &LibraryTarget,
+    name: &str,
+) -> Option<Value> {
+    if !name.to_ascii_lowercase().ends_with(".ddrm") {
+        return None;
+    }
+    let metadata = fs::metadata(&target.path).ok()?;
+    if !metadata.is_file() || metadata.len() > RUNTIME_CUSTODY_CAPSULE_MAX_BYTES {
+        return None;
+    }
+    // Read it the way the Library reads any of its files: what is on disk is a
+    // principal-root object carrying the document, not the document itself.
+    let capsule: Value =
+        serde_json::from_slice(&read_library_file_bytes(data_dir, principal_id, target).ok()?)
+            .ok()?;
+    if capsule.get("schema").and_then(Value::as_str)
+        != Some(crate::protected_content_runtime::RUNTIME_CUSTODY_CAPSULE_SCHEMA_V1)
+    {
+        return None;
+    }
+    // Capsules written before the metadata document was embedded spell these
+    // in snake_case. They are on real disks and must keep opening, so both
+    // spellings are read rather than migrating every file to find out.
+    let field = |camel: &str, snake: &str| {
+        capsule
+            .get(camel)
+            .or_else(|| capsule.get(snake))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    Some(json!({
+        "schema": "elastos.library.protected-content-identity/v1",
+        "content_id": field("contentId", "content_id"),
+        "mint_id": field("mintId", "mint_id"),
+        "kid": field("kid", "kid"),
+        "token_id": field("tokenId", "token_id"),
+        "ledger": field("ledger", "ledger"),
+        "authority": field("authority", "authority"),
+        "asset_mime": field("contentType", "asset_mime"),
+        "acquisition": field("acquisition", "acquisition"),
+        "published_cid": field("contentCid", "content_cid"),
+    }))
+}
+
 fn runtime_custody_library_identity_metadata(record: &LibraryPublishRecord) -> Option<Value> {
     record_is_runtime_custody(record).then(|| {
         json!({
             "schema": "elastos.library.protected-content-identity/v1",
             "content_id": record.content_security.get("content_id"),
             "mint_id": record.content_security.get("mint_id"),
-            // What the capsule protects. `mime_for_name` can only see a
-            // `.ddrm` extension, so without this the viewer would have no way
-            // to tell a protected film from a protected PDF.
-            "asset_mime": record.content_security.get("asset_mime"),
             "published_cid": record.cid,
             "availability": record.availability,
         })

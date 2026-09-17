@@ -2655,6 +2655,65 @@ pub(in crate::api::gateway) fn transaction_effect_store_for_test(
     .expect("encode Runtime transaction effect store for test")
 }
 
+/// What a settled transaction effect still says about itself: the wallet's
+/// validated outcome, and the transaction it actually sent.
+pub(in crate::api::gateway) struct SettledTransactionEffectV1 {
+    pub(in crate::api::gateway) outcome: ValidatedChainOutcomeV1,
+    pub(in crate::api::gateway) effect_id: String,
+    pub(in crate::api::gateway) approval_request_id: String,
+    pub(in crate::api::gateway) request_sha256: String,
+    pub(in crate::api::gateway) chain_namespace: String,
+    pub(in crate::api::gateway) network: String,
+    pub(in crate::api::gateway) to: String,
+    pub(in crate::api::gateway) value: String,
+    pub(in crate::api::gateway) data: String,
+}
+
+/// An effect this principal already settled, read back from their own store.
+///
+/// Read-only and authority-free by design: it opens no approval, signs nothing
+/// and drives no wallet. It answers "what did the wallet record when this
+/// transaction confirmed", which is why it is safe to call from paths the proxy
+/// deliberately denies a Wallet authority -- the protected viewer operations
+/// among them.
+///
+/// Everything here is what was durably recorded at the time, never rebuilt: the
+/// intent carries the exact `to`/`value`/`data` that were approved and sent, so
+/// a caller reconstructing history reports it rather than deriving it.
+///
+/// `None` when no such effect is stored, or when it never confirmed.
+pub(in crate::api::gateway) fn settled_transaction_effect(
+    state: &GatewayState,
+    principal_id: &str,
+    approval_request_id: &str,
+) -> Option<SettledTransactionEffectV1> {
+    let store = load_transaction_effect_store(state, principal_id).ok()?;
+    let index = find_effect_index(
+        &store,
+        &RuntimeTransactionLookup::ApprovalId(approval_request_id),
+    )?;
+    let effect = store.effects.get(index)?;
+    let outcome = validated_chain_outcome(effect).ok()?;
+    let intent_string = |field: &str| {
+        effect
+            .intent
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    Some(SettledTransactionEffectV1 {
+        outcome,
+        effect_id: effect.effect_id.clone(),
+        approval_request_id: effect.approval_request_id.clone(),
+        request_sha256: effect.request_sha256.clone(),
+        chain_namespace: effect.chain_namespace.clone(),
+        network: effect.network.clone(),
+        to: intent_string("to")?,
+        value: intent_string("value")?,
+        data: intent_string("data")?,
+    })
+}
+
 fn find_effect_index(
     store: &RuntimeTransactionEffectStore,
     lookup: &RuntimeTransactionLookup<'_>,

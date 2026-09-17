@@ -81,6 +81,12 @@ pub(crate) struct ElacityMetadataInputs<'a> {
     pub chain_id: u64,
     /// Ledger (Operative) address the listing belongs to.
     pub ledger: &'a str,
+    /// The authority gateway that governs this asset, stated at mint time so a
+    /// reader does not have to resolve it from whatever a runtime happens to
+    /// have registered afterwards. Empty when the network has no market
+    /// configured, in which case it is recovered from the mint's own
+    /// `ItemListed` -- the gateway that emitted it IS the authority.
+    pub authority: &'a str,
     /// Copies offered, as a decimal count.
     pub copies: u64,
     /// Price in base units, decimal.
@@ -226,6 +232,7 @@ fn metadata_json(
         "properties": {
             "chainId": inputs.chain_id,
             "ledger": inputs.ledger,
+            "authority": inputs.authority,
             "publisher": inputs.publisher_address,
             "contract": "self://contract.json",
             "labelType": "Creator",
@@ -341,6 +348,7 @@ mod tests {
             publisher_address: "0xab5028bdbb0826ad6f1885478e421db677b0001a",
             chain_id: 8453,
             ledger: "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+            authority: "0x00000000000000000000000000000000000000aa",
             copies: 1000,
             price: "100000",
             image: "ipfs://bafycidofcover",

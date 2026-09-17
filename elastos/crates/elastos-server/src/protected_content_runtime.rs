@@ -241,6 +241,51 @@ impl Drop for RuntimeMintStep {
     }
 }
 
+/// Times one leg *inside* a step, for steps long enough that knowing they took
+/// five minutes says nothing useful.
+///
+/// `availability_publish` is the case that forced this: it is a single step
+/// that publishes the ciphertext, then reads a receipt, a manifest, and every
+/// file back to prove the object replicated. When it takes five minutes, the
+/// step timer can only report five minutes -- which of those legs spent them
+/// is exactly the question, and was previously answerable only by guessing.
+///
+/// Reports on drop like `RuntimeMintStep`, so a leg that returns early is
+/// still recorded rather than vanishing.
+pub(crate) struct RuntimeCustodyPhase {
+    name: &'static str,
+    detail: String,
+    started: std::time::Instant,
+    outcome: &'static str,
+}
+
+impl RuntimeCustodyPhase {
+    pub(crate) fn begin(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            detail: detail.into(),
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+        }
+    }
+
+    pub(crate) fn ok(mut self) {
+        self.outcome = "ok";
+    }
+}
+
+impl Drop for RuntimeCustodyPhase {
+    fn drop(&mut self) {
+        tracing::debug!(
+            phase = self.name,
+            detail = %self.detail,
+            outcome = self.outcome,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            "runtime custody phase"
+        );
+    }
+}
+
 pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
     "Runtime custody composition is not configured";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
@@ -2108,9 +2153,20 @@ fn adopt_settled_runtime_mint_record(
             .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
         return Ok(Some(mint_id));
     }
+    // This attempt can never finish -- its content key material did not outlive
+    // the request that made it -- so keeping the record only wedges the object
+    // it was minted from. Every later attempt on that path would find this
+    // record, refuse to treat it as a candidate, and fail the same way forever.
+    // Forget it instead, and say once what it left behind.
+    //
+    // Safe for what follows: a fresh attempt seals new shares against a new
+    // envelope and cannot combine with anything this one left on the nodes.
+    // Those shares open nothing without the envelope and no listing will ever
+    // name them, so reclaiming the space is housekeeping, not a precondition.
+    let mint_id = record.draft().mint_id();
     tracing::warn!(
         request_id = %hex::encode(mint_intent.request_id().as_bytes()),
-        mint_id = %hex::encode(record.draft().mint_id().as_bytes()),
+        mint_id = %hex::encode(mint_id.as_bytes()),
         custody_terminal = ?record.custody_terminal(),
         content_availability_recorded = record.content_availability().is_some(),
         // What an operator needs is not "did anything start" but what was left
@@ -2118,9 +2174,12 @@ fn adopt_settled_runtime_mint_record(
         // holding one without ever having said so.
         node_receipts_accepted = record.accepted_orphans().len(),
         nodes_possibly_holding_a_share = record.uncertain_node_count(),
-        "settled runtime custody mint record is not fully terminal; orphaned custody state requires cleanup reconciliation"
+        "runtime custody mint attempt cannot finish and was discarded; its custody shares are inert residue"
     );
-    anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
+    journal
+        .discard_unfinishable_mint(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    Ok(None)
 }
 
 pub fn list_unresolved_runtime_releases(
@@ -4436,6 +4495,15 @@ pub async fn publish_and_verify_protected_content_object_availability(
         PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF,
     )?
     .with_availability_policy(requirement.policy())?;
+    // Each leg is timed separately. This step is the one a creator watches as
+    // a stalled "Encrypt & escrow", and it is four different pieces of work:
+    // publishing and replicating the ciphertext, then reading back a receipt,
+    // a manifest and every file to prove it landed. Without this split the
+    // only honest thing anyone can say about a slow publish is its total.
+    let phase = RuntimeCustodyPhase::begin(
+        "content_publish",
+        protected_content_dir.display().to_string(),
+    );
     let content_cid = crate::content::publish_directory_via_provider_with_kind_and_requirements(
         registry,
         protected_content_dir,
@@ -4445,8 +4513,14 @@ pub async fn publish_and_verify_protected_content_object_availability(
         publish_requirements,
     )
     .await?;
+    phase.ok();
+    let phase = RuntimeCustodyPhase::begin("availability_receipt", &content_cid);
     let receipt = fetch_content_availability_receipt(registry, &content_cid).await?;
+    phase.ok();
+    let phase = RuntimeCustodyPhase::begin("object_manifest", &content_cid);
     let manifest = crate::content::fetch_content_object_manifest(registry, &content_cid).await?;
+    phase.ok();
+    let phase = RuntimeCustodyPhase::begin("object_files_verify", &content_cid);
     verify_protected_content_object_manifest_and_files(
         registry,
         &content_cid,
@@ -4454,6 +4528,7 @@ pub async fn publish_and_verify_protected_content_object_availability(
         object_identity,
     )
     .await?;
+    phase.ok();
     let now_unix_seconds = now_unix_seconds();
     verify_protected_content_object_receipt(
         &content_cid,
@@ -5174,6 +5249,10 @@ pub(crate) struct RuntimeCustodyLibraryPublishFacts {
     pub receipt: Value,
     pub content_security: Value,
     pub listing_uri: Option<String>,
+    /// Where the `.ddrm` for this mint was filed. `None` until the tail has
+    /// reached its terminal, since a capsule names a `tokenId` that does not
+    /// exist before then.
+    pub capsule_uri: Option<String>,
 }
 
 async fn prepare_runtime_custody_library_source(
@@ -5817,6 +5896,19 @@ async fn protect_runtime_custody_media(
         runtime_custody_open_protection_session_request(composition, input, mint_intent)?;
     match runtime_protect_recovery_disposition(mint_intent) {
         RuntimeProtectRecoveryDisposition::TerminalAbort => {
+            // This intent settled its protect session before any draft existed,
+            // so it can produce nothing and there is no record to adopt. Its
+            // identity comes from the object path, so keeping it makes that
+            // file unmintable for good. Forget it: this attempt still fails,
+            // but the next one starts from nothing instead of meeting the same
+            // wall forever.
+            tracing::warn!(
+                request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+                "runtime custody mint intent settled before any draft and was discarded"
+            );
+            journal
+                .discard_unmintable_intent(mint_intent.request_id())
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
             anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
         }
         RuntimeProtectRecoveryDisposition::SettleCancel(handle) => {
@@ -5970,6 +6062,19 @@ async fn protect_runtime_custody_object(
     let session_handle = *mint_intent.request_id().as_bytes();
     match runtime_protect_recovery_disposition(mint_intent) {
         RuntimeProtectRecoveryDisposition::TerminalAbort => {
+            // This intent settled its protect session before any draft existed,
+            // so it can produce nothing and there is no record to adopt. Its
+            // identity comes from the object path, so keeping it makes that
+            // file unmintable for good. Forget it: this attempt still fails,
+            // but the next one starts from nothing instead of meeting the same
+            // wall forever.
+            tracing::warn!(
+                request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+                "runtime custody mint intent settled before any draft and was discarded"
+            );
+            journal
+                .discard_unmintable_intent(mint_intent.request_id())
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
             anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
         }
         RuntimeProtectRecoveryDisposition::SettleCancel(handle) => {
@@ -6605,6 +6710,7 @@ fn runtime_custody_library_publish_facts(
             "required_providers": [],
         }),
         listing_uri: None,
+        capsule_uri: None,
     }
 }
 
@@ -6674,6 +6780,14 @@ pub(crate) struct RuntimeCustodyListingAvailabilitySummary {
     checked_at: u64,
     observed_replicas: u32,
     receipt_digest: String,
+}
+
+impl RuntimeCustodyListingAvailabilitySummary {
+    /// The availability receipt this listing was recorded against, as the bare
+    /// hex the record stores. Callers that need the `sha256:` spelling add it.
+    pub(crate) fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7448,7 +7562,11 @@ pub(crate) struct RuntimeCustodyTerminalPurchaseRecord {
     pub(crate) chain_observation: Value,
     pub(crate) access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord,
     pub(crate) confirmed_at: u64,
-    pub(crate) bought_at: u64,
+    /// When this principal came to hold the copy. Written as `acquired_at`;
+    /// `bought_at` is how every record predating minted copies spells it, and a
+    /// minted copy was never bought.
+    #[serde(alias = "bought_at")]
+    pub(crate) acquired_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -7469,6 +7587,24 @@ pub(crate) enum RuntimeCustodyPurchaseProgress {
     Complete {
         terminal: RuntimeCustodyTerminalPurchaseRecord,
     },
+}
+
+/// How a principal came to own this copy.
+///
+/// Nothing downstream of the entitlement check reads this. The right to open
+/// is the chain's answer to `hasAccess`, and buying and minting are two ways of
+/// arriving at the same answer -- so an owned copy behaves identically either
+/// way. This records only which one happened, so a reader can tell provenance
+/// without that changing what the copy can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeCustodyAcquisitionV1 {
+    /// Bought from a listing. Every record written before minted copies
+    /// existed is one of these, which is why it is the default.
+    #[default]
+    Bought,
+    /// Minted by this principal: the copy was theirs from the first block.
+    Minted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -7496,7 +7632,26 @@ pub(crate) struct RuntimeCustodyPurchaseRecord {
     pub(crate) address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approval_stage: Option<RuntimeCustodyPurchaseStageRecord>,
-    pub(crate) buy_stage: RuntimeCustodyPurchaseStageRecord,
+    /// The transaction by which this principal acquired access: the buy for a
+    /// bought copy, the mint for a minted one. The open path presents it as the
+    /// chain evidence behind a release, so every owned copy has one -- which is
+    /// why this is not optional and why a minted copy records its mint here
+    /// rather than leaving a hole or fabricating a buy.
+    ///
+    /// Written as `acquisition_stage`; `buy_stage` is how every record predating
+    /// minted copies spells the same field.
+    #[serde(alias = "buy_stage")]
+    pub(crate) acquisition_stage: RuntimeCustodyPurchaseStageRecord,
+    #[serde(default)]
+    pub(crate) acquisition: RuntimeCustodyAcquisitionV1,
+    /// Where this copy's `.ddrm` was filed in the owner's Library.
+    ///
+    /// `None` means no capsule has been written yet -- either the copy predates
+    /// capsules, or filing one has not succeeded. That is what a repair looks
+    /// for, and what keeps a replayed buy from filing a second capsule beside
+    /// the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capsule_uri: Option<String>,
     pub(crate) progress: RuntimeCustodyPurchaseProgress,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
@@ -9252,6 +9407,75 @@ pub(crate) fn runtime_custody_creator_listing_package(
     })
 }
 
+/// The on-disk shape of an owned protected item: the `.ddrm` the Library shows
+/// and the viewer opens.
+pub(crate) const RUNTIME_CUSTODY_CAPSULE_SCHEMA_V1: &str =
+    "elastos.library.protected-content-capsule/v1";
+
+/// The document a `.ddrm` file contains.
+///
+/// It is the asset's own `metadata.json` -- the same document the token URI
+/// resolves to -- with the handful of facts only the chain can supply raised to
+/// the top level beside it: the authority governing the asset, its `kid`, the
+/// `tokenId` minted on the ledger, the ledger itself, and the content type that
+/// decides which viewer opens it.
+///
+/// Those five are lifted rather than left to readers to dig out, because they
+/// are what every reader needs first and what `metadata.json` alone cannot
+/// answer: a `tokenId` does not exist until the mint emits it, and an authority
+/// may not have been configured when the metadata was written. The metadata is
+/// carried whole rather than summarised, so a capsule is self-describing and
+/// can be read without fetching anything.
+///
+/// `metadataUri` names where that document was published, so the embedded copy
+/// can always be checked against the one the token URI resolves to.
+pub(crate) fn runtime_custody_capsule_document(
+    package: &RuntimePortableListingPackage,
+    metadata: &Value,
+    acquisition: RuntimeCustodyAcquisitionV1,
+) -> Value {
+    // Stated at mint time when the network had a market configured; otherwise
+    // recovered afterwards from the gateway that emitted the mint's own
+    // `ItemListed`, which IS the authority.
+    let authority = metadata
+        .get("properties")
+        .and_then(|properties| properties.get("authority"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    serde_json::json!({
+        "schema": RUNTIME_CUSTODY_CAPSULE_SCHEMA_V1,
+        "authority": authority,
+        "kid": package.content_access_id,
+        "tokenId": package.token_id,
+        "ledger": package.ledger,
+        "contentType": runtime_custody_capsule_content_type(metadata),
+        "operative": package.operative,
+        "chainNamespace": package.chain_namespace,
+        "network": package.network,
+        "mintId": package.mint_id,
+        "contentId": package.content_id,
+        "contentCid": package.content_cid,
+        "mintTransactionHash": package.mint_transaction_hash,
+        "acquisition": acquisition,
+        "metadataUri": format!("ipfs://{}", package.metadata_cid),
+        "metadata": metadata,
+    })
+}
+
+/// What the capsule protects, taken from the metadata document that describes
+/// it. `media.contentType` is the declared type; `media.mimeType` is the same
+/// answer under the spelling some documents use.
+pub(crate) fn runtime_custody_capsule_content_type(metadata: &Value) -> String {
+    let media = metadata.get("media");
+    media
+        .and_then(|media| media.get("contentType"))
+        .or_else(|| media.and_then(|media| media.get("mimeType")))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(crate) fn persist_runtime_custody_creator_listing(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
@@ -9368,8 +9592,8 @@ fn validate_runtime_custody_viewer_asset(
         || !purchase.operative.eq_ignore_ascii_case(&package.operative)
         || purchase.price != package.price
         || !purchase.pay_token.eq_ignore_ascii_case(&package.pay_token)
-        || purchase.buy_stage.chain_namespace != package.chain_namespace
-        || purchase.buy_stage.network != package.network
+        || purchase.acquisition_stage.chain_namespace != package.chain_namespace
+        || purchase.acquisition_stage.network != package.network
         || purchase
             .payment_processor
             .as_deref()
@@ -9856,16 +10080,16 @@ fn reconstructed_buy_receipt(
             RightsActionV1::View,
             purchase.chain_namespace.clone(),
             purchase.network.clone(),
-            purchase.buy_stage.to.clone(),
-            purchase.buy_stage.value.clone(),
-            purchase.buy_stage.data.clone(),
+            purchase.acquisition_stage.to.clone(),
+            purchase.acquisition_stage.value.clone(),
+            purchase.acquisition_stage.data.clone(),
         )
         .map_err(|_| anyhow::anyhow!("Runtime custody chain evidence is invalid"))?,
         RuntimePurchaseEffectAuthority::new(
             purchase.principal_id.clone(),
             purchase.account_id.clone(),
             purchase.address.clone(),
-            purchase.buy_stage.approval_request_id.clone(),
+            purchase.acquisition_stage.approval_request_id.clone(),
         )
         .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?,
         terminal.wallet_binding.clone(),

@@ -413,6 +413,12 @@ struct ResolvedProtectedContentCreatorMintSource {
     pay_token: String,
     abi: String,
     function: String,
+    /// The authority gateway the network's market is configured with. Absent
+    /// when the network has no market configured, and absent from every
+    /// response a chain provider built before it was reported -- so a mint
+    /// states the authority when it can and says nothing when it cannot.
+    #[serde(default)]
+    authority_gateway_contract: Option<String>,
 }
 
 fn runtime_custody_creator_mint_source_digest(
@@ -1841,6 +1847,19 @@ pub(super) async fn gateway_provider_proxy(
     if scheme == "documents" || scheme == "object" || scheme == "net" {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }
+    // A creator opening an asset they minted before minted copies were recorded
+    // as owned would be refused at their own door. Restore the record first,
+    // from what was already written down -- silently, because there is nothing
+    // here for them to decide.
+    if is_protected_viewer_op && op == "open_viewer" {
+        if let Some(mint_id) = request
+            .get("mint_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| crate::protected_content_runtime::parse_mint_id_hex(value).ok())
+        {
+            repair_runtime_custody_minted_owned_copy(&state, &principal_id, mint_id).await;
+        }
+    }
     if is_protected_viewer_op {
         if let Some(object) = request.as_object_mut() {
             object.remove("launch_id");
@@ -3004,6 +3023,10 @@ async fn publish_runtime_custody_creator_metadata(
         chain_id: runtime_custody_creator_chain_id(&source.chain_namespace)
             .map_err(creator_mint_unavailable!())?,
         ledger: &source.ledger,
+        authority: source
+            .authority_gateway_contract
+            .as_deref()
+            .unwrap_or_default(),
         copies: runtime_custody_hex_quantity_to_u64(copies_hex)?,
         price: &runtime_custody_hex_quantity_to_decimal(price_hex)?,
         image: &image,
@@ -3073,7 +3096,10 @@ async fn publish_runtime_custody_creator_listing(
     facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
     publisher_principal_id: &str,
     terminal: &elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(
+    String,
+    crate::protected_content_runtime::RuntimePortableListingPackage,
+)> {
     let package = crate::protected_content_runtime::runtime_custody_creator_listing_package(
         data_dir,
         mint,
@@ -3109,11 +3135,11 @@ async fn publish_runtime_custody_creator_listing(
     crate::protected_content_runtime::persist_runtime_custody_creator_listing(
         data_dir,
         mint,
-        package,
+        package.clone(),
         publisher_principal_id,
         listing_uri.clone(),
     )?;
-    Ok(listing_uri)
+    Ok((listing_uri, package))
 }
 
 fn runtime_custody_metadata_name(object_uri: &str) -> &str {
@@ -3655,7 +3681,9 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                     .as_ref()
                     .map(|request| runtime_custody_purchase_stage_record("approval", request))
                     .transpose()?,
-                buy_stage: runtime_custody_purchase_stage_record("buy", &buy_request)?,
+                acquisition_stage: runtime_custody_purchase_stage_record("buy", &buy_request)?,
+                acquisition: crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Bought,
+                capsule_uri: None,
                 progress:
                     crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
                         confirmed_approval: None,
@@ -3694,7 +3722,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         listing,
         &listing_sha256,
         mint_id,
-        &purchase.buy_stage,
+        &purchase.acquisition_stage,
         "buy",
     )?;
 
@@ -3786,6 +3814,26 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             ..
         } => confirmed_buy.clone(),
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. } => {
+            // Already owned. File the capsule if an earlier attempt settled the
+            // purchase without one -- and only then, so asking again never
+            // leaves a second copy of the same asset on the shelf.
+            if purchase.capsule_uri.is_none() {
+                purchase.capsule_uri = write_runtime_custody_owned_capsule(
+                    state,
+                    registry.as_ref(),
+                    listing,
+                    &input.principal_id,
+                    crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Bought,
+                )
+                .await;
+                if purchase.capsule_uri.is_some() {
+                    purchase.updated_at = crate::auth::now_ts();
+                    crate::protected_content_runtime::persist_runtime_custody_purchase(
+                        &state.data_dir,
+                        &purchase,
+                    )?;
+                }
+            }
             return Ok(runtime_custody_buy_terminal_response(&purchase));
         }
         crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
@@ -3800,7 +3848,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         listing,
         &buyer_account,
         &expected_content_access_id,
-        &format!("purchase-access:{}", purchase.buy_stage.effect_id),
+        &format!("purchase-access:{}", purchase.acquisition_stage.effect_id),
     )
     .await?;
     let Some(access) = access else {
@@ -3819,9 +3867,20 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 chain_observation: confirmed_buy.chain_observation,
                 access_evidence: access,
                 confirmed_at: confirmed_buy.confirmed_at,
-                bought_at: crate::auth::now_ts(),
+                acquired_at: crate::auth::now_ts(),
             },
         };
+    // A bought copy is filed exactly like a minted one: same capsule, same
+    // shelf, chosen by what it protects. Nothing below this point can tell how
+    // the copy was acquired, which is the point.
+    purchase.capsule_uri = write_runtime_custody_owned_capsule(
+        state,
+        registry.as_ref(),
+        listing,
+        &input.principal_id,
+        crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Bought,
+    )
+    .await;
     purchase.updated_at = crate::auth::now_ts();
     crate::protected_content_runtime::persist_runtime_custody_purchase(&state.data_dir, &purchase)?;
     Ok(runtime_custody_buy_terminal_response(&purchase))
@@ -3974,7 +4033,8 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                     &input.principal_id,
                     terminal,
                 )
-                .await?,
+                .await?
+                .0,
             );
             // This request settled nothing: the mint was already terminal, so
             // no effect was raised and no transaction was sent. Without saying
@@ -4201,18 +4261,519 @@ async fn runtime_custody_publish_creator_tail_from_facts(
     mint = mint_journal
         .mark_creator_completed(facts.mint_id, terminal.clone())
         .map_err(creator_mint_unavailable!())?;
-    facts.listing_uri = Some(
-        publish_runtime_custody_creator_listing(
-            registry.as_ref(),
-            &state.data_dir,
-            &mint,
-            &facts,
-            &input.principal_id,
-            &terminal,
-        )
-        .await?,
-    );
+    let (listing_uri, package) = publish_runtime_custody_creator_listing(
+        registry.as_ref(),
+        &state.data_dir,
+        &mint,
+        &facts,
+        &input.principal_id,
+        &terminal,
+    )
+    .await?;
+    facts.listing_uri = Some(listing_uri);
+    // The `.ddrm` the creator opens. Written only now, because a capsule states
+    // the `tokenId` the mint produced and that does not exist until it has.
+    facts.capsule_uri = write_runtime_custody_owned_capsule(
+        state,
+        registry.as_ref(),
+        &package,
+        &input.principal_id,
+        crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Minted,
+    )
+    .await;
+    record_runtime_custody_minted_owned_copy(
+        state,
+        &package,
+        &creator_account,
+        &input.principal_id,
+        mint.draft().content_access_id().as_bytes(),
+        mint.content_availability()
+            .map(runtime_custody_purchase_availability_receipt_digest),
+        &request,
+        completion,
+        facts.mint_id,
+        facts.capsule_uri.clone(),
+    )
+    .await;
     Ok(facts)
+}
+
+/// The digest a listing record states as its own, recomputed over the package.
+///
+/// It is the value `portable_package_digest` returns, spelled the one way, so a
+/// copy recorded here binds to exactly the listing a viewer will validate it
+/// against.
+fn runtime_custody_portable_package_digest(
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(
+            package
+        )?))
+    ))
+}
+
+/// File an owned protected item into its owner's Library as a `.ddrm`.
+///
+/// The capsule carries the asset's own `metadata.json` whole, so the Library
+/// can show it and the viewer can open it without fetching anything; the
+/// document is read back from the CID it was published under rather than kept
+/// from whatever built it, so a copy acquired by buying is assembled exactly
+/// like one acquired by minting.
+///
+/// When the metadata states no authority -- because none was configured at the
+/// time it was written -- it is asked for now and filled in, which is the whole
+/// reason the authority sits at the capsule's top level rather than only inside
+/// the metadata it was published with.
+///
+/// Best effort: the asset is owned whether or not a file could be written for
+/// it, and the owner keeps it either way. `None` when nothing was filed.
+async fn write_runtime_custody_owned_capsule(
+    state: &GatewayState,
+    registry: &ProviderRegistry,
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+    principal_id: &str,
+    acquisition: crate::protected_content_runtime::RuntimeCustodyAcquisitionV1,
+) -> Option<String> {
+    let metadata = match crate::content::fetch_bytes_via_provider(
+        registry,
+        &package.metadata_cid,
+        Some("metadata.json"),
+    )
+    .await
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    {
+        Some(metadata) => metadata,
+        None => {
+            tracing::debug!("runtime custody: no metadata document to build a capsule from");
+            return None;
+        }
+    };
+    let mut capsule = crate::protected_content_runtime::runtime_custody_capsule_document(
+        package,
+        &metadata,
+        acquisition,
+    );
+    if capsule
+        .get("authority")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        if let Some(authority) = runtime_custody_market_authority(state, &package.network).await {
+            capsule["authority"] = serde_json::Value::String(authority);
+        }
+    }
+    // The asset's material belongs on the machine that owns it, whether this
+    // copy was minted here or bought from someone else.
+    materialize_runtime_custody_artifacts(registry, package).await;
+    let content_type =
+        crate::protected_content_runtime::runtime_custody_capsule_content_type(&metadata);
+    match crate::library::write_runtime_custody_capsule(
+        &state.data_dir,
+        principal_id,
+        &package.display_name,
+        &content_type,
+        &capsule,
+    ) {
+        Ok(uri) => Some(uri),
+        Err(error) => {
+            tracing::warn!(error = %error, "runtime custody: the owned capsule was not filed");
+            None
+        }
+    }
+}
+
+/// Keep an owned asset's material on the machine that owns it.
+///
+/// An owned copy should read from local storage, not from whoever still happens
+/// to be serving it: without this every chunk of every read goes back out to
+/// custody, which is slow, fails when the network does, and asks other people's
+/// nodes to carry the cost of someone else's library. A minted copy is already
+/// here because it started here; a bought one is fetched once and kept.
+///
+/// Pinning is what "kept" means. Fetching alone leaves the blocks collectable,
+/// so they would quietly disappear and reads would silently go back to the
+/// network. The pin is recursive, which is how a DASH directory keeps its
+/// segments rather than just the manifest naming them.
+///
+/// Silent and best effort, as the owner asked: nothing here is shown, and an
+/// asset whose material could not be kept is still owned and still readable --
+/// just over the network until the next attempt.
+async fn materialize_runtime_custody_artifacts(
+    registry: &ProviderRegistry,
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+) {
+    for cid in [&package.content_cid, &package.metadata_cid] {
+        if cid.trim().is_empty() {
+            continue;
+        }
+        match registry
+            .send_raw(
+                "ipfs",
+                &serde_json::json!({
+                    "op": "pin",
+                    "cid": cid,
+                }),
+            )
+            .await
+        {
+            Ok(response)
+                if response.get("status").and_then(serde_json::Value::as_str) != Some("error") => {}
+            Ok(response) => tracing::debug!(
+                reason = %response
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                "runtime custody: owned material was not kept locally"
+            ),
+            Err(error) => tracing::debug!(
+                error = %error,
+                "runtime custody: owned material was not kept locally"
+            ),
+        }
+    }
+}
+
+/// The authority gateway this network's market is configured with, asked for
+/// when an asset's metadata did not state one.
+async fn runtime_custody_market_authority(state: &GatewayState, network: &str) -> Option<String> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "describe_protected_content_market_source",
+            "network": network,
+        }),
+    )
+    .await
+    .ok()?;
+    response
+        .get("authority_gateway_contract")
+        .and_then(serde_json::Value::as_str)
+        .filter(|authority| !authority.is_empty())
+        .map(str::to_string)
+}
+
+/// Give a creator back the record of a copy they have always owned.
+///
+/// Minted copies were not recorded as owned until they were, so an asset minted
+/// before that lands on disk with a listing, a terminal and no owned copy --
+/// and its creator is refused at the door of their own asset. This restores the
+/// record from what was already written down at the time.
+///
+/// Nothing is reconstructed or assumed. The listing names the content, the mint
+/// journal names the wallet and the effect behind it, and the settled effect
+/// still carries the exact transaction that was approved and sent. The one
+/// question asked fresh is the one that must be: whether the chain says this
+/// wallet has access now.
+///
+/// Authority-free on purpose. The proxy denies protected viewer operations a
+/// Wallet authority, and this respects that: it reads the principal's own
+/// durable state and asks one read-only chain question. It signs nothing, opens
+/// no approval and moves no funds.
+///
+/// Silent and best effort. A creator opening their asset should not be shown
+/// the repair, and a mint whose copy cannot be restored yet is simply not
+/// restored -- the caller's own refusal still speaks for it.
+async fn repair_runtime_custody_minted_owned_copy(
+    state: &GatewayState,
+    principal_id: &str,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) {
+    if crate::protected_content_runtime::load_runtime_custody_purchase(
+        &state.data_dir,
+        principal_id,
+        mint_id,
+    )
+    .ok()
+    .flatten()
+    .is_some()
+    {
+        return;
+    }
+    let Ok(Some(listing)) =
+        crate::protected_content_runtime::load_runtime_custody_listing(&state.data_dir, mint_id)
+    else {
+        return;
+    };
+    // Only the creator of a locally minted listing owns it by minting. An
+    // imported listing carries no principal at all, so it can never take this
+    // path -- someone else's listing on this disk grants nothing.
+    if !matches!(
+        &listing.origin,
+        crate::protected_content_runtime::RuntimeCustodyListingOrigin::LocalCreator {
+            principal_id: creator,
+            ..
+        } if creator == principal_id
+    ) {
+        return;
+    }
+    let journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
+    let Ok(mint) = journal.load(mint_id) else {
+        return;
+    };
+    let Some(creator_state) = mint.creator_state() else {
+        return;
+    };
+    // No terminal means the mint never completed, so there is no copy to give
+    // back.
+    let (Some(_terminal), Some(effect)) = (creator_state.terminal(), creator_state.effect()) else {
+        return;
+    };
+    let Some(settled) = crate::api::gateway::settled_transaction_effect(
+        state,
+        principal_id,
+        effect.approval_request_id(),
+    ) else {
+        return;
+    };
+    // The effect the journal points at must be the effect that was settled.
+    if settled.request_sha256 != effect.request_sha256()
+        || settled.effect_id != effect.effect_id()
+        || settled.chain_namespace != listing.package.chain_namespace
+        || settled.network != listing.package.network
+    {
+        return;
+    }
+    let creator_account = RuntimeCustodyCreatorAccount {
+        account_id: effect.account_id().to_string(),
+        address: effect.address().to_string(),
+        external_signer: false,
+        connector_id: None,
+    };
+    let content_access_id_hex = format!(
+        "0x{}",
+        hex::encode(mint.draft().content_access_id().as_bytes())
+    );
+    let Ok(Some(access)) = resolve_runtime_custody_purchase_access(
+        state,
+        &listing.package,
+        &creator_account,
+        &content_access_id_hex,
+        &format!("minted-access:{}", settled.effect_id),
+    )
+    .await
+    else {
+        return;
+    };
+    let profile_did = match crate::protected_content_runtime::load_runtime_custody_profile_did(
+        &state.data_dir,
+        principal_id,
+    ) {
+        Ok(profile_did) => profile_did,
+        Err(_) => return,
+    };
+    // Amend the asset in place while we are here: a copy minted before capsules
+    // existed has no `.ddrm` anywhere, and restoring only the invisible record
+    // would leave the Library still showing nothing.
+    let capsule_uri = match state.provider_registry.as_ref() {
+        Some(registry) => {
+            write_runtime_custody_owned_capsule(
+                state,
+                registry.as_ref(),
+                &listing.package,
+                principal_id,
+                crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Minted,
+            )
+            .await
+        }
+        None => None,
+    };
+    let now = crate::auth::now_ts();
+    let owned = crate::protected_content_runtime::RuntimeCustodyPurchaseRecord {
+        schema: crate::protected_content_runtime::RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+        principal_id: principal_id.to_string(),
+        profile_did,
+        mint_id: listing.package.mint_id.clone(),
+        content_id: listing.package.content_id.clone(),
+        cid: listing.package.content_cid.clone(),
+        listing_sha256: listing.portable_package_digest(),
+        seller_address: listing.package.seller_address.clone(),
+        chain_namespace: listing.package.chain_namespace.clone(),
+        network: listing.package.network.clone(),
+        ledger: listing.package.ledger.clone(),
+        token_id: listing.package.token_id.clone(),
+        operative: listing.package.operative.clone(),
+        price: listing.package.price.clone(),
+        pay_token: listing.package.pay_token.clone(),
+        payment_processor: listing.package.payment_processor.clone(),
+        availability_receipt_digest: format!("sha256:{}", listing.availability.receipt_digest()),
+        account_id: creator_account.account_id.clone(),
+        address: creator_account.address.clone(),
+        approval_stage: None,
+        acquisition: crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Minted,
+        capsule_uri,
+        acquisition_stage: crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord {
+            stage: "mint".to_string(),
+            effect_id: settled.effect_id.clone(),
+            approval_request_id: settled.approval_request_id.clone(),
+            request_sha256: settled.request_sha256.clone(),
+            chain_namespace: settled.chain_namespace.clone(),
+            network: settled.network.clone(),
+            to: settled.to.clone(),
+            value: settled.value.clone(),
+            data: settled.data.clone(),
+        },
+        progress: crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete {
+            terminal: crate::protected_content_runtime::RuntimeCustodyTerminalPurchaseRecord {
+                chain_transaction: settled.outcome.transaction_hash.clone(),
+                wallet_binding: settled.outcome.binding.clone(),
+                chain_observation: settled.outcome.chain_observation.clone(),
+                access_evidence: access,
+                confirmed_at: settled.outcome.confirmed_at,
+                acquired_at: now,
+            },
+        },
+        created_at: now,
+        updated_at: now,
+    };
+    if crate::protected_content_runtime::persist_runtime_custody_purchase(&state.data_dir, &owned)
+        .is_ok()
+    {
+        tracing::debug!("runtime custody: restored the owned copy of a minted asset");
+    }
+}
+
+/// Record the copy the creator has owned since their mint landed.
+///
+/// A mint is not a purchase, but it ends somewhere identical: this principal
+/// holds access to this content, and the chain is what says so. So the right is
+/// established by the very question a buy asks -- `hasAccess` for the creator's
+/// wallet, which is also how a subscription grants access, so asking it here
+/// keeps one rule rather than inventing a second, weaker notion of ownership
+/// that lives only on this disk.
+///
+/// The answer goes into the same store a purchase uses, which is what makes a
+/// minted copy openable at all: below the entitlement check nothing
+/// distinguishes the two, and `acquisition` records only which one happened.
+///
+/// Best effort by design. The mint has already settled on chain by the time
+/// this runs, so a copy that cannot be recorded must not fail a mint that is
+/// done -- the creator keeps their asset and their listing either way.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an owned copy binds the listing, the wallet, the acquiring transaction and its confirmation"
+)]
+async fn record_runtime_custody_minted_owned_copy(
+    state: &GatewayState,
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+    creator_account: &RuntimeCustodyCreatorAccount,
+    principal_id: &str,
+    content_access_id: &[u8],
+    availability_receipt_digest: Option<String>,
+    request: &RuntimeTransactionRequest,
+    completion: RuntimeTransactionCompletion,
+    mint_id: elastos_protected_content_contracts::Digest32,
+    capsule_uri: Option<String>,
+) {
+    let step = crate::protected_content_runtime::RuntimeMintStep::begin(
+        "owned_copy",
+        &hex::encode(mint_id.as_bytes()),
+    );
+    let already_owned = crate::protected_content_runtime::load_runtime_custody_purchase(
+        &state.data_dir,
+        principal_id,
+        mint_id,
+    )
+    .unwrap_or_default()
+    .is_some();
+    if already_owned {
+        step.ok();
+        return;
+    }
+    let (Some(confirmed), Some(availability_receipt_digest)) =
+        (confirmed_stage(completion), availability_receipt_digest)
+    else {
+        step.pending();
+        return;
+    };
+    let content_access_id_hex = format!("0x{}", hex::encode(content_access_id));
+    let access = resolve_runtime_custody_purchase_access(
+        state,
+        package,
+        creator_account,
+        &content_access_id_hex,
+        &format!("minted-access:{}", request.effect_id),
+    )
+    .await;
+    let access = match access {
+        Ok(Some(access)) => access,
+        // The mint is on chain and the listing is recorded; the chain simply
+        // has not answered yet, or answered no. Either way this is not a
+        // failure of the mint.
+        Ok(None) => {
+            step.pending();
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "runtime custody creator tail: minted copy was not recorded"
+            );
+            return;
+        }
+    };
+    let (Ok(profile_did), Ok(listing_sha256), Ok(acquisition_stage)) = (
+        crate::protected_content_runtime::load_runtime_custody_profile_did(
+            &state.data_dir,
+            principal_id,
+        ),
+        runtime_custody_portable_package_digest(package),
+        runtime_custody_purchase_stage_record("mint", request),
+    ) else {
+        tracing::warn!("runtime custody creator tail: minted copy was not recorded");
+        return;
+    };
+    let now = crate::auth::now_ts();
+    let owned = crate::protected_content_runtime::RuntimeCustodyPurchaseRecord {
+        schema: crate::protected_content_runtime::RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+        principal_id: principal_id.to_string(),
+        profile_did,
+        mint_id: package.mint_id.clone(),
+        content_id: package.content_id.clone(),
+        cid: package.content_cid.clone(),
+        listing_sha256,
+        seller_address: package.seller_address.clone(),
+        chain_namespace: package.chain_namespace.clone(),
+        network: package.network.clone(),
+        ledger: package.ledger.clone(),
+        token_id: package.token_id.clone(),
+        operative: package.operative.clone(),
+        price: package.price.clone(),
+        pay_token: package.pay_token.clone(),
+        payment_processor: package.payment_processor.clone(),
+        availability_receipt_digest,
+        account_id: creator_account.account_id.clone(),
+        address: creator_account.address.clone(),
+        approval_stage: None,
+        acquisition: crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Minted,
+        capsule_uri,
+        acquisition_stage,
+        progress: crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete {
+            terminal: crate::protected_content_runtime::RuntimeCustodyTerminalPurchaseRecord {
+                chain_transaction: confirmed.chain_transaction,
+                wallet_binding: confirmed.wallet_binding,
+                chain_observation: confirmed.chain_observation,
+                access_evidence: access,
+                confirmed_at: confirmed.confirmed_at,
+                acquired_at: now,
+            },
+        },
+        created_at: now,
+        updated_at: now,
+    };
+    match crate::protected_content_runtime::persist_runtime_custody_purchase(
+        &state.data_dir,
+        &owned,
+    ) {
+        Ok(()) => step.ok(),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "runtime custody creator tail: minted copy was not recorded"
+        ),
+    }
 }
 
 #[cfg(test)]
