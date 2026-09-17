@@ -420,7 +420,8 @@ impl Inventory {
         self.stage(false)?.check()?;
         #[cfg(target_os = "linux")]
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 self.dir.as_raw_fd(),
                 c"stage".as_ptr(),
                 self.dir.as_raw_fd(),
