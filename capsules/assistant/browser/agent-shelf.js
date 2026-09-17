@@ -882,6 +882,8 @@ export function bindAgentShelf() {
   document.addEventListener("input", (event) => {
     if (event.target?.id === "agent-composer-input") {
       autosizeComposer(event.target);
+      // Typed text joins the same debounced save as attachments; a draft is saved as it is written.
+      persistComposerDraft?.();
     }
   });
 
