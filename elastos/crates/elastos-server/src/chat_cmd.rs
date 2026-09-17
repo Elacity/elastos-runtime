@@ -3,14 +3,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io::IsTerminal, io::Read, io::Write};
 
-use elastos_server::sources::{
-    default_data_dir, load_trusted_sources, normalize_gateways, TrustedSource, TrustedSourcesConfig,
-};
+use elastos_server::carrier::live_source_bootstrap_ticket;
+use elastos_server::sources::{default_data_dir, load_trusted_sources, TrustedSourcesConfig};
 use sha2::{Digest, Sha256};
 
 const CHAT_TOPIC: &str = "#general";
 const PRESENCE_ATTACH_RETRY_BACKOFF: Duration = Duration::from_secs(12);
-const SOURCE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Default)]
 struct AttachedChatIdentity {
@@ -47,15 +45,6 @@ struct ChatPresenceAnnouncement {
     ts: u64,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct SourceCarrierBootstrapDocument {
-    schema: String,
-    role: String,
-    ticket: String,
-    node_id: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeChatInputMode {
     Line,
     StdinTty,
@@ -980,59 +969,6 @@ async fn resolve_chat_bootstrap(
         .map(ChatBootstrap::TrustedSourceSeed)
 }
 
-async fn live_source_bootstrap_ticket(source: &TrustedSource) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(SOURCE_BOOTSTRAP_TIMEOUT)
-        .build()
-        .ok()?;
-
-    for gateway in normalize_gateways(&source.gateways) {
-        let url = format!("{gateway}/.well-known/elastos/carrier-bootstrap.json?role=publisher");
-        let Ok(response) = client.get(url).send().await else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        let Ok(document) = response.json::<SourceCarrierBootstrapDocument>().await else {
-            continue;
-        };
-        if let Some(ticket) = verified_source_bootstrap_ticket(source, &document) {
-            return Some(ticket);
-        }
-    }
-    None
-}
-
-fn verified_source_bootstrap_ticket(
-    source: &TrustedSource,
-    document: &SourceCarrierBootstrapDocument,
-) -> Option<String> {
-    if document.schema != "elastos.carrier.bootstrap/v1"
-        || document.role != "publisher"
-        || document.ticket.trim().is_empty()
-        || document.node_id.trim().is_empty()
-    {
-        return None;
-    }
-
-    let expected_node_id = source.publisher_node_id.trim();
-    if !expected_node_id.is_empty() && document.node_id != expected_node_id {
-        return None;
-    }
-
-    let endpoints = elastos_server::carrier::decode_ticket_endpoints(&document.ticket);
-    if endpoints.is_empty()
-        || endpoints
-            .iter()
-            .any(|endpoint| endpoint.id.to_string() != document.node_id)
-    {
-        return None;
-    }
-
-    Some(document.ticket.trim().to_string())
-}
-
 fn presence_attach_retry_pending(
     retry_after: &HashMap<String, Instant>,
     did: &str,
@@ -1859,6 +1795,9 @@ pub(crate) async fn request_attached_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use elastos_server::carrier::{
+        verified_source_bootstrap_ticket, SourceCarrierBootstrapDocument,
+    };
     use elastos_server::sources::{TrustedSource, TrustedSourcesConfig};
     use std::io::Cursor;
     use std::sync::Mutex;
@@ -1902,6 +1841,7 @@ mod tests {
             role: "publisher".to_string(),
             ticket: ticket.clone(),
             node_id,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1920,6 +1860,7 @@ mod tests {
             role: "publisher".to_string(),
             ticket,
             node_id,
+            ..Default::default()
         };
 
         assert_eq!(verified_source_bootstrap_ticket(&source, &document), None);
@@ -1934,6 +1875,7 @@ mod tests {
             role: "runtime".to_string(),
             ticket,
             node_id,
+            ..Default::default()
         };
 
         assert_eq!(verified_source_bootstrap_ticket(&source, &document), None);

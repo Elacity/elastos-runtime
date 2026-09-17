@@ -452,16 +452,19 @@ pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<Serve
 pub(crate) async fn register_content_plane(
     provider_registry: &Arc<provider::ProviderRegistry>,
     data_dir: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<ContentProvider>> {
     let content_provider = Arc::new(ContentProvider::new(
         data_dir.to_path_buf(),
         Arc::downgrade(provider_registry),
     ));
     provider_registry.register(content_provider.clone()).await;
     provider_registry
-        .register_sub_provider("content", content_provider)
+        .register_sub_provider("content", content_provider.clone())
         .await
-        .map_err(|err| anyhow::anyhow!("failed to register elastos://content sub-provider: {err}"))
+        .map_err(|err| {
+            anyhow::anyhow!("failed to register elastos://content sub-provider: {err}")
+        })?;
+    Ok(content_provider)
 }
 
 /// Spawn the ipfs-provider capsule and register `elastos://ipfs`, the block
@@ -653,9 +656,13 @@ async fn setup_server_infrastructure_impl(
     let mut managed_host_processes = Vec::new();
     let mut external_availability_registered = false;
     let mut carrier_service = None;
-    if let Err(err) = register_content_plane(&provider_registry, &data_dir).await {
-        tracing::warn!("{}", err);
-    }
+    let content_plane = match register_content_plane(&provider_registry, &data_dir).await {
+        Ok(provider) => Some(provider),
+        Err(err) => {
+            tracing::warn!("{}", err);
+            None
+        }
+    };
     provider_registry
         .register(Arc::new(DocumentsProvider::new(
             data_dir.clone(),
@@ -1447,19 +1454,24 @@ async fn setup_server_infrastructure_impl(
                     tracing::warn!("Failed to register Carrier gossip provider: {}", e);
                 }
                 if !external_availability_registered {
-                    let availability_provider: Arc<dyn provider::Provider> =
-                        Arc::new(
+                    let availability_provider = Arc::new(
                             elastos_server::carrier::CarrierAvailabilityProvider::with_provider_registry_data_dir_and_peer_attestation_exchange_config(
                             carrier_node.gossip_state.clone(),
                             Arc::downgrade(&provider_registry),
                             data_dir.clone(),
                             carrier_peer_attestation_exchange_config_from_env(),
                         ));
+                    availability_provider
+                        .restore_persisted_local_holder_announcements()
+                        .await;
                     if let Err(e) = provider_registry
                         .register_sub_provider("availability", availability_provider)
                         .await
                     {
                         tracing::warn!("Failed to register Carrier availability provider: {}", e);
+                    }
+                    if let Some(content) = content_plane.as_ref() {
+                        content.restore_complete_local_objects().await;
                     }
                 }
                 carrier_service = Some(elastos_server::carrier::CarrierRuntimeService::new(

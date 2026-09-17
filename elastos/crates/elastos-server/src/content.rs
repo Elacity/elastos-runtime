@@ -100,6 +100,16 @@ const OBJECT_MANIFEST_PATH: &str = "_elastos_object.json";
 const SEALED_OBJECT_PATH: &str = "sealed.json";
 
 pub const CONTENT_OBJECT_MANIFEST_PATH: &str = OBJECT_MANIFEST_PATH;
+const MAX_LOCAL_OBJECT_DIRS: usize = 16;
+const MAX_LOCAL_OBJECT_WALK_DEPTH: usize = 8;
+const LOCAL_OBJECT_WALK_SKIP: &[&str] = &[
+    "ipfs-repo",
+    "logs",
+    "bin",
+    "managed-runtimes",
+    "target",
+    ".git",
+];
 
 pub struct ContentProvider {
     data_dir: PathBuf,
@@ -3000,6 +3010,11 @@ impl Provider for ContentProvider {
     }
 }
 
+fn local_backend_needs_prepare(err: &ProviderError) -> bool {
+    let text = err.to_string();
+    text.contains("Bounded content read failed") || text.contains("bounded_read_failed")
+}
+
 impl ContentProvider {
     async fn invoke_provider(
         &self,
@@ -3068,15 +3083,26 @@ impl ContentProvider {
 
         let registry = self.registry()?;
         let transfer = ContentFetchTransfer::from_request(request)?;
+        let local_only = request.get("local_only").and_then(|value| value.as_bool()) == Some(true);
         let result = match self
             .fetch_from_local_backend(&registry, cid, path, &transfer)
             .await
         {
             Ok(result) => result,
-            Err(local_err)
-                if request.get("local_only").and_then(|value| value.as_bool()) == Some(true) =>
-            {
-                return Err(local_err);
+            Err(local_err) if local_only => {
+                if local_backend_needs_prepare(&local_err)
+                    && registry.prepare_local_ipfs_backend().await.is_ok()
+                {
+                    match self
+                        .fetch_from_local_backend(&registry, cid, path, &transfer)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    return Err(local_err);
+                }
             }
             Err(local_err) => match self
                 .fetch_from_availability_provider(&registry, cid, path, &transfer)
@@ -3778,7 +3804,7 @@ impl ContentProvider {
             ));
         }
 
-        let outcome = AvailabilityOutcome {
+        let local_outcome = AvailabilityOutcome {
             provider: "ipfs-provider".to_string(),
             policy: "carrier_object_import".to_string(),
             status: "local_pinned".to_string(),
@@ -3791,6 +3817,23 @@ impl ContentProvider {
             repair_graph: local_repair_graph_json(),
             abuse_controls: local_abuse_controls_json(),
         };
+        let outcome = self
+            .ensure_network_availability(
+                &registry,
+                cid,
+                request,
+                &local_outcome,
+                AvailabilityRequestContext {
+                    object_did: request.get("object_did").and_then(|value| value.as_str()),
+                    publisher_did: publisher_did.as_deref(),
+                    accounting_observation: ContentAccountingObservation {
+                        files: Some(file_count as u64),
+                        bytes: Some(total_bytes as u64),
+                    },
+                },
+            )
+            .await?
+            .unwrap_or(local_outcome);
         let object_did = request
             .get("object_did")
             .and_then(|value| value.as_str())
@@ -3973,11 +4016,17 @@ impl ContentProvider {
             )
             .await?;
 
-        let (status, policy, replicas, reason) = if ipfs_response
+        let pin_failed = ipfs_response
             .get("status")
             .and_then(|status| status.as_str())
-            == Some("error")
-        {
+            == Some("error");
+        let imported_local_object = if pin_failed {
+            self.import_complete_local_object_matching(&registry, cid)
+                .await?
+        } else {
+            false
+        };
+        let (status, policy, replicas, reason) = if pin_failed && !imported_local_object {
             (
                 "repair_needed",
                 failure_policy,
@@ -3987,6 +4036,8 @@ impl ContentProvider {
                     .and_then(|message| message.as_str())
                     .map(str::to_string),
             )
+        } else if imported_local_object {
+            ("local_pinned", "local_object_import", 1, None)
         } else {
             ("local_pinned", success_policy, 1, None)
         };
@@ -4073,6 +4124,101 @@ impl ContentProvider {
             "repair_task": repair_task,
             "receipt": receipt,
         })))
+    }
+
+    async fn import_complete_local_object_matching(
+        &self,
+        registry: &ProviderRegistry,
+        cid: &str,
+    ) -> Result<bool, ProviderError> {
+        for dir in complete_local_object_dirs(&self.data_dir) {
+            match self.import_local_object_dir(registry, &dir).await {
+                Ok(imported_cid) if imported_cid == cid => return Ok(true),
+                Ok(imported_cid) => {
+                    let _ = self
+                        .invoke_provider(
+                            registry,
+                            "ipfs",
+                            "unpin",
+                            json!({
+                                "op": "unpin",
+                                "cid": imported_cid,
+                            }),
+                            ProviderTransfer::Json,
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        dir = %dir.display(),
+                        error = %err,
+                        "content: local object import skipped"
+                    );
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn import_local_object_dir(
+        &self,
+        registry: &ProviderRegistry,
+        dir: &Path,
+    ) -> Result<String, ProviderError> {
+        let files = local_object_dir_files(dir)?;
+        let ipfs_response = self
+            .invoke_provider(
+                registry,
+                "ipfs",
+                "add_directory",
+                json!({
+                    "op": "add_directory",
+                    "files": files,
+                    "pin": true,
+                }),
+                ProviderTransfer::Json,
+            )
+            .await?;
+        provider_response_ok(&ipfs_response, "content local object import")?;
+        provider_response_cid(&ipfs_response).map_err(|err| {
+            ProviderError::Provider(format!("content local object import missing CID: {err}"))
+        })
+    }
+
+    pub async fn restore_complete_local_objects(&self) {
+        let Ok(registry) = self.registry() else {
+            return;
+        };
+        for dir in complete_local_object_dirs(&self.data_dir) {
+            match self.import_local_object_dir(&registry, &dir).await {
+                Ok(cid) => match self
+                    .ensure(&json!({
+                        "cid": cid,
+                        "availability_requirements": {
+                            "min_replicas": 1,
+                            "max_replicas": 1,
+                            "require_live_multi_peer_proof": false
+                        }
+                    }))
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        cid = %cid,
+                        "content: restored complete local object replica"
+                    ),
+                    Err(err) => tracing::warn!(
+                        cid = %cid,
+                        error = %err,
+                        "content: restore local object replica failed"
+                    ),
+                },
+                Err(err) => tracing::debug!(
+                    dir = %dir.display(),
+                    error = %err,
+                    "content: restore local object import skipped"
+                ),
+            }
+        }
     }
 
     async fn ensure_network_availability(
@@ -8476,6 +8622,120 @@ fn validate_content_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn complete_local_object_dirs(data_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    walk_local_object_dirs(data_dir, 0, &mut found);
+    if let Some(owner) = managed_home_owner_data_dir() {
+        if owner != data_dir {
+            walk_local_object_dirs(&owner, 0, &mut found);
+        }
+    }
+    found
+}
+
+fn managed_home_owner_data_dir() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("ELASTOS_MANAGED_GATEWAY_OWNER") {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            if let Some(dir) = value.get("data_dir").and_then(|v| v.as_str()) {
+                let path = PathBuf::from(dir);
+                if path.is_absolute() && path.is_dir() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    std::env::var("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir())
+}
+
+fn walk_local_object_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if found.len() >= MAX_LOCAL_OBJECT_DIRS || depth > MAX_LOCAL_OBJECT_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if found.len() >= MAX_LOCAL_OBJECT_DIRS {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if LOCAL_OBJECT_WALK_SKIP
+            .iter()
+            .any(|skip| *skip == name.as_ref())
+        {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join(OBJECT_MANIFEST_PATH).is_file() {
+            if local_object_dir_is_complete(&path) {
+                found.push(path);
+            }
+            continue;
+        }
+        walk_local_object_dirs(&path, depth + 1, found);
+    }
+}
+
+fn local_object_dir_is_complete(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join(OBJECT_MANIFEST_PATH)) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<ContentObjectManifest>(&bytes) else {
+        return false;
+    };
+    if manifest.schema != OBJECT_MANIFEST_SCHEMA || manifest.files.is_empty() {
+        return false;
+    }
+    manifest.files.iter().all(|file| {
+        if validate_content_path(&file.path).is_err() {
+            return false;
+        }
+        let path = dir.join(&file.path);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        bytes.len() as u64 == file.size
+            && format!("{:x}", sha2::Sha256::digest(&bytes)) == file.sha256
+    })
+}
+
+fn local_object_dir_files(dir: &Path) -> Result<Vec<Value>, ProviderError> {
+    let manifest_path = dir.join(OBJECT_MANIFEST_PATH);
+    let manifest_bytes = std::fs::read(&manifest_path)?;
+    let manifest: ContentObjectManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|err| {
+            ProviderError::Provider(format!(
+                "content local object manifest decode failed: {err}"
+            ))
+        })?;
+    let mut files = Vec::with_capacity(manifest.files.len().saturating_add(1));
+    for file in &manifest.files {
+        if validate_content_path(&file.path).is_err() {
+            return Err(ProviderError::Provider(format!(
+                "content local object path {} is invalid",
+                file.path
+            )));
+        }
+        let bytes = std::fs::read(dir.join(&file.path))?;
+        files.push(json!({
+            "path": file.path,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }));
+    }
+    files.push(json!({
+        "path": OBJECT_MANIFEST_PATH,
+        "data": base64::engine::general_purpose::STANDARD.encode(manifest_bytes),
+    }));
+    Ok(files)
+}
+
 fn with_directory_object_manifest(
     files: Value,
     kind: &str,
@@ -8885,6 +9145,7 @@ mod tests {
         pinned: Mutex<Vec<String>>,
         pin_error: Mutex<Option<String>>,
         unpinned: Mutex<Vec<String>>,
+        bounded_read_not_ready: Mutex<bool>,
     }
 
     struct MockAvailabilityProvider {
@@ -8937,6 +9198,17 @@ mod tests {
                         .and_then(|path| path.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if request
+                        .get("bounded_read")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                        && *self.bounded_read_not_ready.lock().await
+                    {
+                        return Ok(provider_error(
+                            "bounded_read_failed",
+                            "Bounded content read failed",
+                        ));
+                    }
                     if self
                         .missing_paths
                         .lock()
@@ -9201,6 +9473,7 @@ mod tests {
             pinned: Mutex::new(Vec::new()),
             pin_error: Mutex::new(None),
             unpinned: Mutex::new(Vec::new()),
+            bounded_read_not_ready: Mutex::new(false),
         });
         registry
             .register_sub_provider("ipfs", ipfs.clone())
@@ -11263,6 +11536,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_ensure_imports_complete_local_object_when_pin_fails() {
+        let (data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        *ipfs.pin_error.lock().await = Some("not in local repo".to_string());
+        let body = b"hello object";
+        let digest = format!("{:x}", sha2::Sha256::digest(body));
+        let object_dir = data_dir.path().join("held-object");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(object_dir.join("index.md"), body).unwrap();
+        std::fs::write(
+            object_dir.join(OBJECT_MANIFEST_PATH),
+            serde_json::to_vec(&json!({
+                "schema": OBJECT_MANIFEST_SCHEMA,
+                "kind": "directory",
+                "content_digest": format!("sha256:{digest}"),
+                "files": [{
+                    "path": "index.md",
+                    "sha256": digest,
+                    "size": body.len() as u64
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "availability": {
+                    "status": "carrier_announced",
+                    "provider": "carrier-availability",
+                    "policy": "network_default",
+                    "replicas": 1,
+                    "peer_selection": {
+                        "mode": "carrier_topic",
+                        "strategy": "local_holder",
+                        "topic": "elastos.content.availability"
+                    },
+                    "quota": {
+                        "policy": "local_holder",
+                        "status": "within_quota"
+                    },
+                    "repair_worker": {
+                        "scheduled": false,
+                        "status": "idle"
+                    }
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+
+        let response = content
+            .send_raw(&json!({
+                "op": "ensure",
+                "cid": TEST_CID,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_ne!(
+            response["data"]["availability"]["status"], "repair_needed",
+            "complete local object must become a Content replica: {response}"
+        );
+        assert_eq!(response["data"]["availability"]["replicas"], 1);
+        assert_eq!(ipfs.added_directories.lock().await.len(), 1);
+        let sent = availability.requests.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["op"], "ensure");
+        assert_eq!(sent[0]["local"]["replicas"], 1);
+        assert_eq!(sent[0]["local"]["policy"], "local_object_import");
+        assert_eq!(
+            response["data"]["availability"]["status"],
+            "carrier_announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_restore_imports_complete_local_objects() {
+        let (data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let body = b"hello object";
+        let digest = format!("{:x}", sha2::Sha256::digest(body));
+        let object_dir = data_dir.path().join("held-object");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(object_dir.join("index.md"), body).unwrap();
+        std::fs::write(
+            object_dir.join(OBJECT_MANIFEST_PATH),
+            serde_json::to_vec(&json!({
+                "schema": OBJECT_MANIFEST_SCHEMA,
+                "kind": "directory",
+                "content_digest": format!("sha256:{digest}"),
+                "files": [{
+                    "path": "index.md",
+                    "sha256": digest,
+                    "size": body.len() as u64
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        content.restore_complete_local_objects().await;
+
+        assert_eq!(ipfs.added_directories.lock().await.len(), 1);
+        assert_eq!(ipfs.pinned.lock().await.as_slice(), [TEST_CID.to_string()]);
+    }
+
+    #[tokio::test]
     async fn content_publish_file_wraps_ipfs_bytes_with_receipt() {
         let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
         let cid = publish_bytes_via_provider(
@@ -11883,6 +12262,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_fetch_rejects_max_bytes_for_a_non_index_path_and_forwards_declared_range() {
+        // Exclusive LICENSE miss: max_bytes is the whole-index metadata bound.
+        // A non-index file uses the signed size as a closed 64 KiB range.
+        let (_root, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let err = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": "docs/readme.md",
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .expect_err("max_bytes stays the whole-index bound");
+        assert!(
+            err.to_string()
+                .contains("complete metadata requires a local bounded whole index"),
+            "{err}"
+        );
+        assert!(ipfs.requests.lock().await.is_empty());
+        assert!(registry.get("availability").await.is_none());
+
+        ipfs.missing_paths
+            .lock()
+            .await
+            .push("docs/readme.md".to_string());
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": encode(b"89ab"),
+                "availability": {
+                    "status": "network_available",
+                    "provider": "mock-availability",
+                    "policy": "carrier_provider_invoke",
+                    "replicas": 1
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+        let response = registry
+            .invoke_provider(ProviderInvocation {
+                source: "runtime-model-preparation".into(),
+                target: "content".into(),
+                op: "fetch".into(),
+                request: json!({
+                    "op": "fetch",
+                    "cid": TEST_CID,
+                    "path": "docs/readme.md",
+                    "bounded_read": true,
+                    "range": { "start": 0, "end": 3 },
+                    "transfer": "stream"
+                }),
+                transfer: ProviderTransfer::Stream,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_test_stream_payload(&response["data"]["stream"]),
+            b"89ab"
+        );
+        let sent = availability.requests.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["path"], "docs/readme.md");
+        assert_eq!(sent[0]["bounded_read"], true);
+        assert_eq!(sent[0]["range"], json!({ "start": 0, "end": 3 }));
+        assert!(sent[0].get("max_bytes").is_none());
+        assert!(sent[0]["_runtime_invocation"]["range"].is_null());
+    }
+
+    #[tokio::test]
+    async fn fetch_model_part_requires_a_declared_range_for_a_non_index_path() {
+        let (_root, registry, _ipfs, _content) = registry_with_content_and_ipfs().await;
+        let err = fetch_model_part(&registry, TEST_CID, "docs/readme.md", None)
+            .await
+            .expect_err("non-index files use a declared range");
+        assert!(
+            err.to_string().contains("complete model index required"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn content_fetch_ranges_availability_provider_when_local_backend_misses() {
         let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
         ipfs.missing_paths
@@ -12047,6 +12513,52 @@ mod tests {
 
         assert!(err.to_string().contains("content fetch"));
         assert!(availability.requests.lock().await.is_empty());
+    }
+
+    #[test]
+    fn local_backend_needs_prepare_matches_holder_cold_bounded_read() {
+        assert!(local_backend_needs_prepare(&ProviderError::Provider(
+            "content fetch failed: Bounded content read failed".into(),
+        )));
+        assert!(local_backend_needs_prepare(&ProviderError::Provider(
+            "bounded_read_failed".into(),
+        )));
+        assert!(!local_backend_needs_prepare(&ProviderError::Provider(
+            "content fetch failed: mock content path missing".into(),
+        )));
+    }
+
+    #[tokio::test]
+    async fn content_fetch_local_only_cold_bounded_read_does_not_use_availability() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(b"remote content"),
+            }))),
+        });
+        registry.register(availability.clone()).await;
+        *ipfs.bounded_read_not_ready.lock().await = true;
+        let err = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "local_only": true,
+            }))
+            .await
+            .expect_err("cold bounded local_only fetch must fail closed");
+        assert!(
+            err.to_string().contains("Bounded content read failed"),
+            "{err}"
+        );
+        assert!(availability.requests.lock().await.is_empty());
+        assert!(
+            ipfs.requests.lock().await.len() <= 2,
+            "one bounded miss plus at most one prepare retry"
+        );
     }
 
     #[tokio::test]

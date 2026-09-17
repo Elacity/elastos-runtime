@@ -64,7 +64,9 @@ use crate::content::{ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH};
 use crate::operator_control::{
     load_operator_control, OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN,
 };
-use crate::sources::TrustedSource;
+use crate::sources::{
+    load_trusted_sources, normalize_gateways, save_trusted_sources, TrustedSource,
+};
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
 #[path = "carrier_file.rs"]
@@ -104,6 +106,8 @@ const CONTENT_STORAGE_MARKET_ADMISSION_POLICY_SCHEMA: &str =
 const CONTENT_BLOCK_GRAPH_PROVIDER: &str = "content-block-graph-provider";
 const CONTENT_BLOCK_GRAPH_TARGET: &str = "block-graph";
 const CARRIER_PEER_REPUTATION_SCHEMA: &str = "elastos.carrier.peer-reputation/v1";
+const CARRIER_LOCAL_HOLDER_ANNOUNCEMENTS_SCHEMA: &str =
+    "elastos.carrier.local-holder-announcements/v1";
 const CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA: &str =
     "elastos.carrier.peer-attestation-exchange-policy/v1";
 const CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_SCHEMA: &str =
@@ -129,6 +133,8 @@ const GOSSIP_JOIN_PEERS_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// on LAN needed more than 8s (2026-09-16).
 const CONTENT_AVAILABILITY_DISCOVERY_WAIT: Duration = Duration::from_secs(30);
 const CONTENT_AVAILABILITY_DISCOVERY_POLL: Duration = Duration::from_millis(100);
+const SOURCE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
+const SOURCE_BOOTSTRAP_PATH: &str = "/.well-known/elastos/carrier-bootstrap.json?role=publisher";
 const GOSSIP_JOIN_EXACT_MAX_PEERS: usize = 16;
 const GOSSIP_CARRIER_PUSH_MAX_TOPIC_LEN: usize = 256;
 // Maximum complete JSON GossipMessage admitted to the iroh-gossip wire.
@@ -676,6 +682,130 @@ pub(crate) fn public_key_to_did(public_key: &iroh::PublicKey) -> anyhow::Result<
         .context("iroh public keys must be canonical Ed25519 verifying keys")?;
     encode_did_key(&verifying_key)
         .context("iroh public keys must encode as one canonical Ed25519 did:key")
+}
+
+/// Live publisher bootstrap from `/.well-known/elastos/carrier-bootstrap.json`.
+/// The document names schema, role, and current endpoint coordinates.
+/// The pinned `publisher_node_id` is the holder identity.
+/// Carrier authenticates the replica session after that identity check.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SourceCarrierBootstrapDocument {
+    #[serde(default)]
+    pub schema: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub ticket: String,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub did: Option<String>,
+}
+
+/// Accept a publisher bootstrap ticket only for the already-pinned holder.
+/// Schema and role must match. Ticket endpoints must match the pinned node.
+/// This document has no signature field; Carrier authenticates the session.
+pub fn verified_source_bootstrap_ticket(
+    source: &TrustedSource,
+    document: &SourceCarrierBootstrapDocument,
+) -> Option<String> {
+    if document.schema != "elastos.carrier.bootstrap/v1"
+        || document.role != "publisher"
+        || document.ticket.trim().is_empty()
+        || document.node_id.trim().is_empty()
+    {
+        return None;
+    }
+
+    let expected_node_id = source.publisher_node_id.trim();
+    if !expected_node_id.is_empty() && document.node_id.trim() != expected_node_id {
+        return None;
+    }
+
+    let endpoints = decode_ticket_endpoints(&document.ticket);
+    if endpoints.is_empty()
+        || endpoints
+            .iter()
+            .any(|endpoint| endpoint.id.to_string() != document.node_id.trim())
+    {
+        return None;
+    }
+
+    if let Some(did) = document
+        .did
+        .as_deref()
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+    {
+        let ticket_did = ticket_holder_did(&document.ticket)?;
+        if did != ticket_did {
+            return None;
+        }
+    }
+
+    Some(document.ticket.trim().to_string())
+}
+
+/// Fetch current endpoint coordinates from the trusted-source gateway.
+pub async fn live_source_bootstrap_ticket(source: &TrustedSource) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(SOURCE_BOOTSTRAP_TIMEOUT)
+        .build()
+        .ok()?;
+
+    for gateway in normalize_gateways(&source.gateways) {
+        let url = format!("{gateway}{SOURCE_BOOTSTRAP_PATH}");
+        let Ok(response) = client.get(&url).send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(document) = response.json::<SourceCarrierBootstrapDocument>().await else {
+            continue;
+        };
+        if let Some(ticket) = verified_source_bootstrap_ticket(source, &document) {
+            return Some(ticket);
+        }
+    }
+    None
+}
+
+enum TrustedSourceBootstrapRefresh {
+    NotConfigured,
+    Rejected,
+    Current,
+    Fresh(String),
+}
+
+async fn refresh_trusted_source_replica_ticket(
+    data_dir: &std::path::Path,
+    holder_did: &str,
+    current_ticket: &str,
+) -> TrustedSourceBootstrapRefresh {
+    let Ok(mut config) = load_trusted_sources(data_dir) else {
+        return TrustedSourceBootstrapRefresh::NotConfigured;
+    };
+    let Some(source_name) = config.sources.iter().find_map(|source| {
+        (trusted_source_replica_did(source).as_deref() == Some(holder_did))
+            .then(|| source.name.clone())
+    }) else {
+        return TrustedSourceBootstrapRefresh::NotConfigured;
+    };
+    let Some(source) = config.source_named(Some(source_name.as_str())).cloned() else {
+        return TrustedSourceBootstrapRefresh::NotConfigured;
+    };
+    let Some(live) = live_source_bootstrap_ticket(&source).await else {
+        return TrustedSourceBootstrapRefresh::Rejected;
+    };
+    if live == current_ticket {
+        return TrustedSourceBootstrapRefresh::Current;
+    }
+    if let Some(stored) = config.source_named_mut(Some(source_name.as_str())) {
+        stored.connect_ticket = live.clone();
+    }
+    let _ = save_trusted_sources(data_dir, &config);
+    TrustedSourceBootstrapRefresh::Fresh(live)
 }
 
 pub fn decode_ticket_endpoints(ticket: &str) -> Vec<iroh::EndpointAddr> {
@@ -2301,6 +2431,60 @@ impl CarrierAvailabilityProvider {
         self
     }
 
+    pub async fn restore_persisted_local_holder_announcements(&self) {
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return;
+        };
+        for holder in load_local_holder_announcements(data_dir) {
+            let mut request = serde_json::json!({
+                "op": "ensure",
+                "cid": holder.cid,
+                "uri": holder.uri,
+                "policy": holder.policy,
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 1
+                },
+                "requirements": {
+                    "min_replicas": 1,
+                    "max_replicas": 1,
+                    "require_live_multi_peer_proof": false
+                }
+            });
+            if let Some(object_did) = holder.object_did.as_deref() {
+                request["object_did"] = serde_json::Value::String(object_did.to_string());
+            }
+            if let Some(publisher_did) = holder.publisher_did.as_deref() {
+                request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
+            }
+            match self.announce_availability(&request).await {
+                Ok(response)
+                    if response.get("status").and_then(|value| value.as_str()) == Some("ok") =>
+                {
+                    info!(cid = %holder.cid, "carrier: restored local holder announcement");
+                }
+                Ok(response) => {
+                    warn!(
+                        cid = %holder.cid,
+                        "carrier: restored local holder announcement returned {}",
+                        response
+                            .get("code")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("error")
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        cid = %holder.cid,
+                        error = %err,
+                        "carrier: restored local holder announcement failed"
+                    );
+                }
+            }
+        }
+    }
+
     async fn record_peer_reputation(&self, node_did: &str, success: bool) {
         let snapshot = {
             let mut reputation = self.peer_reputation.lock().await;
@@ -3088,6 +3272,25 @@ struct CarrierPeerReputationStore {
     peers: BTreeMap<String, CarrierPeerReputation>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalHolderAnnouncement {
+    cid: String,
+    #[serde(default)]
+    uri: String,
+    #[serde(default)]
+    policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publisher_did: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalHolderAnnouncementStore {
+    schema: String,
+    holders: Vec<LocalHolderAnnouncement>,
+}
+
 #[async_trait::async_trait]
 impl Provider for CarrierAvailabilityProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -3221,7 +3424,7 @@ impl CarrierAvailabilityProvider {
         // add`) are the replica targets this node was told to use; offer
         // them behind any announced holder of the CID.
         if let Some(data_dir) = self.data_dir.as_deref() {
-            append_operator_peer_store_replica_candidates(
+            append_known_holder_replica_candidates(
                 &mut remote_candidate_pool,
                 data_dir,
                 &node_did,
@@ -3329,6 +3532,32 @@ impl CarrierAvailabilityProvider {
             let mut buffers = state.buffers.lock().await;
             if let Some(buffer) = buffers.get_mut(&topic_name) {
                 push_gossip_buffer_message(buffer, msg.clone());
+            }
+        }
+        if let Some(data_dir) = self.data_dir.as_deref() {
+            if replicas > 0 {
+                if let Err(err) = record_local_holder_announcement(
+                    data_dir,
+                    LocalHolderAnnouncement {
+                        cid: cid.to_string(),
+                        uri: uri.clone(),
+                        policy: policy.to_string(),
+                        object_did: request
+                            .get("object_did")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string),
+                        publisher_did: request
+                            .get("publisher_did")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string),
+                    },
+                ) {
+                    debug!("carrier: persist local holder announcement failed: {err}");
+                }
+            } else if let Err(err) = forget_local_holder_announcement(data_dir, cid) {
+                debug!("carrier: forget local holder announcement failed: {err}");
             }
         }
 
@@ -3557,7 +3786,7 @@ impl CarrierAvailabilityProvider {
             // peers fill the same gap they fill on ensure: a known holder that
             // has not yet announced this CID can still serve a bounded fetch.
             if let Some(data_dir) = self.data_dir.as_deref() {
-                append_operator_peer_store_replica_candidates(
+                append_known_holder_replica_candidates(
                     &mut replicas,
                     data_dir,
                     &self_did,
@@ -3568,7 +3797,7 @@ impl CarrierAvailabilityProvider {
             let next = replicas
                 .into_iter()
                 .find(|replica| !tried.contains(&replica.node_did));
-            if let Some(replica) = next {
+            if let Some(mut replica) = next {
                 if tried.len() >= MAX_CARRIER_REPLICATION_CANDIDATES {
                     break;
                 }
@@ -3595,6 +3824,7 @@ impl CarrierAvailabilityProvider {
                                     "policy": "carrier_provider_invoke",
                                     "replicas": 1,
                                     "transport": "carrier-provider-plane",
+                                    "node_did": replica.node_did,
                                     "remote_transfer": remote_transfer,
                                     "checked_at": now_secs(),
                                 }
@@ -3602,8 +3832,73 @@ impl CarrierAvailabilityProvider {
                         }));
                     }
                     Err(err) => {
+                        warn!(
+                            holder = %replica.node_did,
+                            error = %err,
+                            "Carrier availability fetch from holder failed"
+                        );
+                        let mut final_err = err.to_string();
+                        if let Some(data_dir) = self.data_dir.as_deref() {
+                            match refresh_trusted_source_replica_ticket(
+                                data_dir,
+                                &replica.node_did,
+                                &replica.connect_ticket,
+                            )
+                            .await
+                            {
+                                TrustedSourceBootstrapRefresh::Fresh(live_ticket) => {
+                                    replica.connect_ticket = live_ticket;
+                                    match fetch_content_via_carrier_provider_invocation(
+                                        &registry,
+                                        &replica.node_did,
+                                        &replica.connect_ticket,
+                                        cid,
+                                        path,
+                                        bound,
+                                    )
+                                    .await
+                                    {
+                                        Ok((bytes, remote_transfer)) => {
+                                            self.record_peer_reputation(&replica.node_did, true)
+                                                .await;
+                                            return Ok(serde_json::json!({
+                                                "status": "ok",
+                                                "data": {
+                                                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                                                    "availability": {
+                                                        "status": "network_available",
+                                                        "provider": "carrier-availability",
+                                                        "policy": "carrier_provider_invoke",
+                                                        "replicas": 1,
+                                                        "transport": "carrier-provider-plane",
+                                                        "node_did": replica.node_did,
+                                                        "remote_transfer": remote_transfer,
+                                                        "checked_at": now_secs(),
+                                                    }
+                                                }
+                                            }));
+                                        }
+                                        Err(retry_err) => {
+                                            warn!(
+                                                holder = %replica.node_did,
+                                                error = %retry_err,
+                                                "Carrier availability fetch after bootstrap refresh failed"
+                                            );
+                                            final_err = retry_err.to_string();
+                                        }
+                                    }
+                                }
+                                TrustedSourceBootstrapRefresh::Rejected => {
+                                    final_err = format!(
+                                        "{final_err}; trusted-source bootstrap refresh rejected"
+                                    );
+                                }
+                                TrustedSourceBootstrapRefresh::Current
+                                | TrustedSourceBootstrapRefresh::NotConfigured => {}
+                            }
+                        }
                         self.record_peer_reputation(&replica.node_did, false).await;
-                        errors.push(err.to_string());
+                        errors.push(final_err);
                         continue;
                     }
                 }
@@ -5707,6 +6002,99 @@ fn append_operator_peer_store_replica_candidates(
     sort_replica_candidates(pool);
 }
 
+/// Installer-written trusted sources fill the same Get/Use holder gap as
+/// `elastos node peer add`, without marking those tickets as gossip
+/// bootstrap peers. The replica DID is the connect-ticket endpoint encoded
+/// as `did:key`, so Carrier route filtering matches the ticket.
+fn append_trusted_source_replica_candidates(
+    pool: &mut Vec<CarrierAvailabilityReplica>,
+    data_dir: &std::path::Path,
+    self_did: &str,
+    reputation: &HashMap<String, CarrierPeerReputation>,
+    now: u64,
+) {
+    let config = match load_trusted_sources(data_dir) {
+        Ok(config) => config,
+        Err(err) => {
+            debug!("carrier: no trusted sources for replica candidates: {err}");
+            return;
+        }
+    };
+    if config
+        .sources
+        .iter()
+        .all(|source| source.connect_ticket.trim().is_empty())
+    {
+        debug!("carrier: trusted sources have no connect tickets for replica candidates");
+        return;
+    }
+    for source in &config.sources {
+        let connect_ticket = source.connect_ticket.trim();
+        if connect_ticket.is_empty() {
+            continue;
+        }
+        let Some(node_did) = trusted_source_replica_did(source) else {
+            warn!(
+                source = %source.name,
+                "carrier: trusted source has a connect ticket without a usable holder DID, skipping"
+            );
+            continue;
+        };
+        if node_did == self_did || pool.iter().any(|replica| replica.node_did == node_did) {
+            continue;
+        }
+        let (reputation_score, reputation_reason) =
+            carrier_reputation_score(reputation.get(&node_did));
+        let mut score = 40_u32;
+        let mut reasons = vec!["trusted_source"];
+        if reputation_score > 0 {
+            score = score.saturating_add(reputation_score as u32);
+            reasons.push("local_reputation_positive");
+        } else if reputation_score < 0 {
+            score = score.saturating_sub(reputation_score.unsigned_abs());
+            reasons.push("local_reputation_negative");
+        } else {
+            reasons.push("local_reputation_neutral");
+        }
+        debug!(
+            source = %source.name,
+            "carrier: added trusted-source replica candidate"
+        );
+        pool.push(CarrierAvailabilityReplica {
+            node_did,
+            endpoint_id: None,
+            connect_ticket: connect_ticket.to_string(),
+            announced_at: now,
+            score: score.min(100),
+            selection_reason: reasons.join("+"),
+            reputation_score,
+            reputation_reason,
+        });
+    }
+    sort_replica_candidates(pool);
+}
+
+fn append_known_holder_replica_candidates(
+    pool: &mut Vec<CarrierAvailabilityReplica>,
+    data_dir: &std::path::Path,
+    self_did: &str,
+    reputation: &HashMap<String, CarrierPeerReputation>,
+    now: u64,
+) {
+    append_operator_peer_store_replica_candidates(pool, data_dir, self_did, reputation, now);
+    append_trusted_source_replica_candidates(pool, data_dir, self_did, reputation, now);
+}
+
+fn ticket_holder_did(ticket: &str) -> Option<String> {
+    decode_ticket_endpoints(ticket)
+        .into_iter()
+        .find_map(|endpoint| public_key_to_did(&endpoint.id).ok())
+}
+
+fn trusted_source_replica_did(source: &TrustedSource) -> Option<String> {
+    ticket_holder_did(&source.connect_ticket)
+}
+
 fn carrier_replica_candidate_score(
     endpoint_id: Option<&str>,
     announced_at: u64,
@@ -5810,6 +6198,94 @@ fn save_carrier_peer_reputation(
     let bytes = serde_json::to_vec_pretty(&store)?;
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+fn carrier_local_holder_announcements_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir
+        .join("ElastOS")
+        .join("SystemServices")
+        .join("Content")
+        .join("local-holder-announcements.json")
+}
+
+fn load_local_holder_announcements(data_dir: &std::path::Path) -> Vec<LocalHolderAnnouncement> {
+    let path = carrier_local_holder_announcements_path(data_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let Ok(store) = serde_json::from_slice::<LocalHolderAnnouncementStore>(&bytes) else {
+        debug!(
+            "carrier local holder announcements decode failed: {}",
+            path.display()
+        );
+        return Vec::new();
+    };
+    if store.schema != CARRIER_LOCAL_HOLDER_ANNOUNCEMENTS_SCHEMA {
+        debug!(
+            "carrier local holder announcements schema mismatch at {}: {}",
+            path.display(),
+            store.schema
+        );
+        return Vec::new();
+    }
+    store
+        .holders
+        .into_iter()
+        .filter(|holder| validate_content_cid(&holder.cid).is_ok())
+        .take(MAX_TOPICS)
+        .collect()
+}
+
+fn save_local_holder_announcements(
+    data_dir: &std::path::Path,
+    store: &LocalHolderAnnouncementStore,
+) -> Result<()> {
+    let path = carrier_local_holder_announcements_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(store)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn record_local_holder_announcement(
+    data_dir: &std::path::Path,
+    announcement: LocalHolderAnnouncement,
+) -> Result<()> {
+    if validate_content_cid(&announcement.cid).is_err() {
+        anyhow::bail!("local holder announcement requires a valid CID");
+    }
+    let mut holders = load_local_holder_announcements(data_dir);
+    holders.retain(|holder| holder.cid != announcement.cid);
+    holders.push(announcement);
+    if holders.len() > MAX_TOPICS {
+        let drop_count = holders.len() - MAX_TOPICS;
+        holders.drain(0..drop_count);
+    }
+    save_local_holder_announcements(
+        data_dir,
+        &LocalHolderAnnouncementStore {
+            schema: CARRIER_LOCAL_HOLDER_ANNOUNCEMENTS_SCHEMA.to_string(),
+            holders,
+        },
+    )
+}
+
+fn forget_local_holder_announcement(data_dir: &std::path::Path, cid: &str) -> Result<()> {
+    let mut holders = load_local_holder_announcements(data_dir);
+    let before = holders.len();
+    holders.retain(|holder| holder.cid != cid);
+    if holders.len() == before {
+        return Ok(());
+    }
+    save_local_holder_announcements(
+        data_dir,
+        &LocalHolderAnnouncementStore {
+            schema: CARRIER_LOCAL_HOLDER_ANNOUNCEMENTS_SCHEMA.to_string(),
+            holders,
+        },
+    )
 }
 
 fn gossip_cursor_error(code: &str, message: &str) -> serde_json::Value {
@@ -6978,7 +7454,7 @@ impl CarrierProviderInvoker {
 }
 
 fn carrier_provider_public_connect_error(index: usize, err: &anyhow::Error) -> String {
-    tracing::debug!(
+    tracing::warn!(
         ticket_index = index,
         error = %format_args!("{err:#}"),
         "Carrier provider connect failed"
@@ -6987,7 +7463,7 @@ fn carrier_provider_public_connect_error(index: usize, err: &anyhow::Error) -> S
 }
 
 fn carrier_provider_public_invoke_error(index: usize, err: &anyhow::Error) -> String {
-    tracing::debug!(
+    tracing::warn!(
         ticket_index = index,
         error = %format_args!("{err:#}"),
         "Carrier provider invocation failed"
@@ -12815,6 +13291,117 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_carrier_availability_fetch_uses_trusted_source_without_announcements() {
+        // Ordinary install writes sources.json, not `elastos node peer add`.
+        // Get still has to invoke that holder before gossip announces the CID.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (remote_sk, expected_holder_did) = elastos_identity::derive_did(&[42u8; 32]);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[43u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let remote_ticket = encode_ticket_for(iroh::EndpointAddr::from(
+            iroh::SecretKey::from_bytes(&remote_sk.to_bytes()).public(),
+        ));
+        let catalog_publisher_did =
+            "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string();
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::sources::save_trusted_sources(
+            data_dir.path(),
+            &crate::sources::TrustedSourcesConfig {
+                schema: "elastos.trusted-sources/v1".to_string(),
+                default_source: "official".to_string(),
+                sources: vec![TrustedSource {
+                    name: "official".to_string(),
+                    publisher_dids: vec![catalog_publisher_did.clone()],
+                    channel: "stable".to_string(),
+                    discovery_uri: "https://example.invalid/discovery".to_string(),
+                    connect_ticket: remote_ticket.clone(),
+                    gateways: Vec::new(),
+                    install_path: String::new(),
+                    installed_version: String::new(),
+                    head_cid: String::new(),
+                    publisher_node_id: iroh::SecretKey::from_bytes(&remote_sk.to_bytes())
+                        .public()
+                        .to_string(),
+                    ipns_name: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(
+            response["data"]["availability"]["policy"],
+            "carrier_provider_invoke"
+        );
+        let requests = invoker.requests.lock().await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["ticket"] == remote_ticket),
+            "{requests:?}"
+        );
+        assert!(requests.iter().any(|request| request["op"] == "fetch"));
+        assert_eq!(requests.len(), 1);
+        let mut pool = Vec::new();
+        append_trusted_source_replica_candidates(
+            &mut pool,
+            data_dir.path(),
+            &local_did,
+            &HashMap::new(),
+            1,
+        );
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].node_did, expected_holder_did);
+        assert_ne!(pool[0].node_did, catalog_publisher_did);
+        assert!(pool[0].selection_reason.starts_with("trusted_source"));
+    }
+
+    #[tokio::test]
     async fn test_carrier_availability_fetch_waits_for_a_late_signed_announcement() {
         // A consumer that joins after the holder announced still has an empty
         // local buffer. The fetch waits for the signed announcement instead of
@@ -13066,6 +13653,311 @@ pub(crate) mod tests {
                 .any(|request| request["ticket"] == live_ticket),
             "{requests:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_walks_a_dead_trusted_source_then_a_later_independent_holder(
+    ) {
+        // Exclusive-holder miss shape: the installer replica is unreachable,
+        // then a later independent signed announcement is the live holder.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[61u8; 32]);
+        let (source_sk, dead_source_did) = elastos_identity::derive_did(&[62u8; 32]);
+        let (_, independent_holder_did) = elastos_identity::derive_did(&[63u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let live_ticket = "ticket:independent-holder";
+        let dead_ticket = encode_ticket_for(iroh::EndpointAddr::from(
+            iroh::SecretKey::from_bytes(&source_sk.to_bytes()).public(),
+        ));
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name.clone(), test_topic_buffer([], 0));
+        }
+        let buffers = state.lock().await.buffers.clone();
+        let topic = topic_name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let (message, _) =
+                signed_content_availability_message(cid, [63u8; 32], live_ticket, "", now_secs());
+            let mut buffers = buffers.lock().await;
+            let buffer = buffers.get_mut(&topic).expect("topic buffer");
+            assert!(push_gossip_buffer_message(buffer, message));
+        });
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::sources::save_trusted_sources(
+            data_dir.path(),
+            &crate::sources::TrustedSourcesConfig {
+                schema: "elastos.trusted-sources/v1".to_string(),
+                default_source: "official".to_string(),
+                sources: vec![TrustedSource {
+                    name: "official".to_string(),
+                    publisher_dids: vec![
+                        "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string(),
+                    ],
+                    channel: "stable".to_string(),
+                    discovery_uri: String::new(),
+                    connect_ticket: dead_ticket.clone(),
+                    gateways: Vec::new(),
+                    install_path: String::new(),
+                    installed_version: String::new(),
+                    head_cid: String::new(),
+                    publisher_node_id: iroh::SecretKey::from_bytes(&source_sk.to_bytes())
+                        .public()
+                        .to_string(),
+                    ipns_name: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            fail_tickets: vec![dead_ticket.clone()],
+            ..Default::default()
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        )
+        .with_discovery_wait(Duration::from_secs(2));
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        let requests = invoker.requests.lock().await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["ticket"] == dead_ticket),
+            "{requests:?}"
+        );
+        assert_eq!(requests.last().unwrap()["ticket"], live_ticket);
+        assert_eq!(
+            response["data"]["availability"]["node_did"].as_str(),
+            Some(independent_holder_did.as_str()),
+            "{response}"
+        );
+        assert_ne!(
+            response["data"]["availability"]["node_did"].as_str(),
+            Some(dead_source_did.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_announce_records_a_durable_local_holder() {
+        // A complete local pin must survive Carrier restart as a CID-topic
+        // holder. The in-memory gossip buffer is empty after restart.
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[64u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "policy": "network_default",
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 1
+                },
+                "requirements": {
+                    "min_replicas": 1,
+                    "max_replicas": 1,
+                    "require_live_multi_peer_proof": false
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        let path = data_dir
+            .path()
+            .join("ElastOS")
+            .join("SystemServices")
+            .join("Content")
+            .join("local-holder-announcements.json");
+        assert!(
+            path.is_file(),
+            "local holder announce must persist the CID at {}",
+            path.display()
+        );
+        let store: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            store["schema"],
+            "elastos.carrier.local-holder-announcements/v1"
+        );
+        assert_eq!(store["holders"][0]["cid"], cid);
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_restore_reannounces_a_persisted_holder_into_an_empty_buffer()
+    {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (local_sk, local_did) = elastos_identity::derive_did(&[65u8; 32]);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let first_state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup.clone(),
+            Some(elastos_identity::derive_did(&[65u8; 32]).0),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = first_state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name.clone(), test_topic_buffer([], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker).await;
+        let first = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            first_state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        let response = first
+            .send_raw(&serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "policy": "network_default",
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 1
+                },
+                "requirements": {
+                    "min_replicas": 1,
+                    "max_replicas": 1,
+                    "require_live_multi_peer_proof": false
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+
+        let restarted_gossip = spawn_carrier_gossip(&endpoint);
+        let restarted_state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            restarted_gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = restarted_state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name.clone(), test_topic_buffer([], 0));
+        }
+        let restarted = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            restarted_state.clone(),
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        );
+        restarted
+            .restore_persisted_local_holder_announcements()
+            .await;
+        let messages = {
+            let state = restarted_state.lock().await;
+            let buffers = state.buffers.lock().await;
+            buffers
+                .get(&topic_name)
+                .map(|buffer| buffer.messages.iter().cloned().collect::<VecDeque<_>>())
+                .unwrap_or_default()
+        };
+        let catchup = local_content_availability_catchup_message(&messages, &local_did)
+            .expect("restarted holder must reannounce a fetch ticket");
+        assert_eq!(catchup.sender_id, local_did);
+        assert!(catchup.content.contains("connect_ticket"));
     }
 
     #[tokio::test]
@@ -13626,6 +14518,418 @@ pub(crate) mod tests {
         assert!(
             bootstrap_peers.is_empty(),
             "trusted-source rendezvous should not force direct bootstrap joins"
+        );
+    }
+
+    #[test]
+    fn trusted_source_replica_did_comes_from_the_connect_ticket() {
+        let secret = iroh::SecretKey::from_bytes(&[44u8; 32]);
+        let ticket = encode_ticket_for(iroh::EndpointAddr::from(secret.public()));
+        let expected = public_key_to_did(&secret.public()).unwrap();
+        let source = TrustedSource {
+            name: "official".to_string(),
+            publisher_dids: vec![
+                "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
+            ],
+            channel: "stable".to_string(),
+            discovery_uri: String::new(),
+            connect_ticket: ticket,
+            gateways: Vec::new(),
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: secret.public().to_string(),
+            ipns_name: String::new(),
+        };
+        assert_eq!(
+            trusted_source_replica_did(&source).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_ne!(source.publisher_dids[0], expected);
+    }
+
+    fn publisher_bootstrap_document(
+        ticket: &str,
+        node_id: &str,
+        role: &str,
+        schema: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema": schema,
+            "role": role,
+            "ticket": ticket,
+            "node_id": node_id,
+            "transport": "carrier",
+        })
+    }
+
+    async fn serve_publisher_bootstrap(
+        document: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/.well-known/elastos/carrier-bootstrap.json",
+            axum::routing::get({
+                let document = document.clone();
+                move || {
+                    let document = document.clone();
+                    async move { axum::Json(document) }
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn holder_tickets_for_secret(
+        seed: [u8; 32],
+    ) -> (ed25519_dalek::SigningKey, String, String, String) {
+        let (remote_sk, holder_did) = elastos_identity::derive_did(&seed);
+        let public = iroh::SecretKey::from_bytes(&remote_sk.to_bytes()).public();
+        let stale = encode_ticket_for(
+            iroh::EndpointAddr::from(public)
+                .with_addrs([iroh::TransportAddr::Ip("127.0.0.1:1".parse().unwrap())]),
+        );
+        let live = encode_ticket_for(iroh::EndpointAddr::from(public));
+        (remote_sk, holder_did, stale, live)
+    }
+
+    #[test]
+    fn verified_source_bootstrap_ticket_rejects_missing_schema_and_identity_mismatch() {
+        let secret = iroh::SecretKey::from_bytes(&[46u8; 32]);
+        let ticket = encode_ticket_for(iroh::EndpointAddr::from(secret.public()));
+        let node_id = secret.public().to_string();
+        let source = TrustedSource {
+            name: "official".to_string(),
+            publisher_dids: vec![
+                "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
+            ],
+            channel: "stable".to_string(),
+            discovery_uri: String::new(),
+            connect_ticket: "stale".to_string(),
+            gateways: Vec::new(),
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
+            publisher_node_id: node_id.clone(),
+            ipns_name: String::new(),
+        };
+        let matching = SourceCarrierBootstrapDocument {
+            schema: "elastos.carrier.bootstrap/v1".to_string(),
+            role: "publisher".to_string(),
+            ticket: ticket.clone(),
+            node_id: node_id.clone(),
+            did: None,
+        };
+        assert_eq!(
+            verified_source_bootstrap_ticket(&source, &matching),
+            Some(ticket.clone())
+        );
+        let missing_schema = SourceCarrierBootstrapDocument {
+            schema: String::new(),
+            role: "publisher".to_string(),
+            ticket: ticket.clone(),
+            node_id: node_id.clone(),
+            did: None,
+        };
+        assert_eq!(
+            verified_source_bootstrap_ticket(&source, &missing_schema),
+            None
+        );
+        let other = iroh::SecretKey::from_bytes(&[47u8; 32]);
+        let foreign = SourceCarrierBootstrapDocument {
+            schema: "elastos.carrier.bootstrap/v1".to_string(),
+            role: "publisher".to_string(),
+            ticket: encode_ticket_for(iroh::EndpointAddr::from(other.public())),
+            node_id: other.public().to_string(),
+            did: None,
+        };
+        assert_eq!(verified_source_bootstrap_ticket(&source, &foreign), None);
+    }
+
+    #[tokio::test]
+    async fn live_source_bootstrap_ticket_rejects_http_refresh_without_bootstrap_schema() {
+        let secret = iroh::SecretKey::from_bytes(&[53u8; 32]);
+        let ticket = encode_ticket_for(iroh::EndpointAddr::from(secret.public()));
+        let node_id = secret.public().to_string();
+        let (gateway, _server) = serve_publisher_bootstrap(publisher_bootstrap_document(
+            &ticket,
+            &node_id,
+            "publisher",
+            "",
+        ))
+        .await;
+        let source = TrustedSource {
+            name: "official".to_string(),
+            publisher_dids: vec![
+                "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
+            ],
+            channel: "stable".to_string(),
+            discovery_uri: String::new(),
+            connect_ticket: ticket,
+            gateways: vec![gateway],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
+            publisher_node_id: node_id,
+            ipns_name: String::new(),
+        };
+        assert_eq!(live_source_bootstrap_ticket(&source).await, None);
+    }
+
+    async fn availability_provider_with_trusted_source(
+        stale_ticket: String,
+        publisher_node_id: String,
+        catalog_publisher_did: String,
+        gateway: String,
+        local_sk: ed25519_dalek::SigningKey,
+        local_did: String,
+        fail_tickets: Vec<String>,
+    ) -> (
+        CarrierAvailabilityProvider,
+        Arc<MockCarrierProviderPlaneInvoker>,
+        Arc<ProviderRegistry>,
+        tempfile::TempDir,
+        String,
+    ) {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
+        let gossip = spawn_carrier_gossip(&endpoint);
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did.clone()),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard
+                .buffers
+                .lock()
+                .await
+                .insert(topic_name, test_topic_buffer([], 0));
+        }
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::sources::save_trusted_sources(
+            data_dir.path(),
+            &crate::sources::TrustedSourcesConfig {
+                schema: "elastos.trusted-sources/v1".to_string(),
+                default_source: "official".to_string(),
+                sources: vec![TrustedSource {
+                    name: "official".to_string(),
+                    publisher_dids: vec![catalog_publisher_did],
+                    channel: "stable".to_string(),
+                    discovery_uri: "https://example.invalid/discovery".to_string(),
+                    connect_ticket: stale_ticket,
+                    gateways: vec![gateway],
+                    install_path: String::new(),
+                    installed_version: String::new(),
+                    head_cid: cid.to_string(),
+                    publisher_node_id,
+                    ipns_name: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            fail_tickets,
+            ..Default::default()
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider = CarrierAvailabilityProvider::with_provider_registry_and_data_dir(
+            state,
+            Arc::downgrade(&registry),
+            data_dir.path().to_path_buf(),
+        )
+        .with_discovery_wait(Duration::from_millis(400));
+        (provider, invoker, registry, data_dir, cid.to_string())
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_refreshes_stale_ticket_after_holder_restart() {
+        let (local_sk, local_did) = elastos_identity::derive_did(&[48u8; 32]);
+        let (_remote_sk, _holder_did, stale_ticket, live_ticket) =
+            holder_tickets_for_secret([49u8; 32]);
+        let public =
+            iroh::SecretKey::from_bytes(&elastos_identity::derive_did(&[49u8; 32]).0.to_bytes())
+                .public();
+        let catalog_did = "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string();
+        let (gateway, _server) = serve_publisher_bootstrap(publisher_bootstrap_document(
+            &live_ticket,
+            &public.to_string(),
+            "publisher",
+            "elastos.carrier.bootstrap/v1",
+        ))
+        .await;
+        let (provider, invoker, _registry, data_dir, cid) =
+            availability_provider_with_trusted_source(
+                stale_ticket.clone(),
+                public.to_string(),
+                catalog_did.clone(),
+                gateway,
+                local_sk,
+                local_did,
+                vec![stale_ticket.clone()],
+            )
+            .await;
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        let requests = invoker.requests.lock().await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["ticket"] == stale_ticket),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["ticket"] == live_ticket),
+            "{requests:?}"
+        );
+        let stored = crate::sources::load_trusted_sources(data_dir.path()).unwrap();
+        let source = stored.default_source().unwrap();
+        assert_eq!(source.connect_ticket, live_ticket);
+        assert_eq!(source.publisher_dids, vec![catalog_did]);
+        assert_eq!(
+            source.head_cid,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_rejects_identity_mismatch_and_malformed_refresh() {
+        let (local_sk, local_did) = elastos_identity::derive_did(&[50u8; 32]);
+        let (_remote_sk, _holder_did, stale_ticket, _live_ticket) =
+            holder_tickets_for_secret([51u8; 32]);
+        let public =
+            iroh::SecretKey::from_bytes(&elastos_identity::derive_did(&[51u8; 32]).0.to_bytes())
+                .public();
+        let foreign = iroh::SecretKey::from_bytes(&[52u8; 32]).public();
+        let foreign_ticket = encode_ticket_for(iroh::EndpointAddr::from(foreign));
+        let catalog_did = "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string();
+        let (gateway, _server) = serve_publisher_bootstrap(publisher_bootstrap_document(
+            &foreign_ticket,
+            &foreign.to_string(),
+            "publisher",
+            "elastos.carrier.bootstrap/v1",
+        ))
+        .await;
+        let (provider, _, _registry, data_dir, cid) = availability_provider_with_trusted_source(
+            stale_ticket.clone(),
+            public.to_string(),
+            catalog_did.clone(),
+            gateway,
+            local_sk,
+            local_did,
+            vec![stale_ticket.clone()],
+        )
+        .await;
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "path": crate::content::CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "error", "{response}");
+        assert_eq!(response["code"], "carrier_fetch_failed");
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("trusted-source bootstrap refresh rejected"),
+            "{response}"
+        );
+        let stored = crate::sources::load_trusted_sources(data_dir.path()).unwrap();
+        let source = stored.default_source().unwrap();
+        assert_eq!(source.connect_ticket, stale_ticket);
+        assert_eq!(source.publisher_dids, vec![catalog_did]);
+
+        let missing_schema = SourceCarrierBootstrapDocument {
+            schema: String::new(),
+            role: String::new(),
+            ticket: foreign_ticket,
+            node_id: foreign.to_string(),
+            did: None,
+        };
+        assert_eq!(
+            verified_source_bootstrap_ticket(source, &missing_schema),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_ticket_endpoints_accepts_installer_n0_relay_shape() {
+        let secret = iroh::SecretKey::from_bytes(&[45u8; 32]);
+        let ticket_json = serde_json::json!({
+            "topic": serde_json::Value::Null,
+            "endpoints": [{
+                "id": secret.public().to_string(),
+                "addrs": [
+                    { "Relay": "https://euc1-1.relay.n0.iroh.link./" },
+                    { "Ip": "127.0.0.1:9" }
+                ]
+            }]
+        });
+        let mut encoded =
+            data_encoding::BASE32_NOPAD.encode(&serde_json::to_vec(&ticket_json).unwrap());
+        encoded.make_ascii_lowercase();
+        let endpoints = decode_ticket_endpoints(&encoded);
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "installer connect tickets must decode to one Carrier endpoint"
+        );
+        assert_eq!(endpoints[0].id, secret.public());
+        assert_eq!(
+            trusted_source_replica_did(&TrustedSource {
+                name: "official".to_string(),
+                publisher_dids: vec![
+                    "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
+                ],
+                channel: "stable".to_string(),
+                discovery_uri: String::new(),
+                connect_ticket: encoded,
+                gateways: Vec::new(),
+                install_path: String::new(),
+                installed_version: String::new(),
+                head_cid: String::new(),
+                publisher_node_id: secret.public().to_string(),
+                ipns_name: String::new(),
+            })
+            .as_deref(),
+            Some(public_key_to_did(&secret.public()).unwrap().as_str())
         );
     }
 
