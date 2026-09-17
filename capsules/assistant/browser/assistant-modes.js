@@ -2,13 +2,13 @@ import { createAssistantApp, eligibleStudioOffers } from "./assistant.js";
 import { getAgentWorkspaceSnapshot, setAssistantMode } from "./agent-harness.js";
 import { setAssistantWorkspaceField, getAssistantSession, ensureAssistantStudioSession, setAssistantSessionStudio, captureActiveSessionState, applyAssistantModeDraft } from "./agent-workspace.js";
 import { getHomeGuiLaunchToken, persistAgentWorkspaceNow, flushAgentWorkspace, bindWorkspaceMergeGuard } from "./harness-host.js";
-import { getLiveTurnCanonical } from "./agent-stream.js";
-import { fetchModelOffers } from "./agent-live.js";
+import { fetchModelOffers, unresolvedModelTurn } from "./agent-live.js";
 
 /* UI ≠ authority: a mode control is shown only when the Runtime backs it.
    Build is a saved label today (no run reads it), so its segment stays hidden;
    Studio appears once an image or video offer is advertised. */
 const MODE_CAPABILITY = { chat: true, build: false };
+const SETTLED_TURN_STATES = ["completed", "failed", "stopped", "settlement_unknown", "interrupted"];
 
 export async function bindAssistantModes(saved = {}) {
   const panel = document.querySelector("#assistant-studio");
@@ -32,6 +32,12 @@ export async function bindAssistantModes(saved = {}) {
   let visibleSessionId = saved.activeSessionId || null;
   let studioAvailable = false;
 
+  // The active session's saved turn record is the same authority the harness consults before
+  // accepting a new turn; the streamed canonical text carries no turn identity or state.
+  function turnInProgress() {
+    const turn = getAssistantSession()?.lastTurn;
+    return unresolvedModelTurn(turn) && !SETTLED_TURN_STATES.includes(turn.state);
+  }
   function modeAvailable(mode) {
     return mode === "studio" ? studioAvailable : Boolean(MODE_CAPABILITY[mode]);
   }
@@ -135,11 +141,8 @@ export async function bindAssistantModes(saved = {}) {
   for (const session of getAgentWorkspaceSnapshot()?.sessions || []) {
     if (session.studio?.activeRun && !session.studio.activeRun.terminal) controllerFor(session);
   }
-  bindWorkspaceMergeGuard(() => {
-    const turn = getLiveTurnCanonical();
-    return (!turn?.turnId || ["completed", "failed", "stopped", "settlement_unknown", "interrupted"].includes(turn.state)) &&
-      [...controllers.values()].every(({ app }) => !app.snapshot().modeSwitchDisabled || app.snapshot().activeRun?.status === "settlement_unknown");
-  });
+  bindWorkspaceMergeGuard(() => !turnInProgress() &&
+    [...controllers.values()].every(({ app }) => !app.snapshot().modeSwitchDisabled || app.snapshot().activeRun?.status === "settlement_unknown"));
   draft.addEventListener("input", () => visibleController()?.setDraft(draft.value));
   offer.addEventListener("change", () => visibleController()?.setSelectedOfferId(offer.value));
   document.querySelector("#studio-refresh").addEventListener("click", () => visibleController()?.refreshModels());
@@ -166,20 +169,32 @@ export async function bindAssistantModes(saved = {}) {
     const hasStudioRun = wanted === "studio" && getAssistantSession()?.studio?.activeRun && !getAssistantSession().studio.activeRun.terminal;
     showMode(modeAvailable(wanted) || hasStudioRun ? wanted : "chat");
   }
+  // Offers arrive after boot, so a saved Studio session reopens once its offer is confirmed. The
+  // reopen belongs to the session it was saved in and lasts only while the person has chosen
+  // nothing else: selecting a chat, typing in the composer or a turn still running keeps the view.
+  const savedMode = saved.activeMode || saved.sessionMode || "chat";
+  const restoreSessionId = getAssistantSession()?.id ?? null;
+  let restorePending = savedMode === "studio";
+  const keepCurrentView = () => { restorePending = false; };
   window.addEventListener("assistant:session-selected", event => {
+    keepCurrentView();
     visibleSessionId = event.detail?.sessionId ?? getAssistantSession()?.id ?? null;
     showAvailableMode(event.detail?.mode);
   });
-  const savedMode = saved.activeMode || saved.sessionMode || "chat";
+  document.addEventListener("input", event => {
+    if (event.target?.id === "agent-composer-input") keepCurrentView();
+  });
   showAvailableMode(savedMode);
-  // Offers arrive after boot; a saved Studio session reopens once its offer is confirmed.
   void refreshStudioAvailability().then(() => {
-    if (savedMode === "studio" && studioAvailable && document.body.dataset.assistantMode === "chat") showMode("studio");
+    if (!restorePending) return;
+    restorePending = false;
+    if (studioAvailable && document.body.dataset.assistantMode === "chat" && !turnInProgress() &&
+      getAssistantSession()?.id === restoreSessionId) showMode("studio");
   });
   for (const button of document.querySelectorAll("button[data-assistant-mode]")) {
     button.addEventListener("click", () => {
-      const turn = getLiveTurnCanonical();
-      if ((turn?.turnId && !["completed", "failed", "stopped", "settlement_unknown", "interrupted"].includes(turn.state)) || visibleController()?.snapshot().modeSwitchDisabled) {
+      keepCurrentView();
+      if (turnInProgress() || visibleController()?.snapshot().modeSwitchDisabled) {
         notice.hidden = false; notice.textContent = "Finish or stop the current run before changing mode."; return;
       }
       captureActiveSessionState();
