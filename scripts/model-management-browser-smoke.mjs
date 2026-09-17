@@ -149,6 +149,19 @@ try {
     }
     await (app === "marketplace" ? frame.locator(".modal-title") : frame.getByRole("heading", { name: "Fixture model", exact: true })).waitFor();
     assert.match(await frame.locator("body").textContent(), /did:key:zFixturePublisher/);
+    if (app === "marketplace") {
+      // The model detail leads with identity and verification, then the controls, then exact identifiers.
+      assert.equal(await frame.locator(".modal-developer").innerText(), "Verified publisher · did:key:zFixturePublisher");
+      assert.match(await frame.locator(".modal-version").innerText(), /^1\.02 KB download$/);
+      assert.equal(await frame.locator(".modal-body .modal-section-title").filter({ hasText: /^(About|Status|Works with|Available actions)$/ }).count(), 0,
+        "the model detail has no checklist sections");
+      assert.equal(await frame.locator("[data-model-management] .model-hint").count(), 0, "compact detail carries no cache or memory hints");
+      assert.equal(await frame.locator("[data-model-management] > :last-child").getAttribute("data-model-control"), "refresh",
+        "refresh follows the model controls");
+      assert.match(await frame.locator(".technical-details .model-publisher-identity").evaluate(node => node.textContent), /^Publisher: did:key:zFixturePublisher$/);
+      assert.equal(await frame.getByText("Not on this device yet", { exact: true }).count(), 1);
+      assert.equal(await frame.getByRole("button", { name: "Get", exact: true }).isEnabled(), true);
+    }
     phase = "capacity_pending";
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByText("Waiting for local capacity…", { exact: true }).waitFor();
@@ -188,6 +201,16 @@ try {
     activationPending = false; dispatchPending = false;
     await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, activationUses, "activation readiness uses status without another Use");
+    if (app === "marketplace") {
+      // The ready detail hands exactly this model and its live offer to Assistant through Home.
+      await page.evaluate(() => { window.homeMessages = []; window.addEventListener("message", event => window.homeMessages.push(event.data)); });
+      assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).count(), 0, "a ready model offers no second acquisition");
+      await frame.getByRole("button", { name: "Open in Assistant", exact: true }).click();
+      await page.waitForFunction(() => window.homeMessages.some(message => message?.type === "home:open-target"));
+      const handoff = (await page.evaluate(() => window.homeMessages)).filter(message => message?.type === "home:open-target");
+      assert.deepEqual(handoff, [{ type: "home:open-target", target: "assistant", homeToken: "fixture-token",
+        query: { model_cid: cid, offer_id: `model:${"b".repeat(64)}` } }]);
+    }
     const readyStatuses = calls.filter(c => c.method === "content.status").length;
     await page.waitForTimeout(1750);
     assert.equal(calls.filter(c => c.method === "content.status").length, readyStatuses, "ready state stops polling");

@@ -401,7 +401,7 @@
       name: publicTitle(capsule),
       developer: String(model ? capsule.publisher_did : capsule.author || "Unknown publisher"),
       category: appCategory(capsule, role),
-      description: model ? `${publicTitle(capsule)} model for Assistant.` : publicDescription(capsule),
+      description: model ? "Language model for Assistant." : publicDescription(capsule),
       version: String(capsule.version || ""),
       installed,
       launchable,
@@ -819,11 +819,22 @@
     return roleLabel(app.role);
   }
 
+  function shortDid(did) {
+    return did.length <= 32 ? did : `${did.slice(0, 16)}…${did.slice(-4)}`;
+  }
+
   function detailPublisher(app) {
+    if (app.modelCid) return `Verified publisher · ${shortDid(app.developer)}`;
     if (isFirstPartyPublisher(app.developer)) {
       return "ElastOS";
     }
     return app.developer;
+  }
+
+  function modelSizeLabel(bytes) {
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const rank = bytes ? Math.min(4, Math.floor(Math.log(bytes) / Math.log(1000))) : 0;
+    return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
   }
 
   function renderAppRow(app) {
@@ -951,14 +962,14 @@
         ${appIconHtml(app, "modal-icon-size")}
         <div class="modal-title-section">
           <div class="modal-title">${escapeHtml(app.name)}</div>
-          <div class="modal-developer">${escapeHtml(detailPublisher(app))}</div>
-          ${app.version ? `<div class="modal-version">Version ${escapeHtml(app.version)}</div>` : ""}
+          <div class="modal-developer"${app.modelCid ? ` title="${escapeAttr(app.developer)}"` : ""}>${escapeHtml(detailPublisher(app))}</div>
+          ${app.modelCid ? `<div class="modal-version">${escapeHtml(modelSizeLabel(app.contentBytes))} download${app.version ? ` · Version ${escapeHtml(app.version)}` : ""}</div>` : app.version ? `<div class="modal-version">Version ${escapeHtml(app.version)}</div>` : ""}
           <div class="modal-badges">${badgesHtml(app)}</div>
         </div>
         <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
       </header>
       <div class="modal-body">
-        <section class="modal-section">
+        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>` : `<section class="modal-section">
           <div class="modal-section-title">About</div>
           <div class="modal-description">${escapeHtml(app.description)}</div>
         </section>
@@ -969,7 +980,7 @@
           </ul>
         </section>
         ${relationshipSection(app)}
-        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>` : `<section class="modal-section">
+        <section class="modal-section">
           <div class="modal-section-title">Available actions</div>
           <ul class="permissions-list">
             ${availableActionItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
@@ -1030,7 +1041,6 @@
   }
 
   function statusItems(app) {
-    if (app.modelCid) return ["Publisher signature verified", "Assistant uses this model after preparation."];
     const items = [
       `Trust: ${trustLabel(app.trustState)}`,
       `Status: ${app.installed ? "Installed on this Home" : "Not installed on this Home"}`,
@@ -1081,7 +1091,7 @@
         </div>
         <ul class="permissions-list">
           <li><span class="permission-icon">${icons.check}</span>${escapeHtml(signatureLabel(app.signatureState))}</li>
-          ${app.modelCid ? `<li class="model-content-identity">Content ID: ${escapeHtml(app.modelCid)}</li><li>${app.contentBytes.toLocaleString()} bytes</li>` : ""}
+          ${app.modelCid ? `<li class="model-publisher-identity">Publisher: ${escapeHtml(app.developer)}</li><li class="model-content-identity">Content ID: ${escapeHtml(app.modelCid)}</li><li>${app.contentBytes.toLocaleString()} bytes</li>` : ""}
           <li><span class="permission-icon">${icons.check}</span>${escapeHtml(packageLabel(app))}</li>
         </ul>
       </details>

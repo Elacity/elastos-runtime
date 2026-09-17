@@ -686,6 +686,29 @@ button {
   background: var(--bg-hover);
 }
 
+/* The model detail's one forward action reads as the primary button. */
+[data-model-management] .modal-btn[data-model-control="use"],
+[data-model-management] .modal-btn[data-model-control="open-assistant"] {
+  border-color: transparent;
+  color: #fff;
+  background: var(--accent);
+}
+
+[data-model-management] .modal-btn[data-model-control="use"]:hover,
+[data-model-management] .modal-btn[data-model-control="open-assistant"]:hover {
+  background: var(--accent-hover);
+}
+
+[data-model-management] .modal-btn[data-model-control="use"]:disabled,
+[data-model-management] .modal-btn[data-model-control="open-assistant"]:disabled {
+  opacity: 0.55;
+}
+
+[data-model-management] .model-row {
+  border-top: 0;
+  padding-top: 4px;
+}
+
 .store-loading {
   margin-top: 12px;
 }
