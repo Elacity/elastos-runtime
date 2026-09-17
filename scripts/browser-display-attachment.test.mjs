@@ -8,6 +8,8 @@ import { SelkiesPage, MinimalWebSocketClient } from './browser-selkies-control-s
 const id = 'a'.repeat(32), otherId = 'b'.repeat(32);
 const videoSdp = 'v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n';
 const audioSdp = 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n';
+const relayIce = { candidate: 'candidate:1 1 UDP 2130706431 203.0.113.5 3478 typ relay', sdpMLineIndex: 0 };
+const hostIce = { candidate: 'candidate:2 1 UDP 2130706430 192.0.2.8 9 typ host', sdpMLineIndex: 0 };
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 function fixture() {
   const calls = [], closed = [];
@@ -106,19 +108,123 @@ for (const [video, audio] of [['raw_json', 'peer_routed'], ['peer_routed', 'raw_
   });
 }
 
+test('reload reuse asks the live producer for a new offer and does not send SESSION', async () => {
+  const f = fixture();
+  delete f.page.openLegacySelkiesSession;
+  delete f.page.openLegacySelkiesAudioSession;
+  f.page.serverPeerId = '1';
+  f.page.audioServerPeerId = '2';
+  f.page.ws.legacyHelloAccepted = true;
+  f.page.audioWs.legacyHelloAccepted = true;
+  f.page.ws.closed = false;
+  f.page.audioWs.closed = false;
+  Object.assign(f.page.config, { signalTimeoutMs: 1000 });
+  const pending = f.page.signal(f.request);
+  await nextTurn();
+  assert.deepEqual(
+    f.calls.filter((entry) => entry[0] === 'send').sort((a, b) => a[1].localeCompare(b[1])),
+    [
+      ['send', 'audio', JSON.stringify({ elastos_display_renegotiate: true })],
+      ['send', 'video', JSON.stringify({ elastos_display_renegotiate: true })],
+    ],
+  );
+  assert.equal(f.calls.some((entry) => String(entry[2] || '').includes('SESSION')), false);
+  f.page.handleMessage(JSON.stringify({ sdp: { type: 'offer', sdp: videoSdp }, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ sdp: { type: 'offer', sdp: audioSdp }, from: '2' }));
+  f.page.handleMessage(JSON.stringify({ ice: hostIce, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ ice: hostIce, from: '2' }));
+  f.page.handleMessage(JSON.stringify({ ice: relayIce, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ ice: relayIce, from: '2' }));
+  const result = await pending;
+  assert.equal(result.initial_offer.sdp, videoSdp);
+  assert.equal(result.audio_offer.sdp, audioSdp);
+  assert.deepEqual(result.initial_offer.candidates, [relayIce]);
+  assert.deepEqual(result.audio_offer.candidates, [relayIce]);
+  assert.equal(f.page.ws.closed, false);
+  assert.equal(f.page.audioWs.closed, false);
+  assert.deepEqual(f.closed, []);
+});
+
+test('reload reuse rebinds a later video offer after the first pair is already taken', async () => {
+  const f = fixture();
+  const laterVideo = 'v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 97\r\n';
+  const laterRelay = { candidate: 'candidate:9 1 UDP 2130706431 203.0.113.9 3478 typ relay', sdpMLineIndex: 0 };
+  delete f.page.openLegacySelkiesSession;
+  delete f.page.openLegacySelkiesAudioSession;
+  f.page.serverPeerId = '1';
+  f.page.audioServerPeerId = '2';
+  f.page.ws.legacyHelloAccepted = true;
+  f.page.audioWs.legacyHelloAccepted = true;
+  f.page.ws.closed = false;
+  f.page.audioWs.closed = false;
+  Object.assign(f.page.config, { signalTimeoutMs: 1000 });
+  const pending = f.page.signal(f.request);
+  await nextTurn();
+  f.page.handleMessage(JSON.stringify({ sdp: { type: 'offer', sdp: videoSdp }, from: '1' }));
+  f.page.handleMessage(JSON.stringify({ ice: relayIce, from: '1' }));
+  await nextTurn();
+  f.page.handleMessage(JSON.stringify({ sdp: { type: 'offer', sdp: laterVideo }, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ sdp: { type: 'offer', sdp: audioSdp }, from: '2' }));
+  f.page.handleAudioMessage(JSON.stringify({ ice: relayIce, from: '2' }));
+  f.page.handleMessage(JSON.stringify({ ice: laterRelay, from: '1' }));
+  const result = await pending;
+  assert.equal(result.initial_offer.sdp, laterVideo);
+  assert.deepEqual(result.initial_offer.candidates, [laterRelay]);
+  assert.equal(result.audio_offer.sdp, audioSdp);
+  assert.deepEqual(result.audio_offer.candidates, [relayIce]);
+  assert.deepEqual(f.page.ack("answer").candidates, [laterRelay]);
+});
+
+test('reload reuse keeps the later offer and only publishes relay ICE', async () => {
+  const f = fixture();
+  const laterVideo = 'v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 97\r\n';
+  const laterAudio = 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 112\r\n';
+  delete f.page.openLegacySelkiesSession;
+  delete f.page.openLegacySelkiesAudioSession;
+  f.page.serverPeerId = '1';
+  f.page.audioServerPeerId = '2';
+  f.page.ws.legacyHelloAccepted = true;
+  f.page.audioWs.legacyHelloAccepted = true;
+  f.page.ws.closed = false;
+  f.page.audioWs.closed = false;
+  Object.assign(f.page.config, { signalTimeoutMs: 1000 });
+  const pending = f.page.signal(f.request);
+  await nextTurn();
+  f.page.handleMessage(JSON.stringify({ sdp: { type: 'offer', sdp: videoSdp }, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ sdp: { type: 'offer', sdp: audioSdp }, from: '2' }));
+  f.page.handleMessage(JSON.stringify({ ice: hostIce, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ ice: hostIce, from: '2' }));
+  f.page.handleMessage(JSON.stringify({ sdp: { type: 'offer', sdp: laterVideo }, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ sdp: { type: 'offer', sdp: laterAudio }, from: '2' }));
+  f.page.handleMessage(JSON.stringify({ ice: relayIce, from: '1' }));
+  f.page.handleAudioMessage(JSON.stringify({ ice: relayIce, from: '2' }));
+  const result = await pending;
+  assert.equal(result.initial_offer.sdp, laterVideo);
+  assert.equal(result.audio_offer.sdp, laterAudio);
+  assert.deepEqual(result.initial_offer.candidates, [relayIce]);
+  assert.deepEqual(result.audio_offer.candidates, [relayIce]);
+  assert.deepEqual(f.page.ack("answer").candidates, [relayIce]);
+  assert.deepEqual(f.page.ackAudio("answer").candidates, [relayIce]);
+});
+
 test('paired attachment preserves the page and returns only fresh display offers', async () => {
   const f = fixture(), browserPage = f.page.browserPage, oldVideo = f.page.ws, oldAudio = f.page.audioWs;
+  f.page.serverPeerId = '1';
+  f.page.audioServerPeerId = '2';
+  oldVideo.legacyHelloAccepted = true;
+  oldAudio.legacyHelloAccepted = true;
   f.page.remoteCandidateHistory.push({ candidate: 'old-video' });
   f.page.audioRemoteCandidateHistory.push({ candidate: 'old-audio' });
   const result = await f.page.signal(f.request);
-  assert.deepEqual(f.calls, [['close', 'video'], ['close', 'audio'], ['open', 'video'], ['open', 'audio']]);
+  assert.deepEqual(f.calls, [['open', 'video'], ['open', 'audio']]);
+  assert.equal(f.page.ws, oldVideo);
+  assert.equal(f.page.audioWs, oldAudio);
   assert.notEqual(result.display_generation, f.generation);
   assert.equal(result.previous_display_generation, f.generation);
   assert.equal(result.page_id, 'page:test'); assert.equal(result.request_id, id);
   assert.deepEqual(result.initial_offer.candidates, []); assert.deepEqual(result.audio_offer.candidates, []);
   assert.deepEqual(Object.keys(result).sort(), ['schema', 'page_id', 'request_id', 'previous_display_generation', 'display_generation', 'initial_offer', 'audio_offer'].sort());
   assert.equal(f.page.browserPage, browserPage); assert.equal(f.page.closed, false); assert.deepEqual(f.closed, []);
-  oldVideo.close(); oldAudio.close();
   assert.equal(f.page.displayAvailable, true); assert.equal(f.page.videoClosed, false); assert.equal(f.page.audioClosed, false);
 });
 
@@ -297,7 +403,25 @@ async function legacyBroker(t, { releaseMs = 120, rejectionReason = 'invalid pee
         for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
         if (opcode === 8) { socket.end(frame(8, Buffer.alloc(0))); return; }
         if (opcode !== 1) continue;
-        const words = payload.toString().split(' '); assert.equal(words[0], 'HELLO');
+        const text = payload.toString();
+        if (text.startsWith('{')) {
+          const data = JSON.parse(text);
+          assert.equal(data.elastos_display_renegotiate, true);
+          if (!uid) continue;
+          const sdp = uid === '1' ? videoSdp : audioSdp;
+          socket.write(frame(1, JSON.stringify({ sdp: { type: 'offer', sdp } })));
+          socket.write(frame(1, JSON.stringify({ ice: relayIce })));
+          continue;
+        }
+        const words = text.split(' ');
+        if (words[0] === 'SESSION') {
+          if (!uid) continue;
+          const sdp = uid === '1' ? videoSdp : audioSdp;
+          socket.write(frame(1, JSON.stringify({ sdp: { type: 'offer', sdp } })));
+          socket.write(frame(1, JSON.stringify({ ice: relayIce })));
+          continue;
+        }
+        assert.equal(words[0], 'HELLO');
         const requested = words[1];
         if (peers.has(requested)) {
           rejected.push(requested);
@@ -331,22 +455,28 @@ async function actualLegacyPage(t, broker) {
 test('actual legacy broker keeps retired viewer IDs until producer teardown; attachment retries only UID rejection', async t => {
   const broker = await legacyBroker(t, { releaseMs: { '1': 120, '3': 320 } }), f = await actualLegacyPage(t, broker);
   assert.deepEqual(broker.accepted, ['1', '3']);
+  const liveVideo = f.page.ws, liveAudio = f.page.audioWs;
   const result = await f.page.signal(f.request);
-  assert.ok(broker.rejected.includes('1'));
-  assert.ok(broker.rejected.includes('3'));
-  assert.equal(broker.accepted.length, 4);
-  assert.deepEqual(broker.accepted.slice(2).sort(), ['1', '3']);
+  assert.deepEqual(broker.rejected, []);
+  assert.deepEqual(broker.accepted, ['1', '3']);
+  assert.equal(f.page.ws, liveVideo);
+  assert.equal(f.page.audioWs, liveAudio);
   assert.equal(f.page.closed, false); assert.equal(f.page.displayAvailable, true);
   assert.equal(result.initial_offer.type, 'offer'); assert.equal(result.audio_offer.type, 'offer');
   assert.notEqual(result.display_generation, f.generation);
   const next = await f.page.signal({ ...f.request, request_id: otherId, display_generation: result.display_generation });
   assert.notEqual(next.display_generation, result.display_generation);
-  assert.equal(broker.accepted.length, 6);
-  assert.deepEqual(broker.accepted.slice(4).sort(), ['1', '3']);
+  assert.deepEqual(broker.accepted, ['1', '3']);
+  assert.equal(f.page.ws, liveVideo);
+  assert.equal(f.page.audioWs, liveAudio);
 });
 
 test('UID error after HELLO acknowledgment is terminal even when its code and reason match', async t => {
   const broker = await legacyBroker(t, { acknowledgeRejected: true }), f = await actualLegacyPage(t, broker);
+  f.page.serverPeerId = null;
+  f.page.audioServerPeerId = null;
+  delete f.page.ws.legacyHelloAccepted;
+  delete f.page.audioWs.legacyHelloAccepted;
   await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
   assert.ok(broker.rejected.length > 0);
   assert.equal(new Set(broker.rejected).size, broker.rejected.length, 'neither channel may retry after HELLO');
@@ -354,6 +484,10 @@ test('UID error after HELLO acknowledgment is terminal even when its code and re
 
 test('actual broker protocol rejection other than the exact UID release response remains terminal', async t => {
   const broker = await legacyBroker(t, { rejectionReason: 'invalid protocol' }), f = await actualLegacyPage(t, broker);
+  f.page.serverPeerId = null;
+  f.page.audioServerPeerId = null;
+  delete f.page.ws.legacyHelloAccepted;
+  delete f.page.audioWs.legacyHelloAccepted;
   await assert.rejects(f.page.signal(f.request), { code: 'display_attach_failed' });
   assert.ok(broker.rejected.length > 0);
   assert.equal(new Set(broker.rejected).size, broker.rejected.length, 'neither channel may retry another protocol error');

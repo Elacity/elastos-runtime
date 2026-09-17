@@ -249,6 +249,55 @@ fn prepare_intent(request: &Value) -> Result<Value> {
     Ok(Value::Object(request))
 }
 
+async fn status_from_settlement_authority(
+    registry: Arc<ProviderRegistry>,
+    source: iroh::PublicKey,
+    request: &Value,
+) -> Result<Value> {
+    let authority = request
+        .get("transport_authority")
+        .filter(|value| value.is_object())
+        .context("Engine retained owner unavailable")?;
+    let generation = request["lifecycle_generation"]
+        .as_str()
+        .context("Engine retained owner unavailable")?;
+    let page_id = request["page_id"]
+        .as_str()
+        .context("Engine retained owner unavailable")?;
+    let stream_id = request["stream_id"]
+        .as_str()
+        .context("Engine retained owner unavailable")?;
+    let principal = request["principal_id"]
+        .as_str()
+        .context("Engine retained owner unavailable")?;
+    let expected_page = format!(
+        "page:vz-{}",
+        hex::encode(Sha256::digest(format!("{generation}\npage")))
+    );
+    let storage = RemoteEngineOwner::storage_principal_for(&source.to_string(), principal);
+    ensure!(
+        page_id == expected_page
+            && authority.get("generation").and_then(Value::as_str) == Some(generation)
+            && authority.get("page_id").and_then(Value::as_str) == Some(page_id)
+            && authority
+                .pointer("/egress/stream_id")
+                .and_then(Value::as_str)
+                == Some(stream_id)
+            && authority.get("principal_id").and_then(Value::as_str) == Some(storage.as_str()),
+        "Engine requester or generation changed"
+    );
+    let mut local = request.clone();
+    let object = local.as_object_mut().context("Engine request required")?;
+    for key in ["grant_id", "page_id", "_runtime_invocation"] {
+        object.remove(key);
+    }
+    local["op"] = json!("status");
+    local["principal_id"] = json!(storage);
+    local["lifecycle_generation"] = json!(generation);
+    local["stream_id"] = json!(stream_id);
+    Ok(registry.send_raw("browser-engine", &local).await?)
+}
+
 pub(crate) async fn invoke(
     data_dir: &FsPath,
     registry: Arc<ProviderRegistry>,
@@ -376,13 +425,12 @@ pub(crate) async fn invoke(
             });
             page
         }
+    } else if let Some(page) = pages.lock().await.get(&key).cloned() {
+        page
+    } else if operation == "status" {
+        return status_from_settlement_authority(registry, source, request).await;
     } else {
-        pages
-            .lock()
-            .await
-            .get(&key)
-            .cloned()
-            .context("Engine retained owner unavailable")?
+        return Err(anyhow::anyhow!("Engine retained owner unavailable"));
     };
     ensure!(
         page.owner.matches_request(&source, request),
@@ -565,6 +613,126 @@ impl ServedPage {
     }
 }
 
+const REMOTE_WALLET_CONSUMER_MEDIATION_SCHEMA: &str =
+    "elastos.browser.wallet-consumer-mediation/v1";
+const REMOTE_WALLET_CONSUMER_REQUEST_SCHEMA: &str = "elastos.browser.wallet-consumer-request/v1";
+
+fn remote_wallet_consumer_mediation(
+    requester_endpoint: &str,
+    page_id: &str,
+    generation: &str,
+) -> Value {
+    json!({
+        "schema": REMOTE_WALLET_CONSUMER_MEDIATION_SCHEMA,
+        "resolution": "consumer_runtime",
+        "requester_endpoint": requester_endpoint,
+        "page_id": page_id,
+        "lifecycle_generation": generation,
+        "bus": "private",
+        "authority": "consumer_runtime",
+    })
+}
+
+fn remote_wallet_consumer_request(
+    mediation: &Value,
+    operation: &str,
+    page_url: &str,
+    origin: &str,
+    payload: Value,
+) -> Result<Value> {
+    ensure!(
+        mediation["schema"] == REMOTE_WALLET_CONSUMER_MEDIATION_SCHEMA
+            && mediation["resolution"] == "consumer_runtime"
+            && mediation["authority"] == "consumer_runtime"
+            && mediation["bus"] == "private",
+        "Remote Wallet request requires consumer mediation"
+    );
+    ensure!(
+        mediation.get("home_token").is_none() && mediation.get("account_access_url").is_none(),
+        "Remote Wallet request keeps tokens on the consumer"
+    );
+    ensure!(
+        matches!(
+            operation,
+            "request_accounts"
+                | "request_signature"
+                | "request_transaction"
+                | "approval_status"
+                | "read"
+                | "broadcast_transaction"
+        ),
+        "Remote Wallet operation is outside the consumer mediation set"
+    );
+    let requester_endpoint = mediation["requester_endpoint"]
+        .as_str()
+        .context("Remote Wallet consumer peer required")?;
+    let page_id = mediation["page_id"]
+        .as_str()
+        .context("Remote Wallet page required")?;
+    let generation = mediation["lifecycle_generation"]
+        .as_str()
+        .context("Remote Wallet generation required")?;
+    Ok(json!({
+        "schema": REMOTE_WALLET_CONSUMER_REQUEST_SCHEMA,
+        "resolution": "consumer_runtime",
+        "requester_endpoint": requester_endpoint,
+        "page_id": page_id,
+        "lifecycle_generation": generation,
+        "operation": operation,
+        "page_url": page_url,
+        "origin": origin,
+        "payload": payload,
+        "bus": "private",
+        "authority": "consumer_runtime",
+    }))
+}
+
+fn authenticated_engine_peer(binding: &ConsumerBinding) -> Result<iroh::PublicKey> {
+    binding.grant["peer_did"]
+        .as_str()
+        .context("Remote Wallet Engine peer required")?
+        .parse()
+        .context("Remote Wallet Engine peer invalid")
+}
+
+#[allow(dead_code)]
+pub(in crate::api::gateway) fn admit_remote_wallet_consumer_request(
+    binding: &ConsumerBinding,
+    request: &Value,
+    source: &iroh::PublicKey,
+) -> Result<()> {
+    ensure!(
+        request["schema"] == REMOTE_WALLET_CONSUMER_REQUEST_SCHEMA
+            && request["resolution"] == "consumer_runtime"
+            && request["page_id"] == binding.page_id
+            && request["lifecycle_generation"] == binding.generation
+            && request.get("home_token").is_none()
+            && request.get("account_access_url").is_none(),
+        "Remote Wallet request is not bound to this consumer page"
+    );
+    ensure!(
+        *source == authenticated_engine_peer(binding)?,
+        "Remote Wallet request is not bound to the authenticated Engine peer"
+    );
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(in crate::api::gateway) fn forward_remote_wallet_consumer_request(
+    binding: &ConsumerBinding,
+    launch_wallet: &Value,
+    source: &iroh::PublicKey,
+    operation: &str,
+    page_url: &str,
+    origin: &str,
+    payload: Value,
+) -> Result<Value> {
+    let request =
+        remote_wallet_consumer_request(launch_wallet, operation, page_url, origin, payload)?;
+    admit_remote_wallet_consumer_request(binding, &request, source)?;
+    Ok(request)
+}
+
 async fn prepare(page: &ServedPage) -> Result<Prepared> {
     let gateway = &page.gateway;
     let registry = gateway
@@ -638,9 +806,27 @@ async fn prepare(page: &ServedPage) -> Result<Prepared> {
         profile["profile_key"] = json!(owner.profile_key);
         let viewer = browser_vz_viewer_turn_capability(&transport.authority, &transport.secret).map_err(anyhow::Error::msg)?;
         crate::carrier::browser_engine_media::bind_target(&gateway.data_dir, owner.requester_endpoint.parse()?, &transport.authority, page.closing.clone()).await?;
+        let wallet = remote_wallet_consumer_mediation(&owner.requester_endpoint, &owner.page_id, &owner.generation);
+        let origin = url::Url::parse(&url)
+            .ok()
+            .map(|parsed| parsed.origin().ascii_serialization())
+            .filter(|origin| origin.starts_with("http"))
+            .context("Engine Wallet page origin required")?;
+        ensure!(
+            remote_wallet_consumer_request(
+                &wallet,
+                "request_accounts",
+                &url,
+                &origin,
+                json!({"method": "eth_requestAccounts"}),
+            )?["page_id"]
+                == owner.page_id,
+            "Engine Wallet launch request escaped its page"
+        );
         let request = json!({"op":"launch","url":url,"stream_session":browser_engine_stream_session(&stream),
             "lifecycle_generation":owner.generation,"principal_id":principal,"profile":profile,
-            "wallet":{},"viewport":intent["viewport"],"display_mode":mode,"guarantee_level":guarantee,
+            "wallet":wallet,
+            "viewport":intent["viewport"],"display_mode":mode,"guarantee_level":guarantee,
             "adapter_id":owner.adapter_id,"page_id":owner.page_id,"vm_id":owner.vm_id,
             "transport_authority":transport.authority,"transport_secret":transport.secret});
         Ok::<_, anyhow::Error>(Prepared {reservation:reservation.clone(),owner_launch_id,
@@ -893,7 +1079,7 @@ async fn close(page: &ServedPage) -> Result<Value> {
         &page.owner.generation,
     )
     .await?;
-    commit_browser_terminal_cleanup(&page.gateway, &cleanup.engine_cleanup, None)
+    commit_browser_terminal_cleanup(&page.gateway, &cleanup.engine_cleanup, None, None)
         .await
         .map_err(anyhow::Error::msg)?;
     release_browser_page_for_principal(
@@ -1193,6 +1379,86 @@ pub(super) fn consumer_terminal_retirement(
     .is_some_and(|binding| binding.terminal_retirement))
 }
 
+pub(super) fn consumer_grant_expired(
+    data_dir: &FsPath,
+    principal: &str,
+    generation: &str,
+) -> Result<bool> {
+    Ok(consumer_binding(
+        data_dir,
+        &json!({"principal_id":principal,"lifecycle_generation":generation}),
+    )?
+    .is_some_and(|binding| {
+        binding.grant["expires_at"]
+            .as_u64()
+            .is_none_or(|expiry| expiry <= now_ts())
+    }))
+}
+
+#[cfg(test)]
+pub(in crate::api::gateway) fn consumer_binding_for_wallet_forward_test(
+    principal_id: &str,
+    page_id: &str,
+    generation: &str,
+    engine_peer: &iroh::PublicKey,
+) -> ConsumerBinding {
+    ConsumerBinding {
+        grant: json!({"peer_did": engine_peer.to_string()}),
+        selection_id: "remote-engine-selection".into(),
+        adapter_id: "mock-browser-engine".into(),
+        principal_id: principal_id.into(),
+        page_id: page_id.into(),
+        generation: generation.into(),
+        stream_id: "stream:wallet-forward".into(),
+        prepared: None,
+        dispatch_started: true,
+        preparation_closed: false,
+        owner_launch_id: Some("launch:wallet-forward".into()),
+        browser_instance: Some("window:wallet-forward".into()),
+        reservation: None,
+        stream_cleanup: None,
+        cleanup_pending: false,
+        retry_after: u64::MAX,
+        terminal_retirement: false,
+    }
+}
+
+#[cfg(test)]
+pub(in crate::api::gateway) fn write_consumer_binding_for_test(
+    data_dir: &FsPath,
+    reservation: &BrowserLaunchReservation,
+    principal_id: &str,
+    stream_id: &str,
+    expires_at: u64,
+) -> Result<()> {
+    insert_consumer(
+        data_dir,
+        &ConsumerBinding {
+            grant: json!({
+                "id": "grant:reconciliation-test",
+                "grant_id": "grant:reconciliation-test",
+                "expires_at": expires_at,
+            }),
+            selection_id: reservation.engine_route_provider().to_string(),
+            adapter_id: "mock-browser-engine".into(),
+            principal_id: principal_id.into(),
+            page_id: reservation.page_id().to_string(),
+            generation: reservation.generation().to_string(),
+            stream_id: stream_id.into(),
+            prepared: None,
+            dispatch_started: true,
+            preparation_closed: false,
+            owner_launch_id: None,
+            browser_instance: None,
+            reservation: None,
+            stream_cleanup: None,
+            cleanup_pending: true,
+            retry_after: 0,
+            terminal_retirement: false,
+        },
+    )
+}
+
 pub(super) fn mark_consumer_reservation_terminal(
     data_dir: &FsPath,
     reservation: &BrowserLaunchReservation,
@@ -1462,6 +1728,10 @@ pub(in crate::api::gateway) async fn prepare_consumer(
         terminal_retirement: false,
     };
     insert_consumer(&gateway.data_dir, &binding)?;
+    ensure!(
+        authenticated_engine_peer(&binding)? == peer,
+        "Remote Wallet Engine peer differs from the selected grant"
+    );
     browser_engine_binding::bind_egress(
         &gateway.data_dir,
         peer,
@@ -1478,6 +1748,12 @@ pub(in crate::api::gateway) async fn prepare_consumer(
     let request = json!({"lifecycle_generation":reservation.generation(),"page_id":reservation.page_id(),"vm_id":reservation.vm_id(),
         "profile_key":profile["profile_key"],"adapter_id":choice.1,"stream_id":stream_id,"target":stream["target"],
         "url":input["url"],"viewport":input["viewport"],"display_mode":input["display_mode"],"guarantee_level":input["guarantee_level"]});
+    let warm = gateway.carrier_endpoint.clone().map(|endpoint| {
+        let grant = choice.0.clone();
+        tokio::spawn(async move {
+            crate::carrier::browser_engine_media::preconnect_engine(&endpoint, &grant).await
+        })
+    });
     let response =
         crate::carrier::call_browser_engine(registry, &choice.0, "prepare_launch", request).await?;
     let data = provider_response_data(&response).context("Remote Engine preparation missing")?;
@@ -1517,6 +1793,7 @@ pub(in crate::api::gateway) async fn prepare_consumer(
         endpoint,
         &choice.0,
         &data["transport_authority"],
+        warm,
     )
     .await?;
     let mut viewer = data["viewer_turn_capability"].clone();
@@ -1822,6 +2099,69 @@ mod tests {
             retry_after: u64::MAX,
             terminal_retirement: false,
         }
+    }
+
+    fn test_engine_peer() -> iroh::PublicKey {
+        iroh::SecretKey::from_bytes(&[9; 32]).public()
+    }
+
+    #[test]
+    fn remote_wallet_consumer_mediation_keeps_wallet_bus_on_the_consumer() {
+        let wallet = remote_wallet_consumer_mediation(
+            "peer-alice",
+            "page:vz-example",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        assert_eq!(wallet["schema"], REMOTE_WALLET_CONSUMER_MEDIATION_SCHEMA);
+        assert_eq!(wallet["resolution"], "consumer_runtime");
+        assert_eq!(wallet["bus"], "private");
+        assert_eq!(wallet["requester_endpoint"], "peer-alice");
+        assert!(wallet.get("principal_id").is_none());
+        assert!(wallet.get("home_token").is_none());
+        assert!(wallet.get("bridge_url").is_none());
+    }
+
+    #[test]
+    fn remote_wallet_consumer_request_binds_authenticated_peer_page_and_generation() {
+        let engine = test_engine_peer();
+        let binding = consumer_binding_for_wallet_forward_test(
+            "person:consumer",
+            "page:7",
+            "generation:7",
+            &engine,
+        );
+        let mediation = remote_wallet_consumer_mediation(
+            "peer-consumer",
+            &binding.page_id,
+            &binding.generation,
+        );
+        let request = remote_wallet_consumer_request(
+            &mediation,
+            "request_accounts",
+            "https://ela.city/",
+            "https://ela.city",
+            json!({"method": "eth_requestAccounts"}),
+        )
+        .expect("consumer Wallet request");
+        assert_eq!(request["schema"], REMOTE_WALLET_CONSUMER_REQUEST_SCHEMA);
+        assert!(request.get("home_token").is_none());
+        assert!(request.get("principal_id").is_none());
+        admit_remote_wallet_consumer_request(&binding, &request, &engine).expect("matching page");
+        let mut foreign_page = binding.clone();
+        foreign_page.page_id = "page:other".into();
+        assert!(admit_remote_wallet_consumer_request(&foreign_page, &request, &engine).is_err());
+        let foreign_peer = iroh::SecretKey::from_bytes(&[23; 32]).public();
+        assert!(admit_remote_wallet_consumer_request(&binding, &request, &foreign_peer).is_err());
+        let mut tokenized = mediation.clone();
+        tokenized["home_token"] = json!("launch-token");
+        assert!(remote_wallet_consumer_request(
+            &tokenized,
+            "request_accounts",
+            "https://ela.city/",
+            "https://ela.city",
+            json!({})
+        )
+        .is_err());
     }
 
     #[test]

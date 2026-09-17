@@ -99,12 +99,27 @@ const system = {
   watchdog: startWatchdog,
 };
 
+function adapterControlSocket(doc, dataDir) {
+  requireProof(doc && typeof doc === "object" && Array.isArray(doc.adapters) && doc.adapters.length > 0 &&
+    doc.adapters.length <= 16, "turn_adapter_invalid");
+  const matches = doc.adapters.filter(adapter => adapter?.kind === "chromium_microvm" &&
+    typeof adapter?.supervisor?.control_socket_path === "string" &&
+    adapter.supervisor.env?.ELASTOS_BROWSER_VM_DATA_DIR === dataDir &&
+    adapter.supervisor.env?.ELASTOS_BROWSER_VM_CONTROL_SOCKET === adapter.supervisor.control_socket_path);
+  requireProof(matches.length === 1 && isAbsolute(matches[0].supervisor.control_socket_path),
+    "turn_adapter_ambiguous_or_absent");
+  return matches[0].supervisor.control_socket_path;
+}
+
 async function bind(options, io, remaining, stage = () => {}) {
   stage("input");
   requireProof(io.platform === "darwin", "turn_interruption_requires_macos");
   const { testHome, pageId, runtimeOrigin } = options;
+  const controlSocketPath = typeof options.controlSocketPath === "string" && options.controlSocketPath
+    ? options.controlSocketPath : undefined;
   requireProof(typeof testHome === "string" && isAbsolute(testHome) &&
-    typeof pageId === "string" && /^page:vz-[0-9a-f]{64}$/.test(pageId), "turn_explicit_fixture_required");
+    typeof pageId === "string" && /^page:vz-[0-9a-f]{64}$/.test(pageId) &&
+    (controlSocketPath === undefined || isAbsolute(controlSocketPath)), "turn_explicit_fixture_required");
   stage("home_path");
   const home = await io.realpath(testHome);
   stage("personal_home_path");
@@ -112,17 +127,28 @@ async function bind(options, io, remaining, stage = () => {}) {
   const dataDir = join(home, "Library/Application Support/elastos");
   stage("data_dir");
   requireProof(await io.realpath(dataDir) === dataDir, "turn_data_dir_redirected");
-  stage("restart_receipt");
-  const receipt = JSON.parse(await io.ownedFile(join(dataDir, "receipts/mac-source-home-restart.json")));
   stage("runtime_origin");
-  const origin = new URL(runtimeOrigin), homeUrl = new URL(receipt.home_url);
+  const origin = new URL(runtimeOrigin);
   requireProof(origin.origin === runtimeOrigin && origin.protocol === "http:" &&
     ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname) &&
-    homeUrl.origin === origin.origin && homeUrl.pathname === "/apps/home/" &&
-    !homeUrl.username && !homeUrl.password && !homeUrl.search && !homeUrl.hash &&
-    receipt.schema === "elastos.mac-source-home-restart/v1" && receipt.ok === true && receipt.dry_run === false &&
-    receipt.test_home === home && receipt.data_dir === dataDir, "turn_restart_receipt_mismatch");
-  const controlSocket = join(home, "run/browser.sock");
+    !origin.username && !origin.password, "turn_runtime_origin_invalid");
+  let controlSocket;
+  if (controlSocketPath) {
+    stage("adapter_config");
+    const resolved = adapterControlSocket(
+      JSON.parse(await io.ownedFile(join(dataDir, "config/browser-engine-adapter.json"))), dataDir);
+    requireProof(resolved === controlSocketPath, "turn_control_socket_mismatch");
+    controlSocket = resolved;
+  } else {
+    stage("restart_receipt");
+    const receipt = JSON.parse(await io.ownedFile(join(dataDir, "receipts/mac-source-home-restart.json")));
+    const homeUrl = new URL(receipt.home_url);
+    requireProof(homeUrl.origin === origin.origin && homeUrl.pathname === "/apps/home/" &&
+      !homeUrl.username && !homeUrl.password && !homeUrl.search && !homeUrl.hash &&
+      receipt.schema === "elastos.mac-source-home-restart/v1" && receipt.ok === true && receipt.dry_run === false &&
+      receipt.test_home === home && receipt.data_dir === dataDir, "turn_restart_receipt_mismatch");
+    controlSocket = join(home, "run/browser.sock");
+  }
   stage("control_socket");
   await io.socket(controlSocket);
   stage("control_status");

@@ -839,3 +839,92 @@ async fn exact_cleanup_ownership_remains_until_typed_terminal_receipt() {
     .expect("replacement only after terminal receipt");
     release_browser_launch(&replacement).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn expired_remote_engine_grant_forgets_launch_reconciliation_without_engine_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+        dir.path(),
+        MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess,
+    )
+    .await;
+    let principal_id = "person:local:expired-grant-reconciliation";
+    let reservation = record_pending_launch(
+        &state,
+        principal_id,
+        "launch:expired-grant-reconciliation",
+        "stream:expired-grant-reconciliation",
+    )
+    .await;
+    gateway_browser_remote::write_consumer_binding_for_test(
+        &state.data_dir,
+        &reservation,
+        principal_id,
+        "stream:expired-grant-reconciliation",
+        1,
+    )
+    .expect("expired remote Engine grant record");
+    let reconciler =
+        start_controlled_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
+    reconciler.wait_for_completed_sweeps(1).await;
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+        0
+    );
+    assert!(
+        reconciliation_calls.snapshot().await.is_empty(),
+        "an expired remote Engine grant retires the leftover without an Engine status call"
+    );
+    let replacement = reserve_browser_launch(
+        &state.data_dir,
+        principal_id,
+        browser_lifecycle("launch:replacement-after-expired-grant"),
+    )
+    .await
+    .expect("replacement after expired remote Engine grant retirement");
+    release_browser_launch(&replacement).await;
+    reconciler.cancel();
+    reconciler.join().await.expect("Runtime shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn current_remote_engine_grant_still_asks_engine_for_launch_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+        dir.path(),
+        MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess,
+    )
+    .await;
+    let principal_id = "person:local:current-grant-reconciliation";
+    let reservation = record_pending_launch(
+        &state,
+        principal_id,
+        "launch:current-grant-reconciliation",
+        "stream:current-grant-reconciliation",
+    )
+    .await;
+    gateway_browser_remote::write_consumer_binding_for_test(
+        &state.data_dir,
+        &reservation,
+        principal_id,
+        "stream:current-grant-reconciliation",
+        crate::auth::now_ts().saturating_add(3600),
+    )
+    .expect("current remote Engine grant record");
+    let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
+    reconciliation_calls.wait_for_count(1).await;
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+        1
+    );
+    finish_current_reconciliation_sweep().await;
+    advance_until_reconciliation_call_count(&reconciliation_calls, 2, Duration::from_millis(100))
+        .await;
+    close_calls.wait_for_count(1).await;
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+        0
+    );
+    reconciler.cancel();
+    reconciler.join().await.expect("Runtime shutdown");
+}

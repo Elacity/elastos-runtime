@@ -80,12 +80,19 @@ function controllerFixture({ audio = true, offerer = 'engine' } = {}) {
   const peers = [], calls = [], recovered = [], focused = [], timers = new Map();
   const state = { supported: true, active: true, owner: 1, fetch: null, validation: async () => [], description: null };
   class Peer extends Events {
-    connectionState = 'new'; iceConnectionState = 'new'; signalingState = 'stable';
+    connectionState = 'new'; iceConnectionState = 'new'; iceGatheringState = 'complete'; signalingState = 'stable';
     added = []; descriptions = [];
     constructor() { super(); peers.push(this); }
     addTransceiver() {}
     async setRemoteDescription(value) { this.descriptions.push(value); if (state.description) await state.description(this); }
-    async setLocalDescription(value) { this.localDescription = value; }
+    async setLocalDescription(value) {
+      this.localDescription = value;
+      if (state.localIce) {
+        for (const candidate of state.localIce) {
+          this.emit('icecandidate', { candidate: { toJSON: () => candidate } });
+        }
+      }
+    }
     async createAnswer() { return { type: 'answer', sdp: 'v=0\r\ns=answer\r\n' }; }
     async createOffer() { return { type: 'offer', sdp: 'v=0\r\ns=offer\r\n' }; }
     async addIceCandidate(value) { this.added.push(value); }
@@ -101,6 +108,7 @@ function controllerFixture({ audio = true, offerer = 'engine' } = {}) {
     normalizeDisplayIceServers: value => value || [], normalizeEngineCandidate: value => value,
     normalizeIceCandidateForRuntime: value => value, sdpHasOnlyRelayCandidates: () => true,
     stripTrickleCandidatesFromSdp: value => value,
+    waitForLocalAnswerIce: async () => {},
     validateRuntimeLaunchTurn: (...args) => state.validation(...args),
   });
   vm.runInContext(source.slice(source.indexOf('const WEBRTC_CONNECT_TIMEOUT_MS')).replace('export function createBrowserRemoteDisplay', 'function createBrowserRemoteDisplay'), context);
@@ -163,7 +171,8 @@ for (const channel of ['video', 'audio']) for (const outcome of ['success', 'fai
       }
       return ack(body);
     };
-    const poll = f.pollIds()[channel === 'video' ? 0 : 1]; f.timers.get(poll).callback(); await started.promise;
+    for (const id of f.pollIds()) f.timers.get(id).callback();
+    await started.promise;
     await f.controller.connect(f.display('b'), {}); const polls = f.pollIds();
     if (outcome === 'success') pending.resolve(f.ack({ type: 'end_of_candidates', display_generation: generation('a') }));
     else pending.reject(new Error('old poll failed'));
@@ -271,8 +280,56 @@ for (const outcome of ['success', 'failure']) test(`closing retained owner stops
   if (outcome === 'success') pending.resolve(f.ack({ type: 'answer', display_generation: generation('a') }));
   else pending.reject(new Error('answer failed during close'));
   await connecting;
-  assert.equal(f.peers.length, 1); assert.equal(f.focused.length, 0); assert.equal(f.pollIds().length, 0);
+  assert.equal(f.peers.length, 2); assert.equal(f.focused.length, 0); assert.equal(f.pollIds().length, 0);
   assert.deepEqual(f.recovered, []); f.controller.close();
+});
+
+for (const owner of ['current', 'replaced']) {
+  test(`queued local ICE send rejection recovers only the current owner: ${owner}`, async () => {
+    const f = controllerFixture({ audio: false });
+    const pending = deferred(), started = deferred();
+    const unhandled = [];
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    f.state.localIce = [ice('queued')];
+    f.state.fetch = (body, ack) => {
+      if (body.display_generation === generation('a') && body.type === 'candidate') {
+        started.resolve();
+        return pending.promise;
+      }
+      return ack(body);
+    };
+    try {
+      const connecting = f.controller.connect(f.display('a'), {});
+      await started.promise;
+      if (owner === 'replaced') await f.controller.connect(f.display('b'), {});
+      pending.reject(new Error('queued ice failed'));
+      await connecting;
+      await flush();
+      await flush();
+      if (owner === 'current') {
+        assert.equal(f.recovered.length, 1);
+        assert.equal(f.recovered[0][0], 'queued ice failed');
+        assert.equal(f.recovered[0][1].failureKind, 'signaling');
+      } else {
+        assert.deepEqual(f.recovered, []);
+      }
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      f.controller.close();
+    }
+  });
+}
+
+test('connect starts the audio peer before the first video frame', async () => {
+  const f = controllerFixture();
+  await f.controller.connect(f.display('a'), {});
+  await flush();
+  await flush();
+  assert.equal(f.peers.length, 2);
+  assert.equal(f.controller.isTrackReady(), false);
+  f.controller.close();
 });
 
 test('viewer activity guard is captured for the owner at connect', async () => {

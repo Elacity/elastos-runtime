@@ -674,14 +674,22 @@ fn engine_terminal_cleanup_result(
             "Browser supervisor did not return an exact typed terminal cleanup receipt".to_string(),
         );
     }
-    Ok(json!({
+    let mut terminal = json!({
         "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
         "page_id": binding.page_id,
         "generation": binding.generation,
         "binding": binding,
         "terminal": true,
         "effects": supervisor_receipt["effects"],
-    }))
+    });
+    if let Some(durability) = supervisor_receipt
+        .get("profile_durability")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "failed" | "unknown" | "proved"))
+    {
+        terminal["profile_durability"] = json!(durability);
+    }
+    Ok(terminal)
 }
 
 struct LaunchContext<'a> {
@@ -1271,10 +1279,6 @@ impl BrowserEngineAdapter {
                             if selected_adapter.kind != AdapterKind::ChromiumMicrovm
                                 || page_acquired
                                 || vm_acquired
-                                    != settlement
-                                        .pointer("/effects/vm")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false)
                                 || launch
                                     .and_then(|value| value.get("adapter"))
                                     .and_then(Value::as_str)

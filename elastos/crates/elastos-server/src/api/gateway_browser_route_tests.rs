@@ -3139,7 +3139,7 @@ async fn test_exact_terminal_vz_settlement_releases_restart_reconciliation_oblig
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
-    assert_eq!(payload["outcome"]["effects"]["vm_acquired"], true);
+    assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
     assert_eq!(reconciliation_calls.count(), 1);
     assert!(close_calls.snapshot().await.is_empty());
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
@@ -4377,48 +4377,86 @@ async fn test_browser_eth_send_transaction_allows_external_connector_approval() 
     );
 }
 
+fn completed_browser_personal_sign_approval(
+    context: &elastos_wallet_contract::VerifiedWalletInvocationContext,
+    request_id: &str,
+    page_url: &str,
+    origin: &str,
+) -> serde_json::Value {
+    json!({
+        "request_id": request_id,
+        "status": "completed",
+        "intent": "browser_personal_sign",
+        "requested_by_actor": BROWSER_CAPSULE_ID,
+        "capsule_id": BROWSER_CAPSULE_ID,
+        "resource": "elastos://wallet/eip155:1/sign/browser_personal_sign",
+        "reason": "Browser page requests personal_sign",
+        "account_id": "wallet:eip155:1:0x1111111111111111111111111111111111111111",
+        "chain_namespace": "eip155:1",
+        "address": "0x1111111111111111111111111111111111111111",
+        "proof_type": "managed_evm",
+        "payload_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "principal_id": context.principal_id(),
+        "session_id": context.session_id(),
+        "launch_id": context.launch_id(),
+        "created_at": 10,
+        "expires_at": 20,
+        "completed_at": 12,
+        "payload": {
+            "schema": "elastos.browser.wallet-signature-request/v1",
+            "method": "personal_sign",
+            "page_url": page_url,
+            "origin": origin,
+            "principal_id": context.principal_id(),
+            "session_id": context.session_id(),
+            "requires_wallet_approval": true
+        },
+        "signed_result": {
+            "schema": "elastos.browser.personal-sign-result/v1",
+            "request_id": request_id,
+            "method": "personal_sign",
+            "signature": "0xsigned",
+            "signer": "0x1111111111111111111111111111111111111111"
+        }
+    })
+}
+
 #[tokio::test]
 async fn test_browser_wallet_approval_status_returns_completed_signature() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
+    let context = runtime_authority.verified_context();
+    let page_url = "https://dapp.example/sign";
+    let origin = "https://dapp.example";
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
         accounts: TokioMutex::default(),
-        approvals: TokioMutex::new(vec![json!({
-            "request_id": "wallet-approval:browser",
-            "status": "completed",
-            "intent": "browser_personal_sign",
-            "capsule_id": BROWSER_CAPSULE_ID,
-            "resource": "elastos://wallet/eip155:1/sign/browser_personal_sign",
-            "reason": "Browser page requests personal_sign",
-            "account_id": "wallet:eip155:1:0x1111111111111111111111111111111111111111",
-            "chain_namespace": "eip155:1",
-            "address": "0x1111111111111111111111111111111111111111",
-            "proof_type": "managed_evm",
-            "payload_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "principal_id": authority.principal_id,
-            "created_at": 10,
-            "expires_at": 20,
-            "completed_at": 12,
-            "signed_result": {
-                "schema": "elastos.browser.personal-sign-result/v1",
-                "request_id": "wallet-approval:browser",
-                "method": "personal_sign",
-                "signature": "0xsigned",
-                "signer": "0x1111111111111111111111111111111111111111"
-            }
-        })]),
+        approvals: TokioMutex::new(vec![completed_browser_personal_sign_approval(
+            context,
+            "wallet-approval:browser",
+            page_url,
+            origin,
+        )]),
         defaults: TokioMutex::default(),
     };
     let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("page_url", page_url)
+        .append_pair("origin", origin)
+        .finish();
 
     let response = app
+        .clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
-                .uri("/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser")
-                .header("x-elastos-home-token", browser_token)
+                .uri(format!(
+                    "/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser?{query}"
+                ))
+                .header("x-elastos-home-token", browser_token.clone())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4435,6 +4473,37 @@ async fn test_browser_wallet_approval_status_returns_completed_signature() {
     );
     assert_eq!(payload["status"], "completed");
     assert_eq!(payload["signature"], "0xsigned");
+
+    let foreign_query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("page_url", "https://attacker.example/sign")
+        .append_pair("origin", "https://attacker.example")
+        .finish();
+    let foreign = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(format!(
+                    "/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser?{foreign_query}"
+                ))
+                .header("x-elastos-home-token", browser_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+    let missing_context = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser")
+                .header("x-elastos-home-token", browser_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_context.status(), StatusCode::BAD_REQUEST);
 }
 
 fn completed_browser_transaction_approval(
@@ -5539,6 +5608,85 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
 }
 
 #[tokio::test]
+async fn test_browser_ordinary_close_and_replay_keep_failed_profile_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
+    let opened =
+        open_mock_browser_page_result(app.clone(), &token, "inject failed profile durability")
+            .await;
+    let page_id = opened["engine_page"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cleanup_id = browser_cleanup_id(&opened).to_string();
+    let encoded_page_id = page_id.replace(':', "%3A");
+    assert_eq!(page_id, "page:mock-failed-profile-durability");
+
+    let close = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{encoded_page_id}/close"))
+                .header("x-elastos-home-token", token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(&cleanup_id))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(close.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["schema"], "elastos.browser.close-result/v1");
+    assert_eq!(payload["page_id"], page_id);
+    assert_eq!(payload["closed"], true);
+    assert_eq!(payload["terminal_effects"]["child_absent"], true);
+    assert_eq!(payload["profile_durability"], "failed");
+
+    let replay = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{encoded_page_id}/close"))
+                .header("x-elastos-home-token", token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(&cleanup_id))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let replay: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay["schema"], "elastos.browser.close-result/v1");
+    assert_eq!(replay["already_closed"], true);
+    assert_eq!(replay["closed"], false);
+    assert_eq!(replay["profile_durability"], "failed");
+
+    let input_after_close = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{encoded_page_id}/input"))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"event":{"type":"click","x":12,"y":34}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(input_after_close.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn test_browser_page_routes_require_page_owner() {
     let dir = tempfile::tempdir().unwrap();
     let owner = passkey_authority_with_name(dir.path(), Some("owner"));
@@ -6218,6 +6366,97 @@ async fn test_browser_close_typed_already_absent_is_terminal_without_retry_oblig
     let close: serde_json::Value = serde_json::from_slice(&close_body).unwrap();
     assert_eq!(close["closed"], true);
     assert_eq!(close["cleanup_id"], cleanup_id);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(close_calls.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn test_browser_close_after_engine_restart_fail_closed_is_runtime_already_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let app = gateway_router(
+        browser_engine_retrying_close_test_state(
+            dir.path(),
+            close_calls.clone(),
+            MockBrowserEngineCloseFailure::RestartFailClosed,
+            4,
+            None,
+            None,
+        )
+        .await,
+    );
+    let opened =
+        open_mock_browser_page_result(app.clone(), &token, "restart fail-closed cleanup").await;
+    let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    let cleanup_id = browser_cleanup_id(&opened);
+    let close = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page_id}/close"))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(cleanup_id))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+    let close_body = axum::body::to_bytes(close.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let close: serde_json::Value = serde_json::from_slice(&close_body).unwrap();
+    assert_eq!(close["already_closed"], true);
+    assert_eq!(close["cleanup"]["action"], "already_absent");
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(close_calls.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn test_browser_close_after_engine_retained_owner_unavailable_is_runtime_already_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let app = gateway_router(
+        browser_engine_retrying_close_test_state(
+            dir.path(),
+            close_calls.clone(),
+            MockBrowserEngineCloseFailure::RetainedOwnerUnavailable,
+            4,
+            None,
+            None,
+        )
+        .await,
+    );
+    let opened =
+        open_mock_browser_page_result(app.clone(), &token, "retained owner unavailable cleanup")
+            .await;
+    let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    let cleanup_id = browser_cleanup_id(&opened);
+    let close = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page_id}/close"))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(cleanup_id))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+    let close_body = axum::body::to_bytes(close.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let close: serde_json::Value = serde_json::from_slice(&close_body).unwrap();
+    assert_eq!(close["already_closed"], true);
+    assert_eq!(close["cleanup"]["action"], "already_absent");
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(close_calls.lock().await.len(), 1);
 }
@@ -7602,6 +7841,158 @@ async fn test_browser_account_access_creates_review_only_inbox_handoff_without_d
 }
 
 #[tokio::test]
+async fn test_browser_account_access_creates_review_for_connector_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let address = "0x3333333333333333333333333333333333333333";
+    let account_id = format!("wallet:eip155:20:{address}");
+    let provider = MockWalletProvider {
+        challenges: TokioMutex::default(),
+        bitcoin_challenges: TokioMutex::default(),
+        accounts: TokioMutex::new(vec![json!({
+            "account_id": account_id,
+            "principal_id": authority.principal_id,
+            "proof_binding_id": "proof:wallet:siwe:eip155:20:0x3333333333333333333333333333333333333333",
+            "chain_namespace": "eip155:20",
+            "address": address,
+            "proof_type": "siwe",
+            "connector_id": "wallet-metamask",
+            "label": "Family",
+            "linked_at": crate::auth::now_ts()
+        })]),
+        approvals: TokioMutex::default(),
+        defaults: TokioMutex::default(),
+    };
+    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/wallet/request-accounts")
+                .header("x-elastos-home-token", browser_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_namespace": "eip155:20",
+                        "page_url": "https://dapp.example/connect",
+                        "origin": "https://dapp.example",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        created["schema"],
+        "elastos.browser.account-access-request-result/v1"
+    );
+    assert_eq!(created["requires_approval"], true);
+    assert_eq!(created["approval_request"]["status"], "pending");
+    assert!(
+        created.get("address").is_none(),
+        "unapproved account-access response disclosed an address"
+    );
+}
+
+#[tokio::test]
+async fn test_browser_account_access_uses_selected_connector_when_managed_account_is_also_present()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let wallet_token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
+    let managed_address = "0x1111111111111111111111111111111111111111";
+    let connector_address = "0x3333333333333333333333333333333333333333";
+    let managed_account_id = format!("wallet:eip155:20:{managed_address}");
+    let connector_account_id = format!("wallet:eip155:20:{connector_address}");
+    let provider = MockWalletProvider {
+        challenges: TokioMutex::default(),
+        bitcoin_challenges: TokioMutex::default(),
+        accounts: TokioMutex::new(vec![
+            json!({
+                "account_id": managed_account_id,
+                "principal_id": authority.principal_id,
+                "proof_binding_id": "proof:wallet:managed:browser-consent",
+                "chain_namespace": "eip155:20",
+                "address": managed_address,
+                "proof_type": "managed_evm",
+                "signing_available": true,
+                "signing_status": "managed_key_available",
+                "linked_at": crate::auth::now_ts(),
+            }),
+            json!({
+                "account_id": connector_account_id,
+                "principal_id": authority.principal_id,
+                "proof_binding_id": "proof:wallet:siwe:eip155:20:0x3333333333333333333333333333333333333333",
+                "chain_namespace": "eip155:20",
+                "address": connector_address,
+                "proof_type": "siwe",
+                "connector_id": "wallet-metamask",
+                "label": "Family",
+                "linked_at": crate::auth::now_ts()
+            }),
+        ]),
+        approvals: TokioMutex::default(),
+        defaults: TokioMutex::new(vec![json!({
+            "principal_id": authority.principal_id,
+            "chain_namespace": "eip155:20",
+            "intent": "browser_connect",
+            "account_id": connector_account_id,
+            "set_at": crate::auth::now_ts()
+        })]),
+    };
+    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/wallet/request-accounts")
+                .header("x-elastos-home-token", browser_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_namespace": "eip155:20",
+                        "page_url": "https://dapp.example/connect",
+                        "origin": "https://dapp.example",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let summary = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/wallet/wallet/summary")
+                .header("x-elastos-home-token", wallet_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let review = &summary["wallet_approvals"]["approval_requests"][0]["review"];
+    assert_eq!(review["kind"], "account_access");
+    assert_eq!(review["address"], connector_address);
+    assert_ne!(review["address"], managed_address);
+}
+
+#[tokio::test]
 async fn test_browser_account_access_status_returns_only_exact_origin_bound_grant() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
@@ -8169,6 +8560,100 @@ async fn display_attach_route_concurrent_request_is_bounded_and_close_wins_late_
     assert_eq!(late.1["code"], "display_owner_changed");
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+}
+
+#[tokio::test]
+async fn display_attach_route_same_id_joins_one_provider_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (app, provider) = display_attach_test_app(dir.path(), false, Some(gate)).await;
+    let opened = open_mock_browser_page_result(app.clone(), &token, "same id attach join").await;
+    let page_id = opened["engine_page"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        let page_id = page_id.clone();
+        async move { display_attach_post(app, &token, &page_id, display_attach_test_body()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.entered.notified())
+        .await
+        .unwrap();
+    let second = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        let page_id = page_id.clone();
+        async move { display_attach_post(app, &token, &page_id, display_attach_test_body()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(provider.signals.lock().await.len(), 1);
+    release.send(()).unwrap();
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(second, first);
+    assert_eq!(provider.signals.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn display_attach_route_survives_leader_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (app, provider) = display_attach_test_app(dir.path(), false, Some(gate)).await;
+    let opened =
+        open_mock_browser_page_result(app.clone(), &token, "leader disconnect attach").await;
+    let page_id = opened["engine_page"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        let page_id = page_id.clone();
+        async move { display_attach_post(app, &token, &page_id, display_attach_test_body()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.entered.notified())
+        .await
+        .unwrap();
+    first.abort();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        let page_id = page_id.clone();
+        async move { display_attach_post(app, &token, &page_id, display_attach_test_body()).await }
+    });
+    release.send(()).unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(second.0, StatusCode::OK);
+    assert_eq!(second.1["display_generation"], DISPLAY_ATTACH_TEST_NEW);
+    assert_eq!(provider.signals.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn display_attach_route_late_same_id_uses_cached_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &owner);
+    let (app, provider) = display_attach_test_app(dir.path(), false, None).await;
+    let opened = open_mock_browser_page_result(app.clone(), &token, "late same id cache").await;
+    let page_id = opened["engine_page"]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first =
+        display_attach_post(app.clone(), &token, &page_id, display_attach_test_body()).await;
+    assert_eq!(first.0, StatusCode::OK);
+    let second =
+        display_attach_post(app.clone(), &token, &page_id, display_attach_test_body()).await;
+    assert_eq!(second, first);
+    assert_eq!(provider.signals.lock().await.len(), 1);
 }
 
 #[derive(Default)]

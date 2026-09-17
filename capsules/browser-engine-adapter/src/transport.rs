@@ -212,6 +212,23 @@ pub(super) fn validate_vz_transport_effect_receipt(
     Ok(())
 }
 
+fn vz_launch_settlement_keys_are_exact(settlement: &Value, keys: &[&str]) -> bool {
+    let Some(object) = settlement.as_object() else {
+        return false;
+    };
+    keys.iter().all(|key| object.contains_key(*key))
+        && object
+            .keys()
+            .all(|key| keys.contains(&key.as_str()) || key == "profile_durability")
+}
+
+fn vz_launch_profile_durability_is_safe(settlement: &Value) -> bool {
+    match settlement.get("profile_durability") {
+        None => true,
+        Some(value) => matches!(value.as_str(), Some("failed" | "unknown" | "proved")),
+    }
+}
+
 pub(super) fn validate_vz_launch_settlement(
     settlement: &Value,
     transport: &VzTransportLaunchContext,
@@ -228,9 +245,9 @@ pub(super) fn validate_vz_launch_settlement_binding(
     authority: &Value,
 ) -> Result<(), String> {
     validate_vz_transport_authority(authority)?;
-    let object = settlement
-        .as_object()
-        .ok_or_else(|| "Browser VZ launch settlement must be an object".to_string())?;
+    if settlement.as_object().is_none() {
+        return Err("Browser VZ launch settlement must be an object".to_string());
+    }
     let keys = [
         "schema",
         "state",
@@ -283,8 +300,8 @@ pub(super) fn validate_vz_launch_settlement_binding(
         .filter(|value| value.len() <= 8_192 && !value.contains('\0'))
         .ok_or_else(|| "Browser VZ launch settlement message is invalid".to_string())?;
     let _ = message;
-    if object.len() != keys.len()
-        || keys.iter().any(|key| !object.contains_key(*key))
+    if !vz_launch_settlement_keys_are_exact(settlement, &keys)
+        || !vz_launch_profile_durability_is_safe(settlement)
         || effects.len() != effect_keys.len()
         || effect_keys.iter().any(|key| !effects.contains_key(*key))
         || absence.len() != absence_keys.len()

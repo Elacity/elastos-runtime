@@ -65,6 +65,63 @@ export function sdpHasOnlyRelayCandidates(sdp) {
     .every((line) => iceCandidateType(line) === "relay");
 }
 
+export const ANSWER_ICE_GATHER_BUDGET_MS = 800;
+
+export function localAnswerSdpHasUsableCandidates(sdp, relayOnly) {
+  const lines = String(sdp || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^a=candidate:/i.test(line));
+  if (lines.length === 0) {
+    return false;
+  }
+  if (relayOnly) {
+    return lines.some((line) => iceCandidateType(line) === "relay");
+  }
+  return true;
+}
+
+export function waitForLocalAnswerIce(
+  peerConnection,
+  { relayOnly = false, budgetMs = ANSWER_ICE_GATHER_BUDGET_MS } = {},
+) {
+  const usable = () =>
+    localAnswerSdpHasUsableCandidates(peerConnection.localDescription?.sdp, relayOnly) ||
+    peerConnection.iceGatheringState === "complete";
+  if (usable()) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) {
+        return;
+      }
+      done = true;
+      peerConnection.removeEventListener("icecandidate", onCandidate);
+      peerConnection.removeEventListener("icegatheringstatechange", onState);
+      clearTimeout(timer);
+      resolve();
+    };
+    const onCandidate = () => {
+      if (usable()) {
+        finish();
+      }
+    };
+    const onState = () => {
+      if (peerConnection.iceGatheringState === "complete") {
+        finish();
+      }
+    };
+    const timer = setTimeout(finish, budgetMs);
+    peerConnection.addEventListener("icecandidate", onCandidate);
+    peerConnection.addEventListener("icegatheringstatechange", onState);
+    if (usable()) {
+      finish();
+    }
+  });
+}
+
 export function normalizeDisplayIceServers(value) {
   if (!Array.isArray(value)) {
     return [];

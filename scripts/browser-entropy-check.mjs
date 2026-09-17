@@ -56,6 +56,7 @@ const browserManifest = read("capsules/browser/capsule.json");
 const browserCapsuleManifest = JSON.parse(browserManifest);
 const browser = read("capsules/browser/browser/index.html");
 const browserMain = read("capsules/browser/browser/browser.js");
+const browserRestoreBoot = read("capsules/browser/browser/browser-restore-boot.js");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
@@ -225,9 +226,12 @@ const browserVmGuestControlBridge = read(
 const browserVmGuestControlBridgeSmoke = read(
   "scripts/browser-vm-guest-control-bridge-smoke.sh",
 );
-const browserVzEngineSupervisor = read(
+const browserVzEngineSupervisor = readAll([
   "elastos/crates/elastos-vz/src/bin/browser-vz-engine-supervisor.rs",
-);
+  "elastos/crates/elastos-vz/src/ffi/delegate.rs",
+  "elastos/crates/elastos-vz/src/provider.rs",
+  "elastos/crates/elastos-vz/src/vm.rs",
+]);
 const browserVmTargetStage = read("scripts/build/stage-browser-vm-target.sh");
 const browserVmTargetStageSmoke = read(
   "scripts/build/stage-browser-vm-target-smoke.sh",
@@ -390,11 +394,40 @@ assertNoForbidden(browserJs, "Browser UI", [
 assert(
     browserJs.includes("normalizeUrl") &&
     browserJs.includes("streamTargetForUrl") &&
+    browserJs.includes("const requestedStartupUrl = params.get(\"url\")") &&
+    browserJs.includes("if (!requestedStartupUrl)") &&
+    !browserJs.includes("return requestRuntimeOpen(initialUrl, { history: \"replace\" });") &&
     browserJs.includes("recoverableRuntimePage") &&
     browserJs.includes("elastos.browser.cleanup-handle/v1") &&
     browserJs.includes("elastos.browser.close-request/v2") &&
+    browserJs.includes("the profile save failed") &&
+    browserJs.includes("response.profile_durability") &&
     !browserJs.includes("runtime_close") &&
     !browserJs.includes("sessionStorage") &&
+    !browserRestoreBoot.includes("sessionStorage") &&
+    browser.includes("browser-restore-boot.js?v=browser-20260915c") &&
+    browserRestoreBoot.includes("function waitForReadyAttach") &&
+    browserRestoreBoot.includes("function attachFromKnownUrl") &&
+    browser.includes('rel="modulepreload"') &&
+    browserRestoreBoot.includes("__elastosBrowserRestoreBoot") &&
+    browserRestoreBoot.includes('generation.slice("display:".length)') &&
+    browserJs.includes("__elastosBrowserRestoreBoot") &&
+    browserJs.includes("function startRecoverableDisplayAttach") &&
+    browserJs.includes("keepalive: true") &&
+    browserJs.includes('pending.state === "pending" || pending.state === "ready"') &&
+    !browserJs.includes("prepareRecoverableDisplayAttach") &&
+    browserJs.includes("const connecting = connectRemoteDisplay") &&
+    browserRemoteDisplay.includes("const startAudioPeerAfterVideoIce = () => {") &&
+    browserRemoteDisplay.includes("emitMediaDiagnostic(\"viewer_peer_created\", \"video\");\n    startAudioPeerAfterVideoIce();") &&
+    browserRemoteDisplay.includes("startAudioPeerAfterVideoIce();\n        return;") &&
+    !browserRemoteDisplay.includes("const audioConnecting = expectsAudio") &&
+    !browserRemoteDisplay.includes("await audioConnecting") &&
+    browserRemoteDisplay.includes("postAnswerWithQueuedLocalIce") &&
+    !browserRemoteDisplay.includes("waitForLocalAnswerIce") &&
+    browserRemoteDisplay.includes("const flushing = queued.splice(0).map((candidate) =>") &&
+    browserRemoteDisplay.includes("signalOne(candidate).catch((error) => {") &&
+    browserRemoteDisplay.includes("recoverPeerSignal(nextPeer, error)") &&
+    browserRemoteDisplay.includes("void Promise.all(flushing)") &&
     browserJs.includes("Only http and https addresses") &&
     browserJs.includes("/api/apps/browser/open") &&
     browserJs.includes("/api/apps/browser/summary") &&
@@ -529,6 +562,9 @@ assert(
     ) &&
     browserEngineAdapter.includes(
       "elastos.browser.engine-cleanup-result/v2",
+    ) &&
+    browserEngineAdapter.includes(
+      "ordinary_isolated_close_and_replay_keep_failed_profile_durability",
     ) &&
     browserEngineAdapter.includes("elastos.adapter-ipc/v1") &&
     browserEngineAdapter.includes("runtime_stream_path") &&
@@ -1131,6 +1167,7 @@ assert(
     setupSourceHome.includes("browser-source-home-config.mjs") &&
     setupSourceHome.includes("browser-vm-engine-supervisor.mjs") &&
     setupSourceHome.includes("browser-vm-control-service.mjs") &&
+    !setupSourceHome.includes("browser-vm-webrtc-apply-gate.mjs") &&
     setupSourceHome.includes("browser-vm-remote-vz-launcher.mjs") &&
     setupSourceHome.includes("browser-vm-local-crosvm-launcher.mjs") &&
     setupSourceHome.includes("browser-vm-prepare-rootfs-pool.mjs") &&
@@ -1343,6 +1380,8 @@ assert(
     browserVmArtifactPreflightSmoke.includes("elastos.browser.vm-artifact-preflight-smoke/v1") &&
     browserVmArtifactPreflightSmoke.includes("ELASTOS_BROWSER_VM_STAGED_ROOTFS") &&
     browserVmControlService.includes("elastos.browser.vm-control-service.config/v1") &&
+    !browserVmControlService.includes("createGuestWebrtcApplyGate") &&
+    !browserVmControlService.includes("guestWebrtcApplyGate.apply") &&
     browserVmControlService.includes("Browser VM control service accepts only chromium_microvm") &&
     browserVmControlService.includes("Browser VM control service requires webrtc_remote_display") &&
     browserVmControlService.includes('const expectedMediaTransport = "runtime_relay"') &&
@@ -1352,6 +1391,30 @@ assert(
     browserVmEngineSupervisor.includes("launcher: controlServiceArtifactFingerprints(config.launcher_program)") &&
     browserVmControlService.includes("persistent_launcher") &&
     browserVmControlService.includes("runPersistentProgram") &&
+    browserVmControlService.includes("persistentLauncherReadyLine") &&
+    browserVmControlService.includes(
+      'parsed?.schema === "elastos.browser.engine.supervisor-result/v1"',
+    ) &&
+    browserVmControlService.includes("settleDispatchedTransportLaunchWithoutBinding") &&
+    browserVmControlService.includes("helperLogVzLaunchEffects") &&
+    browserVmControlService.includes("launch_reconciliation_log_effects") &&
+    browserVmControlService.includes(
+      "launchSettlement?.state === LAUNCH_SETTLEMENT_TERMINAL",
+    ) &&
+    browserVmControlService.includes("? { terminal_record: true }") &&
+    browserVmControlService.includes(
+      "record.terminal_cleanup_receipt === undefined ||",
+    ) &&
+    browserVmControlService.includes("durableReceiptIsSafe") &&
+    browserVmControlService.includes(
+      "if (current?.state === LAUNCH_SETTLEMENT_TERMINAL)",
+    ) &&
+    browserVmControlService.includes("profile_durability") &&
+    gatewayBrowserApi.includes("browser_profile_durability_from_receipt") &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_ordinary_close_and_replay_keep_failed_profile_durability",
+    ) &&
+    browserVmControlService.includes("terminateOwnedSupervisorPid") &&
     browserVmControlService.includes("terminatePersistentLauncher") &&
     !browserVmControlService.includes("sameLaunchIdentity") &&
     !browserVmControlService.includes("launch_replacing") &&
@@ -1362,7 +1425,26 @@ assert(
     browserVmControlService.includes("single_active_page_non_reusable_profile") &&
     browserVmControlService.includes("max_active_pages") &&
     browserVmControlService.includes("Browser VM active page capacity reached") &&
+    browserVmControlService.includes("vm_retirement_defers_guest_page_close") &&
+    browserVmControlService.includes("supervisor_owns_guest_profile_flush") &&
     browserVmControlService.includes("page_close_forced_vm_retirement") &&
+    browserVmControlService.includes("exact owned native settlement arrives") &&
+    browserVmControlService.includes("turnListenerPortAbsent") &&
+    browserVmControlService.includes("turnRelayPortsAbsent") &&
+    browserVmControlService.includes("reuseAddr: false") &&
+    browserVmControlService.includes("termination?.graceful === true") &&
+    browserVmControlService.includes("supervisorOwnedVsockBridgesAbsent") &&
+    browserVmControlService.includes("ownedTurnDelayedTerminal") &&
+    browserVmControlService.includes("vzLaunchNonPortAbsenceProved") &&
+    browserVmControlService.includes("parseVzLaunchSettlementFromStderr") &&
+    browserVmControlService.includes("delayed_turn_port_absence") &&
+    !browserVmControlService.includes("const ordinaryBridgeAbsent = !fs.existsSync(") &&
+    !browserVmControlService.includes("observedOwnerAbsent") &&
+    !browserVmControlService.includes("restart_observation") &&
+    !browserVmControlService.includes("function tcpEndpointAbsent") &&
+    !browserVmControlService.includes(
+      "Browser VZ exact launcher did not produce a graceful terminal exit",
+    ) &&
     browserVmControlService.includes("per_launch_vm_target") &&
     browserVmControlService.includes("elastos.browser.vz-launch-settlement/v1") &&
     browserVmControlService.includes("validateVzLaunchSettlementForLaunch") &&
@@ -1385,6 +1467,45 @@ assert(
     browserVmControlServiceSettlementSmoke.includes("verify-typed-restart") &&
     browserVmControlServiceSettlementSmoke.includes("did_not_act cleanup_pending terminal_post_effect_cleanup") &&
     browserVmControlServiceSettlementSmoke.includes("substituted transport settlement escaped cleanup ownership") &&
+    browserVmControlServiceSettlementSmoke.includes("ungraceful-transport-close") &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "ungraceful post-exit close synthesized terminal TURN process absence",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "occupied UDP relay port did not retain cleanup ownership",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "Runtime stream sockets remaining after owned launcher cleanup",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes("polluted-stdout-ready") &&
+    browserVmControlServiceSettlementSmoke.includes("polluted-stdout-hold") &&
+    browserVmControlServiceSettlementSmoke.includes("delayed-turn-child-present") &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "delayed turn with child_absent=false became terminal",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "verify-delayed-turn-child-present-restart",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes("delayed-turn-port-only") &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "verify-delayed-turn-port-only-restart",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes("log-started-paths-gone-owner-alive") &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "log-started-owner-exits-without-native-settlement",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "logged started launch with a live owner became terminal",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes("verify-failed-flush-durability-restart") &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "failed durability close lost the data-save failure",
+    ) &&
+    browserVmControlServiceSettlementSmoke.includes("Allocated inode: 728") &&
+    browserVmControlServiceSettlementSmoke.includes("verify-transport-restart") &&
+    browserVmControlServiceSettlementSmoke.includes(
+      "surviving transport owner was synthesized terminal after restart",
+    ) &&
     browserVmEngineContractSmoke.includes("elastos.browser.vm-engine-contract-smoke/v1") &&
     browserVmRemoteControlPreflightSmoke.includes("elastos.browser.vm-remote-control-preflight-smoke/v1") &&
     browserVmRemoteControlPreflightSmoke.includes("remote_vm_control_socket") &&
@@ -1466,6 +1587,47 @@ assert(
     browserVzEngineSupervisor.includes("UNIX_SOCKET_PATH_BUDGET") &&
     browserVzEngineSupervisor.includes("validate_unix_socket_path_budget") &&
     browserVzEngineSupervisor.includes("/tmp/evzs") &&
+    browserVzEngineSupervisor.includes("stage=shutdown_wait") &&
+    browserVzEngineSupervisor.includes("sender_pid") &&
+    browserVzEngineSupervisor.includes("stage=shutdown_wait_sender") &&
+    browserVzEngineSupervisor.includes("stage=vz_delegate_exit") &&
+    browserVzEngineSupervisor.includes("Browser VZ guest or framework stopped") &&
+    browserVzEngineSupervisor.includes("wait_for_guest_exit") &&
+    browserVzEngineSupervisor.includes("take_guest_exit_receiver") &&
+    browserVzEngineSupervisor.includes("format_delegate_exit_reason") &&
+    browserVzEngineSupervisor.includes("truncate_delegate_exit_message") &&
+    browserVzEngineSupervisor.includes("is_char_boundary") &&
+    !browserVzEngineSupervisor.includes("message.truncate(512)") &&
+    browserVzEngineSupervisor.includes("request_guest_profile_disk_flush") &&
+    browserVzEngineSupervisor.includes("guest_profile_disk_flush_accepted") &&
+    browserVzEngineSupervisor.includes("settle_failed_profile_flush") &&
+    browserVzEngineSupervisor.includes("settlement_with_absence_and_profile_durability") &&
+    !browserVzEngineSupervisor.includes("retain_failed_profile_flush_durability") &&
+    browserVzEngineSupervisor.includes(
+      "failed_profile_flush_keeps_truthful_child_absence_and_failed_durability",
+    ) &&
+    browserVzEngineSupervisor.includes("leftover_writers_killed") &&
+    browserVzEngineSupervisor.includes("profile_durability") &&
+    browserVzEngineSupervisor.includes("stage=guest_profile_flush") &&
+    browserVzEngineSupervisor.includes("overlay_guest_selkies_control_service") &&
+    browserVzEngineSupervisor.includes("stage=guest_control_overlay") &&
+    browserVzEngineSupervisor.includes("overlay_guest_webrtc_send_diagnostic") &&
+    browserVzEngineSupervisor.includes("stage=guest_webrtc_send_overlay") &&
+    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY") &&
+    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC_SHA256") &&
+    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START_SHA256") &&
+    browserVzEngineSupervisor.includes("webrtc_send_overlay_requested") &&
+    browserVzEngineSupervisor.includes(".stdout(Stdio::null())") &&
+    browserSelkiesControlService.includes("flushAndUnmountBrowserProfileDisk") &&
+    browserSelkiesControlService.includes("quitGuestProfileDiskWriters") &&
+    browserSelkiesControlService.includes("graceMs = 4000") &&
+    browserSelkiesControlService.includes("browserProfileDiskDurability") &&
+    browserSelkiesControlService.includes("leftover_writers_killed") &&
+    browserSelkiesControlService.includes("shutdown_result") &&
+    browserSelkiesControlService.includes("profile_disk_unmounted") &&
+    browserSelkiesControlService.includes("Browser.close") &&
+    browserVmControlService.includes("stderr_tail") &&
+    browserVmControlService.includes("looksLikeRejectedVzMediaDiagnostic") &&
     browserVzEngineSupervisor.includes("Browser VZ launcher requires adapter_ipc.runtime_stream_path") &&
     browserVzEngineSupervisor.includes("validate_runtime_stream_socket_path") &&
     browserVzEngineSupervisor.includes("launch_requires_runtime_owned_stream_path_for_egress") &&
@@ -1479,6 +1641,8 @@ assert(
     browserVzEngineSupervisor.includes("VzLaunchOwner") &&
     browserVzEngineSupervisor.includes("TurnCleanupEvidence") &&
     browserVzEngineSupervisor.includes("LaunchTurnStartError") &&
+    browserVzEngineSupervisor.includes("wait_for_owned_turn_ports_absent") &&
+    browserVzEngineSupervisor.includes("signal_owned_turn_process_group") &&
     browserVzEngineSupervisor.includes("child_absent: self.terminate_and_reap()") &&
     browserVzEngineSupervisor.includes("TurnCleanupEvidence::Indeterminate => false") &&
     browserVzEngineSupervisor.includes("elastos.browser.vz-launch-settlement/v1") &&
@@ -1572,6 +1736,11 @@ assert(
     browserVmTargetStage.includes("found_media_iface") &&
     browserVmTargetStage.includes('[ -n "$found_media_iface" ] && break') &&
     browserVmTargetStage.includes("patch_selkies_relay_policy") &&
+    browserVmTargetStage.includes("patch_selkies_display_renegotiate") &&
+    browserVmTargetStage.includes("elastos_display_renegotiate") &&
+    browserVmTargetStage.includes("request_display_offer") &&
+    browserVmTargetStage.includes("recreating display pipeline for a new viewer") &&
+    browserVmTargetStage.includes("_elastos_audio_only") &&
     !browserVmTargetStage.includes("_elastos_raw_caps_with_framerate") &&
     !browserVmTargetStage.includes("fraction_replacement") &&
     browserVmTargetStage.includes("/run/elastos/browser-ice-transport-policy") &&
@@ -1838,7 +2007,22 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260907c") &&
+    browser.includes("browser.js?v=browser-20260915b") &&
+    !browser.includes("browser.js?v=browser-20260915a") &&
+    !browser.includes("browser.js?v=browser-20260914f") &&
+    !browser.includes("browser.js?v=browser-20260914e") &&
+    !browser.includes("browser.js?v=browser-20260914d") &&
+    !browser.includes("browser.js?v=browser-20260914c") &&
+    !browser.includes("browser.js?v=browser-20260913i") &&
+    !browser.includes("browser.js?v=browser-20260913h") &&
+    !browser.includes("browser.js?v=browser-20260913g") &&
+    !browser.includes("browser.js?v=browser-20260913f") &&
+    !browser.includes("browser.js?v=browser-20260913e") &&
+    !browser.includes("browser.js?v=browser-20260913d") &&
+    !browser.includes("browser.js?v=browser-20260913c") &&
+    !browser.includes("browser.js?v=browser-20260913b") &&
+    !browser.includes("browser.js?v=browser-20260913a") &&
+    !browser.includes("browser.js?v=browser-20260907c") &&
     !browser.includes("browser.js?v=browser-20260731a") &&
     !browser.includes("browser.js?v=browser-20260730a") &&
     !browser.includes("browser.js?v=browser-20260728a") &&
@@ -1900,7 +2084,14 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260907c") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260915d") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260915a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260914c") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260913h") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260913g") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260913f") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260913e") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260907c") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
@@ -2013,6 +2204,10 @@ assert(
     !releaseRuntimePageForUnloadBlock.includes("currentPage = null") &&
     !releaseRuntimePageForUnloadBlock.includes("publishRuntimePageForHost(null)") &&
     !releaseRuntimePageForUnloadBlock.includes("closeRemoteDisplay()") &&
+    !releaseRuntimePageForUnloadBlock.includes("prepareRecoverableDisplayAttach") &&
+    !releaseRuntimePageForUnloadBlock.includes("startRecoverableDisplayAttach") &&
+    !releaseRuntimePageForUnloadBlock.includes("display_attach") &&
+    !releaseRuntimePageForUnloadBlock.includes("keepalive") &&
     failRuntimeOwnedPageBlock.includes("closeRemoteDisplay();") &&
     !failRuntimeOwnedPageBlock.includes("currentPage = null") &&
     !failRuntimeOwnedPageBlock.includes("publishRuntimePageForHost(null)") &&
@@ -2200,6 +2395,13 @@ assert(
       "Browser guest raster is fixed at 1920x1080",
     ) &&
     !browserSelkiesControlService.includes("function resizeBrowserPage") &&
+    browserSelkiesControlService.includes("waitForRenegotiatedOffer") &&
+    browserSelkiesControlService.includes("settleRenegotiatedOffer") &&
+    browserSelkiesControlService.includes("Selkies relay ICE for the new offer") &&
+    browserSelkiesControlService.includes("relayIceCandidates") &&
+    browserSelkiesControlService.includes("rememberIceCandidate") &&
+    browserSelkiesControlService.includes("this.remoteCandidateHistory = [];") &&
+    browserSelkiesControlService.includes("relayIceCandidates(") &&
     browserSelkiesControlService.includes("function mediaKindsForSdp") &&
     !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
     !browserSelkiesControlService.includes("audio_offer_unavailable") &&

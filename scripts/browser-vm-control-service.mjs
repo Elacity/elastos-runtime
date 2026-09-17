@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
-
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let verifiedHostReadiness = null;
 
@@ -57,7 +57,7 @@ async function engineReadiness(config) {
   if (identity && verifiedHostReadiness?.identity === identity) return verifiedHostReadiness.result;
   return new Promise((resolve) => {
     execFile(script, ["--host-readiness"], {
-      timeout: 8000, maxBuffer: 64 * 1024,
+      timeout: 30000, maxBuffer: 64 * 1024,
       env: {
         ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
         ...((process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")
@@ -102,6 +102,20 @@ const VZ_TRANSPORT_SECRET_SCHEMA =
   "elastos.browser.vz-transport-secret/v1";
 const VZ_LAUNCH_SETTLEMENT_SCHEMA =
   "elastos.browser.vz-launch-settlement/v1";
+const VZ_LAUNCH_SETTLEMENT_KEYS = [
+  "schema",
+  "state",
+  "message",
+  "binding_hash",
+  "generation",
+  "page_id",
+  "vm_id",
+  "stream_id",
+  "media_stream_id",
+  "effects",
+  "absence",
+];
+const VZ_LAUNCH_PROFILE_DURABILITY = ["failed", "unknown", "proved"];
 const VZ_MEDIA_DIAGNOSTIC_SCHEMA =
   "elastos.browser.media-diagnostic/v1";
 const VZ_MEDIA_DIAGNOSTIC_EVENTS = new Set([
@@ -131,6 +145,10 @@ const VZ_LAUNCH_ABSENCE_KEYS = [
   "media_stream_bridge_absent",
   "session_directory_absent",
   "vm_absent",
+];
+const VZ_LAUNCH_PORT_ABSENCE_KEYS = [
+  "turn_listener_absent",
+  "turn_relay_ports_absent",
 ];
 const TERMINAL_CLEANUP_EFFECT_KEYS = [
   "page_absent",
@@ -231,6 +249,33 @@ function exactObjectKeys(value, keys) {
     !Array.isArray(value) &&
     Object.keys(value).length === keys.length &&
     keys.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function profileDurabilityIsSafe(value) {
+  return value === undefined || VZ_LAUNCH_PROFILE_DURABILITY.includes(value);
+}
+
+function profileDurabilityFields(source) {
+  const durability =
+    source?.profile_durability ||
+    source?.launch_settlement_result?.profile_durability;
+  if (!VZ_LAUNCH_PROFILE_DURABILITY.includes(durability)) {
+    return {};
+  }
+  return { profile_durability: durability };
+}
+
+function vzLaunchSettlementKeysAreExact(settlement) {
+  if (!settlement || typeof settlement !== "object" || Array.isArray(settlement)) {
+    return false;
+  }
+  if (!VZ_LAUNCH_SETTLEMENT_KEYS.every((key) => Object.hasOwn(settlement, key))) {
+    return false;
+  }
+  return Object.keys(settlement).every(
+    (key) =>
+      VZ_LAUNCH_SETTLEMENT_KEYS.includes(key) || key === "profile_durability",
   );
 }
 
@@ -458,19 +503,8 @@ function validateVzTransportSecret(authority, secret) {
 
 function validateVzLaunchSettlement(settlement) {
   if (
-    !exactObjectKeys(settlement, [
-      "schema",
-      "state",
-      "message",
-      "binding_hash",
-      "generation",
-      "page_id",
-      "vm_id",
-      "stream_id",
-      "media_stream_id",
-      "effects",
-      "absence",
-    ]) ||
+    !vzLaunchSettlementKeysAreExact(settlement) ||
+    !profileDurabilityIsSafe(settlement.profile_durability) ||
     settlement.schema !== VZ_LAUNCH_SETTLEMENT_SCHEMA ||
     ![
       LAUNCH_SETTLEMENT_DID_NOT_ACT,
@@ -648,7 +682,17 @@ function controlServiceIdentityIsSafe(identity, controlSocketPath) {
     !/[\r\n\0]/.test(identity.control_socket_path) &&
     identity.control_socket_path === controlSocketPath &&
     (identity.config_fingerprint === null ||
+      identity.config_fingerprint === undefined ||
       /^[0-9a-f]{64}$/.test(identity.config_fingerprint))
+  );
+}
+
+function controlServiceIdentityMatches(left, right) {
+  return (
+    controlServiceIdentityIsSafe(left, left?.control_socket_path) &&
+    controlServiceIdentityIsSafe(right, right?.control_socket_path) &&
+    left.service_id === right.service_id &&
+    left.control_socket_path === right.control_socket_path
   );
 }
 
@@ -739,24 +783,146 @@ function exactCleanupEffects(
   };
 }
 
-function tcpEndpointAbsent(host, port, timeoutMs = 500) {
+function closeBoundHandle(handle) {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
+    try {
+      handle.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function tcpBindAbsent(host, port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
     let settled = false;
     const finish = (absent) => {
       if (settled) return;
       settled = true;
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(absent);
+      server.removeAllListeners();
+      server.close(() => resolve(absent));
     };
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => finish(false));
-    socket.once("timeout", () => finish(false));
-    socket.once("error", (error) =>
-      finish(error?.code === "ECONNREFUSED"),
-    );
+    server.once("error", () => finish(false));
+    server.listen({ host, port, exclusive: true }, () => finish(true));
   });
+}
+
+function bindTcpExclusive(host, port) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", (error) => reject(error));
+    server.listen({ host, port, exclusive: true }, () => resolve(server));
+  });
+}
+
+function bindUdpExclusive(host, port) {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket({
+      type: net.isIP(host) === 6 ? "udp6" : "udp4",
+      reuseAddr: false,
+    });
+    socket.once("error", (error) => reject(error));
+    socket.bind({ address: host, port, exclusive: true }, () => resolve(socket));
+  });
+}
+
+async function turnListenerPortAbsent(turn) {
+  return tcpBindAbsent(turn.listen_host, turn.listen_port);
+}
+
+async function turnRelayPortsAbsent(turn) {
+  const held = [];
+  try {
+    for (let port = turn.relay_port_min; port <= turn.relay_port_max; port += 1) {
+      let tcp;
+      let udp;
+      try {
+        tcp = await bindTcpExclusive(turn.relay_host, port);
+      } catch {
+        return false;
+      }
+      held.push(tcp);
+      try {
+        udp = await bindUdpExclusive(turn.relay_host, port);
+      } catch {
+        return false;
+      }
+      held.push(udp);
+    }
+    return true;
+  } finally {
+    await Promise.all(held.map(closeBoundHandle));
+  }
+}
+
+function supervisorOwnedVsockBridgesAbsent(sessionAbsent, termination) {
+  return (
+    sessionAbsent === true &&
+    (termination?.graceful === true ||
+      termination?.terminal_record === true)
+  );
+}
+
+function hostProcessIsAlive(binding) {
+  const pid = binding?.pid;
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseVzLaunchSettlementFromStderr(stderr) {
+  const error = launcherError("Browser VZ launcher settlement", stderr);
+  return error?.vz_launch_settlement || null;
+}
+
+function vzLaunchNonPortAbsenceProved(absence) {
+  if (!absence || typeof absence !== "object" || Array.isArray(absence)) {
+    return false;
+  }
+  return VZ_LAUNCH_ABSENCE_KEYS.filter(
+    (key) => !VZ_LAUNCH_PORT_ABSENCE_KEYS.includes(key),
+  ).every((key) => absence[key] === true);
+}
+
+function ownedTurnDelayedTerminal(
+  settlement,
+  binding,
+  sessionAbsent,
+  turnListenerAbsent,
+  relayPortsAbsent,
+) {
+  if (!settlement || !binding) {
+    return false;
+  }
+  if (settlement.schema !== VZ_LAUNCH_SETTLEMENT_SCHEMA) {
+    return false;
+  }
+  if (settlement.effects?.turn_process !== true) {
+    return false;
+  }
+  if (
+    settlement.page_id !== binding.page_id ||
+    settlement.generation !== binding.generation
+  ) {
+    return false;
+  }
+  // effects.turn_process only records that TURN started. Native settlement
+  // absence must prove every non-port effect before the helper retries ports.
+  if (!vzLaunchNonPortAbsenceProved(settlement.absence)) {
+    return false;
+  }
+  return (
+    sessionAbsent === true &&
+    turnListenerAbsent === true &&
+    relayPortsAbsent === true
+  );
 }
 
 async function exactTransportCleanupEffects(binding, termination) {
@@ -768,22 +934,49 @@ async function exactTransportCleanupEffects(binding, termination) {
     authority,
   );
   const sessionAbsent = !fs.existsSync(binding.isolation.session_dir);
-  const turnListenerAbsent = await tcpEndpointAbsent(
-    authority.turn.listen_host,
-    authority.turn.listen_port,
+  // Runtime owns egress/media runtime_socket_path listeners during official close.
+  // Supervisor connects to those paths and proves its own bridges by session
+  // absence plus a graceful or already-terminal owned launcher exit.
+  // Native browser-vz-engine-supervisor owns TURN child cleanup.
+  // Port binds prove only listen and declared TCP/UDP relay absence.
+  const probeTurnPorts =
+    binding.transport_receipt.effects.turn_launch_owned === true;
+  const turnListenerAbsent = probeTurnPorts
+    ? await turnListenerPortAbsent(authority.turn)
+    : true;
+  const relayPortsAbsent = probeTurnPorts
+    ? await turnRelayPortsAbsent(authority.turn)
+    : true;
+  const delayedTurnTerminal = ownedTurnDelayedTerminal(
+    termination?.vz_launch_settlement,
+    binding,
+    sessionAbsent,
+    turnListenerAbsent,
+    relayPortsAbsent,
   );
-  const gracefulOwnerExit = termination?.graceful === true;
-  const ownedEffectsAbsent = gracefulOwnerExit && sessionAbsent;
+  const turnProcessAbsent =
+    !probeTurnPorts ||
+    termination?.graceful === true ||
+    termination?.terminal_record === true ||
+    delayedTurnTerminal;
+  const delayedBridgesAbsent = supervisorOwnedVsockBridgesAbsent(
+    sessionAbsent,
+    {
+      graceful: termination?.graceful === true,
+      terminal_record:
+        termination?.terminal_record === true || delayedTurnTerminal,
+    },
+  );
   return {
     transport_session_absent: sessionAbsent,
-    turn_process_absent: ownedEffectsAbsent,
-    turn_listener_absent: ownedEffectsAbsent && turnListenerAbsent,
-    turn_relay_ports_absent: ownedEffectsAbsent && turnListenerAbsent,
-    ordinary_vsock_bridge_absent: ownedEffectsAbsent,
-    media_vsock_bridge_absent: ownedEffectsAbsent,
-    bootstrap_vsock_bridge_absent: ownedEffectsAbsent,
+    turn_process_absent: turnProcessAbsent,
+    turn_listener_absent: turnListenerAbsent,
+    turn_relay_ports_absent: relayPortsAbsent,
+    ordinary_vsock_bridge_absent: delayedBridgesAbsent,
+    media_vsock_bridge_absent: delayedBridgesAbsent,
+    bootstrap_vsock_bridge_absent: sessionAbsent,
     hibernation_state_absent:
-      ownedEffectsAbsent &&
+      sessionAbsent &&
       binding.transport_receipt.effects.hibernation_disabled === true,
   };
 }
@@ -907,7 +1100,7 @@ function requireExactRuntimeCleanupRecord(
     (binding.principal_id || "") === (launch.principal_id || "") &&
     binding.control_socket_path === page.control_socket_path &&
     binding.shutdown_socket_path === config.control_socket_path &&
-    isDeepStrictEqual(binding.control_service, controlServiceIdentity) &&
+    controlServiceIdentityMatches(binding.control_service, controlServiceIdentity) &&
     isDeepStrictEqual(binding.isolation, page.isolation) &&
     isDeepStrictEqual(binding.process, page.process) &&
     isDeepStrictEqual(
@@ -939,8 +1132,8 @@ function requireExactDurableCleanupRecord(store, binding) {
     !record ||
     !record.cleanup_binding ||
     !record.control_service ||
-    !isDeepStrictEqual(record.control_service, store.control_service) ||
-    !isDeepStrictEqual(binding.control_service, store.control_service) ||
+    !controlServiceIdentityMatches(record.control_service, store.control_service) ||
+    !controlServiceIdentityMatches(binding.control_service, store.control_service) ||
     !launchIdentityMatchesCleanupBinding(record.launch, binding) ||
     !isDeepStrictEqual(record.cleanup_binding, binding) ||
     ![
@@ -1154,6 +1347,21 @@ function parseVzMediaDiagnostic(line, launch) {
   return diagnostic;
 }
 
+function looksLikeRejectedVzMediaDiagnostic(line) {
+  const trimmed = String(line || "").trim();
+  if (
+    !trimmed.startsWith("{") ||
+    !trimmed.includes("elastos.browser.media-diagnostic/v1")
+  ) {
+    return false;
+  }
+  try {
+    return JSON.parse(trimmed)?.schema === "elastos.browser.media-diagnostic/v1";
+  } catch {
+    return false;
+  }
+}
+
 function logVzMediaDiagnostic(diagnostic) {
   logEvent("media_diagnostic", {
     component: "turn",
@@ -1338,15 +1546,17 @@ function launchReconciliationRecordIsSafe(record) {
     launchSettlementIsSafe &&
     record.launch_settlement_result?.state ===
       LAUNCH_SETTLEMENT_TERMINAL;
+  const durableReceiptIsSafe = durableTerminalCleanupReceiptIsSafe(
+    record.terminal_cleanup_receipt,
+    launch,
+    record.cleanup_binding,
+  );
   const terminalCleanupReceiptIsSafe =
     state === LAUNCH_SETTLEMENT_TERMINAL
       ? typedTerminalLaunchSettlement
-        ? record.terminal_cleanup_receipt === undefined
-        : durableTerminalCleanupReceiptIsSafe(
-            record.terminal_cleanup_receipt,
-            launch,
-            record.cleanup_binding,
-          )
+        ? record.terminal_cleanup_receipt === undefined ||
+          durableReceiptIsSafe
+        : durableReceiptIsSafe
       : record.terminal_cleanup_receipt === undefined;
   return (
     record?.schema ===
@@ -1381,7 +1591,8 @@ function launchReconciliationRecordIsSafe(record) {
       (typeof effects.page_acquired === "boolean" &&
         typeof effects.vm_acquired === "boolean")) &&
     launchSettlementIsSafe &&
-    terminalCleanupReceiptIsSafe
+    terminalCleanupReceiptIsSafe &&
+    profileDurabilityIsSafe(record.profile_durability)
   );
 }
 
@@ -1406,6 +1617,9 @@ function durableLaunchReconciliationRecord(record) {
   if (record.launch_settlement_result !== undefined) {
     durable.launch_settlement_result =
       record.launch_settlement_result;
+  }
+  if (record.profile_durability !== undefined) {
+    durable.profile_durability = record.profile_durability;
   }
   return durable;
 }
@@ -1571,6 +1785,19 @@ function recordLaunchReconciliation(
   ) {
     next.cleanup_binding = current.cleanup_binding;
   }
+  if (
+    next.launch_settlement_result === undefined &&
+    current?.launch_settlement_result !== undefined &&
+    current.launch_settlement_result.state === state
+  ) {
+    next.launch_settlement_result = current.launch_settlement_result;
+  }
+  if (
+    next.profile_durability === undefined &&
+    current?.profile_durability !== undefined
+  ) {
+    next.profile_durability = current.profile_durability;
+  }
   launchReconciliations.set(key, next);
   try {
     persistLaunchReconciliations(launchReconciliationStore);
@@ -1583,7 +1810,99 @@ function recordLaunchReconciliation(
   }
 }
 
-function reconcileLaunch(launchReconciliationStore, activePages, body) {
+async function settleDispatchedTransportLaunchWithoutBinding(
+  launchReconciliationStore,
+  record,
+  _shutdownTimeoutMs,
+) {
+  const launch = record?.launch;
+  if (
+    record?.state !== LAUNCH_SETTLEMENT_PENDING ||
+    record.cleanup_binding ||
+    !launch?.transport_authority
+  ) {
+    return record;
+  }
+  const authority = validateVzTransportAuthority(launch.transport_authority);
+  const paths = vzTransportLaunchPaths(authority);
+  if (!paths) {
+    return record;
+  }
+  let owner = null;
+  if (fs.existsSync(paths.owner_path)) {
+    try {
+      owner = JSON.parse(fs.readFileSync(paths.owner_path, "utf8"));
+    } catch {
+      return record;
+    }
+    if (!ownerMatchesTransportLaunch(owner, launch)) {
+      return record;
+    }
+  }
+  const loggedEffects = helperLogVzLaunchEffects(
+    launch.page_id,
+    launch.lifecycle_generation,
+    launch.stream_id,
+  );
+  if (loggedEffects) {
+    logEvent("launch_reconciliation_log_effects", {
+      stream_id: launch.stream_id,
+      page_id: launch.page_id,
+      generation: launch.lifecycle_generation,
+      effects: loggedEffects,
+    });
+  }
+  if (record.launch_settlement_result) {
+    try {
+      const native = validateVzLaunchSettlementForLaunch(
+        record.launch_settlement_result,
+        launch,
+      );
+      if (native.state === LAUNCH_SETTLEMENT_TERMINAL) {
+        return record;
+      }
+      const liveEffectsGone =
+        !fs.existsSync(paths.owner_path) &&
+        !fs.existsSync(paths.session_dir) &&
+        !fs.existsSync(paths.control_socket_path);
+      const nativeAbsent =
+        native.absence?.vm_absent === true &&
+        native.absence?.session_directory_absent === true &&
+        native.absence?.supervisor_child_absent === true;
+      if (liveEffectsGone && nativeAbsent) {
+        recordLaunchReconciliation(
+          launchReconciliationStore,
+          launch,
+          LAUNCH_SETTLEMENT_TERMINAL,
+          {
+            effects: { page_acquired: false, vm_acquired: false },
+            launch_settlement_result: {
+              ...native,
+              state: LAUNCH_SETTLEMENT_TERMINAL,
+              absence: Object.fromEntries(
+                VZ_LAUNCH_ABSENCE_KEYS.map((key) => [key, true]),
+              ),
+            },
+          },
+        );
+        return (
+          launchReconciliationStore.records.get(
+            launchReconciliationKey(
+              launch.lifecycle_generation,
+              launch.stream_id,
+            ),
+          ) || record
+        );
+      }
+    } catch {
+      return record;
+    }
+  }
+  // Keep cleanup_pending until an exact owned native settlement arrives.
+  return record;
+}
+
+async function reconcileLaunch(launchReconciliationStore, activePages, body, shutdownTimeoutMs) {
   const launchReconciliations = launchReconciliationStore.records;
   if (
     body?.schema !== "elastos.browser.vm-control-service.reconcile-launch/v1" ||
@@ -1683,11 +2002,16 @@ function reconcileLaunch(launchReconciliationStore, activePages, body) {
       "Browser VM launch reconciliation authority does not match the durable record",
     );
   }
+  const settled = await settleDispatchedTransportLaunchWithoutBinding(
+    launchReconciliationStore,
+    record,
+    shutdownTimeoutMs,
+  );
   return {
-    ...record,
+    ...(settled || record),
     responder_control_service: launchReconciliationStore.control_service,
-    ...(record.launch?.transport_authority
-      ? { transport_authority: record.launch.transport_authority }
+    ...((settled || record).launch?.transport_authority
+      ? { transport_authority: (settled || record).launch.transport_authority }
       : {}),
   };
 }
@@ -1713,6 +2037,8 @@ function markLaunchReconciliationTerminal(
         ...(terminalCleanupReceipt
           ? { terminal_cleanup_receipt: terminalCleanupReceipt }
           : {}),
+        ...profileDurabilityFields(terminalCleanupReceipt),
+        ...profileDurabilityFields(record),
       },
     );
   }
@@ -1828,6 +2154,46 @@ function idleVmReuseEnabled(config) {
 
 function vmKeyHash(vmKey) {
   return crypto.createHash("sha256").update(String(vmKey || "")).digest("hex").slice(0, 16);
+}
+
+function launcherChildIsLive(child) {
+  return Boolean(child) && child.exitCode == null && child.signalCode == null;
+}
+
+function vmOwnsExactPage(vmRecord, pageId) {
+  return (
+    Boolean(pageId) &&
+    vmRecord?.pages instanceof Set &&
+    vmRecord.pages.has(pageId)
+  );
+}
+
+function ownedVmRecord(record, pageId, activeVms) {
+  const vmRecord = record?.vm_key ? activeVms.get(record.vm_key) : null;
+  return vmOwnsExactPage(vmRecord, pageId) ? vmRecord : null;
+}
+
+function pageHoldsLiveCapacity(pageId, record, activeVms) {
+  if (launcherChildIsLive(record?.launcher_child)) {
+    return true;
+  }
+  return launcherChildIsLive(ownedVmRecord(record, pageId, activeVms)?.launcher_child);
+}
+
+function liveCapacityPageCount(activePages, activeVms) {
+  let count = 0;
+  for (const [pageId, record] of activePages.entries()) {
+    if (pageHoldsLiveCapacity(pageId, record, activeVms)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function pendingCleanupPageIds(activePages, activeVms) {
+  return [...activePages.entries()]
+    .filter(([pageId, record]) => !pageHoldsLiveCapacity(pageId, record, activeVms))
+    .map(([pageId]) => pageId);
 }
 
 const LIFECYCLE_PHASES = [
@@ -1947,11 +2313,14 @@ function lifecycleWarmVmRecord(vmKey, vmRecord, nowMs, config) {
 function lifecycleStatus(config, activePages, activeVms, pendingLaunches) {
   const nowMs = Date.now();
   const maxActivePages = Number(config.max_active_pages ?? 1);
+  const livePages = [...activePages.entries()].filter(([pageId, record]) =>
+    pageHoldsLiveCapacity(pageId, record, activeVms),
+  );
   const sessions = [
     ...[...pendingLaunches.entries()].map(([requestId, launch]) =>
       lifecyclePendingLaunchRecord(requestId, launch, nowMs),
     ),
-    ...[...activePages.entries()].map(([pageId, record]) =>
+    ...livePages.map(([pageId, record]) =>
       lifecycleActivePageRecord(pageId, record, nowMs),
     ),
     ...[...activeVms.entries()]
@@ -1962,7 +2331,7 @@ function lifecycleStatus(config, activePages, activeVms, pendingLaunches) {
     schema: "elastos.browser.lifecycle-status/v1",
     owner: "vm_control_service",
     phases: LIFECYCLE_PHASES,
-    capacity_available: activePages.size < maxActivePages,
+    capacity_available: liveCapacityPageCount(activePages, activeVms) < maxActivePages,
     sessions,
     redaction: {
       principal_id: "sha256-16",
@@ -2454,6 +2823,246 @@ function vmSupervisorResultFromGuest(result, launch, vmRecord) {
   return normalized;
 }
 
+function persistentLauncherReadyLine(stdout) {
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed?.schema === "elastos.browser.engine.supervisor-result/v1") {
+        return trimmed;
+      }
+    } catch {
+      // Host tools such as debugfs may write stdout before the supervisor result.
+    }
+  }
+  return null;
+}
+
+function attachLauncherFailureContext(error, child, stderr, stderrTail) {
+  const next = error instanceof Error ? error : new Error(String(error));
+  next.launcher_child = child;
+  next.stderr = stderr;
+  next.stderr_tail = stderrTail;
+  return next;
+}
+
+function launchedChildFromFailure(launcher, error) {
+  return launcher?.child || error?.launcher_child || null;
+}
+
+function launchedStderrFromFailure(launcher, error) {
+  return (
+    launcher?.stderr_tail?.text ||
+    error?.stderr_tail?.text ||
+    launcher?.stderr ||
+    error?.stderr ||
+    ""
+  );
+}
+
+function vzTransportLaunchPaths(authority) {
+  const digest = String(authority?.binding_hash || "")
+    .replace(/^sha256:/, "")
+    .toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    return null;
+  }
+  const segment = digest.slice(0, 32);
+  const sessionRoot = process.env.ELASTOS_BROWSER_VM_ROOT || "/tmp/evzs";
+  const socketRoot = process.env.ELASTOS_BROWSER_VM_SOCKET_ROOT || "/tmp/evzrc";
+  const socketDir = path.join(socketRoot, segment);
+  return {
+    session_dir: path.join(sessionRoot, `vz-${segment}`),
+    socket_dir: socketDir,
+    control_socket_path: path.join(socketDir, "c.sock"),
+    owner_path: path.join(socketDir, "owner.json"),
+  };
+}
+
+function ownerMatchesTransportLaunch(owner, launch) {
+  return (
+    owner?.schema === "elastos.browser.vz-socket-owner/v1" &&
+    owner.page_id === launch.page_id &&
+    owner.generation === launch.lifecycle_generation &&
+    owner.vm_id === launch.vm_id &&
+    owner.stream_id === launch.stream_id
+  );
+}
+
+function helperLogVzLaunchEffects(pageId, generation, streamId) {
+  const dataDir = process.env.ELASTOS_BROWSER_VM_DATA_DIR;
+  const logPath =
+    process.env.ELASTOS_BROWSER_VM_CONTROL_SERVICE_LOG ||
+    (dataDir
+      ? path.join(dataDir, "logs/browser-vm-control-service.log")
+      : "");
+  if (!logPath || !fs.existsSync(logPath)) {
+    return null;
+  }
+  let text = "";
+  try {
+    const fd = fs.openSync(logPath, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const start = Math.max(0, size - 2 * 1024 * 1024);
+      const buffer = Buffer.alloc(size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      text = buffer.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  let sawSession = false;
+  let sawTurn = false;
+  for (const line of text.split(/\r?\n/)) {
+    if (
+      !line.includes(pageId) &&
+      !line.includes(generation) &&
+      !line.includes(streamId)
+    ) {
+      continue;
+    }
+    try {
+      const event = JSON.parse(line);
+      if (event.page_id && event.page_id !== pageId) continue;
+      if (event.generation && event.generation !== generation) continue;
+      if (event.stream_id && event.stream_id !== streamId) continue;
+      if (event.event === "media_diagnostic") {
+        sawSession = true;
+        if (
+          event.diagnostic_event === "turn_process_started" ||
+          event.diagnostic_event === "turn_listener_ready"
+        ) {
+          sawTurn = true;
+        }
+      }
+      if (
+        event.event === "launch_failed" &&
+        String(event.error || "").includes("Allocated inode")
+      ) {
+        sawSession = true;
+      }
+    } catch {
+      // Ignore non-JSON log lines.
+    }
+  }
+  if (!sawSession) {
+    return null;
+  }
+  return {
+    session_directory: true,
+    control_socket: true,
+    ordinary_stream_bridge: true,
+    media_stream_bridge: true,
+    turn_process: sawTurn,
+    supervisor_child: true,
+    vm: true,
+  };
+}
+
+function supervisorPidOwningPath(socketPath) {
+  try {
+    const output = execFileSync("lsof", ["-t", "--", socketPath], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    const pids = [
+      ...new Set(
+        String(output)
+          .trim()
+          .split(/\s+/)
+          .map((value) => Number(value))
+          .filter((pid) => Number.isInteger(pid) && pid > 1 && pid !== process.pid),
+      ),
+    ];
+    return pids.length === 1 ? pids[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+function terminateOwnedSupervisorPid(pid, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (!Number.isInteger(pid) || pid <= 1) {
+      resolve({ already_exited: true, graceful: false, forced: false });
+      return;
+    }
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        resolve({ already_exited: true, graceful: false, forced: false });
+        return;
+      }
+      reject(error);
+      return;
+    }
+    let forced = false;
+    let settled = false;
+    const finish = (result, error = null) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      clearTimeout(killTimer);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const poll = setInterval(() => {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if (error?.code === "ESRCH") {
+          finish({
+            already_exited: false,
+            graceful: !forced,
+            forced,
+          });
+        }
+      }
+    }, 100);
+    const killTimer = setTimeout(() => {
+      forced = true;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (error?.code === "ESRCH") {
+          finish({ already_exited: false, graceful: false, forced: true });
+          return;
+        }
+        finish(null, error);
+        return;
+      }
+      setTimeout(() => {
+        try {
+          process.kill(pid, 0);
+          finish(
+            null,
+            new Error("Browser VZ supervisor did not exit after its exact SIGKILL"),
+          );
+        } catch (error) {
+          if (error?.code === "ESRCH") {
+            finish({ already_exited: false, graceful: false, forced: true });
+            return;
+          }
+          finish(null, error);
+        }
+      }, Math.min(Math.max(timeoutMs, 100), 5000));
+    }, timeoutMs);
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        finish({ already_exited: true, graceful: false, forced: false });
+        return;
+      }
+      finish(null, error);
+    }
+  });
+}
+
 function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, launch) {
   return new Promise((resolve, reject) => {
     let child;
@@ -2471,6 +3080,7 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
     let stdout = "";
     let stderr = "";
     let diagnosticStderr = "";
+    const stderrTail = { text: "" };
     let phase = "running";
     let timer;
     const clearSettlementTriggers = () => {
@@ -2481,13 +3091,13 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
       if (phase === "settled") return;
       phase = "settled";
       clearSettlementTriggers();
-      reject(error);
+      reject(attachLauncherFailureContext(error, child, stderr, stderrTail));
     };
     const settleOk = (line) => {
       if (phase !== "running") return;
       phase = "settled";
       clearSettlementTriggers();
-      resolve({ stdout: line, stderr, child, owner_reaped: false });
+      resolve({ stdout: line, stderr, child, owner_reaped: false, stderr_tail: stderrTail });
     };
     const terminateFor = (error) => {
       if (phase !== "running") return;
@@ -2527,9 +3137,9 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
     signal?.addEventListener?.("abort", abortLaunch, { once: true });
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
-      const lines = stdout.split(/\r?\n/).filter(Boolean);
-      if (lines.length > 0) {
-        settleOk(lines[0]);
+      const ready = persistentLauncherReadyLine(stdout);
+      if (ready) {
+        settleOk(ready);
       }
     });
     child.stderr.on("data", (chunk) => {
@@ -2548,6 +3158,11 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, laun
         const diagnostic = parseVzMediaDiagnostic(line, launch);
         if (diagnostic) {
           logVzMediaDiagnostic(diagnostic);
+        } else if (!looksLikeRejectedVzMediaDiagnostic(line)) {
+          stderrTail.text += `${line}\n`;
+          if (stderrTail.text.length > 8192) {
+            stderrTail.text = stderrTail.text.slice(-8192);
+          }
         }
       }
     });
@@ -2659,7 +3274,10 @@ function recordProvenLaunchFailure(
                   error?.vz_launch_settlement?.effects?.vm ?? true,
               },
         ...(error?.vz_launch_settlement
-          ? { launch_settlement_result: error.vz_launch_settlement }
+          ? {
+              launch_settlement_result: error.vz_launch_settlement,
+              ...profileDurabilityFields(error.vz_launch_settlement),
+            }
           : {}),
       },
     );
@@ -2710,10 +3328,31 @@ async function settleDispatchedLaunchFailure(
   shutdownTimeoutMs,
   transportLaunch = false,
 ) {
-  if (
-    transportLaunch &&
-    !error?.vz_launch_settlement
-  ) {
+  const child = launchedChildFromFailure(launcher, error);
+  if (launcherChildIsLive(child)) {
+    try {
+      await terminatePersistentLauncher(child, shutdownTimeoutMs);
+    } catch (cleanupError) {
+      return launchSettlementError(
+        error,
+        LAUNCH_SETTLEMENT_PENDING,
+        cleanupError,
+      );
+    }
+  }
+  const settlement =
+    error?.vz_launch_settlement ||
+    parseVzLaunchSettlementFromStderr(launchedStderrFromFailure(launcher, error));
+  if (settlement) {
+    return launchSettlementError(
+      Object.assign(
+        error instanceof Error ? error : new Error(String(error)),
+        { vz_launch_settlement: settlement },
+      ),
+      settlement.state,
+    );
+  }
+  if (transportLaunch) {
     return launchSettlementError(
       error,
       LAUNCH_SETTLEMENT_PENDING,
@@ -2727,19 +3366,7 @@ async function settleDispatchedLaunchFailure(
   ) {
     return error;
   }
-  if (launcher?.child) {
-    try {
-      await terminatePersistentLauncher(launcher.child, shutdownTimeoutMs);
-      return launchSettlementError(error, LAUNCH_SETTLEMENT_TERMINAL);
-    } catch (cleanupError) {
-      return launchSettlementError(
-        error,
-        LAUNCH_SETTLEMENT_PENDING,
-        cleanupError,
-      );
-    }
-  }
-  if (launcher?.owner_reaped === true) {
+  if (launcher?.owner_reaped === true || child) {
     return launchSettlementError(error, LAUNCH_SETTLEMENT_TERMINAL);
   }
   return launchSettlementError(error, LAUNCH_SETTLEMENT_PENDING);
@@ -2781,8 +3408,9 @@ async function openPage(
     throw new Error(`Browser VM launch already in progress${busyStreamId ? ` for ${busyStreamId}` : ""}`);
   }
   const maxActivePages = Number(config.max_active_pages ?? 1);
-  if (activePages.size >= maxActivePages) {
-    throw new Error(`Browser VM active page capacity reached (${activePages.size}/${maxActivePages}); close a page before launching another page`);
+  const livePages = liveCapacityPageCount(activePages, activeVms);
+  if (livePages >= maxActivePages) {
+    throw new Error(`Browser VM active page capacity reached (${livePages}/${maxActivePages}); close a page before launching another page`);
   }
   await retireConflictingIdleVmsForProfile(config, activeVms, vmKey, profileLeaseKey);
   await retireNonReusableIdleVmsForSinglePageRuntime(config, activeVms, vmKey);
@@ -3041,16 +3669,17 @@ async function openPage(
         supervisor_result: result,
       },
     );
+    const acquiredVmKey = vmKey || result.control_socket_path || null;
     activePages.set(result.page_id, {
       page: result,
       launch,
-      vm_key: vmKey,
+      vm_key: acquiredVmKey,
       launcher_child: launcher.child || null,
       process_binding: result.process,
       started_at: new Date(startedAt).toISOString(),
     });
-    if (vmKey && result.control_socket_path) {
-      activeVms.set(vmKey, {
+    if (acquiredVmKey && result.control_socket_path) {
+      activeVms.set(acquiredVmKey, {
         control_socket_path: result.control_socket_path,
         isolation: result.isolation,
         launcher_child: launcher.child || null,
@@ -3069,7 +3698,7 @@ async function openPage(
       const handleLauncherExit = (code, exitSignal) => {
         if (launcherExitHandled) return;
         launcherExitHandled = true;
-        const currentVm = vmKey ? activeVms.get(vmKey) : null;
+        const currentVm = acquiredVmKey ? activeVms.get(acquiredVmKey) : null;
         const affectedPages =
           currentVm?.launcher_child === launcher.child
             ? [...currentVm.pages]
@@ -3078,15 +3707,28 @@ async function openPage(
             : [activePages.get(result.page_id)].filter(
                 (record) => record?.launcher_child === launcher.child,
               );
+        const stderrTail = String(launcher.stderr_tail?.text || "").trim();
+        const launchSettlement = parseVzLaunchSettlementFromStderr(stderrTail);
+        const nextState =
+          launchSettlement?.state === LAUNCH_SETTLEMENT_TERMINAL
+            ? LAUNCH_SETTLEMENT_TERMINAL
+            : LAUNCH_SETTLEMENT_PENDING;
         for (const affected of affectedPages) {
           affected.cleanup_pending = true;
+          affected.stderr_tail = launcher.stderr_tail;
           try {
             recordLaunchReconciliation(
               launchReconciliations,
               affected.launch,
-              LAUNCH_SETTLEMENT_PENDING,
+              nextState,
               {
                 effects: { page_acquired: true, vm_acquired: true },
+                ...(launchSettlement
+                  ? {
+                      launch_settlement_result: launchSettlement,
+                      ...profileDurabilityFields(launchSettlement),
+                    }
+                  : {}),
               },
             );
           } catch (error) {
@@ -3096,17 +3738,24 @@ async function openPage(
             );
             logEvent("launch_reconciliation_persist_failed", {
               stream_id: affected.launch.stream_id,
-              intended_state: LAUNCH_SETTLEMENT_PENDING,
+              intended_state: nextState,
               error: error instanceof Error ? error.message : String(error),
             });
           }
+        }
+        if (currentVm?.launcher_child === launcher.child && acquiredVmKey) {
+          clearIdleVmShutdown(currentVm);
+          activeVms.delete(acquiredVmKey);
         }
         logEvent("launcher_exit", {
           request_id: requestId,
           page_id: result.page_id,
           code,
           signal: exitSignal,
-          settlement: LAUNCH_SETTLEMENT_PENDING,
+          settlement: nextState,
+          live_capacity_pages: liveCapacityPageCount(activePages, activeVms),
+          pending_cleanup_pages: pendingCleanupPageIds(activePages, activeVms).length,
+          ...(stderrTail ? { stderr_tail: stderrTail } : {}),
         });
       };
       launcher.child.once("exit", handleLauncherExit);
@@ -3218,9 +3867,11 @@ async function shutdownPage(
       record,
     );
   }
-  let vmKey = record?.vm_key || null;
-  let vmRecord = vmKey ? activeVms.get(vmKey) : null;
-  if (!vmRecord) {
+  let vmKey = null;
+  let vmRecord = ownedVmRecord(record, pageId, activeVms);
+  if (vmRecord) {
+    vmKey = record.vm_key;
+  } else {
     for (const [candidateKey, candidate] of activeVms.entries()) {
       if (candidate.pages.has(pageId)) {
         vmKey = candidateKey;
@@ -3230,7 +3881,16 @@ async function shutdownPage(
     }
   }
 
-  const recordCleanupPending = () =>
+  const recordCleanupPending = () => {
+    const current = launchReconciliations.records.get(
+      launchReconciliationKey(
+        runtimeCleanup.generation,
+        runtimeCleanup.stream_id,
+      ),
+    );
+    if (current?.state === LAUNCH_SETTLEMENT_TERMINAL) {
+      return;
+    }
     recordLaunchReconciliation(
       launchReconciliations,
       durableRecord.launch,
@@ -3240,6 +3900,7 @@ async function shutdownPage(
         cleanup_binding: runtimeCleanup,
       },
     );
+  };
   const runShutdownProgram = async (page) => {
     if (!config.shutdown_program) return;
     const request = JSON.stringify({
@@ -3261,6 +3922,53 @@ async function shutdownPage(
   };
 
   if (!record && !vmRecord) {
+    if (
+      durableRecord.state === LAUNCH_SETTLEMENT_PENDING &&
+      durableRecord.launch_settlement_result &&
+      !hostProcessIsAlive(runtimeCleanup.process)
+    ) {
+      const delayedEffects = await exactTransportCleanupEffects(
+        runtimeCleanup,
+        {
+          graceful: false,
+          terminal_record: false,
+          vz_launch_settlement: durableRecord.launch_settlement_result,
+        },
+      );
+      const delayedUnresolved = Object.entries(delayedEffects)
+        .filter(([, value]) => value !== true)
+        .map(([key]) => key);
+      if (delayedUnresolved.length === 0) {
+        const receipt = terminalCleanupReceipt(
+          runtimeCleanup,
+          {
+            page_absent: true,
+            child_absent: true,
+            vm_absent: true,
+            route_absent: true,
+            socket_absent: true,
+            ...delayedEffects,
+          },
+          {
+            already_absent: true,
+            delayed_turn_port_absence: true,
+            ...profileDurabilityFields(durableRecord),
+            ...profileDurabilityFields(durableRecord.launch_settlement_result),
+          },
+        );
+        markLaunchReconciliationTerminal(
+          launchReconciliations,
+          runtimeCleanup.generation,
+          runtimeCleanup.stream_id,
+          {
+            page_acquired: true,
+            vm_acquired: true,
+          },
+          runtimeCleanup.transport_authority ? receipt : undefined,
+        );
+        return receipt;
+      }
+    }
     if (durableRecord.state !== LAUNCH_SETTLEMENT_TERMINAL) {
       throw new Error(
         "Browser VM cleanup remains indeterminate after service restart: exact owned launcher unavailable",
@@ -3280,7 +3988,11 @@ async function shutdownPage(
         socket_absent: true,
         ...transportEffects,
       },
-      { already_absent: true },
+      {
+        already_absent: true,
+        ...profileDurabilityFields(durableRecord),
+        ...profileDurabilityFields(durableRecord.launch_settlement_result),
+      },
     );
   }
   if (
@@ -3304,7 +4016,12 @@ async function shutdownPage(
   let closeError = null;
   const controlSocketPath =
     vmRecord?.control_socket_path || record?.page?.control_socket_path || "";
-  if (controlSocketPath) {
+  if (controlSocketPath && runtimeCleanup.transport_authority) {
+    logEvent("vm_retirement_defers_guest_page_close", {
+      page_id: pageId,
+      reason: "supervisor_owns_guest_profile_flush",
+    });
+  } else if (controlSocketPath) {
     try {
       await postJsonOverUnix(
         controlSocketPath,
@@ -3348,14 +4065,6 @@ async function shutdownPage(
           "Browser VM exact owned launcher did not produce an exit receipt",
         );
       }
-      if (
-        runtimeCleanup.transport_authority &&
-        launcherTermination?.graceful !== true
-      ) {
-        throw new Error(
-          "Browser VZ exact launcher did not produce a graceful terminal exit",
-        );
-      }
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
     }
@@ -3386,9 +4095,30 @@ async function shutdownPage(
       `Browser VM cleanup remains indeterminate: ${externallyUnresolved.join(", ")}`,
     );
   }
+  const launchSettlement =
+    parseVzLaunchSettlementFromStderr(
+      String(
+        record?.stderr_tail?.text ||
+          record?.launcher_child?.stderr_tail?.text ||
+          "",
+      ),
+    ) ||
+    launchReconciliations.records.get(
+      launchReconciliationKey(
+        runtimeCleanup.generation,
+        runtimeCleanup.stream_id,
+      ),
+    )?.launch_settlement_result ||
+    durableRecord.launch_settlement_result;
   const transportEffects = await exactTransportCleanupEffects(
     runtimeCleanup,
-    launcherTermination,
+    {
+      ...launcherTermination,
+      ...(launchSettlement?.state === LAUNCH_SETTLEMENT_TERMINAL
+        ? { terminal_record: true }
+        : {}),
+      vz_launch_settlement: launchSettlement,
+    },
   );
   const unresolvedTransport = Object.entries(transportEffects)
     .filter(([, value]) => value !== true)
@@ -3420,22 +4150,37 @@ async function shutdownPage(
     {
       forced_vm_retirement: Boolean(closeError),
       ...(closeError ? { control_error: closeError } : {}),
+      ...profileDurabilityFields(durableRecord),
+      ...profileDurabilityFields(durableRecord.launch_settlement_result),
+      ...profileDurabilityFields(launchSettlement),
     },
   );
   markVmPendingLaunchReconciliationsTerminal(
     launchReconciliations,
     vmRecord,
   );
-  markLaunchReconciliationTerminal(
-    launchReconciliations,
-    runtimeCleanup.generation,
-    runtimeCleanup.stream_id,
-    {
-      page_acquired: true,
-      vm_acquired: true,
-    },
-    runtimeCleanup.transport_authority ? receipt : undefined,
-  );
+  try {
+    markLaunchReconciliationTerminal(
+      launchReconciliations,
+      runtimeCleanup.generation,
+      runtimeCleanup.stream_id,
+      {
+        page_acquired: true,
+        vm_acquired: true,
+      },
+      runtimeCleanup.transport_authority ? receipt : undefined,
+    );
+  } catch (error) {
+    if (launchSettlement?.state !== LAUNCH_SETTLEMENT_TERMINAL) {
+      throw error;
+    }
+    logEvent("launch_reconciliation_persist_failed", {
+      stream_id: runtimeCleanup.stream_id,
+      page_id: pageId,
+      intended_state: LAUNCH_SETTLEMENT_TERMINAL,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   return receipt;
 }
 
@@ -3450,7 +4195,7 @@ function activePageGuestControl(activePages, activeVms, pageId) {
   if (record.cleanup_pending === true) {
     throw new Error("browser page cleanup is pending");
   }
-  const vmRecord = record.vm_key ? activeVms.get(record.vm_key) : null;
+  const vmRecord = ownedVmRecord(record, pageId, activeVms);
   const controlSocketPath = vmRecord?.control_socket_path || record.page?.control_socket_path || "";
   if (!controlSocketPath) {
     throw new Error("browser page guest control socket is unavailable");
@@ -3643,6 +4388,8 @@ function main() {
         return;
       }
       if (req.method === "GET" && url.pathname === "/status") {
+        const livePages = liveCapacityPageCount(activePages, activeVms);
+        const pendingIds = pendingCleanupPageIds(activePages, activeVms);
         sendJson(200, {
           schema: "elastos.browser.vm-control-service.status/v1",
           ok: true,
@@ -3651,16 +4398,22 @@ function main() {
           uptime_ms: Math.max(0, Date.now() - serviceStartedAtMs),
           config_fingerprint: config.config_fingerprint || null,
           control_service: controlServiceIdentity,
-          active_pages: activePages.size,
+          active_pages: livePages,
           active_vms: activeVms.size,
           warm_vms: [...activeVms.values()].filter((record) => record.pages.size === 0).length,
           max_active_pages: Number(config.max_active_pages ?? 1),
           idle_vm_keepalive_ms: idleVmKeepaliveMs(config),
           reuse_idle_vms: idleVmReuseEnabled(config),
           hibernation_mode: config.hibernation_mode || "off",
-          capacity_available: activePages.size < Number(config.max_active_pages ?? 1),
-          page_ids: [...activePages.keys()],
-          active_stream_ids: [...activePages.values()].map((record) => record.page?.stream_id || record.launch?.stream_id || ""),
+          capacity_available: livePages < Number(config.max_active_pages ?? 1),
+          pending_cleanup_pages: pendingIds.length,
+          pending_cleanup_page_ids: pendingIds,
+          page_ids: [...activePages.keys()].filter((pageId) =>
+            pageHoldsLiveCapacity(pageId, activePages.get(pageId), activeVms),
+          ),
+          active_stream_ids: [...activePages.entries()]
+            .filter(([pageId, record]) => pageHoldsLiveCapacity(pageId, record, activeVms))
+            .map(([, record]) => record.page?.stream_id || record.launch?.stream_id || ""),
           pending_launches: pendingLaunches.size,
           pending_stream_ids: [...pendingLaunches.values()].map((launch) => launch.stream_id),
           lifecycle: lifecycleStatus(config, activePages, activeVms, pendingLaunches),
@@ -3796,10 +4549,11 @@ function main() {
       if (req.method === "POST" && url.pathname === "/launches/reconcile") {
         sendJson(
           200,
-          reconcileLaunch(
+          await reconcileLaunch(
             launchReconciliations,
             activePages,
             await readJsonBody(req),
+            Number(config.shutdown_timeout_ms ?? 30000),
           ),
         );
         return;

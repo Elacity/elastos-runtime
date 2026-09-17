@@ -1295,12 +1295,17 @@ test("unexpected close errors return error receipts without implying terminal", 
 test("iframe unload and refresh remain teardown-only", () => {
   const unloadBlock = extractFunction(browserSource, "releaseRuntimePageForUnload");
   assert.doesNotMatch(unloadBlock, /closeRuntimePage\s*\(/);
+  assert.doesNotMatch(unloadBlock, /display_attach/);
+  assert.doesNotMatch(unloadBlock, /prepareRecoverableDisplayAttach/);
+  assert.doesNotMatch(unloadBlock, /startRecoverableDisplayAttach/);
+  assert.doesNotMatch(browserSource, /prepareRecoverableDisplayAttach/);
+  assert.match(browserSource, /function startRecoverableDisplayAttach/);
   assert.match(
     browserSource,
-    /window\.addEventListener\("beforeunload", \(\) => \{\s*releaseRuntimePageForUnload\(\);\s*\}\);/,
+    /window\.addEventListener\("beforeunload", \(\) => \{\s*startRecoverableDisplayAttach\(\);\s*releaseRuntimePageForUnload\(\);\s*\}\);/,
   );
   assert.match(
     browserSource,
-    /window\.addEventListener\("pagehide", releaseRuntimePageForUnload\);/,
+    /window\.addEventListener\("pagehide", \(event\) => \{/,
   );
 });

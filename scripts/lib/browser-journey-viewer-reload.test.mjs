@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
-import { diagnoseBrowserViewerReload } from "./browser-journey-viewer-reload.mjs";
+import { censusBrowserViewerReload, classifyReloadCensus, diagnoseBrowserViewerReload } from "./browser-journey-viewer-reload.mjs";
 
 const hash = value => `sha256:${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
 const secret = "private-token-turn://credential@private.invalid";
@@ -154,6 +154,18 @@ async function fails(options, expected, edit) {
   assert.ok(f.calls.filter(call => call.method === "input").length <= 1);
   return { ...f, evidence };
 }
+
+test("late observe samples report unmeasured bindings instead of claiming a match", async () => {
+  const f = fixture();
+  f.args.observeMs = 5500;
+  const proof = await f.run();
+  assert.equal(proof.ok, true);
+  const observed = proof.samples.filter(sample => sample.phase === "observe");
+  assert.ok(observed.length > 0);
+  assert.ok(observed.every(sample => sample.binding_matches === "unmeasured"));
+  assert.ok(proof.samples.filter(sample => sample.phase !== "observe")
+    .every(sample => sample.binding_matches === true));
+});
 
 test("a new viewer retains fresh Runtime binding, resets counters, decodes and appends exact input within five seconds", async () => {
   const f = fixture();
@@ -388,6 +400,114 @@ test("failed Runtime predicate is retained before any pending viewer check", asy
   assert.ok(evidence.binding_failure.at_ms >= evidence.reload_started_ms);
 });
 
+test("reload census records candidate creation, send, ICE, and first frame without the product gate", async () => {
+  const timer = virtualClock();
+  let reloaded = false, frames = 40, record, recordDiagnostic;
+  const evidence = await timer.run(censusBrowserViewerReload({
+    clock: timer.clock,
+    async observeRequests(callback) {
+      record = callback;
+      return async () => {};
+    },
+    async observeDiagnostics(callback) {
+      recordDiagnostic = callback;
+      return async () => {};
+    },
+    async readState() {
+      if (!reloaded) frames += 1;
+      return {
+        viewer: {
+          page_id: "page-current", engine_id: "selected-engine", exit_id: "selected-exit",
+          browser_instance: "instance-current", actual_url: fixtureUrl, document_id: reloaded ? 2 : 1,
+        },
+        video: {
+          present: true, hidden: false, paused: false, ready_state: 4,
+          video_width: 640, video_height: 360, client_width: 640, client_height: 360,
+          decoded_frames: frames, video_bytes_received: 1000,
+        },
+      };
+    },
+    async reloadViewer() {
+      reloaded = true;
+      frames = 0;
+      record({ kind: "navigation", phase: "commit", source_matches: true });
+      record({ kind: "signaling", phase: "request", source_matches: true, signal_type: "display_attach" });
+      record({ kind: "signaling", phase: "response", source_matches: true, signal_type: "display_attach", status: 200 });
+      record({ kind: "signaling", phase: "request", source_matches: true, signal_type: "answer" });
+      record({ kind: "signaling", phase: "response", source_matches: true, signal_type: "answer", status: 200 });
+      recordDiagnostic({ schema: "elastos.browser.media-diagnostic/v1", event: "viewer_browser_candidate",
+        candidate_type: "relay" });
+      record({ kind: "signaling", phase: "request", source_matches: true, signal_type: "candidate" });
+      record({ kind: "signaling", phase: "response", source_matches: true, signal_type: "candidate", status: 200 });
+      recordDiagnostic({ schema: "elastos.browser.media-diagnostic/v1", event: "viewer_ice_state",
+        ice_connection_state: "checking" });
+      recordDiagnostic({ schema: "elastos.browser.media-diagnostic/v1", event: "viewer_ice_state",
+        ice_connection_state: "connected" });
+      frames = 8;
+    },
+  }));
+  const classified = classifyReloadCensus(evidence);
+  assert.equal(evidence.ok, true);
+  assert.equal(evidence.first_frame_in_window, true);
+  assert.ok(classified.display_attach_request_ms >= 0);
+  assert.ok(classified.first_answer_request_ms >= classified.display_attach_request_ms);
+  assert.ok(classified.first_local_candidate_created_ms >= classified.first_answer_request_ms);
+  assert.ok(classified.first_candidate_request_ms >= classified.first_local_candidate_created_ms);
+  assert.ok(classified.ice_connected_ms >= classified.ice_checking_ms);
+  assert.ok(classified.first_decoded_frame_ms >= classified.ice_connected_ms);
+});
+
+test("reload census keeps recording past five seconds and classifies a late first frame", async () => {
+  const timer = virtualClock();
+  let reloaded = false, frames = 40, reloadAt = 0, record;
+  const evidence = await timer.run(censusBrowserViewerReload({
+    clock: timer.clock,
+    watchMs: 20_000,
+    async observeRequests(callback) {
+      record = callback;
+      return async () => {};
+    },
+    async readState() {
+      const elapsed = reloaded ? timer.clock.now() - reloadAt : 0;
+      if (!reloaded) frames += 1;
+      else frames = elapsed >= 8_000 ? 4 : 0;
+      return {
+        viewer: {
+          page_id: "page-current", engine_id: "selected-engine", exit_id: "selected-exit",
+          browser_instance: "instance-current", actual_url: fixtureUrl, document_id: reloaded ? 2 : 1,
+        },
+        page_status: {
+          webrtc_signaling: {
+            selkies_offers_received: reloaded ? 2 : 1,
+            browser_answers_received: reloaded && elapsed >= 1_000 ? 1 : 0,
+          },
+        },
+        video: {
+          present: true, hidden: false, paused: false, ready_state: reloaded && frames === 0 ? 0 : 4,
+          video_width: 640, video_height: 360, client_width: 640, client_height: 360,
+          decoded_frames: frames, video_bytes_received: 1000,
+        },
+      };
+    },
+    async reloadViewer() {
+      reloaded = true;
+      reloadAt = timer.clock.now();
+      frames = 0;
+      record({ kind: "navigation", phase: "commit", source_matches: true, document_generation: 1 });
+      record({ kind: "signaling", phase: "response", source_matches: true, signal_type: "display_attach",
+        status: 200, initial_offer_ice: { candidate_count: 1, relay_candidate_count: 1 } });
+    },
+  }));
+  assert.equal(evidence.ok, true);
+  assert.equal(evidence.classification.first_decoded_frame_after_deadline, true);
+  assert.ok(evidence.classification.first_decoded_frame_ms >= 8_000);
+  assert.ok(evidence.classification.last_sample_ms >= 15_000);
+  assert.deepEqual(evidence.classification.attach_initial_offer_ice,
+    { candidate_count: 1, relay_candidate_count: 1 });
+  assert.equal(evidence.classification.document_generations[0], 1);
+  assert.ok(evidence.samples.some((row) => row.engine_signaling?.selkies_offers_received === 2));
+});
+
 test("reload retains summary and attachment header timing without accepting bodies or changing its gate", async () => {
   const f = fixture(), reload = f.args.reloadViewer;
   f.args.reloadViewer = async budget => {
@@ -400,4 +520,84 @@ test("reload retains summary and attachment header timing without accepting bodi
   assert.equal(evidence.requests.filter(row => row.kind === "summary").length, 2);
   assert.ok(evidence.requests.some(row => row.kind === "signaling" && row.event === "headers" && row.status === 200));
   assert.ok(evidence.reload_ms <= 5000); assert.ok(!JSON.stringify(evidence).includes(secret));
+});
+
+test("reload census treats extra navigation events as observers when the document hash stays the same", () => {
+  const classified = classifyReloadCensus({
+    reload_started_ms: 100,
+    requests: [
+      { at_ms: 200, kind: "navigation", event: "commit", document_generation: 1 },
+      { at_ms: 800, kind: "navigation", event: "commit", document_generation: 2 },
+    ],
+    samples: [
+      { at_ms: 150, phase: "reload", document_hash: "sha256:samehash000001", visible: false, decoded_frames: 0 },
+      { at_ms: 900, phase: "reload", document_hash: "sha256:samehash000001", visible: true, decoded_frames: 4 },
+    ],
+    diagnostics: [],
+  });
+  assert.deepEqual(classified.document_generations, [1, 2]);
+  assert.equal(classified.observer_navigation_events, 2);
+  assert.deepEqual(classified.document_hashes, ["sha256:samehash000001"]);
+  assert.equal(classified.same_document, true);
+  assert.equal(classified.second_document_ms, null);
+});
+
+test("reload census records a second document only when the sampled document hash changes", () => {
+  const classified = classifyReloadCensus({
+    reload_started_ms: 0,
+    requests: [{ at_ms: 10, kind: "navigation", event: "commit", document_generation: 1 }],
+    samples: [
+      { at_ms: 20, phase: "reload", document_hash: "sha256:firstdocument01", visible: false },
+      { at_ms: 80, phase: "reload", document_hash: "sha256:seconddocument1", visible: false },
+    ],
+    diagnostics: [],
+  });
+  assert.equal(classified.same_document, false);
+  assert.equal(classified.second_document_ms, 80);
+  assert.deepEqual(classified.document_hashes, ["sha256:firstdocument01", "sha256:seconddocument1"]);
+});
+
+test("reload census records dying-page and restore-boot request identity", () => {
+  const classified = classifyReloadCensus({
+    reload_started_ms: 100,
+    requests: [],
+    samples: [],
+    diagnostics: [
+      { at_ms: 101, event: "dying_page_attach", request_id: "a".repeat(32) },
+      { at_ms: 180, event: "restore_boot", attach_from_url: true, request_id: "a".repeat(32) },
+      { at_ms: 220, event: "restore_boot_ready", from_summary: true, request_id: "a".repeat(32) },
+    ],
+  });
+  assert.equal(classified.dying_page_attach_ms, 1);
+  assert.equal(classified.dying_page_attach_request_id, "a".repeat(32));
+  assert.equal(classified.restore_boot_ms, 80);
+  assert.equal(classified.restore_boot_attach_from_url, true);
+  assert.equal(classified.restore_boot_request_id, "a".repeat(32));
+  assert.equal(classified.restore_boot_ready_ms, 120);
+  assert.equal(classified.restore_boot_from_summary, true);
+});
+
+test("reload census captures viewer failure status and the original exception fields", () => {
+  const classified = classifyReloadCensus({
+    reload_started_ms: 0,
+    requests: [
+      { at_ms: 100, kind: "signaling", event: "response", signal_type: "display_attach", status: 200 },
+    ],
+    samples: [
+      {
+        at_ms: 366,
+        phase: "reload",
+        viewer_status: "Browser could not complete the request. Refresh Browser and try again.",
+        viewer_failure_stage: "peer_setup",
+        viewer_failure_message: "Browser display could not connect.",
+        viewer_failure_status: 400,
+      },
+    ],
+    diagnostics: [],
+  });
+  assert.equal(classified.viewer_failure_ms, 366);
+  assert.equal(classified.viewer_failure_stage, "peer_setup");
+  assert.equal(classified.viewer_failure_message, "Browser display could not connect.");
+  assert.equal(classified.viewer_failure_status, 400);
+  assert.match(classified.viewer_failure_status_text, /could not complete/);
 });

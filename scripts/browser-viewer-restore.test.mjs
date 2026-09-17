@@ -23,10 +23,11 @@ function summary() {
 }
 function harness() {
   const calls = [], failures = [], requests = [];
-  const state = vm.createContext({ crypto, currentPage: null, currentPageGeneration: 0, nextPageGeneration: 1,
+  const state = vm.createContext({ crypto, URLSearchParams, AbortSignal, currentPage: null, currentPageGeneration: 0, nextPageGeneration: 1,
     restoredViewerOwner: null, unloadCleanupStarted: false, relaunchRequested: false,
     homeWindowCloseInFlight: false, homeWindowTerminalCloseConfirmed: false,
     pendingHomeWindowCloseDelivery: null, runtimePageCleanup: { status: () => null },
+    displayAttachRetryIdentity: null, window: {}, globalThis: null,
     runtimeOwnershipTerminallyAbsent: true, selectedBrowserEngineId: '', currentBrowserEngineId: '',
     selectedRemoteExitId: '', currentRemoteExitId: '', currentDisplayMode: '', currentView: null, lastPageStatus: null,
     runtimePageOwner, sameRuntimePageOwner,
@@ -52,11 +53,157 @@ function harness() {
       actual_url: 'https://current.invalid/form', title: 'Retained form', direct_network: false,
       display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'diagnostic-status', ice_servers: [{ credential_present: true }] } }; },
   });
-  for (const name of ['currentRuntimePageOwner', 'runtimeViewerOwnerActive', 'recoverableRuntimePage', 'fetchPageStatus', 'attachRecoveredDisplay', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
+  state.globalThis = state;
+  for (const name of ['displayAttachRequestId', 'viewerDisplayAttachTimeoutMs', 'reuseDisplayAttachment', 'terminalDisplayAttachment', 'allocateDisplayAttachRetryId', 'markDisplayAttachRetryNeeded', 'displayAttachRequestForRecovery', 'currentRuntimePageOwner', 'runtimeViewerOwnerActive', 'recoverableRuntimePage', 'fetchPageStatus', 'attachRecoveredDisplay', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
     vm.runInContext(declaration(name), state);
   }
   return { state, calls, failures, requests, restore: value => state.restoreRuntimePageViewer(value) };
 }
+
+test('display attach request id is the generation hex', () => {
+  const state = vm.createContext({});
+  vm.runInContext(declaration('displayAttachRequestId'), state);
+  assert.equal(state.displayAttachRequestId('display:' + '1'.repeat(32)), '1'.repeat(32));
+  assert.equal(state.displayAttachRequestId('display:not-hex'), 'not-hex');
+  assert.equal(state.displayAttachRequestId(''), '');
+  assert.equal(state.displayAttachRequestId(null), '');
+});
+
+test('unload release leaves display attach to a dedicated starter', () => {
+  const unload = declaration('releaseRuntimePageForUnload');
+  assert.match(unload, /unloadCleanupStarted = true/);
+  assert.doesNotMatch(unload, /display_attach/);
+  assert.doesNotMatch(unload, /keepalive/);
+  assert.doesNotMatch(unload, /startRecoverableDisplayAttach/);
+  assert.doesNotMatch(source, /prepareRecoverableDisplayAttach/);
+});
+
+test('unload attach posts the current generation with keepalive and skips Home close', () => {
+  const posts = [];
+  const state = vm.createContext({
+    launchToken: 'token-one',
+    recoverableDisplayAttachStarted: false,
+    currentPage: {
+      page_id: 'page-one',
+      display_session: {
+        mode: 'webrtc_remote_display',
+        display_generation: 'display:' + '1'.repeat(32),
+      },
+    },
+    browserSummary: { engine_adapter: { display_attach_supported: true } },
+    homeWindowCloseInFlight: false,
+    homeWindowTerminalCloseConfirmed: false,
+    PRODUCT_DISPLAY_MODE: 'webrtc_remote_display',
+    console: { info() {} },
+    fetch: (path, options) => {
+      posts.push({ path, options });
+      return Promise.resolve();
+    },
+  });
+  vm.runInContext(declaration('displayAttachRequestId'), state);
+  vm.runInContext(declaration('startRecoverableDisplayAttach'), state);
+  state.startRecoverableDisplayAttach();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].path, '/api/apps/browser/pages/page-one/webrtc');
+  assert.equal(posts[0].options.method, 'POST');
+  assert.equal(posts[0].options.keepalive, true);
+  assert.equal(posts[0].options.headers['x-elastos-home-token'], 'token-one');
+  assert.deepEqual(JSON.parse(posts[0].options.body), {
+    type: 'display_attach',
+    request_id: '1'.repeat(32),
+    display_generation: 'display:' + '1'.repeat(32),
+  });
+  state.startRecoverableDisplayAttach();
+  assert.equal(posts.length, 1);
+  state.recoverableDisplayAttachStarted = false;
+  state.homeWindowCloseInFlight = true;
+  state.startRecoverableDisplayAttach();
+  assert.equal(posts.length, 1);
+});
+
+test('boot attach uses the generation hex when no pending request exists', () => {
+  const boot = readFileSync(new URL('../capsules/browser/browser/browser-restore-boot.js', import.meta.url), 'utf8');
+  assert.match(boot, /generation\.slice\("display:"\.length\)/);
+  assert.match(boot, /function waitForReadyAttach/);
+  assert.match(boot, /pending\.state === "ready"/);
+  assert.match(source, /__elastosBrowserRestoreBoot/);
+});
+
+test('recoverable display query writes page identity and clears it', () => {
+  const hrefs = [];
+  const location = {
+    href: 'http://localhost/apps/browser/?browser_instance=b#home_token=t',
+    pathname: '/apps/browser/',
+    search: '?browser_instance=b',
+    hash: '#home_token=t',
+  };
+  const state = vm.createContext({
+    location,
+    history: {
+      state: null,
+      replaceState(_s, _t, next) {
+        hrefs.push(next);
+        const url = new URL(next, 'http://localhost');
+        location.href = url.href;
+        location.pathname = url.pathname;
+        location.search = url.search;
+        location.hash = url.hash;
+      },
+    },
+    URL,
+  });
+  vm.runInContext(declaration('persistRecoverableDisplayQuery'), state);
+  state.persistRecoverableDisplayQuery({
+    page_id: 'page-one',
+    display_session: { display_generation: 'display:' + '1'.repeat(32) },
+  });
+  assert.match(hrefs[0], /page_id=page-one/);
+  assert.match(hrefs[0], /display_generation=display%3A11111111111111111111111111111111/);
+  state.persistRecoverableDisplayQuery(null);
+  assert.equal(hrefs.at(-1).includes('page_id'), false);
+  assert.equal(hrefs.at(-1).includes('display_generation'), false);
+});
+
+test('failed boot attach falls back to a webrtc POST', async () => {
+  const h = harness();
+  h.state.window = {
+    __elastosBrowserRestoreBoot: {
+      attachPromise: Promise.reject(new Error('boot attach failed')),
+    },
+  };
+  await h.restore(summary());
+  assert.deepEqual(h.requests, ['/api/apps/browser/pages/page-one/status', '/api/apps/browser/pages/page-one/webrtc']);
+  assert.equal(h.calls.find(row => row[0] === 'connect')[3].initial_offer.sdp, 'fresh-video');
+  assert.equal(h.state.window.__elastosBrowserRestoreBoot.attachPromise, null);
+});
+
+test('boot attach promise is consumed once and skips a second webrtc POST', async () => {
+  const h = harness();
+  const request = {
+    type: 'display_attach',
+    request_id: 'a'.repeat(32),
+    display_generation: 'display:' + '1'.repeat(32),
+  };
+  const result = {
+    schema: 'elastos.browser.display-attach-result/v1',
+    page_id: 'page-one',
+    request_id: request.request_id,
+    previous_display_generation: request.display_generation,
+    display_generation: 'display:' + '2'.repeat(32),
+    initial_offer: { schema: 'elastos.browser.webrtc-offer/v1', type: 'offer', sdp: 'boot-video' },
+    audio_offer: { schema: 'elastos.browser.webrtc-offer/v1', type: 'offer', sdp: 'boot-audio' },
+  };
+  h.state.window = {
+    __elastosBrowserRestoreBoot: {
+      attachPromise: Promise.resolve({ request, result, page_id: 'page-one' }),
+    },
+  };
+  await h.restore(summary());
+  assert.deepEqual(h.requests, ['/api/apps/browser/pages/page-one/status']);
+  const connection = h.calls.find(row => row[0] === 'connect');
+  assert.equal(connection[3].initial_offer.sdp, 'boot-video');
+  assert.equal(h.state.window.__elastosBrowserRestoreBoot.attachPromise, null);
+});
 
 test('startup restores exact owner, fresh URL, and Runtime-selected services without opening or closing', async () => {
   const h = harness(), original = summary();
@@ -91,8 +238,9 @@ test('restored page becomes visible to Home after its fresh address is applied',
   } finally { pending.resolve(); await restoring; }
   const url = h.calls.findIndex(row => row[0] === 'url');
   const publish = h.calls.findIndex(row => row[0] === 'publish');
+  const connect = h.calls.findIndex(row => row[0] === 'connect');
   assert.ok(url >= 0 && publish > url);
-  assert.ok(h.calls.findIndex(row => row[0] === 'connect') > publish);
+  assert.ok(connect >= 0);
 });
 
 test('Automatic Engine and local Exit remain the Runtime-selected empty values', async () => {
@@ -169,10 +317,9 @@ for (const owned of [true, false]) test(`actual startup selects ${owned ? 'resto
   Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
     fetchBrowserSummary: async () => value, requestRuntimeOpen: async url => opens.push(url),
     isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
-  await vm.runInContext(source.slice(source.lastIndexOf('const initialUrl =')), h.state);
+  await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
   assert.deepEqual(opens, owned ? [] : ['https://default.invalid/']);
 });
-
 
 test('summary authority failure reaches startup renewal without a replacement open', async () => {
   const h = harness(), renewals = [], opens = [], error = Object.assign(new Error('Browser authority expired'), { status: 401 });
@@ -184,7 +331,7 @@ test('summary authority failure reaches startup renewal without a replacement op
     friendlyOpenError: value => value.message,
     requestHomeRelaunch: value => { renewals.push(value); return true; } });
   vm.runInContext(declaration('fetchBrowserSummary'), h.state);
-  await vm.runInContext(source.slice(source.lastIndexOf('const initialUrl =')), h.state);
+  await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
   assert.deepEqual(renewals, ['Browser authority expired']);
   assert.deepEqual(opens, []); assert.deepEqual(h.failures, []);
   assert.equal(h.state.browserSummaryPromise, null);
@@ -205,7 +352,7 @@ for (const flag of ['unloadCleanupStarted', 'homeWindowCloseInFlight', 'homeWind
     Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
       fetchBrowserSummary: async () => wait.promise, requestRuntimeOpen: async url => opens.push(url),
       isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
-    const startup = vm.runInContext(source.slice(source.lastIndexOf('const initialUrl =')), h.state);
+    const startup = vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
     h.state[flag] = true; wait.resolve(value); await startup;
     assert.deepEqual(opens, []); assert.deepEqual(h.failures, []);
     assert.equal(h.state.currentPage, null);
@@ -295,7 +442,7 @@ for (const flag of ['unloadCleanupStarted', 'homeWindowCloseInFlight', 'homeWind
       fetchBrowserSummary: async () => wait.promise, requestRuntimeOpen: async () => assert.fail('fresh open'),
       isAuthoritySessionError: () => true, friendlyOpenError: error => error.message,
       requestHomeRelaunch: value => { renewals.push(value); return true; } });
-    const startup = vm.runInContext(source.slice(source.lastIndexOf('const initialUrl =')), h.state);
+    const startup = vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
     h.state[flag] = true; const before = h.calls.length;
     wait.reject(new Error('late expired authority')); await startup;
     assert.deepEqual(renewals, []); assert.deepEqual(h.failures, []); assert.equal(h.calls.length, before);
@@ -323,7 +470,9 @@ for (const stage of ['status', 'attachment']) for (const closeState of ['in-flig
     if (outcome === 'failure') wait.reject(new Error('late close-time failure')); else wait.resolve();
     assert.equal(await pending, true);
     assert.equal(attaches, 1); // Both requests started before close began.
-    assert.equal(h.calls.length, before); assert.deepEqual(h.failures, []);
+    if (stage === 'attachment') assert.equal(h.calls.length, before);
+    assert.equal(h.calls.some(row => row[0] === 'publish'), false);
+    assert.deepEqual(h.failures, []);
     assert.equal(h.state.currentPage.display_session.display_generation, 'display:' + '1'.repeat(32));
     assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
   });
@@ -347,9 +496,11 @@ test('restore starts attachment while fresh status is pending and publishes only
     assert.deepEqual(started, ['status', 'attachment']);
     attachment.resolve();
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(h.calls.some(row => ['publish', 'connect'].includes(row[0])), false);
+    assert.equal(h.calls.some(row => row[0] === 'publish'), false);
+    assert.equal(h.calls.filter(row => row[0] === 'connect').length, 1);
   } finally { status.resolve(); attachment.resolve(); await pending; }
   assert.equal(h.calls.filter(row => row[0] === 'connect').length, 1);
+  assert.equal(h.calls.filter(row => row[0] === 'publish').length, 1);
 });
 
 for (const field of ['schema', 'page_id', 'direct_network']) test(`invalid concurrent status ${field} cannot publish or connect`, async () => {
@@ -360,7 +511,8 @@ for (const field of ['schema', 'page_id', 'direct_network']) test(`invalid concu
     return result;
   };
   await assert.rejects(h.restore(summary()));
-  assert.equal(h.calls.some(row => ['publish', 'connect'].includes(row[0])), false);
+  assert.equal(h.calls.some(row => row[0] === 'publish'), false);
+  assert.equal(h.calls.some(row => row[0] === 'connect'), true);
   assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
 });
 
@@ -378,4 +530,169 @@ test('attachment failure while status is pending cannot publish after late valid
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.calls.some(row => ['publish', 'connect'].includes(row[0])), false);
   assert.equal(h.state.currentPage.display_session.display_generation, 'display:' + '1'.repeat(32));
+});
+
+function failedAttachment(errorCode = 'display_attach_failed') {
+  return {
+    schema: 'elastos.browser.display-attachment/v1',
+    state: 'failed',
+    error_code: errorCode,
+    request_id: '1'.repeat(32),
+    previous_display_generation: 'display:' + '1'.repeat(32),
+  };
+}
+
+test('a terminal attach failure allocates a fresh request id instead of replaying the cached id', async () => {
+  const h = harness(), value = summary(), calls = [], fetch = h.state.fetchJson;
+  value.sessions.recoverable_page.display_attachment = failedAttachment();
+  h.state.fetchJson = async (path, options) => { if (options?.body) calls.push(options.body); return fetch(path, options); };
+  await h.restore(value);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].request_id, /^[a-f0-9]{32}$/);
+  assert.notEqual(calls[0].request_id, '1'.repeat(32));
+  assert.equal(calls[0].display_generation, 'display:' + '1'.repeat(32));
+});
+
+test('uncertain attach work keeps the same request id', async () => {
+  const h = harness(), value = summary(), calls = [], fetch = h.state.fetchJson;
+  value.sessions.recoverable_page.display_attachment = failedAttachment('display_attach_uncertain');
+  h.state.fetchJson = async (path, options) => { if (options?.body) calls.push(options.body); return fetch(path, options); };
+  await h.restore(value);
+  assert.equal(calls[0].request_id, '1'.repeat(32));
+});
+
+test('boot and main viewer share one retry identity after a terminal failure', async () => {
+  const h = harness(), value = summary(), calls = [], fetch = h.state.fetchJson;
+  const shared = 'c'.repeat(32);
+  value.sessions.recoverable_page.display_attachment = failedAttachment();
+  h.state.window.__elastosBrowserRestoreBoot = {
+    retryIdentity: { page_id: 'page-one', generation: 'display:' + '1'.repeat(32), request_id: shared },
+  };
+  h.state.fetchJson = async (path, options) => { if (options?.body) calls.push(options.body); return fetch(path, options); };
+  await h.restore(value);
+  assert.equal(calls[0].request_id, shared);
+});
+
+test('viewer attach timeout stops a hung restore POST', async () => {
+  const h = harness();
+  h.state.VIEWER_DISPLAY_ATTACH_TIMEOUT_MS = 20;
+  h.state.fetchJson = async (path, options) => {
+    if (options?.body?.type === 'display_attach') {
+      await new Promise((_, reject) => {
+        const fail = () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+        if (options.signal?.aborted) fail();
+        else options.signal?.addEventListener('abort', fail, { once: true });
+      });
+    }
+    return { schema: 'elastos.browser.page-status/v1', page_id: 'page-one', actual_url: 'https://current.invalid/form',
+      title: 'Retained form', direct_network: false,
+      display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'diagnostic-status', ice_servers: [{ credential_present: true }] } };
+  };
+  await assert.rejects(h.restore(summary()), /aborted|could not restore|interrupted/i);
+  assert.equal(h.calls.some(row => row[0] === 'connect'), false);
+  assert.equal(h.state.currentPage.runtime_cleanup.id, 'cleanup-one');
+});
+
+test('reload after a terminal Engine failure recovers with a new request id', async () => {
+  const cached = '1'.repeat(32);
+  const seen = [];
+  const h = harness(), first = summary(), second = summary();
+  second.sessions.recoverable_page.display_attachment = failedAttachment();
+  const fetch = h.state.fetchJson;
+  h.state.fetchJson = async (path, options) => {
+    if (options?.body?.type === 'display_attach') {
+      seen.push(options.body.request_id);
+      if (options.body.request_id === cached) {
+        throw Object.assign(new Error('Browser display attachment failed'), {
+          payload: { code: 'display_attach_failed' },
+        });
+      }
+    }
+    return fetch(path, options);
+  };
+  await assert.rejects(h.restore(first), /display attachment failed/);
+  assert.deepEqual(seen, [cached]);
+  h.state.currentPage = null;
+  h.state.restoredViewerOwner = null;
+  await h.restore(second);
+  assert.equal(seen.length, 2);
+  assert.notEqual(seen[1], cached);
+  assert.equal(h.calls.filter(row => row[0] === 'connect').length, 1);
+});
+
+function bootContext(summaries, harness = {}) {
+  const posts = [];
+  let summaryIndex = 0;
+  const cachedId = '1'.repeat(32);
+  const context = {
+    location: { search: '?browser_instance=b&page_id=page-one&display_generation=display%3A' + cachedId, hash: '#home_token=t' },
+    URLSearchParams, crypto, AbortController, setTimeout, clearTimeout, Date,
+    console: { info() {} },
+    window: {},
+    fetch(url, fetchOptions) {
+      if (String(url).includes('/summary')) {
+        if (harness.hangSummary) return new Promise(() => {});
+        const body = summaries[Math.min(summaryIndex, summaries.length - 1)];
+        summaryIndex += 1;
+        return Promise.resolve({ ok: true, json: async () => body });
+      }
+      const request = JSON.parse(fetchOptions.body);
+      posts.push(request);
+      if (harness.failCachedId && request.request_id === cachedId) {
+        return Promise.resolve({ ok: false, json: async () => ({}) });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          schema: 'elastos.browser.display-attach-result/v1',
+          page_id: 'page-one',
+          request_id: request.request_id,
+          previous_display_generation: request.display_generation,
+          display_generation: 'display:' + '2'.repeat(32),
+          initial_offer: { schema: 'elastos.browser.webrtc-offer/v1', type: 'offer', sdp: 'boot-video' },
+          audio_offer: { schema: 'elastos.browser.webrtc-offer/v1', type: 'offer', sdp: 'boot-audio' },
+        }),
+      });
+    },
+  };
+  context.window = context;
+  vm.runInContext(readFileSync(new URL('../capsules/browser/browser/browser-restore-boot.js', import.meta.url), 'utf8'), vm.createContext(context));
+  return { context, posts };
+}
+
+function bootSummary(attachment) {
+  return {
+    engine_adapter: { display_attach_supported: true },
+    sessions: { recoverable_page: {
+      state: 'active', page_id: 'page-one',
+      engine_page: { display_session: { mode: 'webrtc_remote_display', display_generation: 'display:' + '1'.repeat(32) } },
+      display_attachment: attachment,
+    } },
+  };
+}
+
+test('known URL attach posts before a delayed summary returns', async () => {
+  const { context, posts } = bootContext([bootSummary(null)], { hangSummary: true });
+  const attached = await context.window.__elastosBrowserRestoreBoot.attachPromise;
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].request_id, '1'.repeat(32));
+  assert.equal(attached.request.request_id, posts[0].request_id);
+});
+
+test('restore boot posts a fresh request id after a terminal attach failure', async () => {
+  const { context, posts } = bootContext([bootSummary(failedAttachment())], { failCachedId: true });
+  const attached = await context.window.__elastosBrowserRestoreBoot.attachPromise;
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].request_id, '1'.repeat(32));
+  assert.notEqual(posts[1].request_id, '1'.repeat(32));
+  assert.match(posts[1].request_id, /^[a-f0-9]{32}$/);
+  assert.equal(attached.request.request_id, posts[1].request_id);
+  assert.equal(context.window.__elastosBrowserRestoreBoot.retryIdentity.request_id, posts[1].request_id);
+});
+
+test('restore boot reuses an uncertain request id', async () => {
+  const { posts } = bootContext([bootSummary(failedAttachment('display_attach_uncertain'))]);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(posts[0].request_id, '1'.repeat(32));
 });

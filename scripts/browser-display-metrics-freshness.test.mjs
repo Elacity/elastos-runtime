@@ -39,7 +39,7 @@ function fixture({ debugMetrics = true, audio = true } = {}) {
   const peers = [], timers = new Map(), updates = [], recoveries = [];
   const state = { active: true, owner: 1, fetch: null };
   class Peer extends Events {
-    connectionState = 'new'; iceConnectionState = 'new'; signalingState = 'stable';
+    connectionState = 'new'; iceConnectionState = 'new'; iceGatheringState = 'complete'; signalingState = 'stable';
     reads = 0; bytes = 100; frames = 10; response = null;
     constructor() { super(); this.kind = peers.length % (audio ? 2 : 1) ? 'audio' : 'video'; peers.push(this); }
     addTransceiver() {}
@@ -63,6 +63,7 @@ function fixture({ debugMetrics = true, audio = true } = {}) {
     iceCandidateType: () => 'relay', normalizeDisplayIceServers: value => value || [],
     normalizeEngineCandidate: value => value, normalizeIceCandidateForRuntime: value => value,
     sdpHasOnlyRelayCandidates: () => true, stripTrickleCandidatesFromSdp: value => value,
+    waitForLocalAnswerIce: async () => {},
     validateRuntimeLaunchTurn: async () => [],
   });
   vm.runInContext(statusSource.slice(statusSource.indexOf('export async function collectWebrtcStats'), statusSource.indexOf('export function browserMetricsText')).replace('export async function', 'async function'), context);
@@ -207,19 +208,21 @@ for (const outcome of ['success', 'failure']) test(`old query ${outcome} cannot 
   assert.deepEqual(f.recoveries, []); f.controller.close();
 });
 
-test('audio peer appearing during a video-only query invalidates the captured pair', async () => {
+test('refresh during in-flight answers keeps the live video and audio pair', async () => {
   const f = fixture(), answer = deferred(), started = deferred(), stats = deferred();
   f.state.fetch = body => {
     if (!body.channel) { started.resolve(); return answer.promise; }
     return f.ack(body);
   };
   const connecting = f.connect(); await started.promise;
-  assert.equal(f.peers.length, 1); f.peers[0].response = () => stats.promise;
+  assert.equal(f.peers.length, 2); f.peers[0].response = () => stats.promise;
   const refreshing = f.controller.refreshMetrics();
   answer.resolve(f.ack({ type: 'answer' })); await connecting;
   assert.equal(f.peers.length, 2);
-  stats.resolve(statsReport('video', 100)); assert.equal(await refreshing, null);
-  assert.equal(f.controller.metricsState().latestWebrtcStats, null);
+  stats.resolve(statsReport('video', 100));
+  const fresh = await refreshing;
+  assert.equal(fresh.latestWebrtcStats.video_bytes_received, 100);
+  assert.equal(fresh.latestWebrtcStats.audio_bytes_received, 100);
   f.peers[0].response = null;
   assert.equal((await f.controller.refreshMetrics()).latestWebrtcStats.audio_bytes_received, 100);
   f.controller.close();

@@ -87,6 +87,88 @@ function fixture() {
   return { state, io };
 }
 
+const adapterSocket = "/tmp/elastos-browser-fixture-vm-control.sock";
+const adapterJournal = `${adapterSocket}.launch-reconciliations.json`;
+const adapterDoc = {
+  adapters: [{
+    kind: "chromium_microvm",
+    supervisor: {
+      control_socket_path: adapterSocket,
+      env: { ELASTOS_BROWSER_VM_DATA_DIR: data, ELASTOS_BROWSER_VM_CONTROL_SOCKET: adapterSocket },
+    },
+  }],
+};
+
+function adapterFixture() {
+  const { state, io } = fixture();
+  state.adapter = adapterDoc;
+  state.status.control_service.control_socket_path = adapterSocket;
+  state.record.control_service.control_socket_path = adapterSocket;
+  state.record.cleanup_binding.control_service.control_socket_path = adapterSocket;
+  state.record.cleanup_binding.shutdown_socket_path = adapterSocket;
+  const originalOwned = io.ownedFile;
+  const originalPids = io.socketPids;
+  io.ownedFile = async (path, max) => {
+    if (path === `${data}/config/browser-engine-adapter.json`) {
+      state.reads.push(path);
+      return JSON.stringify(state.adapter);
+    }
+    if (path === adapterJournal) {
+      state.reads.push(path);
+      assert.equal(max, 4 * 1024 * 1024);
+      return JSON.stringify(state.journal);
+    }
+    return originalOwned(path, max);
+  };
+  io.socketPids = async path => path === adapterSocket ? state.controlPids : originalPids(path);
+  return { state, io };
+}
+
+test("adapter identity binds the live control socket without a matching restart receipt", async () => {
+  const { state, io } = adapterFixture();
+  state.receipt.home_url = "http://localhost:61510/home/";
+  state.receipt.ok = false;
+  const driver = await __test.createDriver({ ...options, controlSocketPath: adapterSocket }, io);
+  assert.equal(driver.evidence.bound, true);
+  assert.ok(state.reads.includes(`${data}/config/browser-engine-adapter.json`));
+  assert.ok(state.reads.includes(adapterJournal));
+  assert.ok(!state.reads.includes(`${data}/receipts/mac-source-home-restart.json`));
+  await driver.cut({ timeoutMs: 1000 });
+  await driver.restore({ timeoutMs: 1000 });
+  assert.equal(driver.evidence.restored, true);
+  const evidence = JSON.stringify(driver.evidence);
+  assert.ok(!evidence.includes(adapterSocket));
+  assert.ok(!evidence.includes(home));
+});
+
+test("adapter identity rejects a control socket that the adapter does not own", async () => {
+  const { io } = adapterFixture();
+  await assert.rejects(__test.createDriver({ ...options, controlSocketPath: "/tmp/foreign.sock" }, io), error => {
+    assert.equal(error.message, "turn_control_socket_mismatch");
+    assert.ok(!JSON.stringify(error).includes(adapterSocket));
+    return true;
+  });
+});
+
+test("adapter identity filesystem failure exposes only the fixed stage", async () => {
+  const { io } = adapterFixture();
+  const original = io.ownedFile;
+  io.ownedFile = async (path, max) => {
+    if (path.endsWith("browser-engine-adapter.json")) {
+      throw Object.assign(new Error("ENOENT private adapter NEVER-PRINT-THIS-SECRET"), { code: "ENOENT" });
+    }
+    return original(path, max);
+  };
+  await assert.rejects(__test.createDriver({ ...options, controlSocketPath: adapterSocket }, io), error => {
+    assert.equal(error.message, "turn_binding_adapter_config_failed");
+    assert.deepEqual(error.evidence.failure, {
+      stage: "adapter_config", code: "turn_binding_adapter_config_failed", errno: "ENOENT",
+    });
+    assert.ok(!JSON.stringify(error).includes("NEVER-PRINT"));
+    return true;
+  });
+});
+
 test("creation only binds; cut revalidates and starts watchdog; restore is idempotent and redacted", async () => {
   const { state, io } = fixture();
   const driver = await __test.createDriver(options, io);

@@ -7,7 +7,7 @@ import {
   sdpHasOnlyRelayCandidates,
   stripTrickleCandidatesFromSdp,
   validateRuntimeLaunchTurn,
-} from "./browser-webrtc.js?v=browser-20260730a";
+} from "./browser-webrtc.js?v=browser-20260913h";
 
 const WEBRTC_CONNECT_TIMEOUT_MS = 30000;
 const WEBRTC_DISCONNECT_GRACE_MS = 10000;
@@ -851,27 +851,54 @@ export function createBrowserRemoteDisplay({
       await nextAudioPeerConnection.setLocalDescription(answer);
       if (!isCurrentDisplayPeer(nextAudioPeerConnection)) return;
       audioAnswerSummary = summarizeSdp(nextAudioPeerConnection.localDescription?.sdp || answer.sdp);
-      const ack = await sendRuntimeSignal(nextAudioPeerConnection, displaySession, {
-        method: "POST",
-        body: {
-          type: "answer",
-          channel: "audio",
-          sdp: stripTrickleCandidatesFromSdp(nextAudioPeerConnection.localDescription.sdp),
+      const ack = await postAnswerWithQueuedLocalIce(
+        nextAudioPeerConnection,
+        displaySession,
+        { channel: "audio" },
+        queuedAudioCandidates,
+        () => {
+          canSignalAudioCandidates = true;
         },
-      });
-      if (!isCurrentDisplayPeer(nextAudioPeerConnection)) return;
-      requireSignalAck(ack, "answer");
-      await applyEngineRemoteSignalsTo(nextAudioPeerConnection, ack);
-      if (!isCurrentDisplayPeer(nextAudioPeerConnection)) return;
-      canSignalAudioCandidates = true;
-      for (const candidate of queuedAudioCandidates.splice(0)) {
-        await signalAudioCandidate(candidate);
-        if (!isCurrentDisplayPeer(nextAudioPeerConnection)) return;
-      }
+        signalAudioCandidate,
+        iceTransportPolicy === "relay",
+      );
+      if (!ack || !isCurrentDisplayPeer(nextAudioPeerConnection)) return;
       pollAudioEngineCandidates(WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS);
     } catch (error) {
       if (isCurrentDisplayPeer(nextAudioPeerConnection)) throw error;
     }
+  }
+
+  async function postAnswerWithQueuedLocalIce(
+    nextPeer,
+    displaySession,
+    extraBody,
+    queued,
+    enableSignal,
+    signalOne,
+    relayOnly,
+  ) {
+    if (!isCurrentDisplayPeer(nextPeer)) return null;
+    enableSignal();
+    const flushing = queued.splice(0).map((candidate) =>
+      signalOne(candidate).catch((error) => {
+        recoverPeerSignal(nextPeer, error);
+      }),
+    );
+    const ack = await sendRuntimeSignal(nextPeer, displaySession, {
+      method: "POST",
+      body: {
+        type: "answer",
+        sdp: stripTrickleCandidatesFromSdp(nextPeer.localDescription.sdp),
+        ...extraBody,
+      },
+    });
+    if (!isCurrentDisplayPeer(nextPeer)) return null;
+    requireSignalAck(ack, "answer");
+    await applyEngineRemoteSignalsTo(nextPeer, ack);
+    if (!isCurrentDisplayPeer(nextPeer)) return null;
+    void Promise.all(flushing);
+    return ack;
   }
 
   function displayForRuntimeSignaling(displaySession) {
@@ -968,9 +995,28 @@ export function createBrowserRemoteDisplay({
     startStatsPolling(nextPeerConnection);
     startFrameWatch(nextPeerConnection);
     const expectsAudio = displaySession.audio === true;
+    let audioPeerStarted = false;
+    const startAudioPeerAfterVideoIce = () => {
+      if (
+        audioPeerStarted ||
+        !expectsAudio ||
+        !isCurrentDisplayPeer(nextPeerConnection)
+      ) {
+        return;
+      }
+      audioPeerStarted = true;
+      void connectAudioPeer(
+        displaySession,
+        iceServers,
+        iceTransportPolicy,
+      ).catch((error) => {
+        recoverPeerSignal(nextPeerConnection, error);
+      });
+    };
     prepareAudio(expectsAudio);
     peerConnection = nextPeerConnection;
     emitMediaDiagnostic("viewer_peer_created", "video");
+    startAudioPeerAfterVideoIce();
     inputChannel = null;
     const offerer = displaySession.offerer === "engine" ? "engine" : "browser";
     if (inputTransport === "datachannel") {
@@ -1013,6 +1059,7 @@ export function createBrowserRemoteDisplay({
         ),
         ...mediaDiagnosticStats(latestVideoWebrtcStats),
       });
+      startAudioPeerAfterVideoIce();
       showStatus(
         remoteAudioExpected
           ? "Remote display ready. Click the page to enable audio."
@@ -1130,6 +1177,7 @@ export function createBrowserRemoteDisplay({
         window.clearTimeout(disconnectTimer);
         disconnectTimer = 0;
         markVideoProgress();
+        startAudioPeerAfterVideoIce();
         return;
       }
       if (
@@ -1260,19 +1308,18 @@ export function createBrowserRemoteDisplay({
         if (!isCurrentDisplayPeer(nextPeerConnection)) return;
         await nextPeerConnection.setLocalDescription(answer);
         if (!isCurrentDisplayPeer(nextPeerConnection)) return;
-        const ack = await sendRuntimeSignal(nextPeerConnection, displaySession, {
-          method: "POST",
-          body: {
-            type: "answer",
-            sdp: stripTrickleCandidatesFromSdp(
-              nextPeerConnection.localDescription.sdp,
-            ),
+        const ack = await postAnswerWithQueuedLocalIce(
+          nextPeerConnection,
+          displaySession,
+          {},
+          queuedCandidates,
+          () => {
+            canSignalCandidates = true;
           },
-        });
-        if (!isCurrentDisplayPeer(nextPeerConnection)) return;
-        requireSignalAck(ack, "answer");
-        await applyEngineRemoteSignalsTo(nextPeerConnection, ack);
-        if (!isCurrentDisplayPeer(nextPeerConnection)) return;
+          signalCandidate,
+          iceTransportPolicy === "relay",
+        );
+        if (!ack || !isCurrentDisplayPeer(nextPeerConnection)) return;
       } else {
         const offer = await nextPeerConnection.createOffer();
         if (!isCurrentDisplayPeer(nextPeerConnection)) return;
@@ -1309,10 +1356,6 @@ export function createBrowserRemoteDisplay({
         if (!isCurrentDisplayPeer(nextPeerConnection)) return;
       }
       pollEngineCandidates(WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS);
-      if (expectsAudio) {
-        await connectAudioPeer(displaySession, iceServers, iceTransportPolicy);
-        if (!isCurrentDisplayPeer(nextPeerConnection)) return;
-      }
       connectTimer = window.setTimeout(() => {
         if (!trackReady && getCurrentDisplayMode() === "webrtc_remote_display") {
           failRemoteDisplay(nextPeerConnection, "no_first_frame");

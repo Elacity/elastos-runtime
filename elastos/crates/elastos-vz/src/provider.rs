@@ -66,6 +66,44 @@ impl VzProvider {
         Self::new(VzConfig::default())
     }
 
+    pub async fn guest_is_running(&self, handle: &CapsuleHandle) -> bool {
+        let vms = self.vms.read().await;
+        vms.get(&handle.id).is_some_and(|vm| vm.is_running())
+    }
+
+    pub async fn guest_state_label(&self, handle: &CapsuleHandle) -> String {
+        let vms = self.vms.read().await;
+        match vms.get(&handle.id) {
+            None => "absent".to_string(),
+            Some(vm) => vm.guest_state_label(),
+        }
+    }
+
+    pub async fn wait_for_guest_exit(&self, handle: &CapsuleHandle) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            let receiver = {
+                let vms = self.vms.read().await;
+                match vms.get(&handle.id) {
+                    None => return "absent".to_string(),
+                    Some(vm) => vm.take_guest_exit_receiver(),
+                }
+            };
+            if let Some(rx) = receiver {
+                return match rx.await {
+                    Ok(exit) => crate::ffi::delegate::format_delegate_exit_reason(&exit),
+                    Err(_) => "delegate_sender_dropped".to_string(),
+                };
+            }
+        }
+        loop {
+            if !self.guest_is_running(handle).await {
+                return self.guest_state_label(handle).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Initialise on-disk state directories.
     pub async fn init(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.config.state_dir)

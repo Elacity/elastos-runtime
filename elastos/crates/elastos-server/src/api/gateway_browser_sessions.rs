@@ -416,11 +416,14 @@ struct BrowserReapedPageTombstone {
     browser_instance: Option<String>,
     terminal_kind: String,
     reaped_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_durability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::api::gateway) struct BrowserReapedPageTerminalReceipt {
     pub(in crate::api::gateway) browser_instance: Option<String>,
+    pub(in crate::api::gateway) profile_durability: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2398,6 +2401,7 @@ pub(in crate::api::gateway) async fn record_browser_reaped_page_tombstone(
     data_dir: &Path,
     cleanup: &BrowserEngineCleanup,
     terminal_owner_launch_id: Option<&str>,
+    profile_durability: Option<&str>,
 ) -> Result<(), String> {
     let now_unix_ms = browser_now_unix_ms()?;
     let mut owner_launch_ids = vec![cleanup.owner_launch_id.clone()];
@@ -2419,6 +2423,9 @@ pub(in crate::api::gateway) async fn record_browser_reaped_page_tombstone(
             browser_instance: cleanup.browser_instance.clone(),
             terminal_kind: "already_absent".to_string(),
             reaped_at_unix_ms: now_unix_ms,
+            profile_durability: profile_durability
+                .filter(|value| matches!(*value, "failed" | "unknown" | "proved"))
+                .map(str::to_string),
         },
         now_unix_ms,
     )
@@ -2882,6 +2889,10 @@ fn browser_reaped_page_tombstone_is_safe(
             .is_none_or(|instance| browser_instance_id(Some(instance.to_string())).is_ok())
         && tombstone.reaped_at_unix_ms > 0
         && tombstone.reaped_at_unix_ms <= now_unix_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+        && tombstone
+            .profile_durability
+            .as_deref()
+            .is_none_or(|value| matches!(value, "failed" | "unknown" | "proved"))
 }
 
 fn browser_reaped_page_tombstone_is_expired(
@@ -2955,11 +2966,16 @@ fn persist_browser_reaped_page_tombstone(
                 "Browser terminal close receipt owner aliases exceeded their bound".to_string(),
             );
         }
-        if owner_launch_ids == previous.owner_launch_ids {
+        if owner_launch_ids == previous.owner_launch_ids
+            && previous.profile_durability == tombstone.profile_durability
+        {
             return Ok(());
         }
         let mut expanded = previous.clone();
         expanded.owner_launch_ids = owner_launch_ids;
+        if expanded.profile_durability.is_none() {
+            expanded.profile_durability = tombstone.profile_durability.clone();
+        }
         return write_browser_json_atomic(
             data_dir,
             &browser_reaped_page_tombstone_path(data_dir, &expanded.cleanup_id),
@@ -3016,6 +3032,7 @@ fn browser_reaped_page_tombstone_matches_at(
     {
         return Ok(Some(BrowserReapedPageTerminalReceipt {
             browser_instance: tombstone.browser_instance,
+            profile_durability: tombstone.profile_durability,
         }));
     }
     if browser_instance.is_none()
@@ -3031,6 +3048,7 @@ fn browser_reaped_page_tombstone_matches_at(
     persist_browser_reaped_page_tombstone(data_dir, expanded.clone(), now_unix_ms)?;
     Ok(Some(BrowserReapedPageTerminalReceipt {
         browser_instance: expanded.browser_instance,
+        profile_durability: expanded.profile_durability,
     }))
 }
 
@@ -5094,6 +5112,7 @@ mod tests {
                     browser_instance: Some("browser:0123456789abcdef0123456789abcdef".to_string()),
                     terminal_kind: "already_absent".to_string(),
                     reaped_at_unix_ms: now_unix_ms,
+                    profile_durability: None,
                 },
                 now_unix_ms,
             )

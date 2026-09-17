@@ -5,6 +5,7 @@ use axum::extract::{Path as AxumPath, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
+use sha2::{Digest, Sha256};
 
 use super::capsule_inventory::{
     installed_active_capsule_dir, installed_capsules_root, list_active_capsule_manifests,
@@ -16,6 +17,7 @@ use super::gateway::{
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
+const BROWSER_VERSIONED_ASSET_CACHE_CONTROL: &str = "private, max-age=60, must-revalidate";
 const BROWSER_CAPSULE_COOP: &str = "same-origin";
 const BROWSER_CAPSULE_COEP: &str = "require-corp";
 const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin";
@@ -87,8 +89,16 @@ pub async fn serve_home_asset(
     State(state): State<GatewayState>,
     headers: axum::http::HeaderMap,
     AxumPath(path): AxumPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, Some(&path)).await
+    serve_browser_capsule_asset(
+        &state.data_dir,
+        &headers,
+        HOME_CAPSULE_ID,
+        Some(&path),
+        query.as_deref(),
+    )
+    .await
 }
 
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
@@ -115,6 +125,7 @@ pub async fn serve_browser_app_asset(
     State(state): State<GatewayState>,
     headers: axum::http::HeaderMap,
     AxumPath((app, path)): AxumPath<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     if app == "home-agent" {
         return if path == "index.html" {
@@ -123,7 +134,14 @@ pub async fn serve_browser_app_asset(
             StatusCode::NOT_FOUND.into_response()
         };
     }
-    serve_browser_capsule_path(&state.data_dir, &headers, &app, Some(&path)).await
+    serve_browser_capsule_asset(
+        &state.data_dir,
+        &headers,
+        &app,
+        Some(&path),
+        query.as_deref(),
+    )
+    .await
 }
 
 pub(super) fn canonical_browser_capsule_route(route: &str) -> Result<String, String> {
@@ -142,11 +160,59 @@ pub(super) fn canonical_browser_capsule_route(route: &str) -> Result<String, Str
     Ok(parsed[url::Position::BeforePath..].to_string())
 }
 
+fn browser_capsule_versioned_static_asset(relative_path: &str, raw_query: Option<&str>) -> bool {
+    let versioned = raw_query
+        .unwrap_or("")
+        .split('&')
+        .any(|part| part.starts_with("v=browser-"));
+    versioned
+        && matches!(
+            Path::new(relative_path)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("js" | "css" | "woff" | "woff2" | "svg")
+        )
+}
+
+fn browser_capsule_cache_control(relative_path: &str, raw_query: Option<&str>) -> &'static str {
+    if browser_capsule_versioned_static_asset(relative_path, raw_query) {
+        BROWSER_VERSIONED_ASSET_CACHE_CONTROL
+    } else {
+        BROWSER_CAPSULE_CACHE_CONTROL
+    }
+}
+
+fn browser_capsule_etag(bytes: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Sha256::digest(bytes)))
+}
+
+fn if_none_match_contains(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        })
+}
+
 async fn serve_browser_capsule_path(
     data_dir: &Path,
     request_headers: &axum::http::HeaderMap,
     app: &str,
     requested_path: Option<&str>,
+) -> Response {
+    serve_browser_capsule_asset(data_dir, request_headers, app, requested_path, None).await
+}
+
+async fn serve_browser_capsule_asset(
+    data_dir: &Path,
+    request_headers: &axum::http::HeaderMap,
+    app: &str,
+    requested_path: Option<&str>,
+    raw_query: Option<&str>,
 ) -> Response {
     if ensure_wallet_connector_configured(data_dir, app).is_err() {
         return (StatusCode::NOT_FOUND, "Browser capsule not found").into_response();
@@ -199,11 +265,41 @@ async fn serve_browser_capsule_path(
         };
 
     let is_document = relative_path == capsule.entrypoint;
+    let cache_control = browser_capsule_cache_control(relative_path, raw_query);
+    let etag = browser_capsule_versioned_static_asset(relative_path, raw_query)
+        .then(|| browser_capsule_etag(&bytes));
+    if let Some(etag) = etag.as_deref() {
+        if if_none_match_contains(request_headers, etag) {
+            let mut response = StatusCode::NOT_MODIFIED.into_response();
+            let headers = response.headers_mut();
+            headers.insert("cache-control", cache_control.parse().unwrap());
+            headers.insert("etag", etag.parse().unwrap());
+            headers.insert(
+                "cross-origin-opener-policy",
+                BROWSER_CAPSULE_COOP.parse().unwrap(),
+            );
+            headers.insert(
+                "cross-origin-embedder-policy",
+                BROWSER_CAPSULE_COEP.parse().unwrap(),
+            );
+            headers.insert(
+                "cross-origin-resource-policy",
+                resource_policy.parse().unwrap(),
+            );
+            headers.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                BROWSER_CAPSULE_OPAQUE_ORIGIN.parse().unwrap(),
+            );
+            headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+            headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+            return response;
+        }
+    }
     let mut response = (
         StatusCode::OK,
         [
             ("content-type", content_type(relative_path)),
-            ("cache-control", BROWSER_CAPSULE_CACHE_CONTROL),
+            ("cache-control", cache_control),
             ("cross-origin-opener-policy", BROWSER_CAPSULE_COOP),
             ("cross-origin-embedder-policy", BROWSER_CAPSULE_COEP),
             ("cross-origin-resource-policy", resource_policy),
@@ -212,6 +308,9 @@ async fn serve_browser_capsule_path(
     )
         .into_response();
     let headers = response.headers_mut();
+    if let Some(etag) = etag.as_deref() {
+        headers.insert("etag", etag.parse().unwrap());
+    }
     headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
         BROWSER_CAPSULE_OPAQUE_ORIGIN.parse().unwrap(),
@@ -737,6 +836,112 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn versioned_static_assets_are_cacheable_and_documents_stay_unstored() {
+        assert!(browser_capsule_versioned_static_asset(
+            "browser.js",
+            Some("v=browser-20260907c")
+        ));
+        assert_eq!(
+            browser_capsule_cache_control("browser.js", Some("v=browser-20260907c")),
+            BROWSER_VERSIONED_ASSET_CACHE_CONTROL
+        );
+        assert!(
+            !BROWSER_VERSIONED_ASSET_CACHE_CONTROL.contains("immutable"),
+            "versioned assets must revalidate; they must not stay cached for a year"
+        );
+        assert!(
+            !BROWSER_VERSIONED_ASSET_CACHE_CONTROL.contains("31536000"),
+            "versioned assets must revalidate; they must not stay cached for a year"
+        );
+        assert!(BROWSER_VERSIONED_ASSET_CACHE_CONTROL.contains("must-revalidate"));
+        assert_eq!(
+            browser_capsule_cache_control("index.html", Some("v=browser-20260907c")),
+            BROWSER_CAPSULE_CACHE_CONTROL
+        );
+        assert_eq!(
+            browser_capsule_cache_control("browser.js", None),
+            BROWSER_CAPSULE_CACHE_CONTROL
+        );
+    }
+
+    #[test]
+    fn versioned_asset_etag_changes_when_bytes_change() {
+        let first = browser_capsule_etag(b"browser.js v1");
+        let second = browser_capsule_etag(b"browser.js v2");
+        assert!(first.starts_with('"') && first.ends_with('"'));
+        assert_ne!(first, second);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::IF_NONE_MATCH, first.parse().unwrap());
+        assert!(if_none_match_contains(&headers, &first));
+        assert!(!if_none_match_contains(&headers, &second));
+    }
+
+    #[tokio::test]
+    async fn versioned_static_assets_revalidate_by_etag() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "test-browser", "Browser test", "app");
+        fs::write(
+            data_dir.path().join("capsules/test-browser/browser.js"),
+            "export const version = 1;\n",
+        )
+        .unwrap();
+        let first = serve_browser_capsule_asset(
+            data_dir.path(),
+            &test_request_headers(),
+            "test-browser",
+            Some("browser.js"),
+            Some("v=browser-20260907c"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some(BROWSER_VERSIONED_ASSET_CACHE_CONTROL)
+        );
+        let etag = first
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let mut headers = test_request_headers();
+        headers.insert(axum::http::header::IF_NONE_MATCH, etag.parse().unwrap());
+        let again = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("browser.js"),
+            Some("v=browser-20260907c"),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        fs::write(
+            data_dir.path().join("capsules/test-browser/browser.js"),
+            "export const version = 2;\n",
+        )
+        .unwrap();
+        let changed = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("browser.js"),
+            Some("v=browser-20260907c"),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(
+            changed
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok()),
+            Some(etag.as_str())
+        );
     }
 
     #[test]

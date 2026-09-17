@@ -282,7 +282,54 @@ async fn remote_engine_preparation_replay_close_and_late_input_keep_exact_native
         .unwrap()
         .starts_with(root.path().to_str().unwrap()));
     assert_eq!(native["profile"]["profile_key"], prepare["profile_key"]);
-    assert_eq!(native["wallet"], json!({}));
+    assert_eq!(
+        native["wallet"]["schema"],
+        "elastos.browser.wallet-consumer-mediation/v1"
+    );
+    assert_eq!(native["wallet"]["resolution"], "consumer_runtime");
+    assert_eq!(native["wallet"]["page_id"], page_id);
+    assert_eq!(native["wallet"]["lifecycle_generation"], generation);
+    assert_eq!(
+        native["wallet"]["requester_endpoint"],
+        owner.requester_endpoint
+    );
+    assert!(native["wallet"].get("principal_id").is_none());
+    assert_ne!(owner.storage_principal(), grant.requester_principal_id);
+    assert!(native["wallet"].get("home_token").is_none());
+    assert!(native["wallet"].get("account_access_url").is_none());
+    let engine_peer = endpoint.id();
+    let consumer = gateway_browser_remote::consumer_binding_for_wallet_forward_test(
+        &grant.requester_principal_id,
+        page_id.as_str(),
+        generation.as_str(),
+        &engine_peer,
+    );
+    let forwarded = gateway_browser_remote::forward_remote_wallet_consumer_request(
+        &consumer,
+        &native["wallet"],
+        &engine_peer,
+        "request_accounts",
+        "https://ela.city/",
+        "https://ela.city",
+        json!({"method": "eth_requestAccounts"}),
+    )
+    .expect("Wallet request built from the real launch payload");
+    assert_eq!(forwarded["page_id"], page_id);
+    assert_eq!(forwarded["lifecycle_generation"], generation);
+    assert!(forwarded.get("principal_id").is_none());
+    let foreign_peer = iroh::SecretKey::from_bytes(&[23; 32]).public();
+    assert!(
+        gateway_browser_remote::forward_remote_wallet_consumer_request(
+            &consumer,
+            &native["wallet"],
+            &foreign_peer,
+            "request_accounts",
+            "https://ela.city/",
+            "https://ela.city",
+            json!({"method": "eth_requestAccounts"}),
+        )
+        .is_err()
+    );
     assert_eq!(native["transport_authority"]["generation"], generation);
     assert_eq!(requests.iter().filter(|r| r["op"] == "launch").count(), 1);
     let mut stale = base.clone();
@@ -1019,4 +1066,123 @@ pub(super) async fn exercise_revoked_remote_preparation_cleanup(
             crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(endpoint),
         ))
         .await;
+}
+
+#[tokio::test]
+async fn remote_engine_status_after_restart_uses_settlement_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RemoteEngineFixture::default());
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await
+        .unwrap();
+    let (trusted, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted, "remote-engine-restart");
+    let source = iroh::SecretKey::from_bytes(&[46; 32]).public();
+    let principal = "person:local:5021af2e018b5ebcbf577e0cc1554a8c";
+    let generation = format!("sha256:{}", "f".repeat(64));
+    let page_id = format!(
+        "page:vz-{}",
+        hex::encode(Sha256::digest(format!("{generation}\npage")))
+    );
+    let stream_id = "stream:source-home-browser-exit:465196cc18314cb9";
+    let storage = RemoteEngineOwner::storage_principal_for(&source.to_string(), principal);
+    let authority = json!({
+        "principal_id": storage,
+        "generation": generation,
+        "page_id": page_id,
+        "egress": {"stream_id": stream_id},
+    });
+    let request = json!({
+        "op": "status",
+        "principal_id": principal,
+        "grant_id": "services-remote-engine-grant-c64af1d3ac031112",
+        "page_id": page_id,
+        "lifecycle_generation": generation,
+        "stream_id": stream_id,
+        "adapter_id": "browser-vm-product",
+        "transport_authority": authority,
+    });
+    let call = |source: iroh::PublicKey, request: Value| {
+        let root = root.path().to_owned();
+        let registry = registry.clone();
+        let endpoint = endpoint.clone();
+        let network = network.clone();
+        async move {
+            gateway_browser_remote::invoke(
+                &root, registry, endpoint, source, network, None, &request,
+            )
+            .await
+        }
+    };
+    let settled = call(source, request.clone()).await.unwrap();
+    assert_eq!(settled["status"], "ok", "{settled}");
+    assert_eq!(
+        settled["data"]["schema"],
+        "elastos.browser.engine.launch-reconciliation/v1"
+    );
+    assert_eq!(settled["data"]["lifecycle_generation"], generation);
+    assert_eq!(settled["data"]["stream_id"], stream_id);
+    let forwarded = provider.calls.lock().await;
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(forwarded[0]["op"], "status");
+    assert_eq!(forwarded[0]["principal_id"], storage);
+    assert!(forwarded[0].get("page_id").is_none());
+    drop(forwarded);
+
+    let foreign = iroh::SecretKey::from_bytes(&[47; 32]).public();
+    assert!(
+        call(foreign, request.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Engine requester or generation changed"),
+        "wrong peer must stay rejected"
+    );
+
+    let mut wrong_principal = request.clone();
+    wrong_principal["principal_id"] = json!("person:local:other");
+    assert!(
+        call(source, wrong_principal)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Engine requester or generation changed"),
+        "wrong principal must stay rejected"
+    );
+
+    let mut wrong_generation = request.clone();
+    let other = format!("sha256:{}", "a".repeat(64));
+    wrong_generation["lifecycle_generation"] = json!(other);
+    wrong_generation["page_id"] = json!(format!(
+        "page:vz-{}",
+        hex::encode(Sha256::digest(format!("{other}\npage")))
+    ));
+    assert!(
+        call(source, wrong_generation)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Engine requester or generation changed"),
+        "wrong generation must stay rejected"
+    );
+
+    let mut missing = request.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("transport_authority");
+    assert!(
+        call(source, missing)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Engine retained owner unavailable"),
+        "status without settlement authority stays unavailable"
+    );
 }

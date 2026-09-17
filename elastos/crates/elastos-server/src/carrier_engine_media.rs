@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    sync::{watch, Mutex, Semaphore},
+    sync::{oneshot, watch, Mutex, Semaphore},
 };
 
 struct MediaTarget {
@@ -146,6 +146,7 @@ pub(crate) async fn serve(
         tokio::net::TcpStream::connect(address),
     )
     .await??;
+    disable_media_nagle(&target)?;
     ensure!(
         !retiring.load(Ordering::Acquire),
         "Engine media retired during connect"
@@ -165,11 +166,87 @@ pub(crate) async fn serve(
     Ok(())
 }
 
-async fn connect(
+enum WarmPayload {
+    Ready(super::BrowserCarrierStream),
+    Pending {
+        client: super::CarrierClient,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    },
+}
+
+const STREAM_WARM_DEADLINE: Duration = Duration::from_secs(5);
+
+struct MediaWarm {
+    generation: String,
+    first: Option<oneshot::Receiver<Result<WarmPayload, String>>>,
+    worker: Option<tokio::task::AbortHandle>,
+    attach_armed: bool,
+}
+
+struct TakenWarm {
+    rx: oneshot::Receiver<Result<WarmPayload, String>>,
+    worker: Option<tokio::task::AbortHandle>,
+}
+
+fn abort_warm_worker(worker: Option<tokio::task::AbortHandle>) {
+    if let Some(worker) = worker {
+        worker.abort();
+    }
+}
+
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        abort_warm_worker(self.0.take());
+    }
+}
+
+async fn warm_payload_with_deadline<F>(
+    prepared_abort: Option<tokio::task::AbortHandle>,
+    deadline: Duration,
+    work: F,
+) -> Result<WarmPayload, String>
+where
+    F: std::future::Future<Output = Result<WarmPayload, String>>,
+{
+    match tokio::time::timeout(deadline, work).await {
+        Ok(result) => result,
+        Err(_) => {
+            abort_warm_worker(prepared_abort);
+            tracing::info!("browser_media_warm warm_deadline");
+            Err("Engine media warm deadline".into())
+        }
+    }
+}
+
+static MEDIA_WARMS: OnceLock<Mutex<BTreeMap<(PathBuf, String), MediaWarm>>> = OnceLock::new();
+
+fn clone_client_handle(client: &super::CarrierClient) -> super::CarrierClient {
+    super::CarrierClient {
+        conn: client.conn.clone(),
+        _endpoint: client._endpoint.clone(),
+        owns_endpoint: false,
+    }
+}
+
+fn media_admit_request(authority: &Value) -> Value {
+    json!({"op":"browser_engine_media","page_id":authority["page_id"],
+        "generation":authority["generation"],"binding_hash":authority["binding_hash"]})
+}
+
+pub(crate) async fn preconnect_engine(
     endpoint: &iroh::Endpoint,
     grant: &Value,
-    authority: &Value,
-) -> Result<super::BrowserCarrierStream> {
+) -> Result<super::CarrierClient> {
+    warm_media_client(endpoint, grant).await
+}
+
+async fn warm_media_client(
+    endpoint: &iroh::Endpoint,
+    grant: &Value,
+) -> Result<super::CarrierClient> {
     let peer = grant["peer_did"]
         .as_str()
         .context("Engine peer missing")?
@@ -179,47 +256,399 @@ async fn connect(
             .as_str()
             .context("Engine route missing")?,
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        for address in addresses.into_iter().filter(|a| a.id == peer) {
-            let Ok(client) =
-                super::CarrierClient::connect_known_endpoint(endpoint, address, 5).await
-            else {
-                continue;
-            };
-            let (mut send, mut recv) = client.conn.open_bi().await?;
-            super::write_json_line(
-                &mut send,
-                &json!({"op":"browser_engine_media","page_id":authority["page_id"],
-                "generation":authority["generation"],"binding_hash":authority["binding_hash"]}),
-            )
-            .await?;
-            let mut response = Vec::new();
-            loop {
-                let mut b = [0; 1];
-                recv.read_exact(&mut b).await?;
-                ensure!(
-                    response.len() < 1024,
-                    "Engine media acknowledgement too large"
-                );
-                if b[0] == b'\n' {
-                    break;
-                }
-                response.push(b[0]);
-            }
-            ensure!(
-                serde_json::from_slice::<Value>(&response)?["ok"] == true,
-                "Engine media was not admitted"
-            );
-            return Ok(super::BrowserCarrierStream {
-                send,
-                recv,
-                _client: client,
-            });
+    for address in addresses.into_iter().filter(|a| a.id == peer) {
+        if let Ok(client) = super::CarrierClient::connect_known_endpoint(endpoint, address, 5).await
+        {
+            return Ok(client);
         }
-        anyhow::bail!("Engine media route unavailable")
+    }
+    anyhow::bail!("Engine media route unavailable")
+}
+
+async fn admit_opened_stream(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    client: super::CarrierClient,
+    authority: &Value,
+) -> Result<super::BrowserCarrierStream> {
+    super::write_json_line(&mut send, &media_admit_request(authority)).await?;
+    let mut response = Vec::new();
+    loop {
+        let mut b = [0; 1];
+        recv.read_exact(&mut b).await?;
+        ensure!(
+            response.len() < 1024,
+            "Engine media acknowledgement too large"
+        );
+        if b[0] == b'\n' {
+            break;
+        }
+        response.push(b[0]);
+    }
+    ensure!(
+        serde_json::from_slice::<Value>(&response)?["ok"] == true,
+        "Engine media was not admitted"
+    );
+    Ok(super::BrowserCarrierStream {
+        send,
+        recv,
+        _client: client,
+    })
+}
+
+async fn open_media_stream(
+    client: super::CarrierClient,
+    authority: &Value,
+) -> Result<super::BrowserCarrierStream> {
+    let (send, recv) = client.conn.open_bi().await?;
+    admit_opened_stream(send, recv, client, authority).await
+}
+
+async fn open_pending_stream(client: super::CarrierClient) -> Result<WarmPayload> {
+    let (send, recv) = client.conn.open_bi().await?;
+    Ok(WarmPayload::Pending { client, send, recv })
+}
+
+async fn take_warm_stream(root: &Path, authority: &Value) -> Option<TakenWarm> {
+    let page = authority["page_id"].as_str()?;
+    let generation = authority["generation"].as_str()?;
+    let mut warms = MEDIA_WARMS.get_or_init(Default::default).lock().await;
+    let warm = warms.get_mut(&(root.to_owned(), page.into()))?;
+    if warm.generation != generation || !warm.attach_armed {
+        return None;
+    }
+    warm.attach_armed = false;
+    Some(TakenWarm {
+        rx: warm.first.take()?,
+        worker: warm.worker.take(),
+    })
+}
+
+fn spawn_stream_warm(
+    tx: oneshot::Sender<Result<WarmPayload, String>>,
+    prepared: Option<tokio::task::JoinHandle<Result<super::CarrierClient>>>,
+    endpoint: iroh::Endpoint,
+    grant: Value,
+    authority: Value,
+    admit: bool,
+) -> tokio::task::AbortHandle {
+    let prepared_abort = prepared.as_ref().map(|task| task.abort_handle());
+    tokio::spawn(async move {
+        let _cancel_prepared = AbortOnDrop(prepared_abort.clone());
+        let result = warm_payload_with_deadline(prepared_abort, STREAM_WARM_DEADLINE, async {
+            let client = match prepared {
+                Some(task) => match task.await {
+                    Ok(Ok(client)) => Ok(client),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                },
+                None => warm_media_client(&endpoint, &grant)
+                    .await
+                    .map_err(|err| err.to_string()),
+            };
+            match client {
+                Ok(client) if admit => open_media_stream(client, &authority)
+                    .await
+                    .map(WarmPayload::Ready)
+                    .map_err(|err| err.to_string()),
+                Ok(client) => open_pending_stream(client)
+                    .await
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(err),
+            }
+        })
+        .await;
+        let _ = tx.send(result);
+    })
+    .abort_handle()
+}
+
+async fn replace_media_warm(key: (PathBuf, String), warm: MediaWarm) {
+    let previous = MEDIA_WARMS
+        .get_or_init(Default::default)
+        .lock()
+        .await
+        .insert(key, warm);
+    if let Some(previous) = previous {
+        abort_warm_worker(previous.worker);
+    }
+}
+
+#[cfg(test)]
+struct PreadmitCommitBarrier {
+    prepared: Arc<tokio::sync::Barrier>,
+    release: watch::Sender<bool>,
+}
+
+#[cfg(test)]
+static PREADMIT_COMMIT_BARRIER: OnceLock<std::sync::Mutex<Option<Arc<PreadmitCommitBarrier>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+async fn await_preadmit_commit_barrier() {
+    let barrier = PREADMIT_COMMIT_BARRIER
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(barrier) = barrier else {
+        return;
+    };
+    let mut released = barrier.release.subscribe();
+    barrier.prepared.wait().await;
+    while !*released.borrow() {
+        if released.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn commit_prepared_media<T>(
+    key: (PathBuf, String),
+    generation: String,
+    armed: bool,
+    prepared: T,
+    into_payload: impl FnOnce(T) -> Result<WarmPayload, String>,
+) -> bool {
+    #[cfg(test)]
+    await_preadmit_commit_barrier().await;
+
+    let ingresses = INGRESS.get_or_init(Default::default).lock().await;
+    if ingresses.get(&key).is_none() {
+        return false;
+    }
+    let (tx, rx) = oneshot::channel();
+    let previous = {
+        let mut warms = MEDIA_WARMS.get_or_init(Default::default).lock().await;
+        warms.insert(
+            key,
+            MediaWarm {
+                generation,
+                first: Some(rx),
+                worker: None,
+                attach_armed: armed,
+            },
+        )
+    };
+    drop(ingresses);
+    if let Some(previous) = previous {
+        abort_warm_worker(previous.worker);
+    }
+    let _ = tx.send(into_payload(prepared));
+    true
+}
+
+async fn install_stream_warm(
+    root: &Path,
+    page: &str,
+    generation: &str,
+    prepared: Option<tokio::task::JoinHandle<Result<super::CarrierClient>>>,
+    endpoint: iroh::Endpoint,
+    grant: Value,
+    authority: Value,
+    attach_armed: bool,
+    admit: bool,
+) {
+    let (tx, rx) = oneshot::channel();
+    let worker = spawn_stream_warm(tx, prepared, endpoint, grant, authority, admit);
+    replace_media_warm(
+        (root.to_owned(), page.into()),
+        MediaWarm {
+            generation: generation.into(),
+            first: Some(rx),
+            worker: Some(worker),
+            attach_armed,
+        },
+    )
+    .await;
+}
+
+async fn install_pending_spare(
+    root: &Path,
+    page: &str,
+    generation: &str,
+    client: &super::CarrierClient,
+) {
+    {
+        let warms = MEDIA_WARMS.get_or_init(Default::default).lock().await;
+        if let Some(warm) = warms.get(&(root.to_owned(), page.into())) {
+            if warm.generation == generation && warm.first.is_some() {
+                tracing::info!(page, "browser_media_warm spare_keep");
+                return;
+            }
+        }
+    }
+    match open_pending_stream(clone_client_handle(client)).await {
+        Ok(payload) => {
+            let (tx, rx) = oneshot::channel();
+            replace_media_warm(
+                (root.to_owned(), page.into()),
+                MediaWarm {
+                    generation: generation.into(),
+                    first: Some(rx),
+                    worker: None,
+                    attach_armed: false,
+                },
+            )
+            .await;
+            let _ = tx.send(Ok(payload));
+            tracing::info!(page, "browser_media_warm spare_pending");
+        }
+        Err(error) => tracing::info!(page, error = %error, "browser_media_warm spare_failed"),
+    }
+}
+
+pub(crate) async fn preadmit_media_stream(root: &Path, authority: &Value) {
+    let Some(page) = authority["page_id"].as_str() else {
+        return;
+    };
+    let Some(generation) = authority["generation"].as_str() else {
+        return;
+    };
+    let key = (root.to_owned(), page.into());
+    let mut warms = MEDIA_WARMS.get_or_init(Default::default).lock().await;
+    let Some(warm) = warms.get_mut(&key) else {
+        return;
+    };
+    if warm.generation != generation {
+        return;
+    }
+    let Some(rx) = warm.first.take() else {
+        return;
+    };
+    let armed = warm.attach_armed;
+    let worker = warm.worker.take();
+    drop(warms);
+    let payload = match tokio::time::timeout(Duration::from_secs(2), rx).await {
+        Ok(Ok(Ok(payload))) => payload,
+        _ => {
+            abort_warm_worker(worker);
+            tracing::info!(page, "browser_media_warm preadmit_miss");
+            return;
+        }
+    };
+    let ready = match payload {
+        WarmPayload::Ready(stream) => {
+            tracing::info!(page, "browser_media_warm preadmit_already_ready");
+            stream
+        }
+        WarmPayload::Pending { client, send, recv } => match tokio::time::timeout(
+            STREAM_WARM_DEADLINE,
+            admit_opened_stream(send, recv, client, authority),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                tracing::info!(page, "browser_media_warm preadmit_ready");
+                stream
+            }
+            Ok(Err(error)) => {
+                tracing::info!(page, error = %error, "browser_media_warm preadmit_failed");
+                return;
+            }
+            Err(_) => {
+                tracing::info!(page, "browser_media_warm preadmit_deadline");
+                return;
+            }
+        },
+    };
+    if !commit_prepared_media(key, generation.into(), armed, ready, |stream| {
+        Ok(WarmPayload::Ready(stream))
     })
     .await
-    .context("Engine media connection deadline")?
+    {
+        tracing::info!(page, "browser_media_warm preadmit_retired");
+    }
+}
+
+pub(crate) async fn rearm_media_stream(
+    root: &Path,
+    endpoint: &iroh::Endpoint,
+    grant: &Value,
+    authority: &Value,
+) {
+    let Some(page) = authority["page_id"].as_str() else {
+        return;
+    };
+    let Some(generation) = authority["generation"].as_str() else {
+        return;
+    };
+    let key = (root.to_owned(), page.into());
+    let ingresses = INGRESS.get_or_init(Default::default).lock().await;
+    let Some(ingress) = ingresses.get(&key) else {
+        return;
+    };
+    if ingress.generation != generation || *ingress.cancel.borrow() || *ingress.closed.borrow() {
+        return;
+    }
+    drop(ingresses);
+    let mut warms = MEDIA_WARMS.get_or_init(Default::default).lock().await;
+    if let Some(warm) = warms.get_mut(&key) {
+        if warm.generation == generation && warm.first.is_some() {
+            warm.attach_armed = true;
+            tracing::info!(page, "browser_media_warm rearm_keep");
+            return;
+        }
+    }
+    drop(warms);
+    tracing::info!(page, "browser_media_warm rearm_pending");
+    install_stream_warm(
+        root,
+        page,
+        generation,
+        None,
+        endpoint.clone(),
+        grant.clone(),
+        authority.clone(),
+        true,
+        false,
+    )
+    .await;
+}
+
+async fn connect(
+    root: &Path,
+    endpoint: &iroh::Endpoint,
+    grant: &Value,
+    authority: &Value,
+) -> Result<super::BrowserCarrierStream> {
+    let stream = if let Some(taken) = take_warm_stream(root, authority).await {
+        let TakenWarm { rx, worker } = taken;
+        if let Ok(Ok(Ok(payload))) = tokio::time::timeout(Duration::from_secs(5), rx).await {
+            match payload {
+                WarmPayload::Ready(stream) => {
+                    tracing::info!("browser_media_warm take_ready");
+                    stream
+                }
+                WarmPayload::Pending { client, send, recv } => {
+                    tracing::info!("browser_media_warm take_pending");
+                    admit_opened_stream(send, recv, client, authority).await?
+                }
+            }
+        } else {
+            abort_warm_worker(worker);
+            tracing::info!("browser_media_warm take_failed");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                open_media_stream(warm_media_client(endpoint, grant).await?, authority).await
+            })
+            .await
+            .context("Engine media connection deadline")??
+        }
+    } else {
+        tracing::info!("browser_media_warm take_miss");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            open_media_stream(warm_media_client(endpoint, grant).await?, authority).await
+        })
+        .await
+        .context("Engine media connection deadline")??
+    };
+    if let (Some(page), Some(generation)) = (
+        authority["page_id"].as_str(),
+        authority["generation"].as_str(),
+    ) {
+        install_pending_spare(root, page, generation, &stream._client).await;
+    }
+    Ok(stream)
 }
 
 #[derive(serde::Deserialize)]
@@ -269,6 +698,14 @@ fn read_config(root: &Path) -> Result<IngressConfig> {
     );
     Ok(config)
 }
+
+fn disable_media_nagle(stream: &tokio::net::TcpStream) -> Result<()> {
+    stream
+        .set_nodelay(true)
+        .context("Runtime media TCP requires TCP_NODELAY")?;
+    Ok(())
+}
+
 fn valid_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return !ip.is_unspecified() && !ip.is_multicast();
@@ -292,6 +729,7 @@ pub(crate) async fn start_ingress(
     endpoint: &iroh::Endpoint,
     grant: &Value,
     authority: &Value,
+    prepared: Option<tokio::task::JoinHandle<Result<super::CarrierClient>>>,
 ) -> Result<Value> {
     let config = read_config(root)?;
     let page = authority["page_id"]
@@ -318,7 +756,12 @@ pub(crate) async fn start_ingress(
                     ),
             "Viewer ingress owner changed"
         );
-        return Ok(ingress.descriptor.clone());
+        let descriptor = ingress.descriptor.clone();
+        drop(ingresses);
+        if let Some(task) = prepared {
+            task.abort();
+        }
+        return Ok(descriptor);
     }
     let mut listener = None;
     for port in config.port_start..=config.port_end {
@@ -338,8 +781,20 @@ pub(crate) async fn start_ingress(
         "turn_url":format!("turn:{host}:{}?transport=tcp",listener.local_addr()?.port())});
     let (cancel, mut cancelled) = watch::channel(false);
     let (done, closed) = watch::channel(false);
+    install_stream_warm(
+        root,
+        page,
+        generation,
+        prepared,
+        endpoint.clone(),
+        grant.clone(),
+        authority.clone(),
+        true,
+        true,
+    )
+    .await;
     ingresses.insert(
-        key,
+        key.clone(),
         Ingress {
             generation: generation.into(),
             descriptor: descriptor.clone(),
@@ -348,6 +803,7 @@ pub(crate) async fn start_ingress(
         },
     );
     drop(ingresses);
+    let root = root.to_owned();
     let endpoint = endpoint.clone();
     let grant = grant.clone();
     let authority = authority.clone();
@@ -360,10 +816,11 @@ pub(crate) async fn start_ingress(
                 result=listener.accept()=>match result {
                     Ok((socket,_))=>{
                         let Ok(slot)=slots.clone().try_acquire_owned() else {drop(socket);continue;};
-                        let endpoint=endpoint.clone();let grant=grant.clone();let authority=authority.clone();
+                        let root=root.clone();let endpoint=endpoint.clone();let grant=grant.clone();let authority=authority.clone();
                         children.spawn(async move {
                             let _slot=slot;
-                            let mut remote=connect(&endpoint,&grant,&authority).await?;
+                            disable_media_nagle(&socket)?;
+                            let mut remote=connect(&root,&endpoint,&grant,&authority).await?;
                             let (mut read,mut write)=socket.into_split();
                             tokio::try_join!(async {tokio::io::copy(&mut read,&mut remote.send).await?;remote.send.finish()?;Ok::<_,anyhow::Error>(())},
                                 async {tokio::io::copy(&mut remote.recv,&mut write).await?;write.shutdown().await?;Ok::<_,anyhow::Error>(())})?;
@@ -404,6 +861,14 @@ pub(crate) async fn close_ingress(root: &Path, page: &str, generation: &str) -> 
     .await??;
     ingresses = INGRESS.get_or_init(Default::default).lock().await;
     ingresses.remove(&key);
+    let previous = MEDIA_WARMS
+        .get_or_init(Default::default)
+        .lock()
+        .await
+        .remove(&key);
+    if let Some(previous) = previous {
+        abort_warm_worker(previous.worker);
+    }
     Ok(())
 }
 
@@ -512,9 +977,9 @@ mod tests {
             std::fs::write(consumer_root.path().join("config/browser-viewer-ingress.json"),serde_json::to_vec(&json!({
                 "schema":"elastos.browser.viewer-ingress-config/v1","listen_host":"127.0.0.1","advertised_host":"127.0.0.1",
                 "port_start":port,"port_end":port})).unwrap()).unwrap();
-            let ingress=start_ingress(consumer_root.path(),&consumer.endpoint,&grant,&authority).await.unwrap();
+            let ingress=start_ingress(consumer_root.path(),&consumer.endpoint,&grant,&authority,None).await.unwrap();
             validate_ingress(&authority,&ingress,ingress["turn_url"].as_str().unwrap()).unwrap();
-            assert_eq!(start_ingress(consumer_root.path(),&consumer.endpoint,&grant,&authority).await.unwrap(),ingress);
+            assert_eq!(start_ingress(consumer_root.path(),&consumer.endpoint,&grant,&authority,None).await.unwrap(),ingress);
             assert!(!ingress.to_string().contains(&engine.endpoint.id().to_string()));
             let echo=tokio::spawn(async move {
                 let (mut socket,_)=target.accept().await.unwrap();let mut bytes=[0;8];
@@ -525,16 +990,220 @@ mod tests {
             let mut viewer=tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,port)).await.unwrap();
             viewer.write_all(b"turndata").await.unwrap();let mut bytes=[0;8];viewer.read_exact(&mut bytes).await.unwrap();assert_eq!(&bytes,b"received");
             let anonymous=iroh::Endpoint::builder(iroh::endpoint::presets::Minimal).bind().await.unwrap();
-            assert!(connect(&anonymous,&grant,&authority).await.is_err(),"routing information cannot confer Runtime authority");
+            assert!(connect(consumer_root.path(),&anonymous,&grant,&authority).await.is_err(),"routing information cannot confer Runtime authority");
             let mut stale=authority.clone();stale["generation"]=json!(runtime_hash("stale"));
-            assert!(connect(&consumer.endpoint,&grant,&stale).await.is_err());
+            assert!(connect(consumer_root.path(),&consumer.endpoint,&grant,&stale).await.is_err());
             assert!(close_ingress(consumer_root.path(),"page:media-test","foreign").await.is_err());
             remove_target(engine_root.path(),"page:media-test",authority["generation"].as_str().unwrap()).await.unwrap();
             echo.await.unwrap();
             close_ingress(consumer_root.path(),"page:media-test",authority["generation"].as_str().unwrap()).await.unwrap();
             assert!(tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST,port)).await.is_err());
-            assert!(connect(&consumer.endpoint,&grant,&authority).await.is_err());
+            assert!(connect(consumer_root.path(),&consumer.endpoint,&grant,&authority).await.is_err());
             anonymous.close().await;consumer.endpoint.close().await;engine.endpoint.close().await;
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_warm_deadline_aborts_hung_prepare() {
+        let prepared = tokio::spawn(std::future::pending::<()>());
+        let abort = prepared.abort_handle();
+        let started = tokio::time::Instant::now();
+        let result = warm_payload_with_deadline(
+            Some(abort.clone()),
+            Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+        match result {
+            Err(error) => assert_eq!(error, "Engine media warm deadline"),
+            Ok(_) => panic!("hung prepare must miss the warm deadline"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(abort.is_finished());
+        drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn take_warm_timeout_aborts_owned_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = json!({"page_id":"page:warm-timeout","generation":"gen"});
+        let (_tx, rx) = oneshot::channel::<Result<WarmPayload, String>>();
+        let worker = tokio::spawn(std::future::pending::<()>());
+        let abort = worker.abort_handle();
+        MEDIA_WARMS
+            .get_or_init(Default::default)
+            .lock()
+            .await
+            .insert(
+                (root.path().to_owned(), "page:warm-timeout".into()),
+                MediaWarm {
+                    generation: "gen".into(),
+                    first: Some(rx),
+                    worker: Some(abort.clone()),
+                    attach_armed: true,
+                },
+            );
+        let TakenWarm { rx, worker } = take_warm_stream(root.path(), &authority).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), rx)
+            .await
+            .is_err());
+        abort_warm_worker(worker);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn close_ingress_aborts_prepared_warm_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = unused.local_addr().unwrap().port();
+        drop(unused);
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/browser-viewer-ingress.json"),
+            serde_json::to_vec(&json!({
+                "schema":"elastos.browser.viewer-ingress-config/v1",
+                "listen_host":"127.0.0.1",
+                "advertised_host":"127.0.0.1",
+                "port_start":port,
+                "port_end":port
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let grant = json!({"peer_did":endpoint.id().to_string(),"connect_ticket":"ticket"});
+        let authority = json!({
+            "page_id":"page:warm-close",
+            "generation":"gen",
+            "binding_hash":runtime_hash("binding")
+        });
+        let prepared = tokio::spawn(std::future::pending::<Result<super::super::CarrierClient>>());
+        let abort = prepared.abort_handle();
+        start_ingress(root.path(), &endpoint, &grant, &authority, Some(prepared))
+            .await
+            .unwrap();
+        close_ingress(root.path(), "page:warm-close", "gen")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(abort.is_finished());
+        endpoint.close().await;
+    }
+
+    struct ReleasedPreparedStream(Arc<AtomicBool>);
+
+    impl Drop for ReleasedPreparedStream {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PreadmitBarrierGuard(Arc<PreadmitCommitBarrier>);
+
+    impl Drop for PreadmitBarrierGuard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = PREADMIT_COMMIT_BARRIER.get_or_init(Default::default).lock() {
+                *slot = None;
+            }
+            let _ = self.0.release.send(true);
+        }
+    }
+
+    fn install_preadmit_commit_barrier() -> PreadmitBarrierGuard {
+        let (release, _) = watch::channel(false);
+        let barrier = Arc::new(PreadmitCommitBarrier {
+            prepared: Arc::new(tokio::sync::Barrier::new(2)),
+            release,
+        });
+        *PREADMIT_COMMIT_BARRIER
+            .get_or_init(Default::default)
+            .lock()
+            .expect("preadmit barrier") = Some(barrier.clone());
+        PreadmitBarrierGuard(barrier)
+    }
+
+    async fn insert_fast_close_ingress(root: &Path, page: &str, generation: &str) {
+        let (cancel, _) = watch::channel(false);
+        let (_done, closed) = watch::channel(true);
+        INGRESS.get_or_init(Default::default).lock().await.insert(
+            (root.to_owned(), page.into()),
+            Ingress {
+                generation: generation.into(),
+                descriptor: json!({}),
+                cancel,
+                closed,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn late_preadmit_after_close_releases_prepared_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let page = "page:late-preadmit";
+        let key = (root.path().to_owned(), page.into());
+        insert_fast_close_ingress(root.path(), page, "gen").await;
+        let barrier = install_preadmit_commit_barrier();
+        let released = Arc::new(AtomicBool::new(false));
+        let pending = tokio::spawn({
+            let key = key.clone();
+            let released = released.clone();
+            async move {
+                commit_prepared_media(
+                    key,
+                    "gen".into(),
+                    true,
+                    ReleasedPreparedStream(released),
+                    |_| Err("test".into()),
+                )
+                .await
+            }
+        });
+        barrier.0.prepared.wait().await;
+        close_ingress(root.path(), page, "gen").await.unwrap();
+        let _ = barrier.0.release.send(true);
+        assert_eq!(pending.await.unwrap(), false);
+        assert!(released.load(Ordering::SeqCst));
+        assert!(MEDIA_WARMS
+            .get_or_init(Default::default)
+            .lock()
+            .await
+            .get(&key)
+            .is_none());
+        assert!(INGRESS
+            .get_or_init(Default::default)
+            .lock()
+            .await
+            .get(&key)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn preadmit_commit_retains_stream_while_ingress_owns_the_page() {
+        let root = tempfile::tempdir().unwrap();
+        let page = "page:preadmit-retain";
+        let key = (root.path().to_owned(), page.into());
+        insert_fast_close_ingress(root.path(), page, "gen").await;
+        assert!(
+            commit_prepared_media(key.clone(), "gen".into(), true, (), |_| Err("kept".into()))
+                .await
+        );
+        assert!(MEDIA_WARMS
+            .get_or_init(Default::default)
+            .lock()
+            .await
+            .get(&key)
+            .is_some());
+        close_ingress(root.path(), page, "gen").await.unwrap();
+        assert!(MEDIA_WARMS
+            .get_or_init(Default::default)
+            .lock()
+            .await
+            .get(&key)
+            .is_none());
     }
 }

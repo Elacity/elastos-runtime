@@ -4,6 +4,7 @@ use super::*;
 use elastos_common::browser_protocol::{
     BrowserEngineReadiness, BrowserEngineReadinessReason, BROWSER_ENGINE_READINESS_SCHEMA,
 };
+use sha2::Sha256;
 
 pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
     registry: &ProviderRegistry,
@@ -881,6 +882,64 @@ mod tests {
     }
 }
 
+const REMOTE_ENGINE_SUMMARY_TTL: std::time::Duration = std::time::Duration::from_secs(8);
+
+struct RemoteEngineSummaryCacheEntry {
+    fingerprint: String,
+    expires_at: std::time::Instant,
+    value: serde_json::Value,
+}
+
+fn remote_engine_summary_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, RemoteEngineSummaryCacheEntry>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, RemoteEngineSummaryCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remote_engine_cache_key(data_dir: &FsPath, principal_id: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("{}\n{principal_id}", data_dir.display()).as_bytes(),
+    ))
+}
+
+fn remote_engine_grant_fingerprint(grants: &[serde_json::Value]) -> String {
+    let mut rows = grants
+        .iter()
+        .map(|grant| {
+            format!(
+                "{}\n{}\n{}",
+                grant["id"].as_str().unwrap_or(""),
+                grant["expires_at"].as_u64().unwrap_or(0),
+                grant["operations"]
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    hex::encode(Sha256::digest(rows.join("\n").as_bytes()))
+}
+
+fn cached_remote_engine_summary(key: &str, fingerprint: &str) -> Option<serde_json::Value> {
+    let cache = remote_engine_summary_cache().lock().ok()?;
+    let entry = cache.get(key)?;
+    (entry.fingerprint == fingerprint && std::time::Instant::now() < entry.expires_at)
+        .then(|| entry.value.clone())
+}
+
+fn store_remote_engine_summary(key: String, fingerprint: String, value: serde_json::Value) {
+    if let Ok(mut cache) = remote_engine_summary_cache().lock() {
+        cache.insert(
+            key,
+            RemoteEngineSummaryCacheEntry {
+                fingerprint,
+                expires_at: std::time::Instant::now() + REMOTE_ENGINE_SUMMARY_TTL,
+                value,
+            },
+        );
+    }
+}
+
 /// Approved remote services are observed through the same Runtime provider plane.
 /// Execution selections retain an opaque Runtime route to their exact grant.
 pub(in crate::api::gateway) async fn browser_remote_engine_summary(
@@ -900,6 +959,11 @@ pub(in crate::api::gateway) async fn browser_remote_engine_summary(
     let Some(registry) = state.provider_registry.as_ref() else {
         return serde_json::json!({"state":"unavailable","offers":[]});
     };
+    let fingerprint = remote_engine_grant_fingerprint(&grants);
+    let cache_key = remote_engine_cache_key(&state.data_dir, &context.principal_id);
+    if let Some(cached) = cached_remote_engine_summary(&cache_key, &fingerprint) {
+        return cached;
+    }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut offers = Vec::new();
     for grant in grants {
@@ -966,5 +1030,43 @@ pub(in crate::api::gateway) async fn browser_remote_engine_summary(
         }
         offers.push(visible);
     }
-    serde_json::json!({"state":"available","offers":offers})
+    let value = serde_json::json!({"state":"available","offers":offers});
+    store_remote_engine_summary(cache_key, fingerprint, value.clone());
+    value
+}
+
+#[cfg(test)]
+mod remote_engine_summary_cache_tests {
+    use super::*;
+
+    #[test]
+    fn grant_fingerprint_changes_when_offer_identity_changes() {
+        let first =
+            serde_json::json!([{"id":"remote-engine-aa","expires_at":10,"operations":["status"]}]);
+        let second =
+            serde_json::json!([{"id":"remote-engine-bb","expires_at":10,"operations":["status"]}]);
+        assert_ne!(
+            remote_engine_grant_fingerprint(first.as_array().unwrap()),
+            remote_engine_grant_fingerprint(second.as_array().unwrap())
+        );
+    }
+
+    #[test]
+    fn cache_returns_the_stored_observation_until_the_grant_set_changes() {
+        let key = format!(
+            "test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let fingerprint = "fp-one".to_string();
+        let value = serde_json::json!({"state":"available","offers":[{"id":"cached"}]});
+        store_remote_engine_summary(key.clone(), fingerprint.clone(), value.clone());
+        assert_eq!(
+            cached_remote_engine_summary(&key, &fingerprint),
+            Some(value)
+        );
+        assert_eq!(cached_remote_engine_summary(&key, "fp-two"), None);
+    }
 }

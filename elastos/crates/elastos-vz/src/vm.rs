@@ -145,6 +145,23 @@ impl RunningVm {
         self.last_vz_error.as_ref()
     }
 
+    pub(crate) fn guest_state_label(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if let Some(machine) = self.handle.as_ref() {
+            return format!("{:?}", machine.current_state());
+        }
+        format!("{:?}", self.status)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_guest_exit_receiver(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::ffi::delegate::DelegateExit>> {
+        self.handle
+            .as_ref()
+            .and_then(|machine| machine.take_exit_receiver().ok())
+    }
+
     /// Typed Vz exit reason from the most recent terminal
     /// observation (macOS only). Returns `None` before any stop
     /// or `wait_for_exit_code` call.

@@ -704,7 +704,7 @@ fn reconcile_terminal_vz_settlement(mutate: impl FnOnce(&mut Value)) -> Value {
         "transport_authority": transport.authority,
         "effects": {
             "page_acquired": false,
-            "vm_acquired": true,
+            "vm_acquired": false,
         },
         "launch_settlement_result": settlement,
     });
@@ -2452,11 +2452,39 @@ fn launch_reconciliation_adopts_exact_terminal_vz_settlement_without_page_bindin
     assert_eq!(response["status"], "ok");
     assert_eq!(response["data"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(response["data"]["effects"]["page_acquired"], false);
-    assert_eq!(response["data"]["effects"]["vm_acquired"], true);
+    assert_eq!(response["data"]["effects"]["vm_acquired"], false);
     assert_eq!(
         response["data"]["terminal_cleanup_receipt"]["schema"],
         "elastos.browser.vz-launch-settlement/v1"
     );
+}
+
+#[test]
+fn launch_reconciliation_adopts_terminal_vz_settlement_with_failed_profile_durability() {
+    let response = reconcile_terminal_vz_settlement(|value| {
+        value["launch_settlement_result"]["profile_durability"] = json!("failed");
+        value["control_service"]["config_fingerprint"] = json!("b".repeat(64));
+    });
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "terminal_post_effect_cleanup");
+    assert_eq!(
+        response["data"]["terminal_cleanup_receipt"]["absence"]["child_absent"],
+        true
+    );
+    assert_eq!(
+        response["data"]["terminal_cleanup_receipt"]["profile_durability"],
+        "failed"
+    );
+}
+
+#[test]
+fn launch_reconciliation_rejects_invalid_profile_durability() {
+    let response = reconcile_terminal_vz_settlement(|value| {
+        value["launch_settlement_result"]["profile_durability"] = json!("maybe");
+    });
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "cleanup_pending");
 }
 
 #[test]
@@ -2694,6 +2722,51 @@ fn exact_typed_already_absent_supervisor_proof_is_terminal() {
     let terminal = engine_terminal_cleanup_result(&binding, receipt).unwrap();
     assert_eq!(terminal["schema"], BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA);
     assert_eq!(terminal["terminal"], true);
+}
+
+#[test]
+fn ordinary_close_builder_keeps_failed_profile_durability() {
+    let session = PageControlSession {
+        display_attachment: BrowserDisplayAttachment::default(),
+        generation: "sha256:typed-durability".to_string(),
+        stream_id: "stream:typed-durability".to_string(),
+        socket_path: "/tmp/elastos-browser-typed-durability.sock".to_string(),
+        shutdown_socket_path: None,
+        adapter_id: "hosted-product".to_string(),
+        principal_id: Some("person:local:test".to_string()),
+        engine: AdapterKind::SelkiesGstreamer,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        isolated_session: false,
+        isolation_session_dir: None,
+        isolation_kind: None,
+        control_service: None,
+        process: None,
+        transport_authority: None,
+        transport_receipt: None,
+    };
+    let binding = engine_cleanup_binding("page:typed-durability", &session);
+    let receipt = json!({
+        "schema": BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA,
+        "page_id": binding.page_id,
+        "generation": binding.generation,
+        "binding": binding,
+        "terminal": true,
+        "profile_durability": "failed",
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true
+        }
+    });
+
+    let terminal = engine_terminal_cleanup_result(&binding, receipt).unwrap();
+    assert_eq!(terminal["schema"], BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA);
+    assert_eq!(terminal["terminal"], true);
+    assert_eq!(terminal["effects"]["child_absent"], true);
+    assert_eq!(terminal["profile_durability"], "failed");
 }
 
 #[test]
@@ -3001,6 +3074,123 @@ fn isolated_close_uses_target_shutdown_contract() {
     );
     assert_eq!(response["data"]["terminal"], true);
     assert_eq!(response["data"]["effects"]["child_absent"], true);
+    handle.join().unwrap();
+}
+
+#[test]
+fn ordinary_isolated_close_and_replay_keep_failed_profile_durability() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    let socket_path = format!(
+        "/tmp/elastos-browser-isolated-durability-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let handle = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            let mut shutdowns = 0;
+            while shutdowns < 2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 256];
+                loop {
+                    let size = stream.read(&mut buffer).unwrap_or(0);
+                    if size == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..size]);
+                    if http_request_is_complete(&request) {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                if !request.starts_with("POST /shutdown HTTP/1.1") {
+                    let body = r#"{"schema":"elastos.browser.test-probe/v1","ok":true}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let mut receipt: serde_json::Value =
+                    serde_json::from_str(&typed_supervisor_cleanup_receipt(&request)).unwrap();
+                receipt["profile_durability"] = json!("failed");
+                let body = serde_json::to_string(&receipt).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                shutdowns += 1;
+            }
+            let _ = std::fs::remove_file(socket_path);
+        }
+    });
+
+    let mut provider = BrowserEngineAdapter::new();
+    provider.page_control_sessions.insert(
+        "page:isolated-durability".to_string(),
+        PageControlSession {
+            display_attachment: BrowserDisplayAttachment::default(),
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
+            socket_path: socket_path.clone(),
+            shutdown_socket_path: None,
+            adapter_id: "hosted-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::SelkiesGstreamer,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+            isolated_session: true,
+            isolation_session_dir: Some(
+                "/tmp/elastos-browser-sessions/stream_isolated-durability-test".to_string(),
+            ),
+            isolation_kind: Some("per_launch_selkies_target".to_string()),
+            control_service: None,
+            process: None,
+            transport_authority: None,
+            transport_receipt: None,
+        },
+    );
+
+    let cleanup = cleanup_binding_for(&provider, "page:isolated-durability");
+    let first = serde_json::to_value(provider.close_page(
+        "page:isolated-durability",
+        Some("person:local:test".to_string()),
+        cleanup.clone(),
+    ))
+    .unwrap();
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["data"]["terminal"], true);
+    assert_eq!(first["data"]["effects"]["child_absent"], true);
+    assert_eq!(first["data"]["profile_durability"], "failed");
+    assert!(!provider
+        .page_control_sessions
+        .contains_key("page:isolated-durability"));
+
+    let replay = serde_json::to_value(provider.close_page(
+        "page:isolated-durability",
+        Some("person:local:test".to_string()),
+        cleanup,
+    ))
+    .unwrap();
+    assert_eq!(replay["status"], "ok");
+    assert_eq!(replay["data"]["terminal"], true);
+    assert_eq!(replay["data"]["effects"]["child_absent"], true);
+    assert_eq!(replay["data"]["profile_durability"], "failed");
     handle.join().unwrap();
 }
 

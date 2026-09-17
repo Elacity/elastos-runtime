@@ -27,7 +27,7 @@ import {
   isMissingRuntimePageError,
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260907c";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260907c";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260915d";
 import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907c";
 import { createOperatorApprovalController, mountOperatorApproval } from "./browser-operator-approval.js";
 
@@ -117,6 +117,8 @@ let pageStatusRefreshTimers = [];
 let pageHeartbeatTimer = 0;
 let lastPageStatus = null;
 let unloadCleanupStarted = false;
+let recoverableDisplayAttachStarted = false;
+let displayAttachRetryIdentity = null;
 let remoteDisplay = null;
 let relaunchRequested = false;
 let browserAuthorityRenewal = null;
@@ -428,8 +430,185 @@ function recoverableRuntimePage(summary = browserSummary) {
   };
 }
 
+function displayAttachRequestId(generation) {
+  return typeof generation === "string" && generation.startsWith("display:")
+    ? generation.slice("display:".length)
+    : "";
+}
+
+function viewerDisplayAttachTimeoutMs() {
+  const value = globalThis.VIEWER_DISPLAY_ATTACH_TIMEOUT_MS;
+  return typeof value === "number" && value > 0 ? value : 8000;
+}
+
+function reuseDisplayAttachment(pending) {
+  const validRequest = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  const validGeneration = value => typeof value === "string" && /^display:[a-f0-9]{32}$/.test(value);
+  if (
+    !pending ||
+    pending.schema !== "elastos.browser.display-attachment/v1" ||
+    !validRequest(pending.request_id) ||
+    !validGeneration(pending.previous_display_generation)
+  ) {
+    return null;
+  }
+  if (pending.state === "pending" || pending.state === "ready") {
+    return pending;
+  }
+  if (pending.state === "failed" && pending.error_code === "display_attach_uncertain") {
+    return pending;
+  }
+  return null;
+}
+
+function terminalDisplayAttachment(pending) {
+  return pending &&
+    pending.schema === "elastos.browser.display-attachment/v1" &&
+    pending.state === "failed" &&
+    pending.error_code === "display_attach_failed";
+}
+
+function allocateDisplayAttachRetryId(pageId, generation) {
+  const validRequest = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const shared = (boot && boot.retryIdentity) || displayAttachRetryIdentity;
+  if (
+    shared &&
+    shared.page_id === pageId &&
+    shared.generation === generation &&
+    validRequest(shared.request_id)
+  ) {
+    displayAttachRetryIdentity = shared;
+    if (boot) boot.retryIdentity = shared;
+    return shared.request_id;
+  }
+  const requestId = crypto.randomUUID().replace(/-/g, "");
+  if (shared && typeof shared === "object") {
+    shared.page_id = pageId;
+    shared.generation = generation;
+    shared.request_id = requestId;
+    displayAttachRetryIdentity = shared;
+    if (boot) boot.retryIdentity = shared;
+    return requestId;
+  }
+  const next = { page_id: pageId, generation, request_id: requestId };
+  displayAttachRetryIdentity = next;
+  if (boot) boot.retryIdentity = next;
+  return next.request_id;
+}
+
+function markDisplayAttachRetryNeeded(pageId, generation) {
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const shared = (boot && boot.retryIdentity) || displayAttachRetryIdentity || {
+    page_id: "",
+    generation: "",
+    request_id: "",
+  };
+  shared.page_id = pageId;
+  shared.generation = generation;
+  shared.request_id = "";
+  displayAttachRetryIdentity = shared;
+  if (boot) boot.retryIdentity = shared;
+}
+
+function displayAttachRequestForRecovery(pageId, generation, pending) {
+  const reused = reuseDisplayAttachment(pending);
+  if (reused) {
+    return {
+      type: "display_attach",
+      request_id: reused.request_id,
+      display_generation: reused.previous_display_generation,
+    };
+  }
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const shared = (boot && boot.retryIdentity) || displayAttachRetryIdentity;
+  if (
+    terminalDisplayAttachment(pending) ||
+    (shared && shared.page_id === pageId && shared.generation === generation)
+  ) {
+    return {
+      type: "display_attach",
+      request_id: allocateDisplayAttachRetryId(pageId, generation),
+      display_generation: generation,
+    };
+  }
+  return {
+    type: "display_attach",
+    request_id: displayAttachRequestId(generation),
+    display_generation: generation,
+  };
+}
+
+function startRecoverableDisplayAttach() {
+  if (
+    recoverableDisplayAttachStarted ||
+    homeWindowCloseInFlight ||
+    homeWindowTerminalCloseConfirmed
+  ) {
+    return;
+  }
+  const pageId = currentPage?.page_id;
+  const generation = currentPage?.display_session?.display_generation;
+  const requestId = displayAttachRequestId(generation);
+  if (
+    typeof pageId !== "string" ||
+    !pageId ||
+    !launchToken ||
+    !/^[a-f0-9]{32}$/.test(requestId) ||
+    currentPage?.display_session?.mode !== PRODUCT_DISPLAY_MODE ||
+    browserSummary?.engine_adapter?.display_attach_supported !== true
+  ) {
+    return;
+  }
+  recoverableDisplayAttachStarted = true;
+  try {
+    console.info(JSON.stringify({
+      schema: "elastos.browser.media-diagnostic/v1",
+      event: "dying_page_attach",
+      request_id: requestId,
+    }));
+  } catch {
+    // Keep unload attach on the product path if diagnostics cannot print.
+  }
+  fetch(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/webrtc`, {
+    method: "POST",
+    headers: {
+      "x-elastos-home-token": launchToken,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      type: "display_attach",
+      request_id: requestId,
+      display_generation: generation,
+    }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function persistRecoverableDisplayQuery(page) {
+  if (typeof location === "undefined" || typeof history === "undefined") {
+    return;
+  }
+  const url = new URL(location.href);
+  const generation = page?.display_session?.display_generation;
+  const validGeneration = typeof generation === "string" && /^display:[a-f0-9]{32}$/.test(generation);
+  if (typeof page?.page_id === "string" && page.page_id && validGeneration) {
+    url.searchParams.set("page_id", page.page_id);
+    url.searchParams.set("display_generation", generation);
+  } else if (!page?.page_id) {
+    url.searchParams.delete("page_id");
+    url.searchParams.delete("display_generation");
+  }
+  const next = `${url.pathname}${url.search}${url.hash}`;
+  const current = `${location.pathname}${location.search}${location.hash}`;
+  if (next !== current) {
+    history.replaceState(history.state, "", next);
+  }
+}
+
 function publishRuntimePageForHost(page = currentPage) {
   window.__elastosBrowserCurrentPageId = page?.page_id || "";
+  persistRecoverableDisplayQuery(page);
 }
 
 function currentRuntimePageOwner() {
@@ -489,6 +668,18 @@ const runtimePageCleanup = createRuntimePageCleanupController({
   onTerminal: (owner, _outcome, failure) => {
     const applied = finalizeRuntimePageClose(owner);
     deliverPendingHomeBrowserWindowClose(owner, _outcome);
+    if (
+      applied &&
+      (_outcome?.profile_durability === "failed" ||
+        _outcome?.profile_durability === "unknown") &&
+      !unloadCleanupStarted
+    ) {
+      showStatus(
+        "Runtime closed the Browser session, but the profile save failed. You can open the address again.",
+        { sticky: true },
+      );
+      return;
+    }
     if (applied && failure && !unloadCleanupStarted) {
       showStatus(
         "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
@@ -1750,13 +1941,33 @@ function syncEngineSelect(summary) {
   updateSettingsTitle();
 }
 
-async function fetchBrowserSummary() {
+async function fetchBrowserSummary({ remoteServices = true } = {}) {
   if (browserSummaryPromise) {
     return browserSummaryPromise;
   }
-  const summaryPath = browserInstanceId
-    ? `/api/apps/browser/summary?browser_instance=${encodeURIComponent(browserInstanceId)}`
-    : "/api/apps/browser/summary";
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  if (!remoteServices && boot?.summaryPromise) {
+    const pending = boot.summaryPromise;
+    boot.summaryPromise = null;
+    try {
+      const summary = await pending;
+      browserSummary = summary;
+      syncEngineSelect(summary);
+      syncExitSelect(summary);
+      return summary;
+    } catch {
+      // Fall through to a live summary request when the boot prefetch fails.
+    }
+  }
+  const query = new URLSearchParams();
+  if (browserInstanceId) {
+    query.set("browser_instance", browserInstanceId);
+  }
+  if (!remoteServices) {
+    query.set("remote_services", "0");
+  }
+  const encoded = query.toString();
+  const summaryPath = encoded ? `/api/apps/browser/summary?${encoded}` : "/api/apps/browser/summary";
   browserSummaryPromise = fetchJson(summaryPath, { method: "GET" })
     .then((summary) => {
       browserSummary = summary;
@@ -2051,6 +2262,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       );
     }
     await connectRemoteDisplay(openedPage.display_session, openedPage);
+    publishRuntimePageForHost(currentPage);
     startPageStatusPolling();
     startPageHeartbeat();
     if (!remoteDisplay.isTrackReady()) {
@@ -2347,19 +2559,41 @@ async function attachRecoveredDisplay(summary, owner) {
       !validRequest(pending.request_id) || !validGeneration(pending.previous_display_generation))) {
     throw new Error("Runtime could not check the pending Browser display attachment.");
   }
-  const request = {
-    type: "display_attach",
-    request_id: pending?.state === "pending" ? pending.request_id : crypto.randomUUID().replaceAll("-", ""),
-    display_generation: pending?.state === "pending" ? pending.previous_display_generation : display.display_generation,
-  };
+  const request = displayAttachRequestForRecovery(
+    owner.page_id,
+    display.display_generation,
+    pending,
+  );
   let result;
-  try {
-    result = await fetchJson(`/api/apps/browser/pages/${encodeURIComponent(owner.page_id)}/webrtc`, {
-      method: "POST", body: request,
-    });
-  } catch (error) {
-    if (!runtimeViewerOwnerActive(owner)) return null;
-    throw error;
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const bootAttach = boot?.attachPromise;
+  if (bootAttach) {
+    boot.attachPromise = null;
+    try {
+      const attached = await bootAttach;
+      if (attached?.page_id === owner.page_id && attached.request && attached.result) {
+        request.request_id = attached.request.request_id;
+        request.display_generation = attached.request.display_generation;
+        result = attached.result;
+      }
+    } catch {
+      result = undefined;
+    }
+  }
+  if (!result) {
+    try {
+      result = await fetchJson(`/api/apps/browser/pages/${encodeURIComponent(owner.page_id)}/webrtc`, {
+        method: "POST",
+        body: request,
+        signal: AbortSignal.timeout(viewerDisplayAttachTimeoutMs()),
+      });
+    } catch (error) {
+      if (!runtimeViewerOwnerActive(owner)) return null;
+      if (error?.payload?.code === "display_attach_failed") {
+        markDisplayAttachRetryNeeded(owner.page_id, request.display_generation);
+      }
+      throw error;
+    }
   }
   if (!runtimeViewerOwnerActive(owner)) return null;
   const offerValid = offer => offer?.schema === "elastos.browser.webrtc-offer/v1" && offer.type === "offer" &&
@@ -2419,28 +2653,43 @@ async function restoreRuntimePageViewer(summary) {
   syncExitSelect(summary);
   showStatus("Restoring the Browser display...", { sticky: true });
   startPageHeartbeat();
+  let statusPromise = null;
   try {
     // Page status is diagnostic; attach replaces offers within retained Runtime authority.
     if (currentPage.display_session?.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");
     }
-    const [status, display] = await Promise.all([
-      fetchPageStatus({ history: "replace", forceAddress: true }),
-      attachRecoveredDisplay(summary, owner),
-    ]);
-    if (!status || !display || !runtimeViewerOwnerActive(owner)) return true;
+    statusPromise = fetchPageStatus({ history: "replace", forceAddress: true });
+    const display = await attachRecoveredDisplay(summary, owner);
+    if (!display || !runtimeViewerOwnerActive(owner)) {
+      await statusPromise.catch(() => null);
+      return true;
+    }
     if (display.mode !== "webrtc_remote_display") {
       throw new Error("Runtime could not restore the Browser display.");
     }
-    currentPage = { ...currentPage, display_session: display };
-    publishRuntimePageForHost(currentPage);
     currentDisplayMode = display.mode;
     syncDisplayInputFromSession(display);
     currentView = viewFromDisplaySession(display) || currentPage.view;
     startPageStatusPolling();
-    await connectRemoteDisplay(display, currentPage);
+    const connecting = connectRemoteDisplay(display, { ...currentPage, display_session: display });
+    let status;
+    try {
+      status = await statusPromise;
+    } catch (error) {
+      await connecting.catch(() => null);
+      throw error;
+    }
+    if (!status || !runtimeViewerOwnerActive(owner)) {
+      await connecting.catch(() => null);
+      return true;
+    }
+    currentPage = { ...currentPage, display_session: display };
+    publishRuntimePageForHost(currentPage);
+    await connecting;
     return true;
   } catch (error) {
+    if (statusPromise) await statusPromise.catch(() => null);
     if (!runtimeViewerOwnerActive(owner)) return true;
     throw error;
   } finally {
@@ -2449,10 +2698,16 @@ async function restoreRuntimePageViewer(summary) {
 }
 
 window.addEventListener("beforeunload", () => {
+  startRecoverableDisplayAttach();
   releaseRuntimePageForUnload();
 });
 
-window.addEventListener("pagehide", releaseRuntimePageForUnload);
+window.addEventListener("pagehide", (event) => {
+  if (!event.persisted) {
+    startRecoverableDisplayAttach();
+  }
+  releaseRuntimePageForUnload();
+});
 
 mountOperatorApproval({
   container: settingsPanel,
@@ -2465,13 +2720,18 @@ mountOperatorApproval({
   }),
 });
 
-const initialUrl = params.get("url") || DEFAULT_URL;
+const requestedStartupUrl = params.get("url");
+const initialUrl = requestedStartupUrl || DEFAULT_URL;
 addressInput.value = initialUrl;
 setLoading(true);
-fetchBrowserSummary()
+fetchBrowserSummary({ remoteServices: false })
   .then(async (summary) => {
     if (await restoreRuntimePageViewer(summary)) return;
-    return requestRuntimeOpen(initialUrl, { history: "replace" });
+    if (!requestedStartupUrl) {
+      setLoading(false);
+      return;
+    }
+    return requestRuntimeOpen(requestedStartupUrl, { history: "replace" });
   })
   .catch((error) => {
     if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;

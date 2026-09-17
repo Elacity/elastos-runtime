@@ -80,5 +80,27 @@ test('signaling evidence preserves only allowlisted stage metadata', () => {
     sdp: 'private', candidate: 'private', url: 'private', token: 'private' }),
     { signal_type: 'display_attach', error_code: 'display_attach_failed' });
   assert.deepEqual(browserViewerSignalMetadata({ schema: 'elastos.browser.display-attach-result/v1', initial_offer: { sdp: 'private' } }), { attached: true });
+  assert.deepEqual(browserViewerSignalMetadata({
+    schema: 'elastos.browser.display-attach-result/v1',
+    initial_offer: {
+      sdp: 'private',
+      candidates: [
+        { candidate: 'candidate:1 1 UDP 1 203.0.113.5 3478 typ relay' },
+        { candidate: 'candidate:2 1 UDP 1 192.0.2.8 9 typ host' },
+      ],
+    },
+    audio_offer: { sdp: 'private', candidates: [] },
+  }), {
+    attached: true,
+    initial_offer_ice: { candidate_count: 2, relay_candidate_count: 1 },
+    audio_offer_ice: { candidate_count: 0, relay_candidate_count: 0 },
+  });
+  assert.deepEqual(browserViewerSignalMetadata({
+    attached: true,
+    initial_offer_ice: { candidate_count: 1, relay_candidate_count: 1 },
+  }), {
+    attached: true,
+    initial_offer_ice: { candidate_count: 1, relay_candidate_count: 1 },
+  });
   assert.deepEqual(browserViewerSignalMetadata({ type: ['answer'], code: ['display_attach_busy'], attached: 'true' }), {});
 });

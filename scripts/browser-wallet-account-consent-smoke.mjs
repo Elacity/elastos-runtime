@@ -58,6 +58,56 @@ assert.equal(
   accountId,
 );
 
+const connectorAccountId = "wallet:eip155:20:0x3333333333333333333333333333333333333333";
+const connectorRuntime = {
+  wallet: {
+    ...runtime.wallet,
+    default_account_id: connectorAccountId,
+    accounts: [
+      {
+        account_id: connectorAccountId,
+        chain_namespace: "eip155:20",
+        address: "0x3333333333333333333333333333333333333333",
+        proof_type: "siwe",
+        connector_id: "wallet-metamask",
+      },
+    ],
+  },
+};
+assert.equal(
+  walletRuntimeRequestedAccount(connectorRuntime, { chain_namespace: "eip155:20" })
+    .connector_id,
+  "wallet-metamask",
+);
+
+const bothRuntime = {
+  wallet: {
+    ...runtime.wallet,
+    default_account_id: connectorAccountId,
+    accounts: [
+      {
+        account_id: accountId,
+        chain_namespace: "eip155:20",
+        address,
+        proof_type: "managed_evm",
+      },
+      {
+        account_id: connectorAccountId,
+        chain_namespace: "eip155:20",
+        address: "0x3333333333333333333333333333333333333333",
+        proof_type: "siwe",
+        connector_id: "wallet-metamask",
+      },
+    ],
+  },
+};
+assert.equal(
+  walletRuntimeRequestedAccount(bothRuntime, { chain_namespace: "eip155:20" })
+    .connector_id,
+  "wallet-metamask",
+  "selected connector wins when a managed account is also present",
+);
+
 runtime.pendingAccountAccess.set("wallet-approval:consent", {
   executionContextId: context.executionContextId,
   origin: context.pageOrigin,

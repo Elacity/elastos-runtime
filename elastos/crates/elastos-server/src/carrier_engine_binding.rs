@@ -129,12 +129,13 @@ impl RemoteEngineOwner {
     /// Provider storage is scoped to both identities. A peer cannot name a host
     /// directory or borrow another peer's profile by supplying its principal.
     pub(crate) fn storage_principal(&self) -> String {
+        Self::storage_principal_for(&self.requester_endpoint, &self.requester_principal_id)
+    }
+
+    pub(crate) fn storage_principal_for(endpoint: &str, principal: &str) -> String {
         format!(
             "remote-engine-{}",
-            hex::encode(Sha256::digest(format!(
-                "{}\n{}",
-                self.requester_endpoint, self.requester_principal_id
-            )))
+            hex::encode(Sha256::digest(format!("{endpoint}\n{principal}")))
         )
     }
 }

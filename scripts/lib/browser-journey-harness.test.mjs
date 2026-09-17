@@ -10,17 +10,26 @@ import { browserJourneyTargetConfig, readBrowserJourneyReceipt,
   browserJourneyProfileStorage, browserJourneyProfileBinding } from "./browser-journey-target.mjs";
 
 const source = readFileSync(new URL("../home-passkey-virtual-auth-smoke.mjs", import.meta.url), "utf8");
-function harnessFunction(name, globals = {}) {
+function extractDeclaration(name) {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   assert.ok(start >= 0, name);
   const next = source.slice(start + 1).search(/\n(?:async )?function /);
-  const declaration = source.slice(start, start + 1 + next);
+  return source.slice(start, start + 1 + next);
+}
+const browserJourneySummaryUrl = vm.runInNewContext(
+  `(${extractDeclaration("browserJourneySummaryUrl")})`,
+  { URL, URLSearchParams },
+);
+function harnessFunction(name, globals = {}) {
+  const declaration = extractDeclaration(name);
   return vm.runInNewContext(`(${declaration})`, { URL, URLSearchParams, Date, performance,
     CHECK_BROWSER_CONTROLLED_MEDIA: false, CHECK_BROWSER_CONTROLLED_INSPECTION: false,
     CHECK_BROWSER_CONTROLLED_OPERATOR: false, CHECK_BROWSER_CONTROLLED_JOURNEY: false,
+    CHECK_BROWSER_RELOAD_CENSUS: false, BROWSER_RELOAD_OBSERVE_MS: 0,
     BROWSER_REMOTE_EXIT_ID: "", browserQualification: null, qualificationCancellation: null,
     BROWSER_JOURNEY_TARGET: browserJourneyTargetConfig(), browserJourneyEngineChoice, browserJourneyEngineRoute,
     browserJourneyFixtureUrl, browserJourneyProfileStorage, browserJourneyProfileBinding,
+    browserJourneySummaryUrl,
     readBrowserJourneyReceipt: (config, run, options) => readBrowserJourneyReceipt(config, run,
       { ...options, fetchImpl: globals.fetch || fetch }), ...globals });
 }
@@ -67,7 +76,7 @@ test("controlled fixture isolates runs, records bounded events and rejects malfo
   }
 });
 
-test("page acquisition fails immediately on its terminal open settlement", async () => {
+test("page acquisition keeps a published page before a later failed open settlement", async () => {
   let inspected = false;
   const frame = { evaluate: async () => { inspected = true; return ""; } };
   const wait = harnessFunction("waitForEmbeddedBrowserPage", {
@@ -76,11 +85,11 @@ test("page acquisition fails immediately on its terminal open settlement", async
   await assert.rejects(wait(frame, [{ frame, at: Date.now(), status: 200,
     body: { schema: "elastos.browser.open-status/v1", status: "failed", error: { code: "launch-failed" } } }]),
   error => error.details.settlement.status === "failed" && error.details.stage === "browser:page-acquisition");
-  assert.equal(inspected, false);
+  assert.equal(inspected, true);
   const active = { evaluate: async () => "page-current" };
   assert.equal(await wait(active, [{ frame, at: Date.now(), body: {} }]), "page-current");
   assert.equal(await wait(active, [{ frame: active, open_id: "old-open", body: {} }], new Set(["old-open"])), "page-current");
-  await assert.rejects(wait(active, [{ frame: active, open_id: "new-open", body: {} }], new Set(["old-open"])));
+  assert.equal(await wait(active, [{ frame: active, open_id: "new-open", body: {} }], new Set(["old-open"])), "page-current");
 });
 
 test("explicit Browser inventory deadline aborts a hung response body; default API calls keep their options", async () => {
@@ -173,6 +182,52 @@ test("launcher reuses the selected Browser through exact focus without toggling 
   const page = { url: () => "http://localhost/apps/home/", goto: async () => actions.push("reload-home") };
   assert.equal(await open(page, "browser", actual => { assert.equal(actual, frame); actions.push("captured"); }), frame);
   assert.deepEqual(actions, ["captured", "focus-exact"]);
+});
+
+test("controlled journey opens a fresh Home Browser and leaves hidden leftovers unused", async () => {
+  const actions = [];
+  const frame = { url: () => "http://localhost/apps/browser/?browser_instance=fresh" };
+  const handle = { contentFrame: async () => frame, waitForElementState: async () => {} };
+  const locators = {
+    "#identity-menu-show-desktop": { evaluate: async () => { actions.push("show-desktop"); } },
+    "#taskbar-targets [data-target=\"browser\"]": { first: () => ({ count: async () => 1, click: async options => {
+      assert.equal(options.button, "right");
+      actions.push("shelf-menu");
+    } }) },
+    "#desktop-context-menu [data-context-action=\"open-target-new-window\"]": {
+      count: async () => 1, click: async () => actions.push("new-window"),
+    },
+    "#desktop-context-menu [data-context-action=\"open-target\"]": { count: async () => 0 },
+    "section.window[data-target=\"browser\"]:not(.hidden).window-active iframe.window-frame": {
+      elementHandle: async () => handle,
+    },
+  };
+  const gui = {
+    waitForFunction: async (callback, prior) => {
+      if (prior) {
+        assert.deepEqual(prior, ["leftover"]);
+        actions.push("fresh-src");
+      }
+    },
+    evaluate: async () => ["leftover"],
+    locator: selector => {
+      if (selector === "#setup-sheet") return { isVisible: async () => false };
+      const found = locators[selector];
+      assert.ok(found, selector);
+      return found;
+    },
+  };
+  const identity = { token: "fresh-token" };
+  const open = harnessFunction("openDesktopAppWindow", {
+    CHECK_BROWSER_CONTROLLED_JOURNEY: true,
+    HOME_URL: "http://localhost/apps/home/", waitForSignedHome: async () => {},
+    waitForCapsuleFrame: async () => gui, assert: (condition, message) => assert.ok(condition, message),
+    captureBrowserWindowIdentity: async actual => { assert.equal(actual, frame); return identity; },
+    focusCapturedBrowserWindow: async () => { actions.push("focus-exact"); },
+  });
+  const page = { url: () => "http://localhost/apps/home/", goto: async () => actions.push("reload-home") };
+  assert.equal(await open(page, "browser", actual => { assert.equal(actual, frame); actions.push("captured"); }), frame);
+  assert.deepEqual(actions, ["show-desktop", "shelf-menu", "new-window", "fresh-src", "captured", "focus-exact"]);
 });
 
 function closeHarnessSurface() {
@@ -1015,9 +1070,10 @@ for (const observation of ["ready", "document-transition", "unexpected-viewer-er
       const outcome = await run;
       assert.equal(outcome.ok, true);
       assert.deepEqual(Array.from(outcome.state_observation.steps, row => row.step),
-        ["runtime_summary", "remote_page_status", "viewer_document_metrics"]);
+        ["viewer_document_metrics", "runtime_summary", "remote_page_status"]);
       assert.ok(outcome.state_observation.steps.every(row => row.end_ms >= row.start_ms));
-      assert.equal(outcome.state_observation.steps[0].outcome, "complete");
+      assert.equal(outcome.state_observation.steps.find(row => row.step === "runtime_summary").outcome, "complete");
+      assert.equal(outcome.state_observation.steps[0].outcome, observation === "document-transition" ? "failed" : "complete");
       assert.deepEqual(actions, ["wait-commit", "reload-frame", "input"]);
       assert.match(requests[1].url, /\/pages\/runtime-owner\/status$/);
     }
@@ -1123,6 +1179,87 @@ test("observer cancellation disposes a listener handle returned after its setup 
   assert.ok([...listeners.values()].every(value => value.size === 0));
 });
 
+test("viewer reload wrapper fetches fresh Runtime ownership while the reloaded document has no page yet", async () => {
+  let summaryCalls = 0, viewerPageId = "page-one";
+  const firstSessions = { recoverable_page: { page_id: "page-one" } };
+  const freshSessions = { recoverable_page: { page_id: "page-one" }, generation: "fresh" };
+  const frame = {
+    url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one#home_token=token-one",
+    evaluate: async fn => {
+      if (fn.toString().includes("location.reload()")) return;
+      return { viewer: { page_id: viewerPageId, browser_instance: "instance-one", actual_url: "", document_id: 100 }, video: null };
+    },
+    waitForNavigation: async () => {},
+    locator: () => ({ pressSequentially: async () => {} }),
+  };
+  const signal = new AbortController().signal;
+  const wrapper = harnessFunction("runControlledBrowserViewerReload", {
+    readBrowserViewerReloadDocument, markStage: () => {}, assert: (value, message) => assert.ok(value, message),
+    fetch: async url => {
+      if (String(url).includes("/pages/")) return { ok: true, json: async () => ({ actual_url: "http://localhost:61511/nav" }) };
+      assert.match(String(url), /remote_services=0/);
+      summaryCalls++;
+      return { ok: true, json: async () => ({ sessions: summaryCalls === 1 ? firstSessions : freshSessions }) };
+    },
+    observeControlledBrowserRequests: async () => () => {},
+    diagnoseBrowserViewerReload: async callbacks => {
+      const first = await callbacks.readState({ signal, deadlineMs: 5000 });
+      assert.equal(first.sessions, firstSessions);
+      assert.equal(first.viewer.page_id, "page-one");
+      const afterFirst = summaryCalls;
+      viewerPageId = "";
+      const second = await callbacks.readState({ signal, deadlineMs: 5000 });
+      assert.equal(second.sessions, freshSessions);
+      assert.equal(second.viewer.page_id, "");
+      assert.ok(summaryCalls > afterFirst);
+      return { ok: true };
+    },
+  });
+  assert.equal((await wrapper({}, frame, "token-one", async () => {}, "http://localhost:61511/nav?run=fixture")).ok, true);
+});
+
+test("reload samples reuse last status for binding and do not wait on a hung Engine probe", async () => {
+  let releaseStatus;
+  const hung = new Promise(resolve => { releaseStatus = resolve; });
+  let statusCalls = 0;
+  const sessions = { recoverable_page: { page_id: "page-one" } };
+  const frame = {
+    url: () => "http://localhost:61510/apps/browser/?browser_instance=instance-one#home_token=token-one",
+    evaluate: async fn => {
+      if (fn.toString().includes("location.reload()")) return;
+      return { viewer: { page_id: "page-one", document_id: 100 }, video: { decoded_frames: 4 } };
+    },
+    waitForNavigation: async () => {},
+    locator: () => ({ pressSequentially: async () => {} }),
+  };
+  const signal = new AbortController().signal;
+  const wrapper = harnessFunction("runControlledBrowserViewerReload", {
+    readBrowserViewerReloadDocument, markStage: () => {}, assert: (value, message) => assert.ok(value, message),
+    fetch: async url => {
+      if (String(url).includes("/pages/")) {
+        statusCalls++;
+        if (statusCalls === 1) return { ok: true, json: async () => ({ page_id: "page-one" }) };
+        return { ok: true, json: () => hung };
+      }
+      return { ok: true, json: async () => ({ sessions }) };
+    },
+    observeControlledBrowserRequests: async () => () => {},
+    diagnoseBrowserViewerReload: async callbacks => {
+      const first = await callbacks.readState({ signal, deadlineMs: 5000 });
+      assert.equal(first.page_status.page_id, "page-one");
+      const started = Date.now();
+      const second = await callbacks.readState({ signal, deadlineMs: 5000 });
+      assert.ok(Date.now() - started < 200);
+      assert.equal(second.page_status.page_id, "page-one");
+      assert.equal(second.video.decoded_frames, 4);
+      releaseStatus({ page_id: "page-one" });
+      return { ok: true };
+    },
+  });
+  assert.equal((await wrapper({}, frame, "token-one", async () => {}, "http://localhost:61511/nav?run=fixture")).ok, true);
+  assert.equal(statusCalls, 2);
+});
+
 for (const mode of ["body-abort", "overflow"]) test(`reload substep evidence is bounded and retains ${mode}`, async () => {
   const controller = new AbortController();
   let release, inFlight, count = 0;
@@ -1152,10 +1289,10 @@ for (const mode of ["body-abort", "overflow"]) test(`reload substep evidence is 
   } else {
     let evidence;
     await assert.rejects(run, error => { evidence = error.details.viewer_reload; return evidence.failure === "state_deadline"; });
-    assert.equal(evidence.state_observation.steps.length, 1);
-    const row = evidence.state_observation.steps[0];
-    assert.equal(row.step, "runtime_summary"); assert.equal(row.outcome, "aborted");
-    assert.ok(row.start_ms <= row.headers_ms && row.headers_ms <= row.end_ms);
+    const summary = evidence.state_observation.steps.find(row => row.step === "runtime_summary");
+    assert.equal(summary.outcome, "aborted");
+    assert.ok(summary.start_ms <= summary.headers_ms && summary.headers_ms <= summary.end_ms);
+    assert.ok(evidence.state_observation.steps.some(row => row.step === "viewer_document_metrics"));
     const frozen = JSON.stringify(evidence);
     release({ sessions: { recoverable_page: { page_id: "private-page" } } }); await inFlight;
     assert.equal(JSON.stringify(evidence), frozen); assert.equal(count, 1);

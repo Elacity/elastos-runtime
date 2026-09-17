@@ -3228,6 +3228,8 @@ enum MockBrowserEngineCloseFailure {
     Transport,
     Adapter,
     AlreadyClosed,
+    RestartFailClosed,
+    RetainedOwnerUnavailable,
 }
 
 struct MockRetryingBrowserEngineProvider {
@@ -3285,6 +3287,9 @@ fn mock_browser_launch_page_id(request: &serde_json::Value) -> String {
     if reason.contains("simulate close failure") {
         return "page:mock-browser-close-fails".to_string();
     }
+    if reason.contains("inject failed profile durability") {
+        return "page:mock-failed-profile-durability".to_string();
+    }
     let digest = sha2::Sha256::digest(format!("{url}:{reason}").as_bytes());
     format!("page:mock-browser-engine-{}", hex::encode(&digest[..4]))
 }
@@ -3302,22 +3307,30 @@ fn mock_browser_terminal_cleanup_response(request: &serde_json::Value) -> serde_
         .get("runtime_cleanup")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let page_id = binding
+        .get("page_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut data = json!({
+        "schema": "elastos.browser.engine-cleanup-result/v2",
+        "page_id": binding.get("page_id").cloned().unwrap_or(serde_json::Value::Null),
+        "generation": binding.get("generation").cloned().unwrap_or(serde_json::Value::Null),
+        "binding": binding,
+        "terminal": true,
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true
+        }
+    });
+    if page_id.contains("failed-profile-durability") {
+        data["profile_durability"] = json!("failed");
+    }
     json!({
         "status": "ok",
-        "data": {
-            "schema": "elastos.browser.engine-cleanup-result/v2",
-            "page_id": binding.get("page_id").cloned().unwrap_or(serde_json::Value::Null),
-            "generation": binding.get("generation").cloned().unwrap_or(serde_json::Value::Null),
-            "binding": binding,
-            "terminal": true,
-            "effects": {
-                "page_absent": true,
-                "child_absent": true,
-                "vm_absent": true,
-                "route_absent": true,
-                "socket_absent": true
-            }
-        }
+        "data": data
     })
 }
 
@@ -4073,7 +4086,7 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                             "transport_authority": authority,
                             "effects": {
                                 "page_acquired": false,
-                                "vm_acquired": true,
+                                "vm_acquired": false,
                             },
                             "terminal_cleanup_receipt": settlement,
                         }
@@ -4307,6 +4320,16 @@ impl Provider for MockRetryingBrowserEngineProvider {
                     MockBrowserEngineCloseFailure::AlreadyClosed => {
                         Ok(mock_browser_terminal_cleanup_response(request))
                     }
+                    MockBrowserEngineCloseFailure::RestartFailClosed => Ok(json!({
+                        "status": "error",
+                        "code": "engine_close_indeterminate",
+                        "message": "Browser VM cleanup remains indeterminate after service restart: exact owned launcher unavailable"
+                    })),
+                    MockBrowserEngineCloseFailure::RetainedOwnerUnavailable => Ok(json!({
+                        "status": "error",
+                        "code": "engine_close_indeterminate",
+                        "message": "Engine retained owner unavailable"
+                    })),
                 };
             }
             let response = <MockBrowserEngineProvider as Provider>::send_raw(

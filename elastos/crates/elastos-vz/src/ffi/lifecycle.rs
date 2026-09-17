@@ -478,14 +478,23 @@ impl VzMachineHandle {
     ///
     /// The receiver is consumed on first call; subsequent calls
     /// return a typed error rather than block indefinitely.
+    pub(crate) fn take_exit_receiver(
+        &self,
+    ) -> Result<tokio::sync::oneshot::Receiver<DelegateExit>, String> {
+        self.exit_rx
+            .lock()
+            .expect("exit_rx mutex")
+            .take()
+            .ok_or_else(|| {
+                format!(
+                    "vz wait_for_exit (vm_id='{}'): receiver already consumed",
+                    self.vm_id
+                )
+            })
+    }
+
     pub(crate) async fn wait_for_exit_classified(&self) -> Result<VzExitReason, String> {
-        let rx = self.exit_rx.lock().expect("exit_rx mutex").take();
-        let Some(rx) = rx else {
-            return Err(format!(
-                "vz wait_for_exit (vm_id='{}'): receiver already consumed",
-                self.vm_id
-            ));
-        };
+        let rx = self.take_exit_receiver()?;
         match rx.await {
             Ok(exit) => Ok(delegate_exit_to_reason(exit)),
             Err(_) => Err(format!(

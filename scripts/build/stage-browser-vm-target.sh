@@ -1392,6 +1392,84 @@ def patch_selkies_input_writer(source):
             raise SystemExit("browser-vm-selkies-start: Selkies input writer patch target not found")
     return source.replace(input_marker, input_patch, 1).replace(import_marker, import_patch, 1).replace(close_marker, close_patch, 1)
 
+def patch_selkies_display_renegotiate(signalling_source, gst_source, main_source):
+    signalling_cb = "        self.on_session = lambda peer_id, meta: logger.warn('unhandled on_session callback')\n"
+    signalling_cb_patch = signalling_cb + "        self.on_renegotiate = lambda: logger.warn('unhandled on_renegotiate callback')\n"
+    signalling_json = '''                elif data.get("ice", None):
+                    logger.info("received ICE")
+                    logger.debug("ICE:\\n%s" % data.get("ice"))
+                    self.on_ice(data['ice'].get('sdpMLineIndex'),
+                                data['ice'].get('candidate'))
+                else:
+'''
+    signalling_json_patch = '''                elif data.get("ice", None):
+                    logger.info("received ICE")
+                    logger.debug("ICE:\\n%s" % data.get("ice"))
+                    self.on_ice(data['ice'].get('sdpMLineIndex'),
+                                data['ice'].get('candidate'))
+                elif data.get("elastos_display_renegotiate") is True:
+                    logger.info("received display renegotiate")
+                    self.on_renegotiate()
+                else:
+'''
+    gst_marker = "    def __on_negotiation_needed(self, webrtcbin):\n"
+    gst_offer_plain = """    def request_display_offer(self):
+        if self.webrtcbin:
+            self.__on_negotiation_needed(self.webrtcbin)
+
+    def __on_negotiation_needed(self, webrtcbin):
+"""
+    gst_offer_restart = """    def request_display_offer(self):
+        if not self.webrtcbin:
+            return
+        logger.info("creating display offer with ICE restart")
+        options = Gst.Structure("application/x-gst-webrtc-offer-options")
+        options.set_value("IceRestart", True)
+        promise = Gst.Promise.new_with_change_func(
+            self.__on_offer_created, self.webrtcbin, None)
+        self.webrtcbin.emit("create-offer", options, promise)
+
+    def __on_negotiation_needed(self, webrtcbin):
+"""
+    gst_patch = """    def request_display_offer(self):
+        logger.info("recreating display pipeline for a new viewer")
+        audio_only = bool(getattr(self, "_elastos_audio_only", False))
+        self.stop_pipeline()
+        self.start_pipeline(audio_only=audio_only)
+
+    def __on_negotiation_needed(self, webrtcbin):
+"""
+    start_marker = '        logger.info("starting pipeline")\n'
+    start_patch = '        self._elastos_audio_only = audio_only\n        logger.info("starting pipeline")\n'
+    main_marker = "    app.on_sdp = signalling.send_sdp\n    audio_app.on_sdp = audio_signalling.send_sdp\n"
+    main_patch = main_marker + "    signalling.on_renegotiate = app.request_display_offer\n    audio_signalling.on_renegotiate = audio_app.request_display_offer\n"
+    if signalling_cb_patch not in signalling_source:
+        if signalling_source.count(signalling_cb) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate callback target not found")
+        signalling_source = signalling_source.replace(signalling_cb, signalling_cb_patch, 1)
+    if signalling_json_patch not in signalling_source:
+        if signalling_source.count(signalling_json) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate JSON target not found")
+        signalling_source = signalling_source.replace(signalling_json, signalling_json_patch, 1)
+    if gst_patch not in gst_source:
+        if gst_offer_restart in gst_source:
+            gst_source = gst_source.replace(gst_offer_restart, gst_patch, 1)
+        elif gst_offer_plain in gst_source:
+            gst_source = gst_source.replace(gst_offer_plain, gst_patch, 1)
+        elif gst_source.count(gst_marker) == 1:
+            gst_source = gst_source.replace(gst_marker, gst_patch, 1)
+        else:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate offer target not found")
+    if start_patch not in gst_source:
+        if gst_source.count(start_marker) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies pipeline audio flag target not found")
+        gst_source = gst_source.replace(start_marker, start_patch, 1)
+    if main_patch not in main_source:
+        if main_source.count(main_marker) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate wiring target not found")
+        main_source = main_source.replace(main_marker, main_patch, 1)
+    return signalling_source, gst_source, main_source
+
 main_text = patch_selkies_input_writer(patch_selkies_signaling_retries(main_path.read_text()))
 transport_helper_marker = "\ndef parse_rtc_config(data):\n"
 transport_helper_patch = '''
@@ -1654,6 +1732,12 @@ if audio_offer_patch not in text:
     if audio_offer_marker not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies split audio offer patch target not found")
     text = text.replace(audio_offer_marker, audio_offer_patch, 1)
+signalling_path = path.with_name("webrtc_signalling.py")
+if not signalling_path.is_file():
+    raise SystemExit("browser-vm-selkies-start: webrtc_signalling.py not found")
+signalling_text = signalling_path.read_text()
+signalling_text, text, main_text = patch_selkies_display_renegotiate(signalling_text, text, main_text)
+signalling_path.write_text(signalling_text)
 path.write_text(text)
 main_path.write_text(main_text)
 PY

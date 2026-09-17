@@ -18,7 +18,7 @@ pub(super) use elastos_common::browser_protocol::{
     BrowserWebrtcSignalRequest, BROWSER_DISPLAY_ATTACH_REQUEST_SCHEMA,
 };
 use std::sync::{Mutex as StdMutex, Weak};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 #[path = "gateway_browser_engine.rs"]
 mod gateway_browser_engine;
 #[path = "gateway_browser_operator.rs"]
@@ -66,6 +66,18 @@ pub(super) struct BrowserSummaryResponse {
 pub(super) struct BrowserSummaryQuery {
     #[serde(default)]
     pub(super) browser_instance: Option<String>,
+    /// Session restore reads ownership only. Engine selection still requests live offers.
+    #[serde(default)]
+    pub(super) remote_services: Option<String>,
+}
+
+impl BrowserSummaryQuery {
+    fn omit_remote_services(&self) -> bool {
+        matches!(
+            self.remote_services.as_deref(),
+            Some("0" | "false" | "omit")
+        )
+    }
 }
 
 pub(super) struct BrowserProviderResourceCall {
@@ -219,13 +231,18 @@ pub(super) async fn browser_app_summary(
             Err(err) => return system_error_response(err),
         };
     let context = authority.home_launch_context();
+    let omit_remote_services = query.omit_remote_services();
     let browser_instance = match browser_instance_id(query.browser_instance) {
         Ok(value) => value,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let mut engine_adapter =
         browser_engine_summary(state.provider_registry.as_ref(), &context.principal_id).await;
-    engine_adapter["remote_services"] = browser_remote_engine_summary(&state, &context).await;
+    engine_adapter["remote_services"] = if omit_remote_services {
+        serde_json::json!({"state":"available","offers":[]})
+    } else {
+        browser_remote_engine_summary(&state, &context).await
+    };
     let remote_adapters = engine_adapter["remote_services"]["offers"]
         .as_array()
         .into_iter()
@@ -1452,14 +1469,41 @@ fn validate_browser_vz_did_not_act_settlement(
     Ok(())
 }
 
+fn browser_vz_launch_settlement_keys_are_exact(
+    settlement: &serde_json::Value,
+    keys: &[&str],
+) -> bool {
+    let Some(object) = settlement.as_object() else {
+        return false;
+    };
+    keys.iter().all(|key| object.contains_key(*key))
+        && object
+            .keys()
+            .all(|key| keys.contains(&key.as_str()) || key == "profile_durability")
+}
+
+fn browser_vz_profile_durability_is_safe(settlement: &serde_json::Value) -> bool {
+    match settlement.get("profile_durability") {
+        None => true,
+        Some(value) => matches!(value.as_str(), Some("failed" | "unknown" | "proved")),
+    }
+}
+
+fn browser_profile_durability_from_receipt(receipt: &serde_json::Value) -> Option<&str> {
+    receipt
+        .get("profile_durability")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "failed" | "unknown" | "proved"))
+}
+
 fn validate_browser_vz_launch_settlement_binding(
     settlement: &serde_json::Value,
     authority: &serde_json::Value,
 ) -> Result<(bool, bool), String> {
     validate_browser_vz_transport_authority(authority)?;
-    let object = settlement
-        .as_object()
-        .ok_or_else(|| "Browser VZ launch settlement must be an object".to_string())?;
+    if settlement.as_object().is_none() {
+        return Err("Browser VZ launch settlement must be an object".to_string());
+    }
     let keys = [
         "schema",
         "state",
@@ -1508,8 +1552,8 @@ fn validate_browser_vz_launch_settlement_binding(
         .filter(|value| value.len() <= 8_192 && !value.contains('\0'))
         .ok_or_else(|| "Browser VZ launch settlement message is invalid".to_string())?;
     let _ = message;
-    if object.len() != keys.len()
-        || keys.iter().any(|key| !object.contains_key(*key))
+    if !browser_vz_launch_settlement_keys_are_exact(settlement, &keys)
+        || !browser_vz_profile_durability_is_safe(settlement)
         || settlement.get("schema").and_then(serde_json::Value::as_str)
             != Some("elastos.browser.vz-launch-settlement/v1")
         || settlement.get("binding_hash") != authority.get("binding_hash")
@@ -2216,14 +2260,14 @@ fn validate_browser_dispatched_transport_terminal_receipt(
     if receipt.get("schema").and_then(serde_json::Value::as_str)
         == Some("elastos.browser.vz-launch-settlement/v1")
     {
-        let (acted, settlement_vm_acquired) =
+        let (acted, _settlement_vm_acquired) =
             validate_browser_vz_launch_settlement_binding(receipt, authority)?;
         if selected_engine_adapter.is_none()
             || receipt.get("state").and_then(serde_json::Value::as_str)
                 != Some("terminal_post_effect_cleanup")
             || !acted
             || page_acquired
-            || settlement_vm_acquired != vm_acquired
+            || vm_acquired
             || receipt
                 .get("generation")
                 .and_then(serde_json::Value::as_str)
@@ -2458,6 +2502,73 @@ async fn retry_pending_browser_lifecycle_obligations(state: &GatewayState) -> bo
     preparation_settled || launch_settled || engine_settled || stream_settled
 }
 
+async fn finish_browser_launch_reconciliation_without_engine_effects(
+    state: &GatewayState,
+    reconciliation: &BrowserLaunchReconciliation,
+) -> bool {
+    if let Some(authority) = reconciliation.transport_authority() {
+        if let Err(err) = gateway_browser_remote::close_transport_listener(state, authority).await {
+            tracing::warn!(
+                error = %err,
+                generation = %reconciliation.generation,
+                "Browser launch reconciliation could not close its VZ media listener"
+            );
+            release_browser_launch_reconciliation_claim(&state.data_dir, reconciliation).await;
+            return false;
+        }
+    }
+    let stream_result = tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()),
+    )
+    .await
+    .map_err(|_| "Browser stream cleanup timed out".to_string())
+    .and_then(|result| result);
+    if let Err(err) = stream_result {
+        tracing::warn!(
+            error = %err,
+            generation = %reconciliation.generation,
+            "Browser launch reconciliation terminal proof could not close its stream"
+        );
+        release_browser_launch_reconciliation_claim(&state.data_dir, reconciliation).await;
+        return false;
+    }
+    if let Err(error) = gateway_browser_remote::mark_consumer_terminal_retirement(
+        &state.data_dir,
+        &reconciliation.principal_id,
+        &reconciliation.generation,
+    ) {
+        tracing::warn!(%error, "Remote Engine terminal retirement could not be retained");
+        release_browser_launch_reconciliation_claim(&state.data_dir, reconciliation).await;
+        return false;
+    }
+    if let Err(err) =
+        forget_browser_launch_reconciliation_obligation(&state.data_dir, reconciliation).await
+    {
+        tracing::warn!(
+            error = %err,
+            generation = %reconciliation.generation,
+            "Browser launch reconciliation terminal release could not be committed"
+        );
+        release_browser_launch_reconciliation_claim(&state.data_dir, reconciliation).await;
+        return false;
+    }
+    if let Err(error) = gateway_browser_remote::retire_consumer_generation(
+        &state.data_dir,
+        &reconciliation.principal_id,
+        &reconciliation.generation,
+    ) {
+        tracing::warn!(%error, "Remote Engine terminal route retirement remains pending");
+    }
+    release_browser_open_job_instance_for_owner(
+        &state.data_dir,
+        &reconciliation.principal_id,
+        &reconciliation.owner_launch_id,
+    )
+    .await;
+    true
+}
+
 async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> bool {
     let mut settled = false;
     for reconciliation in claim_pending_browser_launch_reconciliations(
@@ -2499,6 +2610,25 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
             }
             continue;
         }
+        let grant_expired = match gateway_browser_remote::consumer_grant_expired(
+            &state.data_dir,
+            &reconciliation.principal_id,
+            &reconciliation.generation,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation).await;
+                continue;
+            }
+        };
+        if grant_expired {
+            if finish_browser_launch_reconciliation_without_engine_effects(state, &reconciliation)
+                .await
+            {
+                settled = true;
+            }
+            continue;
+        }
         let result = if reconciliation.was_dispatched() {
             attempt_browser_launch_reconciliation_bounded(
                 state,
@@ -2519,77 +2649,12 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
         match browser_launch_reconciliation_decision(result) {
             BrowserLaunchReconciliationDecision::DidNotAct
             | BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup { .. } => {
-                if let Some(authority) = reconciliation.transport_authority() {
-                    if let Err(err) =
-                        gateway_browser_remote::close_transport_listener(state, authority).await
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            generation = %reconciliation.generation,
-                            "Browser launch reconciliation could not close its VZ media listener"
-                        );
-                        release_browser_launch_reconciliation_claim(
-                            &state.data_dir,
-                            &reconciliation,
-                        )
-                        .await;
-                        continue;
-                    }
-                }
-                let stream_result = tokio::time::timeout(
-                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
-                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()),
-                )
-                .await
-                .map_err(|_| "Browser stream cleanup timed out".to_string())
-                .and_then(|result| result);
-                if let Err(err) = stream_result {
-                    tracing::warn!(
-                        error = %err,
-                        generation = %reconciliation.generation,
-                        "Browser launch reconciliation terminal proof could not close its stream"
-                    );
-                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
-                        .await;
-                    continue;
-                }
-                if let Err(error) = gateway_browser_remote::mark_consumer_terminal_retirement(
-                    &state.data_dir,
-                    &reconciliation.principal_id,
-                    &reconciliation.generation,
-                ) {
-                    tracing::warn!(%error, "Remote Engine terminal retirement could not be retained");
-                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
-                        .await;
-                    continue;
-                }
-                if let Err(err) = forget_browser_launch_reconciliation_obligation(
-                    &state.data_dir,
+                if finish_browser_launch_reconciliation_without_engine_effects(
+                    state,
                     &reconciliation,
                 )
                 .await
                 {
-                    tracing::warn!(
-                        error = %err,
-                        generation = %reconciliation.generation,
-                        "Browser launch reconciliation terminal release could not be committed"
-                    );
-                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
-                        .await;
-                } else {
-                    if let Err(error) = gateway_browser_remote::retire_consumer_generation(
-                        &state.data_dir,
-                        &reconciliation.principal_id,
-                        &reconciliation.generation,
-                    ) {
-                        tracing::warn!(%error, "Remote Engine terminal route retirement remains pending");
-                    }
-                    release_browser_open_job_instance_for_owner(
-                        &state.data_dir,
-                        &reconciliation.principal_id,
-                        &reconciliation.owner_launch_id,
-                    )
-                    .await;
                     settled = true;
                 }
             }
@@ -2642,7 +2707,17 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                 .map_err(|_| "Browser stream cleanup timed out".to_string())
                 .and_then(|result| result);
                 if engine_result.is_ok() && stream_result.is_ok() {
-                    if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
+                    if let Err(err) = commit_browser_terminal_cleanup(
+                        state,
+                        &cleanup,
+                        None,
+                        engine_result
+                            .as_ref()
+                            .ok()
+                            .and_then(browser_profile_durability_from_receipt),
+                    )
+                    .await
+                    {
                         release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
                         tracing::warn!(
                             error = %err,
@@ -2703,7 +2778,7 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
             }
         };
         if terminal_retirement {
-            if commit_browser_terminal_cleanup(state, &cleanup, None)
+            if commit_browser_terminal_cleanup(state, &cleanup, None, None)
                 .await
                 .is_ok()
             {
@@ -2735,34 +2810,61 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
         .await
         .map_err(|_| "Browser stream cleanup timed out".to_string())
         .and_then(|result| result);
-        match (engine_result, stream_result) {
-            (Ok(_), Ok(())) => {
-                if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
-                    release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+        let already_absent = matches!(
+            (&engine_result, &stream_result),
+            (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
+        );
+        let ingress_released = if already_absent {
+            match release_absent_engine_viewer_ingress(state, &cleanup).await {
+                Ok(()) => true,
+                Err(err) => {
                     tracing::warn!(
                         page_id = %cleanup.page_id,
                         error = %err,
-                        "Browser terminal cleanup could not commit its receipt and owner release"
+                        "Browser already-absent close could not retire its viewer ingress"
                     );
-                } else {
-                    release_browser_open_job_instance_for_owner(
-                        &state.data_dir,
-                        &cleanup.principal_id,
-                        &cleanup.owner_launch_id,
-                    )
-                    .await;
-                    settled = true;
+                    false
                 }
             }
-            (engine_result, stream_result) => {
+        } else {
+            true
+        };
+        if (engine_result.is_ok() && stream_result.is_ok()) || (already_absent && ingress_released)
+        {
+            if let Err(err) = commit_browser_terminal_cleanup(
+                state,
+                &cleanup,
+                None,
+                engine_result
+                    .as_ref()
+                    .ok()
+                    .and_then(browser_profile_durability_from_receipt),
+            )
+            .await
+            {
                 release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
                 tracing::warn!(
                     page_id = %cleanup.page_id,
-                    engine_error = ?engine_result.err(),
-                    stream_error = ?stream_result.err(),
-                    "Browser pending engine cleanup retry failed"
+                    error = %err,
+                    "Browser terminal cleanup could not commit its receipt and owner release"
                 );
+            } else {
+                release_browser_open_job_instance_for_owner(
+                    &state.data_dir,
+                    &cleanup.principal_id,
+                    &cleanup.owner_launch_id,
+                )
+                .await;
+                settled = true;
             }
+        } else {
+            release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+            tracing::warn!(
+                page_id = %cleanup.page_id,
+                engine_error = ?engine_result.err(),
+                stream_error = ?stream_result.err(),
+                "Browser pending engine cleanup retry failed"
+            );
         }
     }
     settled
@@ -2801,9 +2903,15 @@ async fn commit_browser_terminal_cleanup(
     state: &GatewayState,
     cleanup: &BrowserEngineCleanup,
     terminal_owner_launch_id: Option<&str>,
+    profile_durability: Option<&str>,
 ) -> Result<(), String> {
-    record_browser_reaped_page_tombstone(&state.data_dir, cleanup, terminal_owner_launch_id)
-        .await?;
+    record_browser_reaped_page_tombstone(
+        &state.data_dir,
+        cleanup,
+        terminal_owner_launch_id,
+        profile_durability,
+    )
+    .await?;
     gateway_browser_remote::mark_consumer_terminal_retirement(
         &state.data_dir,
         &cleanup.principal_id,
@@ -2821,6 +2929,11 @@ async fn commit_browser_terminal_cleanup(
 }
 
 async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup) {
+    forget_browser_page_status(&browser_page_status_cache_key(
+        &state.data_dir,
+        &page.engine_cleanup.principal_id,
+        &page.engine_cleanup.page_id,
+    ));
     let engine_cleanup = page.engine_cleanup;
     forget_browser_open_job_for_owner(
         &state.data_dir,
@@ -2848,27 +2961,68 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             release_browser_stream_cleanup_claim(&state.data_dir, cleanup).await;
         }
     }
-    match (&engine_result, &stream_result) {
-        (Ok(_), Ok(())) => {
-            if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
-                release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+    let already_absent = matches!(
+        (&engine_result, &stream_result),
+        (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
+    );
+    let ingress_released = if already_absent {
+        match release_absent_engine_viewer_ingress(state, &engine_cleanup).await {
+            Ok(()) => true,
+            Err(err) => {
                 tracing::warn!(
                     page_id = %engine_cleanup.page_id,
                     error = %err,
-                    "Browser stale page terminal receipt and release could not be committed"
+                    "Browser already-absent stale close could not retire its viewer ingress"
                 );
+                false
             }
         }
-        _ => {
+    } else {
+        true
+    };
+    if (engine_result.is_ok() && stream_result.is_ok()) || (already_absent && ingress_released) {
+        if let Err(err) = commit_browser_terminal_cleanup(
+            state,
+            &engine_cleanup,
+            None,
+            engine_result
+                .as_ref()
+                .ok()
+                .and_then(browser_profile_durability_from_receipt),
+        )
+        .await
+        {
             release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
             tracing::warn!(
                 page_id = %engine_cleanup.page_id,
-                engine_error = ?engine_result.as_ref().err(),
-                stream_error = ?stream_result.as_ref().err(),
-                "Browser stale page engine cleanup failed"
+                error = %err,
+                "Browser stale page terminal receipt and release could not be committed"
             );
         }
+    } else {
+        release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+        tracing::warn!(
+            page_id = %engine_cleanup.page_id,
+            engine_error = ?engine_result.as_ref().err(),
+            stream_error = ?stream_result.as_ref().err(),
+            "Browser stale page engine cleanup failed"
+        );
     }
+}
+
+fn browser_engine_close_is_already_absent(message: &str) -> bool {
+    message.contains("indeterminate after service restart: exact owned launcher unavailable")
+        || message.contains("Engine retained owner unavailable")
+}
+
+async fn release_absent_engine_viewer_ingress(
+    state: &GatewayState,
+    cleanup: &BrowserEngineCleanup,
+) -> Result<(), String> {
+    let Some(authority) = cleanup.transport_authority.as_ref() else {
+        return Ok(());
+    };
+    gateway_browser_remote::close_transport_listener(state, authority).await
 }
 
 async fn attempt_browser_engine_cleanup(
@@ -3102,7 +3256,17 @@ async fn reap_browser_open_effect_after_failure(
     )
     .await;
     if engine_result.is_ok() && stream_result.is_ok() {
-        if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
+        if let Err(err) = commit_browser_terminal_cleanup(
+            state,
+            &engine_cleanup,
+            None,
+            engine_result
+                .as_ref()
+                .ok()
+                .and_then(browser_profile_durability_from_receipt),
+        )
+        .await
+        {
             release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
             tracing::warn!(
                 page_id,
@@ -3203,6 +3367,124 @@ async fn close_browser_stream_cleanup(
     }
 }
 
+const BROWSER_PAGE_STATUS_INACTIVE: &str = "browser session is not active";
+
+type BrowserPageStatusOutcome = Result<serde_json::Value, String>;
+
+fn browser_page_status_flights() -> &'static StdMutex<
+    std::collections::HashMap<String, Vec<oneshot::Sender<BrowserPageStatusOutcome>>>,
+> {
+    static FLIGHTS: std::sync::OnceLock<
+        StdMutex<std::collections::HashMap<String, Vec<oneshot::Sender<BrowserPageStatusOutcome>>>>,
+    > = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+fn browser_page_status_cache_key(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    page_id: &str,
+) -> String {
+    format!("{}\n{principal_id}\n{page_id}", data_dir.display())
+}
+
+fn join_browser_page_status_flight(
+    key: String,
+) -> (bool, Option<oneshot::Receiver<BrowserPageStatusOutcome>>) {
+    let mut flights = match browser_page_status_flights().lock() {
+        Ok(guard) => guard,
+        Err(_) => return (true, None),
+    };
+    if let Some(waiters) = flights.get_mut(&key) {
+        let (tx, rx) = oneshot::channel();
+        waiters.push(tx);
+        return (false, Some(rx));
+    }
+    flights.insert(key, Vec::new());
+    (true, None)
+}
+
+fn complete_browser_page_status_flight(key: &str, outcome: BrowserPageStatusOutcome) {
+    let waiters = match browser_page_status_flights().lock() {
+        Ok(mut flights) => flights.remove(key).unwrap_or_default(),
+        Err(_) => return,
+    };
+    for waiter in waiters {
+        let _ = waiter.send(outcome.clone());
+    }
+}
+
+fn forget_browser_page_status(key: &str) {
+    complete_browser_page_status_flight(key, Err(BROWSER_PAGE_STATUS_INACTIVE.to_string()));
+}
+
+fn browser_page_status_response(outcome: BrowserPageStatusOutcome) -> Response {
+    match outcome {
+        Ok(data) => Json(data).into_response(),
+        Err(message) if message == BROWSER_PAGE_STATUS_INACTIVE => {
+            (StatusCode::NOT_FOUND, BROWSER_PAGE_STATUS_INACTIVE).into_response()
+        }
+        Err(message) => gateway_provider_error_response("browser-engine", anyhow::anyhow!(message)),
+    }
+}
+
+#[cfg(test)]
+mod browser_page_status_flight_tests {
+    use super::{
+        complete_browser_page_status_flight, forget_browser_page_status,
+        join_browser_page_status_flight, BROWSER_PAGE_STATUS_INACTIVE,
+    };
+
+    fn unique_key() -> String {
+        format!(
+            "test-page-status-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn overlapping_reads_share_one_probe_and_the_next_read_starts_fresh() {
+        let key = unique_key();
+        let (leader, waiter) = join_browser_page_status_flight(key.clone());
+        assert!(leader);
+        assert!(waiter.is_none());
+        let (leader, waiter) = join_browser_page_status_flight(key.clone());
+        assert!(!leader);
+        let waiter = waiter.expect("follower waits for the in-flight probe");
+        let first = serde_json::json!({"page_id":"page:one","actual_url":"https://example.test/"});
+        complete_browser_page_status_flight(&key, Ok(first.clone()));
+        assert_eq!(waiter.blocking_recv().unwrap().unwrap(), first);
+
+        let (leader, _) = join_browser_page_status_flight(key.clone());
+        assert!(leader);
+        let (leader, waiter) = join_browser_page_status_flight(key.clone());
+        assert!(!leader);
+        let waiter = waiter.expect("follower waits for the next probe");
+        let second =
+            serde_json::json!({"page_id":"page:two","actual_url":"https://example.test/next"});
+        complete_browser_page_status_flight(&key, Ok(second.clone()));
+        assert_eq!(waiter.blocking_recv().unwrap().unwrap(), second);
+    }
+
+    #[test]
+    fn forget_completes_waiters_and_leaves_no_stored_observation() {
+        let key = unique_key();
+        let _ = join_browser_page_status_flight(key.clone());
+        let (_, waiter) = join_browser_page_status_flight(key.clone());
+        let waiter = waiter.expect("follower waits for the in-flight probe");
+        forget_browser_page_status(&key);
+        assert_eq!(
+            waiter.blocking_recv().unwrap(),
+            Err(BROWSER_PAGE_STATUS_INACTIVE.to_string())
+        );
+        let (leader, _) = join_browser_page_status_flight(key);
+        assert!(leader);
+    }
+}
+
 pub(super) async fn browser_app_page_status(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -3220,40 +3502,58 @@ pub(super) async fn browser_app_page_status(
     }
     let principal_id = context.principal_id;
     if !touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id).await {
-        return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
+        forget_browser_page_status(&browser_page_status_cache_key(
+            &state.data_dir,
+            &principal_id,
+            &page_id,
+        ));
+        return (StatusCode::NOT_FOUND, BROWSER_PAGE_STATUS_INACTIVE).into_response();
     }
-    let call = match browser_provider_resource_call(
-        "browser-engine",
-        "page_status",
-        "elastos://browser-engine/page/status".to_string(),
-        serde_json::json!({
-            "page_id": page_id,
-            "principal_id": principal_id.clone(),
-        }),
-    ) {
-        Ok(call) => call,
-        Err((status, message)) => return (status, message).into_response(),
-    };
-    let response = match browser_provider_resource_response(&state, call).await {
-        Ok(value) => value,
-        Err((_status, message)) => {
-            return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
-        }
-    };
-    if let Some(message) = provider_response_error_message(&response) {
-        return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
+    let status_key = browser_page_status_cache_key(&state.data_dir, &principal_id, &page_id);
+    let (leader, waiter) = join_browser_page_status_flight(status_key.clone());
+    if !leader {
+        return match waiter {
+            Some(rx) => match rx.await {
+                Ok(outcome) => browser_page_status_response(outcome),
+                Err(_) => gateway_provider_error_response(
+                    "browser-engine",
+                    anyhow::anyhow!("browser-engine page-status probe closed"),
+                ),
+            },
+            None => gateway_provider_error_response(
+                "browser-engine",
+                anyhow::anyhow!("browser-engine page-status probe is unavailable"),
+            ),
+        };
     }
-    match provider_response_data(&response) {
-        Some(data) => {
-            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id)
-                .await;
-            Json(data).into_response()
-        }
-        None => gateway_provider_error_response(
+    let outcome = async {
+        let call = browser_provider_resource_call(
             "browser-engine",
-            anyhow::anyhow!("browser-engine provider returned an invalid page-status response"),
-        ),
+            "page_status",
+            "elastos://browser-engine/page/status".to_string(),
+            serde_json::json!({
+                "page_id": page_id,
+                "principal_id": principal_id.clone(),
+            }),
+        )
+        .map_err(|(_status, message)| message)?;
+        let response = browser_provider_resource_response(&state, call)
+            .await
+            .map_err(|(_status, message)| message)?;
+        if let Some(message) = provider_response_error_message(&response) {
+            return Err(message);
+        }
+        provider_response_data(&response).ok_or_else(|| {
+            "browser-engine provider returned an invalid page-status response".to_string()
+        })
     }
+    .await;
+    complete_browser_page_status_flight(&status_key, outcome.clone());
+    if outcome.is_ok() {
+        let _ =
+            touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id).await;
+    }
+    browser_page_status_response(outcome)
 }
 
 pub(super) async fn browser_app_page_diagnostics(
@@ -3682,6 +3982,7 @@ pub(super) async fn browser_app_page_close(
                         &page_id,
                         &cleanup_id,
                         receipt.browser_instance.as_deref(),
+                        receipt.profile_durability.as_deref(),
                     ))
                     .into_response();
                 }
@@ -3735,8 +4036,38 @@ pub(super) async fn browser_app_page_close(
     } else {
         close_browser_stream_cleanup(&state, page_cleanup.stream_cleanup).await
     };
-    let terminal = if engine_result.is_ok() && stream_result.is_ok() {
-        commit_browser_terminal_cleanup(&state, &engine_cleanup, Some(&owner_launch_id)).await
+    let already_absent = matches!(
+        (&engine_result, &stream_result),
+        (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
+    );
+    let ingress_released = if already_absent {
+        match release_absent_engine_viewer_ingress(&state, &engine_cleanup).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    page_id = %engine_cleanup.page_id,
+                    error = %err,
+                    "Browser already-absent close could not retire its viewer ingress"
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+    let terminal = if (engine_result.is_ok() && stream_result.is_ok())
+        || (already_absent && ingress_released)
+    {
+        commit_browser_terminal_cleanup(
+            &state,
+            &engine_cleanup,
+            Some(&owner_launch_id),
+            engine_result
+                .as_ref()
+                .ok()
+                .and_then(browser_profile_durability_from_receipt),
+        )
+        .await
     } else {
         release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
         Ok(())
@@ -3754,6 +4085,15 @@ pub(super) async fn browser_app_page_close(
             &receipt,
         ))
         .into_response(),
+        Err(_) if already_absent && ingress_released => {
+            Json(browser_public_already_absent_close_receipt(
+                &page_id,
+                &cleanup_id,
+                cleanup_browser_instance,
+                None,
+            ))
+            .into_response()
+        }
         Err(message) => gateway_provider_error_response("browser-engine", anyhow::anyhow!(message)),
     }
 }
@@ -3762,6 +4102,7 @@ fn browser_public_already_absent_close_receipt(
     page_id: &str,
     cleanup_id: &str,
     browser_instance: Option<&str>,
+    profile_durability: Option<&str>,
 ) -> serde_json::Value {
     let mut receipt = serde_json::json!({
         "schema": "elastos.browser.close-result/v1",
@@ -3780,6 +4121,11 @@ fn browser_public_already_absent_close_receipt(
     });
     if let Some(browser_instance) = browser_instance {
         receipt["browser_instance"] = serde_json::json!(browser_instance);
+    }
+    if let Some(durability) =
+        profile_durability.filter(|value| matches!(*value, "failed" | "unknown" | "proved"))
+    {
+        receipt["profile_durability"] = serde_json::json!(durability);
     }
     receipt
 }
@@ -3808,6 +4154,9 @@ fn browser_public_terminal_close_receipt(
     });
     if let Some(browser_instance) = cleanup.browser_instance.as_deref() {
         public_receipt["browser_instance"] = serde_json::json!(browser_instance);
+    }
+    if let Some(durability) = browser_profile_durability_from_receipt(receipt) {
+        public_receipt["profile_durability"] = serde_json::json!(durability);
     }
     if let (Some(authority), Some(transport_receipt)) = (
         cleanup.provider_cleanup.get("transport_authority"),
@@ -3890,6 +4239,174 @@ pub(super) fn browser_terminal_close_receipt(
     Ok(data)
 }
 
+type BrowserDisplayAttachOutcome = Result<serde_json::Value, BrowserDisplayError>;
+
+fn display_attach_flights() -> &'static StdMutex<
+    std::collections::HashMap<String, Vec<oneshot::Sender<BrowserDisplayAttachOutcome>>>,
+> {
+    static FLIGHTS: std::sync::OnceLock<
+        StdMutex<
+            std::collections::HashMap<String, Vec<oneshot::Sender<BrowserDisplayAttachOutcome>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+fn display_attach_flight_key(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    page_id: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "{}\n{principal_id}\n{page_id}\n{request_id}",
+        data_dir.display()
+    )
+}
+
+fn join_display_attach_flight(
+    key: String,
+) -> Result<(bool, oneshot::Receiver<BrowserDisplayAttachOutcome>), ()> {
+    let mut flights = display_attach_flights().lock().map_err(|_| ())?;
+    let (tx, rx) = oneshot::channel();
+    if let Some(waiters) = flights.get_mut(&key) {
+        waiters.push(tx);
+        return Ok((false, rx));
+    }
+    flights.insert(key, vec![tx]);
+    Ok((true, rx))
+}
+
+fn complete_display_attach_flight(key: &str, outcome: BrowserDisplayAttachOutcome) {
+    let waiters = match display_attach_flights().lock() {
+        Ok(mut flights) => flights.remove(key).unwrap_or_default(),
+        Err(_) => return,
+    };
+    for waiter in waiters {
+        let _ = waiter.send(outcome.clone());
+    }
+}
+
+async fn execute_browser_display_attach(
+    state: GatewayState,
+    dispatch: BrowserWebrtcDispatch,
+    page_id: String,
+    principal_id: String,
+    signal: serde_json::Value,
+    transport_authority: Option<serde_json::Value>,
+) -> BrowserDisplayAttachOutcome {
+    let request = serde_json::json!({
+        "page_id": page_id,
+        "signal": signal,
+        "principal_id": principal_id,
+    });
+    let outcome = async {
+        let call = browser_provider_resource_call(
+            "browser-engine",
+            "webrtc_signal",
+            "elastos://browser-engine/page/webrtc_signal".to_string(),
+            request,
+        )
+        .map_err(|_| BrowserDisplayError::Uncertain)?;
+        let response = match browser_provider_resource_response(&state, call).await {
+            Ok(response) => response,
+            Err((_status, _message)) => return Err(BrowserDisplayError::Uncertain),
+        };
+        let mut envelope = &response;
+        for _ in 0..4 {
+            match envelope.get("status").and_then(serde_json::Value::as_str) {
+                Some("error") => {
+                    return Err(envelope
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(BrowserDisplayError::from_code)
+                        .unwrap_or(BrowserDisplayError::Uncertain));
+                }
+                Some("ok") => match envelope.get("data") {
+                    Some(data) => envelope = data,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        let data = provider_response_data(&response).ok_or(BrowserDisplayError::Uncertain)?;
+        validate_browser_display_attach_result(
+            &data,
+            &page_id,
+            signal["request_id"].as_str().unwrap_or(""),
+            signal["display_generation"].as_str().unwrap_or(""),
+        )?;
+        Ok(data)
+    }
+    .await;
+    let data = finish_browser_page_webrtc(&dispatch, outcome).await?;
+    if let (Some(authority), Some(endpoint)) = (
+        transport_authority.as_ref(),
+        state.carrier_endpoint.as_ref(),
+    ) {
+        if let Ok(Some(binding)) = gateway_browser_remote::consumer_binding(
+            &state.data_dir,
+            &serde_json::json!({
+                "principal_id": principal_id,
+                "page_id": page_id,
+            }),
+        ) {
+            crate::carrier::browser_engine_media::rearm_media_stream(
+                &state.data_dir,
+                endpoint,
+                &binding.grant,
+                authority,
+            )
+            .await;
+        }
+    }
+    Ok(data)
+}
+
+fn browser_display_attach_http_response(outcome: BrowserDisplayAttachOutcome) -> Response {
+    match outcome {
+        Ok(data) => Json(data).into_response(),
+        Err(error) => browser_display_error_response(error),
+    }
+}
+
+#[cfg(test)]
+mod display_attach_flight_tests {
+    use super::{complete_display_attach_flight, join_display_attach_flight};
+    use elastos_common::browser_protocol::BrowserDisplayError;
+
+    fn unique_key() -> String {
+        format!(
+            "test-display-attach-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn overlapping_same_id_shares_one_flight_and_the_next_starts_fresh() {
+        let key = unique_key();
+        let (leader, first) = join_display_attach_flight(key.clone()).unwrap();
+        assert!(leader);
+        let (leader, second) = join_display_attach_flight(key.clone()).unwrap();
+        assert!(!leader);
+        let receipt = serde_json::json!({"request_id":"a","page_id":"page:one"});
+        complete_display_attach_flight(&key, Ok(receipt.clone()));
+        assert_eq!(first.blocking_recv().unwrap().unwrap(), receipt);
+        assert_eq!(second.blocking_recv().unwrap().unwrap(), receipt);
+
+        let (leader, retry) = join_display_attach_flight(key.clone()).unwrap();
+        assert!(leader);
+        complete_display_attach_flight(&key, Err(BrowserDisplayError::Uncertain));
+        assert_eq!(
+            retry.blocking_recv().unwrap(),
+            Err(BrowserDisplayError::Uncertain)
+        );
+    }
+}
+
 pub(super) async fn browser_app_page_webrtc(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -3937,6 +4454,16 @@ pub(super) async fn browser_app_page_webrtc(
             return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
         }
     };
+    if signal_type == "display_attach" {
+        if let Some(authority) = transport_authority.as_ref() {
+            let data_dir = state.data_dir.clone();
+            let authority = authority.clone();
+            tokio::spawn(async move {
+                crate::carrier::browser_engine_media::preadmit_media_stream(&data_dir, &authority)
+                    .await;
+            });
+        }
+    }
     if let Some(authority) = transport_authority.as_ref() {
         if let Err(message) = normalize_browser_vz_webrtc_signal(authority, &mut signal) {
             return gateway_provider_error_response("browser", anyhow::anyhow!(message));
@@ -3958,6 +4485,72 @@ pub(super) async fn browser_app_page_webrtc(
         return match finish_browser_page_webrtc(&dispatch, Ok(cached)).await {
             Ok(value) => Json(value).into_response(),
             Err(error) => browser_display_error_response(error),
+        };
+    }
+    if signal_type == "display_attach" {
+        let request_id = signal
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let flight_key =
+            display_attach_flight_key(&state.data_dir, &principal_id, &page_id, &request_id);
+        return match join_display_attach_flight(flight_key.clone()) {
+            Ok((owns, waiter)) => {
+                if owns {
+                    match begin_browser_page_webrtc(
+                        &state.data_dir,
+                        &page_id,
+                        &principal_id,
+                        &owner_launch_id,
+                        &signal,
+                    )
+                    .await
+                    {
+                        Ok(again) if again.cached.is_some() => {
+                            let cached = again
+                                .cached
+                                .clone()
+                                .expect("display attach cache was present");
+                            let outcome = finish_browser_page_webrtc(&again, Ok(cached)).await;
+                            complete_display_attach_flight(&flight_key, outcome);
+                        }
+                        Ok(_) => {
+                            let work_state = state.clone();
+                            tokio::spawn(async move {
+                                let outcome = execute_browser_display_attach(
+                                    work_state,
+                                    dispatch,
+                                    page_id,
+                                    principal_id,
+                                    signal,
+                                    transport_authority,
+                                )
+                                .await;
+                                complete_display_attach_flight(&flight_key, outcome);
+                            });
+                        }
+                        Err(error) => {
+                            complete_display_attach_flight(&flight_key, Err(error));
+                        }
+                    }
+                }
+                match waiter.await {
+                    Ok(outcome) => browser_display_attach_http_response(outcome),
+                    Err(_) => browser_display_error_response(BrowserDisplayError::Uncertain),
+                }
+            }
+            Err(()) => browser_display_attach_http_response(
+                execute_browser_display_attach(
+                    state,
+                    dispatch,
+                    page_id,
+                    principal_id,
+                    signal,
+                    transport_authority,
+                )
+                .await,
+            ),
         };
     }
     let mut request = serde_json::json!({
@@ -4041,7 +4634,28 @@ pub(super) async fn browser_app_page_webrtc(
     }
     .await;
     match finish_browser_page_webrtc(&dispatch, outcome).await {
-        Ok(data) => Json(data).into_response(),
+        Ok(data) => {
+            if signal_type == "display_attach" {
+                if let (Some(authority), Some(endpoint)) = (
+                    transport_authority.as_ref(),
+                    state.carrier_endpoint.as_ref(),
+                ) {
+                    if let Ok(Some(binding)) = gateway_browser_remote::consumer_binding(
+                        &state.data_dir,
+                        &serde_json::json!({"principal_id": principal_id, "page_id": page_id}),
+                    ) {
+                        crate::carrier::browser_engine_media::rearm_media_stream(
+                            &state.data_dir,
+                            endpoint,
+                            &binding.grant,
+                            authority,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Json(data).into_response()
+        }
         Err(BrowserDisplayError::Uncertain) if legacy_error.is_some() => {
             gateway_provider_error_response(
                 "browser-engine",

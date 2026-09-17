@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -18,6 +19,7 @@ const DISPLAY_CONTROL_HTTP_STATUS = Object.freeze({
   display_attach_failed: 503,
   display_attach_uncertain: 503,
 });
+const DISPLAY_RENEGOTIATE_SIGNAL = JSON.stringify({ elastos_display_renegotiate: true });
 const HOSTED_PRODUCT_OPEN_SCHEMA = "elastos.browser.hosted-product.open/v1";
 const VM_GUEST_OPEN_SCHEMA = "elastos.browser.vm-guest.open/v1";
 const VM_LOG_DIR = "/var/log/elastos";
@@ -762,6 +764,7 @@ function normalizeWalletBridge(wallet) {
     accounts.some((account) => account.account_id === wallet.default_account_id)
       ? wallet.default_account_id
       : accounts[0]?.account_id || "";
+  const consumerMediation = walletUsesConsumerMediation(wallet);
   return {
     accounts,
     default_chain_namespace: defaultChain,
@@ -775,11 +778,27 @@ function normalizeWalletBridge(wallet) {
     transaction_broadcast_url:
       typeof wallet?.transaction_broadcast_url === "string" ? wallet.transaction_broadcast_url : "",
     approval_status_url: typeof wallet?.approval_status_url === "string" ? wallet.approval_status_url : "",
-    home_token: typeof wallet?.home_token === "string" ? wallet.home_token : "",
+    home_token: consumerMediation
+      ? ""
+      : typeof wallet?.home_token === "string"
+        ? wallet.home_token
+        : "",
     principal_id: typeof wallet?.principal_id === "string" ? wallet.principal_id : "",
     session_id: typeof wallet?.session_id === "string" ? wallet.session_id : "",
     launch_id: typeof wallet?.launch_id === "string" ? wallet.launch_id : "",
+    schema: typeof wallet?.schema === "string" ? wallet.schema : "",
+    resolution: typeof wallet?.resolution === "string" ? wallet.resolution : "",
+    page_id: typeof wallet?.page_id === "string" ? wallet.page_id : "",
+    lifecycle_generation:
+      typeof wallet?.lifecycle_generation === "string" ? wallet.lifecycle_generation : "",
   };
+}
+
+function walletUsesConsumerMediation(wallet) {
+  return (
+    wallet?.schema === "elastos.browser.wallet-consumer-mediation/v1" &&
+    wallet.resolution === "consumer_runtime"
+  );
 }
 
 function chainNamespaceToDecimal(namespace) {
@@ -1824,6 +1843,92 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function isSdpOffer(message) {
+  return message?.sdp?.type === "offer" && typeof message.sdp.sdp === "string";
+}
+
+function isRelayIce(message) {
+  return Boolean(message?.ice) && summarizeIceCandidate(message.ice)?.type === "relay";
+}
+
+function relayIceCandidates(list) {
+  return (Array.isArray(list) ? list : []).filter(
+    (candidate) => summarizeIceCandidate(candidate)?.type === "relay",
+  );
+}
+
+function rememberIceCandidate(candidates, history, ice) {
+  if (!ice) {
+    return;
+  }
+  const exists = (Array.isArray(history) ? history : []).some((candidate) => (
+    candidate?.candidate === ice.candidate &&
+    candidate?.sdpMLineIndex === ice.sdpMLineIndex &&
+    candidate?.sdpMid === ice.sdpMid
+  ));
+  if (exists) {
+    return;
+  }
+  if (Array.isArray(candidates)) {
+    candidates.push(ice);
+  }
+  if (Array.isArray(history)) {
+    history.push(ice);
+  }
+}
+
+async function waitForRenegotiatedOffer(waitFor, clearHistory, rememberIce) {
+  let offer = await waitFor(isSdpOffer, "Selkies SDP offer");
+  for (;;) {
+    const next = await waitFor(
+      (message) => isSdpOffer(message) || isRelayIce(message),
+      "Selkies relay ICE for the new offer",
+    );
+    if (isSdpOffer(next)) {
+      clearHistory();
+      offer = next;
+      continue;
+    }
+    rememberIce(next.ice);
+    return offer;
+  }
+}
+
+function takeQueuedMessage(messages, predicate) {
+  const index = (Array.isArray(messages) ? messages : []).findIndex(predicate);
+  if (index < 0) {
+    return null;
+  }
+  const [message] = messages.splice(index, 1);
+  return message;
+}
+
+async function settleRenegotiatedOffer(offer, waitFor, rememberIce, takeQueuedOffer, getHistory) {
+  let current = offer;
+  let sawNewer = false;
+  for (;;) {
+    const newer = takeQueuedOffer();
+    if (newer && isSdpOffer(newer)) {
+      current = newer;
+      sawNewer = true;
+      continue;
+    }
+    const candidates = relayIceCandidates(getHistory());
+    if (candidates.length > 0 || !sawNewer) {
+      return { offer: current, candidates };
+    }
+    const next = await waitFor(
+      (message) => isSdpOffer(message) || isRelayIce(message),
+      "Selkies relay ICE for the new offer",
+    );
+    if (isSdpOffer(next)) {
+      current = next;
+      continue;
+    }
+    rememberIce(next.ice);
+  }
+}
+
 function summarizeIceCandidate(candidate) {
   const line = String(candidate?.candidate || "").trim();
   if (!line) {
@@ -2320,20 +2425,36 @@ export class SelkiesPage {
       this.checkDisplayAttachmentDeadline();
     };
     current();
-    await socket.connect(this.config.connectTimeoutMs);
-    current();
-    socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
-    await this.waitForAudio((message) => message.kind === "hello", "Selkies audio HELLO");
-    current();
-    socket.sendText("SESSION server");
-    const session = await this.waitForAudio((message) => message.kind === "session_ok", "Selkies audio SESSION_OK");
-    current();
-    this.audioServerPeerId = session.serverPeerId;
-    this.audioSignalingEnvelope = "peer_routed";
-    const offer = await this.waitForAudio(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "Selkies audio SDP offer",
-    );
+    const reuse = socket.closed !== true && (this.audioServerPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
+      await this.waitForAudio((message) => message.kind === "hello", "Selkies audio HELLO");
+      current();
+      socket.sendText("SESSION server");
+    }
+    if (!reuse) {
+      const session = await this.waitForAudio((message) => message.kind === "session_ok", "Selkies audio SESSION_OK");
+      current();
+      this.audioServerPeerId = session.serverPeerId;
+      this.audioSignalingEnvelope = "peer_routed";
+    }
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitForAudio(predicate, label),
+          () => {
+            this.audioRemoteCandidates = [];
+            this.audioRemoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.audioRemoteCandidates, this.audioRemoteCandidateHistory, ice),
+        )
+      : await this.waitForAudio(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "Selkies audio SDP offer",
+        );
     current();
     return offer;
   }
@@ -2345,20 +2466,34 @@ export class SelkiesPage {
       this.checkDisplayAttachmentDeadline();
     };
     current();
-    await socket.connect(this.config.connectTimeoutMs);
+    const reuse = socket.closed !== true && (this.audioServerPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      const helloMeta = Buffer.from(JSON.stringify({
+        res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
+        scale: displaySize.scale || 1,
+      })).toString("base64");
+      socket.sendText(`HELLO 3 ${helloMeta}`);
+      await this.waitForAudio((message) => message.kind === "hello", "legacy Selkies audio HELLO");
+      socket.legacyHelloAccepted = true;
+    }
     current();
-    const helloMeta = Buffer.from(JSON.stringify({
-      res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
-      scale: displaySize.scale || 1,
-    })).toString("base64");
-    socket.sendText(`HELLO 3 ${helloMeta}`);
-    await this.waitForAudio((message) => message.kind === "hello", "legacy Selkies audio HELLO");
-    socket.legacyHelloAccepted = true;
-    current();
-    const offer = await this.waitForAudio(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "legacy Selkies audio SDP offer",
-    );
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitForAudio(predicate, label),
+          () => {
+            this.audioRemoteCandidates = [];
+            this.audioRemoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.audioRemoteCandidates, this.audioRemoteCandidateHistory, ice),
+        )
+      : await this.waitForAudio(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "legacy Selkies audio SDP offer",
+        );
     current();
     this.audioServerPeerId = offer.from || "2";
     this.audioSignalingEnvelope = "raw_json";
@@ -2372,20 +2507,36 @@ export class SelkiesPage {
       this.checkDisplayAttachmentDeadline();
     };
     current();
-    await socket.connect(this.config.connectTimeoutMs);
-    current();
-    socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
-    await this.waitFor((message) => message.kind === "hello", "Selkies HELLO");
-    current();
-    socket.sendText("SESSION server");
-    const session = await this.waitFor((message) => message.kind === "session_ok", "Selkies SESSION_OK");
-    current();
-    this.serverPeerId = session.serverPeerId;
-    this.signalingEnvelope = "peer_routed";
-    const offer = await this.waitFor(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "Selkies SDP offer",
-    );
+    const reuse = socket.closed !== true && (this.serverPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
+      await this.waitFor((message) => message.kind === "hello", "Selkies HELLO");
+      current();
+      socket.sendText("SESSION server");
+    }
+    if (!reuse) {
+      const session = await this.waitFor((message) => message.kind === "session_ok", "Selkies SESSION_OK");
+      current();
+      this.serverPeerId = session.serverPeerId;
+      this.signalingEnvelope = "peer_routed";
+    }
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitFor(predicate, label),
+          () => {
+            this.remoteCandidates = [];
+            this.remoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.remoteCandidates, this.remoteCandidateHistory, ice),
+        )
+      : await this.waitFor(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "Selkies SDP offer",
+        );
     current();
     return offer;
   }
@@ -2397,20 +2548,34 @@ export class SelkiesPage {
       this.checkDisplayAttachmentDeadline();
     };
     current();
-    await socket.connect(this.config.connectTimeoutMs);
+    const reuse = socket.closed !== true && (this.serverPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      const helloMeta = Buffer.from(JSON.stringify({
+        res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
+        scale: displaySize.scale || 1,
+      })).toString("base64");
+      socket.sendText(`HELLO 1 ${helloMeta}`);
+      await this.waitFor((message) => message.kind === "hello", "legacy Selkies HELLO");
+      socket.legacyHelloAccepted = true;
+    }
     current();
-    const helloMeta = Buffer.from(JSON.stringify({
-      res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
-      scale: displaySize.scale || 1,
-    })).toString("base64");
-    socket.sendText(`HELLO 1 ${helloMeta}`);
-    await this.waitFor((message) => message.kind === "hello", "legacy Selkies HELLO");
-    socket.legacyHelloAccepted = true;
-    current();
-    const offer = await this.waitFor(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "legacy Selkies SDP offer",
-    );
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitFor(predicate, label),
+          () => {
+            this.remoteCandidates = [];
+            this.remoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.remoteCandidates, this.remoteCandidateHistory, ice),
+        )
+      : await this.waitFor(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "legacy Selkies SDP offer",
+        );
     current();
     this.serverPeerId = offer.from || "1";
     this.signalingEnvelope = "raw_json";
@@ -2490,6 +2655,8 @@ export class SelkiesPage {
     }
     if (parsed?.sdp?.type === "offer") {
       this.signalingStats.selkies_offers_received += 1;
+      this.remoteCandidates = [];
+      this.remoteCandidateHistory = [];
     }
     if (parsed?.ice) {
       this.remoteCandidates.push(parsed.ice);
@@ -2511,6 +2678,8 @@ export class SelkiesPage {
     }
     if (parsed?.sdp?.type === "offer") {
       this.signalingStats.selkies_offers_received += 1;
+      this.audioRemoteCandidates = [];
+      this.audioRemoteCandidateHistory = [];
     }
     if (parsed?.ice) {
       this.audioRemoteCandidates.push(parsed.ice);
@@ -2522,6 +2691,38 @@ export class SelkiesPage {
       this.audioMessages.push(parsed);
       this.flushAudioWaiters();
     }
+  }
+
+  canReuseDisplaySignaling() {
+    return Boolean(
+      this.ws &&
+      this.audioWs &&
+      !this.videoClosed &&
+      !this.audioClosed &&
+      this.ws.closed !== true &&
+      this.audioWs.closed !== true &&
+      (this.serverPeerId || this.ws.legacyHelloAccepted) &&
+      (this.audioServerPeerId || this.audioWs.legacyHelloAccepted)
+    );
+  }
+
+  rejectStaleDisplayWaiters() {
+    for (const waiter of this.waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`Selkies WebSocket closed while waiting for ${waiter.label}`));
+    }
+    this.waiters = [];
+    this.messages = [];
+    this.remoteCandidates = [];
+    this.remoteCandidateHistory = [];
+    for (const waiter of this.audioWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`Selkies audio WebSocket closed while waiting for ${waiter.label}`));
+    }
+    this.audioWaiters = [];
+    this.audioMessages = [];
+    this.audioRemoteCandidates = [];
+    this.audioRemoteCandidateHistory = [];
   }
 
   flushWaiters() {
@@ -2657,9 +2858,14 @@ export class SelkiesPage {
     };
     const prepare = Promise.resolve().then(async () => {
       current();
-      retire();
-      this.resetSignaling();
-      this.resetAudioSignaling();
+      const reusedSignaling = this.canReuseDisplaySignaling();
+      if (reusedSignaling) {
+        this.rejectStaleDisplayWaiters();
+      } else {
+        retire();
+        this.resetSignaling();
+        this.resetAudioSignaling();
+      }
       const size = browserDisplayMetrics(this.config);
       const negotiate = async (channel, protocol) => {
         for (;;) {
@@ -2690,19 +2896,59 @@ export class SelkiesPage {
       ]);
       current();
       if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
+      let videoBound = {
+        offer: videoOffer,
+        candidates: relayIceCandidates(this.remoteCandidateHistory),
+      };
+      let audioBound = {
+        offer: audioOffer,
+        candidates: relayIceCandidates(this.audioRemoteCandidateHistory),
+      };
+      if (reusedSignaling) {
+        videoBound = await settleRenegotiatedOffer(
+          videoOffer,
+          (predicate, label) => this.waitFor(predicate, label),
+          (ice) => rememberIceCandidate(this.remoteCandidates, this.remoteCandidateHistory, ice),
+          () => takeQueuedMessage(this.messages, isSdpOffer),
+          () => this.remoteCandidateHistory,
+        );
+        current();
+        audioBound = await settleRenegotiatedOffer(
+          audioOffer,
+          (predicate, label) => this.waitForAudio(predicate, label),
+          (ice) => rememberIceCandidate(this.audioRemoteCandidates, this.audioRemoteCandidateHistory, ice),
+          () => takeQueuedMessage(this.audioMessages, isSdpOffer),
+          () => this.audioRemoteCandidateHistory,
+        );
+        current();
+      }
+      if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
       const generation = `display:${crypto.randomBytes(16).toString("hex")}`;
-      const display = this.supervisorResult(videoOffer.sdp.sdp, this.browserPage, this.wallet, audioOffer.sdp.sdp).display_session;
+      const display = this.supervisorResult(
+        videoBound.offer.sdp.sdp,
+        this.browserPage,
+        this.wallet,
+        audioBound.offer.sdp.sdp,
+      ).display_session;
+      const initial_offer = {
+        ...display.initial_offer,
+        candidates: videoBound.candidates,
+      };
+      const audio_offer = {
+        ...display.audio_offer,
+        candidates: audioBound.candidates,
+      };
       const result = {
         schema: "elastos.browser.display-attach-result/v1",
         page_id: this.pageId,
         request_id: attachment.requestId,
         previous_display_generation: attachment.previousGeneration,
         display_generation: generation,
-        initial_offer: display.initial_offer,
-        audio_offer: display.audio_offer,
+        initial_offer,
+        audio_offer,
       };
       this.displayGeneration = generation;
-      this.displaySession = { ...display, display_generation: generation };
+      this.displaySession = { ...display, display_generation: generation, initial_offer, audio_offer };
       this.displayAvailable = true;
       return result;
     });
@@ -2806,9 +3052,11 @@ export class SelkiesPage {
   }
 
   ack(type) {
-    const candidates = type === "answer"
-      ? this.remoteCandidateHistory.slice()
-      : this.remoteCandidates.splice(0);
+    const candidates = relayIceCandidates(
+      type === "answer"
+        ? this.remoteCandidateHistory.slice()
+        : this.remoteCandidates.splice(0),
+    );
     if (type === "answer") {
       this.remoteCandidates = [];
     }
@@ -2824,9 +3072,11 @@ export class SelkiesPage {
   }
 
   ackAudio(type) {
-    const candidates = type === "answer"
-      ? this.audioRemoteCandidateHistory.slice()
-      : this.audioRemoteCandidates.splice(0);
+    const candidates = relayIceCandidates(
+      type === "answer"
+        ? this.audioRemoteCandidateHistory.slice()
+        : this.audioRemoteCandidates.splice(0),
+    );
     if (type === "answer") {
       this.audioRemoteCandidates = [];
     }
@@ -2842,12 +3092,16 @@ export class SelkiesPage {
   }
 
   close() {
+    this.closeAndPersist().catch(() => {});
+  }
+
+  async closeAndPersist() {
     this.markClosed();
     this.ws?.close();
     this.markAudioClosed();
     this.audioWs?.close();
-    if (this.browserPage?.target_id) {
-      closeBrowserPage(this.config.browserControl, this.browserPage).catch(() => {});
+    if (this.browserPage) {
+      await closeBrowserPage(this.config.browserControl, this.browserPage).catch(() => {});
     }
   }
 
@@ -3277,6 +3531,11 @@ async function walletRuntimeFetchJson(
   url,
   { method = "GET", body = null, timeoutMs: requestedTimeoutMs = null } = {},
 ) {
+  if (walletUsesConsumerMediation(runtime.wallet)) {
+    throw walletRuntimeHttpError(
+      "Consumer Wallet mediation is bound for this Browser session. Wallet Bus stays on the consumer Runtime.",
+    );
+  }
   if (!url || !runtime.wallet.home_token) {
     throw walletRuntimeHttpError("Runtime wallet endpoint is unavailable for this Browser session.");
   }
@@ -3409,23 +3668,26 @@ export function walletRuntimeRequestedAccount(runtime, rawBody, { required = tru
   if (!/^eip155:\d+$/.test(requestedChain)) {
     throw walletRuntimeHttpError("Runtime wallet request chain is invalid.", 4902);
   }
-  const managed = (candidate) => candidate.proof_type === "managed_evm";
+  const selectable = (candidate) =>
+    candidate.proof_type === "managed_evm" ||
+    (typeof candidate.connector_id === "string" && candidate.connector_id);
   const account =
     runtime.wallet.accounts.find(
       (candidate) =>
-        managed(candidate) &&
+        selectable(candidate) &&
         candidate.chain_namespace === requestedChain &&
         candidate.account_id === runtime.wallet.default_account_id,
     ) ||
     runtime.wallet.accounts.find(
-      (candidate) => managed(candidate) && candidate.chain_namespace === requestedChain,
+      (candidate) =>
+        selectable(candidate) && candidate.chain_namespace === requestedChain,
     );
   if (!account) {
     if (!required) {
       return null;
     }
     throw walletRuntimeHttpError(
-      `No Runtime-managed wallet account is available for ${requestedChain}.`,
+      `No principal-owned wallet account is available for ${requestedChain}.`,
       4902,
     );
   }
@@ -5507,6 +5769,179 @@ function validateOpenRequest(body) {
   return launch;
 }
 
+export const BROWSER_PROFILE_DISK_MOUNT = "/var/lib/elastos/browser-profile-disk";
+
+function defaultExec(command, args = []) {
+  return spawnSync(command, args, { encoding: "utf8" });
+}
+
+function defaultReadMounts() {
+  return fs.readFileSync("/proc/mounts", "utf8");
+}
+
+function defaultListProc() {
+  return fs.readdirSync("/proc");
+}
+
+function defaultReadCmdline(pid) {
+  return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+}
+
+function defaultPidAlive(pid) {
+  try {
+    fs.accessSync(`/proc/${pid}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function guestProcessIdsHoldingProfileDisk({
+  listProc = defaultListProc,
+  readCmdline = defaultReadCmdline,
+  mountPoint = BROWSER_PROFILE_DISK_MOUNT,
+  selfPid = process.pid,
+} = {}) {
+  const ids = [];
+  let names;
+  try {
+    names = listProc();
+  } catch {
+    return ids;
+  }
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    if (pid === selfPid) continue;
+    let cmdline = "";
+    try {
+      cmdline = readCmdline(name);
+    } catch {
+      continue;
+    }
+    if (
+      cmdline.includes("browser-native-proxy-engine") ||
+      cmdline.includes(`--user-data-dir=${mountPoint}`)
+    ) {
+      ids.push(pid);
+    }
+  }
+  return ids;
+}
+
+export function signalGuestProfileDiskWriters(pids, { exec = defaultExec, signal = "TERM" } = {}) {
+  for (const pid of pids) {
+    exec("kill", [`-${signal}`, String(pid)]);
+  }
+}
+
+export function flushAndUnmountBrowserProfileDisk({
+  exec = defaultExec,
+  readMounts = defaultReadMounts,
+  mountPoint = BROWSER_PROFILE_DISK_MOUNT,
+  sleep = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  },
+  umountAttempts = 8,
+  umountRetryMs = 250,
+} = {}) {
+  const syncResult = exec("sync", []);
+  if (syncResult.status !== 0) {
+    throw new Error("Browser profile disk sync failed");
+  }
+  const mounts = readMounts();
+  if (!mounts.includes(` ${mountPoint} `)) {
+    return { flushed: true, unmounted: true, already_absent: true };
+  }
+  const attempts = Math.max(1, Number(umountAttempts) || 1);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const umount = exec("umount", [mountPoint]);
+    if (umount.status === 0) {
+      return { flushed: true, unmounted: true, already_absent: false };
+    }
+    if (attempt + 1 < attempts) {
+      sleep(umountRetryMs);
+    }
+  }
+  throw new Error("Browser profile disk umount failed");
+}
+
+export async function quitGuestProfileDiskWriters({
+  exec = defaultExec,
+  listProc = defaultListProc,
+  readCmdline = defaultReadCmdline,
+  pidAlive = defaultPidAlive,
+  nowMs = () => Date.now(),
+  sleep = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  },
+  graceMs = 4000,
+  timeoutMs = 5000,
+} = {}) {
+  const pids = guestProcessIdsHoldingProfileDisk({ listProc, readCmdline });
+  const graceDeadline = nowMs() + Math.max(0, graceMs);
+  while (nowMs() < graceDeadline) {
+    sleep(Math.min(50, Math.max(0, graceDeadline - nowMs())));
+  }
+  let leftover = pids.filter((pid) => pidAlive(pid));
+  if (leftover.length === 0) {
+    return leftover;
+  }
+  signalGuestProfileDiskWriters(leftover, { exec, signal: "TERM" });
+  const deadline = nowMs() + timeoutMs;
+  while (leftover.some((pid) => pidAlive(pid)) && nowMs() < deadline) {
+    sleep(50);
+  }
+  leftover = leftover.filter((pid) => pidAlive(pid));
+  if (leftover.length > 0) {
+    signalGuestProfileDiskWriters(leftover, { exec, signal: "KILL" });
+  }
+  return leftover;
+}
+
+export function browserProfileDiskDurability(profile, leftoverWriterPids = []) {
+  const leftover = Array.isArray(leftoverWriterPids) ? leftoverWriterPids : [];
+  const leftoverKilled = leftover.length > 0;
+  if (leftoverKilled) {
+    return {
+      ok: false,
+      profile_disk_flushed: false,
+      profile_disk_unmounted: profile?.unmounted === true,
+      leftover_writers_killed: true,
+      error:
+        "Guest profile disk writers required SIGKILL; application writes are unproven",
+    };
+  }
+  return {
+    ok: profile?.flushed === true && profile?.unmounted === true,
+    profile_disk_flushed: profile?.flushed === true,
+    profile_disk_unmounted: profile?.unmounted === true,
+    leftover_writers_killed: false,
+  };
+}
+
+async function quitChromiumBrowser(browserControl) {
+  if (!browserControl) {
+    return;
+  }
+  try {
+    const version = await fetchBrowserControlJson(browserControl, "/json/version");
+    const wsUrl = version?.webSocketDebuggerUrl;
+    if (!wsUrl) {
+      return;
+    }
+    const cdp = new CdpClient(wsUrl, 5000, { retainEvents: false });
+    await cdp.connect(5000);
+    try {
+      await cdp.request("Browser.close", {}, 5000);
+    } finally {
+      cdp.close();
+    }
+  } catch {
+    // Chromium may already be gone. Process-group kill still flushes or fails closed.
+  }
+}
+
 async function main() {
   const config = readConfig();
   if (fs.existsSync(config.controlSocketPath)) {
@@ -5520,11 +5955,9 @@ async function main() {
   const markSessionClosed = () => {
     lastSessionClosedAt = Date.now();
   };
-  const closeActivePages = () => {
+  const closeActivePages = async () => {
     const pageIds = [...pages.keys()];
-    for (const page of pages.values()) {
-      page.close();
-    }
+    await Promise.all([...pages.values()].map((page) => page.closeAndPersist()));
     pages.clear();
     if (pageIds.length > 0) {
       markSessionClosed();
@@ -5542,10 +5975,31 @@ async function main() {
       const url = new URL(req.url, "http://browser-engine");
       if (req.method === "POST" && url.pathname === "/shutdown") {
         logControlEvent("request", { method: req.method, path: url.pathname });
-        closeActivePages();
+        const closedPageIds = await closeActivePages();
+        await quitChromiumBrowser(config.browserControl);
+        const leftover = await quitGuestProfileDiskWriters();
+        let profile;
+        try {
+          profile = flushAndUnmountBrowserProfileDisk();
+        } catch (error) {
+          profile = {
+            flushed: false,
+            unmounted: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        const durability = {
+          ...browserProfileDiskDurability(profile, leftover),
+          ...(profile?.error ? { error: profile.error } : {}),
+        };
+        logControlEvent("shutdown_result", {
+          closed_page_ids: closedPageIds,
+          ...durability,
+        });
         httpJson(res, 200, {
           schema: "elastos.browser.selkies-control.shutdown/v1",
-          ok: true,
+          closed_page_ids: closedPageIds,
+          ...durability,
         });
         setTimeout(() => {
           server.close(() => {
@@ -5835,7 +6289,7 @@ async function main() {
         return;
       }
       if (req.method === "POST" && op === "close") {
-        page.close();
+        await page.closeAndPersist();
         pages.delete(pageId);
         markSessionClosed();
         httpJson(res, 200, { schema: "elastos.browser.close-result/v1", page_id: pageId, closed: true });
