@@ -385,10 +385,10 @@ struct Multipart<'a> {
 }
 
 fn new_boundary() -> io::Result<String> {
+    // The kernel CSPRNG through the standard device: the same bytes on every
+    // Unix libc, where getentropy is missing from musl's declarations.
     let mut random = [0u8; 32];
-    if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
     let mut boundary = String::with_capacity(64);
     const HEX: &[u8] = b"0123456789abcdef";
     for byte in random {
