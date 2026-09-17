@@ -171,28 +171,21 @@ verification separate from product acceptance and required human review.
 
 ## Now
 
-### Model delivery R14 — bounded Sash preview first
+### Model delivery R14 — 0.7.1 on public Home
 
-The immediate D1 outcome is a normal Apple Silicon model demo: install the named
-candidate, discover both signed model entries, Get/Use SmolLM2, send in Assistant,
-see the reply, then reload/restart with saved conversation and payload reuse.
-Reuse existing Qwen evidence within its recorded scope. The full R14 requirements
-remain below; they follow this bounded preview instead of delaying its first test.
+The 0.7.1 preview uses the existing public Home at
+https://elastos.elacitylabs.com/home/. Ordinary install, Marketplace Get/Use,
+Assistant Send/reply, reload and restart remain the demo path. Reuse existing
+Qwen evidence within its recorded scope. The full R14 requirements remain below.
 
-1. Local owns actual Assistant Send/reply/reload/restart on the admitted model,
-   durable test-holder ownership and installed managed-Home catalogue sync.
-   First visible result or exact failure is due within ten minutes of resuming.
-   Preserve the human Qwen Home and existing admissions.
-2. Cloud's catalogue-before-installation repair is integrated. The exact two-file
-   patch passed all 53 installer tests locally (four retained fixture skips).
-   Cloud now owns only the publisher shell, native-platform admission helper and
-   their focused tests for an explicit Apple Silicon canary preview. Default
-   release admission retains all three platforms and all provenance/trust gates.
-   Local freezes those packaging files until the reviewed patch returns.
-3. Coordinator reviews the exact combined source and artifacts, prepares coherent
-   commits and a short test guide. Publication for review uses the existing
-   branch and preserves Browser ancestry. Show the candidate and verification
-   before named approval to push or expose the preview. Public Home is preserved.
+1. Local owns the publisher discovery repair: health from one control coords
+   file, bootstrap from ELASTOS_SOURCE_PUBLISHER_URL or the legacy same URL.
+   Preserve human Home, admitted models and existing test Homes.
+2. Prepare matching Linux native inputs from this source candidate and verify
+   the isolated seed before updating public Home. Default release admission
+   retains all three platforms and provenance gates.
+3. Coordinator pushes the frozen `feat/remote-services` candidate to GitHub.
+   Public Home stays the preview surface.
 
 The broader R14 queue remains required after D1: independent full Mac/seed holder
 reads and demonstrated transfer repairs; responsive preparation cancellation and

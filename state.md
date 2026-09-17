@@ -2,21 +2,22 @@
 
 ## Current model delivery checkpoint, 17 September 2026 UTC
 
-The unpublished working branch is `feat/remote-services` at
-`4009015b945abca23a705e7cd3cb83a15afb649d`, committed tree
-`907bbf1f7ec5611460a57dd88772e1160d213b4e`. It is 169 commits ahead and
-0 behind the last fetched `origin/feat/0.7.1-integration` (`093b51ca`).
-The working delta remains uncommitted. These Git identities identify the base;
-installed results retain their own binary and patch bindings.
+The model-delivery source line is `feat/remote-services`. Last frozen prefix is
+`7690aabc6acb4f125b84b7ec0117e3e406898b91`, tree
+`e7d8d0e1ac2b343e3104f7eefd1dcfeb3fba6bbc`, 174 ahead and 0 behind the last
+fetched `origin/feat/0.7.1-integration` (`093b51ca`). This source includes the
+publisher discovery repair. Installed results retain their own binary and
+patch bindings. The 0.7.1 preview target is the existing public Home at
+https://elastos.elacitylabs.com/home/. GitHub review uses that same branch. Matching Linux native inputs and isolated
+seed verification precede the public Home update. Preserve existing Homes.
 
 The signed catalogue contains Qwen and SmolLM2-135M-Instruct Q8_0. Mac and seed
 holders retain the small package. Complete Mac-holder delivery was hashed, and
 an isolated Mac consumer admitted the package through Marketplace authority.
-The installed weights match the published 144,811,072-byte SHA-256. A native
-SmolLM2 run completed through the Assistant model contract. That check used a
-test helper; the visible Assistant conversation stayed empty. Normal Send,
-visible history, reload and full restart reuse remain open on this candidate.
-Earlier accepted Qwen receipts keep their original scope.
+The installed weights match the published 144,811,072-byte SHA-256. Coordinator
+verified ordinary Assistant Send on the isolated consumer Home. Reload and
+restart preserved that history. Earlier accepted Qwen receipts keep their
+original scope.
 
 The reviewed Linux CPU and multi-model startup delta `e84dd728` is integrated.
 The two-order startup, Mac symlink and catalogue identity tests passed. The
@@ -31,11 +32,13 @@ the Content requests. Seed-local Kubo read the same amount in 0.04 seconds.
 This rules out the driver as the main delay; it does not identify the slow
 Runtime, Carrier or network stage. Full independent seed delivery remains open.
 
-The installer audit found catalogue validation after installed-file replacement.
-Cloud owns the narrow installer/test repair. The existing Mac-only publication
-path can prepare Sash's preview; complete three-platform W1 remains required for
-the release. A source review push has its own source gates and exact-candidate
-approval; platform release artifacts are not a prerequisite for draft review.
+The installer catalogue-before-replacement repair is integrated. Publisher
+discovery reads health from one selected control coords file. Bootstrap comes
+from ELASTOS_SOURCE_PUBLISHER_URL, or from that same control URL on a legacy
+operator layout. Matching Linux native inputs are required for this candidate.
+Complete three-platform W1 remains required for the release. A source review
+push has its own source gates and exact-candidate approval; platform release
+artifacts are not a prerequisite for draft review.
 
 Whitespace, Home entropy, Browser entropy and required formatting checks are the
 current source review gates. Installed and human acceptance retain their separate

@@ -223,60 +223,13 @@ default_elastos_data_dir() {
 }
 
 discover_source_bootstrap_json() {
-    local data_dir
+    local data_dir helper
     data_dir="$(default_elastos_data_dir)"
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/discover-source-bootstrap.py"
     DATA_DIR="${data_dir}" \
     COORDS_PATH="${ELASTOS_RUNTIME_COORDS_FILE:-${data_dir}/runtime-coords.json}" \
-    EXPECTED_VERSION="${ELASTOS_SOURCE_EXPECTED_VERSION:-${VERSION:-}}" \
-    python3 - <<'PY'
-import json
-import os
-import pathlib
-import urllib.request
-
-coords_path = pathlib.Path(os.environ["COORDS_PATH"])
-if not coords_path.exists():
-    print("{}")
-    raise SystemExit(0)
-
-try:
-    coords = json.loads(coords_path.read_text())
-    api = coords["api_url"].rstrip("/")
-except Exception:
-    print("{}")
-    raise SystemExit(0)
-
-version = ""
-try:
-    with urllib.request.urlopen(api + "/api/health", timeout=2) as resp:
-        health = json.loads(resp.read().decode())
-    version = health.get("version", "") or ""
-except Exception:
-    version = ""
-
-try:
-    with urllib.request.urlopen(api + "/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=5) as resp:
-        bootstrap = json.loads(resp.read().decode())
-    if bootstrap.get("schema") != "elastos.carrier.bootstrap/v1":
-        print("{}")
-        raise SystemExit(0)
-    if bootstrap.get("role") != "publisher":
-        print("{}")
-        raise SystemExit(0)
-    ticket = (bootstrap.get("ticket") or "").strip()
-    node_id = (bootstrap.get("node_id") or "").strip()
-    if not ticket or not node_id:
-        print("{}")
-        raise SystemExit(0)
-    print(json.dumps({
-        "ticket": ticket,
-        "node_id": node_id,
-        "role": "publisher",
-        "version": version,
-    }))
-except Exception:
-    print("{}")
-PY
+    PYTHONDONTWRITEBYTECODE=1 \
+    python3 "$helper"
 }
 
 canonical_publisher_gateway() {
