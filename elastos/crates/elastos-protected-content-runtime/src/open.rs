@@ -16,9 +16,10 @@ use elastos_protected_content_contracts::{
     SignedTerminalReceiptV1, TerminalReceiptIssuerKey, WalletAddress,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
-    DecryptProviderResponseV1, OpaqueHandleV1, ValidatedDecryptProviderRequestV1,
-    ViewerMediaPartSelectorV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, DecryptProviderRequestV1,
+    DecryptProviderResponseStatusV1, DecryptProviderResponseV1, OpaqueHandleV1,
+    ValidatedDecryptProviderRequestV1, ViewerMediaPartSelectorV1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 use elastos_wallet_contract::{
     PublicNetwork, ValidatedChainOutcomeBindingV1, ValidatedChainOutcomeV1,
@@ -75,6 +76,11 @@ pub trait RuntimeDecryptProvider: Send + Sync {
         request: &DecryptProviderRequestV1,
     ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError>;
 
+    async fn read_viewer_object_chunk(
+        &self,
+        request: &DecryptProviderRequestV1,
+    ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError>;
+
     async fn cancel_prepared_recipient(
         &self,
         request: &DecryptProviderRequestV1,
@@ -86,6 +92,41 @@ pub trait RuntimeDecryptProvider: Send + Sync {
     ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError>;
 }
 
+/// The one part of an open-viewer-session call that is genuinely
+/// content-kind-specific: which identity and which cleartext-adjacent
+/// framing bytes get bound into the decrypt provider's session. Every other
+/// field on `RuntimeOpenViewerSessionInput`, and every binding/expiry check
+/// `open_viewer_session` performs, is about the buy/prepared-recipient/
+/// release-operation chain and applies identically regardless of kind.
+///
+/// This is a plain in-memory Rust enum, not a durable record (no byte
+/// framing, no kind-byte discriminant to persist) and not a wire contract
+/// (the provider-contracts crate already models the wire shape as
+/// sibling `Option`s inside `DecryptProviderRequestV1`, because JSON has to
+/// serialize *something* for the absent side). Neither of those constraints
+/// applies at this call boundary, so the enum is the right shape: the type
+/// system enforces "exactly one, and which one" for free, with no
+/// possible state where both or neither are populated.
+///
+/// Both variants borrow (`&'a ...`), exactly mirroring the fields they
+/// replace, so `RuntimeOpenViewerSessionInput` keeps its `Copy` derive at
+/// zero cost — a reference is `Copy` regardless of whether the pointee
+/// (`ChunkedPayloadObjectIdentityV1` included) is. An owned enum holding the
+/// object identity by value would not be `Copy` (the identity type has no
+/// such derive), which would force `RuntimeOpenViewerSessionInput` to drop
+/// `Copy` and every caller to pass it by reference or clone it instead.
+#[derive(Debug, Clone, Copy)]
+pub enum RuntimeOpenViewerContentV1<'a> {
+    Media {
+        media_identity: &'a CencFmp4MediaIdentityV1,
+        protected_init_segment: &'a [u8],
+    },
+    Object {
+        object_identity: &'a ChunkedPayloadObjectIdentityV1,
+        framed_header: &'a [u8],
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeOpenViewerSessionInput<'a> {
     pub buy: &'a RuntimeBuyReceipt,
@@ -93,8 +134,7 @@ pub struct RuntimeOpenViewerSessionInput<'a> {
     pub signed_runtime_release_operation: &'a SignedRuntimeReleaseOperationV1,
     pub expected_terminal_issuer: TerminalReceiptIssuerKey,
     pub content_key_commitment: Digest32,
-    pub media_identity: &'a CencFmp4MediaIdentityV1,
-    pub protected_init_segment: &'a [u8],
+    pub content: RuntimeOpenViewerContentV1<'a>,
     pub signed_node_contributions: &'a [SignedNodeContributionV1],
     pub signed_terminal_receipt: &'a SignedTerminalReceiptV1,
     pub now_unix_seconds: u64,
@@ -647,6 +687,44 @@ impl RuntimeViewerMediaPart {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeViewerObjectChunk {
+    audit_request_id: Digest32,
+    viewer_session_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    chunk_index: u32,
+    plaintext: Vec<u8>,
+}
+
+impl fmt::Debug for RuntimeViewerObjectChunk {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeViewerObjectChunk")
+            .field("audit_request_id", &self.audit_request_id)
+            .field("viewer_session_handle", &"[redacted]")
+            .field("chunk_index", &self.chunk_index)
+            .field("plaintext_len", &self.plaintext.len())
+            .finish()
+    }
+}
+
+impl RuntimeViewerObjectChunk {
+    pub const fn audit_request_id(&self) -> Digest32 {
+        self.audit_request_id
+    }
+
+    pub const fn viewer_session_handle(&self) -> &[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1] {
+        &self.viewer_session_handle
+    }
+
+    pub const fn chunk_index(&self) -> u32 {
+        self.chunk_index
+    }
+
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+}
+
 pub fn reject_bearer_playback(bytes: &[u8]) -> Result<(), RuntimeOpenError> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| RuntimeOpenError::DecryptResult)?;
@@ -686,9 +764,26 @@ impl crate::RuntimeMintDraft {
         profile: ProfileIdentityV1,
         purchase_effect: &RuntimeVerifiedPurchaseEffect,
     ) -> Result<RuntimeBuyReceipt, RuntimeOpenError> {
-        if availability.encrypted_content() != self.encrypted_content()
-            || availability.media_manifest_root() != self.media_identity().media_manifest_root()
-        {
+        // R27: mirror Task 12b's `matches_draft` — the draft's own kind
+        // decides which identity-root claim availability must satisfy, with
+        // both cross-kind combinations failing closed. An object draft with
+        // exact object-availability evidence now satisfies this exactly the
+        // way a media draft does; there is no longer a kind this can never
+        // satisfy.
+        if availability.encrypted_content() != self.encrypted_content() {
+            return Err(RuntimeOpenError::MintSelection);
+        }
+        let identity_matches = match self.content_identity() {
+            crate::RuntimeContentIdentityV1::Media(media) => {
+                availability.content_identity_root()
+                    == crate::RuntimeVerifiedContentIdentityRootV1::for_media(media)
+            }
+            crate::RuntimeContentIdentityV1::Object(object) => {
+                crate::RuntimeVerifiedContentIdentityRootV1::for_object(object)
+                    .is_ok_and(|expected| availability.content_identity_root() == expected)
+            }
+        };
+        if !identity_matches {
             return Err(RuntimeOpenError::MintSelection);
         }
         if purchase_effect.authority().principal_id() != principal_id {
@@ -826,16 +921,34 @@ pub async fn open_viewer_session(
     {
         return Err(RuntimeOpenError::MintSelection);
     }
-    let request = DecryptProviderRequestV1::new_open_viewer_session(
-        *input.prepared_recipient.prepared_recipient_handle(),
-        input.signed_runtime_release_operation,
-        input.expected_terminal_issuer,
-        input.content_key_commitment,
-        input.media_identity,
-        input.protected_init_segment,
-        input.signed_node_contributions,
-        input.signed_terminal_receipt,
-    )?;
+    let request = match input.content {
+        RuntimeOpenViewerContentV1::Media {
+            media_identity,
+            protected_init_segment,
+        } => DecryptProviderRequestV1::new_open_viewer_session(
+            *input.prepared_recipient.prepared_recipient_handle(),
+            input.signed_runtime_release_operation,
+            input.expected_terminal_issuer,
+            input.content_key_commitment,
+            media_identity,
+            protected_init_segment,
+            input.signed_node_contributions,
+            input.signed_terminal_receipt,
+        )?,
+        RuntimeOpenViewerContentV1::Object {
+            object_identity,
+            framed_header,
+        } => DecryptProviderRequestV1::new_open_viewer_session_for_object(
+            *input.prepared_recipient.prepared_recipient_handle(),
+            input.signed_runtime_release_operation,
+            input.expected_terminal_issuer,
+            input.content_key_commitment,
+            object_identity,
+            framed_header,
+            input.signed_node_contributions,
+            input.signed_terminal_receipt,
+        )?,
+    };
     let request_bytes = request
         .to_json_vec()
         .map_err(|_| RuntimeOpenError::DecryptResult)?;
@@ -990,6 +1103,60 @@ pub async fn read_viewer_media_part(
         viewer_session_handle: session.viewer_session_handle,
         part_selector,
         clear_media_part: response.clear_media_part()?.to_vec(),
+    })
+}
+
+/// Object twin of [`read_viewer_media_part`]. The session-expiry check is
+/// identical (enforced here, before any provider round trip, exactly as for
+/// media). The response cross-check is weaker than media's by contract, not
+/// by choice: `DecryptProviderResponseV1::ViewerObjectChunk` carries only
+/// `audit_request_id` and `plaintext` — unlike `ViewerMediaPart`, it echoes
+/// back neither the viewer session handle nor the chunk index, so this
+/// function cannot verify those two request fields survived the round trip
+/// the way `read_viewer_media_part` verifies `viewer_session_handle` and
+/// `part_selector`. That is a pre-existing shape of the provider-contracts
+/// response type (Task 8), not narrowed here.
+pub async fn read_viewer_object_chunk(
+    decrypt: &dyn RuntimeDecryptProvider,
+    session: &RuntimeViewerSession,
+    chunk_index: u32,
+    framed_chunk: &[u8],
+    now_unix_seconds: u64,
+) -> Result<RuntimeViewerObjectChunk, RuntimeOpenError> {
+    if now_unix_seconds >= session.expires_at {
+        return Err(RuntimeOpenError::DecryptResult);
+    }
+    let audit_request_id = RuntimeReleaseAuditIdV1::new(session.audit_request_id)
+        .map_err(|_| RuntimeOpenError::DecryptResult)?;
+    let request = DecryptProviderRequestV1::new_read_viewer_object_chunk(
+        audit_request_id,
+        session.viewer_session_handle,
+        chunk_index,
+        framed_chunk,
+    )?;
+    let request_bytes = request
+        .to_json_vec()
+        .map_err(|_| RuntimeOpenError::DecryptResult)?;
+    reject_bearer_playback(&request_bytes)?;
+    let response = decrypt
+        .read_viewer_object_chunk(&request)
+        .await
+        .map_err(|_| RuntimeOpenError::DecryptResult)?;
+    let response_bytes = response
+        .to_json_vec()
+        .map_err(|_| RuntimeOpenError::DecryptResult)?;
+    reject_bearer_playback(&response_bytes)?;
+    if response.status() != DecryptProviderResponseStatusV1::ViewerObjectChunk {
+        return Err(RuntimeOpenError::DecryptResult);
+    }
+    if response.audit_request_id()? != audit_request_id {
+        return Err(RuntimeOpenError::DecryptResult);
+    }
+    Ok(RuntimeViewerObjectChunk {
+        audit_request_id: audit_request_id.digest(),
+        viewer_session_handle: session.viewer_session_handle,
+        chunk_index,
+        plaintext: response.plaintext()?.to_vec(),
     })
 }
 
@@ -1159,8 +1326,9 @@ mod tests {
     use crate::coordinator::wallet_address_hex;
     use crate::test_media;
     use crate::{
-        RuntimeContentAvailabilityRequirement, RuntimeMintDraft, RuntimeMintJournal,
-        RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeVerifiedContentAvailability,
+        RuntimeContentAvailabilityRequirement, RuntimeContentIdentityV1, RuntimeMintDraft,
+        RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
+        RuntimeVerifiedContentAvailability, RuntimeVerifiedContentIdentityRootV1,
     };
 
     const NOW: u64 = 2_000_000_000;
@@ -1271,6 +1439,39 @@ mod tests {
         mint_draft_with_access_seed(0x41)
     }
 
+    fn object_mint_draft_with_access_seed(access_seed: u8) -> RuntimeMintDraft {
+        let nodes = vec![mint_binding(1), mint_binding(2), mint_binding(3)];
+        let threshold = ThresholdV1::new(2, 3).unwrap();
+        let object_identity = crate::test_object::object_identity(0x51);
+        let encrypted = object_identity.encrypted_content().clone();
+        let node_set = NodeSetV1::new(
+            threshold,
+            nodes.iter().map(|node| node.node_public_key()).collect(),
+        )
+        .unwrap();
+        let key_envelope = KeyEnvelopeIdentityV1::new(
+            encrypted,
+            digest(0x22),
+            512,
+            node_set.node_set_id().unwrap(),
+            threshold,
+            CustodyPoolIdentityV1::new(digest(0x35), 512).unwrap(),
+            CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap(),
+            CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap(),
+        )
+        .unwrap();
+        RuntimeMintDraft::new_from_identity(
+            RuntimeContentIdentityV1::Object(object_identity),
+            content_access_id(access_seed),
+            key_envelope,
+            RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
+            digest(0x19),
+            threshold,
+            nodes,
+        )
+        .unwrap()
+    }
+
     fn mint_receipt(node: &RuntimeMintNodeBinding, seed: u8) -> RuntimeMintNodeReceipt {
         RuntimeMintNodeReceipt::new(
             node.node_public_key(),
@@ -1341,6 +1542,33 @@ mod tests {
         }
     }
 
+    fn persist_object_mint_with_access_seed(
+        custody_provisioned: bool,
+        access_seed: u8,
+    ) -> (tempfile::TempDir, PersistedRuntimeMint) {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("owner-only-parent");
+        create_owner_only_directory(&parent);
+        let journal = RuntimeMintJournal::new(parent.join("runtime-mint"));
+        let draft = object_mint_draft_with_access_seed(access_seed);
+        journal.persist_bound(&draft).unwrap();
+        if custody_provisioned {
+            for (index, node) in draft.nodes().iter().enumerate() {
+                journal
+                    .mark_node_effect_started(draft.mint_id(), node.node_public_key())
+                    .unwrap();
+                journal
+                    .mark_node_receipt(draft.mint_id(), mint_receipt(node, 0x80 + index as u8))
+                    .unwrap();
+            }
+            let provisioned = journal.mark_custody_provisioned(draft.mint_id()).unwrap();
+            (temp, provisioned)
+        } else {
+            let bound = journal.load(draft.mint_id()).unwrap();
+            (temp, bound)
+        }
+    }
+
     fn availability_requirement() -> RuntimeContentAvailabilityRequirement {
         RuntimeContentAvailabilityRequirement::new(
             "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe",
@@ -1368,7 +1596,36 @@ mod tests {
             NOW,
             digest(0x7e),
             provisioned.draft().encrypted_content().clone(),
-            provisioned.draft().media_identity().media_manifest_root(),
+            RuntimeVerifiedContentIdentityRootV1::for_media(
+                provisioned.draft().media_identity().unwrap(),
+            ),
+        )
+        .unwrap();
+        RuntimeMintJournal::new(temp.path().join("owner-only-parent").join("runtime-mint"))
+            .mark_content_available(provisioned.draft().mint_id(), &requirement, evidence)
+            .unwrap()
+    }
+
+    fn persist_object_content_availability(
+        temp: &tempfile::TempDir,
+        provisioned: &PersistedRuntimeMint,
+    ) -> PersistedRuntimeMint {
+        let requirement = availability_requirement();
+        let crate::RuntimeContentIdentityV1::Object(object_identity) =
+            provisioned.draft().content_identity()
+        else {
+            panic!("expected an object draft");
+        };
+        let evidence = RuntimeVerifiedContentAvailability::new(
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#content",
+            "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#publisher",
+            &requirement,
+            3,
+            NOW,
+            digest(0x7e),
+            provisioned.draft().encrypted_content().clone(),
+            RuntimeVerifiedContentIdentityRootV1::for_object(object_identity).unwrap(),
         )
         .unwrap();
         RuntimeMintJournal::new(temp.path().join("owner-only-parent").join("runtime-mint"))
@@ -1506,10 +1763,12 @@ mod tests {
         prepare_response: Result<DecryptProviderResponseV1, RuntimeProviderCallError>,
         open_response: Result<DecryptProviderResponseV1, RuntimeProviderCallError>,
         read_response: Result<DecryptProviderResponseV1, RuntimeProviderCallError>,
+        object_read_response: Result<DecryptProviderResponseV1, RuntimeProviderCallError>,
         cancel_response: Result<DecryptProviderResponseV1, RuntimeProviderCallError>,
         close_response: Result<DecryptProviderResponseV1, RuntimeProviderCallError>,
         prepare_requests: std::sync::Mutex<Vec<Vec<u8>>>,
         read_requests: std::sync::Mutex<Vec<Vec<u8>>>,
+        object_read_requests: std::sync::Mutex<Vec<Vec<u8>>>,
         cancel_requests: std::sync::Mutex<Vec<Vec<u8>>>,
         close_requests: std::sync::Mutex<Vec<Vec<u8>>>,
     }
@@ -1526,10 +1785,12 @@ mod tests {
                 prepare_response: Ok(response),
                 open_response: Err(RuntimeProviderCallError::NoExactResult),
                 read_response: Err(RuntimeProviderCallError::NoExactResult),
+                object_read_response: Err(RuntimeProviderCallError::NoExactResult),
                 cancel_response: Err(RuntimeProviderCallError::NoExactResult),
                 close_response: Err(RuntimeProviderCallError::NoExactResult),
                 prepare_requests: std::sync::Mutex::new(Vec::new()),
                 read_requests: std::sync::Mutex::new(Vec::new()),
+                object_read_requests: std::sync::Mutex::new(Vec::new()),
                 cancel_requests: std::sync::Mutex::new(Vec::new()),
                 close_requests: std::sync::Mutex::new(Vec::new()),
             }
@@ -1542,10 +1803,30 @@ mod tests {
                 prepare_response: Err(RuntimeProviderCallError::NoExactResult),
                 open_response: Err(RuntimeProviderCallError::NoExactResult),
                 read_response: Ok(response),
+                object_read_response: Err(RuntimeProviderCallError::NoExactResult),
                 cancel_response: Err(RuntimeProviderCallError::NoExactResult),
                 close_response: Err(RuntimeProviderCallError::NoExactResult),
                 prepare_requests: std::sync::Mutex::new(Vec::new()),
                 read_requests: std::sync::Mutex::new(Vec::new()),
+                object_read_requests: std::sync::Mutex::new(Vec::new()),
+                cancel_requests: std::sync::Mutex::new(Vec::new()),
+                close_requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_object_read_response(response: DecryptProviderResponseV1) -> Self {
+            Self {
+                expected_issuer: runtime_operation_issuer(0x42),
+                now: NOW,
+                prepare_response: Err(RuntimeProviderCallError::NoExactResult),
+                open_response: Err(RuntimeProviderCallError::NoExactResult),
+                read_response: Err(RuntimeProviderCallError::NoExactResult),
+                object_read_response: Ok(response),
+                cancel_response: Err(RuntimeProviderCallError::NoExactResult),
+                close_response: Err(RuntimeProviderCallError::NoExactResult),
+                prepare_requests: std::sync::Mutex::new(Vec::new()),
+                read_requests: std::sync::Mutex::new(Vec::new()),
+                object_read_requests: std::sync::Mutex::new(Vec::new()),
                 cancel_requests: std::sync::Mutex::new(Vec::new()),
                 close_requests: std::sync::Mutex::new(Vec::new()),
             }
@@ -1558,10 +1839,12 @@ mod tests {
                 prepare_response: Err(RuntimeProviderCallError::NoExactResult),
                 open_response: Err(RuntimeProviderCallError::NoExactResult),
                 read_response: Err(RuntimeProviderCallError::NoExactResult),
+                object_read_response: Err(RuntimeProviderCallError::NoExactResult),
                 cancel_response: Ok(response),
                 close_response: Err(RuntimeProviderCallError::NoExactResult),
                 prepare_requests: std::sync::Mutex::new(Vec::new()),
                 read_requests: std::sync::Mutex::new(Vec::new()),
+                object_read_requests: std::sync::Mutex::new(Vec::new()),
                 cancel_requests: std::sync::Mutex::new(Vec::new()),
                 close_requests: std::sync::Mutex::new(Vec::new()),
             }
@@ -1574,10 +1857,12 @@ mod tests {
                 prepare_response: Err(RuntimeProviderCallError::NoExactResult),
                 open_response: Err(RuntimeProviderCallError::NoExactResult),
                 read_response: Err(RuntimeProviderCallError::NoExactResult),
+                object_read_response: Err(RuntimeProviderCallError::NoExactResult),
                 cancel_response: Err(RuntimeProviderCallError::NoExactResult),
                 close_response: Ok(response),
                 prepare_requests: std::sync::Mutex::new(Vec::new()),
                 read_requests: std::sync::Mutex::new(Vec::new()),
+                object_read_requests: std::sync::Mutex::new(Vec::new()),
                 cancel_requests: std::sync::Mutex::new(Vec::new()),
                 close_requests: std::sync::Mutex::new(Vec::new()),
             }
@@ -1619,6 +1904,17 @@ mod tests {
                 .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
             self.read_requests.lock().unwrap().push(bytes);
             self.read_response.clone()
+        }
+
+        async fn read_viewer_object_chunk(
+            &self,
+            request: &DecryptProviderRequestV1,
+        ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError> {
+            let bytes = request
+                .to_json_vec()
+                .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
+            self.object_read_requests.lock().unwrap().push(bytes);
+            self.object_read_response.clone()
         }
 
         async fn cancel_prepared_recipient(
@@ -1688,22 +1984,125 @@ mod tests {
         );
     }
 
+    /// R27: an object draft with exact object-availability evidence can now
+    /// be bought and opened — before this fix, `bind_verified_buy` rejected
+    /// every object draft unconditionally regardless of availability.
+    #[test]
+    fn bind_verified_buy_accepts_exact_object_availability() {
+        let (temp, provisioned) = persist_object_mint_with_access_seed(true, 0x41);
+        let available = persist_object_content_availability(&temp, &provisioned);
+        let effect = purchase_effect(&available, WALLET_ACCOUNT, 0xaa);
+        let profile = profile_identity(0x26);
+        let receipt = bind_buy(&available, "profile:alpha", profile, &effect).unwrap();
+        assert_eq!(receipt.mint_id(), available.draft().mint_id());
+        assert_eq!(receipt.profile(), profile);
+        assert_eq!(receipt.wallet(), wallet(7));
+        assert_eq!(
+            receipt.encrypted_content(),
+            available.draft().encrypted_content()
+        );
+    }
+
+    /// R27 fail-closed: the draft's own kind decides which identity-root claim
+    /// availability must satisfy, so a root carrying the RIGHT digest under the
+    /// WRONG kind must still be refused, both ways round. Both cases keep the
+    /// digest byte-identical to the matching one so the only difference under
+    /// test is the kind discriminant itself.
+    #[test]
+    fn bind_verified_buy_rejects_cross_kind_availability_identity_roots() {
+        let requirement = availability_requirement();
+        let cross_kind_availability =
+            |mint: &PersistedRuntimeMint, root: RuntimeVerifiedContentIdentityRootV1| {
+                RuntimeVerifiedContentAvailability::new(
+                    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                    requirement.expected_object_identity(),
+                    requirement.expected_publisher_did(),
+                    &requirement,
+                    3,
+                    NOW,
+                    digest(0x7e),
+                    mint.draft().encrypted_content().clone(),
+                    root,
+                )
+                .unwrap()
+            };
+
+        // An object draft whose availability claims a media root.
+        let (object_temp, object_provisioned) = persist_object_mint_with_access_seed(true, 0x41);
+        let object_available =
+            persist_object_content_availability(&object_temp, &object_provisioned);
+        let object_effect = purchase_effect(&object_available, WALLET_ACCOUNT, 0xaa);
+        let crate::RuntimeContentIdentityV1::Object(object_identity) =
+            object_available.draft().content_identity()
+        else {
+            panic!("expected an object draft");
+        };
+        let RuntimeVerifiedContentIdentityRootV1::Object(object_root_digest) =
+            RuntimeVerifiedContentIdentityRootV1::for_object(object_identity).unwrap()
+        else {
+            panic!("expected an object identity root");
+        };
+        let object_draft_media_root = cross_kind_availability(
+            &object_available,
+            RuntimeVerifiedContentIdentityRootV1::Media(object_root_digest),
+        );
+        assert_eq!(
+            object_available.draft().bind_verified_buy(
+                &object_draft_media_root,
+                "profile:alpha",
+                profile_identity(0x26),
+                &object_effect,
+            ),
+            Err(RuntimeOpenError::MintSelection)
+        );
+
+        // A media draft whose availability claims an object root.
+        let (media_temp, media_provisioned) = persist_mint(true);
+        let media_available = persist_content_availability(&media_temp, &media_provisioned);
+        let media_effect = purchase_effect(&media_available, WALLET_ACCOUNT, 0xaa);
+        let RuntimeVerifiedContentIdentityRootV1::Media(media_root_digest) =
+            RuntimeVerifiedContentIdentityRootV1::for_media(
+                media_available.draft().media_identity().unwrap(),
+            )
+        else {
+            panic!("expected a media identity root");
+        };
+        let media_draft_object_root = cross_kind_availability(
+            &media_available,
+            RuntimeVerifiedContentIdentityRootV1::Object(media_root_digest),
+        );
+        assert_eq!(
+            media_available.draft().bind_verified_buy(
+                &media_draft_object_root,
+                "profile:alpha",
+                profile_identity(0x26),
+                &media_effect,
+            ),
+            Err(RuntimeOpenError::MintSelection)
+        );
+    }
+
     #[test]
     fn bind_verified_buy_rejects_mismatched_availability_identity() {
         let (temp, provisioned) = persist_mint(true);
         let available = persist_content_availability(&temp, &provisioned);
         let effect = purchase_effect(&available, WALLET_ACCOUNT, 0xaa);
         let requirement = availability_requirement();
-        for (encrypted_content, media_manifest_root) in [
+        for (encrypted_content, content_identity_root) in [
             (
                 EncryptedContentIdentityV1::new(
                     digest(0x70),
                     available.draft().encrypted_content().ciphertext_bytes(),
                 )
                 .unwrap(),
-                available.draft().media_identity().media_manifest_root(),
+                RuntimeVerifiedContentIdentityRootV1::for_media(
+                    available.draft().media_identity().unwrap(),
+                ),
             ),
-            (available.draft().encrypted_content().clone(), digest(0x7f)),
+            (
+                available.draft().encrypted_content().clone(),
+                RuntimeVerifiedContentIdentityRootV1::Media(digest(0x7f)),
+            ),
         ] {
             let mismatch = RuntimeVerifiedContentAvailability::new(
                 "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
@@ -1714,7 +2113,7 @@ mod tests {
                 NOW,
                 digest(0x7e),
                 encrypted_content,
-                media_manifest_root,
+                content_identity_root,
             )
             .unwrap();
             assert_eq!(
@@ -1971,6 +2370,80 @@ mod tests {
             Err(RuntimeOpenError::DecryptResult)
         );
         assert_eq!(provider.read_requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_viewer_object_chunk_returns_exact_plaintext_and_replays() {
+        let session = viewer_session(0x35);
+        let chunk_index = 2u32;
+        let framed_chunk = vec![0xaa; 64];
+        let response = DecryptProviderResponseV1::new_viewer_object_chunk(
+            RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+            vec![0x20, 0x21, 0x22],
+        )
+        .unwrap();
+        let provider = FakeDecryptProvider::with_object_read_response(response);
+
+        let first = read_viewer_object_chunk(&provider, &session, chunk_index, &framed_chunk, NOW)
+            .await
+            .unwrap();
+        let second = read_viewer_object_chunk(&provider, &session, chunk_index, &framed_chunk, NOW)
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.audit_request_id(), session.audit_request_id());
+        assert_eq!(
+            first.viewer_session_handle(),
+            session.viewer_session_handle()
+        );
+        assert_eq!(first.chunk_index(), chunk_index);
+        assert_eq!(first.plaintext(), &[0x20, 0x21, 0x22]);
+        assert_eq!(provider.object_read_requests.lock().unwrap().len(), 2);
+        assert!(format!("{first:?}").contains("plaintext_len"));
+        assert!(!format!("{first:?}").contains("202122"));
+    }
+
+    /// Object twin of `read_viewer_media_part_rejects_conflicting_response_binding`,
+    /// narrowed to what the contract can actually carry back: unlike
+    /// `ViewerMediaPart`, `ViewerObjectChunk` echoes neither the viewer
+    /// session handle nor the chunk index (see the doc comment on
+    /// `read_viewer_object_chunk`), so the only response field this function
+    /// can cross-check is `audit_request_id`.
+    #[tokio::test]
+    async fn read_viewer_object_chunk_rejects_mismatched_response_audit_id() {
+        let session = viewer_session(0x35);
+        let wrong_response = DecryptProviderResponseV1::new_viewer_object_chunk(
+            RuntimeReleaseAuditIdV1::new(digest(0x99)).unwrap(),
+            vec![0x20, 0x21, 0x22],
+        )
+        .unwrap();
+        let provider = FakeDecryptProvider::with_object_read_response(wrong_response);
+
+        assert_eq!(
+            read_viewer_object_chunk(&provider, &session, 0, &[0xaa; 32], NOW).await,
+            Err(RuntimeOpenError::DecryptResult)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_viewer_object_chunk_rejects_expired_session_before_provider_dispatch() {
+        let session = RuntimeViewerSession {
+            expires_at: NOW,
+            ..viewer_session(0x35)
+        };
+        let response = DecryptProviderResponseV1::new_viewer_object_chunk(
+            RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+            vec![0x20, 0x21, 0x22],
+        )
+        .unwrap();
+        let provider = FakeDecryptProvider::with_object_read_response(response);
+
+        assert_eq!(
+            read_viewer_object_chunk(&provider, &session, 0, &[0xaa; 32], NOW).await,
+            Err(RuntimeOpenError::DecryptResult)
+        );
+        assert_eq!(provider.object_read_requests.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]

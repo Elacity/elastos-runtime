@@ -14,7 +14,7 @@
     "capabilities": [
       {
         "resource": "elastos://object/*",
-        "actions": ["read", "write", "delete"],
+        "actions": ["read", "write", "delete", "buy"],
         "operations": ["roots", "list", "stat", "read", "download", "write", "mkdir", "rename", "move", "copy", "trash", "restore", "delete_permanently", "empty_trash", "status", "events", "publish", "unpublish", "repair", "share", "list_runtime_custody", "buy", "open_viewer", "read_viewer", "close_viewer"]
       }
     ],

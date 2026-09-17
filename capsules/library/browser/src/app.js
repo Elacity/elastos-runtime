@@ -7,7 +7,7 @@ import {
   inTrash,
   isBlockedObject,
   isDirectory,
-  isRuntimeCustodyProtectableVideo,
+  isRuntimeCustodyProtectable,
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
@@ -1010,7 +1010,7 @@ import {
               if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
           } else if (hasCapability(object, "publish")) {
             actions.push(menuAction("Publish", () => publishObject(object)));
-            if (isRuntimeCustodyProtectableVideo(object)) {
+            if (isRuntimeCustodyProtectable(object)) {
               actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
             }
           }

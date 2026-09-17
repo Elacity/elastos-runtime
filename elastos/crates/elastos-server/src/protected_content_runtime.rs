@@ -34,15 +34,17 @@ use elastos_protected_content_contracts::{
     TerminalReceiptIssuerKey, TerminalReceiptStatementV1, WalletSignedRightsRequestV1,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
-    DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
-    ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
-    RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
-    ValidatedClearFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
-    CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
-    DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
-    MAX_PROTECT_MEDIA_SEGMENTS_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
-    PROTECT_PROVIDER_REQUEST_SCHEMA_V1, PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
+    CencFmp4MediaIdentityV1, ChunkedPayloadObjectIdentityV1, DecryptProviderRequestOpV1,
+    DecryptProviderRequestV1, DecryptProviderResponseV1, ElastosPqPsshDataV1,
+    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
+    ProtectionSessionNodeV1, RightsProviderRequestV1, RightsProviderResponseV1,
+    ValidatedCencFmp4MediaSessionLayoutV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    ViewerMediaPartSelectorV1, CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
+    CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1, DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
+    DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1, MAX_OBJECT_PLAINTEXT_BYTES_V1,
+    MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1, MAX_PROTECT_MEDIA_SEGMENTS_V1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+    PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 use elastos_protected_content_rights::{
     PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
@@ -51,18 +53,21 @@ use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
     cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
     close_viewer_session_with_result, open_viewer_session, prepare_recipient,
-    read_viewer_media_part, resolve_runtime_mint_selected_nodes, PersistedRuntimeMint,
-    PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
-    RuntimeCustodyTerminalKind, RuntimeDecryptProvider, RuntimeMediaPreparationRecord,
-    RuntimeMediaPreparationState, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
-    RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence,
-    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    read_viewer_media_part, read_viewer_object_chunk, resolve_runtime_mint_selected_nodes,
+    ExclusiveFileLock, PersistedRuntimeMint, PersistedRuntimeReleaseOperation,
+    RuntimeContentAvailabilityRequirement, RuntimeContentIdentityV1, RuntimeCustodyTerminalKind,
+    RuntimeDecryptProvider, RuntimeMediaPreparationRecord, RuntimeMediaPreparationState,
+    RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorError,
+    RuntimeMintCoordinatorOutcome, RuntimeMintCreatorStage, RuntimeMintCreatorState,
+    RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal,
+    RuntimeMintJournalError, RuntimeOpenViewerContentV1, RuntimeOpenViewerSessionInput,
     RuntimePreparedRecipient, RuntimePreparedRecipientCancelResult,
     RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
     RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
-    RuntimeSelectedProvider, RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
-    RuntimeViewerSession, RuntimeViewerSessionCloseResult,
+    RuntimeSelectedProvider, RuntimeVerifiedContentAvailability,
+    RuntimeVerifiedContentIdentityRootV1, RuntimeVerifiedPurchaseEffect, RuntimeViewerSession,
+    RuntimeViewerSessionCloseResult,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
@@ -99,6 +104,7 @@ const MEDIA_PROVIDER_MAX_SOURCE_FPS_V1: u32 = 60;
 const MEDIA_PROVIDER_MAX_SEGMENT_COUNT_V1: usize = MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize;
 const MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES_V1: u64 = 2 << 30;
 const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
+pub(crate) const ELACITY_READER_CAPSULE_ID: &str = "elacity-reader";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
 const PROTECTED_CONTENT_MIN_REPLICAS: u32 = 3;
@@ -135,12 +141,159 @@ struct RuntimeMediaToolImport {
     path: PathBuf,
     created: bool,
 }
+/// One critical step of a mint, traced at both ends.
+///
+/// Every trace on this path used to be an *end* marker -- "protected",
+/// "provisioned", "verified". With only those, a step that is slow and a step
+/// that is stuck look identical until it finishes, which is why a publish that
+/// took nineteen minutes could not be attributed to any phase afterwards. A
+/// step now announces itself before it begins and reports how long it took when
+/// it stops.
+///
+/// It reports even when it stops by failing: the end is logged from `Drop`, so
+/// an early `?` return still leaves a boundary in the log, marked `abandoned`
+/// rather than `ok`. That is the case worth seeing, and it is the one an
+/// explicit call at the end of the happy path would always miss.
+///
+/// DEBUG on purpose. An operator at INFO wants the outcome, not the itinerary;
+/// this is for whoever is asking where the time went.
+pub(crate) struct RuntimeMintStep {
+    name: &'static str,
+    request_id: String,
+    started: std::time::Instant,
+    outcome: &'static str,
+    repeating: bool,
+}
+
+impl RuntimeMintStep {
+    /// A step that happens once in a publish.
+    pub(crate) fn begin(name: &'static str, request_id: &str) -> Self {
+        tracing::debug!(step = name, %request_id, "runtime custody step: begin");
+        Self {
+            name,
+            request_id: request_id.to_string(),
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+            repeating: false,
+        }
+    }
+
+    /// A step re-run by every poll of a wait.
+    ///
+    /// TRACE, not DEBUG. Waiting for a wallet approval or for a block to
+    /// finalise means re-entering the same three steps every few seconds for
+    /// minutes on end, and at DEBUG that repetition buries the things that
+    /// happen once. What a reader needs from a wait is when it started and when
+    /// it ended -- both of which are logged at DEBUG elsewhere -- not a
+    /// transcript of every time nothing changed.
+    pub(crate) fn begin_repeating(name: &'static str, request_id: &str) -> Self {
+        tracing::trace!(step = name, %request_id, "runtime custody step: begin");
+        Self {
+            name,
+            request_id: request_id.to_string(),
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+            repeating: true,
+        }
+    }
+
+    /// Mark the step as having run to completion. Anything that returns before
+    /// this is reached is reported as abandoned.
+    pub(crate) fn ok(mut self) {
+        self.outcome = "ok";
+    }
+
+    /// Mark the step as having stopped because what it waits for has not
+    /// happened yet.
+    ///
+    /// Without this, a chain answer of "not finalized yet" -- the expected
+    /// shape of that wait, repeated every few seconds -- reads identically to a
+    /// step that fell over. Distinguishing them is the whole point of recording
+    /// an outcome, and `abandoned` is only useful if it stays rare.
+    pub(crate) fn pending(mut self) {
+        self.outcome = "pending";
+    }
+}
+
+impl Drop for RuntimeMintStep {
+    fn drop(&mut self) {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        // A repeating step that ends badly is still worth DEBUG: the point of
+        // quietening the loop is to hide the times nothing happened, not the
+        // time something did.
+        if self.repeating && self.outcome != "abandoned" {
+            tracing::trace!(
+                step = self.name,
+                request_id = %self.request_id,
+                outcome = self.outcome,
+                elapsed_ms,
+                "runtime custody step: end"
+            );
+            return;
+        }
+        tracing::debug!(
+            step = self.name,
+            request_id = %self.request_id,
+            outcome = self.outcome,
+            elapsed_ms,
+            "runtime custody step: end"
+        );
+    }
+}
+
+/// Times one leg *inside* a step, for steps long enough that knowing they took
+/// five minutes says nothing useful.
+///
+/// `availability_publish` is the case that forced this: it is a single step
+/// that publishes the ciphertext, then reads a receipt, a manifest, and every
+/// file back to prove the object replicated. When it takes five minutes, the
+/// step timer can only report five minutes -- which of those legs spent them
+/// is exactly the question, and was previously answerable only by guessing.
+///
+/// Reports on drop like `RuntimeMintStep`, so a leg that returns early is
+/// still recorded rather than vanishing.
+pub(crate) struct RuntimeCustodyPhase {
+    name: &'static str,
+    detail: String,
+    started: std::time::Instant,
+    outcome: &'static str,
+}
+
+impl RuntimeCustodyPhase {
+    pub(crate) fn begin(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            detail: detail.into(),
+            started: std::time::Instant::now(),
+            outcome: "abandoned",
+        }
+    }
+
+    pub(crate) fn ok(mut self) {
+        self.outcome = "ok";
+    }
+}
+
+impl Drop for RuntimeCustodyPhase {
+    fn drop(&mut self) {
+        tracing::debug!(
+            phase = self.name,
+            detail = %self.detail,
+            outcome = self.outcome,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            "runtime custody phase"
+        );
+    }
+}
+
 pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
     "Runtime custody composition is not configured";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
     "Runtime custody purchase is denied before buy";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE: &str =
     "Runtime custody purchase is pending exact Wallet or Chain settlement";
+pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE: &str =
+    "Runtime custody purchase target is not bound on chain";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody purchase is unavailable";
 pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
@@ -187,6 +340,679 @@ macro_rules! release_unavailable_missing {
         }
     };
 }
+/// Wire identity of the typed answer a creator app gets when an attempt to
+/// protect a file is refused because an earlier attempt for the same file is
+/// already on record at different terms.
+pub(crate) const RUNTIME_CUSTODY_CREATOR_MINT_BLOCKED_SCHEMA_V1: &str =
+    "elastos.protected-content.creator-mint-blocked/v1";
+
+pub(crate) const RUNTIME_CUSTODY_CREATOR_DISCARD_DENIED_MESSAGE: &str =
+    "The earlier attempt to protect this file has already reached the blockchain and cannot be dropped";
+
+/// What an earlier creator mint already on record means for a new attempt at
+/// different terms, and what the creator may still do about it.
+///
+/// Mirrors [`RuntimeMintCreatorStage`] one-to-one and exists separately only so
+/// the wire spelling an app branches on is fixed here rather than derived from
+/// a type an app cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyCreatorMintBlockedState {
+    /// Terms are on record and nothing was raised on any ledger.
+    RecordedOnly,
+    /// A transaction is out for the creator's approval and may still settle.
+    ApprovalOutstanding,
+    /// The mint settled; a seller and a token id exist.
+    AlreadyMinted,
+}
+
+impl RuntimeCustodyCreatorMintBlockedState {
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::RecordedOnly => "recorded_only",
+            Self::ApprovalOutstanding => "approval_outstanding",
+            Self::AlreadyMinted => "already_minted",
+        }
+    }
+
+    /// Dropping the record is safe only while nothing was raised on a ledger.
+    const fn can_discard(self) -> bool {
+        matches!(self, Self::RecordedOnly)
+    }
+
+    /// Re-running the same attempt at the recorded terms still moves it
+    /// forward in both unsettled states; a settled mint has nothing to resume.
+    const fn can_resume(self) -> bool {
+        matches!(self, Self::RecordedOnly | Self::ApprovalOutstanding)
+    }
+}
+
+/// A refusal that carries its reason as data.
+///
+/// Re-terming a mint already in flight stays refused. What this adds is that
+/// the creator is told what was recorded and which action is open to them,
+/// without any app having to read the sentence. The recorded copies and price
+/// travel here, to the person who entered them — never into the log.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyCreatorMintBlocked {
+    state: RuntimeCustodyCreatorMintBlockedState,
+    mint_id: String,
+    copies: String,
+    price: String,
+    progress: Option<Value>,
+}
+
+impl RuntimeCustodyCreatorMintBlocked {
+    pub(crate) fn new(mint_id: Digest32, recorded: &RuntimeMintCreatorState) -> Self {
+        let state = match recorded.stage() {
+            RuntimeMintCreatorStage::Recorded => {
+                RuntimeCustodyCreatorMintBlockedState::RecordedOnly
+            }
+            RuntimeMintCreatorStage::EffectRaised => {
+                RuntimeCustodyCreatorMintBlockedState::ApprovalOutstanding
+            }
+            RuntimeMintCreatorStage::Settled => {
+                RuntimeCustodyCreatorMintBlockedState::AlreadyMinted
+            }
+        };
+        Self {
+            state,
+            mint_id: hex::encode(mint_id.as_bytes()),
+            copies: recorded.desired_terms().copies().to_string(),
+            price: recorded.desired_terms().price().to_string(),
+            progress: None,
+        }
+    }
+
+    /// Attach how far the blocked mint actually got.
+    ///
+    /// Opt-in for the same reason the waiting state's is: only a caller holding
+    /// the mint record can say, and a caller that cannot must not fill it with
+    /// a guess. It is what lets an app show which stage a blocked attempt
+    /// reached instead of only that one exists.
+    #[must_use]
+    pub(crate) fn with_progress(mut self, progress: Value) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Stage name for the operator log. Carries no terms and no account.
+    pub(crate) const fn state_label(&self) -> &'static str {
+        self.state.wire_value()
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        let mut answer = json!({
+            "schema": RUNTIME_CUSTODY_CREATOR_MINT_BLOCKED_SCHEMA_V1,
+            "state": self.state.wire_value(),
+            "mint_id": self.mint_id,
+            "recorded_copies": self.copies,
+            "recorded_price": self.price,
+            "can_discard": self.state.can_discard(),
+            "can_resume": self.state.can_resume(),
+        });
+        if let Some(progress) = self.progress.as_ref() {
+            answer["progress"] = progress.clone();
+        }
+        answer
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyCreatorMintBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.state {
+            RuntimeCustodyCreatorMintBlockedState::RecordedOnly => {
+                "An earlier attempt to protect this file is still on record at different terms"
+            }
+            RuntimeCustodyCreatorMintBlockedState::ApprovalOutstanding => {
+                "An earlier attempt to protect this file is waiting for approval in Wallet, so its terms can no longer change"
+            }
+            RuntimeCustodyCreatorMintBlockedState::AlreadyMinted => {
+                "This file is already protected and listed, so its terms can no longer change"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RuntimeCustodyCreatorMintBlocked {}
+
+/// Wire identity of the typed answer an app gets when the wallet's transaction
+/// default for a chain cannot carry a protected-content transaction.
+pub(crate) const RUNTIME_CUSTODY_WALLET_DEFAULT_UNUSABLE_SCHEMA_V1: &str =
+    "elastos.protected-content.wallet-default-unusable/v1";
+
+/// Why the wallet's transaction default for one chain cannot be used.
+///
+/// Five distinct conditions used to share one opaque sentence, so a creator or
+/// a buyer was told only that something was unavailable and no app could tell
+/// which of the five it was, let alone what to offer. Each arm here names one
+/// condition; the sentence in `Display` names the way out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyWalletDefaultReason {
+    /// No account is marked as the transaction default on this chain.
+    NoTransactionDefaultForChainNamespace,
+    /// Two accounts claim the default at the same instant, so neither wins.
+    AmbiguousTransactionDefault,
+    /// The default names an account the wallet no longer holds on this chain.
+    DefaultAccountNotInWallet,
+    /// The default cannot produce a signature: an external wallet whose
+    /// connector is not linked. A linked one is signable through the handoff.
+    DefaultAccountSigningUnavailable,
+    /// The default's address is not usable on this chain.
+    DefaultAccountAddressInvalid,
+}
+
+impl RuntimeCustodyWalletDefaultReason {
+    /// Stable machine-readable spelling, shared by the wire answer and the
+    /// operator log so the two can never drift apart.
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::NoTransactionDefaultForChainNamespace => {
+                "no_transaction_default_for_chain_namespace"
+            }
+            Self::AmbiguousTransactionDefault => "ambiguous_transaction_default",
+            Self::DefaultAccountNotInWallet => "default_account_not_in_wallet_for_chain_namespace",
+            Self::DefaultAccountSigningUnavailable => "default_account_signing_unavailable",
+            Self::DefaultAccountAddressInvalid => "default_account_address_invalid",
+        }
+    }
+}
+
+/// A refusal that carries its reason as data, sibling to
+/// [`RuntimeCustodyCreatorMintBlocked`].
+///
+/// The refusal is unchanged and the opaque top-level sentence still stands
+/// outermost, so nothing that matches on it breaks. What this adds is a typed
+/// field an app branches on to offer the one action that fixes the state. It
+/// carries the chain namespace so the sentence can name the network, and
+/// nothing else: no account id, no address, no balance, no terms.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyWalletDefaultUnusable {
+    reason: RuntimeCustodyWalletDefaultReason,
+    chain_namespace: String,
+}
+
+impl RuntimeCustodyWalletDefaultUnusable {
+    pub(crate) fn new(reason: RuntimeCustodyWalletDefaultReason, chain_namespace: &str) -> Self {
+        Self {
+            reason,
+            chain_namespace: chain_namespace.to_string(),
+        }
+    }
+
+    /// Reason code for the operator log. Carries no account and no address.
+    pub(crate) const fn reason_label(&self) -> &'static str {
+        self.reason.wire_value()
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        json!({
+            "schema": RUNTIME_CUSTODY_WALLET_DEFAULT_UNUSABLE_SCHEMA_V1,
+            "reason": self.reason.wire_value(),
+            "chain_namespace": self.chain_namespace,
+        })
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyWalletDefaultUnusable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let network = &self.chain_namespace;
+        match self.reason {
+            RuntimeCustodyWalletDefaultReason::NoTransactionDefaultForChainNamespace => write!(
+                formatter,
+                "No account is set as the transaction default for {network}; set one in Wallet, then try again"
+            ),
+            RuntimeCustodyWalletDefaultReason::AmbiguousTransactionDefault => write!(
+                formatter,
+                "More than one account claims the transaction default for {network}; set a single default in Wallet, then try again"
+            ),
+            RuntimeCustodyWalletDefaultReason::DefaultAccountNotInWallet => write!(
+                formatter,
+                "The transaction default for {network} names an account this wallet no longer holds; set a current account as the default in Wallet, then try again"
+            ),
+            RuntimeCustodyWalletDefaultReason::DefaultAccountSigningUnavailable => write!(
+                formatter,
+                "The transaction default for {network} is an external wallet with no connector linked, so it cannot sign; link it in Wallet, or set a built-in account as the default, then try again"
+            ),
+            RuntimeCustodyWalletDefaultReason::DefaultAccountAddressInvalid => write!(
+                formatter,
+                "The transaction default for {network} has an address this network cannot use; set an account on {network} as the default in Wallet, then try again"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCustodyWalletDefaultUnusable {}
+
+/// Wire identity of the typed answer an app gets when a mint already under way
+/// is bound to an account that is no longer the wallet's transaction default.
+pub(crate) const RUNTIME_CUSTODY_CREATOR_WALLET_DRIFT_SCHEMA_V1: &str =
+    "elastos.protected-content.creator-wallet-drift/v1";
+
+/// A mint already under way names one account, and the wallet now names
+/// another as its transaction default for that chain.
+///
+/// The recorded account wins — a retry must not switch payer mid-flight, which
+/// is what makes an effect identity durable (PRINCIPLES.md 19). The defect this
+/// answers is not the pinning; it is the *silence*. Before this, changing the
+/// transaction default and re-publishing the same object completed the mint on
+/// the old account with nothing said, so a creator who had deliberately
+/// switched wallets was told only that the listing succeeded.
+///
+/// So the refusal is the honest move (PRINCIPLES.md 11): stop, name both
+/// accounts, and give the two ways out — drop the recorded terms and start over
+/// on the current default, or set the recorded account back as the default.
+///
+/// Unlike [`RuntimeCustodyWalletDefaultUnusable`], this one does carry
+/// addresses. It has to: the whole refusal is "these two differ", and an app
+/// that cannot say which two has nothing to show. They are the creator's own
+/// accounts, returned to the creator's own authenticated session, and the
+/// Wallet surface already displays both. They stay out of the operator log all
+/// the same — `reason_label` is the only thing logged.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyCreatorWalletDrift {
+    chain_namespace: String,
+    bound_address: String,
+    default_address: String,
+}
+
+impl RuntimeCustodyCreatorWalletDrift {
+    pub(crate) fn new(chain_namespace: &str, bound_address: &str, default_address: &str) -> Self {
+        Self {
+            chain_namespace: chain_namespace.to_string(),
+            bound_address: bound_address.to_ascii_lowercase(),
+            default_address: default_address.to_ascii_lowercase(),
+        }
+    }
+
+    /// Reason code for the operator log. Carries no account and no address.
+    pub(crate) const fn reason_label(&self) -> &'static str {
+        "creator_mint_bound_account_is_not_the_transaction_default"
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        json!({
+            "schema": RUNTIME_CUSTODY_CREATOR_WALLET_DRIFT_SCHEMA_V1,
+            "reason": self.reason_label(),
+            "chain_namespace": self.chain_namespace,
+            "bound_address": self.bound_address,
+            "default_address": self.default_address,
+        })
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyCreatorWalletDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "This mint is already bound to {bound} from an earlier attempt, but the transaction \
+             default for {network} is now {default}. A mint keeps the account it started with, so \
+             finish it by setting {bound} back as the default, or discard the recorded terms for \
+             this object and protect it again on {default}",
+            bound = self.bound_address,
+            network = self.chain_namespace,
+            default = self.default_address,
+        )
+    }
+}
+
+impl std::error::Error for RuntimeCustodyCreatorWalletDrift {}
+
+/// Wire identity of the typed answer an app gets when a wallet approval can
+/// never complete.
+pub(crate) const RUNTIME_CUSTODY_APPROVAL_CLOSED_SCHEMA_V1: &str =
+    "elastos.protected-content.approval-closed/v1";
+
+/// Why an outstanding wallet approval will never complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyApprovalClosedReason {
+    /// The person declined it in their wallet.
+    Rejected,
+    /// It lapsed before anyone answered it.
+    Expired,
+}
+
+impl RuntimeCustodyApprovalClosedReason {
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::Rejected => "approval_rejected",
+            Self::Expired => "approval_expired",
+        }
+    }
+}
+
+/// A wallet approval that is finished and did not succeed.
+///
+/// This used to be indistinguishable from "not yet": every approval status
+/// other than `completed` produced one "not completed" answer, so a declined
+/// transaction read exactly like one the person had not got to. A caller
+/// polling for completion waited on it forever.
+///
+/// Neither of these ever produced a signature, so neither can produce a
+/// transaction — which is what makes them terminal rather than slow.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyApprovalClosed {
+    reason: RuntimeCustodyApprovalClosedReason,
+}
+
+impl RuntimeCustodyApprovalClosed {
+    pub(crate) const fn new(reason: RuntimeCustodyApprovalClosedReason) -> Self {
+        Self { reason }
+    }
+
+    /// Reason code for the operator log. Carries no account and no address.
+    pub(crate) const fn reason_label(&self) -> &'static str {
+        self.reason.wire_value()
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        json!({
+            "schema": RUNTIME_CUSTODY_APPROVAL_CLOSED_SCHEMA_V1,
+            "reason": self.reason.wire_value(),
+        })
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyApprovalClosed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            RuntimeCustodyApprovalClosedReason::Rejected => write!(
+                formatter,
+                "This transaction was declined in the wallet, so the listing did not complete"
+            ),
+            RuntimeCustodyApprovalClosedReason::Expired => write!(
+                formatter,
+                "This transaction approval expired before it was answered, so the listing did not \
+                 complete"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCustodyApprovalClosed {}
+
+/// Wire identity of the progress an app renders while a creator publish runs.
+pub(crate) const RUNTIME_CUSTODY_CREATOR_PROGRESS_SCHEMA_V1: &str =
+    "elastos.protected-content.creator-progress/v1";
+
+/// How far a creator publish has actually got, read from the mint journal.
+///
+/// The Creator used to show four dots it drove itself, one of them labelled
+/// "(not tracked)" because the client had no way to know: the whole
+/// server-side pipeline happened inside one request, so "encrypt" went active
+/// when the request was sent and "assemble" went done when it returned, and
+/// the publish step in between was a guess dressed as a stage.
+///
+/// Every state here is evidence the journal already holds, so this cannot
+/// drift from what the server actually did (PRINCIPLES.md 12) -- there is no
+/// second source of truth to keep in step, only a projection of the first:
+///
+/// * `escrow`  the custody envelope. The mint record exists at all only once
+///   protection produced an encrypted content identity, so reaching this
+///   function means encryption is done; `custody_terminal` says whether the
+///   2-of-3 envelope settled or aborted.
+/// * `publish` the ciphertext reaching content availability, which is exactly
+///   `content_availability` -- a verified receipt, not a hopeful one. This is
+///   the stage that was untracked.
+/// * `listing` the chain mint and listing projection, which is the creator
+///   state's own three-stage lifecycle.
+///
+/// The vocabulary is `pending` (has not begun), `active` (running), `done`
+/// (durably finished) and `failed` (finished badly). A stage never claims to be
+/// running when its input has not arrived, and never claims to be done because
+/// it merely stopped.
+pub(crate) fn runtime_custody_creator_progress(
+    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
+) -> Value {
+    use elastos_protected_content_runtime::RuntimeCustodyTerminalKind;
+
+    // A terminal is not a success. `custody_terminal` is `Some` for an aborted
+    // partial provision too, and reporting that as "done" told a creator their
+    // escrow had settled at the exact moment the mint became unrecoverable.
+    let escrow = match mint.custody_terminal() {
+        Some(RuntimeCustodyTerminalKind::CustodyProvisioned) => "done",
+        Some(RuntimeCustodyTerminalKind::AbortedPartialProvision) => "failed",
+        None => "active",
+    };
+    // Availability work begins only once the envelope has settled, so before
+    // that this stage has not started. Saying "active" for work that has not
+    // begun — and for work that now never will — is the same untruth one stage
+    // along.
+    let publish = match (escrow, mint.content_availability().is_some()) {
+        (_, true) => "done",
+        ("done", false) => "active",
+        _ => "pending",
+    };
+    let listing = match mint
+        .creator_state()
+        .map(elastos_protected_content_runtime::RuntimeMintCreatorState::stage)
+    {
+        None => "pending",
+        Some(elastos_protected_content_runtime::RuntimeMintCreatorStage::Settled) => "done",
+        Some(_) => "active",
+    };
+    json!({
+        "schema": RUNTIME_CUSTODY_CREATOR_PROGRESS_SCHEMA_V1,
+        "stages": [
+            { "id": "escrow", "state": escrow },
+            { "id": "publish", "state": publish },
+            { "id": "listing", "state": listing },
+        ],
+    })
+}
+
+/// Wire identity of the typed answer an app gets while a protected-content
+/// effect is still outstanding.
+pub(crate) const RUNTIME_CUSTODY_EFFECT_PENDING_SCHEMA_V1: &str =
+    "elastos.protected-content.effect-pending/v1";
+
+/// What an outstanding effect is actually waiting for.
+///
+/// The distinction is the whole point: one of these needs the person to do
+/// something and the other needs them to do nothing at all. Collapsing both
+/// into "pending" is why the Creator told a creator to approve a transaction
+/// they had already approved, while the real wait was chain evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyEffectPendingReason {
+    /// The wallet approval has not completed. A managed account completes this
+    /// in place; an external one is waiting on its connector, which means it is
+    /// waiting on the person.
+    WalletApproval,
+    /// The approval is done and the chain has not yet produced the evidence the
+    /// operation needs. Nobody can hurry it and nobody need act.
+    ChainSettlement,
+}
+
+impl RuntimeCustodyEffectPendingReason {
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::WalletApproval => "wallet_approval",
+            Self::ChainSettlement => "chain_settlement",
+        }
+    }
+}
+
+/// A non-terminal waiting state, carried as data rather than prose.
+///
+/// Apps used to detect this by matching the English word "pending" in the
+/// message. That is the same defect class as the opaque refusal it sits next
+/// to: control flow decided by a sentence that exists to be read by a person,
+/// and that no test pins. This carries the reason instead, plus enough about
+/// the signer for an app to say whose turn it is -- and, when the answer is
+/// "nobody's", to stop asking the creator to click anything.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyEffectPending {
+    reason: RuntimeCustodyEffectPendingReason,
+    /// Who is being waited on, and only where that is a fact worth stating.
+    ///
+    /// `None` for a chain wait: the signer has already done everything asked of
+    /// them, so naming them would answer a question nobody is asking — and the
+    /// site that raises a chain wait genuinely does not have the account in
+    /// hand, so a default here would be an invention rather than a fact.
+    signer: Option<RuntimeCustodyEffectPendingSigner>,
+    /// How far the operation has got, when the raising site knows. This rides
+    /// the pending answer rather than a channel of its own because the pending
+    /// answer IS the poll response: an app waiting on a publish has exactly one
+    /// thing arriving, and a second transport for progress would be a second
+    /// thing to keep in step with it.
+    progress: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCustodyEffectPendingSigner {
+    /// True when the signer is an external wallet reached through a connector,
+    /// so the outstanding approval needs the person to act in that connector.
+    external: bool,
+    /// Names the connector when there is one, so an app can say "MetaMask"
+    /// rather than "your wallet". A connector id is a local wallet-surface
+    /// identifier, not a secret and not an account.
+    connector_id: Option<String>,
+}
+
+impl RuntimeCustodyEffectPending {
+    /// Waiting on the wallet approval, which is the only wait that can need a
+    /// person.
+    pub(crate) fn awaiting_wallet_approval(
+        external_signer: bool,
+        connector_id: Option<&str>,
+    ) -> Self {
+        Self {
+            reason: RuntimeCustodyEffectPendingReason::WalletApproval,
+            signer: Some(RuntimeCustodyEffectPendingSigner {
+                external: external_signer,
+                connector_id: connector_id.map(ToString::to_string),
+            }),
+            progress: None,
+        }
+    }
+
+    /// Approved already; waiting on the chain. Never needs a person.
+    pub(crate) const fn awaiting_chain_settlement() -> Self {
+        Self {
+            reason: RuntimeCustodyEffectPendingReason::ChainSettlement,
+            signer: None,
+            progress: None,
+        }
+    }
+
+    /// Reason code for the operator log. Carries no account and no address.
+    pub(crate) const fn reason_label(&self) -> &'static str {
+        self.reason.wire_value()
+    }
+
+    /// Whether the person has to do something, or the operation is simply
+    /// waiting. An app polls in both cases; only one of them asks anything of
+    /// the creator.
+    pub(crate) const fn awaits_person(&self) -> bool {
+        match self.signer {
+            Some(ref signer) => {
+                matches!(
+                    self.reason,
+                    RuntimeCustodyEffectPendingReason::WalletApproval
+                ) && signer.external
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        let mut answer = json!({
+            "schema": RUNTIME_CUSTODY_EFFECT_PENDING_SCHEMA_V1,
+            "reason": self.reason.wire_value(),
+            "awaits_person": self.awaits_person(),
+        });
+        if let Some(signer) = self.signer.as_ref() {
+            answer["external_signer"] = Value::Bool(signer.external);
+            answer["connector_id"] = signer
+                .connector_id
+                .as_ref()
+                .map_or(Value::Null, |id| Value::String(id.clone()));
+        }
+        if let Some(progress) = self.progress.as_ref() {
+            answer["progress"] = progress.clone();
+        }
+        answer
+    }
+
+    /// Attach how far the publish has got. Only the sites that have the mint
+    /// record in hand can say, and one of them (the chain-provider answer)
+    /// cannot -- so this is opt-in rather than a constructor argument that
+    /// would have to be filled with a guess.
+    #[must_use]
+    pub(crate) fn with_progress(mut self, progress: Value) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyEffectPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            RuntimeCustodyEffectPendingReason::ChainSettlement => write!(
+                formatter,
+                "The transaction is approved and waiting for the network to confirm it; nothing \
+                 else is needed"
+            ),
+            RuntimeCustodyEffectPendingReason::WalletApproval if self.awaits_person() => match self
+                .signer
+                .as_ref()
+                .and_then(|signer| signer.connector_id.as_deref())
+            {
+                Some(connector) => write!(
+                    formatter,
+                    "Approve this transaction in {connector}; the listing continues on its own \
+                         once you do"
+                ),
+                None => write!(
+                    formatter,
+                    "Approve this transaction in your wallet; the listing continues on its own \
+                         once you do"
+                ),
+            },
+            RuntimeCustodyEffectPendingReason::WalletApproval => write!(
+                formatter,
+                "The wallet approval is still completing; nothing else is needed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCustodyEffectPending {}
+
+/// Drop the creator terms recorded for one object so its owner can start over.
+///
+/// The object is named the way its owner names it, and the mint it reaches is
+/// the one that owner's own publish intent completed into — so no caller can
+/// reach another principal's record through this. Whether the record may be
+/// dropped at all is decided by the mint journal, which refuses every stage
+/// past "nothing raised yet".
+pub(crate) fn discard_runtime_custody_creator_terms(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    source_storage: &str,
+) -> anyhow::Result<bool> {
+    let journal = runtime_mint_journal(data_dir);
+    let request_id =
+        RuntimeMintIntent::request_id_for_source(principal_id, object_uri, source_storage)
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?;
+    let intent = match journal.load_intent(request_id) {
+        Ok(intent) => intent,
+        Err(RuntimeMintJournalError::NotFound) => return Ok(false),
+        Err(_) => anyhow::bail!("Runtime custody mint intent is unavailable"),
+    };
+    let Some(mint_id) = intent.completed_mint_id() else {
+        return Ok(false);
+    };
+    match journal.discard_creator_state(mint_id) {
+        Ok(_) => Ok(true),
+        Err(RuntimeMintJournalError::Conflict) => {
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_DISCARD_DENIED_MESSAGE)
+        }
+        Err(RuntimeMintJournalError::NotFound) => Ok(false),
+        Err(_) => anyhow::bail!("Runtime custody mint intent is unavailable"),
+    }
+}
+
 pub(crate) const RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE: &str =
     "Runtime custody mint requires cleanup reconciliation";
 pub(crate) const RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE: &str =
@@ -219,6 +1045,10 @@ const PROTECTED_CONTENT_IDENTITY_PATH: &str = "protected-content/v1/identity.bin
 const PROTECTED_CONTENT_INIT_PATH: &str = "protected-content/v1/init.mp4";
 const PROTECTED_CONTENT_SEGMENTS_PREFIX: &str = "protected-content/v1/segments/";
 const PROTECTED_CONTENT_SEGMENTS_SUFFIX: &str = ".m4s";
+const PROTECTED_CONTENT_OBJECT_EPC1_PATH: &str = "protected-content/v1/object.epc1";
+const PROTECTED_CONTENT_OBJECT_MANIFEST_PATH: &str = "protected-content/v1/manifest.json";
+const PROTECTED_CONTENT_OBJECT_MANIFEST_SCHEMA_V1: &str =
+    "elastos.protected-content.object-manifest/v1";
 const PROTECTED_CONTENT_AVAILABLE_STATUS: &str = "network_available";
 const RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1: &str =
     "elastos.library.runtime-custody-listings/v1";
@@ -263,6 +1093,9 @@ const PROTECT_PROVIDER_OPERATIONS: &[&str] = &[
     "finalize_protection_session",
     "cancel_protection_session",
     "close_protection_session",
+    "open_object_protection_session",
+    "protect_object_chunk",
+    "finalize_object_protection_session",
     "shutdown",
 ];
 const MEDIA_PROVIDER_OPERATIONS: &[&str] = &["status", "prepare"];
@@ -279,6 +1112,7 @@ const PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS: &[&str] = &[
     "read_viewer_media_part",
     "cancel_prepared_recipient",
     "close_viewer_session",
+    "read_viewer_object_chunk",
     "shutdown",
 ];
 const WALLET_PROVIDER_ID: &str = "wallet";
@@ -290,8 +1124,11 @@ const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
 const CHAIN_PROTECTED_CONTENT_POLICY_OP: &str = "resolve_protected_content_policy";
 const CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1: &str = "elastos.chain.protected-content-policy/v1";
 const MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1: &str = "elastos.media-provider.prepared-media/v1";
-const MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1: &str = "video/mp4";
-const MEDIA_PROVIDER_OUTPUT_CODECS_V1: &str = "avc1.640028";
+/// The renditions the media path produces and the viewer can play, as
+/// `(mime type, codecs)`. A prepared output must match one of these exactly:
+/// halves are never mixed across entries.
+const MEDIA_PROVIDER_OUTPUT_PAIRS_V1: [(&str, &str); 2] =
+    [("video/mp4", "avc1.640028"), ("audio/mp4", "mp4a.40.2")];
 const MEDIA_PROVIDER_INPUT_FILE_NAME: &str = "input.bin";
 const MEDIA_PROVIDER_PREPARED_DIR_NAME: &str = "prepared";
 const MEDIA_PROVIDER_SEGMENTS_DIR_NAME: &str = "segments";
@@ -697,13 +1534,14 @@ impl RuntimeCustodyRegistryAdapter {
         elastos_protected_content_provider_contracts::CustodyProviderResponseV1,
         RuntimeProviderCallError,
     > {
+        // Encoding happens entirely here; a failure means nothing was sent.
         let request_value = serde_json::from_slice(
             &request
                 .to_json_vec()
-                .map_err(|_| RuntimeProviderCallError::NoExactResult)?,
+                .map_err(|_| RuntimeProviderCallError::NotDispatched)?,
         )
-        .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
-        let response_value = invoke_json_provider_with_transport(
+        .map_err(|_| RuntimeProviderCallError::NotDispatched)?;
+        let response_value = invoke_json_provider_classified(
             self.registry.as_ref(),
             CUSTODY_PROVIDER_ID,
             op,
@@ -711,12 +1549,65 @@ impl RuntimeCustodyRegistryAdapter {
             self.transport.clone(),
         )
         .await
-        .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
+        .map_err(|failure| classify_custody_failure(op, &failure))?;
+        // The node answered `ok`; only this Runtime can still fail to read it,
+        // and by then the node has already acted.
         elastos_protected_content_provider_contracts::CustodyProviderResponseV1::from_json_slice(
             &serde_json::to_vec(&response_value)
                 .map_err(|_| RuntimeProviderCallError::NoExactResult)?,
         )
         .map_err(|_| RuntimeProviderCallError::NoExactResult)
+    }
+}
+
+/// Codes the custody capsule emits only from paths that precede its durable
+/// write, so a refusal carrying one proves the share was not stored.
+///
+/// `invalid_request` covers frame and request-validation refusals,
+/// `rights_denied` the rights decision, and `provisioning_refused` everything
+/// the share store rejects before it is touched — expiry above all. All three
+/// are structurally before `NodeLocalShareStoreV1` writes. `backend_unavailable`
+/// is deliberately absent: the capsule returns it from refusals before the
+/// write, from failures after it, and from the `hard_link` that is the write,
+/// so it proves nothing about the share.
+///
+/// A closed list, and the compatibility story runs the safe way in both
+/// directions: an older capsule still answers `backend_unavailable` and this
+/// Runtime keeps treating it as uncertain, and a code this Runtime does not
+/// recognise is uncertain rather than effect-free.
+const CUSTODY_EFFECT_FREE_REFUSAL_CODES: [&str; 3] =
+    ["invalid_request", "provisioning_refused", "rights_denied"];
+
+fn classify_custody_failure(
+    op: &str,
+    failure: &ProviderInvocationFailure,
+) -> RuntimeProviderCallError {
+    match failure {
+        ProviderInvocationFailure::Refused { code, .. }
+            if CUSTODY_EFFECT_FREE_REFUSAL_CODES.contains(&code.as_str()) =>
+        {
+            tracing::warn!(
+                %op,
+                %code,
+                "custody provider refused before acting"
+            );
+            RuntimeProviderCallError::RefusedWithoutEffect
+        }
+        ProviderInvocationFailure::Refused { code, .. } => {
+            tracing::warn!(
+                %op,
+                %code,
+                "custody provider refused with an effect-uncertain code"
+            );
+            RuntimeProviderCallError::NoExactResult
+        }
+        // A lost reply is indistinguishable from a node that never heard us,
+        // and the capsule can complete its write and then fail to answer.
+        ProviderInvocationFailure::NotCompleted { .. }
+        | ProviderInvocationFailure::MalformedResponse { .. } => {
+            tracing::warn!(%op, "custody provider effect is uncertain");
+            RuntimeProviderCallError::NoExactResult
+        }
     }
 }
 
@@ -930,6 +1821,7 @@ fn decrypt_provider_op(request: &DecryptProviderRequestV1) -> &'static str {
         DecryptProviderRequestOpV1::ReadViewerMediaPart => "read_viewer_media_part",
         DecryptProviderRequestOpV1::CancelPreparedRecipient => "cancel_prepared_recipient",
         DecryptProviderRequestOpV1::CloseViewerSession => "close_viewer_session",
+        DecryptProviderRequestOpV1::ReadViewerObjectChunk => "read_viewer_object_chunk",
     }
 }
 
@@ -950,6 +1842,13 @@ impl RuntimeDecryptProvider for RuntimeDecryptRegistryAdapter {
     }
 
     async fn read_viewer_media_part(
+        &self,
+        request: &DecryptProviderRequestV1,
+    ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError> {
+        invoke_decrypt_provider(self.registry.as_ref(), request).await
+    }
+
+    async fn read_viewer_object_chunk(
         &self,
         request: &DecryptProviderRequestV1,
     ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError> {
@@ -1093,6 +1992,81 @@ fn load_or_persist_runtime_mint_intent(
     }
 }
 
+fn runtime_mint_intent_with_access_id_object(
+    composition: &RuntimeCustodyComposition,
+    input: &RuntimeCustodyLibraryPublishObjectInput,
+    selected_nodes: Vec<elastos_protected_content_runtime::RuntimeMintNodeBinding>,
+    content_access_id: ContentAccessIdV1,
+) -> anyhow::Result<RuntimeMintIntent> {
+    RuntimeMintIntent::new_object(
+        input.principal_id.clone(),
+        &input.object_uri,
+        &input.source_storage,
+        input.wallet_account_id.clone(),
+        input.wallet_account_address.clone(),
+        input.creator_mint_source_digest,
+        input.content_type.clone(),
+        &input.clear_plaintext,
+        content_access_id,
+        composition
+            .signed_pool
+            .pool_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?,
+        composition
+            .signed_epoch
+            .epoch_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?,
+        composition
+            .signed_committee_authorization
+            .authorization_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?,
+        selected_nodes,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))
+}
+
+fn load_or_persist_runtime_mint_intent_object(
+    journal: &RuntimeMintJournal,
+    composition: &RuntimeCustodyComposition,
+    input: &RuntimeCustodyLibraryPublishObjectInput,
+    selected_nodes: Vec<elastos_protected_content_runtime::RuntimeMintNodeBinding>,
+) -> anyhow::Result<RuntimeMintIntent> {
+    let request_id = RuntimeMintIntent::request_id_for_source(
+        &input.principal_id,
+        &input.object_uri,
+        &input.source_storage,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?;
+    match journal.load_intent(request_id) {
+        Ok(existing) => {
+            let expected = runtime_mint_intent_with_access_id_object(
+                composition,
+                input,
+                selected_nodes,
+                existing.content_access_id(),
+            )?;
+            if !existing.same_authority_as(&expected) {
+                anyhow::bail!("Runtime custody mint intent conflicts with existing authority");
+            }
+            Ok(existing)
+        }
+        Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {
+            let intent = runtime_mint_intent_with_access_id_object(
+                composition,
+                input,
+                selected_nodes,
+                generate_runtime_content_access_id()?,
+            )?;
+            journal
+                .persist_intent(&intent)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))
+        }
+        Err(_) => Err(anyhow::anyhow!(
+            "Runtime custody mint intent is unavailable"
+        )),
+    }
+}
+
 fn load_completed_runtime_mint_facts(
     journal: &RuntimeMintJournal,
     input: &RuntimeCustodyLibraryPublishInput,
@@ -1106,7 +2080,29 @@ fn load_completed_runtime_mint_facts(
         .ok_or_else(|| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
     let content_id = runtime_protected_content_id(persisted.draft().encrypted_content())?;
     Ok(runtime_custody_library_publish_facts(
-        input,
+        &input.object_uri,
+        &input.source_storage,
+        persisted.draft(),
+        &content_id,
+        evidence,
+    ))
+}
+
+fn load_completed_runtime_mint_object_facts(
+    journal: &RuntimeMintJournal,
+    input: &RuntimeCustodyLibraryPublishObjectInput,
+    mint_id: Digest32,
+) -> anyhow::Result<RuntimeCustodyLibraryPublishFacts> {
+    let persisted = journal
+        .load(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let evidence = persisted
+        .content_availability()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let content_id = runtime_protected_content_id(persisted.draft().encrypted_content())?;
+    Ok(runtime_custody_library_publish_facts(
+        &input.object_uri,
+        &input.source_storage,
         persisted.draft(),
         &content_id,
         evidence,
@@ -1126,10 +2122,25 @@ fn adopt_settled_runtime_mint_record(
     journal: &RuntimeMintJournal,
     mint_intent: &RuntimeMintIntent,
 ) -> anyhow::Result<Option<Digest32>> {
-    let record = journal
+    let scan = journal
         .find_mint_record_for_intent(mint_intent.request_id())
         .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
-    let Some(record) = record else {
+    // Closed attempts cannot be continued, but what they left on the nodes is
+    // real and nothing else reports it. Say so every time this intent is looked
+    // at, whatever happens next.
+    for abandoned in scan.abandoned() {
+        tracing::warn!(
+            request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+            mint_id = %hex::encode(abandoned.mint_id.as_bytes()),
+            node_receipts_accepted = abandoned.accepted_orphan_count,
+            nodes_possibly_holding_a_share = abandoned.uncertain_node_count,
+            "abandoned runtime custody mint attempt left custody state on nodes; cleanup reconciliation required"
+        );
+    }
+    let Some(record) = scan.open() else {
+        // Every attempt for this intent is closed, so a fresh one is the only
+        // way forward and is safe: new shares seal against a new envelope and
+        // cannot combine with what any earlier attempt left behind.
         return Ok(None);
     };
     let fully_terminal = record.custody_terminal()
@@ -1142,16 +2153,33 @@ fn adopt_settled_runtime_mint_record(
             .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
         return Ok(Some(mint_id));
     }
+    // This attempt can never finish -- its content key material did not outlive
+    // the request that made it -- so keeping the record only wedges the object
+    // it was minted from. Every later attempt on that path would find this
+    // record, refuse to treat it as a candidate, and fail the same way forever.
+    // Forget it instead, and say once what it left behind.
+    //
+    // Safe for what follows: a fresh attempt seals new shares against a new
+    // envelope and cannot combine with anything this one left on the nodes.
+    // Those shares open nothing without the envelope and no listing will ever
+    // name them, so reclaiming the space is housekeeping, not a precondition.
+    let mint_id = record.draft().mint_id();
     tracing::warn!(
         request_id = %hex::encode(mint_intent.request_id().as_bytes()),
-        mint_id = %hex::encode(record.draft().mint_id().as_bytes()),
+        mint_id = %hex::encode(mint_id.as_bytes()),
         custody_terminal = ?record.custody_terminal(),
         content_availability_recorded = record.content_availability().is_some(),
-        node_effects_started = record.any_effect_started(),
+        // What an operator needs is not "did anything start" but what was left
+        // behind: shares this Runtime knows are held, and nodes that may be
+        // holding one without ever having said so.
         node_receipts_accepted = record.accepted_orphans().len(),
-        "settled runtime custody mint record is not fully terminal; orphaned custody state requires cleanup reconciliation"
+        nodes_possibly_holding_a_share = record.uncertain_node_count(),
+        "runtime custody mint attempt cannot finish and was discarded; its custody shares are inert residue"
     );
-    anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
+    journal
+        .discard_unfinishable_mint(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    Ok(None)
 }
 
 pub fn list_unresolved_runtime_releases(
@@ -2643,6 +3671,42 @@ pub(crate) async fn invoke_json_provider(
     .await
 }
 
+/// Why a provider invocation did not yield data, keeping the distinction the
+/// formatted-string form throws away.
+///
+/// The distinction that matters to a caller holding a durable journal is
+/// whether the provider can have acted. `NotCompleted` is the only variant that
+/// says nothing either way: the registry call failed, which covers a provider
+/// that was never reached *and* a reply that was lost after the provider did
+/// its work. `Refused` carries the provider's own code, which is the sole
+/// evidence a caller has for classifying the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderInvocationFailure {
+    /// The registry call itself failed. The request may or may not have reached
+    /// the provider, and a reply may have been lost on the way back.
+    NotCompleted { detail: String },
+    /// The provider answered `status: "error"` with its own code and message.
+    Refused { code: String, message: String },
+    /// The provider answered, but the frame was not a usable response.
+    MalformedResponse { detail: String },
+}
+
+impl ProviderInvocationFailure {
+    /// The formatted form the string-returning callers have always seen. Kept
+    /// byte-identical so widening the typed layer changes no existing message.
+    fn into_message(self, target: &str, op: &str) -> String {
+        match self {
+            Self::NotCompleted { detail } => {
+                format!("{target} provider {op} invocation failed: {detail}")
+            }
+            Self::Refused { code, message } => {
+                format!("{target} provider {op} rejected the request: {code}: {message}")
+            }
+            Self::MalformedResponse { detail } => detail,
+        }
+    }
+}
+
 pub(crate) async fn invoke_json_provider_with_transport(
     registry: &ProviderRegistry,
     target: &str,
@@ -2650,6 +3714,19 @@ pub(crate) async fn invoke_json_provider_with_transport(
     request: Value,
     transport: ProviderInvocationTransport,
 ) -> Result<Value, String> {
+    invoke_json_provider_classified(registry, target, op, request, transport)
+        .await
+        .map_err(|failure| failure.into_message(target, op))
+}
+
+/// The same invocation, with the failure kept as data.
+pub(crate) async fn invoke_json_provider_classified(
+    registry: &ProviderRegistry,
+    target: &str,
+    op: &str,
+    request: Value,
+    transport: ProviderInvocationTransport,
+) -> Result<Value, ProviderInvocationFailure> {
     let response = registry
         .invoke_provider(ProviderInvocation {
             source: RUNTIME_PROVIDER_ID.to_string(),
@@ -2669,21 +3746,25 @@ pub(crate) async fn invoke_json_provider_with_transport(
                 error = %error,
                 "provider invocation failed"
             );
-            format!("{target} provider {op} invocation failed: {error}")
+            ProviderInvocationFailure::NotCompleted {
+                detail: error.to_string(),
+            }
         })?;
-    let status = response
-        .get("status")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{target} provider {op} response is missing status"))?;
+    let Some(status) = response.get("status").and_then(Value::as_str) else {
+        return Err(ProviderInvocationFailure::MalformedResponse {
+            detail: format!("{target} provider {op} response is missing status"),
+        });
+    };
     match status {
-        "ok" => response
-            .get("data")
-            .cloned()
-            .ok_or_else(|| format!("{target} provider {op} response is missing data")),
+        "ok" => response.get("data").cloned().ok_or_else(|| {
+            ProviderInvocationFailure::MalformedResponse {
+                detail: format!("{target} provider {op} response is missing data"),
+            }
+        }),
         "error" => {
-            // Keep the provider's own code/message: this string travels back
-            // to the caller (over Carrier for a committee member) and is the
-            // only trace of why a node refused.
+            // Keep the provider's own code/message: this travels back to the
+            // caller (over Carrier for a committee member) and is the only
+            // trace of why a node refused.
             let code = response
                 .get("code")
                 .and_then(Value::as_str)
@@ -2693,13 +3774,14 @@ pub(crate) async fn invoke_json_provider_with_transport(
                 .and_then(Value::as_str)
                 .unwrap_or("no message");
             tracing::warn!(%target, %op, %code, %message, "provider rejected the request");
-            Err(format!(
-                "{target} provider {op} rejected the request: {code}: {message}"
-            ))
+            Err(ProviderInvocationFailure::Refused {
+                code: code.to_string(),
+                message: message.to_string(),
+            })
         }
-        _ => Err(format!(
-            "{target} provider {op} response has unsupported status"
-        )),
+        _ => Err(ProviderInvocationFailure::MalformedResponse {
+            detail: format!("{target} provider {op} response has unsupported status"),
+        }),
     }
 }
 
@@ -2966,7 +4048,10 @@ fn collect_protected_content_directory_files(
             .ok_or_else(|| anyhow::anyhow!("protected content directory is invalid"))?;
         let normalized = relative.replace('\\', "/");
         match normalized.as_str() {
-            PROTECTED_CONTENT_IDENTITY_PATH | PROTECTED_CONTENT_INIT_PATH => {}
+            PROTECTED_CONTENT_IDENTITY_PATH
+            | PROTECTED_CONTENT_INIT_PATH
+            | PROTECTED_CONTENT_OBJECT_EPC1_PATH
+            | PROTECTED_CONTENT_OBJECT_MANIFEST_PATH => {}
             _ if normalized.starts_with(PROTECTED_CONTENT_SEGMENTS_PREFIX)
                 && normalized.ends_with(PROTECTED_CONTENT_SEGMENTS_SUFFIX) =>
             {
@@ -3085,6 +4170,104 @@ async fn verify_protected_content_manifest_and_files(
     Ok((protected_init, encrypted_segments))
 }
 
+/// The object directory's descriptor file, mirroring the role
+/// `PROTECTED_CONTENT_IDENTITY_PATH`'s raw canonical bytes play for media,
+/// but as JSON per the brief's exact schema. Every field is independently
+/// derivable from `ChunkedPayloadObjectIdentityV1`, so — exactly like the
+/// media descriptor — its bytes are fully deterministic from the identity
+/// alone; no separate hash/length parameters are needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedContentObjectManifestV1 {
+    schema: String,
+    content_type: String,
+    plaintext_bytes: u64,
+    framed_header_bytes: u32,
+    encrypted_content: ProtectedContentObjectManifestEncryptedContentV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedContentObjectManifestEncryptedContentV1 {
+    sha256: String,
+    bytes: u64,
+}
+
+fn protected_content_object_manifest_bytes(
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<u8>> {
+    let manifest = ProtectedContentObjectManifestV1 {
+        schema: PROTECTED_CONTENT_OBJECT_MANIFEST_SCHEMA_V1.to_string(),
+        content_type: object_identity.content_type().to_string(),
+        plaintext_bytes: object_identity.plaintext_bytes(),
+        framed_header_bytes: object_identity.framed_header_bytes(),
+        encrypted_content: ProtectedContentObjectManifestEncryptedContentV1 {
+            sha256: hex::encode(
+                object_identity
+                    .encrypted_content()
+                    .ciphertext_sha256()
+                    .as_bytes(),
+            ),
+            bytes: object_identity.encrypted_content().ciphertext_bytes(),
+        },
+    };
+    serde_json::to_vec(&manifest)
+        .map_err(|_| anyhow::anyhow!("protected content object manifest is invalid"))
+}
+
+/// Object twin of `verify_protected_content_directory`. The media function is
+/// untouched — this is a fully parallel path so a change here can never move
+/// media-side behaviour.
+fn verify_protected_content_object_directory(
+    directory: &Path,
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<()> {
+    let expected_files = object_protected_content_files(object_identity)?;
+    let expected_paths: Vec<String> = expected_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
+    let actual_paths = protected_content_directory_files(directory)?;
+    if actual_paths != expected_paths {
+        anyhow::bail!("protected content directory layout is invalid");
+    }
+    let manifest_bytes = fs::read(directory.join(PROTECTED_CONTENT_OBJECT_MANIFEST_PATH))
+        .map_err(|_| anyhow::anyhow!("protected content descriptor is unavailable"))?;
+    if manifest_bytes != protected_content_object_manifest_bytes(object_identity)? {
+        anyhow::bail!("protected content descriptor is invalid");
+    }
+    let framed = fs::read(directory.join(PROTECTED_CONTENT_OBJECT_EPC1_PATH))
+        .map_err(|_| anyhow::anyhow!("protected content object is unavailable"))?;
+    if framed.len() as u64 != object_identity.encrypted_content().ciphertext_bytes()
+        || Digest32::new(sha2::Sha256::digest(&framed).into())
+            != object_identity.encrypted_content().ciphertext_sha256()
+    {
+        anyhow::bail!("protected content object is invalid");
+    }
+    Ok(())
+}
+
+fn object_protected_content_files(
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<crate::content::ContentObjectFile>> {
+    let manifest_bytes = protected_content_object_manifest_bytes(object_identity)?;
+    let mut files = vec![
+        content_object_file(PROTECTED_CONTENT_OBJECT_MANIFEST_PATH, &manifest_bytes),
+        crate::content::ContentObjectFile {
+            path: PROTECTED_CONTENT_OBJECT_EPC1_PATH.to_string(),
+            sha256: hex::encode(
+                object_identity
+                    .encrypted_content()
+                    .ciphertext_sha256()
+                    .as_bytes(),
+            ),
+            size: object_identity.encrypted_content().ciphertext_bytes(),
+        },
+    ];
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
 fn content_object_files_match(
     actual: &[crate::content::ContentObjectFile],
     expected: &[crate::content::ContentObjectFile],
@@ -3185,9 +4368,176 @@ fn verify_protected_content_receipt(
         receipt.payload.checked_at,
         Digest32::new(sha2::Sha256::digest(&receipt_json).into()),
         media_identity.encrypted_content().clone(),
-        media_identity.media_manifest_root(),
+        RuntimeVerifiedContentIdentityRootV1::for_media(media_identity),
     )
     .map_err(|_| anyhow::anyhow!("protected content availability evidence is invalid"))
+}
+
+/// Object twin of `verify_protected_content_receipt`. Identical in every
+/// respect except the last three lines, which build the evidence's
+/// `encrypted_content`/identity-root from a `ChunkedPayloadObjectIdentityV1`
+/// instead of a `CencFmp4MediaIdentityV1` — the media function is untouched.
+fn verify_protected_content_object_receipt(
+    content_cid: &str,
+    manifest: &crate::content::ContentObjectManifest,
+    receipt_json: &[u8],
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    requirement: &RuntimeContentAvailabilityRequirement,
+    now_unix_seconds: u64,
+) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
+    validate_protected_content_availability_requirement(requirement)?;
+    cid::Cid::try_from(content_cid)
+        .map_err(|_| anyhow::anyhow!("protected content availability CID is invalid"))?;
+    let receipt: crate::content::SignedAvailabilityReceipt =
+        serde_json::from_slice(receipt_json)
+            .map_err(|_| anyhow::anyhow!("protected content availability receipt is invalid"))?;
+    let receipt_json = serde_json::to_vec(&receipt)
+        .map_err(|_| anyhow::anyhow!("protected content availability receipt is invalid"))?;
+    if receipt.payload.schema != CONTENT_AVAILABILITY_RECEIPT_SCHEMA
+        || receipt.signer_did != requirement.expected_provider_did()
+        || receipt.payload.cid != content_cid
+        || receipt.payload.uri != format!("elastos://{content_cid}")
+        || receipt.payload.object_did.as_deref() != Some(requirement.expected_object_identity())
+        || receipt.payload.publisher_did != requirement.expected_publisher_did()
+        || receipt.payload.policy != requirement.policy()
+        || receipt.payload.status != PROTECTED_CONTENT_AVAILABLE_STATUS
+        || receipt.payload.replicas < requirement.minimum_replicas()
+        || (PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF
+            && receipt
+                .payload
+                .peer_selection
+                .get("live_multi_peer_proof")
+                .and_then(Value::as_bool)
+                != Some(true))
+        || manifest.object_did.as_deref() != Some(requirement.expected_object_identity())
+        || manifest.publisher_did.as_deref() != Some(requirement.expected_publisher_did())
+    {
+        anyhow::bail!("protected content availability receipt binding is invalid");
+    }
+    let max_checked_at = now_unix_seconds
+        .checked_add(requirement.max_future_skew_seconds())
+        .ok_or_else(|| anyhow::anyhow!("protected content availability time is invalid"))?;
+    if receipt.payload.checked_at > max_checked_at
+        || now_unix_seconds.saturating_sub(receipt.payload.checked_at)
+            > requirement.max_age_seconds()
+    {
+        anyhow::bail!("protected content availability receipt is outside its freshness window");
+    }
+    crate::crypto::verify_signed_json_envelope_against_dids(
+        &receipt_json,
+        CONTENT_AVAILABILITY_RECEIPT_DOMAIN,
+        std::slice::from_ref(&requirement.expected_provider_did().to_string()),
+    )
+    .map_err(|_| anyhow::anyhow!("protected content availability receipt signature is invalid"))?;
+    RuntimeVerifiedContentAvailability::new(
+        content_cid,
+        requirement.expected_object_identity(),
+        requirement.expected_publisher_did(),
+        requirement,
+        receipt.payload.replicas,
+        receipt.payload.checked_at,
+        Digest32::new(sha2::Sha256::digest(&receipt_json).into()),
+        object_identity.encrypted_content().clone(),
+        RuntimeVerifiedContentIdentityRootV1::for_object(object_identity)
+            .map_err(|_| anyhow::anyhow!("protected content availability evidence is invalid"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("protected content availability evidence is invalid"))
+}
+
+/// Object twin of `verify_protected_content_manifest_and_files`. Returns the
+/// fetched framed `object.epc1` bytes.
+async fn verify_protected_content_object_manifest_and_files(
+    registry: &ProviderRegistry,
+    content_cid: &str,
+    manifest: &crate::content::ContentObjectManifest,
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<u8>> {
+    let expected_files = object_protected_content_files(object_identity)?;
+    if manifest.schema != "elastos.content.object.manifest/v1"
+        || manifest.kind != PROTECTED_CONTENT_OBJECT_KIND
+        || !manifest.links.is_empty()
+        || !content_object_files_match(&manifest.files, &expected_files)
+        || manifest.content_digest != content_object_digest(&expected_files)
+    {
+        anyhow::bail!("protected content object manifest is invalid");
+    }
+    let mut framed = None;
+    for file in &expected_files {
+        let bytes =
+            crate::content::fetch_bytes_via_provider(registry, content_cid, Some(&file.path))
+                .await?;
+        crate::content::verify_content_object_file(content_cid, file, &bytes)?;
+        match file.path.as_str() {
+            PROTECTED_CONTENT_OBJECT_MANIFEST_PATH => {
+                if bytes != protected_content_object_manifest_bytes(object_identity)? {
+                    anyhow::bail!("protected content descriptor is invalid");
+                }
+            }
+            PROTECTED_CONTENT_OBJECT_EPC1_PATH => framed = Some(bytes),
+            _ => {}
+        }
+    }
+    framed.ok_or_else(|| anyhow::anyhow!("protected content object is absent"))
+}
+
+/// Object twin of `publish_and_verify_protected_content_availability`.
+pub async fn publish_and_verify_protected_content_object_availability(
+    registry: &ProviderRegistry,
+    protected_content_dir: &Path,
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    requirement: &RuntimeContentAvailabilityRequirement,
+    now_unix_seconds: impl Fn() -> u64,
+) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
+    validate_protected_content_availability_requirement(requirement)?;
+    verify_protected_content_object_directory(protected_content_dir, object_identity)?;
+    let publish_requirements = crate::content::ContentPublishRequirements::new(
+        requirement.minimum_replicas(),
+        PROTECTED_CONTENT_REQUIRE_LIVE_MULTI_PEER_PROOF,
+    )?
+    .with_availability_policy(requirement.policy())?;
+    // Each leg is timed separately. This step is the one a creator watches as
+    // a stalled "Encrypt & escrow", and it is four different pieces of work:
+    // publishing and replicating the ciphertext, then reading back a receipt,
+    // a manifest and every file to prove it landed. Without this split the
+    // only honest thing anyone can say about a slow publish is its total.
+    let phase = RuntimeCustodyPhase::begin(
+        "content_publish",
+        protected_content_dir.display().to_string(),
+    );
+    let content_cid = crate::content::publish_directory_via_provider_with_kind_and_requirements(
+        registry,
+        protected_content_dir,
+        PROTECTED_CONTENT_OBJECT_KIND,
+        Some(requirement.expected_object_identity()),
+        Some(requirement.expected_publisher_did()),
+        publish_requirements,
+    )
+    .await?;
+    phase.ok();
+    let phase = RuntimeCustodyPhase::begin("availability_receipt", &content_cid);
+    let receipt = fetch_content_availability_receipt(registry, &content_cid).await?;
+    phase.ok();
+    let phase = RuntimeCustodyPhase::begin("object_manifest", &content_cid);
+    let manifest = crate::content::fetch_content_object_manifest(registry, &content_cid).await?;
+    phase.ok();
+    let phase = RuntimeCustodyPhase::begin("object_files_verify", &content_cid);
+    verify_protected_content_object_manifest_and_files(
+        registry,
+        &content_cid,
+        &manifest,
+        object_identity,
+    )
+    .await?;
+    phase.ok();
+    let now_unix_seconds = now_unix_seconds();
+    verify_protected_content_object_receipt(
+        &content_cid,
+        &manifest,
+        &receipt,
+        object_identity,
+        requirement,
+        now_unix_seconds,
+    )
 }
 
 #[derive(Debug)]
@@ -3198,11 +4548,15 @@ struct RuntimePreparedLibraryPublish {
     operation_root: PathBuf,
 }
 
+/// Both payloads are boxed. Each is large on its own — `Prepared` carries a
+/// whole publish input including the listing terms, `Consumed` a preparation
+/// record — so leaving either inline sizes every value of this enum, and the
+/// common case, for the bigger of the two.
 #[derive(Debug)]
 enum RuntimeLibraryMediaPreparation {
-    Prepared(RuntimePreparedLibraryPublish),
+    Prepared(Box<RuntimePreparedLibraryPublish>),
     Consumed {
-        record: RuntimeMediaPreparationRecord,
+        record: Box<RuntimeMediaPreparationRecord>,
         operation_root: PathBuf,
     },
 }
@@ -3281,6 +4635,42 @@ fn read_runtime_media_source(
         error.context(MESSAGE)
     })?;
     if bytes.is_empty() || bytes.len() as u64 > MEDIA_PROVIDER_MAX_INPUT_BYTES {
+        return Err(
+            anyhow::anyhow!("source plaintext length {} is out of bounds", bytes.len())
+                .context(MESSAGE),
+        );
+    }
+    Ok(bytes)
+}
+
+/// Object twin of `read_runtime_media_source`'s read (not its media-specific
+/// stored-length preflight, which does not apply to a plain uploaded file):
+/// reads the principal-scoped object, then enforces the object protect
+/// session's own plaintext bound instead of the media preparation one.
+pub(crate) fn read_runtime_object_source(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    source_file_path: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    const MESSAGE: &str = "Runtime custody object publish input is invalid";
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let bytes = crate::auth::read_principal_root_object(
+        data_dir,
+        principal_id,
+        &localhost_root,
+        object_uri,
+        source_file_path,
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            %object_uri,
+            error = ?error,
+            "runtime custody object publish: source object is unreadable"
+        );
+        error.context(MESSAGE)
+    })?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_OBJECT_PLAINTEXT_BYTES_V1 {
         return Err(
             anyhow::anyhow!("source plaintext length {} is out of bounds", bytes.len())
                 .context(MESSAGE),
@@ -3370,13 +4760,54 @@ fn open_runtime_media_source_file(path: &Path) -> anyhow::Result<fs::File> {
     Ok(file)
 }
 
+/// Re-reads an already-settled preparation on resume. The durable record binds
+/// the receipt digest, and that digest covers the rendition pair, but the
+/// record does not store the pair itself -- so each allowed pair is tried
+/// against the recorded digest and only an exact match is accepted.
+fn load_settled_runtime_prepared_media(
+    operation_root: &Path,
+    recorded_receipt: Digest32,
+) -> anyhow::Result<(RuntimeCustodyLibraryPublishInputMedia, Digest32)> {
+    let (first_mime_type, first_codecs) = MEDIA_PROVIDER_OUTPUT_PAIRS_V1[0];
+    // The bytes on disk are the same whichever pair produced them, so they are
+    // read and validated once; only the pair-bound receipt is recomputed.
+    //
+    // CAUTION: this single read is labelled with pair[0] (video), and that is only
+    // sound because `load_validated_runtime_prepared_media` does not cross-check
+    // the declared pair against the init segment's own tracks -- it accepts any
+    // allowed label. If that cross-check is ever added (it should be: the validator
+    // already parses handler types and sample-entry fourccs), an AUDIO preparation
+    // resumed through here would be validated as video and fail silently at the
+    // wrong layer. Load once per pair at that point instead of relabelling.
+    let (mut media, _) = load_validated_runtime_prepared_media(
+        operation_root,
+        &RuntimePreparedMediaProviderOutput {
+            schema: MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1.to_string(),
+            mime_type: first_mime_type.to_string(),
+            codecs: first_codecs.to_string(),
+        },
+    )?;
+    for (mime_type, codecs) in MEDIA_PROVIDER_OUTPUT_PAIRS_V1 {
+        media.mime_type = mime_type.to_string();
+        media.codecs = codecs.to_string();
+        let receipt = runtime_media_preparation_receipt(&media);
+        if receipt == recorded_receipt {
+            return Ok((media, receipt));
+        }
+    }
+    anyhow::bail!("Runtime custody media preparation output is invalid");
+}
+
 fn load_validated_runtime_prepared_media(
     operation_root: &Path,
     prepared_output: &RuntimePreparedMediaProviderOutput,
 ) -> anyhow::Result<(RuntimeCustodyLibraryPublishInputMedia, Digest32)> {
     if prepared_output.schema != MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1
-        || prepared_output.mime_type != MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1
-        || prepared_output.codecs != MEDIA_PROVIDER_OUTPUT_CODECS_V1
+        || !MEDIA_PROVIDER_OUTPUT_PAIRS_V1
+            .iter()
+            .any(|(mime_type, codecs)| {
+                prepared_output.mime_type == *mime_type && prepared_output.codecs == *codecs
+            })
     {
         anyhow::bail!("Runtime custody media preparation output is invalid");
     }
@@ -3607,6 +5038,89 @@ async fn invoke_runtime_media_provider_prepare(
     }
 }
 
+/// The publish-input fields the creator tail (chain mint, metadata, listing)
+/// actually reads. Both publish inputs project into it, so the tail is one
+/// kind-agnostic function instead of a media copy and an object copy:
+/// everything kind-specific it needs, it reads from the persisted mint draft.
+#[derive(Clone)]
+pub(crate) struct RuntimeCustodyCreatorTailInput {
+    pub object_uri: String,
+    pub principal_id: String,
+    pub wallet_account_id: String,
+    pub wallet_account_address: String,
+    pub creator_mint_source_digest: Digest32,
+    pub copies: String,
+    pub price: String,
+    /// The listing a marketplace displays. `None` keeps the pre-listing
+    /// behaviour: a mint with no Elacity metadata folder.
+    pub listing: Option<crate::library::RuntimeCustodyListingTerms>,
+    /// Size of the CLEAR content, which both `metadata.json` and
+    /// `content.json` state. It is computed here from the bytes the publish
+    /// actually carried, because it is not recoverable later: the content
+    /// identity reachable at the metadata site exposes the content type and
+    /// the chunk count, never the plaintext length, and the mint intent that
+    /// does record it is keyed by request id rather than mint id.
+    pub plaintext_bytes: u64,
+}
+
+impl std::fmt::Debug for RuntimeCustodyCreatorTailInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyCreatorTailInput")
+            .field("object_uri", &self.object_uri)
+            .field("principal_id", &self.principal_id)
+            .field("wallet_account_id", &"[redacted]")
+            .field("wallet_account_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
+            .field("copies", &self.copies)
+            .field("price", &self.price)
+            .finish()
+    }
+}
+
+impl From<&RuntimeCustodyLibraryPublishInput> for RuntimeCustodyCreatorTailInput {
+    fn from(input: &RuntimeCustodyLibraryPublishInput) -> Self {
+        Self {
+            object_uri: input.object_uri.clone(),
+            principal_id: input.principal_id.clone(),
+            wallet_account_id: input.wallet_account_id.clone(),
+            wallet_account_address: input.wallet_account_address.clone(),
+            creator_mint_source_digest: input.creator_mint_source_digest,
+            copies: input.copies.clone(),
+            price: input.price.clone(),
+            listing: input.listing.clone(),
+            // The prepared rendition: its init segment plus every media
+            // segment. Saturating rather than wrapping, so an absurd input
+            // reports the ceiling instead of a small number.
+            plaintext_bytes: input
+                .clear_segments
+                .iter()
+                .fold(input.clear_init_segment.len(), |total, segment| {
+                    total.saturating_add(segment.len())
+                }) as u64,
+        }
+    }
+}
+
+impl From<&RuntimeCustodyLibraryPublishObjectInput> for RuntimeCustodyCreatorTailInput {
+    fn from(input: &RuntimeCustodyLibraryPublishObjectInput) -> Self {
+        Self {
+            object_uri: input.object_uri.clone(),
+            principal_id: input.principal_id.clone(),
+            wallet_account_id: input.wallet_account_id.clone(),
+            wallet_account_address: input.wallet_account_address.clone(),
+            creator_mint_source_digest: input.creator_mint_source_digest,
+            copies: input.copies.clone(),
+            price: input.price.clone(),
+            listing: input.listing.clone(),
+            plaintext_bytes: input.clear_plaintext.len() as u64,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub object_uri: String,
@@ -3621,6 +5135,51 @@ pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub clear_init_segment: Vec<u8>,
     pub clear_segments: Vec<Vec<u8>>,
     pub source_storage: String,
+    pub listing: Option<crate::library::RuntimeCustodyListingTerms>,
+}
+
+/// Object twin of `RuntimeCustodyLibraryPublishInput`. Deliberately a
+/// separate type rather than an enum-widening of the media struct: every one
+/// of that struct's ~15 production call sites (segment protection, mint
+/// intent construction, staging directory writer, Debug impl) would need a
+/// match arm added regardless of which shape is chosen, and a fully separate
+/// type means the media struct and every function taking it verbatim by
+/// reference stays completely untouched — the safest way to guarantee the
+/// media path's behaviour cannot move.
+#[derive(Clone)]
+pub(crate) struct RuntimeCustodyLibraryPublishObjectInput {
+    pub object_uri: String,
+    pub principal_id: String,
+    pub content_type: String,
+    pub wallet_account_id: String,
+    pub wallet_account_address: String,
+    pub creator_mint_source_digest: Digest32,
+    pub copies: String,
+    pub price: String,
+    pub clear_plaintext: Vec<u8>,
+    pub source_storage: String,
+    pub listing: Option<crate::library::RuntimeCustodyListingTerms>,
+}
+
+impl std::fmt::Debug for RuntimeCustodyLibraryPublishObjectInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyLibraryPublishObjectInput")
+            .field("object_uri", &self.object_uri)
+            .field("principal_id", &self.principal_id)
+            .field("content_type", &self.content_type)
+            .field("wallet_account_id", &"[redacted]")
+            .field("wallet_account_address", &"[redacted]")
+            .field(
+                "creator_mint_source_digest",
+                &self.creator_mint_source_digest,
+            )
+            .field("copies", &self.copies)
+            .field("price", &self.price)
+            .field("clear_plaintext_bytes", &self.clear_plaintext.len())
+            .field("source_storage", &self.source_storage)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -3634,6 +5193,7 @@ pub(crate) struct RuntimeCustodyLibrarySourceInput {
     pub copies: String,
     pub price: String,
     pub source_storage: String,
+    pub listing: Option<crate::library::RuntimeCustodyListingTerms>,
 }
 
 impl std::fmt::Debug for RuntimeCustodyLibrarySourceInput {
@@ -3689,6 +5249,10 @@ pub(crate) struct RuntimeCustodyLibraryPublishFacts {
     pub receipt: Value,
     pub content_security: Value,
     pub listing_uri: Option<String>,
+    /// Where the `.ddrm` for this mint was filed. `None` until the tail has
+    /// reached its terminal, since a capsule names a `tokenId` that does not
+    /// exist before then.
+    pub capsule_uri: Option<String>,
 }
 
 async fn prepare_runtime_custody_library_source(
@@ -3764,7 +5328,7 @@ async fn prepare_runtime_custody_library_source(
                     .map_err(|_| runtime_media_private_state_error(String::new()))?;
             }
             return Ok(RuntimeLibraryMediaPreparation::Consumed {
-                record,
+                record: Box::new(record),
                 operation_root,
             });
         }
@@ -3776,21 +5340,17 @@ async fn prepare_runtime_custody_library_source(
         }
         RuntimeMediaPreparationState::Prepared => {
             validate_runtime_media_staging_root(&staging_root)?;
-            let output = RuntimePreparedMediaProviderOutput {
-                schema: MEDIA_PROVIDER_PREPARED_MEDIA_SCHEMA_V1.to_string(),
-                mime_type: MEDIA_PROVIDER_OUTPUT_MIME_TYPE_V1.to_string(),
-                codecs: MEDIA_PROVIDER_OUTPUT_CODECS_V1.to_string(),
-            };
+            let recorded_receipt = record.output_receipt_digest().ok_or_else(|| {
+                anyhow::anyhow!("Runtime custody media preparation output is invalid")
+            })?;
             let (media, output_receipt_digest) =
-                load_validated_runtime_prepared_media(&operation_root, &output)?;
-            if record.output_receipt_digest() != Some(output_receipt_digest) {
-                anyhow::bail!("Runtime custody media preparation output is invalid");
-            }
-            return Ok(RuntimeLibraryMediaPreparation::Prepared(
+                load_settled_runtime_prepared_media(&operation_root, recorded_receipt)?;
+            return Ok(RuntimeLibraryMediaPreparation::Prepared(Box::new(
                 RuntimePreparedLibraryPublish {
                     input: RuntimeCustodyLibraryPublishInput {
                         object_uri: source.object_uri.clone(),
                         principal_id: source.principal_id.clone(),
+                        listing: source.listing.clone(),
                         mime_type: media.mime_type,
                         codecs: media.codecs,
                         wallet_account_id: source.wallet_account_id.clone(),
@@ -3806,7 +5366,7 @@ async fn prepare_runtime_custody_library_source(
                     output_receipt_digest,
                     operation_root,
                 },
-            ));
+            )));
         }
         RuntimeMediaPreparationState::Ready => {}
     }
@@ -3857,11 +5417,12 @@ async fn prepare_runtime_custody_library_source(
     journal
         .mark_media_preparation_prepared(record.request_id(), output_receipt_digest)
         .map_err(|_| anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE))?;
-    Ok(RuntimeLibraryMediaPreparation::Prepared(
+    Ok(RuntimeLibraryMediaPreparation::Prepared(Box::new(
         RuntimePreparedLibraryPublish {
             input: RuntimeCustodyLibraryPublishInput {
                 object_uri: source.object_uri.clone(),
                 principal_id: source.principal_id.clone(),
+                listing: source.listing.clone(),
                 mime_type: media.mime_type,
                 codecs: media.codecs,
                 wallet_account_id: source.wallet_account_id.clone(),
@@ -3877,7 +5438,7 @@ async fn prepare_runtime_custody_library_source(
             output_receipt_digest,
             operation_root,
         },
-    ))
+    )))
 }
 
 async fn runtime_media_provider_is_registered(registry: &ProviderRegistry) -> bool {
@@ -3931,11 +5492,15 @@ pub(crate) async fn publish_runtime_custody_library_source(
             let persisted = journal
                 .load(mint_id)
                 .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+            let persisted_media_identity = persisted.draft().media_identity().ok_or_else(|| {
+                anyhow::anyhow!("Runtime custody mint draft is not a media identity")
+            })?;
             let input = RuntimeCustodyLibraryPublishInput {
                 object_uri: source.object_uri,
                 principal_id: source.principal_id,
-                mime_type: persisted.draft().media_identity().mime_type().to_string(),
-                codecs: persisted.draft().media_identity().codecs().to_string(),
+                listing: source.listing,
+                mime_type: persisted_media_identity.mime_type().to_string(),
+                codecs: persisted_media_identity.codecs().to_string(),
                 wallet_account_id: source.wallet_account_id,
                 wallet_account_address: source.wallet_account_address,
                 creator_mint_source_digest: source.creator_mint_source_digest,
@@ -4046,7 +5611,8 @@ pub(crate) async fn publish_runtime_custody_library_object(
         move |bytes| sign_key.sign(bytes).to_bytes(),
         selected,
     )
-    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?;
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?
+    .with_dispatch_clock(crate::auth::now_ts);
     match coordinator
         .provision(&mint_draft, &protected.envelope, now)
         .await
@@ -4076,10 +5642,13 @@ pub(crate) async fn publish_runtime_custody_library_object(
     )
     .map_err(|_| anyhow::anyhow!("Runtime custody availability requirement is invalid"))?;
     let staging = write_protected_content_staging_directory(data_dir, &protected)?;
+    let mint_draft_media_identity = mint_draft
+        .media_identity()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody mint draft is not a media identity"))?;
     let evidence = publish_and_verify_protected_content_availability(
         registry.as_ref(),
         staging.path(),
-        mint_draft.media_identity(),
+        mint_draft_media_identity,
         &requirement,
         crate::auth::now_ts,
     )
@@ -4108,7 +5677,193 @@ pub(crate) async fn publish_runtime_custody_library_object(
             if mint_id == mint_draft.mint_id() => {}
         _ => anyhow::bail!("Runtime custody availability record failed"),
     }
-    let facts = runtime_custody_library_publish_facts(&input, &mint_draft, &content_id, &evidence);
+    let facts = runtime_custody_library_publish_facts(
+        &input.object_uri,
+        &input.source_storage,
+        &mint_draft,
+        &content_id,
+        &evidence,
+    );
+    mint_journal
+        .mark_intent_completed(mint_intent.request_id(), mint_draft.mint_id())
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    Ok(facts)
+}
+
+/// Object twin of `publish_runtime_custody_library_object`. Ends where the
+/// media function's completed mint (custody-provisioned + content-available)
+/// is ready. The creator/chain-mint/listing tail is NOT duplicated here: the
+/// caller (`runtime_custody_publish_object_via_gateway`) runs the same shared
+/// `runtime_custody_publish_creator_tail_from_facts` the media path runs, now
+/// that the portable listing package carries either content kind.
+pub(crate) async fn publish_runtime_custody_library_object_content(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    input: RuntimeCustodyLibraryPublishObjectInput,
+) -> anyhow::Result<RuntimeCustodyLibraryPublishFacts> {
+    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let (device_key, device_did) =
+        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
+    let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
+        .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
+    let now = crate::auth::now_ts();
+    let configured = composition
+        .configured_nodes()
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let selected = resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        now,
+        &configured,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let mint_nodes = selected
+        .iter()
+        .map(|node| node.binding().clone())
+        .collect::<Vec<_>>();
+    let mint_journal = runtime_mint_journal(data_dir);
+    let mint_intent = load_or_persist_runtime_mint_intent_object(
+        &mint_journal,
+        &composition,
+        &input,
+        mint_nodes.clone(),
+    )?;
+    if let Some(mint_id) = mint_intent.completed_mint_id() {
+        return load_completed_runtime_mint_object_facts(&mint_journal, &input, mint_id);
+    }
+    if mint_intent.protect_settled_closed_before_draft() {
+        if let Some(mint_id) = adopt_settled_runtime_mint_record(&mint_journal, &mint_intent)? {
+            return load_completed_runtime_mint_object_facts(&mint_journal, &input, mint_id);
+        }
+    }
+    let request_id = hex::encode(mint_intent.request_id().as_bytes());
+    let step = RuntimeMintStep::begin("protect", &request_id);
+    let protected = protect_runtime_custody_object(
+        &registry,
+        &mint_journal,
+        &composition,
+        &input.content_type,
+        &input.clear_plaintext,
+        &mint_intent,
+    )
+    .await?;
+    step.ok();
+    // DEBUG, like its media twin: at INFO an operator wants the mint's outcome,
+    // not each phase of it.
+    tracing::debug!(
+        request_id = %request_id,
+        content_kind = "object",
+        framed_bytes = protected.framed_bytes.len(),
+        "runtime custody publish: object protected"
+    );
+    let step = RuntimeMintStep::begin("rights_policy", &request_id);
+    let policy = resolve_runtime_rights_policy(
+        registry.as_ref(),
+        protected.object_identity.encrypted_content(),
+        mint_intent.content_access_id(),
+        RightsActionV1::View,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "Runtime custody rights policy resolution failed");
+        error.context("Runtime custody rights policy is unavailable")
+    })?;
+    step.ok();
+    let mint_draft = RuntimeMintDraft::new_from_identity(
+        RuntimeContentIdentityV1::Object(protected.object_identity.clone()),
+        mint_intent.content_access_id(),
+        protected
+            .envelope
+            .key_envelope_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?,
+        policy.identity().clone(),
+        protected.envelope.manifest().content_key_commitment(),
+        protected.envelope.manifest().threshold(),
+        mint_nodes,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint draft is invalid"))?;
+    let sign_key = device_key.clone();
+    let coordinator = RuntimeMintCoordinator::new(
+        runtime_mint_journal(data_dir),
+        runtime_issuer,
+        move |bytes| sign_key.sign(bytes).to_bytes(),
+        selected,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?
+    .with_dispatch_clock(crate::auth::now_ts);
+    let step = RuntimeMintStep::begin("custody_provision", &request_id);
+    match coordinator
+        .provision(&mint_draft, &protected.envelope, crate::auth::now_ts())
+        .await
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint failed"))?
+    {
+        RuntimeMintCoordinatorOutcome::CustodyProvisioned { mint_id }
+            if mint_id == mint_draft.mint_id() => {}
+        RuntimeMintCoordinatorOutcome::ContentAvailable { mint_id }
+            if mint_id == mint_draft.mint_id() => {}
+        _ => anyhow::bail!("Runtime custody mint failed"),
+    }
+    step.ok();
+    tracing::debug!(
+        mint_id = %hex::encode(mint_draft.mint_id().as_bytes()),
+        "runtime custody publish: object custody provisioned"
+    );
+    let content_id = runtime_protected_content_id(mint_draft.encrypted_content())?;
+    let publisher_profile_did = load_runtime_custody_profile_did(data_dir, &input.principal_id)?;
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        device_did,
+        content_id.clone(),
+        publisher_profile_did,
+        PROTECTED_CONTENT_REPLICATION_POLICY,
+        PROTECTED_CONTENT_MIN_REPLICAS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody availability requirement is invalid"))?;
+    let step = RuntimeMintStep::begin("staging", &request_id);
+    let staging = write_protected_content_object_staging_directory(data_dir, &protected)?;
+    step.ok();
+    // The long one. Publishing the ciphertext and proving it replicated is what
+    // a creator sees as a stalled "Encrypt & escrow", because the whole server
+    // round trip is one request from the browser's side.
+    let step = RuntimeMintStep::begin("availability_publish", &request_id);
+    let evidence = publish_and_verify_protected_content_object_availability(
+        registry.as_ref(),
+        staging.path(),
+        &protected.object_identity,
+        &requirement,
+        crate::auth::now_ts,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(
+            mint_id = %hex::encode(mint_draft.mint_id().as_bytes()),
+            %error,
+            "Runtime custody content availability verification failed"
+        );
+        error.context(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE)
+    })?;
+    step.ok();
+    match coordinator
+        .record_content_availability(&mint_draft, &requirement, evidence.clone())
+        .map_err(|_| anyhow::anyhow!("Runtime custody availability record failed"))?
+    {
+        RuntimeMintCoordinatorOutcome::ContentAvailable { mint_id }
+            if mint_id == mint_draft.mint_id() => {}
+        _ => anyhow::bail!("Runtime custody availability record failed"),
+    }
+    let facts = runtime_custody_library_publish_facts(
+        &input.object_uri,
+        &input.source_storage,
+        &mint_draft,
+        &content_id,
+        &evidence,
+    );
     mint_journal
         .mark_intent_completed(mint_intent.request_id(), mint_draft.mint_id())
         .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
@@ -4141,6 +5896,19 @@ async fn protect_runtime_custody_media(
         runtime_custody_open_protection_session_request(composition, input, mint_intent)?;
     match runtime_protect_recovery_disposition(mint_intent) {
         RuntimeProtectRecoveryDisposition::TerminalAbort => {
+            // This intent settled its protect session before any draft existed,
+            // so it can produce nothing and there is no record to adopt. Its
+            // identity comes from the object path, so keeping it makes that
+            // file unmintable for good. Forget it: this attempt still fails,
+            // but the next one starts from nothing instead of meeting the same
+            // wall forever.
+            tracing::warn!(
+                request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+                "runtime custody mint intent settled before any draft and was discarded"
+            );
+            journal
+                .discard_unmintable_intent(mint_intent.request_id())
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
             anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
         }
         RuntimeProtectRecoveryDisposition::SettleCancel(handle) => {
@@ -4260,6 +6028,325 @@ async fn protect_runtime_custody_media(
             Err(error)
         }
     }
+}
+
+struct ProtectedRuntimeCustodyObject {
+    framed_bytes: Vec<u8>,
+    object_identity: ChunkedPayloadObjectIdentityV1,
+    envelope: CustodyEnvelopeV1,
+}
+
+/// Object twin of `protect_runtime_custody_media`. Reuses
+/// `runtime_protect_recovery_disposition` and
+/// `settle_runtime_custody_protect_session` UNCHANGED: both are already
+/// content-kind-agnostic (they only ever inspect the mint intent's protect
+/// recovery fields and dispatch the shared, kind-agnostic
+/// `cancel_protection_session`/`close_protection_session` ops by opaque
+/// handle), so the object-specific session-open/chunk/finalize sequence is
+/// the only new logic here — the recovery/settlement state machine that
+/// makes this resumable across restarts is not duplicated.
+async fn protect_runtime_custody_object(
+    registry: &ProviderRegistry,
+    journal: &RuntimeMintJournal,
+    composition: &RuntimeCustodyComposition,
+    content_type: &str,
+    clear_plaintext: &[u8],
+    mint_intent: &RuntimeMintIntent,
+) -> anyhow::Result<ProtectedRuntimeCustodyObject> {
+    let open_request = runtime_custody_open_object_protection_session_request(
+        composition,
+        content_type,
+        clear_plaintext.len() as u64,
+        mint_intent,
+    )?;
+    let session_handle = *mint_intent.request_id().as_bytes();
+    match runtime_protect_recovery_disposition(mint_intent) {
+        RuntimeProtectRecoveryDisposition::TerminalAbort => {
+            // This intent settled its protect session before any draft existed,
+            // so it can produce nothing and there is no record to adopt. Its
+            // identity comes from the object path, so keeping it makes that
+            // file unmintable for good. Forget it: this attempt still fails,
+            // but the next one starts from nothing instead of meeting the same
+            // wall forever.
+            tracing::warn!(
+                request_id = %hex::encode(mint_intent.request_id().as_bytes()),
+                "runtime custody mint intent settled before any draft and was discarded"
+            );
+            journal
+                .discard_unmintable_intent(mint_intent.request_id())
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::SettleCancel(handle) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Cancel,
+            )
+            .await?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::SettleClose(handle) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Close,
+            )
+            .await?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::ReplayOpenAndSettleCancel => {
+            if !registry
+                .has_ready_runtime_provider_target(PROTECT_PROVIDER_ID)
+                .await
+            {
+                anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
+            }
+            let opened = invoke_typed_protect_provider(
+                registry,
+                "open_object_protection_session",
+                &open_request,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE))?;
+            if opened.status() != ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened {
+                anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
+            }
+            journal
+                .mark_intent_protect_opened(mint_intent.request_id(), session_handle)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                session_handle,
+                RuntimeProtectSessionSettlementOp::Cancel,
+            )
+            .await?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::Fresh => {}
+    }
+
+    if !registry
+        .has_ready_runtime_provider_target(PROTECT_PROVIDER_ID)
+        .await
+    {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    journal
+        .mark_intent_protect_effect_started(mint_intent.request_id())
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let opened =
+        invoke_typed_protect_provider(registry, "open_object_protection_session", &open_request)
+            .await?;
+    if opened.status() != ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    journal
+        .mark_intent_protect_opened(mint_intent.request_id(), session_handle)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let protect_result = protect_opened_runtime_custody_object_session(
+        registry,
+        journal,
+        mint_intent.request_id(),
+        session_handle,
+        &opened,
+        content_type,
+        clear_plaintext,
+        composition,
+    )
+    .await;
+    match protect_result {
+        Ok(protected) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                session_handle,
+                RuntimeProtectSessionSettlementOp::Close,
+            )
+            .await?;
+            Ok(protected)
+        }
+        Err(error) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                session_handle,
+                RuntimeProtectSessionSettlementOp::Cancel,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE))?;
+            Err(error)
+        }
+    }
+}
+
+fn runtime_custody_open_object_protection_session_request(
+    composition: &RuntimeCustodyComposition,
+    content_type: &str,
+    plaintext_bytes: u64,
+    mint_intent: &RuntimeMintIntent,
+) -> anyhow::Result<ProtectProviderRequestV1> {
+    let nodes = composition
+        .nodes
+        .iter()
+        .map(|node| {
+            ProtectionSessionNodeV1::new(node.node_public_key, node.custody_public_key)
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ProtectProviderRequestV1::new_open_object_protection_session(
+        mint_intent.request_id(),
+        mint_intent.content_access_id(),
+        composition
+            .signed_pool
+            .pool_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+        composition
+            .signed_epoch
+            .epoch_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+        composition
+            .signed_committee_authorization
+            .authorization_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+        // The object protect provider enforces exactly 2-of-3 regardless of
+        // what is requested here (Task 10 review, Important 2); this mirrors
+        // that fixed value rather than exposing it as a caller choice.
+        2,
+        3,
+        content_type.to_string(),
+        plaintext_bytes,
+        nodes,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "This operation keeps protect-session authority and settlement inputs explicit at one boundary"
+)]
+async fn protect_opened_runtime_custody_object_session(
+    registry: &ProviderRegistry,
+    journal: &RuntimeMintJournal,
+    request_id: Digest32,
+    handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    opened: &ProtectProviderResponseV1,
+    content_type: &str,
+    clear_plaintext: &[u8],
+    composition: &RuntimeCustodyComposition,
+) -> anyhow::Result<ProtectedRuntimeCustodyObject> {
+    let framed_header = opened
+        .framed_header()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .to_vec();
+    let mut framed_bytes = framed_header.clone();
+    let session_id = Digest32::new(handle);
+    for (chunk_index, chunk) in clear_plaintext
+        .chunks(MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1)
+        .enumerate()
+    {
+        let chunk_index = u32::try_from(chunk_index)
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect input is invalid"))?;
+        let protected = invoke_typed_protect_provider(
+            registry,
+            "protect_object_chunk",
+            &ProtectProviderRequestV1::new_protect_object_chunk(session_id, chunk_index, chunk)
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+        )
+        .await?;
+        if protected.status() != ProtectProviderResponseStatusV1::ObjectChunkProtected {
+            anyhow::bail!("Runtime custody protect provider is unavailable");
+        }
+        framed_bytes.extend_from_slice(
+            protected
+                .framed_chunk()
+                .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?,
+        );
+    }
+    let framed_encrypted_content = EncryptedContentIdentityV1::new(
+        Digest32::new(sha2::Sha256::digest(&framed_bytes).into()),
+        framed_bytes.len() as u64,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let finalized = invoke_typed_protect_provider(
+        registry,
+        "finalize_object_protection_session",
+        &ProtectProviderRequestV1::new_finalize_object_protection_session(
+            session_id,
+            &framed_encrypted_content,
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+    )
+    .await?;
+    if finalized.status() != ProtectProviderResponseStatusV1::ObjectProtectionSessionFinalized {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    let object_identity = finalized
+        .object_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let envelope = finalized
+        .custody_envelope()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let expected_object = ChunkedPayloadObjectIdentityV1::new(
+        framed_encrypted_content,
+        content_type,
+        clear_plaintext.len() as u64,
+        u32::try_from(framed_header.len())
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    if object_identity != expected_object
+        || envelope.manifest().encrypted_content() != object_identity.encrypted_content()
+        || envelope.manifest().custody_pool()
+            != composition
+                .signed_pool
+                .pool_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+        || envelope.manifest().custody_epoch()
+            != composition
+                .signed_epoch
+                .epoch_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+        || envelope.manifest().custody_committee_authorization()
+            != composition
+                .signed_committee_authorization
+                .authorization_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+    {
+        anyhow::bail!("Runtime custody protect output is invalid");
+    }
+    // No object-analogue of media's `content_access_id` cross-check: the
+    // media response's `ValidatedCencFmp4MediaSessionLayoutV1` structurally
+    // carries `content_access_id` (verified above via
+    // `protected_session.content_access_id() != content_access_id` in
+    // `protect_opened_runtime_custody_session`), but neither
+    // `ObjectProtectionSessionOpened` nor `ObjectProtectionSessionFinalized`
+    // carries any artefact binding the session to the requested
+    // `content_access_id` — the object protect-provider contract (Task 8)
+    // has no field to check here. `content_access_id` is still bound
+    // one layer up, into the mint draft itself
+    // (`RuntimeMintDraft::new_from_identity`'s `content_access_id` argument),
+    // so a wrong id cannot silently propagate into the completed mint; it
+    // just is not independently re-verified against the protect session the
+    // way media's is.
+    journal
+        .mark_intent_protect_finalized(request_id, handle)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    Ok(ProtectedRuntimeCustodyObject {
+        framed_bytes,
+        object_identity,
+        envelope,
+    })
 }
 
 fn runtime_protect_recovery_disposition(
@@ -4448,24 +6535,39 @@ async fn protect_opened_runtime_custody_session(
     let protected_session =
         ValidatedCencFmp4MediaSessionLayoutV1::new(&expected_media, &init_segment)
             .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let custody_pool = composition
+        .signed_pool
+        .pool_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?;
+    let custody_epoch = composition
+        .signed_epoch
+        .epoch_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?;
+    let custody_committee_authorization = composition
+        .signed_committee_authorization
+        .authorization_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?;
+    // The CENC protection header the provider wrote into the init segment ships in
+    // a public media file and is what a client reading the artifacts directly will
+    // route on. The Runtime holds the same identities, so it requires the header to
+    // be present on a NEW protect output and to name exactly this session's content
+    // access id, pool, epoch and committee authorization. A provider that omits the
+    // header, or points it at some other quorum, fails here rather than publishing.
+    // (A missing header stays legal on the READ path, where media minted before the
+    // header existed have none.)
+    let expected_protection_header = ElastosPqPsshDataV1::new(
+        content_access_id,
+        &custody_pool,
+        &custody_epoch,
+        &custody_committee_authorization,
+    );
     if media_identity != expected_media
         || protected_session.content_access_id() != content_access_id
+        || protected_session.protection_header() != Some(&expected_protection_header)
         || envelope.manifest().encrypted_content() != media_identity.encrypted_content()
-        || envelope.manifest().custody_pool()
-            != composition
-                .signed_pool
-                .pool_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
-        || envelope.manifest().custody_epoch()
-            != composition
-                .signed_epoch
-                .epoch_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
-        || envelope.manifest().custody_committee_authorization()
-            != composition
-                .signed_committee_authorization
-                .authorization_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+        || envelope.manifest().custody_pool() != custody_pool
+        || envelope.manifest().custody_epoch() != custody_epoch
+        || envelope.manifest().custody_committee_authorization() != custody_committee_authorization
     {
         anyhow::bail!("Runtime custody protect output is invalid");
     }
@@ -4537,8 +6639,35 @@ fn write_protected_content_staging_directory(
     Ok(staging)
 }
 
+fn write_protected_content_object_staging_directory(
+    data_dir: &Path,
+    protected: &ProtectedRuntimeCustodyObject,
+) -> anyhow::Result<tempfile::TempDir> {
+    let parent = protected_content_root(data_dir);
+    fs::create_dir_all(&parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix("publish-")
+        .tempdir_in(&parent)
+        .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    let tree = staging.path().join("protected-content/v1");
+    fs::create_dir_all(&tree)
+        .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    fs::write(
+        staging.path().join(PROTECTED_CONTENT_OBJECT_MANIFEST_PATH),
+        protected_content_object_manifest_bytes(&protected.object_identity)?,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    fs::write(
+        staging.path().join(PROTECTED_CONTENT_OBJECT_EPC1_PATH),
+        &protected.framed_bytes,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    Ok(staging)
+}
+
 fn runtime_custody_library_publish_facts(
-    input: &RuntimeCustodyLibraryPublishInput,
+    object_uri: &str,
+    source_storage: &str,
     draft: &RuntimeMintDraft,
     content_id: &str,
     evidence: &RuntimeVerifiedContentAvailability,
@@ -4559,7 +6688,7 @@ fn runtime_custody_library_publish_facts(
         content_cid: evidence.content_cid().to_string(),
         mint_id: draft.mint_id(),
         content_id: content_id.to_string(),
-        display_name: runtime_custody_display_name(&input.object_uri),
+        display_name: runtime_custody_display_name(object_uri),
         availability: availability.clone(),
         receipt: json!({
             "schema": "elastos.library.runtime-custody-receipt/v1",
@@ -4567,16 +6696,21 @@ fn runtime_custody_library_publish_facts(
         }),
         content_security: json!({
             "schema": "elastos.library.published-content-security/v1",
-            "object_uri": input.object_uri,
-            "source_storage": input.source_storage,
+            "object_uri": object_uri,
+            "source_storage": source_storage,
             "published_payload": "runtime_custody_encrypted",
             "key_release_required": false,
             "status": "runtime_custody_available",
             "content_id": content_id,
             "mint_id": mint_id_hex,
+            // What the capsule protects. The Library item is a `.ddrm`, whose
+            // name cannot say whether it holds a film or a PDF, so the viewer
+            // routes on this rather than on the item's own extension.
+            "asset_mime": draft.content_identity().content_type(),
             "required_providers": [],
         }),
         listing_uri: None,
+        capsule_uri: None,
     }
 }
 
@@ -4591,7 +6725,22 @@ pub(crate) struct RuntimePortableListingPackage {
     pub(crate) token_uri: String,
     pub(crate) publisher_profile_did: String,
     pub(crate) display_name: String,
-    pub(crate) media_identity_base64: String,
+    /// Media listings only. Kept as the FIRST of the two identity fields and
+    /// in its original position so a media package's JSON is byte-identical
+    /// to what every listing already on disk carries — `package_sha256`
+    /// (recomputed over `serde_json::to_vec(package)` on every load) and the
+    /// listing CID both depend on that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) media_identity_base64: Option<String>,
+    /// Object listings only: a `RuntimeContentIdentityV1` canonical encoding
+    /// (kind byte ‖ nested identity), reusing Task 12's already-reviewed
+    /// encoding rather than inventing a second one. Absent on every media
+    /// listing, so media packages keep their exact pre-object bytes.
+    ///
+    /// Exactly one of the two fields is present; see
+    /// [`RuntimePortableListingPackage::decode_and_validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_identity_base64: Option<String>,
     pub(crate) content_access_id: String,
     pub(crate) key_envelope_identity_base64: String,
     pub(crate) rights_policy_identity_base64: String,
@@ -4631,6 +6780,14 @@ pub(crate) struct RuntimeCustodyListingAvailabilitySummary {
     checked_at: u64,
     observed_replicas: u32,
     receipt_digest: String,
+}
+
+impl RuntimeCustodyListingAvailabilitySummary {
+    /// The availability receipt this listing was recorded against, as the bare
+    /// hex the record stores. Callers that need the `sha256:` spelling add it.
+    pub(crate) fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4708,7 +6865,7 @@ fn validate_runtime_portable_listing_origin(
 }
 
 struct DecodedRuntimePortableAsset {
-    media_identity: CencFmp4MediaIdentityV1,
+    content_identity: RuntimeContentIdentityV1,
     content_access_id: ContentAccessIdV1,
     key_envelope: elastos_protected_content_contracts::KeyEnvelopeIdentityV1,
     rights_policy: RightsPolicyIdentityV1,
@@ -4727,16 +6884,71 @@ struct RuntimePortableMetadata {
     protected_content_identity: String,
     mint_id: String,
     publisher_profile_did: String,
-    media_identity_base64: String,
+    /// Mirrors [`RuntimePortableListingPackage`]'s pair exactly (same order,
+    /// same skip-when-absent rule), so a media metadata document keeps its
+    /// pre-object bytes and `verify_runtime_portable_metadata` can compare
+    /// both fields field-for-field against the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_identity_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_identity_base64: Option<String>,
     key_envelope_identity_base64: String,
     rights_policy_identity_base64: String,
     content_key_commitment_base64: String,
 }
 
+/// The two base64 identity fields a portable listing/metadata document
+/// carries for `content_identity`: `(media_identity_base64,
+/// content_identity_base64)`, exactly one of which is `Some`.
+///
+/// Media keeps writing `media_identity_base64` with the bare
+/// `CencFmp4MediaIdentityV1` canonical bytes it always wrote — the object
+/// widening must not move a single byte of a media listing, because
+/// `package_sha256` and the listing CID are computed over them.
+pub(crate) fn runtime_portable_identity_fields(
+    content_identity: &RuntimeContentIdentityV1,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    match content_identity {
+        RuntimeContentIdentityV1::Media(media) => Ok((
+            Some(base64::engine::general_purpose::STANDARD.encode(media.canonical_bytes()?)),
+            None,
+        )),
+        RuntimeContentIdentityV1::Object(_) => {
+            Ok((
+                None,
+                Some(base64::engine::general_purpose::STANDARD.encode(
+                    content_identity.canonical_bytes().map_err(|_| {
+                        anyhow::anyhow!("Runtime custody portable listing is invalid")
+                    })?,
+                )),
+            ))
+        }
+    }
+}
+
+/// The `codecs` declaration a portable listing carries for a content kind:
+/// the media identity's own `codecs` string, and the empty string for an
+/// object, which has no codec declaration at all. Not a placeholder that is
+/// then ignored — `verify_runtime_portable_metadata` compares the published
+/// document's `codecs` against exactly this value, so an object metadata
+/// document declaring any codec is rejected.
+pub(crate) fn runtime_portable_content_codecs(content_identity: &RuntimeContentIdentityV1) -> &str {
+    match content_identity {
+        RuntimeContentIdentityV1::Media(media) => media.codecs(),
+        RuntimeContentIdentityV1::Object(_) => "",
+    }
+}
+
 impl RuntimePortableListingPackage {
     fn decode_and_validate(&self) -> anyhow::Result<DecodedRuntimePortableAsset> {
+        // The token URI names the metadata DIRECTORY. It used to name the
+        // `metadata.json` inside it, which is what put a doubled path on chain
+        // once the Operative appended its own suffix, so listings published
+        // before that fix carry the older spelling and still verify.
+        let directory_uri = format!("ipfs://{}", self.metadata_cid);
+        let legacy_file_uri = format!("{directory_uri}/metadata.json");
         if self.schema != RUNTIME_PORTABLE_LISTING_SCHEMA_V1
-            || self.token_uri != format!("ipfs://{}/metadata.json", self.metadata_cid)
+            || (self.token_uri != directory_uri && self.token_uri != legacy_file_uri)
             || self.published_at == 0
         {
             anyhow::bail!("Runtime custody portable listing is invalid");
@@ -4765,10 +6977,40 @@ impl RuntimePortableListingPackage {
         if self.mint_transaction_hash != format!("0x{}", hex::encode(transaction_hash)) {
             anyhow::bail!("Runtime custody portable listing is invalid");
         }
-        let media_identity: CencFmp4MediaIdentityV1 = decode_runtime_portable_contract(
-            &self.media_identity_base64,
-            MAX_RUNTIME_PORTABLE_LISTING_BYTES as usize,
-        )?;
+        // Exactly one identity field, dispatched on which one is present —
+        // never a default, never a silently-ignored second field. A media
+        // listing MUST use `media_identity_base64` (the bare media canonical
+        // bytes it always used); an object listing MUST use
+        // `content_identity_base64`. A `RuntimeContentIdentityV1::Media`
+        // hiding inside `content_identity_base64` is a cross-kind encoding
+        // that would give one listing two possible byte encodings, so it is
+        // rejected rather than accepted.
+        let content_identity = match (&self.media_identity_base64, &self.content_identity_base64) {
+            (Some(media_identity_base64), None) => {
+                RuntimeContentIdentityV1::Media(decode_runtime_portable_contract(
+                    media_identity_base64,
+                    MAX_RUNTIME_PORTABLE_LISTING_BYTES as usize,
+                )?)
+            }
+            (None, Some(content_identity_base64)) => {
+                let decoded = RuntimeContentIdentityV1::from_canonical_bytes(
+                    &decode_runtime_portable_base64(
+                        content_identity_base64,
+                        MAX_RUNTIME_PORTABLE_LISTING_BYTES as usize,
+                    )?,
+                )
+                .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
+                match decoded {
+                    RuntimeContentIdentityV1::Object(_) => decoded,
+                    RuntimeContentIdentityV1::Media(_) => {
+                        anyhow::bail!("Runtime custody portable listing is invalid")
+                    }
+                }
+            }
+            (Some(_), Some(_)) | (None, None) => {
+                anyhow::bail!("Runtime custody portable listing is invalid")
+            }
+        };
         let key_envelope: elastos_protected_content_contracts::KeyEnvelopeIdentityV1 =
             decode_runtime_portable_contract(
                 &self.key_envelope_identity_base64,
@@ -4792,15 +7034,17 @@ impl RuntimePortableListingPackage {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))?,
         );
-        if media_identity.encrypted_content() != key_envelope.encrypted_content()
-            || runtime_protected_content_id(media_identity.encrypted_content())? != self.content_id
-            || media_identity.mime_type().len() > MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES
-            || media_identity.codecs().len() > MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES
+        if content_identity.encrypted_content() != key_envelope.encrypted_content()
+            || runtime_protected_content_id(content_identity.encrypted_content())?
+                != self.content_id
+            || content_identity.content_type().len() > MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES
+            || runtime_portable_content_codecs(&content_identity).len()
+                > MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES
         {
             anyhow::bail!("Runtime custody portable listing is invalid");
         }
         Ok(DecodedRuntimePortableAsset {
-            media_identity,
+            content_identity,
             content_access_id,
             key_envelope,
             rights_policy,
@@ -4847,6 +7091,14 @@ fn decode_runtime_portable_contract<T: CanonicalContract>(
         .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))
 }
 
+/// Fetch one named file from a published directory, verified against the
+/// directory's own manifest.
+///
+/// Sibling files are expected: a listing directory now carries the Elacity
+/// documents beside the runtime's `manifest.json`. What makes that safe is
+/// unchanged — `verify_content_object_file` checks the named file's bytes
+/// against the hash the manifest records for it, so a sibling can neither
+/// stand in for it nor alter it.
 async fn fetch_runtime_portable_file(
     registry: &ProviderRegistry,
     cid: &str,
@@ -4855,12 +7107,9 @@ async fn fetch_runtime_portable_file(
     let manifest = crate::content::fetch_content_object_manifest(registry, cid).await?;
     let file = manifest
         .files
-        .first()
-        .filter(|file| {
-            manifest.files.len() == 1
-                && file.path == path
-                && file.size <= MAX_RUNTIME_PORTABLE_LISTING_BYTES
-        })
+        .iter()
+        .find(|file| file.path == path)
+        .filter(|file| file.size <= MAX_RUNTIME_PORTABLE_LISTING_BYTES)
         .ok_or_else(|| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
     let bytes = crate::content::fetch_bytes_via_provider(registry, cid, Some(path)).await?;
     if bytes.len() as u64 > MAX_RUNTIME_PORTABLE_LISTING_BYTES {
@@ -4875,24 +7124,53 @@ async fn verify_runtime_portable_metadata(
     package: &RuntimePortableListingPackage,
     decoded: &DecodedRuntimePortableAsset,
 ) -> anyhow::Result<()> {
-    let (manifest, bytes) =
-        fetch_runtime_portable_file(registry, &package.metadata_cid, "metadata.json").await?;
+    // `manifest.json` is where the runtime's document lives in a listing
+    // published since the Elacity folder took the `metadata.json` name. Older
+    // listings have it at `metadata.json` with no siblings, so that name is
+    // tried second — and only accepted when the document there really is the
+    // runtime's, so an Elacity `metadata.json` from a folder whose
+    // `manifest.json` is missing is refused rather than mistaken for one.
+    let (manifest, bytes, is_listing_folder) =
+        match fetch_runtime_portable_file(registry, &package.metadata_cid, "manifest.json").await {
+            Ok((manifest, bytes)) => (manifest, bytes, true),
+            Err(_) => {
+                let (manifest, bytes) =
+                    fetch_runtime_portable_file(registry, &package.metadata_cid, "metadata.json")
+                        .await?;
+                (manifest, bytes, false)
+            }
+        };
+    // The one interop fact a marketplace rejects outright: the listing
+    // document's `kid` is the on-chain `contentId`, and the content market
+    // refuses an asset whose metadata disagrees. Checking it here turns a
+    // listing that would fail silently on chain into one that fails where the
+    // cause is legible. Only a listing folder has the document to check.
+    if is_listing_folder {
+        let (_, listing_bytes) =
+            fetch_runtime_portable_file(registry, &package.metadata_cid, "metadata.json").await?;
+        let listing: serde_json::Value = serde_json::from_slice(&listing_bytes)
+            .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
+        let expected_kid = format!("0x{}", package.content_access_id.trim_start_matches("0x"));
+        if listing.get("kid").and_then(serde_json::Value::as_str) != Some(expected_kid.as_str()) {
+            anyhow::bail!("Runtime custody portable listing is invalid");
+        }
+    }
     let metadata: RuntimePortableMetadata = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
     if serde_json::to_vec(&metadata)? != bytes
         || manifest.schema != "elastos.content.object.manifest/v1"
         || manifest.kind != "directory"
-        || !manifest.links.is_empty()
         || metadata.schema != "elastos.protected-content.metadata/v1"
         || metadata.name != package.display_name
-        || metadata.mime_type != decoded.media_identity.mime_type()
-        || metadata.codecs != decoded.media_identity.codecs()
+        || metadata.mime_type != decoded.content_identity.content_type()
+        || metadata.codecs != runtime_portable_content_codecs(&decoded.content_identity)
         || metadata.encrypted_content_cid != package.content_cid
         || metadata.content_access_id != package.content_access_id
         || metadata.protected_content_identity != package.content_id
         || metadata.mint_id != package.mint_id
         || metadata.publisher_profile_did != package.publisher_profile_did
         || metadata.media_identity_base64 != package.media_identity_base64
+        || metadata.content_identity_base64 != package.content_identity_base64
         || metadata.key_envelope_identity_base64 != package.key_envelope_identity_base64
         || metadata.rights_policy_identity_base64 != package.rights_policy_identity_base64
         || metadata.content_key_commitment_base64 != package.content_key_commitment_base64
@@ -4956,11 +7234,131 @@ async fn verify_runtime_portable_chain(
     Ok(())
 }
 
+/// Re-verifies a portable listing's published content and rebuilds the mint
+/// draft it commits to. Dispatches on the listing's own content kind with an
+/// explicit two-arm match: media keeps the untouched
+/// [`verify_runtime_portable_media`] path and objects take
+/// [`verify_runtime_portable_object`] — never silently treated as media, and
+/// never defaulted.
+async fn verify_runtime_portable_content(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+    package: &RuntimePortableListingPackage,
+    decoded: &DecodedRuntimePortableAsset,
+    now_unix_seconds: u64,
+) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
+    match &decoded.content_identity {
+        RuntimeContentIdentityV1::Media(media_identity) => {
+            verify_runtime_portable_media(
+                data_dir,
+                registry,
+                package,
+                decoded,
+                media_identity,
+                now_unix_seconds,
+            )
+            .await
+        }
+        RuntimeContentIdentityV1::Object(object_identity) => {
+            verify_runtime_portable_object(
+                data_dir,
+                registry,
+                package,
+                decoded,
+                object_identity,
+                now_unix_seconds,
+            )
+            .await
+        }
+    }
+}
+
+/// Object twin of [`verify_runtime_portable_media`]. Step for step the same
+/// sequence — re-observe availability, fetch and verify the published files
+/// against the listing's own identity, verify the receipt, resolve the
+/// custody composition's currently selected nodes, rebuild the mint draft and
+/// require it to hash back to the listing's `mint_id`. The media function is
+/// untouched; only the three content-shaped steps differ (object manifest and
+/// `object.epc1` instead of `identity.bin` + `init.mp4` + segments, the object
+/// receipt twin, and `RuntimeMintDraft::new_from_identity` with an
+/// `Object` identity instead of `RuntimeMintDraft::new` from raw media bytes).
+#[allow(clippy::too_many_arguments)]
+async fn verify_runtime_portable_object(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+    package: &RuntimePortableListingPackage,
+    decoded: &DecodedRuntimePortableAsset,
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    now_unix_seconds: u64,
+) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
+    // Same clock discipline as the media path: a dead candidate's connect
+    // timeouts can outlast the receipt's future-skew allowance.
+    let now_unix_seconds = now_unix_seconds.max(crate::auth::now_ts());
+    let trusted_receipt_signer_did =
+        crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        trusted_receipt_signer_did,
+        &package.content_id,
+        &package.publisher_profile_did,
+        PROTECTED_CONTENT_REPLICATION_POLICY,
+        PROTECTED_CONTENT_MIN_REPLICAS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
+    )?;
+    let receipt =
+        refresh_content_availability_receipt(registry, &package.content_cid, &requirement).await?;
+    let manifest =
+        crate::content::fetch_content_object_manifest(registry, &package.content_cid).await?;
+    verify_protected_content_object_manifest_and_files(
+        registry,
+        &package.content_cid,
+        &manifest,
+        object_identity,
+    )
+    .await?;
+    let availability = verify_protected_content_object_receipt(
+        &package.content_cid,
+        &manifest,
+        &receipt,
+        object_identity,
+        &requirement,
+        now_unix_seconds.max(crate::auth::now_ts()),
+    )?;
+    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let configured_nodes = composition.configured_nodes()?;
+    let selected = resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        now_unix_seconds.max(crate::auth::now_ts()),
+        &configured_nodes,
+    )?;
+    let draft = RuntimeMintDraft::new_from_identity(
+        RuntimeContentIdentityV1::Object(object_identity.clone()),
+        decoded.content_access_id,
+        decoded.key_envelope.clone(),
+        decoded.rights_policy.clone(),
+        decoded.content_key_commitment,
+        decoded.key_envelope.threshold(),
+        selected.iter().map(|node| node.binding().clone()).collect(),
+    )?;
+    if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
+        anyhow::bail!("Runtime custody portable listing is invalid");
+    }
+    Ok((draft, availability))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn verify_runtime_portable_media(
     data_dir: &Path,
     registry: &Arc<ProviderRegistry>,
     package: &RuntimePortableListingPackage,
     decoded: &DecodedRuntimePortableAsset,
+    media_identity: &CencFmp4MediaIdentityV1,
     now_unix_seconds: u64,
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     // The caller samples its clock before the fresh ensure; walking a dead
@@ -4993,14 +7391,14 @@ async fn verify_runtime_portable_media(
         registry,
         &package.content_cid,
         &manifest,
-        &decoded.media_identity,
+        media_identity,
     )
     .await?;
     let availability = verify_protected_content_receipt(
         &package.content_cid,
         &manifest,
         &receipt,
-        &decoded.media_identity,
+        media_identity,
         &requirement,
         // Re-sampled: the refresh above may have walked dead-candidate timeouts.
         now_unix_seconds.max(crate::auth::now_ts()),
@@ -5021,8 +7419,8 @@ async fn verify_runtime_portable_media(
     let draft = RuntimeMintDraft::new(
         &init,
         &segments,
-        decoded.media_identity.mime_type(),
-        decoded.media_identity.codecs(),
+        media_identity.mime_type(),
+        media_identity.codecs(),
         decoded.content_access_id,
         decoded.key_envelope.clone(),
         decoded.rights_policy.clone(),
@@ -5070,7 +7468,7 @@ pub(crate) async fn import_runtime_custody_listing(
     }
     verify_runtime_portable_metadata(&registry, &package, &decoded).await?;
     verify_runtime_portable_chain(&registry, &package).await?;
-    let (draft, verified_availability) = verify_runtime_portable_media(
+    let (draft, verified_availability) = verify_runtime_portable_content(
         data_dir,
         &registry,
         &package,
@@ -5164,19 +7562,49 @@ pub(crate) struct RuntimeCustodyTerminalPurchaseRecord {
     pub(crate) chain_observation: Value,
     pub(crate) access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord,
     pub(crate) confirmed_at: u64,
-    pub(crate) bought_at: u64,
+    /// When this principal came to hold the copy. Written as `acquired_at`;
+    /// `bought_at` is how every record predating minted copies spells it, and a
+    /// minted copy was never bought.
+    #[serde(alias = "bought_at")]
+    pub(crate) acquired_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RuntimeCustodyPurchaseProgress {
     Pending {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Set once the ERC-20 approval stage's transaction has confirmed on
+        /// chain, so a retried buy skips re-driving an already-confirmed
+        /// approval instead of re-requesting it from the Wallet every call.
+        /// Absent for two-legitimate-different reasons: native-token
+        /// purchases that never had an approval stage, and records written
+        /// before this field existed -- both must keep deserializing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_approval: Option<RuntimeCustodyConfirmedPurchaseStage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         confirmed_buy: Option<RuntimeCustodyConfirmedPurchaseStage>,
     },
     Complete {
         terminal: RuntimeCustodyTerminalPurchaseRecord,
     },
+}
+
+/// How a principal came to own this copy.
+///
+/// Nothing downstream of the entitlement check reads this. The right to open
+/// is the chain's answer to `hasAccess`, and buying and minting are two ways of
+/// arriving at the same answer -- so an owned copy behaves identically either
+/// way. This records only which one happened, so a reader can tell provenance
+/// without that changing what the copy can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeCustodyAcquisitionV1 {
+    /// Bought from a listing. Every record written before minted copies
+    /// existed is one of these, which is why it is the default.
+    #[default]
+    Bought,
+    /// Minted by this principal: the copy was theirs from the first block.
+    Minted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5204,7 +7632,26 @@ pub(crate) struct RuntimeCustodyPurchaseRecord {
     pub(crate) address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approval_stage: Option<RuntimeCustodyPurchaseStageRecord>,
-    pub(crate) buy_stage: RuntimeCustodyPurchaseStageRecord,
+    /// The transaction by which this principal acquired access: the buy for a
+    /// bought copy, the mint for a minted one. The open path presents it as the
+    /// chain evidence behind a release, so every owned copy has one -- which is
+    /// why this is not optional and why a minted copy records its mint here
+    /// rather than leaving a hole or fabricating a buy.
+    ///
+    /// Written as `acquisition_stage`; `buy_stage` is how every record predating
+    /// minted copies spells the same field.
+    #[serde(alias = "buy_stage")]
+    pub(crate) acquisition_stage: RuntimeCustodyPurchaseStageRecord,
+    #[serde(default)]
+    pub(crate) acquisition: RuntimeCustodyAcquisitionV1,
+    /// Where this copy's `.ddrm` was filed in the owner's Library.
+    ///
+    /// `None` means no capsule has been written yet -- either the copy predates
+    /// capsules, or filing one has not succeeded. That is what a repair looks
+    /// for, and what keeps a replayed buy from filing a second capsule beside
+    /// the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capsule_uri: Option<String>,
     pub(crate) progress: RuntimeCustodyPurchaseProgress,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
@@ -5218,6 +7665,16 @@ pub(crate) struct RuntimeCustodyBuyInput {
 pub(crate) struct RuntimeCustodyViewerOpenInput {
     pub principal_id: String,
     pub mint_id: String,
+    /// The verified capsule the caller was actually launched as (session
+    /// binding v3's viewer-capsule field). Never taken from client-supplied
+    /// request JSON: the gateway proxy overwrites whatever the client sent
+    /// with `required.launch_context.executable_actor`, exactly as it already
+    /// does for `launch_id`/`session_id`/`grant_id`, and it is the only route
+    /// that may reach this function —
+    /// `library::handle_runtime_custody_library_request` refuses the viewer
+    /// operations on every route that does not perform that overwrite (see
+    /// `library::LibraryRequestRoute`).
+    pub executable_actor: String,
     pub launch_id: Option<String>,
     pub proof_binding_id: Option<String>,
     pub session_id: Option<String>,
@@ -5496,6 +7953,46 @@ impl RuntimeCustodyViewerRecord {
         Ok(())
     }
 
+    /// Object chunks are released strictly in order too, but unlike media
+    /// there is no init part: chunk n IS part n (media's part 0 is the init
+    /// segment and part n+1 is segment n). The counter and
+    /// `mark_media_part_read` are shared and kind-agnostic; only this
+    /// mapping differs.
+    ///
+    /// `chunk_count` bounds the request the way media's caller bounds
+    /// `segment_index` against `encrypted_segments().len()` — and, like
+    /// media, before the published content is fetched, not after. Without it
+    /// an exhausted session (`next_media_part_index == chunk_count`) would
+    /// pass the ordering check for `chunk_index == chunk_count` and only fail
+    /// once the whole framed object had been fetched and re-hashed.
+    fn require_object_chunk_index(&self, chunk_index: u32, chunk_count: u32) -> anyhow::Result<()> {
+        const MESSAGE: &str = "Runtime custody viewer object chunk is invalid";
+        if chunk_index >= chunk_count {
+            tracing::warn!(
+                requested_chunk = chunk_index,
+                chunk_count,
+                "runtime custody viewer: object chunk requested past the last chunk"
+            );
+            return Err(anyhow::anyhow!(
+                "requested object chunk {chunk_index} but the object has {chunk_count} chunks"
+            )
+            .context(MESSAGE));
+        }
+        if chunk_index != self.next_media_part_index {
+            tracing::warn!(
+                requested_chunk = chunk_index,
+                next_chunk = self.next_media_part_index,
+                "runtime custody viewer: object chunk requested out of order"
+            );
+            return Err(anyhow::anyhow!(
+                "requested object chunk {chunk_index} but the next chunk is {}",
+                self.next_media_part_index
+            )
+            .context(MESSAGE));
+        }
+        Ok(())
+    }
+
     fn mark_media_part_read(&mut self, now: u64) -> anyhow::Result<()> {
         self.next_media_part_index = self
             .next_media_part_index
@@ -5630,13 +8127,17 @@ fn runtime_custody_listing_summary(
 ) -> anyhow::Result<Value> {
     let availability = runtime_custody_listing_availability(record);
     let access_state = runtime_custody_listing_access_state(data_dir, principal_id, record)?;
-    let media = record.package.decode_and_validate()?.media_identity;
+    let content_identity = record.package.decode_and_validate()?.content_identity;
+    // `mime_type`/`codecs` keep their exact media values (the listing summary
+    // is a pre-existing public shape); an object listing reports its declared
+    // `content_type` as `mime_type` and an empty `codecs`, which is what its
+    // published metadata document carries too.
     Ok(json!({
         "schema": RUNTIME_LISTING_SCHEMA_V1,
         "mint_id": record.package.mint_id,
         "display_name": record.package.display_name,
-        "mime_type": media.mime_type(),
-        "codecs": media.codecs(),
+        "mime_type": content_identity.content_type(),
+        "codecs": runtime_portable_content_codecs(&content_identity),
         "quantity": record.package.quantity,
         "price": record.package.price,
         "pay_token": record.package.pay_token,
@@ -5786,7 +8287,7 @@ pub(crate) async fn verify_fresh_runtime_custody_availability(
         anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
     let decoded = listing.package.decode_and_validate()?;
-    verify_runtime_portable_media(
+    verify_runtime_portable_content(
         data_dir,
         registry,
         &listing.package,
@@ -5849,12 +8350,25 @@ pub(crate) async fn open_runtime_custody_viewer(
     let runtime_session_binding = derive_runtime_custody_session_binding(
         &input.principal_id,
         &profile_did,
+        &input.executable_actor,
         launch_id,
         proof_binding_id,
         session_id,
         grant_id,
         mint_id,
     )?;
+    // Kind <-> viewer, checked ABOVE every replay / cached-response shortcut
+    // below. `asset.content_identity` is the listing package's own identity,
+    // already cross-bound to this principal's completed purchase by
+    // `validate_runtime_custody_viewer_asset`, so the admitted viewer capsule
+    // for this mint's content kind is known here without any provider round
+    // trip or mint-journal read. The authoritative re-check against the
+    // freshly verified mint draft stays further down (the draft is rebuilt
+    // from re-fetched, re-verified content); this one only makes sure a
+    // cross-kind actor can never reach a shortcut that returns a session.
+    if input.executable_actor != expected_runtime_custody_viewer_capsule(&asset.content_identity) {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    }
     // An open-pending record that still waits on the Wallet approval of its
     // rights-signature request is resumed for the same runtime session
     // (same prepared recipient, same wallet request) instead of being torn
@@ -5878,13 +8392,25 @@ pub(crate) async fn open_runtime_custody_viewer(
                     && !record.is_expired(viewer_now) =>
             {
                 let session =
-                    record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
-                return runtime_custody_viewer_public_response(
-                    &asset.media_identity,
-                    mint_id,
-                    session.viewer_session_handle(),
-                    session.expires_at(),
-                );
+                    record.to_runtime_viewer_session(asset.content_identity.encrypted_content())?;
+                return match &asset.content_identity {
+                    RuntimeContentIdentityV1::Media(media_identity) => {
+                        runtime_custody_viewer_public_response(
+                            media_identity,
+                            mint_id,
+                            session.viewer_session_handle(),
+                            session.expires_at(),
+                        )
+                    }
+                    RuntimeContentIdentityV1::Object(object_identity) => {
+                        runtime_custody_viewer_object_public_response(
+                            object_identity,
+                            mint_id,
+                            session.viewer_session_handle(),
+                            session.expires_at(),
+                        )
+                    }
+                };
             }
             RuntimeCustodyViewerLifecycleStatus::OpenPending
                 if record.pending_release.is_some()
@@ -5934,6 +8460,26 @@ pub(crate) async fn open_runtime_custody_viewer(
         crate::auth::now_ts(),
     )
     .await?;
+    // Session binding v3, kind <-> viewer: the launch-verified
+    // `executable_actor` (already checked at the gateway proxy to be one of
+    // the two admitted viewer capsules) must be the ONE admitted capsule for
+    // this draft's own content kind, not merely any admitted viewer.
+    //
+    // THIS IS THE SOLE ENFORCEMENT POINT for kind <-> viewer. The gateway
+    // proxy deliberately does NOT also check it — see the comment at its
+    // `is_protected_viewer_op` block: a pre-dispatch `RuntimeMintJournal::load`
+    // there would create this Runtime's mint-journal directory as a side
+    // effect of every `open_viewer` call, which broke cross-runtime isolation.
+    // Removing the check below therefore removes it entirely; nothing else
+    // rejects a reader opening a media mint (or a player opening an object).
+    // The cached/replay shortcuts earlier in this function cannot be used to
+    // slip past it: every one of them requires
+    // `record.matches_runtime_session_binding(...)`, and the binding is
+    // derived over `executable_actor`, so a cross-kind actor can never match a
+    // session opened by the correct one.
+    if input.executable_actor != expected_runtime_custody_viewer_capsule(draft.content_identity()) {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    }
     if fresh_availability.content_cid() != purchase.cid {
         anyhow::bail!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE);
     }
@@ -5945,9 +8491,43 @@ pub(crate) async fn open_runtime_custody_viewer(
             .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
     let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
         .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
-    let (media_identity, protected_init) =
-        fetch_runtime_custody_open_media(registry.as_ref(), &purchase.cid, draft.media_identity())
+    // Fetch and re-verify the published content for THIS draft's kind, and
+    // carry the verified result forward: it is what the viewer session is
+    // opened over and what the public response is built from further down, so
+    // neither can ever describe content the Runtime did not just re-observe.
+    // Media reconstructs its identity FROM the fetched bytes; an object is one
+    // published file, so its bytes are verified AGAINST the draft's identity
+    // (exact length and sha256) instead — either way an identity only survives
+    // here if the published bytes back it.
+    let open_content = match draft.content_identity() {
+        RuntimeContentIdentityV1::Media(expected_media_identity) => {
+            let (media_identity, protected_init) = fetch_runtime_custody_open_media(
+                registry.as_ref(),
+                &purchase.cid,
+                expected_media_identity,
+            )
             .await?;
+            RuntimeCustodyOpenContent::Media {
+                media_identity,
+                protected_init,
+            }
+        }
+        RuntimeContentIdentityV1::Object(expected_object_identity) => {
+            let framed = fetch_runtime_custody_open_object(
+                registry.as_ref(),
+                &purchase.cid,
+                expected_object_identity,
+            )
+            .await?;
+            RuntimeCustodyOpenContent::Object {
+                object_identity: expected_object_identity.clone(),
+                framed_header: runtime_custody_object_framed_header(
+                    &framed,
+                    expected_object_identity,
+                )?,
+            }
+        }
+    };
     let now = crate::auth::now_ts();
     let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
     let (prepared, mut open_pending, audit_request_id, replay_wallet_request) =
@@ -6308,8 +8888,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer,
             content_key_commitment: draft.content_key_commitment(),
-            media_identity: &media_identity,
-            protected_init_segment: &protected_init,
+            content: open_content.as_open_viewer_content(),
             signed_node_contributions: &contributions,
             signed_terminal_receipt: &terminal_receipt,
             now_unix_seconds: crate::auth::now_ts(),
@@ -6357,7 +8936,60 @@ pub(crate) async fn open_runtime_custody_viewer(
         .await;
         return Err(error);
     }
-    runtime_custody_viewer_public_response(draft.media_identity(), mint_id, &handle, expires_at)
+    // Built from `open_content` — the identity the fetch above re-verified
+    // against the published bytes — so the response can never describe content
+    // the Runtime did not just re-observe.
+    match &open_content {
+        RuntimeCustodyOpenContent::Media { media_identity, .. } => {
+            runtime_custody_viewer_public_response(media_identity, mint_id, &handle, expires_at)
+        }
+        RuntimeCustodyOpenContent::Object {
+            object_identity, ..
+        } => runtime_custody_viewer_object_public_response(
+            object_identity,
+            mint_id,
+            &handle,
+            expires_at,
+        ),
+    }
+}
+
+/// The published content an open has fetched and verified, owned for the
+/// lifetime of `open_runtime_custody_viewer`.
+///
+/// Only the framed HEADER of an object is retained: that is all
+/// `RuntimeOpenViewerContentV1::Object` needs, and a framed object can be tens
+/// of megabytes.
+enum RuntimeCustodyOpenContent {
+    Media {
+        media_identity: CencFmp4MediaIdentityV1,
+        protected_init: Vec<u8>,
+    },
+    Object {
+        object_identity: ChunkedPayloadObjectIdentityV1,
+        framed_header: Vec<u8>,
+    },
+}
+
+impl RuntimeCustodyOpenContent {
+    fn as_open_viewer_content(&self) -> RuntimeOpenViewerContentV1<'_> {
+        match self {
+            Self::Media {
+                media_identity,
+                protected_init,
+            } => RuntimeOpenViewerContentV1::Media {
+                media_identity,
+                protected_init_segment: protected_init,
+            },
+            Self::Object {
+                object_identity,
+                framed_header,
+            } => RuntimeOpenViewerContentV1::Object {
+                object_identity,
+                framed_header,
+            },
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6367,11 +8999,13 @@ pub(crate) async fn read_runtime_custody_viewer(
     principal_id: &str,
     mint_id_hex: &str,
     handle_hex: &str,
+    executable_actor: &str,
     launch_id: Option<&str>,
     proof_binding_id: Option<&str>,
     session_id: Option<&str>,
     grant_id: Option<&str>,
     segment_index: Option<u32>,
+    chunk_index: Option<u32>,
 ) -> anyhow::Result<Value> {
     let mint_id = parse_mint_id_hex(mint_id_hex)?;
     let _viewer_lifecycle_guard =
@@ -6395,6 +9029,7 @@ pub(crate) async fn read_runtime_custody_viewer(
     let runtime_session_binding = require_runtime_custody_session_binding(
         principal_id,
         &profile_did,
+        executable_actor,
         launch_id,
         proof_binding_id,
         session_id,
@@ -6402,6 +9037,31 @@ pub(crate) async fn read_runtime_custody_viewer(
         mint_id,
         "Runtime custody viewer session is unavailable",
     )?;
+    // Kind dispatch above every lifecycle shortcut. Each kind names its parts
+    // with its OWN selector, and the other kind's selector is refused rather
+    // than accepted-and-ignored: a media read must not carry `chunk_index`, an
+    // object read must not carry `segment_index`, and an object read must name
+    // the chunk it wants (there is no object analogue of media's
+    // "no segment_index means the init segment" default).
+    let content_selector = match (&asset.content_identity, segment_index, chunk_index) {
+        (RuntimeContentIdentityV1::Media(media_identity), _, None) => {
+            RuntimeCustodyViewerReadSelector::Media {
+                media_identity,
+                segment_index,
+            }
+        }
+        (RuntimeContentIdentityV1::Object(object_identity), None, Some(chunk_index)) => {
+            RuntimeCustodyViewerReadSelector::Object {
+                object_identity,
+                chunk_index,
+            }
+        }
+        (RuntimeContentIdentityV1::Media(_), _, Some(_))
+        | (RuntimeContentIdentityV1::Object(_), Some(_), _)
+        | (RuntimeContentIdentityV1::Object(_), None, None) => {
+            anyhow::bail!("Runtime custody viewer session is unavailable")
+        }
+    };
     let mut record = load_runtime_custody_viewer_record(data_dir, principal_id, mint_id)?
         .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
     if !record.validates_authority_identity(
@@ -6417,7 +9077,7 @@ pub(crate) async fn read_runtime_custody_viewer(
     let now = crate::auth::now_ts();
     let session = match record.lifecycle_status {
         RuntimeCustodyViewerLifecycleStatus::Active if !record.is_expired(now) => {
-            record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?
+            record.to_runtime_viewer_session(asset.content_identity.encrypted_content())?
         }
         RuntimeCustodyViewerLifecycleStatus::OpenPending
         | RuntimeCustodyViewerLifecycleStatus::Active
@@ -6438,34 +9098,84 @@ pub(crate) async fn read_runtime_custody_viewer(
             anyhow::bail!("Runtime custody viewer session is unavailable");
         }
     };
-    record.require_media_part_index(segment_index)?;
-    let selector = if let Some(segment_index) = segment_index {
-        let path = protected_content_segment_path(
-            usize::try_from(segment_index)
-                .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?,
-        );
-        if usize::try_from(segment_index).ok()
-            >= Some(asset.media_identity.encrypted_segments().len())
-        {
-            anyhow::bail!("Runtime custody viewer media part is invalid");
-        }
-        let encrypted =
-            crate::content::fetch_bytes_via_provider(registry.as_ref(), &purchase.cid, Some(&path))
+    let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
+    let response = match content_selector {
+        RuntimeCustodyViewerReadSelector::Media {
+            media_identity,
+            segment_index,
+        } => {
+            record.require_media_part_index(segment_index)?;
+            let selector = if let Some(segment_index) = segment_index {
+                let path = protected_content_segment_path(usize::try_from(segment_index).map_err(
+                    |_| anyhow::anyhow!("Runtime custody viewer media part is invalid"),
+                )?);
+                if usize::try_from(segment_index).ok()
+                    >= Some(media_identity.encrypted_segments().len())
+                {
+                    anyhow::bail!("Runtime custody viewer media part is invalid");
+                }
+                let encrypted = crate::content::fetch_bytes_via_provider(
+                    registry.as_ref(),
+                    &purchase.cid,
+                    Some(&path),
+                )
                 .await
                 .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
-        ViewerMediaPartSelectorV1::segment(segment_index, encrypted)
-            .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?
-    } else {
-        ViewerMediaPartSelectorV1::init()
+                ViewerMediaPartSelectorV1::segment(segment_index, encrypted)
+                    .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?
+            } else {
+                ViewerMediaPartSelectorV1::init()
+            };
+            let part = read_viewer_media_part(&decrypt, &session, selector, crate::auth::now_ts())
+                .await
+                .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
+            json!({
+                "schema": "elastos.library.runtime-custody-viewer-part/v1",
+                "mint_id": hex::encode(mint_id.as_bytes()),
+                "viewer_session_handle": handle_hex,
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(part.clear_media_part()),
+            })
+        }
+        RuntimeCustodyViewerReadSelector::Object {
+            object_identity,
+            chunk_index,
+        } => {
+            record.require_object_chunk_index(chunk_index, object_identity.chunk_count())?;
+            // Re-fetch and re-verify the whole framed object against the
+            // listing's identity, then hand the decrypt provider exactly ONE
+            // framed chunk (~1 MiB + tag), never the whole file: a provider
+            // frame carries the chunk as a JSON integer array, so a 1 MiB
+            // chunk already costs roughly 4 MiB of the 16 MiB frame ceiling.
+            let framed = fetch_runtime_custody_open_object(
+                registry.as_ref(),
+                &purchase.cid,
+                object_identity,
+            )
+            .await?;
+            let framed_chunk =
+                runtime_custody_object_framed_chunk(&framed, object_identity, chunk_index)?;
+            drop(framed);
+            let chunk = read_viewer_object_chunk(
+                &decrypt,
+                &session,
+                chunk_index,
+                &framed_chunk,
+                crate::auth::now_ts(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
+            json!({
+                "schema": "elastos.library.runtime-custody-viewer-part/v1",
+                "content_kind": RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT,
+                "mint_id": hex::encode(mint_id.as_bytes()),
+                "viewer_session_handle": handle_hex,
+                "chunk_index": chunk_index,
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(chunk.plaintext()),
+            })
+        }
     };
-    let part = read_viewer_media_part(
-        &RuntimeDecryptRegistryAdapter::new(registry.clone()),
-        &session,
-        selector,
-        crate::auth::now_ts(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
     record.mark_media_part_read(crate::auth::now_ts())?;
     if persist_runtime_custody_viewer_record(data_dir, principal_id, mint_id, &record).is_err() {
         let _ = settle_runtime_custody_viewer_cleanup(
@@ -6479,13 +9189,22 @@ pub(crate) async fn read_runtime_custody_viewer(
         .await;
         anyhow::bail!("Runtime custody viewer session is unavailable");
     }
-    Ok(json!({
-        "schema": "elastos.library.runtime-custody-viewer-part/v1",
-        "mint_id": hex::encode(mint_id.as_bytes()),
-        "viewer_session_handle": handle_hex,
-        "encoding": "base64",
-        "data": base64::engine::general_purpose::STANDARD.encode(part.clear_media_part()),
-    }))
+    Ok(response)
+}
+
+/// Which part of which content kind one `read_viewer` call names, after the
+/// caller's two selectors have been checked against the session's actual
+/// content kind.
+enum RuntimeCustodyViewerReadSelector<'a> {
+    Media {
+        media_identity: &'a CencFmp4MediaIdentityV1,
+        /// `None` is media's init segment, exactly as before.
+        segment_index: Option<u32>,
+    },
+    Object {
+        object_identity: &'a ChunkedPayloadObjectIdentityV1,
+        chunk_index: u32,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6495,6 +9214,7 @@ pub(crate) async fn close_runtime_custody_viewer(
     principal_id: &str,
     mint_id_hex: &str,
     handle_hex: &str,
+    executable_actor: &str,
     launch_id: Option<&str>,
     proof_binding_id: Option<&str>,
     session_id: Option<&str>,
@@ -6522,6 +9242,7 @@ pub(crate) async fn close_runtime_custody_viewer(
     let runtime_session_binding = require_runtime_custody_session_binding(
         principal_id,
         &profile_did,
+        executable_actor,
         launch_id,
         proof_binding_id,
         session_id,
@@ -6567,7 +9288,7 @@ pub(crate) async fn close_runtime_custody_viewer(
         }
         RuntimeCustodyViewerLifecycleStatus::Active => {
             let session =
-                record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
+                record.to_runtime_viewer_session(asset.content_identity.encrypted_content())?;
             Some(
                 match close_viewer_session_with_result(
                     &RuntimeDecryptRegistryAdapter::new(registry),
@@ -6647,6 +9368,9 @@ pub(crate) fn runtime_custody_creator_listing_package(
     if availability.publisher_identity() != publisher_profile_did {
         anyhow::bail!("Runtime custody listing is invalid");
     }
+    let (media_identity_base64, content_identity_base64) =
+        runtime_portable_identity_fields(mint.draft().content_identity())
+            .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
     Ok(RuntimePortableListingPackage {
         schema: RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
         mint_id: hex::encode(mint_id.as_bytes()),
@@ -6660,8 +9384,8 @@ pub(crate) fn runtime_custody_creator_listing_package(
         token_uri: terminal.token_uri().to_string(),
         publisher_profile_did,
         display_name: facts.display_name.clone(),
-        media_identity_base64: base64::engine::general_purpose::STANDARD
-            .encode(mint.draft().media_identity().canonical_bytes()?),
+        media_identity_base64,
+        content_identity_base64,
         key_envelope_identity_base64: base64::engine::general_purpose::STANDARD
             .encode(mint.draft().key_envelope().canonical_bytes()?),
         rights_policy_identity_base64: base64::engine::general_purpose::STANDARD
@@ -6681,6 +9405,75 @@ pub(crate) fn runtime_custody_creator_listing_package(
         mint_transaction_hash: terminal.transaction_hash().to_ascii_lowercase(),
         published_at: terminal.published_at(),
     })
+}
+
+/// The on-disk shape of an owned protected item: the `.ddrm` the Library shows
+/// and the viewer opens.
+pub(crate) const RUNTIME_CUSTODY_CAPSULE_SCHEMA_V1: &str =
+    "elastos.library.protected-content-capsule/v1";
+
+/// The document a `.ddrm` file contains.
+///
+/// It is the asset's own `metadata.json` -- the same document the token URI
+/// resolves to -- with the handful of facts only the chain can supply raised to
+/// the top level beside it: the authority governing the asset, its `kid`, the
+/// `tokenId` minted on the ledger, the ledger itself, and the content type that
+/// decides which viewer opens it.
+///
+/// Those five are lifted rather than left to readers to dig out, because they
+/// are what every reader needs first and what `metadata.json` alone cannot
+/// answer: a `tokenId` does not exist until the mint emits it, and an authority
+/// may not have been configured when the metadata was written. The metadata is
+/// carried whole rather than summarised, so a capsule is self-describing and
+/// can be read without fetching anything.
+///
+/// `metadataUri` names where that document was published, so the embedded copy
+/// can always be checked against the one the token URI resolves to.
+pub(crate) fn runtime_custody_capsule_document(
+    package: &RuntimePortableListingPackage,
+    metadata: &Value,
+    acquisition: RuntimeCustodyAcquisitionV1,
+) -> Value {
+    // Stated at mint time when the network had a market configured; otherwise
+    // recovered afterwards from the gateway that emitted the mint's own
+    // `ItemListed`, which IS the authority.
+    let authority = metadata
+        .get("properties")
+        .and_then(|properties| properties.get("authority"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    serde_json::json!({
+        "schema": RUNTIME_CUSTODY_CAPSULE_SCHEMA_V1,
+        "authority": authority,
+        "kid": package.content_access_id,
+        "tokenId": package.token_id,
+        "ledger": package.ledger,
+        "contentType": runtime_custody_capsule_content_type(metadata),
+        "operative": package.operative,
+        "chainNamespace": package.chain_namespace,
+        "network": package.network,
+        "mintId": package.mint_id,
+        "contentId": package.content_id,
+        "contentCid": package.content_cid,
+        "mintTransactionHash": package.mint_transaction_hash,
+        "acquisition": acquisition,
+        "metadataUri": format!("ipfs://{}", package.metadata_cid),
+        "metadata": metadata,
+    })
+}
+
+/// What the capsule protects, taken from the metadata document that describes
+/// it. `media.contentType` is the declared type; `media.mimeType` is the same
+/// answer under the spelling some documents use.
+pub(crate) fn runtime_custody_capsule_content_type(metadata: &Value) -> String {
+    let media = metadata.get("media");
+    media
+        .and_then(|media| media.get("contentType"))
+        .or_else(|| media.and_then(|media| media.get("mimeType")))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub(crate) fn persist_runtime_custody_creator_listing(
@@ -6718,6 +9511,37 @@ pub(crate) fn persist_runtime_custody_creator_listing(
     persist_runtime_custody_listing(data_dir, &expected)
 }
 
+/// Opens a purchase-ledger record file for read, refusing symlinks,
+/// non-regular files, and hard-linked files — the same discipline
+/// `open_runtime_media_source_file` applies to media source input.
+#[cfg(unix)]
+fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let opened = options.open(path).ok().and_then(|file| {
+        let metadata = file.metadata().ok()?;
+        (metadata.is_file() && metadata.nlink() == 1).then_some(file)
+    });
+    let Some(file) = opened else {
+        tracing::warn!(path = %path.display(), "purchase ledger record rejected");
+        anyhow::bail!("Runtime custody purchase is invalid");
+    };
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
+    let opened = fs::File::open(path).ok().and_then(|file| {
+        let metadata = file.metadata().ok()?;
+        metadata.is_file().then_some(file)
+    });
+    let Some(file) = opened else {
+        tracing::warn!(path = %path.display(), "purchase ledger record rejected");
+        anyhow::bail!("Runtime custody purchase is invalid");
+    };
+    Ok(file)
+}
+
 pub(crate) fn load_runtime_custody_purchase(
     data_dir: &Path,
     principal_id: &str,
@@ -6727,7 +9551,10 @@ pub(crate) fn load_runtime_custody_purchase(
     if !path.exists() {
         return Ok(None);
     }
-    let record: RuntimeCustodyPurchaseRecord = serde_json::from_slice(&fs::read(path)?)?;
+    let mut file = open_owner_only_runtime_record_file(&path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let record: RuntimeCustodyPurchaseRecord = serde_json::from_slice(&bytes)?;
     if record.schema != RUNTIME_PURCHASE_SCHEMA_V1 || record.principal_id != principal_id {
         anyhow::bail!("Runtime custody purchase is invalid");
     }
@@ -6765,8 +9592,8 @@ fn validate_runtime_custody_viewer_asset(
         || !purchase.operative.eq_ignore_ascii_case(&package.operative)
         || purchase.price != package.price
         || !purchase.pay_token.eq_ignore_ascii_case(&package.pay_token)
-        || purchase.buy_stage.chain_namespace != package.chain_namespace
-        || purchase.buy_stage.network != package.network
+        || purchase.acquisition_stage.chain_namespace != package.chain_namespace
+        || purchase.acquisition_stage.network != package.network
         || purchase
             .payment_processor
             .as_deref()
@@ -6795,10 +9622,90 @@ fn validate_runtime_custody_viewer_asset(
     package.decode_and_validate()
 }
 
+/// Test-only observability for the purchase-ledger lock: proves
+/// `persist_runtime_custody_purchase` callers for the *same* lock path never
+/// hold their critical section concurrently, without exposing anything from
+/// production builds. Keyed by lock path so unrelated tests running in
+/// parallel (distinct temp data dirs) cannot produce a false positive.
+/// Compiled out entirely outside `cfg(test)`.
+#[cfg(test)]
+static RUNTIME_PURCHASE_LOCK_TEST_STATE: OnceLock<StdMutex<HashMap<PathBuf, (usize, bool)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn runtime_purchase_lock_test_state() -> &'static StdMutex<HashMap<PathBuf, (usize, bool)>> {
+    RUNTIME_PURCHASE_LOCK_TEST_STATE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Held for the lifetime of one `persist_runtime_custody_purchase` critical
+/// section. Records entry/exit against `path`'s holder count and latches
+/// `true` if a second holder for the same path is ever observed while this
+/// one is still live — the exact overlap `ExclusiveFileLock` must prevent.
+/// The deliberate sleep widens the window: while this probe is alive the
+/// real OS-level `flock` is held, so every other thread contending for the
+/// same lock path is genuinely parked in the kernel, not merely lucky not to
+/// race. That turns "no overlap ever observed" from a probabilistic outcome
+/// into a deterministic one.
+#[cfg(test)]
+struct RuntimePurchaseLockTestProbe {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl RuntimePurchaseLockTestProbe {
+    fn enter(path: PathBuf) -> Self {
+        {
+            let mut state = runtime_purchase_lock_test_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = state.entry(path.clone()).or_insert((0, false));
+            entry.0 += 1;
+            if entry.0 > 1 {
+                entry.1 = true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimePurchaseLockTestProbe {
+    fn drop(&mut self) {
+        let mut state = runtime_purchase_lock_test_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = state.get_mut(&self.path) {
+            entry.0 -= 1;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_purchase_lock_test_overlap_detected(path: &Path) -> bool {
+    runtime_purchase_lock_test_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .is_some_and(|(_, overlapped)| *overlapped)
+}
+
 pub(crate) fn persist_runtime_custody_purchase(
     data_dir: &Path,
     purchase: &RuntimeCustodyPurchaseRecord,
 ) -> anyhow::Result<()> {
+    let lock_path = runtime_purchase_lock_path(data_dir, &purchase.principal_id);
+    #[cfg(unix)]
+    if let Some(parent) = lock_path.parent() {
+        ensure_owner_only_runtime_storage_parent(parent)?;
+    }
+    #[cfg(not(unix))]
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = ExclusiveFileLock::acquire(&lock_path)?;
+    #[cfg(test)]
+    let _lock_test_probe = RuntimePurchaseLockTestProbe::enter(lock_path.clone());
     write_owner_only_bytes(
         &runtime_purchase_path(
             data_dir,
@@ -6882,7 +9789,8 @@ fn validate_runtime_custody_viewer_record_identity(
         mint_id,
         &purchase,
     )?;
-    if runtime_protected_content_id(asset.media_identity.encrypted_content())? != record.content_id
+    if runtime_protected_content_id(asset.content_identity.encrypted_content())?
+        != record.content_id
     {
         anyhow::bail!("viewer record content does not match the durable mint");
     }
@@ -6891,14 +9799,22 @@ fn validate_runtime_custody_viewer_record_identity(
     if record.expires_at == 0 {
         anyhow::bail!("viewer record expiry is invalid");
     }
-    let max_media_part_index = u32::try_from(asset.media_identity.encrypted_segments().len())
-        .map_err(|_| anyhow::anyhow!("viewer record media position is invalid"))?
-        .saturating_add(1);
-    if record.next_media_part_index > max_media_part_index {
+    // Media parts are the init segment plus one per encrypted segment;
+    // object parts are chunks read strictly in order from 0, with no init
+    // part, so the ceiling is the chunk count itself.
+    let max_content_part_index = match &asset.content_identity {
+        RuntimeContentIdentityV1::Media(media_identity) => {
+            u32::try_from(media_identity.encrypted_segments().len())
+                .map_err(|_| anyhow::anyhow!("viewer record media position is invalid"))?
+                .saturating_add(1)
+        }
+        RuntimeContentIdentityV1::Object(object_identity) => object_identity.chunk_count(),
+    };
+    if record.next_media_part_index > max_content_part_index {
         anyhow::bail!("viewer record media position is invalid");
     }
     if record.lifecycle_status != RuntimeCustodyViewerLifecycleStatus::OpenPending {
-        let _ = record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
+        let _ = record.to_runtime_viewer_session(asset.content_identity.encrypted_content())?;
     }
     Ok((mint_id, listing))
 }
@@ -6940,7 +9856,7 @@ async fn settle_runtime_custody_viewer_cleanup(
     match record.lifecycle_status {
         RuntimeCustodyViewerLifecycleStatus::OpenPending => {
             let session =
-                record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
+                record.to_runtime_viewer_session(asset.content_identity.encrypted_content())?;
             let close_result = match record.open_pending_close_result() {
                 Some(RuntimeCustodyOpenPendingCloseResult::Closed) => {
                     RuntimeViewerSessionCloseResult::Closed
@@ -6997,7 +9913,7 @@ async fn settle_runtime_custody_viewer_cleanup(
         RuntimeCustodyViewerLifecycleStatus::Active
         | RuntimeCustodyViewerLifecycleStatus::CleanupPending => {
             let session =
-                record.to_runtime_viewer_session(asset.media_identity.encrypted_content())?;
+                record.to_runtime_viewer_session(asset.content_identity.encrypted_content())?;
             match close_viewer_session_with_result(&decrypt, &session).await {
                 Ok(result) => {
                     record.mark_terminal(result, crate::auth::now_ts());
@@ -7164,16 +10080,16 @@ fn reconstructed_buy_receipt(
             RightsActionV1::View,
             purchase.chain_namespace.clone(),
             purchase.network.clone(),
-            purchase.buy_stage.to.clone(),
-            purchase.buy_stage.value.clone(),
-            purchase.buy_stage.data.clone(),
+            purchase.acquisition_stage.to.clone(),
+            purchase.acquisition_stage.value.clone(),
+            purchase.acquisition_stage.data.clone(),
         )
         .map_err(|_| anyhow::anyhow!("Runtime custody chain evidence is invalid"))?,
         RuntimePurchaseEffectAuthority::new(
             purchase.principal_id.clone(),
             purchase.account_id.clone(),
             purchase.address.clone(),
-            purchase.buy_stage.approval_request_id.clone(),
+            purchase.acquisition_stage.approval_request_id.clone(),
         )
         .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?,
         terminal.wallet_binding.clone(),
@@ -7505,6 +10421,81 @@ async fn fetch_runtime_custody_open_media(
     Ok((media, init))
 }
 
+/// Object twin of [`fetch_runtime_custody_open_media`]. Fetches the published
+/// `object.epc1` and verifies the whole framed file against the identity the
+/// listing commits to (exact length and sha256) before a single byte of it is
+/// used; the caller then slices the framed header or one framed chunk out of
+/// it.
+///
+/// The whole file is fetched because an object is ONE published file, unlike
+/// media's separately-addressable segment files: a chunk read therefore
+/// re-fetches it and slices. A byte-ranged content fetch would avoid that
+/// (`ProviderByteRange` already exists on the content fetch path) but its
+/// semantics are honoured by the backing storage provider, not by this layer,
+/// so verifying the complete file against its committed digest is the only
+/// shape that keeps the "never use unverified published bytes" property
+/// without depending on range fidelity.
+async fn fetch_runtime_custody_open_object(
+    registry: &ProviderRegistry,
+    cid: &str,
+    expected: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<u8>> {
+    let framed = crate::content::fetch_bytes_via_provider(
+        registry,
+        cid,
+        Some(PROTECTED_CONTENT_OBJECT_EPC1_PATH),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
+    if framed.len() as u64 != expected.encrypted_content().ciphertext_bytes()
+        || Digest32::new(sha2::Sha256::digest(&framed).into())
+            != expected.encrypted_content().ciphertext_sha256()
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE);
+    }
+    Ok(framed)
+}
+
+/// The framed header block at offset 0 of a verified framed object.
+fn runtime_custody_object_framed_header(
+    framed: &[u8],
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+) -> anyhow::Result<Vec<u8>> {
+    let header_bytes = usize::try_from(object_identity.framed_header_bytes())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))?;
+    framed
+        .get(..header_bytes)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE))
+}
+
+/// One framed chunk of a verified framed object, addressed by chunk index.
+/// The byte ranges come from the custody crate's own
+/// `framed_chunk_ranges_v1`, the same arithmetic the sealer and the chunk
+/// decrypter use, rather than being re-derived here.
+fn runtime_custody_object_framed_chunk(
+    framed: &[u8],
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    chunk_index: u32,
+) -> anyhow::Result<Vec<u8>> {
+    const MESSAGE: &str = "Runtime custody viewer object chunk is invalid";
+    if chunk_index >= object_identity.chunk_count() {
+        anyhow::bail!(MESSAGE);
+    }
+    let range = elastos_protected_content_custody::framed_chunk_ranges_v1(
+        object_identity.framed_header_bytes(),
+        object_identity.plaintext_bytes(),
+    )
+    .nth(usize::try_from(chunk_index).map_err(|_| anyhow::anyhow!(MESSAGE))?)
+    .ok_or_else(|| anyhow::anyhow!(MESSAGE))?;
+    let start = usize::try_from(range.start).map_err(|_| anyhow::anyhow!(MESSAGE))?;
+    let end = usize::try_from(range.end).map_err(|_| anyhow::anyhow!(MESSAGE))?;
+    framed
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!(MESSAGE))
+}
+
 fn runtime_open_error(error: elastos_protected_content_runtime::RuntimeOpenError) -> anyhow::Error {
     match error {
         elastos_protected_content_runtime::RuntimeOpenError::WalletAuthority => {
@@ -7520,7 +10511,7 @@ fn runtime_open_error(error: elastos_protected_content_runtime::RuntimeOpenError
     }
 }
 
-fn parse_mint_id_hex(value: &str) -> anyhow::Result<Digest32> {
+pub(crate) fn parse_mint_id_hex(value: &str) -> anyhow::Result<Digest32> {
     let bytes = decode_hex_bytes(value)
         .map_err(|_| anyhow::anyhow!("Runtime custody mint identity is invalid"))?;
     let bytes: [u8; 32] = bytes
@@ -7587,9 +10578,19 @@ fn update_length_prefixed_session_field(
     Ok(())
 }
 
+/// Session binding v3: the preimage's viewer-capsule field is the verified
+/// `executable_actor` the caller was actually launched as (checked by the
+/// caller against the admitted viewer set — see `open_runtime_custody_viewer`
+/// and `gateway_provider_proxy`'s `is_protected_viewer_op` admission), not a
+/// hard-coded constant. v2 hard-coded `ELACITY_PLAYER_CAPSULE_ID` here, which
+/// made a second viewer (the object reader) structurally inadmissible: any
+/// binding derived for a non-player launch would simply never match one
+/// derived (with the same hard-coded constant) on the other side.
+#[allow(clippy::too_many_arguments)]
 fn derive_runtime_custody_session_binding(
     principal_id: &str,
     profile_did: &str,
+    executable_actor: &str,
     launch_id: &str,
     proof_binding_id: &str,
     session_id: &str,
@@ -7600,10 +10601,10 @@ fn derive_runtime_custody_session_binding(
         return Err(release_unavailable_missing!()());
     }
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"elastos.protected-content.runtime-session-binding.v2");
+    hasher.update(b"elastos.protected-content.runtime-session-binding.v3");
     update_length_prefixed_session_field(&mut hasher, principal_id.as_bytes())?;
     update_length_prefixed_session_field(&mut hasher, profile_did.as_bytes())?;
-    update_length_prefixed_session_field(&mut hasher, ELACITY_PLAYER_CAPSULE_ID.as_bytes())?;
+    update_length_prefixed_session_field(&mut hasher, executable_actor.as_bytes())?;
     update_length_prefixed_session_field(&mut hasher, launch_id.as_bytes())?;
     update_length_prefixed_session_field(&mut hasher, proof_binding_id.as_bytes())?;
     update_length_prefixed_session_field(&mut hasher, session_id.as_bytes())?;
@@ -7617,6 +10618,7 @@ fn derive_runtime_custody_session_binding(
 fn require_runtime_custody_session_binding(
     principal_id: &str,
     profile_did: &str,
+    executable_actor: &str,
     launch_id: Option<&str>,
     proof_binding_id: Option<&str>,
     session_id: Option<&str>,
@@ -7636,6 +10638,7 @@ fn require_runtime_custody_session_binding(
     derive_runtime_custody_session_binding(
         principal_id,
         profile_did,
+        executable_actor,
         launch_id,
         proof_binding_id,
         session_id,
@@ -7651,6 +10654,58 @@ fn valid_runtime_viewer_launch_id(value: &str) -> bool {
         .is_some_and(|suffix| suffix.len() == 32 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()))
 }
 
+/// Content kind discriminant on the viewer open response.
+///
+/// A viewer must never have to infer the shape of the session it just opened
+/// from which optional geometry fields happen to be present: the media
+/// response carries `mime_type`/`codecs`/`has_init_segment`/`segment_count`,
+/// and the object response (deferred with the object open path) carries its own
+/// chunk geometry instead. This field names the kind outright so each viewer
+/// can fail closed on the other one — `capsules/elacity-player` rejects
+/// anything but `"media"`.
+pub(crate) const RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA: &str = "media";
+
+/// The ONE viewer capsule admitted for a content kind. Media opens only in
+/// `elacity-player`, objects only in `elacity-reader`; there is no arm that
+/// admits both, and no default.
+fn expected_runtime_custody_viewer_capsule(
+    content_identity: &RuntimeContentIdentityV1,
+) -> &'static str {
+    match content_identity {
+        RuntimeContentIdentityV1::Media(_) => ELACITY_PLAYER_CAPSULE_ID,
+        RuntimeContentIdentityV1::Object(_) => ELACITY_READER_CAPSULE_ID,
+    }
+}
+
+/// Object twin of [`RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA`].
+pub(crate) const RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT: &str = "object";
+
+/// Object twin of [`runtime_custody_viewer_public_response`]. Carries the same
+/// five kind-independent fields in the same order (`schema`, `content_kind`,
+/// `mint_id`, `viewer_session_handle`, `expires_at`) and then the geometry a
+/// reader needs to walk the content: its declared content type, the plaintext
+/// size it decrypts to, how many chunks that is, and the plaintext chunk size
+/// every chunk but the last one has. Media's own four geometry fields
+/// (`mime_type`/`codecs`/`has_init_segment`/`segment_count`) are untouched.
+fn runtime_custody_viewer_object_public_response(
+    object_identity: &ChunkedPayloadObjectIdentityV1,
+    mint_id: Digest32,
+    viewer_session_handle: &[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    expires_at: u64,
+) -> anyhow::Result<Value> {
+    Ok(json!({
+        "schema": "elastos.library.runtime-custody-viewer/v1",
+        "content_kind": RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT,
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "viewer_session_handle": hex::encode(viewer_session_handle),
+        "expires_at": expires_at,
+        "content_type": object_identity.content_type(),
+        "plaintext_bytes": object_identity.plaintext_bytes(),
+        "chunk_count": object_identity.chunk_count(),
+        "chunk_plaintext_bytes": MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
+    }))
+}
+
 fn runtime_custody_viewer_public_response(
     media_identity: &CencFmp4MediaIdentityV1,
     mint_id: Digest32,
@@ -7661,6 +10716,7 @@ fn runtime_custody_viewer_public_response(
         .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
     Ok(json!({
         "schema": "elastos.library.runtime-custody-viewer/v1",
+        "content_kind": RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA,
         "mint_id": hex::encode(mint_id.as_bytes()),
         "viewer_session_handle": hex::encode(viewer_session_handle),
         "expires_at": expires_at,
@@ -7692,6 +10748,19 @@ fn runtime_purchase_path(data_dir: &Path, principal_id: &str, mint_id: Digest32)
         .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
 }
 
+/// The lock file guarding a principal's purchase-ledger directory. Every
+/// `persist_runtime_custody_purchase` call for this principal serializes
+/// through this lock before writing, so two concurrent purchase writes never
+/// race on the durable record's rename.
+fn runtime_purchase_lock_path(data_dir: &Path, principal_id: &str) -> PathBuf {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(principal_id.as_bytes());
+    data_dir
+        .join(RUNTIME_PURCHASE_ROOT)
+        .join(hex::encode(hasher.finalize()))
+        .join(".lock")
+}
+
 fn runtime_viewer_path(data_dir: &Path, principal_id: &str, mint_id: Digest32) -> PathBuf {
     let mut hasher = sha2::Sha256::new();
     hasher.update(principal_id.as_bytes());
@@ -7708,6 +10777,8 @@ fn runtime_storage_write_error(reason: String) -> anyhow::Error {
 
 #[cfg(unix)]
 fn ensure_owner_only_runtime_storage_parent(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
     let mut missing = Vec::new();
     let mut cursor = path;
     loop {
@@ -7737,8 +10808,23 @@ fn ensure_owner_only_runtime_storage_parent(path: &Path) -> anyhow::Result<()> {
             .ok_or_else(|| runtime_storage_write_error("parent path is unavailable".to_string()))?;
     }
     for dir in missing.iter().rev() {
-        fs::create_dir(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        // A sibling writer racing to bootstrap the same directory chain (for
+        // example, another principal's first purchase creating the shared
+        // `runtime-purchases/` root) may have created this exact level
+        // between our existence check above and this call. Create with mode
+        // 0700 atomically (the same idiom `create_owner_only_directory` uses
+        // elsewhere in this codebase) rather than `mkdir` then `chmod`: a
+        // losing racer's `AlreadyExists` is only ever returned after the
+        // winner's `mkdir(..., 0700)` has already completed in the kernel,
+        // so there is no window where the directory briefly has loose
+        // default permissions for the validation pass below to observe.
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     for dir in missing {
         let metadata = fs::symlink_metadata(&dir)
@@ -7804,7 +10890,11 @@ fn write_owner_only_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     {
         let temp_path = runtime_storage_temp_path(path)?;
         let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true).mode(0o600);
+        options
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let mut file = options.open(&temp_path)?;
         let result = (|| -> anyhow::Result<()> {
             file.write_all(bytes)?;

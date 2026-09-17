@@ -12,6 +12,11 @@ use crate::media::{
     CencFmp4MediaIdentityV1, ValidatedCencFmp4MediaSessionLayoutV1,
     MAX_CENC_FMP4_MEDIA_IDENTITY_BYTES_V1,
 };
+use crate::object::{
+    ChunkedPayloadObjectIdentityV1, MAX_CHUNKED_PAYLOAD_OBJECT_IDENTITY_BYTES_V1,
+    MAX_OBJECT_FRAMED_CHUNK_BYTES_V1, MAX_OBJECT_FRAMED_HEADER_BYTES_V1,
+    MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
+};
 use crate::wire::{
     contract_decode_error, decode_json, encode_json, validate_schema, validate_time_window,
     CanonicalBlob, CanonicalBlobList, OpaqueHandleV1, ProviderFailureCodeV1,
@@ -39,6 +44,10 @@ type SignedNodeContributionBlobListV1 = CanonicalBlobList<
     MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1,
 >;
 type SignedTerminalReceiptBlobV1 = CanonicalBlob<MAX_SIGNED_TERMINAL_RECEIPT_BYTES_V1>;
+type ObjectIdentityBlobV1 = CanonicalBlob<MAX_CHUNKED_PAYLOAD_OBJECT_IDENTITY_BYTES_V1>;
+type ObjectFramedHeaderBlobV1 = CanonicalBlob<MAX_OBJECT_FRAMED_HEADER_BYTES_V1>;
+type ObjectFramedChunkBlobV1 = CanonicalBlob<MAX_OBJECT_FRAMED_CHUNK_BYTES_V1>;
+type ObjectPlaintextChunkBlobV1 = CanonicalBlob<MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1>;
 
 fn decode_rights_action(value: u8) -> Result<RightsActionV1, ContractError> {
     match value {
@@ -57,6 +66,7 @@ pub enum DecryptProviderRequestOpV1 {
     ReadViewerMediaPart,
     CancelPreparedRecipient,
     CloseViewerSession,
+    ReadViewerObjectChunk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,8 +171,14 @@ enum DecryptProviderRequestKindV1 {
         signed_runtime_release_operation: SignedRuntimeReleaseOperationBlobV1,
         expected_terminal_issuer: [u8; 32],
         content_key_commitment: [u8; 32],
-        media_identity: MediaIdentityBlobV1,
-        protected_init_segment: MediaPartBlobV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_identity: Option<MediaIdentityBlobV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protected_init_segment: Option<MediaPartBlobV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object_identity: Option<ObjectIdentityBlobV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        framed_header: Option<ObjectFramedHeaderBlobV1>,
         signed_node_contributions: SignedNodeContributionBlobListV1,
         signed_terminal_receipt: SignedTerminalReceiptBlobV1,
     },
@@ -181,6 +197,13 @@ enum DecryptProviderRequestKindV1 {
         schema: String,
         audit_request_id: [u8; 32],
         viewer_session_handle: OpaqueHandleV1,
+    },
+    ReadViewerObjectChunk {
+        schema: String,
+        audit_request_id: [u8; 32],
+        session_handle: OpaqueHandleV1,
+        chunk_index: u32,
+        framed_chunk: ObjectFramedChunkBlobV1,
     },
 }
 
@@ -201,6 +224,9 @@ impl DecryptProviderRequestV1 {
             }
             DecryptProviderRequestKindV1::CloseViewerSession { .. } => {
                 DecryptProviderRequestOpV1::CloseViewerSession
+            }
+            DecryptProviderRequestKindV1::ReadViewerObjectChunk { .. } => {
+                DecryptProviderRequestOpV1::ReadViewerObjectChunk
             }
         }
     }
@@ -252,8 +278,47 @@ impl DecryptProviderRequestV1 {
             )?,
             expected_terminal_issuer: *expected_terminal_issuer.as_bytes(),
             content_key_commitment: *content_key_commitment.as_bytes(),
-            media_identity: CanonicalBlob::from_contract(media_identity)?,
-            protected_init_segment: MediaPartBlobV1::new(protected_init_segment.to_vec())?,
+            media_identity: Some(CanonicalBlob::from_contract(media_identity)?),
+            protected_init_segment: Some(MediaPartBlobV1::new(protected_init_segment.to_vec())?),
+            object_identity: None,
+            framed_header: None,
+            signed_node_contributions: CanonicalBlobList::new(contributions)?,
+            signed_terminal_receipt: CanonicalBlob::from_contract(signed_terminal_receipt)?,
+        });
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the protocol requires these independently validated signed and object bindings"
+    )]
+    pub fn new_open_viewer_session_for_object(
+        prepared_recipient_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+        signed_runtime_release_operation: &SignedRuntimeReleaseOperationV1,
+        expected_terminal_issuer: TerminalReceiptIssuerKey,
+        content_key_commitment: Digest32,
+        object_identity: &ChunkedPayloadObjectIdentityV1,
+        framed_header: &[u8],
+        signed_node_contributions: &[SignedNodeContributionV1],
+        signed_terminal_receipt: &SignedTerminalReceiptV1,
+    ) -> Result<Self, ContractError> {
+        let contributions = signed_node_contributions
+            .iter()
+            .map(CanonicalBlob::from_contract)
+            .collect::<Result<Vec<SignedNodeContributionBlobV1>, _>>()?;
+        let value = Self(DecryptProviderRequestKindV1::OpenViewerSession {
+            schema: DECRYPT_PROVIDER_REQUEST_SCHEMA_V1.to_string(),
+            prepared_recipient_handle: OpaqueHandleV1::new(prepared_recipient_handle)?,
+            signed_runtime_release_operation: CanonicalBlob::from_contract(
+                signed_runtime_release_operation,
+            )?,
+            expected_terminal_issuer: *expected_terminal_issuer.as_bytes(),
+            content_key_commitment: *content_key_commitment.as_bytes(),
+            media_identity: None,
+            protected_init_segment: None,
+            object_identity: Some(CanonicalBlob::from_contract(object_identity)?),
+            framed_header: Some(ObjectFramedHeaderBlobV1::new(framed_header.to_vec())?),
             signed_node_contributions: CanonicalBlobList::new(contributions)?,
             signed_terminal_receipt: CanonicalBlob::from_contract(signed_terminal_receipt)?,
         });
@@ -302,6 +367,23 @@ impl DecryptProviderRequestV1 {
         Ok(value)
     }
 
+    pub fn new_read_viewer_object_chunk(
+        audit_request_id: RuntimeReleaseAuditIdV1,
+        session_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+        chunk_index: u32,
+        framed_chunk: &[u8],
+    ) -> Result<Self, ContractError> {
+        let value = Self(DecryptProviderRequestKindV1::ReadViewerObjectChunk {
+            schema: DECRYPT_PROVIDER_REQUEST_SCHEMA_V1.to_string(),
+            audit_request_id: *audit_request_id.digest().as_bytes(),
+            session_handle: OpaqueHandleV1::new(session_handle)?,
+            chunk_index,
+            framed_chunk: ObjectFramedChunkBlobV1::new(framed_chunk.to_vec())?,
+        });
+        value.validate_structure()?;
+        Ok(value)
+    }
+
     pub fn to_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
         encode_json(self)
     }
@@ -318,6 +400,9 @@ impl DecryptProviderRequestV1 {
                 audit_request_id, ..
             }
             | DecryptProviderRequestKindV1::ReadViewerMediaPart {
+                audit_request_id, ..
+            }
+            | DecryptProviderRequestKindV1::ReadViewerObjectChunk {
                 audit_request_id, ..
             } => RuntimeReleaseAuditIdV1::new(elastos_protected_content_contracts::Digest32::new(
                 *audit_request_id,
@@ -429,7 +514,10 @@ impl DecryptProviderRequestV1 {
     fn media_identity(&self) -> Result<CencFmp4MediaIdentityV1, ContractError> {
         match &self.0 {
             DecryptProviderRequestKindV1::OpenViewerSession { media_identity, .. } => {
-                media_identity.decode()
+                media_identity
+                    .as_ref()
+                    .ok_or(ContractError::InvalidField("media_identity"))?
+                    .decode()
             }
             _ => Err(ContractError::InvalidField("media_identity")),
         }
@@ -440,8 +528,35 @@ impl DecryptProviderRequestV1 {
             DecryptProviderRequestKindV1::OpenViewerSession {
                 protected_init_segment,
                 ..
-            } => Ok(protected_init_segment.as_slice()),
+            } => Ok(protected_init_segment
+                .as_ref()
+                .ok_or(ContractError::InvalidField("protected_init_segment"))?
+                .as_slice()),
             _ => Err(ContractError::InvalidField("protected_init_segment")),
+        }
+    }
+
+    fn object_identity(&self) -> Result<ChunkedPayloadObjectIdentityV1, ContractError> {
+        match &self.0 {
+            DecryptProviderRequestKindV1::OpenViewerSession {
+                object_identity, ..
+            } => object_identity
+                .as_ref()
+                .ok_or(ContractError::InvalidField("object_identity"))?
+                .decode(),
+            _ => Err(ContractError::InvalidField("object_identity")),
+        }
+    }
+
+    fn framed_header(&self) -> Result<&[u8], ContractError> {
+        match &self.0 {
+            DecryptProviderRequestKindV1::OpenViewerSession { framed_header, .. } => {
+                Ok(framed_header
+                    .as_ref()
+                    .ok_or(ContractError::InvalidField("framed_header"))?
+                    .as_slice())
+            }
+            _ => Err(ContractError::InvalidField("framed_header")),
         }
     }
 
@@ -513,7 +628,14 @@ impl DecryptProviderRequestV1 {
                 )?;
                 Ok(())
             }
-            DecryptProviderRequestKindV1::OpenViewerSession { schema, .. } => {
+            DecryptProviderRequestKindV1::OpenViewerSession {
+                schema,
+                media_identity,
+                protected_init_segment,
+                object_identity,
+                framed_header,
+                ..
+            } => {
                 validate_schema(
                     schema,
                     DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
@@ -523,8 +645,29 @@ impl DecryptProviderRequestV1 {
                 let _ = self.signed_runtime_release_operation()?;
                 let _ = self.expected_terminal_issuer()?;
                 let _ = self.content_key_commitment()?;
-                let _ = self.media_identity()?;
-                let _ = self.protected_init_segment()?;
+                let is_media = media_identity.is_some();
+                let is_object = object_identity.is_some();
+                if is_media == is_object {
+                    return Err(ContractError::InvalidField("content"));
+                }
+                if is_media != protected_init_segment.is_some() {
+                    return Err(ContractError::InvalidField("protected_init_segment"));
+                }
+                if is_object != framed_header.is_some() {
+                    return Err(ContractError::InvalidField("framed_header"));
+                }
+                if is_media {
+                    let _ = self.media_identity()?;
+                    let _ = self.protected_init_segment()?;
+                } else {
+                    let decoded_object_identity = self.object_identity()?;
+                    let framed_header_bytes = self.framed_header()?;
+                    if framed_header_bytes.len() as u32
+                        != decoded_object_identity.framed_header_bytes()
+                    {
+                        return Err(ContractError::InvalidField("framed_header"));
+                    }
+                }
                 let _ = self.signed_node_contributions()?;
                 let _ = self.signed_terminal_receipt()?;
                 Ok(())
@@ -558,6 +701,15 @@ impl DecryptProviderRequestV1 {
                 )?;
                 self.audit_request_id()?;
                 self.viewer_session_handle()?;
+                Ok(())
+            }
+            DecryptProviderRequestKindV1::ReadViewerObjectChunk { schema, .. } => {
+                validate_schema(
+                    schema,
+                    DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
+                    "decrypt_provider_request.schema",
+                )?;
+                self.audit_request_id()?;
                 Ok(())
             }
         }
@@ -613,6 +765,8 @@ impl DecryptProviderRequestV1 {
                 content_key_commitment,
                 media_identity,
                 protected_init_segment,
+                object_identity,
+                framed_header,
                 signed_node_contributions,
                 signed_terminal_receipt,
                 ..
@@ -624,21 +778,56 @@ impl DecryptProviderRequestV1 {
                 let expected_terminal_issuer =
                     TerminalReceiptIssuerKey::new(expected_terminal_issuer)?;
                 let content_key_commitment = Digest32::new(content_key_commitment);
-                let media_identity: CencFmp4MediaIdentityV1 = media_identity.decode()?;
-                if media_identity.encrypted_content()
-                    != authenticated_runtime_release_operation
-                        .statement()
-                        .release_request()
-                        .binding()
-                        .encrypted_content()
-                {
-                    return Err(ContractError::InvalidField("media_identity"));
-                }
-                let media_session_layout = ValidatedCencFmp4MediaSessionLayoutV1::new(
-                    &media_identity,
-                    protected_init_segment.as_slice(),
-                )
-                .map_err(|_| ContractError::InvalidField("protected_init_segment"))?;
+                let bound_encrypted_content = authenticated_runtime_release_operation
+                    .statement()
+                    .release_request()
+                    .binding()
+                    .encrypted_content();
+                let (media_session_layout, protected_init_segment, object_identity, framed_header) =
+                    match (
+                        media_identity,
+                        protected_init_segment,
+                        object_identity,
+                        framed_header,
+                    ) {
+                        (Some(media_identity), Some(protected_init_segment), None, None) => {
+                            let media_identity: CencFmp4MediaIdentityV1 =
+                                media_identity.decode()?;
+                            if media_identity.encrypted_content() != bound_encrypted_content {
+                                return Err(ContractError::InvalidField("media_identity"));
+                            }
+                            let media_session_layout = ValidatedCencFmp4MediaSessionLayoutV1::new(
+                                &media_identity,
+                                protected_init_segment.as_slice(),
+                            )
+                            .map_err(|_| ContractError::InvalidField("protected_init_segment"))?;
+                            (
+                                Some(Box::new(media_session_layout)),
+                                Some(protected_init_segment),
+                                None,
+                                None,
+                            )
+                        }
+                        (None, None, Some(object_identity), Some(framed_header)) => {
+                            let object_identity: ChunkedPayloadObjectIdentityV1 =
+                                object_identity.decode()?;
+                            if object_identity.encrypted_content() != bound_encrypted_content {
+                                return Err(ContractError::InvalidField("object_identity"));
+                            }
+                            if framed_header.as_slice().len() as u32
+                                != object_identity.framed_header_bytes()
+                            {
+                                return Err(ContractError::InvalidField("framed_header"));
+                            }
+                            (
+                                None,
+                                None,
+                                Some(Box::new(object_identity)),
+                                Some(framed_header),
+                            )
+                        }
+                        _ => return Err(ContractError::InvalidField("content")),
+                    };
                 let signed_node_contributions: Vec<SignedNodeContributionV1> =
                     signed_node_contributions
                         .iter()
@@ -679,8 +868,10 @@ impl DecryptProviderRequestV1 {
                         ),
                         expected_terminal_issuer,
                         content_key_commitment,
-                        media_session_layout: Box::new(media_session_layout),
+                        media_session_layout,
                         protected_init_segment,
+                        object_identity,
+                        framed_header,
                         signed_node_contributions,
                         signed_terminal_receipt: Box::new(signed_terminal_receipt),
                     },
@@ -724,6 +915,22 @@ impl DecryptProviderRequestV1 {
                     viewer_session_handle,
                 },
             )),
+            DecryptProviderRequestKindV1::ReadViewerObjectChunk {
+                audit_request_id,
+                session_handle,
+                chunk_index,
+                framed_chunk,
+                ..
+            } => Ok(ValidatedDecryptProviderRequestV1(
+                ValidatedDecryptProviderRequestKindV1::ReadViewerObjectChunk {
+                    audit_request_id: RuntimeReleaseAuditIdV1::new(
+                        elastos_protected_content_contracts::Digest32::new(audit_request_id),
+                    )?,
+                    session_handle,
+                    chunk_index,
+                    framed_chunk,
+                },
+            )),
         }
     }
 }
@@ -752,8 +959,10 @@ enum ValidatedDecryptProviderRequestKindV1 {
         authenticated_runtime_release_operation: Box<AuthenticatedRuntimeReleaseOperationV1>,
         expected_terminal_issuer: TerminalReceiptIssuerKey,
         content_key_commitment: Digest32,
-        media_session_layout: Box<ValidatedCencFmp4MediaSessionLayoutV1>,
-        protected_init_segment: MediaPartBlobV1,
+        media_session_layout: Option<Box<ValidatedCencFmp4MediaSessionLayoutV1>>,
+        protected_init_segment: Option<MediaPartBlobV1>,
+        object_identity: Option<Box<ChunkedPayloadObjectIdentityV1>>,
+        framed_header: Option<ObjectFramedHeaderBlobV1>,
         signed_node_contributions: Vec<SignedNodeContributionV1>,
         signed_terminal_receipt: Box<SignedTerminalReceiptV1>,
     },
@@ -769,6 +978,12 @@ enum ValidatedDecryptProviderRequestKindV1 {
     CloseViewerSession {
         audit_request_id: RuntimeReleaseAuditIdV1,
         viewer_session_handle: OpaqueHandleV1,
+    },
+    ReadViewerObjectChunk {
+        audit_request_id: RuntimeReleaseAuditIdV1,
+        session_handle: OpaqueHandleV1,
+        chunk_index: u32,
+        framed_chunk: ObjectFramedChunkBlobV1,
     },
 }
 
@@ -811,6 +1026,9 @@ impl ValidatedDecryptProviderRequestV1 {
             ValidatedDecryptProviderRequestKindV1::CloseViewerSession { .. } => {
                 DecryptProviderRequestOpV1::CloseViewerSession
             }
+            ValidatedDecryptProviderRequestKindV1::ReadViewerObjectChunk { .. } => {
+                DecryptProviderRequestOpV1::ReadViewerObjectChunk
+            }
         }
     }
 
@@ -828,6 +1046,10 @@ impl ValidatedDecryptProviderRequestV1 {
             }
             | ValidatedDecryptProviderRequestKindV1::ReadViewerMediaPart {
                 audit_request_id, ..
+            }
+            | ValidatedDecryptProviderRequestKindV1::ReadViewerObjectChunk {
+                audit_request_id,
+                ..
             } => *audit_request_id,
             ValidatedDecryptProviderRequestKindV1::OpenViewerSession {
                 authenticated_runtime_release_operation,
@@ -940,7 +1162,9 @@ impl ValidatedDecryptProviderRequestV1 {
             ValidatedDecryptProviderRequestKindV1::OpenViewerSession {
                 media_session_layout,
                 ..
-            } => Ok(media_session_layout.as_ref()),
+            } => media_session_layout
+                .as_deref()
+                .ok_or(ContractError::InvalidField("media_session_layout")),
             _ => Err(ContractError::InvalidField("media_session_layout")),
         }
     }
@@ -950,8 +1174,63 @@ impl ValidatedDecryptProviderRequestV1 {
             ValidatedDecryptProviderRequestKindV1::OpenViewerSession {
                 protected_init_segment,
                 ..
-            } => Ok(protected_init_segment.as_slice()),
+            } => Ok(protected_init_segment
+                .as_ref()
+                .ok_or(ContractError::InvalidField("protected_init_segment"))?
+                .as_slice()),
             _ => Err(ContractError::InvalidField("protected_init_segment")),
+        }
+    }
+
+    pub fn object_identity(&self) -> Result<&ChunkedPayloadObjectIdentityV1, ContractError> {
+        match &self.0 {
+            ValidatedDecryptProviderRequestKindV1::OpenViewerSession {
+                object_identity, ..
+            } => object_identity
+                .as_deref()
+                .ok_or(ContractError::InvalidField("object_identity")),
+            _ => Err(ContractError::InvalidField("object_identity")),
+        }
+    }
+
+    pub fn framed_header(&self) -> Result<&[u8], ContractError> {
+        match &self.0 {
+            ValidatedDecryptProviderRequestKindV1::OpenViewerSession { framed_header, .. } => {
+                Ok(framed_header
+                    .as_ref()
+                    .ok_or(ContractError::InvalidField("framed_header"))?
+                    .as_slice())
+            }
+            _ => Err(ContractError::InvalidField("framed_header")),
+        }
+    }
+
+    pub fn session_handle(
+        &self,
+    ) -> Result<&[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1], ContractError> {
+        match &self.0 {
+            ValidatedDecryptProviderRequestKindV1::ReadViewerObjectChunk {
+                session_handle, ..
+            } => Ok(session_handle.as_bytes()),
+            _ => Err(ContractError::InvalidField("session_handle")),
+        }
+    }
+
+    pub fn chunk_index(&self) -> Result<u32, ContractError> {
+        match &self.0 {
+            ValidatedDecryptProviderRequestKindV1::ReadViewerObjectChunk {
+                chunk_index, ..
+            } => Ok(*chunk_index),
+            _ => Err(ContractError::InvalidField("chunk_index")),
+        }
+    }
+
+    pub fn framed_chunk(&self) -> Result<&[u8], ContractError> {
+        match &self.0 {
+            ValidatedDecryptProviderRequestKindV1::ReadViewerObjectChunk {
+                framed_chunk, ..
+            } => Ok(framed_chunk.as_slice()),
+            _ => Err(ContractError::InvalidField("framed_chunk")),
         }
     }
 
@@ -1010,6 +1289,7 @@ pub enum DecryptProviderResponseStatusV1 {
     PreparedRecipientAlreadyAbsent,
     ClosedViewerSession,
     ViewerSessionAlreadyAbsent,
+    ViewerObjectChunk,
     Failure,
 }
 
@@ -1058,6 +1338,11 @@ enum DecryptProviderResponseKindV1 {
         audit_request_id: [u8; 32],
         viewer_session_handle: OpaqueHandleV1,
     },
+    ViewerObjectChunk {
+        schema: String,
+        audit_request_id: [u8; 32],
+        plaintext: ObjectPlaintextChunkBlobV1,
+    },
     Failure {
         schema: String,
         audit_request_id: [u8; 32],
@@ -1079,6 +1364,9 @@ impl DecryptProviderResponseV1 {
             }
             DecryptProviderResponseKindV1::CancelledPreparedRecipient { .. } => {
                 DecryptProviderResponseStatusV1::CancelledPreparedRecipient
+            }
+            DecryptProviderResponseKindV1::ViewerObjectChunk { .. } => {
+                DecryptProviderResponseStatusV1::ViewerObjectChunk
             }
             DecryptProviderResponseKindV1::PreparedRecipientAlreadyAbsent { .. } => {
                 DecryptProviderResponseStatusV1::PreparedRecipientAlreadyAbsent
@@ -1196,6 +1484,28 @@ impl DecryptProviderResponseV1 {
         Ok(value)
     }
 
+    pub fn new_viewer_object_chunk(
+        audit_request_id: RuntimeReleaseAuditIdV1,
+        plaintext: Vec<u8>,
+    ) -> Result<Self, ContractError> {
+        let value = Self(DecryptProviderResponseKindV1::ViewerObjectChunk {
+            schema: DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1.to_string(),
+            audit_request_id: *audit_request_id.digest().as_bytes(),
+            plaintext: ObjectPlaintextChunkBlobV1::new(plaintext)?,
+        });
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn plaintext(&self) -> Result<&[u8], ContractError> {
+        match &self.0 {
+            DecryptProviderResponseKindV1::ViewerObjectChunk { plaintext, .. } => {
+                Ok(plaintext.as_slice())
+            }
+            _ => Err(ContractError::InvalidField("plaintext")),
+        }
+    }
+
     pub fn new_failure(
         audit_request_id: RuntimeReleaseAuditIdV1,
         code: ProviderFailureCodeV1,
@@ -1231,6 +1541,9 @@ impl DecryptProviderResponseV1 {
                 audit_request_id, ..
             }
             | DecryptProviderResponseKindV1::ViewerSessionAlreadyAbsent {
+                audit_request_id, ..
+            }
+            | DecryptProviderResponseKindV1::ViewerObjectChunk {
                 audit_request_id, ..
             }
             | DecryptProviderResponseKindV1::Failure {
@@ -1397,6 +1710,16 @@ impl DecryptProviderResponseV1 {
                 self.prepared_recipient_handle()?;
                 Ok(())
             }
+            DecryptProviderResponseKindV1::ViewerObjectChunk { schema, .. } => {
+                validate_schema(
+                    schema,
+                    DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
+                    "decrypt_provider_response.schema",
+                )?;
+                self.audit_request_id()?;
+                let _ = self.plaintext()?;
+                Ok(())
+            }
             DecryptProviderResponseKindV1::Failure { schema, .. } => {
                 validate_schema(
                     schema,
@@ -1436,19 +1759,23 @@ impl<'de> Deserialize<'de> for DecryptProviderResponseV1 {
 mod tests {
     use crate::{
         test_support::{
-            custody_envelope_for_media, custody_envelope_for_seed, make_signed_node_contribution,
+            custody_envelope_for_encrypted_content, custody_envelope_for_media,
+            custody_envelope_for_seed, digest, make_signed_node_contribution,
             make_signed_runtime_release_operation,
             make_signed_runtime_release_operation_for_envelope_and_seed,
             make_signed_terminal_receipt, media_components, media_identity, recipient_identity,
             recipient_public_key, runtime_operation_issuer_for_seed,
         },
-        DecryptProviderRequestOpV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
-        DecryptProviderResponseV1, ProviderFailureCodeV1, ValidatedDecryptProviderRequestV1,
-        ViewerMediaPartSelectorV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
-        MAX_VIEWER_MEDIA_PART_BYTES_V1,
+        ChunkedPayloadObjectIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
+        DecryptProviderResponseStatusV1, DecryptProviderResponseV1, ProviderFailureCodeV1,
+        ValidatedDecryptProviderRequestV1, ViewerMediaPartSelectorV1,
+        MAX_OBJECT_FRAMED_CHUNK_BYTES_V1, MAX_OBJECT_FRAMED_HEADER_BYTES_V1,
+        MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1, MAX_PROVIDER_FRAME_BYTES_V1,
+        MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, MAX_VIEWER_MEDIA_PART_BYTES_V1,
     };
     use elastos_protected_content_contracts::{
-        CanonicalContract, RuntimeReleaseAuditIdV1, SignedRuntimeReleaseOperationV1,
+        CanonicalContract, EncryptedContentIdentityV1, RuntimeReleaseAuditIdV1,
+        SignedRuntimeReleaseOperationV1,
     };
 
     fn handle(seed: u8) -> [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1] {
@@ -2026,5 +2353,207 @@ mod tests {
             failure.failure_code().unwrap(),
             ProviderFailureCodeV1::NotConfigured
         );
+    }
+
+    fn object_identity_for(seed: u8, plaintext_bytes: u64) -> ChunkedPayloadObjectIdentityV1 {
+        ChunkedPayloadObjectIdentityV1::new(
+            EncryptedContentIdentityV1::new(digest(seed), plaintext_bytes + 64).unwrap(),
+            "application/octet-stream",
+            plaintext_bytes,
+            64,
+        )
+        .unwrap()
+    }
+
+    fn object_open_fixture(
+        seed: u8,
+    ) -> (
+        ChunkedPayloadObjectIdentityV1,
+        Vec<u8>,
+        elastos_protected_content_contracts::CustodyEnvelopeV1,
+        SignedRuntimeReleaseOperationV1,
+    ) {
+        let object_identity = object_identity_for(seed, 4096);
+        let framed_header = vec![seed; 64];
+        let custody_envelope = custody_envelope_for_encrypted_content(
+            object_identity.encrypted_content().clone(),
+            seed,
+        );
+        let operation =
+            make_signed_runtime_release_operation_for_envelope_and_seed(0x42, &custody_envelope);
+        (object_identity, framed_header, custody_envelope, operation)
+    }
+
+    #[test]
+    fn decrypt_open_request_for_object_round_trips_and_enforces_exactly_one_content() {
+        let (object_identity, framed_header, custody_envelope, operation) =
+            object_open_fixture(0x71);
+        let contributions = vec![
+            make_signed_node_contribution(&operation, 1),
+            make_signed_node_contribution(&operation, 2),
+        ];
+        let terminal = make_signed_terminal_receipt(&operation, &contributions, 0x61);
+        let request = DecryptProviderRequestV1::new_open_viewer_session_for_object(
+            handle(0x21),
+            &operation,
+            terminal.statement().issuer(),
+            custody_envelope.manifest().content_key_commitment(),
+            &object_identity,
+            &framed_header,
+            &contributions,
+            &terminal,
+        )
+        .unwrap();
+        let request_json = request.to_json_vec().unwrap();
+        let request_text = String::from_utf8(request_json.clone()).unwrap();
+        assert!(!request_text.contains("media_identity"));
+        assert!(!request_text.contains("protected_init_segment"));
+
+        let decoded = DecryptProviderRequestV1::decode_wire(&request_json).unwrap();
+        assert_eq!(decoded, request);
+        let validated = decode_request(&request_json).unwrap();
+        assert_eq!(
+            validated.op(),
+            DecryptProviderRequestOpV1::OpenViewerSession
+        );
+        assert_eq!(validated.object_identity().unwrap(), &object_identity);
+        assert_eq!(validated.framed_header().unwrap(), framed_header.as_slice());
+        assert!(validated.media_session_layout().is_err());
+        assert!(validated.protected_init_segment().is_err());
+
+        // Both media and object content present: rejected.
+        let media_identity = crate::test_support::media_identity(0x11);
+        let (init_segment, _, _, _) = media_components(0x11);
+        let mut both = serde_json::from_slice::<serde_json::Value>(&request_json).unwrap();
+        both["media_identity"] = serde_json::json!(media_identity.canonical_bytes().unwrap());
+        both["protected_init_segment"] = serde_json::json!(init_segment);
+        assert!(decode_request(&serde_json::to_vec(&both).unwrap()).is_err());
+
+        // Neither media nor object content present: rejected.
+        let mut neither = serde_json::from_slice::<serde_json::Value>(&request_json).unwrap();
+        neither.as_object_mut().unwrap().remove("object_identity");
+        neither.as_object_mut().unwrap().remove("framed_header");
+        assert!(decode_request(&serde_json::to_vec(&neither).unwrap()).is_err());
+
+        // framed_header length must match the identity's declared framed_header_bytes.
+        let mut wrong_header_len =
+            serde_json::from_slice::<serde_json::Value>(&request_json).unwrap();
+        wrong_header_len["framed_header"] = serde_json::json!(vec![0x11u8; 63]);
+        assert!(decode_request(&serde_json::to_vec(&wrong_header_len).unwrap()).is_err());
+
+        // framed_header exceeding the CanonicalBlob bound is rejected structurally.
+        let mut oversized_header =
+            serde_json::from_slice::<serde_json::Value>(&request_json).unwrap();
+        oversized_header["framed_header"] =
+            serde_json::json!(vec![0x11u8; MAX_OBJECT_FRAMED_HEADER_BYTES_V1 + 1]);
+        assert!(decode_request(&serde_json::to_vec(&oversized_header).unwrap()).is_err());
+
+        // object_identity not bound to the operation's encrypted content: rejected.
+        let wrong_object_identity = object_identity_for(0x72, 4096);
+        let wrong_object_request = DecryptProviderRequestV1::new_open_viewer_session_for_object(
+            handle(0x21),
+            &operation,
+            terminal.statement().issuer(),
+            custody_envelope.manifest().content_key_commitment(),
+            &wrong_object_identity,
+            &framed_header,
+            &contributions,
+            &terminal,
+        )
+        .unwrap();
+        assert!(decode_request(&wrong_object_request.to_json_vec().unwrap()).is_err());
+
+        let mut unknown = serde_json::from_slice::<serde_json::Value>(&request_json).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(decode_request(&serde_json::to_vec(&unknown).unwrap()).is_err());
+    }
+
+    #[test]
+    fn decrypt_read_viewer_object_chunk_round_trips_rejects_unknown_field_and_oversize_blobs() {
+        let audit_id = RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap();
+        let request = DecryptProviderRequestV1::new_read_viewer_object_chunk(
+            audit_id,
+            handle(0x41),
+            3,
+            b"framed-chunk",
+        )
+        .unwrap();
+        let request_json = request.to_json_vec().unwrap();
+        let decoded = DecryptProviderRequestV1::decode_wire(&request_json).unwrap();
+        assert_eq!(decoded, request);
+        let validated = decode_request(&request_json).unwrap();
+        assert_eq!(
+            validated.op(),
+            DecryptProviderRequestOpV1::ReadViewerObjectChunk
+        );
+        assert_eq!(validated.chunk_index().unwrap(), 3);
+        assert_eq!(validated.framed_chunk().unwrap(), b"framed-chunk");
+        assert_eq!(validated.session_handle().unwrap(), &handle(0x41));
+
+        assert!(DecryptProviderRequestV1::new_read_viewer_object_chunk(
+            audit_id,
+            handle(0x41),
+            3,
+            &vec![0u8; MAX_OBJECT_FRAMED_CHUNK_BYTES_V1 + 1],
+        )
+        .is_err());
+
+        let mut unknown = serde_json::from_slice::<serde_json::Value>(&request_json).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(decode_request(&serde_json::to_vec(&unknown).unwrap()).is_err());
+
+        let mut trailing = request_json.clone();
+        trailing.extend_from_slice(br#"{"extra":true}"#);
+        assert!(decode_request(&trailing).is_err());
+
+        let response =
+            DecryptProviderResponseV1::new_viewer_object_chunk(audit_id, b"clear-chunk".to_vec())
+                .unwrap();
+        let decoded_response =
+            DecryptProviderResponseV1::from_json_slice(&response.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded_response, response);
+        assert_eq!(
+            decoded_response.status(),
+            DecryptProviderResponseStatusV1::ViewerObjectChunk
+        );
+        assert_eq!(decoded_response.plaintext().unwrap(), b"clear-chunk");
+        assert_eq!(decoded_response.audit_request_id().unwrap(), audit_id);
+
+        assert!(DecryptProviderResponseV1::new_viewer_object_chunk(
+            audit_id,
+            vec![0u8; MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1 + 1],
+        )
+        .is_err());
+
+        let mut unknown_response =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        unknown_response["unexpected"] = serde_json::json!(true);
+        assert!(DecryptProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&unknown_response).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn maximum_object_chunk_requests_and_responses_stay_within_provider_frame_limit() {
+        let audit_id = RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap();
+
+        let chunk_request = DecryptProviderRequestV1::new_read_viewer_object_chunk(
+            audit_id,
+            handle(0x41),
+            u32::MAX,
+            &vec![0x77; MAX_OBJECT_FRAMED_CHUNK_BYTES_V1],
+        )
+        .unwrap();
+        let chunk_request_json = chunk_request.to_json_vec().unwrap();
+        assert!(chunk_request_json.len() <= MAX_PROVIDER_FRAME_BYTES_V1);
+
+        let chunk_response = DecryptProviderResponseV1::new_viewer_object_chunk(
+            audit_id,
+            vec![0x88; MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1],
+        )
+        .unwrap();
+        let chunk_response_json = chunk_response.to_json_vec().unwrap();
+        assert!(chunk_response_json.len() <= MAX_PROVIDER_FRAME_BYTES_V1);
     }
 }

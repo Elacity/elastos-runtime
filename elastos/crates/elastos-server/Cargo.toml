@@ -21,6 +21,20 @@ elastos-crosvm = { path = "../elastos-crosvm" }
 elastos-wallet-contract = { path = "../elastos-wallet-contract" }
 elastos-protected-content-runtime = { path = "../elastos-protected-content-runtime" }
 elastos-protected-content-rights = { path = "../elastos-protected-content-rights" }
+# Promoted from dev-dependencies for ONE item: `framed_chunk_ranges_v1`, the
+# pure header-length/plaintext-length arithmetic that says where each framed
+# chunk of a sealed `object.epc1` starts and ends. The Runtime slices one such
+# chunk out of a published object and must not re-derive the sealer's own byte
+# ranges by hand.
+#
+# The scope of the promotion is deliberately narrow and is enforced by review,
+# not by the manifest: `framed_chunk_ranges_v1` takes two integers, holds no
+# key material and performs no cryptography, and it is the ONLY item of this
+# crate that non-test `elastos-server` code may call. Sealing
+# (`PayloadSealerV1`) and decryption (`PayloadChunkDecrypterV1`) stay in the
+# protect/decrypt provider capsules -- calling either from this process would
+# put content keys in the Runtime's address space and must be refused.
+elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
 elastos-protected-content-provider-contracts = { path = "../elastos-protected-content-provider-contracts" }
 elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
 elastos-model-contract = { path = "../elastos-model-contract" }
@@ -122,7 +136,6 @@ tempfile = "3.10"
 tower = { version = "0.5", features = ["util"] }
 wasm-encoder = "=0.236.1"
 elastos-auth = { path = "../elastos-auth" }
-elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
 x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
 
 [features]

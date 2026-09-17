@@ -4,6 +4,61 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Unreleased]
 
+### Added
+- A `creator` app capsule: upload a file through the Library transport,
+  protect it, and list it in one flow.
+- Non-media objects protect and read end to end. A chunked-payload object
+  identity in the contracts, a streaming sealer and chunk decrypter in
+  custody, object sessions in both sandboxed providers, object content
+  identities through the mint journal, an object identity in the portable
+  listing package, and object publish and read in the Runtime.
+- An `elacity-reader` viewer capsule renders pictures, documents, text, 3D
+  models, books and comics, and states plainly when it has no renderer for a
+  file.
+- Audio is a first-class media rendition alongside video: an AAC fMP4
+  `audio/mp4` / `mp4a.40.2` rendition beside the pinned `video/mp4` /
+  `avc1.640028` one.
+- Protected media carries a CENC `pssh` box declaring the post-quantum
+  hybrid-threshold protection scheme. Its payload is public scheme
+  description only, and its custody identities are bound at publish to the
+  mint's own.
+- A reviewer-facing protected-content crypto review package: every primitive
+  with its version and parameters, what each construction binds, a threat
+  model naming the test that pins each claim, a build card, and committed
+  golden vectors replayed against the shipped code.
+
+- A minted asset publishes the Elacity listing metadata a marketplace reads:
+  `metadata.json`, `content.json`, `contract.json` and the per-token-type
+  documents, carrying the creator's title, description, cover, category and
+  content flags. A creator-named royalty split reaches the chain in ERC-1155
+  `ROYALTY_SHARE` units.
+
+### Fixed
+- A mint's on-chain token URI names the metadata directory rather than a file
+  inside it. The Operative appends its own suffixes, so the previous URI
+  produced `…/metadata.json/0000…0001.json` and resolved to nothing: the mint
+  completed and the asset was unlistable. The Runtime's own document moved to
+  `manifest.json`, and listings published before the rename still verify.
+- Library opens protected video through the shell instead of a dead route,
+  and the phantom viewer ids are gone.
+- Library offers protection on any file the Runtime accepts and routes by
+  kind, so the creator never picks a viewer.
+- Session binding is keyed to the verified executable actor behind the launch
+  token, and viewer operations are refused on every caller-supplied route.
+- Cover art no longer hijacks the video branch: a tagged music file is
+  protected as audio instead of being re-encoded into a still picture.
+- The purchases ledger takes one exclusive open per read-modify-write instead
+  of an open per access.
+- `ProviderBridge` keeps one child state value instead of several fields that
+  could disagree.
+- A purchase whose chain effect is unbound is surfaced as unbound rather than
+  left pending forever.
+- Marketplace declares its buy affordance in its capsule manifest, and the ESP
+  documents scope the same way.
+- `Action::Buy` is split out of `Write`, so a buy is authorized as a buy.
+- The viewer approval stage is idempotent: a repeated approval settles on the
+  existing effect instead of starting a second one.
+
 ### Removed
 - The provisional `drm-provider`, `rights-provider`, `key-provider`, and
   `decrypt-provider` capsules, the `elastos://drm`, `elastos://rights`,

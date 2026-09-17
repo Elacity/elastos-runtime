@@ -5,9 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use elastos_protected_content_contracts::{RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1};
 use elastos_protected_content_custody::{
     decrypt_validated_cenc_fmp4_segment_to_clear_v1, possession_transcript_v1,
-    reconstruct_content_key_into_decrypt_session, rewrite_validated_cenc_fmp4_init_to_clear_v1,
-    DecryptSessionReconstructionInputsV1, DecryptSessionSecretKeyV1,
-    DecryptSessionWrappedContentKeyV1, RecipientSecretKeyV1,
+    reconstruct_content_key_for_object_session, reconstruct_content_key_into_decrypt_session,
+    rewrite_validated_cenc_fmp4_init_to_clear_v1, DecryptSessionReconstructionInputsV1,
+    DecryptSessionSecretKeyV1, DecryptSessionWrappedContentKeyV1, PayloadChunkDecrypterV1,
+    RecipientSecretKeyV1,
 };
 use elastos_protected_content_provider_contracts::{
     DecryptProviderRequestOpV1, DecryptProviderResponseV1, ProviderFailureCodeV1,
@@ -116,13 +117,30 @@ struct PreparedRecipientEntry {
     expires_at: u64,
 }
 
+/// A viewer session decrypts either fMP4/CENC media (part-at-a-time, via the
+/// wrap/unwrap possession dance already used by the media path) or a chunked
+/// EPC1 object (chunk-at-a-time, via a `PayloadChunkDecrypterV1` that already
+/// holds the reconstructed content key's derived AEAD state). The two are
+/// mutually exclusive for the life of a session, mirroring
+/// `OpenViewerSession`'s own "exactly one of media/object" contract shape.
+// `media_session_layout` and the whole of `PayloadChunkDecrypterV1` are each
+// boxed: without indirection on both sides, whichever one is larger makes
+// clippy::large_enum_variant flag every `ViewerSessionEntry` as paying that
+// footprint even for a session of the other kind.
+enum ViewerSessionContent {
+    Media {
+        media_session_layout: Box<ValidatedCencFmp4MediaSessionLayoutV1>,
+        protected_init_segment: Vec<u8>,
+        decrypt_session_secret: DecryptSessionSecretKeyV1,
+        wrapped_content_key: DecryptSessionWrappedContentKeyV1,
+        wrap_transcript: Vec<u8>,
+    },
+    Object(Box<PayloadChunkDecrypterV1>),
+}
+
 struct ViewerSessionEntry {
     audit_request_id: RuntimeReleaseAuditIdV1,
-    media_session_layout: ValidatedCencFmp4MediaSessionLayoutV1,
-    protected_init_segment: Vec<u8>,
-    decrypt_session_secret: DecryptSessionSecretKeyV1,
-    wrapped_content_key: DecryptSessionWrappedContentKeyV1,
-    wrap_transcript: Vec<u8>,
+    content: ViewerSessionContent,
     expires_at: u64,
 }
 
@@ -208,7 +226,8 @@ impl DecryptProvider {
                 | "open_viewer_session"
                 | "read_viewer_media_part"
                 | "cancel_prepared_recipient"
-                | "close_viewer_session",
+                | "close_viewer_session"
+                | "read_viewer_object_chunk",
             ) => {
                 if !matches!(envelope, EnvelopeState::Present) {
                     return (invalid_request(), false);
@@ -257,6 +276,7 @@ impl DecryptProvider {
                 "read_viewer_media_part",
                 "cancel_prepared_recipient",
                 "close_viewer_session",
+                "read_viewer_object_chunk",
                 "shutdown"
             ],
             "request_schema": DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
@@ -441,26 +461,61 @@ impl DecryptProvider {
                         ProviderFailureCodeV1::BindingMismatch,
                     ));
                 }
-                let session_seed = match random_nonzero_bytes() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return typed_response(DecryptProviderResponseV1::new_failure(
-                            request.audit_request_id(),
-                            ProviderFailureCodeV1::InternalFailure,
-                        ));
-                    }
-                };
-                let reconstruction_rng_seed = match random_nonzero_bytes() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return typed_response(DecryptProviderResponseV1::new_failure(
-                            request.audit_request_id(),
-                            ProviderFailureCodeV1::InternalFailure,
-                        ));
-                    }
-                };
-                let decrypt_session_secret =
-                    match DecryptSessionSecretKeyV1::from_seed(session_seed) {
+                // Content-kind branch. `OpenViewerSession`'s "exactly one of
+                // media/object" validation already guarantees
+                // `object_identity()` is Ok(..) iff this is an object
+                // session and Err(..) iff it is a media session, so this
+                // single check is enough to route the whole reconstruction.
+                let content = if request.object_identity().is_ok() {
+                    let framed_header = request.framed_header().expect("validated framed header");
+                    // Same authenticated-operation handling as the media
+                    // path below (node-contribution + terminal-receipt
+                    // verification, possession check, commitment check),
+                    // just without the decrypt-session wrap: an object
+                    // session hands the reconstructed key straight to
+                    // `PayloadChunkDecrypterV1`, which derives its own AEAD
+                    // state once and keeps only that, not the raw key.
+                    let content_key = match reconstruct_content_key_for_object_session(
+                        operation,
+                        request
+                            .content_key_commitment()
+                            .expect("validated content key commitment"),
+                        request
+                            .signed_node_contributions()
+                            .expect("validated contributions"),
+                        request
+                            .signed_terminal_receipt()
+                            .expect("validated terminal receipt"),
+                        request
+                            .expected_terminal_issuer()
+                            .expect("validated terminal issuer"),
+                        &prepared.recipient_secret,
+                        now_unix_seconds,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(DecryptProviderResponseV1::new_failure(
+                                request.audit_request_id(),
+                                ProviderFailureCodeV1::BindingMismatch,
+                            ));
+                        }
+                    };
+                    // `PayloadChunkDecrypterV1::new` performs its own header
+                    // commitment check against `content_key`; not duplicated
+                    // or weakened here.
+                    let decrypter = match PayloadChunkDecrypterV1::new(framed_header, &content_key)
+                    {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(DecryptProviderResponseV1::new_failure(
+                                request.audit_request_id(),
+                                ProviderFailureCodeV1::BindingMismatch,
+                            ));
+                        }
+                    };
+                    ViewerSessionContent::Object(Box::new(decrypter))
+                } else {
+                    let session_seed = match random_nonzero_bytes() {
                         Ok(value) => value,
                         Err(_) => {
                             return typed_response(DecryptProviderResponseV1::new_failure(
@@ -469,60 +524,95 @@ impl DecryptProvider {
                             ));
                         }
                     };
-                let mut reconstruction_rng = StdRng::from_seed(reconstruction_rng_seed);
-                let decrypt_session_public = match decrypt_session_secret.public_key() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return typed_response(DecryptProviderResponseV1::new_failure(
-                            request.audit_request_id(),
-                            ProviderFailureCodeV1::InternalFailure,
-                        ));
+                    let reconstruction_rng_seed = match random_nonzero_bytes() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(DecryptProviderResponseV1::new_failure(
+                                request.audit_request_id(),
+                                ProviderFailureCodeV1::InternalFailure,
+                            ));
+                        }
+                    };
+                    let decrypt_session_secret =
+                        match DecryptSessionSecretKeyV1::from_seed(session_seed) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return typed_response(DecryptProviderResponseV1::new_failure(
+                                    request.audit_request_id(),
+                                    ProviderFailureCodeV1::InternalFailure,
+                                ));
+                            }
+                        };
+                    let mut reconstruction_rng = StdRng::from_seed(reconstruction_rng_seed);
+                    let decrypt_session_public = match decrypt_session_secret.public_key() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(DecryptProviderResponseV1::new_failure(
+                                request.audit_request_id(),
+                                ProviderFailureCodeV1::InternalFailure,
+                            ));
+                        }
+                    };
+                    let wrapped_content_key = match reconstruct_content_key_into_decrypt_session(
+                        &DecryptSessionReconstructionInputsV1 {
+                            operation,
+                            content_key_commitment: request
+                                .content_key_commitment()
+                                .expect("validated content key commitment"),
+                            contributions: request
+                                .signed_node_contributions()
+                                .expect("validated contributions"),
+                            terminal_receipt: request
+                                .signed_terminal_receipt()
+                                .expect("validated terminal receipt"),
+                            expected_terminal_issuer: request
+                                .expected_terminal_issuer()
+                                .expect("validated terminal issuer"),
+                            recipient_secret: &prepared.recipient_secret,
+                            decrypt_session_public: &decrypt_session_public,
+                            now: now_unix_seconds,
+                        },
+                        &mut reconstruction_rng,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(DecryptProviderResponseV1::new_failure(
+                                request.audit_request_id(),
+                                ProviderFailureCodeV1::BindingMismatch,
+                            ));
+                        }
+                    };
+                    let mut wrap_transcript = match possession_transcript_v1(
+                        operation.binding().profile(),
+                        operation.binding().runtime_session_binding(),
+                        operation.recipient(),
+                        operation.release_request_hash(),
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return typed_response(DecryptProviderResponseV1::new_failure(
+                                request.audit_request_id(),
+                                ProviderFailureCodeV1::InternalFailure,
+                            ));
+                        }
+                    };
+                    wrap_transcript.extend_from_slice(decrypt_session_public.as_bytes());
+                    ViewerSessionContent::Media {
+                        media_session_layout: Box::new(
+                            request
+                                .media_session_layout()
+                                .expect("validated media layout")
+                                .clone(),
+                        ),
+                        protected_init_segment: request
+                            .protected_init_segment()
+                            .expect("validated init")
+                            .to_vec(),
+                        decrypt_session_secret,
+                        wrapped_content_key,
+                        wrap_transcript,
                     }
                 };
-                let wrapped_content_key = match reconstruct_content_key_into_decrypt_session(
-                    &DecryptSessionReconstructionInputsV1 {
-                        operation,
-                        content_key_commitment: request
-                            .content_key_commitment()
-                            .expect("validated content key commitment"),
-                        contributions: request
-                            .signed_node_contributions()
-                            .expect("validated contributions"),
-                        terminal_receipt: request
-                            .signed_terminal_receipt()
-                            .expect("validated terminal receipt"),
-                        expected_terminal_issuer: request
-                            .expected_terminal_issuer()
-                            .expect("validated terminal issuer"),
-                        recipient_secret: &prepared.recipient_secret,
-                        decrypt_session_public: &decrypt_session_public,
-                        now: now_unix_seconds,
-                    },
-                    &mut reconstruction_rng,
-                ) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return typed_response(DecryptProviderResponseV1::new_failure(
-                            request.audit_request_id(),
-                            ProviderFailureCodeV1::BindingMismatch,
-                        ));
-                    }
-                };
-                let mut wrap_transcript = match possession_transcript_v1(
-                    operation.binding().profile(),
-                    operation.binding().runtime_session_binding(),
-                    operation.recipient(),
-                    operation.release_request_hash(),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return typed_response(DecryptProviderResponseV1::new_failure(
-                            request.audit_request_id(),
-                            ProviderFailureCodeV1::InternalFailure,
-                        ));
-                    }
-                };
-                wrap_transcript.extend_from_slice(decrypt_session_public.as_bytes());
                 let viewer_handle = *request
                     .prepared_recipient_handle()
                     .expect("validated handle");
@@ -540,17 +630,7 @@ impl DecryptProvider {
                 };
                 let entry = ViewerSessionEntry {
                     audit_request_id: request.audit_request_id(),
-                    media_session_layout: request
-                        .media_session_layout()
-                        .expect("validated media layout")
-                        .clone(),
-                    protected_init_segment: request
-                        .protected_init_segment()
-                        .expect("validated init")
-                        .to_vec(),
-                    decrypt_session_secret,
-                    wrapped_content_key,
-                    wrap_transcript,
+                    content,
                     expires_at: operation.statement().expires_at(),
                 };
                 state.open_replays.insert(
@@ -573,6 +653,23 @@ impl DecryptProvider {
                         ProviderFailureCodeV1::HandleAbsent,
                     ));
                 };
+                // Kind discriminant first, above every other check: an
+                // object session must never fall through to media handling
+                // (and vice versa in `ReadViewerObjectChunk` below) no
+                // matter what the rest of this arm would otherwise do.
+                let ViewerSessionContent::Media {
+                    media_session_layout,
+                    protected_init_segment,
+                    decrypt_session_secret,
+                    wrapped_content_key,
+                    wrap_transcript,
+                } = &session.content
+                else {
+                    return typed_response(DecryptProviderResponseV1::new_failure(
+                        request.audit_request_id(),
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
                 if session.audit_request_id != request.audit_request_id() {
                     return typed_response(DecryptProviderResponseV1::new_failure(
                         request.audit_request_id(),
@@ -584,8 +681,8 @@ impl DecryptProvider {
                     .expect("validated selector");
                 let clear_media_part = if selector.is_init() {
                     match rewrite_validated_cenc_fmp4_init_to_clear_v1(
-                        &session.media_session_layout,
-                        &session.protected_init_segment,
+                        media_session_layout,
+                        protected_init_segment,
                     ) {
                         Ok(value) => value,
                         Err(_) => {
@@ -603,12 +700,12 @@ impl DecryptProvider {
                         return invalid_request();
                     };
                     match decrypt_validated_cenc_fmp4_segment_to_clear_v1(
-                        &session.media_session_layout,
+                        media_session_layout,
                         encrypted_segment,
                         segment_index,
-                        &session.decrypt_session_secret,
-                        &session.wrapped_content_key,
-                        &session.wrap_transcript,
+                        decrypt_session_secret,
+                        wrapped_content_key,
+                        wrap_transcript,
                     ) {
                         Ok(value) => value,
                         Err(_) => {
@@ -721,6 +818,49 @@ impl DecryptProvider {
                     },
                 );
                 typed_ok(response)
+            }
+            DecryptProviderRequestOpV1::ReadViewerObjectChunk => {
+                let handle = *request.session_handle().expect("validated handle");
+                let Some(session) = state.viewer_by_handle.get(&handle) else {
+                    return typed_response(DecryptProviderResponseV1::new_failure(
+                        request.audit_request_id(),
+                        ProviderFailureCodeV1::HandleAbsent,
+                    ));
+                };
+                // Kind discriminant first, above every other check — the
+                // mirror image of the guard in `ReadViewerMediaPart` above.
+                let ViewerSessionContent::Object(decrypter) = &session.content else {
+                    return typed_response(DecryptProviderResponseV1::new_failure(
+                        request.audit_request_id(),
+                        ProviderFailureCodeV1::InvalidRequest,
+                    ));
+                };
+                if session.audit_request_id != request.audit_request_id() {
+                    return typed_response(DecryptProviderResponseV1::new_failure(
+                        request.audit_request_id(),
+                        ProviderFailureCodeV1::BindingMismatch,
+                    ));
+                }
+                let chunk_index = request.chunk_index().expect("validated chunk index");
+                let framed_chunk = request.framed_chunk().expect("validated framed chunk");
+                // `decrypt_chunk` returns `Zeroizing<Vec<u8>>` (R21); the
+                // only copy taken out of that protected buffer is the single
+                // `.to_vec()` below, made directly at the point the response
+                // is constructed (`new_viewer_object_chunk` requires an
+                // owned `Vec<u8>` and `Zeroizing` has no `into_inner`).
+                let plaintext_chunk = match decrypter.decrypt_chunk(chunk_index, framed_chunk) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return typed_response(DecryptProviderResponseV1::new_failure(
+                            request.audit_request_id(),
+                            ProviderFailureCodeV1::BindingMismatch,
+                        ));
+                    }
+                };
+                typed_response(DecryptProviderResponseV1::new_viewer_object_chunk(
+                    request.audit_request_id(),
+                    plaintext_chunk.to_vec(),
+                ))
             }
         }
     }

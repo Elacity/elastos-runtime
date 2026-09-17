@@ -22,6 +22,7 @@ enum MockProtectedContentPurchaseAccessMode {
     Allow,
     Deny,
     Error,
+    Unbound,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,39 @@ fn mock_immutable_content_objects() -> &'static std::sync::Mutex<MockImmutableCo
     static OBJECTS: std::sync::OnceLock<std::sync::Mutex<MockImmutableContentObjects>> =
         std::sync::OnceLock::new();
     OBJECTS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn mock_published_content_recording() -> &'static std::sync::atomic::AtomicBool {
+    static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &ENABLED
+}
+
+fn mock_published_content_recording_enabled() -> bool {
+    mock_published_content_recording().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Let a test fetch back what it published, for the length of the test.
+///
+/// The mock answers every publish with the same CID, so recorded documents live
+/// in one process-wide map. Leaving that on would let a test read a document
+/// some earlier test published -- which is exactly how six buy tests started
+/// building capsules out of another test's metadata and passing alone while
+/// failing together. It is therefore off by default, and the guard clears the
+/// store on the way in and on the way out, including when a test panics.
+#[must_use]
+struct MockPublishedContentRecording;
+
+fn record_mock_published_content() -> MockPublishedContentRecording {
+    reset_mock_immutable_content_objects();
+    mock_published_content_recording().store(true, std::sync::atomic::Ordering::Relaxed);
+    MockPublishedContentRecording
+}
+
+impl Drop for MockPublishedContentRecording {
+    fn drop(&mut self) {
+        mock_published_content_recording().store(false, std::sync::atomic::Ordering::Relaxed);
+        reset_mock_immutable_content_objects();
+    }
 }
 
 fn reset_mock_immutable_content_objects() {
@@ -326,6 +360,17 @@ fn set_mock_protected_content_purchase_access_error() {
         .lock()
         .unwrap()
         .access_mode = MockProtectedContentPurchaseAccessMode::Error;
+}
+
+/// The content access id the buy is resolving against was never bound on
+/// chain — the same `unknown_protected_content_object` code chain-provider's
+/// real rights observation answers (`capsules/chain-provider/src/main.rs`),
+/// as opposed to `Error`'s unrelated transient/stale-observation code.
+fn set_mock_protected_content_purchase_access_unbound() {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .access_mode = MockProtectedContentPurchaseAccessMode::Unbound;
 }
 
 fn set_mock_protected_content_listing_quantity(quantity: &str) {
@@ -753,6 +798,18 @@ impl Provider for MockChainProvider {
                         "message": "mock protected-content mint receipt requires BUY_ONCE op type"
                     }));
                 }
+                // The mint emits its own `ItemListed`, so a receipt carries the
+                // listing it created. The fixture mirrors what the verified
+                // listing below reports, because on chain they are one event.
+                let fixture = mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let pay_token = if fixture.native_purchase {
+                    "0x0000000000000000000000000000000000000000".to_string()
+                } else {
+                    MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_string()
+                };
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -760,7 +817,10 @@ impl Provider for MockChainProvider {
                         "network": required_test_str(request, "network")?,
                         "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
                         "token_id": MOCK_PROTECTED_CONTENT_TOKEN_ID,
-                        "operative": MOCK_PROTECTED_CONTENT_OPERATIVE
+                        "operative": MOCK_PROTECTED_CONTENT_OPERATIVE,
+                        "quantity": fixture.listing_quantity,
+                        "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+                        "pay_token": pay_token
                     }
                 }))
             }
@@ -866,6 +926,13 @@ impl Provider for MockChainProvider {
                         "status": "error",
                         "code": "stale_protected_content_purchase_access_observation",
                         "message": "mock protected-content purchase access is unavailable"
+                    }));
+                }
+                if fixture.access_mode == MockProtectedContentPurchaseAccessMode::Unbound {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "unknown_protected_content_object",
+                        "message": "protected-content content access id is not bound on chain"
                     }));
                 }
                 Ok(json!({
@@ -1454,6 +1521,56 @@ impl Provider for TwoRuntimeContentProvider {
     }
 }
 
+/// Records which CIDs were pinned, so a test can assert that owning a copy
+/// keeps its material on this machine rather than leaving reads to the network.
+///
+/// State lives on the instance the test holds, not in a static: two tests using
+/// one of these cannot see each other's pins, and nothing survives the test.
+#[derive(Clone, Default)]
+struct MockPinRecordingIpfsProvider {
+    pinned: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl MockPinRecordingIpfsProvider {
+    fn pinned(&self) -> Vec<String> {
+        self.pinned.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockPinRecordingIpfsProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock ipfs provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["ipfs"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-pin-recording-ipfs-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(Value::as_str) {
+            Some("pin") => {
+                if let Some(cid) = request.get("cid").and_then(Value::as_str) {
+                    self.pinned.lock().unwrap().push(cid.to_string());
+                }
+                Ok(json!({ "status": "ok", "data": {} }))
+            }
+            _ => Err(ProviderError::Provider(
+                "unsupported mock ipfs operation".into(),
+            )),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for MockContentProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -1571,6 +1688,32 @@ impl Provider for MockContentProvider {
                     .lock()
                     .unwrap()
                     .push(request.clone());
+                // Whatever this mock publishes, it can serve back -- but only
+                // for a test that asked for it. Every publish here answers with
+                // the same CID, so recorded documents from different tests
+                // would otherwise evict and leak into each other through this
+                // process-wide store: a test that never published would read
+                // another one's metadata. Off by default, and cleared when the
+                // recording guard drops.
+                if let Some(entries) = request
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .filter(|_| mock_published_content_recording_enabled())
+                {
+                    let mut objects = mock_immutable_content_objects().lock().unwrap();
+                    let files = objects.entry(TEST_CIDV1.to_string()).or_default();
+                    for entry in entries {
+                        let (Some(path), Some(data)) = (
+                            entry.get("path").and_then(Value::as_str),
+                            entry.get("data").and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                            files.insert(path.to_string(), bytes);
+                        }
+                    }
+                }
                 if request.get("object_kind").and_then(Value::as_str)
                     == Some("protected-content-listing")
                     && *mock_runtime_listing_publish_failure().lock().unwrap()

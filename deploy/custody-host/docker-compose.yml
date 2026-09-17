@@ -34,16 +34,21 @@ x-custody-host: &custody-host
     # elastos-server's tracing init reads the standard `RUST_LOG`
     # (tracing_subscriber::EnvFilter::from_default_env(), NOT a custom
     # ELASTOS_LOG -- elastos/crates/elastos-server/src/main.rs:1220-1226).
-    # That call also always layers in a hardcoded `elastos=info` baseline
-    # directive (main.rs:1224), so a bare `RUST_LOG=debug` would not reliably
-    # out-rank it for the `elastos`-binary-crate targets; the live container
-    # logs show both the `elastos::*` (binary, e.g. provider_host) and
-    # `elastos_server::*` (library, e.g. carrier) target namespaces, so both
-    # are named explicitly. Old dkms harness precedent: quorum nodes
+    # That call also layers in a hardcoded `elastos=info` baseline directive
+    # via add_directive (main.rs:1224), which REPLACES any same-target
+    # directive parsed from RUST_LOG -- so both a bare `RUST_LOG=debug` and
+    # an explicit `elastos=debug` are silently clobbered back to info. Only a
+    # strictly longer target prefix out-ranks it, so all three namespaces the
+    # nodes log under are named explicitly: `elastos::*` (binary, e.g.
+    # provider_host), `elastos_server::*` (server library, e.g. carrier) and
+    # `elastos_runtime::*` (runtime library, e.g. provider::bridge -- where a
+    # stuck provider op reports itself, the usual reason to raise the level
+    # here at all). Prefer `up.sh log-level <level>`, which expands a level
+    # word to exactly these three. Old dkms harness precedent: quorum nodes
     # defaulted to trace; debug is the default here instead because trace is
     # very chatty for long-lived soak runs -- override per-deployment via
     # CUSTODY_NODE_LOG without editing this file.
-    RUST_LOG: ${CUSTODY_NODE_LOG:-elastos=debug,elastos_server=debug}
+    RUST_LOG: ${CUSTODY_NODE_LOG:-elastos=debug,elastos_server=debug,elastos_runtime=debug}
   # Named-volume state persists across `up.sh down`; only `up.sh destroy`
   # removes it, so a restart re-enters entrypoint.sh's zero-env branch.
   restart: unless-stopped
@@ -62,6 +67,15 @@ services:
       <<: *custody-host-env
       CUSTODY_OPERATOR: op-a
       CUSTODY_FAILURE_DOMAIN: fd-a
+    # entrypoint.sh defaults to --role custody (custody + chain only, no kubo):
+    # custody IS the role, and a node must be asked explicitly to take on
+    # storage too. This harness asks, because a protected-content mint needs the
+    # publisher's own local pin PLUS two proven REMOTE replicas
+    # (PROTECTED_CONTENT_MIN_REPLICAS = 3 and REQUIRE_LIVE_MULTI_PEER_PROOF =
+    # true, both hardcoded), and these three nodes are the only peers it has --
+    # all-custody means no mint can ever complete here.
+    # Override with CUSTODY_HOST_ROLE=custody to exercise the custody-only path.
+    command: ["--role", "${CUSTODY_HOST_ROLE:-storage}"]
     volumes:
       - custody-a-data:/home/custody/.local/share/elastos
       - ./shared:/shared
@@ -74,6 +88,7 @@ services:
       <<: *custody-host-env
       CUSTODY_OPERATOR: op-b
       CUSTODY_FAILURE_DOMAIN: fd-b
+    command: ["--role", "${CUSTODY_HOST_ROLE:-storage}"]
     volumes:
       - custody-b-data:/home/custody/.local/share/elastos
       - ./shared:/shared
@@ -86,6 +101,7 @@ services:
       <<: *custody-host-env
       CUSTODY_OPERATOR: op-c
       CUSTODY_FAILURE_DOMAIN: fd-c
+    command: ["--role", "${CUSTODY_HOST_ROLE:-storage}"]
     volumes:
       - custody-c-data:/home/custody/.local/share/elastos
       - ./shared:/shared

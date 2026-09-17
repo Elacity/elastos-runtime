@@ -151,8 +151,25 @@ impl AvailabilityProvider {
         let mut network_available = Vec::new();
         let mut repair_needed_reports = Vec::new();
         let mut errors = Vec::new();
+        // Timed per target, and the targets are tried in order until the
+        // requirements are met. One slow target therefore sets the wall clock
+        // for the whole ensure, and which one it was is not recoverable from
+        // the total alone.
+        let ensure_started = std::time::Instant::now();
         for target in &self.targets {
-            match self.ensure_target(target, &request) {
+            let started = std::time::Instant::now();
+            let outcome = self.ensure_target(target, &request);
+            eprintln!(
+                "availability-provider: target settled id={} cid={} outcome={} elapsed_ms={}",
+                target.id,
+                request.cid,
+                match &outcome {
+                    Ok(availability) => availability_status(availability).unwrap_or("unknown"),
+                    Err(_) => "error",
+                },
+                started.elapsed().as_millis()
+            );
+            match outcome {
                 Ok(availability) => {
                     if availability_status(&availability) == Some("network_available") {
                         network_available.push(availability);
@@ -161,6 +178,12 @@ impl AvailabilityProvider {
                             requirements,
                             &network_available,
                         ) {
+                            eprintln!(
+                                "availability-provider: ensure settled cid={} outcome=network_available replicas={} elapsed_ms={}",
+                                request.cid,
+                                network_available.len(),
+                                ensure_started.elapsed().as_millis()
+                            );
                             return Response::ok(json!({ "availability": availability }));
                         }
                     } else {

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-TjveGTlxVFTGeJb7FRPimOCdzEDxa2eVlMln+FIWZoM='; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'none'; child-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'">
+  <title>Elacity Reader - ElastOS</title>
+  <link rel="icon" href="icons/icon-64.png" type="image/png">
+  <link rel="stylesheet" href="style.css?v=reader-20260913a">
+  <script type="importmap">{"imports":{"three":"./vendor/three/three.module.js?v=three-0.160.0"}}</script>
+</head>
+<body>
+  <main class="reader-shell">
+    <header class="reader-bar">
+      <p id="reader-kind" class="reader-kind">Protected file</p>
+      <div id="reader-controls" class="reader-controls" hidden>
+        <button id="reader-previous" class="reader-step" type="button">Previous</button>
+        <p id="reader-position" class="reader-position" aria-live="polite"></p>
+        <button id="reader-next" class="reader-step" type="button">Next</button>
+      </div>
+    </header>
+    <div id="reader-stage" class="reader-stage"></div>
+    <p id="reader-status" class="reader-status" role="status" aria-live="polite">Opening the file...</p>
+  </main>
+
+  <script type="module" src="reader.js?v=reader-20260913a"></script>
+</body>
+</html>

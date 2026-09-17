@@ -10,6 +10,8 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -20,6 +22,106 @@ const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+const PIN_PROBE_FIRST_SAMPLE: Duration = Duration::from_secs(15);
+const PIN_PROBE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Samples Kubo while a pin is in flight.
+///
+/// A pin is one blocking HTTP call, so the only thing the caller can report
+/// about a slow one is how long it took -- which says nothing about why. The
+/// interesting state lives inside Kubo and only exists *during* the call:
+/// whether the CID is still in the wantlist, whether any blocks are arriving,
+/// and how many peers are connected. Sampled after the fact it is all gone,
+/// and the question gets answered by guessing instead.
+///
+/// Runs on its own thread because the pin blocks this one, stops when the pin
+/// returns, and never fails the pin: every sample is best-effort and a probe
+/// that cannot reach Kubo simply says so.
+struct KuboPinProbe {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KuboPinProbe {
+    fn start(api_url: String, cid: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut due = PIN_PROBE_FIRST_SAMPLE;
+            while !stop_signal.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+                if started.elapsed() < due {
+                    continue;
+                }
+                due += PIN_PROBE_SAMPLE_INTERVAL;
+                let stat = kubo_probe_json(&api_url, "bitswap/stat");
+                let peers = kubo_probe_json(&api_url, "swarm/peers");
+                let wanted = stat
+                    .as_ref()
+                    .and_then(|stat| stat.get("Wantlist"))
+                    .and_then(|list| list.as_array())
+                    .map(|list| {
+                        list.iter()
+                            .any(|entry| entry.get("/").and_then(|v| v.as_str()) == Some(&cid))
+                    })
+                    .unwrap_or(false);
+                eprintln!(
+                    "ipfs-provider: pin waiting cid={} elapsed_s={} cid_in_wantlist={} wantlist={} blocks_received={} data_received={} dup_blocks={} peers_bitswap={} peers_swarm={}",
+                    cid,
+                    started.elapsed().as_secs(),
+                    wanted,
+                    kubo_probe_len(stat.as_ref(), "Wantlist"),
+                    kubo_probe_num(stat.as_ref(), "BlocksReceived"),
+                    kubo_probe_num(stat.as_ref(), "DataReceived"),
+                    kubo_probe_num(stat.as_ref(), "DupBlksReceived"),
+                    kubo_probe_len(stat.as_ref(), "Peers"),
+                    peers
+                        .as_ref()
+                        .and_then(|peers| peers.get("Peers"))
+                        .and_then(|peers| peers.as_array())
+                        .map(|peers| peers.len() as i64)
+                        .unwrap_or(-1),
+                );
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for KuboPinProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn kubo_probe_json(api_url: &str, path: &str) -> Option<serde_json::Value> {
+    ureq::post(&format!("{api_url}/api/v0/{path}"))
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()
+        .and_then(|resp| resp.into_json::<serde_json::Value>().ok())
+}
+
+fn kubo_probe_num(stat: Option<&serde_json::Value>, key: &str) -> i64 {
+    stat.and_then(|stat| stat.get(key))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(-1)
+}
+
+fn kubo_probe_len(stat: Option<&serde_json::Value>, key: &str) -> i64 {
+    stat.and_then(|stat| stat.get(key))
+        .and_then(|value| value.as_array())
+        .map(|value| value.len() as i64)
+        .unwrap_or(-1)
+}
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -91,6 +193,10 @@ enum Request {
         #[serde(default, rename = "_runtime_invocation")]
         _runtime_invocation: Option<serde_json::Value>,
     },
+    EnsureStarted {
+        #[serde(default, rename = "_runtime_invocation")]
+        _runtime_invocation: Option<serde_json::Value>,
+    },
     Health,
     Status,
     Shutdown,
@@ -151,6 +257,118 @@ enum KuboState {
     Error,
 }
 
+// ── Peering ─────────────────────────────────────────────────────────
+
+/// A node whose swarm connection must survive ConnMgr pruning.
+///
+/// Stock kubo drops an untagged connection within seconds of crossing the
+/// ConnMgr HighWater mark, so co-operating ElastOS nodes lose each other and
+/// can only re-find a fresh CID through the DHT (minutes). Peering tags the
+/// connection permanently. `addrs` may be empty: peering by peer id alone is
+/// enough to protect an *inbound* connection, which is all the host side can
+/// do when the other node lives behind a Docker bridge it cannot dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeeringPeer {
+    id: String,
+    addrs: Vec<String>,
+}
+
+/// Parse `extra.peering`. Fails closed: a malformed entry is a config error,
+/// never a silently dropped peer (a missing peer looks exactly like the
+/// discovery failure this feature exists to prevent).
+fn parse_peering_config(value: Option<&serde_json::Value>) -> Result<Vec<PeeringPeer>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let entries = value
+        .as_array()
+        .ok_or("ipfs-provider peering must be an array of {id, addrs} objects")?;
+
+    let mut peers = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| format!("ipfs-provider peering[{}] must be an object", index))?;
+
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| format!("ipfs-provider peering[{}] requires a string id", index))?;
+        if id.is_empty() {
+            return Err(format!("ipfs-provider peering[{}] has an empty id", index));
+        }
+        // base58btc peer ids ("12D3Koo…", "Qm…") are alphanumeric; anything
+        // else would corrupt the multiaddr we build from it.
+        if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(format!(
+                "ipfs-provider peering[{}] id must be alphanumeric, got {:?}",
+                index, id
+            ));
+        }
+
+        let mut addrs = Vec::new();
+        match entry.get("addrs") {
+            None => {}
+            Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(items)) => {
+                for item in items {
+                    let addr = item
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|addr| !addr.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "ipfs-provider peering[{}] addrs must be non-empty strings",
+                                index
+                            )
+                        })?;
+                    addrs.push(addr.to_string());
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "ipfs-provider peering[{}] addrs must be an array of strings",
+                    index
+                ))
+            }
+        }
+
+        peers.push(PeeringPeer {
+            id: id.to_string(),
+            addrs,
+        });
+    }
+
+    Ok(peers)
+}
+
+/// kubo's repo config uses capitalised `ID`/`Addrs`, unlike our wire shape.
+fn peering_peers_config_json(peers: &[PeeringPeer]) -> serde_json::Value {
+    serde_json::Value::Array(
+        peers
+            .iter()
+            .map(|peer| serde_json::json!({ "ID": peer.id, "Addrs": peer.addrs }))
+            .collect(),
+    )
+}
+
+/// Multiaddrs for `swarm/peering/add`; a bare `/p2p/<id>` is accepted by kubo
+/// and is what an entry without addrs resolves to.
+fn peering_multiaddrs(peer: &PeeringPeer) -> Vec<String> {
+    if peer.addrs.is_empty() {
+        return vec![format!("/p2p/{}", peer.id)];
+    }
+    peer.addrs
+        .iter()
+        .map(|addr| format!("{}/p2p/{}", addr, peer.id))
+        .collect()
+}
+
 // ── Coord file ──────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +390,10 @@ struct IpfsProvider {
     kubo_child: Option<Child>,
     data_dir: PathBuf,
     repo_dir: PathBuf,
+    peering: Vec<PeeringPeer>,
+    /// Runtime peering adds are per-daemon, not per-op; this keeps the hot
+    /// path from re-POSTing them on every request.
+    peering_applied: bool,
 }
 
 impl IpfsProvider {
@@ -186,6 +408,8 @@ impl IpfsProvider {
             kubo_child: None,
             data_dir,
             repo_dir,
+            peering: Vec::new(),
+            peering_applied: false,
         }
     }
 
@@ -273,6 +497,7 @@ impl IpfsProvider {
             Request::DownloadDirectory { cid, dest } => self.download_directory(&cid, &dest),
             Request::Pin { cid, .. } => self.pin(&cid),
             Request::Unpin { cid, .. } => self.unpin(&cid),
+            Request::EnsureStarted { .. } => self.ensure_started(),
             Request::Health => self.health(),
             Request::Status => self.status(),
             Request::Shutdown => self.shutdown(),
@@ -300,6 +525,19 @@ impl IpfsProvider {
             }
             self.data_dir = path;
             self.repo_dir = self.data_dir.join("ipfs-repo");
+        }
+
+        match parse_peering_config(extra.get("peering")) {
+            Ok(peers) => {
+                if !peers.is_empty() {
+                    eprintln!(
+                        "ipfs-provider: peering configured for {} peer(s)",
+                        peers.len()
+                    );
+                }
+                self.peering = peers;
+            }
+            Err(e) => return Response::error("invalid_config", &e),
         }
 
         if extra.get("gateways").is_some() || std::env::var("ELASTOS_IPFS_GATEWAYS").is_ok() {
@@ -351,6 +589,9 @@ impl IpfsProvider {
             if let Some(coord) = read_coord_file(&self.data_dir) {
                 if is_pid_alive(coord.kubo_pid) {
                     update_coord_last_used(&self.data_dir);
+                    // This daemon may have been adopted (init() found it via the
+                    // coord file), so its repo config predates our peering list.
+                    self.apply_peering_to_running_kubo();
                     return Ok(());
                 }
                 // PID died — remove stale coord and re-start
@@ -361,10 +602,12 @@ impl IpfsProvider {
                 remove_coord_file(&self.data_dir);
             }
             self.state = KuboState::Cold;
+            self.peering_applied = false;
         }
 
         if self.state == KuboState::Starting || self.state == KuboState::Error {
             self.state = KuboState::Cold;
+            self.peering_applied = false;
         }
 
         // Ensure Kubo binary exists
@@ -373,7 +616,53 @@ impl IpfsProvider {
         }
 
         // Use lockfile protocol to safely start Kubo
-        self.start_kubo_with_lock()
+        let started = self.start_kubo_with_lock();
+        if started.is_ok() {
+            self.apply_peering_to_running_kubo();
+        }
+        started
+    }
+
+    /// Tag configured peers on the *live* daemon. kubo does not persist these
+    /// ("not saved to the config" per its own help), which is why start_kubo
+    /// also writes Peering.Peers into the repo. Never fatal: a peering add
+    /// failing must not fail the operation that triggered the start.
+    fn apply_peering_to_running_kubo(&mut self) {
+        if self.peering_applied || self.peering.is_empty() || self.api_port == 0 {
+            return;
+        }
+
+        let mut all_ok = true;
+        for peer in &self.peering {
+            for multiaddr in peering_multiaddrs(peer) {
+                let url = format!(
+                    "http://127.0.0.1:{}/api/v0/swarm/peering/add?arg={}",
+                    self.api_port, multiaddr
+                );
+                match ureq::post(&url).timeout(Duration::from_secs(5)).call() {
+                    Ok(resp) if resp.status() == 200 => {
+                        eprintln!("ipfs-provider: peering add {}", multiaddr);
+                    }
+                    Ok(resp) => {
+                        all_ok = false;
+                        eprintln!(
+                            "ipfs-provider: peering add {} -> HTTP {}",
+                            multiaddr,
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        all_ok = false;
+                        eprintln!("ipfs-provider: peering add {} -> {}", multiaddr, e);
+                    }
+                }
+            }
+        }
+
+        // Only latch on a clean sweep. An adopted daemon has no Peering.Peers
+        // in its repo config, so this runtime add is the sole mechanism there;
+        // latching on failure would strand the node for the daemon's lifetime.
+        self.peering_applied = all_ok;
     }
 
     fn start_kubo_with_lock(&mut self) -> Result<(), String> {
@@ -457,7 +746,13 @@ impl IpfsProvider {
             bind_free_port().map_err(|e| format!("Failed to bind gateway port: {}", e))?;
 
         // Kubo v0.40.x does not support --gateway CLI flag, so set gateway in repo config.
-        let gw_addr = format!("/ip4/127.0.0.1/tcp/{}", gw_port);
+        //
+        // The read-only HTTP gateway binds 0.0.0.0, not loopback: inside a
+        // container a loopback-bound gateway is unreachable from the host and
+        // from sibling nodes, so co-operating nodes cannot serve content to
+        // each other over it. The read-WRITE admin API below stays on
+        // 127.0.0.1 -- that one must never leave the node.
+        let gw_addr = format!("/ip4/0.0.0.0/tcp/{}", gw_port);
         let gw_cfg = Command::new(binary)
             .args(["config", "Addresses.Gateway", &gw_addr])
             .env("IPFS_PATH", &self.repo_dir)
@@ -469,6 +764,24 @@ impl IpfsProvider {
                 "kubo config Addresses.Gateway failed: {}",
                 stderr.trim()
             ));
+        }
+
+        // Persist peering in the repo so it survives the idle-watcher kill and
+        // any later cold start; runtime swarm/peering/add calls do not.
+        if !self.peering.is_empty() {
+            let peers_json = peering_peers_config_json(&self.peering).to_string();
+            let peering_cfg = Command::new(binary)
+                .args(["config", "--json", "Peering.Peers", &peers_json])
+                .env("IPFS_PATH", &self.repo_dir)
+                .output()
+                .map_err(|e| format!("Failed to set Kubo Peering.Peers: {}", e))?;
+            if !peering_cfg.status.success() {
+                let stderr = String::from_utf8_lossy(&peering_cfg.stderr);
+                return Err(format!(
+                    "kubo config Peering.Peers failed: {}",
+                    stderr.trim()
+                ));
+            }
         }
 
         // Start Kubo daemon
@@ -782,10 +1095,44 @@ impl IpfsProvider {
             return Response::error("kubo_unavailable", &e);
         }
         let url = format!("{}/api/v0/pin/add?arg={}", self.api_url(), cid);
-        match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
-            Ok(resp) if resp.status() == 200 => Response::ok_empty(),
-            Ok(resp) => Response::error("pin_failed", &format!("HTTP {}", resp.status())),
-            Err(e) => Response::error("pin_failed", &e.to_string()),
+        let started = Instant::now();
+        // Dropped when this returns, which stops the probe.
+        let _probe = KuboPinProbe::start(self.api_url(), cid.to_string());
+        let outcome = ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call();
+        let elapsed_ms = started.elapsed().as_millis();
+        // The timeout is reported next to the elapsed time on purpose: a pin
+        // that ends a hair either side of its own deadline should never be
+        // mistaken for one that simply took that long.
+        match outcome {
+            Ok(resp) if resp.status() == 200 => {
+                eprintln!(
+                    "ipfs-provider: pin settled cid={} outcome=ok elapsed_ms={} timeout_ms={}",
+                    cid,
+                    elapsed_ms,
+                    LARGE_HTTP_TIMEOUT.as_millis()
+                );
+                Response::ok_empty()
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "ipfs-provider: pin settled cid={} outcome=http_{} elapsed_ms={} timeout_ms={}",
+                    cid,
+                    resp.status(),
+                    elapsed_ms,
+                    LARGE_HTTP_TIMEOUT.as_millis()
+                );
+                Response::error("pin_failed", &format!("HTTP {}", resp.status()))
+            }
+            Err(e) => {
+                eprintln!(
+                    "ipfs-provider: pin settled cid={} outcome=error elapsed_ms={} timeout_ms={} error={}",
+                    cid,
+                    elapsed_ms,
+                    LARGE_HTTP_TIMEOUT.as_millis(),
+                    e
+                );
+                Response::error("pin_failed", &e.to_string())
+            }
         }
     }
 
@@ -830,7 +1177,67 @@ impl IpfsProvider {
         }
     }
 
+    /// Peer id + swarm addrs of the running daemon, so the runtime can build
+    /// other nodes' peering lists. Returns None rather than starting kubo:
+    /// status is a supported cold call.
+    fn kubo_identity(&self) -> Option<(String, Vec<String>)> {
+        if self.state != KuboState::Ready || self.api_port == 0 {
+            return None;
+        }
+
+        let url = format!("{}/api/v0/id", self.api_url());
+        let resp = ureq::post(&url)
+            .timeout(Duration::from_secs(5))
+            .call()
+            .ok()?;
+        if resp.status() != 200 {
+            return None;
+        }
+        let json: serde_json::Value = resp.into_json().ok()?;
+        let id = json.get("ID")?.as_str()?.to_string();
+        let addrs = json
+            .get("Addresses")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((id, addrs))
+    }
+
+    /// Force the daemon up (or adopt a running one) and report its identity.
+    ///
+    /// The provider host calls this at startup so peering is established long
+    /// before a mint needs replicas: peering only protects connections that
+    /// exist, and a kubo first spawned seconds before a publish has no DHT
+    /// provider record and no peers that have ever met it. Unlike `status`,
+    /// which must stay cold-safe, this deliberately starts kubo.
+    fn ensure_started(&mut self) -> Response {
+        if let Err(e) = self.ensure_kubo() {
+            return Response::error("kubo_unavailable", &e);
+        }
+
+        match self.kubo_identity() {
+            Some((peer_id, swarm_addrs)) => Response::ok(serde_json::json!({
+                "state": self.state,
+                "peer_id": peer_id,
+                "swarm_addrs": swarm_addrs,
+            })),
+            // Reporting success with null identity would let the caller write a
+            // readiness receipt no other node can peer with.
+            None => Response::error(
+                "kubo_unavailable",
+                "kubo is running but /api/v0/id returned no peer identity",
+            ),
+        }
+    }
+
     fn status(&self) -> Response {
+        let identity = self.kubo_identity();
         Response::ok(serde_json::json!({
             "version": PROVIDER_VERSION,
             "state": self.state,
@@ -841,6 +1248,8 @@ impl IpfsProvider {
                 None::<String>
             },
             "kubo_pid": read_coord_file(&self.data_dir).map(|c| c.kubo_pid),
+            "peer_id": identity.as_ref().map(|(id, _)| id.clone()),
+            "swarm_addrs": identity.as_ref().map(|(_, addrs)| addrs.clone()),
         }))
     }
 
@@ -1644,6 +2053,142 @@ mod tests {
         assert_eq!(provider.data_dir, tmp.path());
         assert_eq!(provider.repo_dir, tmp.path().join("ipfs-repo"));
         assert_eq!(provider.kubo_binary, Some(tmp.path().join("bin/kubo")));
+    }
+
+    #[test]
+    fn test_ensure_started_request_deserialization() {
+        let json = r#"{"op":"ensure_started"}"#;
+        let req: Request = serde_json::from_str(json).expect("Should parse ensure_started");
+        assert!(matches!(req, Request::EnsureStarted { .. }));
+
+        let with_metadata = r#"{"op":"ensure_started","_runtime_invocation":{"caller":"host"}}"#;
+        let req: Request =
+            serde_json::from_str(with_metadata).expect("Should parse runtime envelope");
+        assert!(matches!(req, Request::EnsureStarted { .. }));
+    }
+
+    #[test]
+    fn test_ensure_started_rejects_unknown_fields() {
+        let json = r#"{"op":"ensure_started","admin":true}"#;
+        let err = serde_json::from_str::<Request>(json).expect_err("Should reject unknown fields");
+        assert!(err.to_string().contains("unknown field `admin`"));
+    }
+
+    #[test]
+    fn test_init_parses_peering_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut provider = IpfsProvider::new();
+        let response = provider.init(serde_json::json!({
+            "base_path": tmp.path().to_string_lossy(),
+            "extra": {
+                "peering": [
+                    {
+                        "id": "12D3KooWAlpha",
+                        "addrs": ["/ip4/172.19.0.1/tcp/4001", "/ip4/172.19.0.1/udp/4001/quic-v1"]
+                    },
+                    { "id": "12D3KooWBeta" }
+                ]
+            }
+        }));
+
+        assert!(matches!(response, Response::Ok { .. }));
+        assert_eq!(
+            provider.peering,
+            vec![
+                PeeringPeer {
+                    id: "12D3KooWAlpha".to_string(),
+                    addrs: vec![
+                        "/ip4/172.19.0.1/tcp/4001".to_string(),
+                        "/ip4/172.19.0.1/udp/4001/quic-v1".to_string(),
+                    ],
+                },
+                PeeringPeer {
+                    id: "12D3KooWBeta".to_string(),
+                    addrs: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_init_without_peering_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut provider = IpfsProvider::new();
+        let response = provider.init(serde_json::json!({
+            "base_path": tmp.path().to_string_lossy(),
+            "extra": {}
+        }));
+
+        assert!(matches!(response, Response::Ok { .. }));
+        assert!(provider.peering.is_empty());
+    }
+
+    #[test]
+    fn test_init_rejects_malformed_peering() {
+        let cases = [
+            serde_json::json!({"extra": {"peering": "12D3KooWAlpha"}}),
+            serde_json::json!({"extra": {"peering": ["12D3KooWAlpha"]}}),
+            serde_json::json!({"extra": {"peering": [{"addrs": []}]}}),
+            serde_json::json!({"extra": {"peering": [{"id": ""}]}}),
+            serde_json::json!({"extra": {"peering": [{"id": "12D3Koo/../W"}]}}),
+            serde_json::json!({"extra": {"peering": [{"id": "12D3KooWAlpha", "addrs": "/ip4/1.2.3.4/tcp/4001"}]}}),
+            serde_json::json!({"extra": {"peering": [{"id": "12D3KooWAlpha", "addrs": [4001]}]}}),
+        ];
+
+        for case in cases {
+            let mut provider = IpfsProvider::new();
+            match provider.init(case.clone()) {
+                Response::Error { code, .. } => assert_eq!(code, "invalid_config", "{case}"),
+                other => panic!("Expected error for {case}, got {other:?}"),
+            }
+            assert!(provider.peering.is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn test_peering_peers_config_json_uses_kubo_field_names() {
+        let peers = vec![
+            PeeringPeer {
+                id: "12D3KooWAlpha".to_string(),
+                addrs: vec!["/ip4/172.19.0.1/tcp/4001".to_string()],
+            },
+            PeeringPeer {
+                id: "12D3KooWBeta".to_string(),
+                addrs: vec![],
+            },
+        ];
+
+        assert_eq!(
+            peering_peers_config_json(&peers).to_string(),
+            r#"[{"Addrs":["/ip4/172.19.0.1/tcp/4001"],"ID":"12D3KooWAlpha"},{"Addrs":[],"ID":"12D3KooWBeta"}]"#
+        );
+    }
+
+    #[test]
+    fn test_peering_multiaddrs() {
+        let with_addrs = PeeringPeer {
+            id: "12D3KooWAlpha".to_string(),
+            addrs: vec![
+                "/ip4/172.19.0.1/tcp/4001".to_string(),
+                "/ip4/172.19.0.1/udp/4001/quic-v1".to_string(),
+            ],
+        };
+        assert_eq!(
+            peering_multiaddrs(&with_addrs),
+            vec![
+                "/ip4/172.19.0.1/tcp/4001/p2p/12D3KooWAlpha".to_string(),
+                "/ip4/172.19.0.1/udp/4001/quic-v1/p2p/12D3KooWAlpha".to_string(),
+            ]
+        );
+
+        let bare = PeeringPeer {
+            id: "12D3KooWBeta".to_string(),
+            addrs: vec![],
+        };
+        assert_eq!(
+            peering_multiaddrs(&bare),
+            vec!["/p2p/12D3KooWBeta".to_string()]
+        );
     }
 
     #[test]
