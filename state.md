@@ -1,45 +1,50 @@
 # State
 
-## Current remote-services checkpoint, 2026-09-12
+## Current model delivery checkpoint, 17 September 2026 UTC
 
-Reconciled 2026-09-13 UTC. The unpublished `feat/remote-services` candidate is
-`4ab99128b5d9491ef0d1c3536954f519aeee0def`, tree
-`2ae65c6737fe13986d0a7b50eaf346deae896f71`, with 161 commits beyond fetched
-`origin/feat/0.7.1-integration` (`093b51ca`) and none missing from that base.
-This identifies the tested source before the documentation reconciliation.
-Product changes end at `8444ff51`; `4ab99128` changes the Browser test's baseline
-budget to ten seconds while keeping actual viewer reload at five seconds.
-The Browser donor `bf846cd8` is included. Its separate dirty updater work retains
-its owner and has not entered this candidate.
+The unpublished working branch is `feat/remote-services` at
+`4009015b945abca23a705e7cd3cb83a15afb649d`, committed tree
+`907bbf1f7ec5611460a57dd88772e1160d213b4e`. It is 169 commits ahead and
+0 behind the last fetched `origin/feat/0.7.1-integration` (`093b51ca`).
+The working delta remains uncommitted. These Git identities identify the base;
+installed results retain their own binary and patch bindings.
 
-The isolated Mac and Linux Runtime binaries remain `50d835ed`; the Mac model
-provider and seed Assistant use `8444ff51` components. Installation receipts bind
-that mixed set explicitly. A fresh read confirms the Runtime/provider hashes and
-available test Homes. Public Runtime retains its September 11 binary and responds
-on the public Home route. These checks preserve earlier acceptance; they are not
-a new full installed campaign.
+The signed catalogue contains Qwen and SmolLM2-135M-Instruct Q8_0. Mac and seed
+holders retain the small package. Complete Mac-holder delivery was hashed, and
+an isolated Mac consumer admitted the package through Marketplace authority.
+The installed weights match the published 144,811,072-byte SHA-256. A native
+SmolLM2 run completed through the Assistant model contract. That check used a
+test helper; the visible Assistant conversation stayed empty. Normal Send,
+visible history, reload and full restart reuse remain open on this candidate.
+Earlier accepted Qwen receipts keep their original scope.
 
-| Surface | Accepted evidence | Remaining proof |
-| --- | --- | --- |
-| Remote Qwen | Real reply and saved chat; exact retained replay without another dispatch; owner Revoke during a run and original-chat recovery with both identifiers; honest Outcome unknown; keyboard Assistant activation; saved historic failure display; fresh Busy classification | Immediate Busy replay and successful retry after capacity frees; restart during a run; unapproved second-principal denial; complete M01-M06 and AI1 identity/Marketplace acceptance |
-| Browser | Bounded local run 92; remote run 100 navigation, media, input and 13 close effects; ordinary open 110 completed on selected Mac Engine `remote-engine-ec54fd5eab67a5c5913513a47a797fc8` with seed Exit and `https://ela.city/` | Actual remote reload and full U9 remain open. Automatic open still fails at profile placement. Attempts 101-103 stopped at automated Home focus; Anders did not reproduce that focus failure. Open 110 left a live page that still needs Home close. |
-| Test desktop | Manual helper now uses the native viewport; Anders confirms desktop fit | The viewport correction proves fit only. It does not establish the cause of earlier automated pointer/focus failures. |
+The reviewed Linux CPU and multi-model startup delta `e84dd728` is integrated.
+The two-order startup, Mac symlink and catalogue identity tests passed. The
+managed-Home catalogue propagation repair and its three regressions are present
+in source; a fresh installed Home without the diagnostic manual copy remains
+unverified. Preparation cancellation and a total deadline across holder attempts
+remain open. Honest inference `settlement_unknown` remains a distinct contract
+from responsive download cancellation.
 
-Expired Busy replay preserves the run identity and terminal status after the
-provider journal expires. The Runtime's status-only fallback is intentional;
-missing expired error details are not a demonstrated defect. Earlier failed
-receipts remain historical evidence. Stop and revoke report the backend's
-`settlement_unknown` as Outcome unknown; confirmed cancellation is a separate claim.
+Eight seed-only 64 KiB reads took 18.516 seconds, including 18.513 seconds inside
+the Content requests. Seed-local Kubo read the same amount in 0.04 seconds.
+This rules out the driver as the main delay; it does not identify the slow
+Runtime, Carrier or network stage. Full independent seed delivery remains open.
 
-The source can enter bounded draft review after documentation and basic gates
-pass. Public cutover needs U8, U9 and U10, the selected public configuration, and
-approval of the exact candidate. Full J1-J5, Browser B01-B16, model M01-M06,
-Marketplace AI1, cold model delivery, signed installation/update and contributor
-acceptance remain open under the approved plan. Follow the current Now section in
-[TASKS.md](TASKS.md); previous checkpoints below retain their dated scope.
+The installer audit found catalogue validation after installed-file replacement.
+Cloud owns the narrow installer/test repair. The existing Mac-only publication
+path can prepare Sash's preview; complete three-platform W1 remains required for
+the release. A source review push has its own source gates and exact-candidate
+approval; platform release artifacts are not a prerequisite for draft review.
 
+Whitespace, Home entropy, Browser entropy and required formatting checks are the
+current source review gates. Installed and human acceptance retain their separate
+scope. Browser is paused during model delivery. Preserve its prior receipts,
+source and J4 obligations, plus all J1–J5, M01–M06 and shared-state criteria.
+Current execution is in [TASKS.md](TASKS.md); target paths, process ownership and
+raw proof identities remain in the private development-loop checkpoint.
 
-## Current public preview and review checkpoint, 2026-09-11
+## Published preview and review checkpoint, last verified 11 September 2026
 
 `feat/0.7.1-integration` is the active working/review branch in
 [draft PR64](https://github.com/Elacity/elastos-runtime/pull/64), based on
@@ -69,7 +74,7 @@ Main/dev and contributor PRs retain their prior identities. Full J1 to J5 and
 D1 to D6 acceptance remains open. The [team report](docs/audits/2026-09-11-team-sync.md)
 and [contributor review](docs/audits/2026-09-11-contributor-review.md) cover
 5 to 11 September. Next implementation: exact Marketplace-to-Assistant handoff
-and safe removal, then cold Content/Carrier delivery. Recurring monitoring stays paused.
+and safe removal, then cold Content/Carrier delivery.
 
 Earlier dated records below retain their original artifacts and verdicts. This
 checkpoint owns the current public installation status.
@@ -961,6 +966,28 @@ complete. Installed proof and the atomic authority cutover remain open.
 - Principal-root object protection exists for selected Home/runtime state; this does not include Browser VM Chromium profile disks yet.
 - Product-readiness claims remain gated on target-specific objective audit and
   matching manual UX evidence; source inclusion does not waive that gate.
+- The 0.7.1 Browser U9 journeys remain open. Isolated Mac Home now runs
+  Runtime `b6d182b7` (PID 50635). Local U9 evidence stays bound to
+  Runtime `63be1c09`, which completed input, TURN SIGSTOP media cut
+  (stall 4344 ms, recovery 1810 ms), viewer reload at 1196 ms, official close
+  with all 13 terminal effects, and a second open (stall 4018 ms, recovery
+  1489 ms, reload 1216 ms). The 22:08 local log remains classified as an
+  unproven interruption: CDP offline produced `cut_ms=5000` and `stall_ms=0`.
+  The earlier `bd0f4beb` 797 ms local first-frame sample and the remote census
+  5340 ms first-frame sample on seed `21388ce6` stay bound to those artifacts.
+  Remote full input/reload/recovery/reopen on the current grant is not run:
+  the 00:51 seed dump still reports expired offer
+  `remote-engine-fdf0eaa2ec5d6ede` and `remote_runtime_binding_required`. The
+  vm-control settlement fixture including exit-then-reopen-before-cleanup
+  passed. Live page capacity requires the VM to own that exact page. A later
+  same-profile VM does not revive an old pending page. Consumer close settles
+  already-absent Engine ownership and releases viewer ingress. Source now
+  allocates a fresh display-attach request ID after a terminal failure and
+  commits preadmitted media only while ingress still owns the page. Those two
+  U9 lifecycle races have source regressions. The installed `63be1c09` pair
+  still runs the earlier source. Source also closes the model revoke/create
+  race and the AI0 Chat/Studio decode plus remote-reply identity boundary.
+  The four installed Qwen U8 Busy/retry/restart/denial checks stay open.
 
 ## Browser Provider Evidence
 

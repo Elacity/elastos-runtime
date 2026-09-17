@@ -2392,6 +2392,24 @@ const [safeBrowser] = shellWindows.normalizeRestorableSession(shellCore.shellSta
 });
 assert(JSON.stringify(safeBrowser.query) === JSON.stringify({ browser_instance: "browser:restore-fixture", url: "https://example.invalid/restore" }),
   "Browser restore retained authority or unknown fields");
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+const hiddenRestoreBefore = restoredBrowserLaunches.length;
+shellCore.shellState.homeBrowserState.session = {
+  root_shell: "home-gui",
+  browser_context_id: shellCore.shellState.browserContextId,
+  windows: [
+    { target: "browser", hidden: true, query: { url: "https://example.invalid/hidden-leftover" } },
+    { target: "browser", hidden: false, active: true, query: { url: "https://example.invalid/visible" } },
+  ],
+};
+await shellWindows.restoreShellSession();
+assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === hiddenRestoreBefore + 1,
+  "hidden leftover Browser windows must not remount or launch an Engine");
+assert(restoredBrowserLaunches.at(-1).query.url === "https://example.invalid/visible",
+  "session restore launched a hidden leftover Browser");
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
 const shellMenubar = await import(`../capsules/home-gui/browser/shell-menubar.js?v=${moduleVersion}`);
 const menuLaunches = [];
 shellMenubar.bindMenubar({

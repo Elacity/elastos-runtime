@@ -732,6 +732,7 @@ const activeUiFiles = [
   "capsules/wallet/browser/style.css",
   "capsules/browser/browser/index.html",
   "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-restore-boot.js",
   "capsules/browser/browser/browser-clipboard.js",
   "capsules/browser/browser/browser-history.js",
   "capsules/browser/browser/browser-input.js",
@@ -887,6 +888,10 @@ assert(
     assistantEntry.includes('from "./assistant-modes.js"') &&
     assistantModes.includes('from "./assistant.js"') && assistantModes.includes("studioOnly: true"),
   "Assistant boots the Sash shell and uses the typed controller for Studio",
+);
+assert(
+  assistantController.includes('from "./model-contract.js"'),
+  "Assistant Chat and Studio decode events through the typed contract module",
 );
 assert(
   !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
@@ -2618,6 +2623,13 @@ assert(
 assert(
   shellJs.includes('library: new Set(["archive-manager", "browser", "chat-room"])'),
   "Home must allow Library picker results to return only to Archive, Browser and Chat Room",
+);
+assert(
+  shellJs.includes('assistant: new Set(["marketplace"])') &&
+    shellJs.includes('"home-agent": new Set(["marketplace"])') &&
+    shellJs.includes("assistantModelsMarketplaceQuery") &&
+    shellJs.includes("marketplaceAssistantHandoffQuery"),
+  "Open Models must hand off through Marketplace with a bounded Assistant CID query",
 );
 assert(
   shellJs.includes('marketplace: "runtime-target"') &&
@@ -4774,6 +4786,42 @@ const publishRustRequired = rustConstItems(
 );
 const homeProfile = new Set(components.profiles.home.components);
 const demoProfile = new Set(components.profiles.demo.components);
+assert(
+  homeProfile.has("model-provider") &&
+    homeProfile.has("llama-server") &&
+    demoProfile.has("model-provider") &&
+    demoProfile.has("llama-server"),
+  "Home and demo profiles must install model-provider and llama-server",
+);
+assert(
+  ![...homeProfile].some((component) => component.startsWith("model-qwen")),
+  "Home profile must not install huggingface GGUF components",
+);
+assert(
+  typeof components.model_catalog?.head_cid === "string" &&
+    components.model_catalog.head_cid.startsWith("bafkrei") &&
+    Array.isArray(components.model_catalog.publisher_dids) &&
+    components.model_catalog.publisher_dids.length === 1 &&
+    components.model_catalog.local_use?.max_cache_bytes >= 18516684377 &&
+    components.model_catalog.local_use?.max_model_memory_bytes >= 8589934592,
+  "components.json must pin the signed permanent model catalog with Qwen local-use floors",
+);
+const modelCatalog = JSON.parse(read("model-catalog.json"));
+assert(
+  modelCatalog.signer_did === components.model_catalog.publisher_dids[0] &&
+    modelCatalog.payload?.schema === "elastos.model.catalog/v1" &&
+    !Object.hasOwn(modelCatalog.payload, "expires_at") &&
+    modelCatalog.payload.entries?.[0]?.cid ===
+      "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi",
+  "repo model-catalog.json must be the permanent Qwen publisher snapshot",
+);
+assert(
+  publishReleaseScript.includes("model_catalog") &&
+    publishReleaseScript.includes("model-catalog.json") &&
+    setupSourceHome.includes("install_signed_model_catalog") &&
+    setupSourceHome.includes("install_local_model_engine"),
+  "publish and source-home setup must carry the signed catalog and llama-server",
+);
 const protectedRuntimeProviders = new Set([
   "protected-content-protect-provider",
   "media-provider",
@@ -4880,10 +4928,11 @@ for (const component of [
   "browser-engine-supervisor",
   "browser-native-proxy-engine",
   "browser-stream-bridge",
-  "browser-local-exit",
-  "object-provider",
-  "wallet-provider",
-]) {
+        "browser-local-exit",
+        "object-provider",
+        "wallet-provider",
+        "model-provider",
+    ]) {
   assert(homeProfile.has(component), `Home profile must install ${component}`);
   assert(
     components.external[component],
@@ -5033,6 +5082,19 @@ assert(
     !marketplaceUi.includes("runtime-bundle") &&
     !marketplaceUi.includes("isBuiltIn"),
   "Marketplace must trust the installed-active catalog instead of inferring product state from source or bundle labels",
+);
+assert(
+  marketplaceUi.includes('elastos.marketplace.navigate/v1') &&
+    marketplaceUi.includes("function applyModelsLaunch") &&
+    marketplaceUi.includes('target: "assistant"') &&
+    marketplaceUi.includes("onReadyOpen: openReadyModelInAssistant") &&
+    read("capsules/home-gui/browser/shell-windows.js").includes(
+      'type: "elastos.marketplace.navigate/v1"',
+    ) &&
+    read("capsules/marketplace/browser/model-management.js").includes(
+      '"Open in Assistant"',
+    ),
+  "Marketplace must accept Models navigation and open a ready CID in Assistant",
 );
 assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
@@ -5268,6 +5330,7 @@ const walletStyle = read("capsules/wallet/browser/style.css");
 const browserManifest = read("capsules/browser/capsule.json");
 const browser = read("capsules/browser/browser/index.html");
 const browserMain = read("capsules/browser/browser/browser.js");
+const browserRestoreBoot = read("capsules/browser/browser/browser-restore-boot.js");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
@@ -5289,13 +5352,18 @@ const browserUnloadReleaseBlock = sourceBlock(
 );
 assert(
   browserJs.includes('window.addEventListener("beforeunload"') &&
-    browserJs.includes('window.addEventListener("pagehide", releaseRuntimePageForUnload)') &&
+    browserJs.includes('window.addEventListener("pagehide"') &&
+    browserJs.includes("startRecoverableDisplayAttach();") &&
     browserUnloadReleaseBlock.includes("stopPageStatusPolling();") &&
     browserUnloadReleaseBlock.includes("stopPageHeartbeat();") &&
     !browserUnloadReleaseBlock.includes("resizeObserver") &&
     !browserUnloadReleaseBlock.includes("closeRuntimePage(") &&
     !browserUnloadReleaseBlock.includes("publishRuntimePageForHost(null)") &&
     !browserUnloadReleaseBlock.includes("closeRemoteDisplay()") &&
+    !browserUnloadReleaseBlock.includes("prepareRecoverableDisplayAttach") &&
+    !browserUnloadReleaseBlock.includes("startRecoverableDisplayAttach") &&
+    !browserUnloadReleaseBlock.includes("display_attach") &&
+    !browserUnloadReleaseBlock.includes("keepalive") &&
     browserJs.includes("createRuntimePageCleanupController") &&
     browserJs.includes("requireTerminalRuntimePageCloseOutcome") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage") &&
@@ -9872,6 +9940,8 @@ assert(
     ) &&
     browserSelkiesControlService.includes("HELLO client") &&
     browserSelkiesControlService.includes("SESSION server") &&
+    browserSelkiesControlService.includes("elastos_display_renegotiate") &&
+    browserSelkiesControlService.includes("DISPLAY_RENEGOTIATE_SIGNAL") &&
     browserSelkiesControlServiceSmoke.includes("HELLO 1") &&
     browserSelkiesControlServiceSmoke.includes("base64") &&
     browserSelkiesControlService.includes('offerer: "engine"') &&
@@ -10310,6 +10380,13 @@ assert(
       "ice_servers: this.config.iceServers",
     ) &&
     browserSelkiesControlServiceSmoke.includes("status lost Runtime media relay proof") &&
+    browserSelkiesControlService.includes("waitForRenegotiatedOffer") &&
+    browserSelkiesControlService.includes("settleRenegotiatedOffer") &&
+    browserSelkiesControlService.includes("Selkies relay ICE for the new offer") &&
+    browserSelkiesControlService.includes("relayIceCandidates") &&
+    browserSelkiesControlService.includes("rememberIceCandidate") &&
+    browserSelkiesControlService.includes("this.remoteCandidateHistory = [];") &&
+    browserSelkiesControlService.includes("relayIceCandidates(") &&
     browserSelkiesControlService.includes("function mediaKindsForSdp") &&
     !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
     !browserSelkiesControlService.includes("audio_offer_unavailable") &&
@@ -10730,9 +10807,28 @@ assert(
     shellWindows.includes('const launchQuery = targetId === "browser"') &&
     shellWindows.includes("withBrowserInstanceQuery({ query: options.query }).query") &&
     shellWindows.includes("query: restoredWindow.query") &&
+    shellWindows.includes("if (restoredWindow.hidden)") &&
     browserJs.includes("const stalePage = previousPage ? null : recoverableRuntimePage();") &&
     browserJs.includes("await closeRuntimePage(stalePage, {") &&
     browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    browser.includes("browser-restore-boot.js?v=browser-20260915c") &&
+    browserRestoreBoot.includes("function waitForReadyAttach") &&
+    browserRestoreBoot.includes("function attachFromKnownUrl") &&
+    browser.includes('rel="modulepreload"') &&
+    browserRestoreBoot.includes("__elastosBrowserRestoreBoot") &&
+    browserRestoreBoot.includes("display_generation") &&
+    browserRestoreBoot.includes('generation.slice("display:".length)') &&
+    browserJs.includes("__elastosBrowserRestoreBoot") &&
+    browserJs.includes("persistRecoverableDisplayQuery") &&
+    browserJs.includes("function startRecoverableDisplayAttach") &&
+    browserJs.includes("keepalive: true") &&
+    browserJs.includes('pending.state === "pending" || pending.state === "ready"') &&
+    !browserJs.includes("prepareRecoverableDisplayAttach") &&
+    browserJs.includes("const connecting = connectRemoteDisplay") &&
+    browserJs.includes("postAnswerWithQueuedLocalIce") &&
+    !read("capsules/browser/browser/browser-remote-display.js").includes("waitForLocalAnswerIce") &&
+    browserJs.includes('url.searchParams.set("page_id"') &&
+    !browserRestoreBoot.includes("sessionStorage") &&
     !browserJs.includes("sessionStorage") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage"),
   "Home must persist Browser window launch query/browser_instance across restore while Browser recovers opaque Runtime cleanup ownership without frame-local session storage",

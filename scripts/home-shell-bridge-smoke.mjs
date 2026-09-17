@@ -246,6 +246,7 @@ const summary = {
     { target: "people", title: "People", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "assistant", title: "Assistant", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "home-agent", title: "Home Agent", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "marketplace", title: "Apps", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "wallet", title: "Wallet", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
@@ -515,7 +516,7 @@ globalThis.fetch = async (url, init = {}) => {
         title: "System",
       });
     }
-    if (["assistant", "home-agent"].includes(body?.target)) {
+    if (["assistant", "home-agent", "marketplace"].includes(body?.target)) {
       return jsonResponse({ attach_kind: "iframe", target: body.target,
         route: `/apps/${body.target}/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${body.target}-token` });
     }
@@ -1182,7 +1183,7 @@ for (const actor of ["assistant", "home-agent"]) {
   assert(shellMessages.some(m => m.payload?.result?.target === actor), "composer launch registered", shellMessages);
   const source = { parent: shellFrameWindow, postMessage() {} };
   const token = `${actor}-token`;
-  const intent = { type: "home:open-target", homeToken: token, target: "system", query: { settings: "models" } };
+  const intent = { type: "home:open-target", homeToken: token, target: "marketplace", query: { category: "models" } };
   const count = () => shellMessages.filter(m => m.payload?.command === "open-target").length;
   const before = count();
   sendChildMessage("null", source, intent);
@@ -1194,7 +1195,7 @@ for (const actor of ["assistant", "home-agent"]) {
     ["null", walletFrameWindow, { ...intent, homeToken: "wallet-token" }],
     ["null", source, { ...intent, target: "wallet" }],
     ["null", source, { ...intent, query: { settings: "accounts" } }],
-    ["null", source, { ...intent, query: { settings: "models", offer_id: "injected" } }],
+    ["null", source, { ...intent, query: { category: "models", offer_id: "injected" } }],
   ]) sendChildMessage(origin, sender, data);
   await new Promise(resolve => setTimeout(resolve, 0));
   assert(count() === before, "Models handoff rejects wrong actor/source/token/origin/target/query", shellMessages);
@@ -1202,7 +1203,34 @@ for (const actor of ["assistant", "home-agent"]) {
   for (let i = 0; i < 50 && count() === before; i++) await new Promise(resolve => setTimeout(resolve, 0));
   assert(count() === before + 1, "registered composer opens Models exactly once", shellMessages);
   const opened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
-  assert(opened.target === "system" && JSON.stringify(opened.query) === JSON.stringify({ settings: "models" }), "exact Models destination", opened);
+  assert(opened.target === "marketplace" && JSON.stringify(opened.query) === JSON.stringify({ category: "models" }), "exact Models destination", opened);
+}
+
+{
+  const modelCid = `bafybei${"a".repeat(51)}a`;
+  sendChildMessage("null", shellFrameWindow, { type: "home:launch-target", requestId: "launch-marketplace",
+    target: "marketplace", query: {}, homeToken: "gui-token" });
+  for (let i = 0; i < 50 && !shellMessages.some(m => m.payload?.requestId === "launch-marketplace"); i++) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  assert(shellMessages.some(m => m.payload?.result?.target === "marketplace"), "marketplace launch registered", shellMessages);
+  const marketSource = { parent: shellFrameWindow, postMessage() {} };
+  sendChildMessage("null", marketSource, { type: "home:app-ready", homeToken: "marketplace-token" });
+  const handoff = { type: "home:open-target", homeToken: "marketplace-token", target: "assistant", query: { model_cid: modelCid } };
+  const count = () => shellMessages.filter(m => m.payload?.command === "open-target").length;
+  const before = count();
+  for (const data of [
+    { ...handoff, query: { model_cid: modelCid, extra: "x" } },
+    { ...handoff, query: { settings: "models" } },
+    { ...handoff, target: "home-gui" },
+  ]) sendChildMessage("null", marketSource, data);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert(count() === before, "Marketplace Assistant handoff rejects extra query keys", shellMessages);
+  sendChildMessage("null", marketSource, handoff);
+  for (let i = 0; i < 50 && count() === before; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert(count() === before + 1, "Marketplace opens Assistant with exact CID", shellMessages);
+  const opened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
+  assert(opened.target === "assistant" && JSON.stringify(opened.query) === JSON.stringify({ model_cid: modelCid }), "exact Assistant handoff", opened);
 }
 
 const connectorLaunchesBeforeDeniedRequests = requests.filter(

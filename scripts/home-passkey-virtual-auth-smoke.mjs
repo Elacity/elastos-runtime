@@ -19,7 +19,9 @@ import { browserJourneyTargetConfig, readBrowserJourneyHealth, readBrowserJourne
   browserJourneyProfileStorage, browserJourneyProfileBinding } from "./lib/browser-journey-target.mjs";
 import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
-import { diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
+import { readBrowserPageStatus, isPageStatusTimeout } from "./lib/browser-journey-page-status.mjs";
+import { recoveredInputClickRect } from "./lib/browser-journey-recovered-input.mjs";
+import { censusBrowserViewerReload, diagnoseBrowserViewerReload, readBrowserViewerReloadDocument, browserViewerSignalMetadata } from "./lib/browser-journey-viewer-reload.mjs";
 import { runBrowserOperatorJourney } from "./lib/browser-journey-operator.mjs";
 import { qualificationOptions, createQualificationHarness, createQualificationCancellation, qualificationInteraction } from "./lib/browser-qualification-observer.mjs";
 
@@ -101,6 +103,12 @@ const BROWSER_INPUT_MAX_MS = parseBoundedIntegerEnv(
   1,
   60_000,
 );
+const BROWSER_AUDIO_WINDOW_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_AUDIO_WINDOW_MS",
+  2500,
+  500,
+  10_000,
+);
 const BROWSER_INPUT_EXPECT_URL_RE = process.env.HOME_VIRTUAL_AUTH_BROWSER_INPUT_EXPECT_URL_RE || "";
 const BROWSER_OPEN_VIEWPORT_WIDTH = parseBoundedIntegerEnv(
   "HOME_VIRTUAL_AUTH_BROWSER_OPEN_VIEWPORT_WIDTH",
@@ -157,6 +165,8 @@ const CHECK_BROWSER_EMBEDDED_UI_INPUT =
 const CHECK_BROWSER_CONTROLLED_JOURNEY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1";
 const CHECK_BROWSER_CONTROLLED_MEDIA = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_MEDIA === "1";
+const CHECK_BROWSER_AUDIO_ENGINE_DIAGNOSTICS =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_AUDIO_ENGINE_DIAGNOSTICS === "1";
 const CHECK_BROWSER_CONTROLLED_INSPECTION = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_INSPECTION === "1";
 const CHECK_BROWSER_CONTROLLED_OPERATOR = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_OPERATOR === "1";
 const REUSE_SIGNED_HOME = process.env.HOME_VIRTUAL_AUTH_REUSE_SIGNED_HOME === "1";
@@ -165,8 +175,17 @@ const qualificationCancellation = createQualificationCancellation(BROWSER_QUALIF
 let browserQualification = null;
 const BROWSER_OPERATOR_COORDS_PATH = process.env.HOME_VIRTUAL_AUTH_BROWSER_OPERATOR_COORDS || "";
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
+const BROWSER_DEFER_SCROLL = process.env.HOME_VIRTUAL_AUTH_BROWSER_DEFER_SCROLL === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
+const CHECK_BROWSER_RELOAD_CENSUS = process.env.HOME_VIRTUAL_AUTH_BROWSER_RELOAD_CENSUS === "1";
+const BROWSER_RELOAD_CENSUS_OUT = process.env.U9_RELOAD_CENSUS_OUT || "";
+const BROWSER_RELOAD_OBSERVE_MS = Number.parseInt(
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_RELOAD_OBSERVE_MS || "0",
+  10,
+);
 const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_TEST_HOME || "";
+const BROWSER_CONTROLLED_TURN_CONTROL_SOCKET =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_CONTROL_SOCKET || "";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
 const BROWSER_JOURNEY_TARGET = CHECK_BROWSER_CONTROLLED_JOURNEY || process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MODE ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MARKER ? browserJourneyTargetConfig(process.env) : null;
@@ -2055,6 +2074,8 @@ async function holdBrowserUiForSetup(context, browserToken, route) {
 async function waitForEmbeddedBrowserPage(appFrame, failures, ignoredOpenIds = new Set()) {
   const deadline = Date.now() + BROWSER_UI_PAGE_ID_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    const pageId = await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId || "");
+    if (pageId) return pageId;
     const failure = failures.find(entry => entry.frame === appFrame &&
       !(entry.open_id && ignoredOpenIds.has(entry.open_id)));
     if (failure) {
@@ -2063,8 +2084,6 @@ async function waitForEmbeddedBrowserPage(appFrame, failures, ignoredOpenIds = n
           response_format: failure.response_format, admission_reason: failure.admission_reason },
       });
     }
-    const pageId = await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId || "");
-    if (pageId) return pageId;
     await delay(200);
   }
   throw new Error("Embedded Browser UI did not publish the current page id before timeout");
@@ -2256,8 +2275,15 @@ async function closeControlledBrowserWindow(page, appFrame, windowIdentity, toke
           browser_instance: safeText(body?.browser_instance) }, receipt: null };
       record.detail = detail;
       evidence.close_responses.push(detail);
-      const receipt = await response.json().catch(() => null);
+      const raw = await response.text().catch(() => "");
+      let receipt = null;
+      try {
+        receipt = raw ? JSON.parse(raw) : null;
+      } catch {
+        detail.error_body = safeText(raw);
+      }
       record.receipt = receipt;
+      if (!receipt && raw && !detail.error_body) detail.error_body = safeText(raw);
       if (receipt) detail.receipt = {
         schema: safeText(receipt.schema), page_id: safeText(receipt.page_id), cleanup_id: safeText(receipt.cleanup_id),
         browser_instance: safeText(receipt.browser_instance), closed: receipt.closed === true,
@@ -2267,6 +2293,9 @@ async function closeControlledBrowserWindow(page, appFrame, windowIdentity, toke
         terminal_effects: Object.fromEntries([...effects, ...transportEffects]
           .filter(key => key in (receipt.terminal_effects || {})).map(key => [key, receipt.terminal_effects[key] === true])),
         transport_proof_present: Boolean(receipt.transport_proof),
+        ...(receipt.profile_durability === "failed" || receipt.profile_durability === "unknown"
+          || receipt.profile_durability === "proved"
+          ? { profile_durability: receipt.profile_durability } : {}),
       };
     } catch (error) {
       evidence.response_error = safeText(error.message);
@@ -2522,45 +2551,209 @@ async function observeControlledBrowserRequests(page, appFrame, token, record,
   }
 }
 
+async function extendControlledBrowserInput(page, appFrame, readReceipt, suffix, { timeoutMs }, evidence = {}) {
+  const deadline = performance.now() + Math.max(1, timeoutMs);
+  const remain = () => Math.max(1, deadline - performance.now());
+  const receipt = await readReceipt();
+  const events = receipt.events || [];
+  const last = [...events].reverse().find(event => event?.input_rect);
+  const load = events.find(event => event?.type === "load" && event.input_rect);
+  evidence.field_y = last?.input_rect?.y ?? null;
+  evidence.scroll_y = last?.scroll_y ?? null;
+  evidence.scrolled = 0;
+  evidence.clicked = false;
+  evidence.typed = false;
+  let rect = last?.input_rect || load?.input_rect;
+  const restRect = load?.input_rect;
+  // Journey wheel(0, 640) can move the field more than 640 px. Guest scroll
+  // then returns the field to its rest viewport y. Click the rest rectangle
+  // after one lift. A guessed lifted y misses the field; a settle poll can
+  // lift again from a mid-scroll y.
+  const clickRect = recoveredInputClickRect(rect, restRect);
+  if (clickRect.lift && remain() > 200) {
+    await appFrame.locator("#browser-remote-display").hover({ timeout: remain() });
+    await page.mouse.wheel(0, -clickRect.lift);
+    evidence.scrolled = -clickRect.lift;
+    rect = clickRect.rect;
+    evidence.field_y = rect.y;
+    if (Number.isFinite(load?.scroll_y)) evidence.scroll_y = load.scroll_y;
+  }
+  if (!rect) {
+    throw new Error("Recovered input has no fixture field rectangle");
+  }
+  const point = await remoteVideoClickPositionForPagePoint(appFrame, {
+    x: rect.x + rect.width / 2,
+    y: rect.y + rect.height / 2,
+  });
+  if (!point || point.x < 0 || point.y < 0 || point.x > point.video_width || point.y > point.video_height) {
+    throw new Error("Recovered input field is outside the visible remote display");
+  }
+  await appFrame.locator("#browser-remote-display").click({
+    position: { x: point.x, y: point.y },
+    timeout: remain(),
+  });
+  evidence.clicked = true;
+  const pasted = await appFrame.evaluate((text) => {
+    const panel = document.querySelector("#browser-render-panel");
+    const data = new DataTransfer();
+    data.setData("text/plain", text);
+    const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: data });
+    return panel.dispatchEvent(event) || event.defaultPrevented;
+  }, suffix);
+  if (!pasted) {
+    throw new Error("Recovered input paste did not reach the Browser page");
+  }
+  evidence.typed = true;
+  return evidence;
+}
+
 async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, expectedUrl) {
   markStage("browser:controlled-recovery");
+  const recoveredInput = { scrolled: 0, clicked: false, typed: false };
   const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
   assert(instance, "Recovery probe requires the current Browser instance");
   const runtimeOrigin = new URL(appFrame.url()).origin;
-  const summaryUrl = new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin);
+  const summaryUrl = browserJourneySummaryUrl(runtimeOrigin, instance);
   const probeId = randomUUID();
+  const knownPageId = await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId || "");
   const mediaInterruption = BROWSER_CONTROLLED_TURN_TEST_HOME
     ? await (await import("./lib/browser-journey-turn-interruption.mjs")).createBrowserTurnInterruption({
       testHome: BROWSER_CONTROLLED_TURN_TEST_HOME,
       runtimeOrigin,
-      pageId: await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId),
+      pageId: knownPageId,
+      ...(BROWSER_CONTROLLED_TURN_CONTROL_SOCKET
+        ? { controlSocketPath: BROWSER_CONTROLLED_TURN_CONTROL_SOCKET } : {}),
     }).catch(error => {
       error.details = { recovery: { ok: false, failure: "media_driver_binding_failed",
         media_driver: error.evidence } };
       throw error;
     }) : null;
   const { session: cdp, ancestorDepth } = await browserRecoveryCdpSession(page, appFrame);
+  let lastViewer = {
+    page_id: knownPageId,
+    browser_instance: instance,
+    actual_url: "",
+    engine_id: "",
+    exit_id: "",
+  };
+  const bindingReads = [];
+  let lastPageStatus = null;
   try {
     const evidence = await diagnoseBrowserJourneyRecovery({
       cdp,
       expectedUrl,
       mediaInterruption,
       readBinding: async ({ signal }) => {
-        // This observer uses the same scoped authority outside the cut viewer.
-        const response = await fetch(summaryUrl, { headers: { Origin: "null", "x-elastos-home-token": token }, signal });
-        assert(response.ok, "Recovery Runtime summary failed");
-        const body = await response.json();
-        const viewer = await appFrame.evaluate(() => ({
+        // Runtime ownership is fetched outside the interrupted viewer transport.
+        // Viewer evaluate can stall during reconnect; known page_id starts the
+        // Runtime reads immediately and fills chrome fields if evaluate aborts.
+        const evaluateViewer = (timeoutMs) => appFrame.locator("html").evaluate(() => ({
           page_id: window.__elastosBrowserCurrentPageId || "",
           browser_instance: new URL(location.href).searchParams.get("browser_instance"),
           actual_url: document.querySelector("#browser-url")?.value || "",
           engine_id: document.querySelector("#browser-engine")?.value,
           exit_id: document.querySelector("#browser-exit")?.value,
-        }));
-        const statusResponse = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(viewer.page_id)}/status`, runtimeOrigin),
-          { headers: { Origin: "null", "x-elastos-home-token": token }, signal });
-        assert(statusResponse.ok, "Recovery page status failed");
-        return { sessions: body.sessions, page_status: await statusResponse.json(), ...viewer };
+        }), undefined, { timeout: Math.max(1, Math.ceil(timeoutMs)) });
+        const fetchRuntime = async (pageId, timing) => {
+          const headers = { Origin: "null", "x-elastos-home-token": token };
+          const statusUrl = new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin);
+          const started = performance.now();
+          const response = await fetch(summaryUrl, { headers, signal });
+          assert(response.ok, "Recovery Runtime summary failed");
+          const sessions = (await response.json()).sessions;
+          if (timing) timing.summary_ms = Math.round(performance.now() - started);
+          // page_status probes the Engine. Timeout reuse keeps the last
+          // matching status and marks it stale. HTTP and JSON errors stay
+          // visible. A first miss without a cached status retries once on
+          // the remaining binding window.
+          const probeStatus = async (budgetMs) => {
+            const result = await readBrowserPageStatus({
+              fetchImpl: fetch,
+              url: statusUrl,
+              headers,
+              signal,
+              budgetMs,
+              lastPageStatus,
+            });
+            if (timing) {
+              timing.status_ms = Math.round(performance.now() - started);
+              timing.status_reused = !result.page_status_fresh;
+            }
+            if (result.page_status_fresh) lastPageStatus = result.page_status;
+            return result;
+          };
+          let status;
+          try {
+            status = lastPageStatus ? await probeStatus(800) : await probeStatus(3000);
+          } catch (error) {
+            if (timing) timing.status_ms = Math.round(performance.now() - started);
+            if (signal?.aborted || lastPageStatus || !isPageStatusTimeout(error)) throw error;
+            status = await probeStatus(null);
+          }
+          if (!status.page_status_fresh && !signal?.aborted) {
+            status = await probeStatus(null);
+          }
+          return {
+            sessions,
+            page_status: status.page_status,
+            page_status_fresh: status.page_status_fresh,
+          };
+        };
+        const knownId = lastViewer.page_id;
+        if (knownId) {
+          // Runtime ownership is the required observation. A reconnecting
+          // viewer evaluate can hang until Playwright's default timeout and
+          // then lose the 5 s clock even after summary and status return.
+          const chromeMs = 400;
+          const started = performance.now();
+          const read = { known_id: true, evaluate_ms: null, runtime_ms: null, summary_ms: null, status_ms: null };
+          try {
+            const [viewerResult, runtime] = await Promise.all([
+              evaluateViewer(chromeMs).then((value) => {
+                read.evaluate_ms = Math.round(performance.now() - started);
+                return value;
+              }).catch(() => {
+                read.evaluate_ms = Math.round(performance.now() - started);
+                return null;
+              }),
+              fetchRuntime(knownId, read).then((value) => {
+                read.runtime_ms = Math.round(performance.now() - started);
+                return value;
+              }),
+            ]);
+            bindingReads.push(read);
+            if (bindingReads.length > 8) bindingReads.shift();
+            const viewer = {
+              page_id: viewerResult?.page_id || lastViewer.page_id || runtime.page_status?.page_id || "",
+              browser_instance: viewerResult?.browser_instance || lastViewer.browser_instance || instance,
+              actual_url: viewerResult?.actual_url || runtime.page_status?.actual_url || lastViewer.actual_url,
+              engine_id: viewerResult?.engine_id ?? lastViewer.engine_id ?? "",
+              exit_id: viewerResult?.exit_id ?? lastViewer.exit_id ?? "",
+            };
+            if (viewer.page_id) lastViewer = viewer;
+            return { ...runtime, ...viewer };
+          } catch (error) {
+            bindingReads.push(read);
+            if (bindingReads.length > 8) bindingReads.shift();
+            throw error;
+          }
+        }
+        const aborted = () => {
+          const error = new Error("binding_aborted");
+          error.name = "AbortError";
+          return error;
+        };
+        const untilAbort = new Promise((_, reject) => {
+          if (signal?.aborted) {
+            reject(aborted());
+            return;
+          }
+          signal?.addEventListener("abort", () => reject(aborted()), { once: true });
+        });
+        const viewer = await Promise.race([evaluateViewer(5000), untilAbort]);
+        lastViewer = viewer;
+        return { ...await fetchRuntime(viewer.page_id, null), ...viewer };
       },
       readVideo: async () => {
         const metrics = await browserRemoteVideoMetrics(appFrame);
@@ -2569,8 +2762,16 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
         return { ...metrics, ...(Number.isSafeInteger(bytes) ? { video_bytes_received: bytes } : {}) };
       },
       readReceipt,
-      extendInput: (suffix, { timeoutMs }) => appFrame.locator("#browser-keyboard-capture")
-        .pressSequentially(suffix, { timeout: Math.ceil(timeoutMs) }),
+      extendInput: async (suffix, budget) => {
+        try {
+          Object.assign(recoveredInput, await extendControlledBrowserInput(
+            page, appFrame, readReceipt, suffix, budget, recoveredInput,
+          ));
+        } catch (error) {
+          recoveredInput.error = String(error?.message || error).slice(0, 240);
+          throw error;
+        }
+      },
       probeViewerRequest: ({ timeoutMs }) => appFrame.evaluate(async ({ probeId, timeoutMs }) => {
         const id = window.__elastosBrowserCurrentPageId;
         const token = new URLSearchParams(location.hash.slice(1)).get("home_token");
@@ -2582,14 +2783,87 @@ async function runControlledBrowserRecovery(page, appFrame, token, readReceipt, 
       }, { probeId, timeoutMs }),
       observeRequests: (record, { signal }) => observeControlledBrowserRequests(page, appFrame, token, record, { probeId, signal }),
     });
-    return { ...evidence, cdp_ancestor_depth: ancestorDepth,
+    return { ...evidence, cdp_ancestor_depth: ancestorDepth, recovered_input: recoveredInput,
+      binding_reads: bindingReads,
       ...(mediaInterruption ? { media_driver: mediaInterruption.evidence } : {}) };
   } catch (error) {
     error.details = { ...error.details, recovery: { ...error.evidence,
       failure: error.evidence?.failure || "probe_setup_or_observation_failed", cdp_ancestor_depth: ancestorDepth,
+      recovered_input: recoveredInput, binding_reads: bindingReads,
       ...(mediaInterruption ? { media_driver: mediaInterruption.evidence } : {}) } };
     throw error;
   }
+}
+
+function browserJourneySummaryUrl(runtimeOrigin, instance) {
+  const url = new URL("/api/apps/browser/summary", runtimeOrigin);
+  url.searchParams.set("browser_instance", instance);
+  // Installed Mac 63be1c09 and seed 21388ce6 both accept this query.
+  // The older Mac-only browser_instance shape stays in its historical receipt.
+  url.searchParams.set("remote_services", "0");
+  return url;
+}
+
+async function runControlledBrowserReloadCensus(page, appFrame, token, expectedUrl) {
+  markStage("browser:reload-census");
+  const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+  const runtimeOrigin = new URL(appFrame.url()).origin;
+  assert(instance, "Reload census requires the current Browser instance");
+  const headers = { Origin: "null", "x-elastos-home-token": token };
+  let lastPageStatus = null;
+  let statusInFlight = null;
+  const readVisible = () => appFrame.evaluate(readBrowserViewerReloadDocument).catch((error) => {
+    if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) {
+      throw error;
+    }
+    return { viewer: null, video: null };
+  });
+  const peekPageStatus = (pageId, signal) => {
+    if (pageId && !statusInFlight) {
+      statusInFlight = fetch(
+        `${runtimeOrigin}/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`,
+        { headers, signal },
+      ).then((response) => (response.ok ? response.json() : null), () => null)
+        .then((status) => {
+          if (status) lastPageStatus = status;
+          return status;
+        })
+        .finally(() => { statusInFlight = null; });
+    }
+    return lastPageStatus;
+  };
+  const evidence = await censusBrowserViewerReload({
+    expectedUrl,
+    watchMs: Number.isFinite(BROWSER_RELOAD_OBSERVE_MS) && BROWSER_RELOAD_OBSERVE_MS > 5000
+      ? BROWSER_RELOAD_OBSERVE_MS
+      : 5000,
+    readState: async ({ signal }) => {
+      const visible = await readVisible();
+      return {
+        sessions: null,
+        page_status: peekPageStatus(visible.viewer?.page_id, signal),
+        ...visible,
+      };
+    },
+    reloadViewer: async ({ timeoutMs }) => {
+      await Promise.all([
+        appFrame.waitForNavigation({ waitUntil: "commit", timeout: Math.ceil(timeoutMs) }),
+        appFrame.evaluate(() => location.reload()),
+      ]);
+    },
+    observeRequests: (record, { signal }) =>
+      observeControlledBrowserRequests(page, appFrame, token, record, { recordNavigation: true, signal }),
+    observeDiagnostics: (record) => {
+      const onConsole = (message) => {
+        const text = message.text();
+        if (!text.includes("elastos.browser.media-diagnostic/v1")) return;
+        try { record(JSON.parse(text)); } catch { /* keep the census bounded to valid events */ }
+      };
+      page.on("console", onConsole);
+      return () => { page.off("console", onConsole); };
+    },
+  });
+  return evidence;
 }
 
 async function runControlledBrowserViewerReload(page, appFrame, token, readReceipt, expectedUrl) {
@@ -2598,10 +2872,22 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
   const runtimeOrigin = new URL(appFrame.url()).origin;
   assert(instance, "Viewer reload requires the current Browser instance");
   const stateObservation = { clock: "performance.now", steps: [], dropped_steps: 0 };
-  let sampleId = 0;
+  let sampleId = 0, lastFreshPageId = "", lastFreshStatus = null, statusRefresh = null;
   try {
     const evidence = await diagnoseBrowserViewerReload({
       expectedUrl, readReceipt,
+      observeMs: Number.isFinite(BROWSER_RELOAD_OBSERVE_MS) && BROWSER_RELOAD_OBSERVE_MS > 5000
+        ? BROWSER_RELOAD_OBSERVE_MS
+        : 0,
+      observeReadState: async ({ signal }) => {
+        const visible = await appFrame.evaluate(readBrowserViewerReloadDocument).catch((error) => {
+          if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) {
+            throw error;
+          }
+          return { viewer: null, video: null };
+        });
+        return { sessions: null, page_status: lastFreshStatus, ...visible };
+      },
       readState: async ({ signal, deadlineMs }) => {
         const sample = ++sampleId;
         const step = async (name, action) => {
@@ -2623,31 +2909,50 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
           finally { signal.removeEventListener("abort", aborted); }
         };
         const headers = { Origin: "null", "x-elastos-home-token": token };
-        const { sessions } = await step("runtime_summary", async headersReceived => {
-          const response = await fetch(new URL(`/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance)}`, runtimeOrigin),
+        const readSummary = () => step("runtime_summary", async headersReceived => {
+          const response = await fetch(browserJourneySummaryUrl(runtimeOrigin, instance),
             { headers, signal });
           headersReceived();
           assert(response.ok, "Viewer reload Runtime summary failed");
           return response.json();
         });
+        const readStatus = pageId => step("remote_page_status", async headersReceived => {
+          const status = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin), { headers, signal });
+          headersReceived();
+          if (status.ok) return status.json();
+          assert(status.status === 404, "Viewer reload Runtime page status failed");
+          return null;
+        });
+        const readViewer = async () => {
+          try {
+            // Read the document identity and media in one execution context.
+            return await step("viewer_document_metrics", () => appFrame.evaluate(readBrowserViewerReloadDocument));
+          } catch (error) {
+            if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) throw error;
+            return { viewer: null, video: null };
+          }
+        };
+        // Fresh summary remains the live owner. Last status is binding
+        // continuity only, so a later sample can publish viewer metrics
+        // while an Engine probe is still in flight.
+        const [visible, summaryResult] = await Promise.all([readViewer(), readSummary()]);
+        const { sessions } = summaryResult;
         const pageId = sessions?.recoverable_page?.page_id;
         let page_status = null;
-        if (pageId) {
-          page_status = await step("remote_page_status", async headersReceived => {
-            const status = await fetch(new URL(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`, runtimeOrigin), { headers, signal });
-            headersReceived();
-            if (status.ok) return status.json();
-            assert(status.status === 404, "Viewer reload Runtime page status failed");
-            return null;
-          });
+        if (pageId && pageId === lastFreshPageId && lastFreshStatus) {
+          page_status = lastFreshStatus;
+          if (!statusRefresh) {
+            statusRefresh = readStatus(pageId).then(status => {
+              if (status) lastFreshStatus = status;
+            }).finally(() => { statusRefresh = null; });
+          }
+        } else if (pageId) {
+          page_status = await readStatus(pageId);
+          if (page_status) lastFreshStatus = page_status;
+        } else {
+          lastFreshStatus = null;
         }
-        let visible = { viewer: null, video: null };
-        try {
-          // Read the document identity and media in one execution context.
-          visible = await step("viewer_document_metrics", () => appFrame.evaluate(readBrowserViewerReloadDocument));
-        } catch (error) {
-          if (!/Execution context was destroyed|Cannot find context with specified id/.test(String(error.message))) throw error;
-        }
+        lastFreshPageId = pageId || "";
         return { sessions, page_status, ...visible };
       },
       reloadViewer: async ({ timeoutMs }) => {
@@ -2656,8 +2961,9 @@ async function runControlledBrowserViewerReload(page, appFrame, token, readRecei
           appFrame.evaluate(() => location.reload()),
         ]);
       },
-      extendInput: (suffix, { timeoutMs }) => appFrame.locator("#browser-keyboard-capture")
-        .pressSequentially(suffix, { timeout: Math.ceil(timeoutMs) }),
+      extendInput: (suffix, budget) => extendControlledBrowserInput(
+        page, appFrame, readReceipt, suffix, budget,
+      ),
       observeRequests: (record, { signal }) => observeControlledBrowserRequests(page, appFrame, token, record, { recordNavigation: true, signal }),
     });
     return { ...evidence, state_observation: stateObservation };
@@ -2901,7 +3207,10 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       null, { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS });
     if (fixture.engineId) {
       await appFrame.locator("#browser-settings").click();
-      await appFrame.locator("#browser-engine").selectOption(fixture.engineId);
+      const selectedEngine = await appFrame.locator("#browser-engine").inputValue();
+      if (selectedEngine !== fixture.engineId) {
+        await appFrame.locator("#browser-engine").selectOption(fixture.engineId);
+      }
       assert(await appFrame.locator("#browser-engine").inputValue() === fixture.engineId,
         "Requested Browser Engine UI selection failed");
       await appFrame.locator("#browser-settings-close").click();
@@ -2921,7 +3230,7 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
     });
     const ignoredOpenIds = new Set(settled.map(entry => entry.open_id));
     result.prior_open_settlements = settled.map(({ open_id, body }) => ({ open_id, settlement: body }));
-    for (const name of ["main", "nav"]) {
+    for (const name of CHECK_BROWSER_RELOAD_CENSUS ? ["nav"] : ["main", "nav"]) {
       markStage(`browser:controlled-${name}`);
       const documentSequence = fixture.profile ? (await readReceipt()).events.at(-1)?.sequence || 0 : 0;
       const url = browserJourneyFixtureUrl(fixture, run, name,
@@ -2973,6 +3282,19 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       await checkProfileDocument(name, status.page_id, documentSequence);
     }
     const current = result.pages.at(-1);
+    if (CHECK_BROWSER_RELOAD_CENSUS) {
+      try {
+        result.reload_census = await runControlledBrowserReloadCensus(page, appFrame, token, current.url);
+      } catch (error) {
+        if (error.evidence) result.reload_census = error.evidence;
+        throw error;
+      } finally {
+        if (BROWSER_RELOAD_CENSUS_OUT && result.reload_census) {
+          writeFileSync(BROWSER_RELOAD_CENSUS_OUT, `${JSON.stringify(result.reload_census, null, 2)}\n`);
+        }
+      }
+      return { page_id: current.page_id, display_mode: BROWSER_OPEN_DISPLAY_MODE, controlled_journey: result };
+    }
     inputObserver = await observeControlledBrowserInput(page, appFrame, token, current.page_id);
     result.input_observation = inputObserver.evidence;
     const rect = current.load.input_rect;
@@ -3027,22 +3349,32 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
           event.audio_state === "running" && event.frequency_hz === 440), "controlled Engine tone starts");
       result.audio = await appFrame.evaluate(() => window.__readBrowserJourneyAudio());
       result.audio.fixture_event = toneReceipt.events.find(event => event.page === "nav" && event.type === "audio");
-      if (!controlledTonePresent(result.audio)) {
+      const afterTone = await readReceipt();
+      result.audio.fixture_event_after = [...afterTone.events].reverse().find(event =>
+        event.page === "nav" && event.type === "audio") || null;
+      if (!controlledTonePresent(result.audio) || CHECK_BROWSER_AUDIO_ENGINE_DIAGNOSTICS) {
         result.audio.receiver_metrics = await browserRemoteDisplayMetrics(appFrame).catch(() => null);
         result.audio.engine_diagnostics = await checkBrowserPageDiagnostics(appFrame, token, current.page_id)
           .catch(error => ({ error: error.message, details: error.details }));
       }
       assert(controlledTonePresent(result.audio), "Controlled 440 Hz tone was not decoded by the product receiver", result.audio);
     }
-    markStage("browser:scroll");
-    await appFrame.locator("#browser-remote-display").hover();
-    await page.mouse.wheel(0, 640);
-    const receipt = await waitForJourneyEvidence(readReceipt,
-      value => value.events.some(event => event.page === "nav" && event.type === "scroll" &&
-        event.value === text && event.scroll_y >= current.load.scroll_y + 100), "Engine page scroll movement");
-    const afterInput = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
-      value => value.decoded_frames > current.video.decoded.decoded_frames, "decoded frames after input");
-    result.input = { text, receipt, video_after_input: afterInput };
+    const typedReceipt = await readReceipt();
+    // Recovery proves reconnection on the field the person already sees.
+    // Ordinary scroll stays a later complete-journey case.
+    if (BROWSER_DEFER_SCROLL) {
+      result.input = { text, receipt: typedReceipt, scroll_deferred: true };
+    } else {
+      markStage("browser:scroll");
+      await appFrame.locator("#browser-remote-display").hover();
+      await page.mouse.wheel(0, 640);
+      const receipt = await waitForJourneyEvidence(readReceipt,
+        value => value.events.some(event => event.page === "nav" && event.type === "scroll" &&
+          event.value === text && event.scroll_y >= current.load.scroll_y + 100), "Engine page scroll movement");
+      const afterInput = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
+        value => value.decoded_frames > current.video.decoded.decoded_frames, "decoded frames after input");
+      result.input = { text, receipt, video_after_input: afterInput };
+    }
     if (browserQualification) {
       result.qualification = await browserQualification.observe({ appFrame, pageId: current.page_id, readReceipt,
         readStatus: () => browserApi(appFrame, token, `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/status`),
@@ -3215,6 +3547,12 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
       }, { capture: true });
     });
     markStage("browser:page-acquisition");
+    await appFrame.locator("#browser-url").waitFor({ state: "visible", timeout: 15_000 });
+    await appFrame.waitForFunction(() => document.querySelector("#browser-url")?.disabled === false,
+      null, { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS });
+    if (!(await appFrame.evaluate(() => window.__elastosBrowserCurrentPageId || ""))) {
+      await appFrame.locator("#browser-url").press("Enter");
+    }
     pageId = await waitForEmbeddedBrowserPage(appFrame, openFailures).catch(async error => {
       error.details = { ...error.details, ui: await embeddedBrowserDebugState(windowLocator, appFrame) };
       throw error;
@@ -3860,31 +4198,67 @@ async function openDesktopAppWindow(page, target, onFrame = null) {
     await setupReminder.waitFor({ state: "hidden", timeout: 5_000 });
   }
   if (target === "browser") {
-    // Match Home's foreground choice once. DOM order can differ from z-order,
-    // and a later restored window must not replace the chosen frame.
-    const selected = (await homeGuiFrame.evaluateHandle(() => {
-      const windows = [...document.querySelectorAll('section.window[data-target="browser"]')];
-      const active = windows.filter(node => node.classList.contains("window-active"));
-      if (active.length > 1) throw new Error("Home has ambiguous active Browser windows");
-      const visible = windows.filter(node => !node.classList.contains("hidden"));
-      return active[0] || (visible.length ? visible : windows)
-        .sort((a, b) => Number(b.style.zIndex || 0) - Number(a.style.zIndex || 0))[0] || null;
-    })).asElement();
     let handle;
-    if (selected) {
-      handle = await selected.$("iframe.window-frame");
-    } else {
+    if (CHECK_BROWSER_CONTROLLED_JOURNEY) {
+      // Hidden leftovers stay unused. Home New Window creates the journey surface.
+      await homeGuiFrame.locator("#identity-menu-show-desktop").evaluate(el => el.click()).catch(() => {});
+      await homeGuiFrame.waitForFunction(() => document.querySelector("#launcher")?.hidden !== false, null, { timeout: 5_000 }).catch(() => {});
+      const priorSrcs = await homeGuiFrame.evaluate(() =>
+        [...document.querySelectorAll('section.window[data-target="browser"] iframe.window-frame')]
+          .map(frame => frame.getAttribute("src") || ""),
+      );
       const shelf = homeGuiFrame.locator('#taskbar-targets [data-target="browser"]').first();
-      if (await shelf.isVisible()) await shelf.click();
+      if (await shelf.count()) await shelf.click({ button: "right" });
       else {
         await homeGuiFrame.locator("#launcher-toggle").click();
-        await homeGuiFrame.locator('#launcher-grid [data-target="browser"]').first().click();
+        await homeGuiFrame.locator('#launcher-grid [data-target="browser"]').first().click({ button: "right" });
       }
-      // There was no Browser at selection. Ambiguous concurrent creations fail
-      // the strict locator instead of assigning another window's authority.
-      const created = homeGuiFrame.locator('section.window[data-target="browser"] iframe.window-frame');
-      await created.waitFor({ state: "attached", timeout: 20_000 });
-      handle = await created.elementHandle();
+      await homeGuiFrame.waitForFunction(() => {
+        const menu = document.querySelector("#desktop-context-menu");
+        return Boolean(menu && menu.hidden !== true &&
+          menu.querySelector('[data-context-action="open-target-new-window"], [data-context-action="open-target"]'));
+      }, null, { timeout: 5_000 }).catch(() => {
+        throw new Error("Home did not offer Browser Open or New Window");
+      });
+      const newWindow = homeGuiFrame.locator('#desktop-context-menu [data-context-action="open-target-new-window"]');
+      const ordinaryOpen = homeGuiFrame.locator('#desktop-context-menu [data-context-action="open-target"]');
+      if (await newWindow.count()) await newWindow.click();
+      else if (await ordinaryOpen.count()) await ordinaryOpen.click();
+      else throw new Error("Home did not offer Browser Open or New Window");
+      await homeGuiFrame.waitForFunction(prior => {
+        return [...document.querySelectorAll('section.window[data-target="browser"]:not(.hidden) iframe.window-frame')]
+          .some(frame => {
+            const src = frame.getAttribute("src") || "";
+            return src.includes("/apps/browser/") && !prior.includes(src);
+          });
+      }, priorSrcs, { timeout: 20_000 });
+      handle = await homeGuiFrame.locator('section.window[data-target="browser"]:not(.hidden).window-active iframe.window-frame').elementHandle();
+    } else {
+      // Match Home's foreground choice once. DOM order can differ from z-order,
+      // and a later restored window must not replace the chosen frame.
+      const selected = (await homeGuiFrame.evaluateHandle(() => {
+        const windows = [...document.querySelectorAll('section.window[data-target="browser"]')];
+        const active = windows.filter(node => node.classList.contains("window-active"));
+        if (active.length > 1) throw new Error("Home has ambiguous active Browser windows");
+        const visible = windows.filter(node => !node.classList.contains("hidden"));
+        return visible.sort((a, b) => Number(b.style.zIndex || 0) - Number(a.style.zIndex || 0))[0] ||
+          active[0] || null;
+      })).asElement();
+      if (selected) {
+        handle = await selected.$("iframe.window-frame");
+      } else {
+        const shelf = homeGuiFrame.locator('#taskbar-targets [data-target="browser"]').first();
+        if (await shelf.isVisible()) await shelf.click();
+        else {
+          await homeGuiFrame.locator("#launcher-toggle").click();
+          await homeGuiFrame.locator('#launcher-grid [data-target="browser"]').first().click();
+        }
+        // There was no Browser at selection. Ambiguous concurrent creations fail
+        // the strict locator instead of assigning another window's authority.
+        const created = homeGuiFrame.locator('section.window[data-target="browser"]:not(.hidden) iframe.window-frame');
+        await created.waitFor({ state: "attached", timeout: 20_000 });
+        handle = await created.elementHandle();
+      }
     }
     const appFrame = handle ? await handle.contentFrame() : null;
     assert(appFrame, "Selected Home Browser window has no content frame");
@@ -4550,6 +4924,46 @@ async function checkBrowserLaunchGrant(page, homeToken) {
   assert(launched.body?.target === "browser", "Browser launch did not resolve the Browser capsule", launched);
   const route = String(launched.body?.route || "");
   const browserToken = assertIsolatedLaunchRoute(route, "browser");
+  const officialClosePageId = process.env.HOME_VIRTUAL_AUTH_OFFICIAL_CLOSE_PAGE || "";
+  const officialCloseCleanupId = process.env.HOME_VIRTUAL_AUTH_OFFICIAL_CLOSE_CLEANUP || "";
+  if (officialClosePageId) {
+    assert(officialCloseCleanupId, "Official close requires HOME_VIRTUAL_AUTH_OFFICIAL_CLOSE_CLEANUP");
+    const officialCloseInstance = process.env.HOME_VIRTUAL_AUTH_OFFICIAL_CLOSE_INSTANCE || "";
+    const appFrame = await openDesktopAppWindow(page, "browser");
+    const frameToken = assertIsolatedLaunchRoute(appFrame.url(), "browser");
+    const closeBody = {
+      schema: "elastos.browser.close-request/v2",
+      cleanup_id: officialCloseCleanupId,
+    };
+    if (officialCloseInstance) {
+      closeBody.browser_instance = officialCloseInstance;
+    }
+    const closed = await browserApi(
+      appFrame,
+      frameToken,
+      `/api/apps/browser/pages/${encodeURIComponent(officialClosePageId)}/close`,
+      {
+        method: "POST",
+        body: closeBody,
+      },
+    );
+    launched.body.official_close = closed;
+    console.error(JSON.stringify(redactSensitive({
+      stage: "browser:official-close",
+      page_id: officialClosePageId,
+      ok: closed.ok,
+      status: closed.status,
+      body: closed.body,
+    })));
+    assert(closed.ok, "Official Runtime close failed", closed);
+    assert(
+      closed.body?.schema === "elastos.browser.close-result/v1" &&
+        closed.body?.closed === true,
+      "Official Runtime close did not return a closed receipt",
+      closed,
+    );
+    return launched.body;
+  }
   if (CHECK_BROWSER_UI_SETUP) {
     launched.body.browser_ui_setup = await holdBrowserUiForSetup(page.context(), browserToken, route);
   }
@@ -5008,6 +5422,10 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 async function main() {
   assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
     "The task TURN interruption requires controlled Browser recovery");
+  assert(!BROWSER_CONTROLLED_TURN_CONTROL_SOCKET || BROWSER_CONTROLLED_TURN_TEST_HOME,
+    "The adapter TURN control socket requires an explicit TURN test Home");
+  assert(!(REQUIRE_BROWSER_VZ_TRANSPORT && CHECK_BROWSER_CONTROLLED_RECOVERY) || BROWSER_CONTROLLED_TURN_TEST_HOME,
+    "VZ recovery requires an explicit TURN test Home so the media path can be interrupted");
   assert(!CHECK_BROWSER_CONTROLLED_MEDIA || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled audio proof requires the controlled Browser journey");
   assert(!BROWSER_QUALIFICATION_OPTIONS || (CHECK_BROWSER_CONTROLLED_JOURNEY && CHECK_BROWSER_CONTROLLED_MEDIA &&
@@ -5020,6 +5438,12 @@ async function main() {
   "Controlled operator proof requires the controlled inspection journey and explicit Runtime coordinates");
   assert(!CHECK_BROWSER_VIEWER_RELOAD || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Browser viewer reload requires the controlled journey");
+  assert(!CHECK_BROWSER_RELOAD_CENSUS || CHECK_BROWSER_CONTROLLED_JOURNEY,
+    "Reload census requires the controlled journey");
+  assert(!(CHECK_BROWSER_RELOAD_CENSUS && CHECK_BROWSER_VIEWER_RELOAD),
+    "Reload census replaces the five-second reload gate");
+  assert(!CHECK_BROWSER_RELOAD_CENSUS || CHECK_BROWSER_CONTROLLED_MEDIA,
+    "Reload census needs decoded video on a working page");
   assert(!CHECK_BROWSER_CONTROLLED_RECOVERY || CHECK_BROWSER_CONTROLLED_JOURNEY,
     "Controlled Browser recovery requires the controlled journey");
   assert(!CHECK_BROWSER_CONTROLLED_JOURNEY || (INCLUDE_BROWSER && CHECK_BROWSER_EMBEDDED_UI_INPUT &&
@@ -5047,10 +5471,12 @@ async function main() {
     headless: HEADLESS,
     executablePath: process.env.ELASTOS_BROWSER_EXECUTABLE || undefined,
     ignoreHTTPSErrors: true,
-    viewport: { width: 1280, height: 900 },
+    viewport: HEADLESS ? { width: 1280, height: 900 } : null,
   });
   const context = qualificationCancellation ? await qualificationCancellation.ownContext(contextPromise) : await contextPromise;
-  if (CHECK_BROWSER_CONTROLLED_MEDIA) await context.addInitScript(installBrowserJourneyAudioProbe);
+  if (CHECK_BROWSER_CONTROLLED_MEDIA) {
+    await context.addInitScript(installBrowserJourneyAudioProbe, { windowMs: BROWSER_AUDIO_WINDOW_MS });
+  }
   let page = context.pages()[0] || await context.newPage();
   let created = null;
   let passkey = null;
