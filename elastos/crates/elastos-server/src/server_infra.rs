@@ -612,6 +612,15 @@ pub(crate) async fn start_carrier_plane(
     Ok(carrier_node)
 }
 
+async fn serve_capability_store(
+    data_dir: &Path,
+) -> anyhow::Result<Arc<capability::CapabilityStore>> {
+    capability::CapabilityStore::with_persistence(data_dir.join("capability_store"))
+        .await
+        .map(Arc::new)
+        .map_err(|err| anyhow::anyhow!("capability store unavailable: {err}"))
+}
+
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
 ) -> anyhow::Result<ServerInfrastructure> {
@@ -628,7 +637,7 @@ async fn setup_server_infrastructure_impl(
         .set_default_owner(local_session_owner(&data_dir)?)
         .await;
     let metrics = Arc::new(primitives::metrics::MetricsManager::new());
-    let capability_store = Arc::new(capability::CapabilityStore::new());
+    let capability_store = serve_capability_store(&data_dir).await?;
     let capability_manager = Arc::new(capability::CapabilityManager::load_or_generate(
         &data_dir,
         capability_store,
@@ -4032,6 +4041,68 @@ mod tests {
         assert!(
             message.contains("elastos protected-content-config provision-custody-node"),
             "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_capability_store_keeps_revoke_all_after_restart() {
+        let data_dir = TempDir::new().unwrap();
+        let resource = capability::ResourceId::new("elastos://content/fetch");
+        let token = {
+            let store = serve_capability_store(data_dir.path())
+                .await
+                .expect("serve store");
+            let manager = capability::CapabilityManager::load_or_generate(
+                data_dir.path(),
+                store,
+                Arc::new(primitives::audit::AuditLog::new()),
+                Arc::new(primitives::metrics::MetricsManager::new()),
+            );
+            let token = manager.grant(
+                "test-capsule",
+                resource.clone(),
+                capability::Action::Read,
+                capability::TokenConstraints::default(),
+                None,
+            );
+            manager
+                .validate(
+                    &token,
+                    "test-capsule",
+                    capability::Action::Read,
+                    &resource,
+                    None,
+                )
+                .await
+                .expect("grant still validates before revoke");
+            manager.revoke_all("test restart revoke");
+            token
+        };
+
+        let store = serve_capability_store(data_dir.path())
+            .await
+            .expect("reopened serve store");
+        let manager = capability::CapabilityManager::load_or_generate(
+            data_dir.path(),
+            store,
+            Arc::new(primitives::audit::AuditLog::new()),
+            Arc::new(primitives::metrics::MetricsManager::new()),
+        );
+        let result = manager
+            .validate(
+                &token,
+                "test-capsule",
+                capability::Action::Read,
+                &resource,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(capability::manager::ValidationError::TokenRevoked)
+            ),
+            "revoked token must stay revoked after restart: {result:?}"
         );
     }
 }
