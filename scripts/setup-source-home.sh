@@ -16,7 +16,9 @@ Configure tool paths with:
   ELASTOS_CARGO_BIN
   ELASTOS_NODE_BIN
   ELASTOS_DEBUGFS_BIN
-  SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR (directory containing ffmpeg and ffprobe)
+  SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR (owner-only directory containing ffmpeg and ffprobe)
+  SETUP_SOURCE_HOME_RUNTIME_BIN (optional receipt-bound Runtime executable)
+  SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN (optional receipt-bound ipfs-provider executable)
   ELASTOS_COLLABORATION_STARTUP_MODE (configured|isolated)
   ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT
   ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
@@ -82,6 +84,66 @@ cargo_built_binary_path() {
     local profile="$2"
     local binary="$3"
     printf '%s\n' "$(cargo_target_root_for_manifest "${manifest_path}")/${profile}/${binary}"
+}
+
+require_reviewed_owner_only_path() {
+    local path="$1"
+    local name="$2"
+    local expect_dir="$3"
+    python3 - "$path" "$name" "$expect_dir" <<'PY'
+import os
+import stat
+import sys
+
+path, name, expect_dir = sys.argv[1], sys.argv[2], sys.argv[3] == "dir"
+try:
+    metadata = os.lstat(path)
+except OSError:
+    raise SystemExit(f"{name} is missing")
+if stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit(f"{name} must not be a symlink")
+if metadata.st_uid != os.geteuid():
+    raise SystemExit(f"{name} must be owned by the setup user")
+if metadata.st_mode & 0o077:
+    raise SystemExit(f"{name} must be owner-only")
+if expect_dir:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"{name} must be a directory")
+elif not (stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o100):
+    raise SystemExit(f"{name} must be an owner-only executable file")
+PY
+}
+
+require_reviewed_media_tools_dir() {
+    local dir="${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR:-}"
+    if [[ -z "$dir" ]]; then
+        echo "Set SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR to the reviewed owner-only directory containing ffmpeg and ffprobe." >&2
+        exit 1
+    fi
+    require_reviewed_owner_only_path "$dir" "SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR" dir
+    local tool
+    for tool in ffmpeg ffprobe; do
+        require_reviewed_owner_only_path "${dir}/${tool}" "SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR/${tool}" file
+    done
+}
+
+source_home_runtime_bin() {
+    if [[ -n "${SETUP_SOURCE_HOME_RUNTIME_BIN:-}" ]]; then
+        require_reviewed_owner_only_path "${SETUP_SOURCE_HOME_RUNTIME_BIN}" "SETUP_SOURCE_HOME_RUNTIME_BIN" file
+        printf '%s\n' "${SETUP_SOURCE_HOME_RUNTIME_BIN}"
+        return
+    fi
+    cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos
+}
+
+source_home_provider_bin() {
+    local provider="$1"
+    if [[ "$provider" == "ipfs-provider" && -n "${SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN:-}" ]]; then
+        require_reviewed_owner_only_path "${SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN}" "SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN" file
+        printf '%s\n' "${SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN}"
+        return
+    fi
+    cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}"
 }
 
 find_cargo() {
@@ -612,7 +674,7 @@ verify_collaboration_startup_config_input() {
         exit 1
     fi
     local elastos_bin
-    elastos_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+    elastos_bin="$(source_home_runtime_bin)"
     "$elastos_bin" collaboration-config verify --input "$input_path" >/dev/null
 }
 
@@ -1155,7 +1217,7 @@ install_local_model_engine() {
     echo "[setup-source-home] install llama-server for local model Use"
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" setup --with llama-server
+        "$(source_home_runtime_bin)" setup --with llama-server
 }
 
 stamp_source_home_capsule_artifacts_manifest() {
@@ -1185,7 +1247,7 @@ prepare_media_provider_prerequisite() {
     echo "[setup-source-home] prepare media-provider prerequisite"
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${ROOT}/components.json" \
-        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
+        "$(source_home_runtime_bin)" \
         setup --with media-provider --prerequisites-only \
         --media-tools-dir "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}"
 }
@@ -1204,7 +1266,7 @@ install_content_publish_backend() {
     echo "[setup-source-home] install Kubo for Library/Documents publish"
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" setup --with kubo
+        "$(source_home_runtime_bin)" setup --with kubo
     if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
         echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
         exit 1
@@ -1232,16 +1294,7 @@ if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
-[[ -n "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR:-}" ]] || {
-    echo "Set SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR to the reviewed directory containing ffmpeg and ffprobe." >&2
-    exit 1
-}
-for tool in ffmpeg ffprobe; do
-    [[ -x "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}/${tool}" ]] || {
-        echo "Source-home media tool is missing: ${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}/${tool}" >&2
-        exit 1
-    }
-done
+require_reviewed_media_tools_dir
 require_minimum_free_space "${ROOT}"
 require_minimum_free_space "${DATA_DIR}"
 
@@ -1254,8 +1307,13 @@ if ! grep -Eq '^[[:space:]]*trusted_keys[[:space:]]*=' "${CONFIG_TOML}"; then
     printf 'trusted_keys = []\n' >> "${CONFIG_TOML}"
 fi
 
-echo "[setup-source-home] build runtime server"
-"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+if [[ -n "${SETUP_SOURCE_HOME_RUNTIME_BIN:-}" ]]; then
+    echo "[setup-source-home] using receipt-bound Runtime binary"
+    require_reviewed_owner_only_path "${SETUP_SOURCE_HOME_RUNTIME_BIN}" "SETUP_SOURCE_HOME_RUNTIME_BIN" file
+else
+    echo "[setup-source-home] build runtime server"
+    "$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+fi
 verify_collaboration_startup_config_input
 if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
@@ -1282,6 +1340,11 @@ source_home_binary_manifest_path() {
 echo "[setup-source-home] build native provider binaries"
 "$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
 source_home_binary_names | while IFS= read -r provider; do
+    if [[ "$provider" == "ipfs-provider" && -n "${SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN:-}" ]]; then
+        echo "[setup-source-home] using receipt-bound ipfs-provider binary"
+        require_reviewed_owner_only_path "${SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN}" "SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN" file
+        continue
+    fi
     "$CARGO_BIN" build --locked --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
 done
 
@@ -1316,7 +1379,7 @@ echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
 source_home_binary_names | while IFS= read -r provider; do
-    install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}")" "${DATA_DIR}/bin/${provider}"
+    install -m 755 "$(source_home_provider_bin "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
 install_signed_model_catalog
@@ -1348,7 +1411,7 @@ install_collaboration_startup_config
 # installer's artifact gate rejects any multi-link source (hardlink-swap
 # defense, st_nlink must be 1). Hand it a private single-link copy staged
 # next to the built binary instead of relaxing the gate.
-built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+built_runtime="$(source_home_runtime_bin)"
 (
     runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"
     trap 'rm -rf "${runtime_stage_dir}"' EXIT

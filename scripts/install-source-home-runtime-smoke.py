@@ -520,7 +520,7 @@ def test_untrusted_built_runtime(temp_root):
 
 def test_setup_stage_cleanup(temp_root):
     setup = SETUP.read_text(encoding="utf-8")
-    start = 'built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"'
+    start = 'built_runtime="$(source_home_runtime_bin)"'
     end = '\n\ncat <<EOF'
     if start not in setup or end not in setup:
         raise AssertionError("setup staging block is unavailable")
@@ -573,7 +573,7 @@ def test_setup_stage_cleanup(temp_root):
             "PLATFORM=\"$3\"\n"
             "FIXTURE_BUILT_RUNTIME=\"$4\"\n"
             "export FIXTURE_BUILT_RUNTIME\n"
-            "cargo_built_binary_path() {\n"
+            "source_home_runtime_bin() {\n"
             "  printf '%s\\n' \"$FIXTURE_BUILT_RUNTIME\"\n"
             "}\n"
             "install() {\n"
@@ -673,6 +673,63 @@ def test_setup_private_directories(fixture):
             raise AssertionError("setup followed a managed directory symlink")
 
 
+def test_receipt_bound_binaries_and_owner_only_media_tools(fixture):
+    setup = SETUP.read_text(encoding="utf-8")
+    for marker in (
+        "SETUP_SOURCE_HOME_RUNTIME_BIN",
+        "SETUP_SOURCE_HOME_IPFS_PROVIDER_BIN",
+        "using receipt-bound Runtime binary",
+        "using receipt-bound ipfs-provider binary",
+        "must be owner-only",
+    ):
+        if marker not in setup:
+            raise AssertionError(f"setup candidate/media gate missing {marker}")
+    if '"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server' not in setup:
+        raise AssertionError("setup still builds Runtime when no receipt-bound binary is supplied")
+
+    header = setup.split("ROOT=", 1)[0]
+    function = "require_reviewed_owner_only_path() {" + setup.split(
+        "require_reviewed_owner_only_path() {", 1
+    )[1].split("\nrequire_reviewed_media_tools_dir() {", 1)[0]
+    body = '\nrequire_reviewed_owner_only_path "$1" "probe" "$2"\n'
+
+    owned_dir = fixture / "media-ok"
+    owned_dir.mkdir(mode=0o700)
+    result = run(
+        ["bash", "-c", header + function + body, "setup", str(owned_dir), "dir"]
+    )
+    if result.returncode != 0:
+        raise AssertionError("owner-only media directory must be accepted")
+
+    group_dir = fixture / "media-homebrew"
+    group_dir.mkdir(mode=0o775)
+    group_dir.chmod(0o775)
+    result = run(
+        ["bash", "-c", header + function + body, "setup", str(group_dir), "dir"],
+        check=False,
+    )
+    if result.returncode == 0 or "must be owner-only" not in result.stderr:
+        raise AssertionError("group-writable media directory must be rejected")
+
+    owned_bin = fixture / "runtime-ok"
+    write(owned_bin, b"candidate\n", 0o700)
+    result = run(
+        ["bash", "-c", header + function + body, "setup", str(owned_bin), "file"]
+    )
+    if result.returncode != 0:
+        raise AssertionError("owner-only candidate binary must be accepted")
+
+    group_bin = fixture / "runtime-stale"
+    write(group_bin, b"stale\n", 0o755)
+    group_bin.chmod(0o755)
+    result = run(
+        ["bash", "-c", header + function + body, "setup", str(group_bin), "file"],
+        check=False,
+    )
+    if result.returncode == 0 or "must be owner-only" not in result.stderr:
+        raise AssertionError("group-readable candidate binary must be rejected")
+
+
 def assert_setup_orchestration():
     setup = SETUP.read_text(encoding="utf-8")
     call = 'python3 "${ROOT}/scripts/install-source-home-runtime.py"'
@@ -691,12 +748,12 @@ def assert_setup_orchestration():
     for binding in (
         '--source-root "${ROOT}"',
         '--data-dir "${DATA_DIR}"',
-        'release elastos)',
+        'source_home_runtime_bin',
         '--platform "${PLATFORM}"',
     ):
         if binding not in main:
             raise AssertionError(f"setup stable Runtime binding missing: {binding}")
-    stage_block = setup.split('built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"', 1)[1].split('\n\ncat <<EOF', 1)[0]
+    stage_block = setup.split('built_runtime="$(source_home_runtime_bin)"', 1)[1].split('\n\ncat <<EOF', 1)[0]
     if 'trap \'rm -rf "${runtime_stage_dir}"\' EXIT' not in stage_block:
         raise AssertionError("setup stage cleanup trap is missing")
     if not (
@@ -722,6 +779,7 @@ def main():
         test_untrusted_built_runtime(fixture)
         test_setup_stage_cleanup(fixture)
         test_setup_private_directories(fixture)
+        test_receipt_bound_binaries_and_owner_only_media_tools(fixture)
         unexpected = [path for path in outer.iterdir() if path.name != "fixture"]
         if unexpected:
             raise AssertionError(f"installer left residue outside the fixture: {unexpected}")
