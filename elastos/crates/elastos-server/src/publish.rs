@@ -1044,8 +1044,8 @@ fn validate_platform_input_options(options: &PublishReleaseOptions) -> anyhow::R
             anyhow::bail!("--platform-input requires each supported platform exactly once: x86_64-linux, aarch64-linux, aarch64-darwin");
         }
     }
-    if supplied != expected {
-        anyhow::bail!("--platform-input requires all three platforms: x86_64-linux, aarch64-linux, aarch64-darwin");
+    if supplied.len() < 2 {
+        anyhow::bail!("--platform-input requires at least two platforms: x86_64-linux, aarch64-linux, aarch64-darwin");
     }
     Ok(())
 }
@@ -1083,7 +1083,7 @@ fn print_publish_selection(options: &PublishReleaseOptions, selected_capsules: &
     if options.platform_inputs.is_empty() {
         println!("  Capsules:  {}", selected_capsules.join(", "));
     } else {
-        println!("  Mode:      import three verified native Home platform inputs");
+        println!("  Mode:      import verified native Home platform inputs");
         for input in &options.platform_inputs {
             println!("  Input:     {}", input);
         }
@@ -1722,12 +1722,15 @@ mod tests {
     }
 
     #[test]
-    fn test_platform_input_options_require_three_unique_supported_platforms() {
+    fn test_platform_input_options_require_at_least_two_unique_supported_platforms() {
         let options = platform_input_options();
         validate_platform_input_options(&options).unwrap();
-        let mut incomplete = options.clone();
-        incomplete.platform_inputs.pop();
-        assert!(validate_platform_input_options(&incomplete).is_err());
+        let mut two = options.clone();
+        two.platform_inputs.pop();
+        validate_platform_input_options(&two).unwrap();
+        let mut one = two.clone();
+        one.platform_inputs.pop();
+        assert!(validate_platform_input_options(&one).is_err());
         for invalid in [
             "x86_64-linux=/duplicate",
             "other-platform=/unsupported",

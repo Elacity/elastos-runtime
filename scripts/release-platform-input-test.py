@@ -294,6 +294,31 @@ printf 'later signing boundary reached\n' > "$TMPDIR/later-effect"
             inputs.stage_inputs(darwin, "0.7.1", stage)
         self.assertFalse(stage.exists())
 
+    def test_stable_admission_accepts_darwin_and_x86_64_linux(self):
+        pin = self.pin_catalogue()
+        values = [f"aarch64-darwin={self.bundles['aarch64-darwin']}",
+                  f"x86_64-linux={self.bundles['x86_64-linux']}"]
+        self.assertEqual(set(inputs.validate_inputs(values, "0.7.1")),
+                         {"aarch64-darwin", "x86_64-linux"})
+        stage = self.root / "publication"
+        record = inputs.stage_inputs(values, "0.7.1", stage)
+        self.assertEqual(record["platforms"], ["aarch64-darwin", "x86_64-linux"])
+        inputs.verify_staged_inputs(stage)
+        merged = json.loads((stage / "components.json").read_text())
+        self.assertEqual(merged["model_catalog"], pin)
+        self.assertEqual(set(merged["external"]["shell"]["platforms"]),
+                         {"darwin-arm64", "linux-amd64"})
+        self.assertNotIn("linux-arm64", merged["external"]["shell"]["platforms"])
+        cids = self.root / "cids.json"
+        self.write_json(cids, {name: "bafy" + entry["sha256"] for name, entry in record["files"].items()})
+        inputs.attach_input_cids(stage, cids)
+        generated = sorted(path.name for path in (stage / "artifacts").glob("components-*.json"))
+        self.assertEqual(generated, ["components-aarch64-darwin.json", "components-x86_64-linux.json"])
+        final = json.loads((stage / "artifacts/components-x86_64-linux.json").read_bytes())
+        self.assertEqual(set(final["external"]["shell"]["platforms"]),
+                         {"darwin-arm64", "linux-amd64"})
+        self.assertNotIn("linux-arm64", final["external"]["shell"]["platforms"])
+
     def test_mac_preview_admits_one_input_and_keeps_catalogue_and_selected_platform(self):
         pin = self.pin_catalogue()
         darwin = [f"aarch64-darwin={self.bundles['aarch64-darwin']}"]
@@ -513,7 +538,7 @@ printf '%s\n' "$RELEASE_PAYLOAD" > "$TMPDIR/release-payload.json"
 
     def test_missing_duplicate_or_wrong_platform_labels_reject(self):
         values = self.values()
-        for case in (values[:2], values + values[:1], [values[0].replace("x86_64-linux=", "aarch64-linux="), *values[1:]]):
+        for case in (values[:1], values + values[:1], [values[0].replace("x86_64-linux=", "aarch64-linux="), *values[1:]]):
             with self.subTest(case=case), self.assertRaises(ValueError):
                 inputs.validate_inputs(case)
 

@@ -416,23 +416,36 @@ def verify(root):
     return receipt
 
 
-def selected_platforms(preview_platform=None):
-    """The platform set one publication admits: every release platform, or one explicit preview."""
-    if preview_platform is None:
+def selected_platforms(preview_platform=None, provided=None):
+    """The platform set one publication admits.
+
+    A preview admits exactly one named platform. A stable publication admits
+    every supplied release platform when at least two are present. With no
+    provided set, the default remains all three release platforms.
+    """
+    if preview_platform is not None:
+        if preview_platform not in PLATFORMS:
+            raise ValueError(f"preview platform is not a release platform: {preview_platform}")
+        return {preview_platform}
+    if provided is None:
         return set(PLATFORMS)
-    if preview_platform not in PLATFORMS:
-        raise ValueError(f"preview platform is not a release platform: {preview_platform}")
-    return {preview_platform}
+    selected = set(provided)
+    if not selected <= set(PLATFORMS):
+        raise ValueError("inputs require each full release platform exactly once")
+    if len(selected) < 2:
+        raise ValueError("candidate input requires all three platforms")
+    return selected
 
 
 def validate_inputs(values, version=None, preview_platform=None):
-    selected = selected_platforms(preview_platform)
+    preview_selected = (
+        selected_platforms(preview_platform) if preview_platform is not None else None)
     inputs = {}
     for value in values:
         name, sep, path = value.partition("=")
         if not sep or name not in PLATFORMS or name in inputs:
             raise ValueError("inputs require each full release platform exactly once")
-        if name not in selected:
+        if preview_selected is not None and name not in preview_selected:
             raise ValueError(f"input platform is outside the selected publication: {name}")
         receipt = verify(Path(path))
         if receipt["platform"] != name:
@@ -451,6 +464,7 @@ def validate_inputs(values, version=None, preview_platform=None):
             elif not any(info.get(key) for key in ("release_path", "url")):
                 raise ValueError(f"{name}: required Home component has no prepared delivery path: {component_name}")
         inputs[name] = receipt
+    selected = selected_platforms(preview_platform, inputs)
     if set(inputs) != selected:
         if preview_platform is None:
             raise ValueError("candidate input requires all three platforms")
@@ -571,7 +585,8 @@ def verify_staged_inputs(stage, allow_generated=False, preview_platform=None):
     source = record["source"]
     if source_identity(source["commit"], source["tree"]) != source:
         raise ValueError("publication staging source differs from candidate checkout")
-    if set(record["platforms"]) != selected_platforms(preview_platform):
+    admitted = None if preview_platform else record["platforms"]
+    if set(record["platforms"]) != selected_platforms(preview_platform, admitted):
         if preview_platform is None:
             raise ValueError("publication staging requires all three platforms")
         raise ValueError(f"publication staging is not the {preview_platform} preview")

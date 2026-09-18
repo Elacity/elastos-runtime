@@ -238,15 +238,10 @@ canonical_publisher_gateway() {
 
 inspect_signer_did() {
     if [[ -n "${PREPARED_INPUT_ROOT:-}" ]]; then
-        # The shell has already admitted the native inputs. The prepared Runtime's
-        # dry run only reports the key's signer; a preview passes no inputs because
-        # the Runtime plan admits three platforms and this run selects one.
-        local value args=()
-        if [[ -z "$PREVIEW_PLATFORM" ]]; then
-            for value in "${PLATFORM_INPUTS[@]}"; do args+=(--platform-input "$value"); done
-        fi
+        # Signer identity comes from --key. Do not forward platform inputs; a
+        # prepared Runtime binary may still reject a two-platform CLI set.
         "$ELASTOS" publish-release --version "$VERSION" --channel "$CHANNEL" \
-            --key "$KEY_PATH" --dry-run ${args[@]+"${args[@]}"} \
+            --key "$KEY_PATH" --dry-run \
             | sed -n 's/^  Signer:[[:space:]]*//p' | head -n1
         return
     fi
@@ -1486,7 +1481,8 @@ if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
         || die "--platform-input conflicts with --skip-build, --skip-rootfs, --cross and --capsules"
 fi
 # A preview publishes one explicitly named native input on the canary channel
-# from that platform's own host. Default admission keeps all three platforms.
+# from that platform's own host. Stable admission keeps every supplied native
+# input when at least two release platforms are present.
 PREVIEW_ARGS=()
 if [[ -n "$PREVIEW_PLATFORM" ]]; then
     [[ "$CHANNEL" == canary ]] || die "--preview-platform requires --channel canary"
@@ -1509,6 +1505,8 @@ if [[ ${#PLATFORM_INPUTS[@]} -gt 0 ]]; then
         die "--preview-platform ${PREVIEW_PLATFORM} must be published from a ${PREVIEW_PLATFORM} host (this host is ${PLATFORM})"
     fi
     stage_platform_inputs "$PREPARED_INPUT_ROOT" "${PLATFORM_INPUTS[@]}"
+    jq -e --arg p "$PLATFORM" '.platforms | index($p)' "$PREPARED_INPUT_ROOT/assembly.json" >/dev/null \
+        || die "prepared inputs do not include this host platform: ${PLATFORM}"
     ELASTOS="$PREPARED_INPUT_ROOT/artifacts/elastos-${PLATFORM}"
     HOST_DATA_DIR="$(default_elastos_data_dir)"
     if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
@@ -2942,7 +2940,7 @@ if [[ -n "$CROSS_BINARY_CID" ]]; then
     TOTAL_ARTIFACTS=$(( ${#CAPSULES[@]} * 2 ))
 fi
 if [[ -n "$PREPARED_INPUT_ROOT" ]]; then
-    echo -e "${DIM}  Native release inputs published for all three platforms; generic microVM rootfs acceptance is separate.${NC}"
+    echo -e "${DIM}  Native release inputs published for the admitted platforms; generic microVM rootfs acceptance is separate.${NC}"
 else
 echo -e "${DIM}  Capsule artifacts published: ${TOTAL_ARTIFACTS} (${#CAPSULES[@]} capsules × $([ -n "$CROSS_BINARY_CID" ] && echo "2 platforms" || echo "1 platform"))${NC}"
 fi
