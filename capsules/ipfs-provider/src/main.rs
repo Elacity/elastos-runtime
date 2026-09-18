@@ -389,6 +389,13 @@ impl IpfsProvider {
                     Ok(()) => {
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
                         {
+                            if let Err(error) =
+                                directory_hash::seal_backend_repository(&self.repo_dir)
+                            {
+                                eprintln!("ipfs-provider: private repository seal failed: {error}");
+                                self.state = KuboState::Error;
+                                return private_preparation_error();
+                            }
                             match directory_hash::verify_backend(self) {
                                 Ok(()) => Response::ok_empty(),
                                 Err(error) => {

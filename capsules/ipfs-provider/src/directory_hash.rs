@@ -4,10 +4,10 @@
 use super::StagedDirectory;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -583,6 +583,26 @@ fn parse_root(bytes: &[u8]) -> io::Result<String> {
         }
     }
     root.ok_or_else(|| invalid("missing directory hash root"))
+}
+
+pub(super) fn seal_backend_repository(repo: &Path) -> io::Result<()> {
+    if !repo.exists() {
+        return Ok(());
+    }
+    let meta = fs::symlink_metadata(repo)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(invalid("unsafe backend repository directory"));
+    }
+    fs::set_permissions(repo, fs::Permissions::from_mode(0o700))?;
+    let sealed = fs::symlink_metadata(repo)?;
+    if sealed.file_type().is_symlink()
+        || !sealed.is_dir()
+        || sealed.uid() != unsafe { libc::geteuid() }
+        || sealed.mode() & 0o7777 != 0o700
+    {
+        return Err(invalid("unsafe backend repository directory"));
+    }
+    Ok(())
 }
 
 pub(super) fn verify_backend(provider: &super::IpfsProvider) -> io::Result<()> {
@@ -1300,7 +1320,7 @@ mod tests {
         let repo_mode = repo_metadata.mode() & 0o7777;
         assert!(repo_metadata.is_dir());
         assert_eq!(repo_metadata.uid(), unsafe { libc::geteuid() });
-        assert_eq!(repo_mode & 0o7022, 0);
+        assert_eq!(repo_mode, 0o700);
         let capacity = call(serde_json::json!({"op":"runtime_check_capacity","required_bytes":1}));
         assert_eq!(capacity["data"].as_object().unwrap().len(), 4);
         assert_eq!(
@@ -1670,6 +1690,30 @@ mod tests {
         assert!(!provider.repo_dir.exists());
         assert!(provider.kubo_child.is_none());
         result
+    }
+
+    #[test]
+    fn seals_kubo_umask_repository_to_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+        for mode in [0o775, 0o755, 0o750, 0o700] {
+            let repo = root.path().join(format!("ipfs-repo-{mode:o}"));
+            fs::create_dir(&repo).unwrap();
+            fs::set_permissions(&repo, fs::Permissions::from_mode(mode)).unwrap();
+            seal_backend_repository(&repo).unwrap();
+            assert_eq!(fs::symlink_metadata(&repo).unwrap().mode() & 0o7777, 0o700);
+        }
+        seal_backend_repository(&root.path().join("absent")).unwrap();
+        let sealed = root.path().join("ipfs-repo-700");
+        let link = root.path().join("linked");
+        std::os::unix::fs::symlink(&sealed, &link).unwrap();
+        assert!(seal_backend_repository(&link).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&sealed).unwrap().mode() & 0o7777,
+            0o700
+        );
+        let file = root.path().join("not-a-repo");
+        fs::write(&file, b"x").unwrap();
+        assert!(seal_backend_repository(&file).is_err());
     }
 
     #[test]
