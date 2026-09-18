@@ -334,7 +334,7 @@ struct RoomPendingRequestStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RoomSessionStatus {
-    token: String,
+    session_id: String,
     display_name: String,
     device_label: String,
 }
@@ -1400,7 +1400,7 @@ async fn gather_snapshot_from_parts(
                 .active_sessions
                 .into_iter()
                 .map(|session| RoomSessionStatus {
-                    token: session.token,
+                    session_id: session.session_id,
                     display_name: session.display_name,
                     device_label: session.device_label,
                 })
@@ -1961,8 +1961,11 @@ async fn dispatch_action(
             None => Ok("That Chat web guest request is no longer pending.".to_string()),
         };
     }
-    if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
-        return match elastos_server::room_service::revoke_session(&default_data_dir(), token)? {
+    if let Some(session_id) = action_id.strip_prefix("room-revoke-session:") {
+        return match elastos_server::room_service::revoke_guest_session_by_id(
+            &default_data_dir(),
+            session_id,
+        )? {
             Some(outcome) => Ok(format!(
                 "Disconnected Chat web guest session for {} on {}.",
                 outcome.display_name, outcome.device_label
@@ -3591,12 +3594,12 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
             ActionReadiness::Blocked("web guest request is no longer pending".to_string())
         };
     }
-    if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
+    if let Some(session_id) = action_id.strip_prefix("room-revoke-session:") {
         return if snapshot
             .room
             .active_sessions
             .iter()
-            .any(|session| session.token == token)
+            .any(|session| session.session_id == session_id)
         {
             ActionReadiness::Ready
         } else {
@@ -3746,7 +3749,7 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
     }
     for session in &snapshot.room.active_sessions {
         actions.push(ActionInfo {
-            id: format!("room-revoke-session:{}", session.token),
+            id: format!("room-revoke-session:{}", session.session_id),
             label: format!(
                 "Disconnect {} on {}",
                 session.display_name, session.device_label
@@ -5210,6 +5213,35 @@ mod tests {
         snapshot.room.active_session_count = 1;
         assert!(matches!(
             action_readiness("room-revoke-all", &snapshot),
+            ActionReadiness::Ready
+        ));
+    }
+
+    #[test]
+    fn home_room_snapshot_revokes_by_session_id_and_omits_bearer_token() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.room.active_sessions = vec![RoomSessionStatus {
+            session_id: "guest-session-id".to_string(),
+            display_name: "Guest".to_string(),
+            device_label: "phone".to_string(),
+        }];
+        snapshot.room.active_session_count = 1;
+
+        let encoded = serde_json::to_value(&snapshot.room.active_sessions).unwrap();
+        assert!(encoded[0].get("token").is_none());
+        assert_eq!(encoded[0]["session_id"], "guest-session-id");
+
+        let revoke_ids: Vec<String> = gather_room_actions(&snapshot)
+            .into_iter()
+            .map(|action| action.id)
+            .filter(|id| id.starts_with("room-revoke-session:"))
+            .collect();
+        assert_eq!(
+            revoke_ids,
+            vec!["room-revoke-session:guest-session-id".to_string()]
+        );
+        assert!(matches!(
+            action_readiness("room-revoke-session:guest-session-id", &snapshot),
             ActionReadiness::Ready
         ));
     }

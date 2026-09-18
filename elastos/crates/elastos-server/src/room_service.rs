@@ -203,6 +203,7 @@ pub struct PendingRequestView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSessionView {
     pub session_id: String,
+    #[serde(skip_serializing, default)]
     pub token: String,
     pub display_name: String,
     pub device_label: String,
@@ -5446,6 +5447,21 @@ mod tests {
                 .token,
             Some(second_token)
         );
+    }
+
+    #[test]
+    fn room_summary_json_omits_session_bearer_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
+        let _ = approve_request(tmp.path(), &request.request_id)
+            .unwrap()
+            .unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        assert!(!summary.active_sessions[0].token.is_empty());
+        let encoded = serde_json::to_value(&summary.active_sessions[0]).unwrap();
+        assert!(encoded.get("token").is_none());
+        assert_eq!(encoded["session_id"], summary.active_sessions[0].session_id);
     }
 
     #[test]
