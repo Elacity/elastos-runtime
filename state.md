@@ -1,13 +1,59 @@
 # State
 
-## Current model delivery checkpoint, 17 September 2026 UTC
+## Current model delivery checkpoint, 18 September 2026 UTC
 
-The model-delivery source line is `feat/remote-services`. Last frozen prefix is
-`7690aabc6acb4f125b84b7ec0117e3e406898b91`, tree
-`e7d8d0e1ac2b343e3104f7eefd1dcfeb3fba6bbc`, 174 ahead and 0 behind the last
-fetched `origin/feat/0.7.1-integration` (`093b51ca`). This source includes the
-publisher discovery repair. Installed results retain their own binary and
-patch bindings. The 0.7.1 preview target is the existing public Home at
+The model-delivery source line is `feat/remote-services`. Working security
+branch `fix/0.7.1-security` HEAD is `bd71cc2e88c80e043583c410890cbd71fd880a45`
+tree `5f3f191acceaf304ceb7b5d05187264c0c708ddb`. The branch depends on
+`feat/remote-services` `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` and must
+merge with or after it. It is 23 ahead and 0 behind
+`origin/feat/remote-services` (`1f9797b8d95ddd6c8c17bac7b1aaa6d81057eb59`).
+Six committed slices on this branch are:
+
+- `4b1a8a47` keep private data roots off `/capsule-data`
+- `9ffd25c7` require tokens for shell content writes
+- `cbf6a58a` persist capability revoke across serve restart
+- `71958e9b` write `signing_key` without following links
+- `51bdcd1f` keep guest session bearers out of Home JSON
+- `bd71cc2e` install receipt-bound binaries and owner-only media tools
+
+Launch principal and Home grant binding stay on this tree. Carrier line,
+frame, archive, and HKDF stay later. Isolated one-Send qualification
+`isolated-qualification-61770.json` SHA-256
+`ad7aa591c39ba1c94207fa580233f379061a7a576a4541ed4d5a40d67b9bb687` stays
+protected.
+
+The accepted combined Mac journey remains
+`isolated-qualification-61780.json` SHA-256
+`a6d167a1c815c8daeededdac297c28f6fa55dca0791d0229fc3feda10a09b1df` on signed
+Runtime SHA-256
+`31d17c03a0c98dcc7387ac0399712ff9bc27a411df4f19fc7d2fd8e1a268b49b`. That
+Home admitted the SmolLM2 package of 144835448 bytes, completed two Sends,
+recorded Stop as `settlement_unknown`, then restored the same chat after
+reload and Runtime restart with measured zero-payload reuse. That installed
+result binds the pre-commit candidate, not HEAD `bd71cc2e`.
+
+Cloud Step 6 is partial. The existing cloud worker completed a read-only
+adversarial review of parent `8da670b5` tree `51ecd3c5` plus the then-draft
+source. Review document SHA-256
+`bd8f6865cf9dc64d09c0c58cb4f5da1d16f3ac0bfd75e0f9e70e951a8b3b1a6b`. That
+review set the slice order and confirmed launch-grant binding already exists.
+The reconstruction patch SHA-256
+`42585ac58b9d77de38811e83a8df5196ca4678dbea06a4f5ad841ed960448b3c` matches
+that draft, not HEAD. Linux reconstruction and installed Linux proof of
+`bd71cc2e` remain open.
+
+Next owned source step is one signed candidate from HEAD `bd71cc2e`, then a
+fresh isolated Mac combined journey, then Linux reconstruction of that exact
+source. Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining
+security stay open. Browser stays paused. No push.
+The parent `feat/remote-services` line matches the Cloud-reviewed PR65
+integration. The freeze ancestor is
+`20ac3f628aea683e2cefff7cf7c056852af3365c` tree
+`99beff2bf89510d0744c8303ea5757bc075d8e8e`. Historical D1 freeze
+`7690aabc6acb4f125b84b7ec0117e3e406898b91` tree
+`e7d8d0e1ac2b343e3104f7eefd1dcfeb3fba6bbc` keeps its own installed bindings.
+Installed results retain their own binary and patch bindings. The 0.7.1 preview target is the existing public Home at
 https://elastos.elacitylabs.com/home/. GitHub review uses that same branch. Matching Linux native inputs and isolated
 seed verification precede the public Home update. Preserve existing Homes.
 
