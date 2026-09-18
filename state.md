@@ -2,13 +2,19 @@
 
 ## Current model delivery checkpoint, 18 September 2026 UTC
 
-The model-delivery source line is `feat/remote-services`. Working security
-branch `fix/0.7.1-security` HEAD is `bd71cc2e88c80e043583c410890cbd71fd880a45`
-tree `5f3f191acceaf304ceb7b5d05187264c0c708ddb`. The branch depends on
-`feat/remote-services` `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` and must
-merge with or after it. It is 23 ahead and 0 behind
-`origin/feat/remote-services` (`1f9797b8d95ddd6c8c17bac7b1aaa6d81057eb59`).
-Six committed slices on this branch are:
+The model-delivery source line is `feat/remote-services`
+`8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` on `origin`. Working security
+branch `fix/0.7.1-security` has released code tip
+`a48ed2a70b9421a384848c2208e7bd6d8fe7f566` tree
+`04b3c271ab106300f4e3afd72b95ff791bdc718c`, published on
+`origin/fix/0.7.1-security`. It is the two-platform release-admission overlay.
+The documentation commit above it does not change product source. The built
+Runtime identity remains
+`42e31e30906a4a380654fa29c5d509e3e6385605` tree
+`67de379c49a54683a72964b80bd39b9025c44760`. The branch depends on
+`feat/remote-services` and must merge with or after it. Six committed
+security slices plus the later object-provider lock and two-platform
+admission commits sit on this branch:
 
 - `4b1a8a47` keep private data roots off `/capsule-data`
 - `9ffd25c7` require tokens for shell content writes
@@ -16,46 +22,58 @@ Six committed slices on this branch are:
 - `71958e9b` write `signing_key` without following links
 - `51bdcd1f` keep guest session bearers out of Home JSON
 - `bd71cc2e` install receipt-bound binaries and owner-only media tools
+- `42e31e30` keep object-provider lock aligned with signing-key libc
+- `a48ed2a7` admit two-platform stable publication
 
 Launch principal and Home grant binding stay on this tree. Carrier line,
 frame, archive, and HKDF stay later. Isolated one-Send qualification
 `isolated-qualification-61770.json` SHA-256
 `ad7aa591c39ba1c94207fa580233f379061a7a576a4541ed4d5a40d67b9bb687` stays
-protected.
+protected. Combined Mac journey `isolated-qualification-61780.json` and
+Darwin candidate `isolated-qualification-61800.json` stay protected.
 
-The accepted combined Mac journey remains
-`isolated-qualification-61780.json` SHA-256
-`a6d167a1c815c8daeededdac297c28f6fa55dca0791d0229fc3feda10a09b1df` on signed
-Runtime SHA-256
-`31d17c03a0c98dcc7387ac0399712ff9bc27a411df4f19fc7d2fd8e1a268b49b`. That
-Home admitted the SmolLM2 package of 144835448 bytes, completed two Sends,
-recorded Stop as `settlement_unknown`, then restored the same chat after
-reload and Runtime restart with measured zero-payload reuse. That installed
-result binds the pre-commit candidate, not HEAD `bd71cc2e`.
+Public 0.7.1 is live. `https://elastos.elacitylabs.com/release-head.json`
+reports version 0.7.1 and latest release CID
+`QmT16KDvZqA4wQc74ssFgy8JJN578Z64AAAhzYvkoE4NF8`. Live signer DID is
+`did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj`. Installed public
+Linux Runtime SHA-256 is
+`63b3cdb06a45523f008fc4e67b50eb795a074890b0a3e839cba2ffa5d532d830`. Darwin
+installer bytes match
+`82593dfc71f53cffa2dd5fd8c68cbaf4a048890929bf08a85aeb83354558c29f`. Catalogue
+SHA-256 is
+`c81d43574da91ad278300eda59330cfdf1fd6a924ef2ebf63658ab0e261d2f2c`.
+components.json SHA-256 is
+`40e7835833e73378d370283b28eefe1e4432773d4b256f0ede2405b8c0a8f4f0`. The old
+0.1.2 head `QmVLFNQfW6V2LuXCX5xAq1jUmQrReE294Fb2NvETWgNbRk` is rollback only.
 
-Cloud Step 6 is partial. The existing cloud worker completed a read-only
-adversarial review of parent `8da670b5` tree `51ecd3c5` plus the then-draft
-source. Review document SHA-256
-`bd8f6865cf9dc64d09c0c58cb4f5da1d16f3ac0bfd75e0f9e70e951a8b3b1a6b`. That
-review set the slice order and confirmed launch-grant binding already exists.
-The reconstruction patch SHA-256
-`42585ac58b9d77de38811e83a8df5196ca4678dbea06a4f5ad841ed960448b3c` matches
-that draft, not HEAD. Linux reconstruction and installed Linux proof of
-`bd71cc2e` remain open.
+Public Home https://elastos.elacitylabs.com/home/ serves 0.7.1 and preserves
+the existing DID, passkeys and `sources.json` hash
+`96b62da57dbfe5d2245403464e99ec65b80968ad96b612724acdb1882aab0676`. Marketplace
+lists verified SmolLM2 CID
+`bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y`. Public Get
+fails at MetadataRead. After Kubo idle-stop, the live repo still pins that
+CID and later serves `_elastos_object.json` (726 bytes) locally. The product
+bounded read uses `offline=true&timeout=100ms` during backend restart.
 
-Next owned source step is one signed candidate from HEAD `bd71cc2e`, then a
-fresh isolated Mac combined journey, then Linux reconstruction of that exact
-source. Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining
-security stay open. Browser stays paused. No push.
+Fresh Apple silicon install from `https://elastos.elacitylabs.com/install.sh`
+completed ordinary Get, two Assistant replies, reload and Runtime restart with
+zero payload transfer. Weights SHA-256
+`c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a` at
+144811072 bytes. Remote Qwen on public Home is blocked. The preserved Mac Home
+still holds admitted Qwen locally and has no published Services share for public
+Home.
+
+Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining security
+stay open. Browser stays paused.
 The parent `feat/remote-services` line matches the Cloud-reviewed PR65
 integration. The freeze ancestor is
 `20ac3f628aea683e2cefff7cf7c056852af3365c` tree
 `99beff2bf89510d0744c8303ea5757bc075d8e8e`. Historical D1 freeze
 `7690aabc6acb4f125b84b7ec0117e3e406898b91` tree
 `e7d8d0e1ac2b343e3104f7eefd1dcfeb3fba6bbc` keeps its own installed bindings.
-Installed results retain their own binary and patch bindings. The 0.7.1 preview target is the existing public Home at
-https://elastos.elacitylabs.com/home/. GitHub review uses that same branch. Matching Linux native inputs and isolated
-seed verification precede the public Home update. Preserve existing Homes.
+Installed results retain their own binary and patch bindings. Public Home
+https://elastos.elacitylabs.com/home/ is the 0.7.1 preview target. Preserve
+existing Homes.
 
 The signed catalogue contains Qwen and SmolLM2-135M-Instruct Q8_0. Mac and seed
 holders retain the small package. Complete Mac-holder delivery was hashed, and

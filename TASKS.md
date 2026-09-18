@@ -173,24 +173,35 @@ verification separate from product acceptance and required human review.
 
 ### Model delivery R14 — 0.7.1 on public Home
 
-Current local source is `fix/0.7.1-security` at HEAD
-`bd71cc2e88c80e043583c410890cbd71fd880a45` tree
-`5f3f191acceaf304ceb7b5d05187264c0c708ddb`. The branch depends on
+The released code tip on `fix/0.7.1-security` is
+`a48ed2a70b9421a384848c2208e7bd6d8fe7f566` tree
+`04b3c271ab106300f4e3afd72b95ff791bdc718c`. It is the two-platform
+release-admission overlay. The built Runtime identity remains
+`42e31e30906a4a380654fa29c5d509e3e6385605` tree
+`67de379c49a54683a72964b80bd39b9025c44760`. The branch depends on
 `feat/remote-services` `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` and must
-merge with or after it. Six security and installer slices are committed
-through that HEAD. Isolated one-Send receipt
-`isolated-qualification-61770.json` stays protected. Combined Mac journey
-`isolated-qualification-61780.json` stays the accepted result for Runtime
-SHA-256 `31d17c03a0c98dcc7387ac0399712ff9bc27a411df4f19fc7d2fd8e1a268b49b`.
-That installed result predates HEAD. Cloud Step 6 completed a read-only
-Linux review of parent `8da670b5` tree `51ecd3c5`; review SHA-256
-`bd8f6865cf9dc64d09c0c58cb4f5da1d16f3ac0bfd75e0f9e70e951a8b3b1a6b`. Linux
-reconstruction of HEAD remains open. Next is one signed candidate from
-`bd71cc2e`, then a fresh isolated Mac combined journey, then that Linux
-reconstruction. Launch principal and Home grant binding stay. Carrier line,
-frame, archive, and HKDF stay later. Full R14, J1–J5, SA1–SA6, CA1,
-responsive UI, Browser, and remaining security stay open. Browser stays
-paused. No push.
+merge with or after it. Both code tips are published on `origin` at those
+commits.
+Public `release-head.json` reports 0.7.1, release CID
+`QmT16KDvZqA4wQc74ssFgy8JJN578Z64AAAhzYvkoE4NF8`, signed by live
+`did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj`. Platforms in
+that head are `aarch64-darwin` Runtime SHA-256
+`82593dfc71f53cffa2dd5fd8c68cbaf4a048890929bf08a85aeb83354558c29f` and
+`x86_64-linux` Runtime SHA-256
+`63b3cdb06a45523f008fc4e67b50eb795a074890b0a3e839cba2ffa5d532d830`. The
+0.1.2 head `QmVLFNQfW6V2LuXCX5xAq1jUmQrReE294Fb2NvETWgNbRk` stays rollback
+only. A fresh isolated Apple silicon Home installed from
+`https://elastos.elacitylabs.com/install.sh` with no `source add`, listed
+verified SmolLM2, completed Get of 144835448 bytes, returned two Assistant
+replies, then restored the same chat and model after Home reload and a full
+Runtime restart with unchanged weights mtime. Public Home
+https://elastos.elacitylabs.com/home/ runs that 0.7.1 Linux Runtime, keeps
+the existing account, and lists verified SmolLM2. Public Marketplace Get
+still fails at MetadataRead. Remote Qwen from the Mac is not restored.
+Protected receipts `isolated-qualification-61770.json`,
+`isolated-qualification-61780.json`, `isolated-qualification-61800.json`
+stay. Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining
+security stay open. Browser stays paused.
 
 The 0.7.1 preview uses the existing public Home at
 https://elastos.elacitylabs.com/home/. Ordinary install, Marketplace Get/Use,
