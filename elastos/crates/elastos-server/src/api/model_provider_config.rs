@@ -104,6 +104,73 @@ fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<se
     Ok(config.offers)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostedModelOfferHint {
+    pub provider_label: String,
+    pub requested_selector: String,
+    pub privacy_policy_ref: String,
+    pub fallback: String,
+}
+
+/// Best-effort hosted-offer facts for Assistant selection and the Jev shadow lens.
+/// This function returns no URLs or credentials.
+pub(crate) fn hosted_model_offer_hint(
+    data_dir: &Path,
+    offer_id: &str,
+) -> Option<HostedModelOfferHint> {
+    let offer_id = offer_id.trim();
+    if offer_id.is_empty() {
+        return None;
+    }
+    let offers = load_model_provider_operator_offers(data_dir).ok()?;
+    hosted_hint_from_offers(&offers, offer_id)
+}
+
+fn hosted_hint_from_offers(
+    offers: &[serde_json::Value],
+    offer_id: &str,
+) -> Option<HostedModelOfferHint> {
+    let offer = offers
+        .iter()
+        .find(|offer| offer.get("id").and_then(serde_json::Value::as_str) == Some(offer_id))?;
+    let adapter = offer.get("adapter")?;
+    let kind = adapter.get("kind").and_then(serde_json::Value::as_str)?;
+    if kind != "openai_compatible_text" && kind != "openai_responses_text" {
+        return None;
+    }
+    let hosted = adapter.get("hosted")?;
+    let provider_label = hosted
+        .get("backend_provider_label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if provider_label.is_empty() {
+        return None;
+    }
+    Some(HostedModelOfferHint {
+        provider_label,
+        requested_selector: adapter
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        privacy_policy_ref: hosted
+            .get("privacy_policy_ref")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        fallback: hosted
+            .get("upstream_routing_fallback_assertion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    })
+}
+
 fn validate_model_provider_private_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
@@ -173,4 +240,45 @@ fn read_model_provider_private_file(
         anyhow::bail!("{label} exceeds its byte limit");
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod hosted_hint_tests {
+    use super::hosted_hint_from_offers;
+    use serde_json::json;
+
+    #[test]
+    fn hosted_hint_omits_urls_and_keys() {
+        let offers = vec![json!({
+            "id": "offer-hosted",
+            "adapter": {
+                "kind": "openai_compatible_text",
+                "api_url": "https://example.invalid/v1/chat/completions",
+                "api_key": "secret-should-not-leak",
+                "model": "gpt-test",
+                "hosted": {
+                    "backend_provider_label": "Fixture Provider",
+                    "privacy_policy_ref": "fixture:privacy:v1",
+                    "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                }
+            }
+        })];
+        let hint = hosted_hint_from_offers(&offers, "offer-hosted").unwrap();
+        assert_eq!(hint.provider_label, "Fixture Provider");
+        assert_eq!(hint.requested_selector, "gpt-test");
+        assert_eq!(hint.privacy_policy_ref, "fixture:privacy:v1");
+        assert_eq!(hint.fallback, "operator_asserted_disabled");
+        let encoded = format!("{hint:?}");
+        assert!(!encoded.contains("https://"));
+        assert!(!encoded.contains("secret-should-not-leak"));
+    }
+
+    #[test]
+    fn local_llama_adapter_is_not_hosted() {
+        let offers = vec![json!({
+            "id": "local",
+            "adapter": { "kind": "local_llama_cpp_text" }
+        })];
+        assert!(hosted_hint_from_offers(&offers, "local").is_none());
+    }
 }

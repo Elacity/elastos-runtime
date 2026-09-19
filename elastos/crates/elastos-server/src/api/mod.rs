@@ -20,6 +20,7 @@ pub(crate) mod gateway_local_control;
 pub mod handlers;
 pub mod middleware;
 mod model_provider_config;
+pub(crate) use model_provider_config::{hosted_model_offer_hint, HostedModelOfferHint};
 pub use model_provider_config::{model_provider_bridge_config, model_provider_config};
 pub mod routes;
 pub mod server;

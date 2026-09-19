@@ -45,6 +45,7 @@ pub mod host_lock;
 pub mod init;
 pub mod inspect_provider;
 pub mod ipfs;
+pub(crate) mod jev_approval_lens;
 pub mod library;
 pub mod local_http;
 pub mod notifications;

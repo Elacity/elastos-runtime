@@ -1956,6 +1956,24 @@ pub(super) async fn gateway_provider_proxy(
                 anyhow::anyhow!("model provider audit failed: {}", err),
             );
         }
+        if launch_capsule_id == "assistant" && op == "runs_create" {
+            if let Some(offer_id) = request.get("offer_id").and_then(serde_json::Value::as_str) {
+                if let Some(hint) = crate::api::hosted_model_offer_hint(&state.data_dir, offer_id) {
+                    let _ = crate::jev_approval_lens::record_assistant_hosted_http_shadow(
+                        &state.data_dir,
+                        &crate::jev_approval_lens::AssistantHostedHttpContext {
+                            request_id: audit.request_id,
+                            principal_id: &principal_id,
+                            session_id: &session_id,
+                            capsule_id: &launch_capsule_id,
+                            grant_id: &context.grant_id,
+                            offer_id,
+                            hint,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     let mut response = if scheme == "object"
@@ -2117,6 +2135,14 @@ pub(super) async fn gateway_provider_proxy(
             return gateway_provider_error_response(
                 &scheme,
                 anyhow::anyhow!("model provider audit failed: {}", err),
+            );
+        }
+        if launch_capsule_id == "assistant" && op == "runs_create" {
+            let outcome = if completed { "completed" } else { "failed" };
+            let _ = crate::jev_approval_lens::record_actual_outcome(
+                &state.data_dir,
+                audit.request_id,
+                outcome,
             );
         }
     }
