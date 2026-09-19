@@ -184,9 +184,9 @@ fn jev_recommendation(hint: &HostedModelOfferHint, policy: &PolicyFilter) -> Jev
     let _ = hint;
     let _ = policy;
     JevRecommendation {
-        recommendation: "review".to_string(),
-        risk: "medium".to_string(),
-        confidence: 80,
+        recommendation: "unavailable".to_string(),
+        risk: "unknown".to_string(),
+        confidence: 0,
         needs_human_review: true,
     }
 }
@@ -296,7 +296,9 @@ mod tests {
         let recorded = record_assistant_hosted_http_shadow(tmp.path(), &context).unwrap();
         assert_eq!(recorded.schema, JEV_RECORD_SCHEMA);
         assert_eq!(recorded.mode, JEV_MODE_SHADOW);
-        assert_eq!(recorded.recommendation.recommendation, "review");
+        assert_eq!(recorded.recommendation.recommendation, "unavailable");
+        assert_eq!(recorded.recommendation.risk, "unknown");
+        assert_eq!(recorded.recommendation.confidence, 0);
         assert!(recorded.recommendation.needs_human_review);
         assert!(recorded
             .policy
@@ -305,10 +307,10 @@ mod tests {
             .any(|choice| choice == "auto_approve"));
         assert!(recorded.human_decision.is_none());
         record_human_decision(tmp.path(), "req-hosted-1", "approve").unwrap();
-        record_actual_outcome(tmp.path(), "req-hosted-1", "completed").unwrap();
+        record_actual_outcome(tmp.path(), "req-hosted-1", "accepted").unwrap();
         let loaded = load_record(tmp.path(), "req-hosted-1").unwrap();
         assert_eq!(loaded.human_decision.as_deref(), Some("approve"));
-        assert_eq!(loaded.actual_outcome.as_deref(), Some("completed"));
+        assert_eq!(loaded.actual_outcome.as_deref(), Some("accepted"));
         assert_eq!(loaded.request_id, "req-hosted-1");
         assert!(loaded
             .relationships

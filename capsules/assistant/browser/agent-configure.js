@@ -170,6 +170,7 @@ function renderModelSelectionFacts() {
     ["Requested model", facts.requestedModel],
     ["Resolved model", facts.resolvedModel],
     ["Provider", facts.provider],
+    ["Execution", facts.execution],
     ["Limits", facts.limits],
     ["Privacy", facts.privacy],
     ["Cost", facts.cost],

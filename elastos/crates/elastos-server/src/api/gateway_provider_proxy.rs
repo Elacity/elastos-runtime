@@ -2138,7 +2138,7 @@ pub(super) async fn gateway_provider_proxy(
             );
         }
         if launch_capsule_id == "assistant" && op == "runs_create" {
-            let outcome = if completed { "completed" } else { "failed" };
+            let outcome = if completed { "accepted" } else { "failed" };
             let _ = crate::jev_approval_lens::record_actual_outcome(
                 &state.data_dir,
                 audit.request_id,

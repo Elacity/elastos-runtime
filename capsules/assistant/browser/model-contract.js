@@ -75,60 +75,82 @@ function offerPolicyLimits(policy) {
   return parts.length ? parts.join("; ") : "offer policy unavailable";
 }
 
+function hostedObject(offer) {
+  return offer?.hosted && typeof offer.hosted === "object" ? offer.hosted : null;
+}
+
+function remoteServiceName(offer) {
+  return typeof offer?.remote_service?.display_name === "string" && offer.remote_service.display_name.trim() !== ""
+    ? offer.remote_service.display_name.trim()
+    : "";
+}
+
+/** Route that will execute the selected offer. */
+export function offerRouteKind(offer) {
+  if (hostedObject(offer)) {
+    return "hosted";
+  }
+  if (offer?.remote_service && typeof offer.remote_service === "object") {
+    return "remote";
+  }
+  return "local";
+}
+
 /** Selection facts the Assistant model picker must show. */
 export function offerSelectionFacts(offer, backendReport = null) {
-  const hosted = offer?.hosted && typeof offer.hosted === "object" ? offer.hosted : null;
-  const remoteName =
-    typeof offer?.remote_service?.display_name === "string" && offer.remote_service.display_name.trim() !== ""
-      ? offer.remote_service.display_name.trim()
-      : "";
+  const hosted = hostedObject(offer);
+  const kind = offerRouteKind(offer);
+  const remoteName = remoteServiceName(offer);
   const requestedModel =
     (typeof hosted?.requested_selector === "string" && hosted.requested_selector.trim() !== ""
       ? hosted.requested_selector.trim()
       : "") || (typeof offer?.title === "string" ? offer.title : "");
-  const resolvedModel = backendFactText(
-    backendReport?.resolved_model,
-    hosted ? "unknown" : requestedModel || "unknown",
-  );
-  const provider = hosted
-    ? typeof hosted.backend_provider_label === "string" && hosted.backend_provider_label.trim() !== ""
+  const resolvedModel = backendFactText(backendReport?.resolved_model, "unknown");
+  const provider = kind === "hosted"
+    ? typeof hosted?.backend_provider_label === "string" && hosted.backend_provider_label.trim() !== ""
       ? hosted.backend_provider_label.trim()
       : "hosted provider"
-    : remoteName || "this Home";
-  const privacy = hosted
-    ? typeof hosted.privacy_policy_ref === "string" && hosted.privacy_policy_ref.trim() !== ""
+    : kind === "remote"
+      ? remoteName || "remote Home"
+      : "this Home";
+  const execution = kind === "hosted"
+    ? `hosted via ${provider}`
+    : kind === "remote"
+      ? `via ${remoteName || "remote Home"}`
+      : "this Home";
+  const privacy = kind === "hosted"
+    ? typeof hosted?.privacy_policy_ref === "string" && hosted.privacy_policy_ref.trim() !== ""
       ? hosted.privacy_policy_ref.trim()
-      : "hosted privacy policy unavailable"
-    : "on this Home";
-  const cost = backendFactText(backendReport?.cost, hosted ? "unknown" : "none");
-  const fallback = hosted
-    ? typeof hosted.upstream_routing_fallback_assertion === "string" &&
+      : "unknown"
+    : "unknown";
+  const cost = backendFactText(backendReport?.cost, "unknown");
+  const fallback = kind === "hosted"
+    ? typeof hosted?.upstream_routing_fallback_assertion === "string" &&
       hosted.upstream_routing_fallback_assertion.trim() !== ""
       ? hosted.upstream_routing_fallback_assertion.trim()
       : "unknown"
-    : "none";
+    : "unknown";
   const limits = offerPolicyLimits(offer?.policy);
   return {
     requestedModel,
     resolvedModel,
     provider,
+    execution,
     limits,
     privacy,
     cost,
     fallback,
-    summary: `requested ${requestedModel}; resolved ${resolvedModel}; provider ${provider}; limits ${limits}; privacy ${privacy}; cost ${cost}; fallback ${fallback}`,
+    summary: `requested ${requestedModel}; resolved ${resolvedModel}; provider ${provider}; execution ${execution}; limits ${limits}; privacy ${privacy}; cost ${cost}; fallback ${fallback}`,
   };
 }
 
 function offerRowDetail(offer, facts) {
-  if (offer?.hosted && typeof offer.hosted === "object") {
+  const kind = offerRouteKind(offer);
+  if (kind === "hosted") {
     return `Hosted · ${facts.provider}`;
   }
-  if (
-    typeof offer?.remote_service?.display_name === "string" &&
-    offer.remote_service.display_name.trim() !== ""
-  ) {
-    return `Model offer · via ${offer.remote_service.display_name.trim()}`;
+  if (kind === "remote") {
+    return `Model offer · ${facts.execution}`;
   }
   return "Model offer · this Home";
 }

@@ -353,11 +353,12 @@ assert.deepEqual(rows, [
   },
 ]);
 assert.equal(localFacts.requestedModel, "Local chat");
-assert.equal(localFacts.resolvedModel, "Local chat");
+assert.equal(localFacts.resolvedModel, "unknown");
 assert.equal(localFacts.provider, "this Home");
-assert.equal(localFacts.privacy, "on this Home");
-assert.equal(localFacts.cost, "none");
-assert.equal(localFacts.fallback, "none");
+assert.equal(localFacts.execution, "this Home");
+assert.equal(localFacts.privacy, "unknown");
+assert.equal(localFacts.cost, "unknown");
+assert.equal(localFacts.fallback, "unknown");
 
 const hostedOffer = {
   id: "offer-hosted",
@@ -390,6 +391,7 @@ assert.equal(hostedFacts.privacy, "fixture:privacy:v1");
 assert.equal(hostedFacts.cost, "unknown");
 assert.equal(hostedFacts.fallback, "operator_asserted_disabled");
 assert.match(hostedFacts.limits, /concurrency 1/);
+assert.equal(hostedFacts.execution, "hosted via Fixture Provider");
 const hostedResolved = contract.offerSelectionFacts(hostedOffer, {
   resolved_model: { status: "reported", value: "gpt-test-resolved" },
   cost: { status: "reported", value: { value: "0.02", unit: "USD" } },
@@ -397,6 +399,34 @@ const hostedResolved = contract.offerSelectionFacts(hostedOffer, {
 assert.equal(hostedResolved.resolvedModel, "gpt-test-resolved");
 assert.equal(hostedResolved.cost, "0.02 USD");
 assert.equal(contract.textOfferRows([hostedOffer])[0].detail, "Hosted · Fixture Provider");
+
+const remoteOffer = {
+  id: "offer-remote",
+  title: "qwen3-5-9b-q4-k-m-local",
+  operation: "text.generate",
+  input_modalities: ["text/plain"],
+  output_modalities: ["text/plain"],
+  stream_output: true,
+  remote_service: { display_name: "MA2 Mac guest's AI model", grant_id: "grant-remote" },
+};
+const remoteFacts = contract.offerSelectionFacts(remoteOffer);
+assert.equal(remoteFacts.requestedModel, "qwen3-5-9b-q4-k-m-local");
+assert.equal(remoteFacts.resolvedModel, "unknown");
+assert.equal(remoteFacts.provider, "MA2 Mac guest's AI model");
+assert.equal(remoteFacts.execution, "via MA2 Mac guest's AI model");
+assert.equal(remoteFacts.privacy, "unknown");
+assert.equal(remoteFacts.cost, "unknown");
+assert.equal(remoteFacts.fallback, "unknown");
+assert.equal(contract.offerRouteKind(remoteOffer), "remote");
+const remoteRows = contract.textOfferRows([remoteOffer, hostedOffer], {
+  "offer-hosted": {
+    resolved_model: { status: "reported", value: "stale-hosted" },
+    cost: { status: "reported", value: "9 USD" },
+  },
+});
+assert.equal(remoteRows[0].selectionFacts.resolvedModel, "unknown");
+assert.equal(remoteRows[0].selectionFacts.cost, "unknown");
+assert.equal(remoteRows[1].selectionFacts.resolvedModel, "stale-hosted");
 
 const messages = [
   { role: "system", content: "Be brief." },

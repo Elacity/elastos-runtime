@@ -97,16 +97,53 @@ export function getLiveInferenceState() {
 /** Chat offers → model-menu rows. An offer exists only when its backend is
  * configured (readiness-honest provider), so listing is the truth probe. */
 const lastBackendReports = Object.create(null);
+let backendReportRunId = "";
 
 function chatOfferRows(offers) {
-  return textOfferRows(eligibleTextOffers(offers), lastBackendReports);
+  const reports = Object.create(null);
+  for (const [offerId, entry] of Object.entries(lastBackendReports)) {
+    if (entry && entry.runId === backendReportRunId && entry.report) {
+      reports[offerId] = entry.report;
+    }
+  }
+  return textOfferRows(eligibleTextOffers(offers), reports);
 }
 
-function rememberBackendReport(offerId, report) {
-  if (typeof offerId !== "string" || offerId.trim() === "" || !report || typeof report !== "object") {
+function forgetBackendReport(offerId) {
+  if (typeof offerId === "string" && offerId.trim() !== "") {
+    delete lastBackendReports[offerId];
+  }
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+function rememberBackendReport(offerId, report, runId) {
+  if (
+    typeof offerId !== "string" ||
+    offerId.trim() === "" ||
+    typeof runId !== "string" ||
+    runId.trim() === "" ||
+    !report ||
+    typeof report !== "object"
+  ) {
     return;
   }
-  lastBackendReports[offerId] = report;
+  if (runId !== backendReportRunId) {
+    return;
+  }
+  lastBackendReports[offerId] = { runId, report };
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+/** A new chat or offer run must not inherit another run's backend facts. */
+export function clearBackendReports() {
+  for (const key of Object.keys(lastBackendReports)) {
+    delete lastBackendReports[key];
+  }
+  backendReportRunId = "";
   if (offersCache) {
     liveState.models = chatOfferRows(offersCache);
   }
@@ -443,7 +480,11 @@ export async function streamChatViaContract(
   let created;
   let runId;
   const createRequestId = resuming ? null : newRequestId();
-  if (!resuming) patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
+  if (!resuming) {
+    backendReportRunId = "";
+    forgetBackendReport(offer?.offerId);
+    patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
+  }
   try {
     created = resuming
       ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
@@ -469,6 +510,7 @@ export async function streamChatViaContract(
     ? Number(created.sequence_cursor)
     : 0;
   run.id = runId;
+  backendReportRunId = runId;
   patch({
     providerRunId: runId,
     state: TurnState.SUBMITTED,
@@ -526,7 +568,7 @@ export async function streamChatViaContract(
     );
   };
   const createdTerminal = created.terminal && typeof created.terminal === "object" ? created.terminal : null;
-  rememberBackendReport(offer?.offerId, createdTerminal?.backend_report);
+  rememberBackendReport(offer?.offerId, createdTerminal?.backend_report, runId);
   if (createdTerminal && created.output_retained === false) {
     createdTerminal.outputRetained = false;
   }
@@ -553,7 +595,7 @@ export async function streamChatViaContract(
         return finish({ detached: true });
       }
       const applied = applyRunEventsPage(page, afterSequence);
-      rememberBackendReport(offer?.offerId, applied.backendReport);
+      rememberBackendReport(offer?.offerId, applied.backendReport, runId);
       afterSequence = applied.nextCursor;
       let eventsInSlice = 0;
       let sliceStart = Date.now();
