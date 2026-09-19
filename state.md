@@ -5,21 +5,23 @@
 The model-delivery source line is `feat/remote-services`
 `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` on `origin`. Working closeout
 branch `feat/0.7.1-model-assistant-closeout` is
-`ee8b8cd89db598709376184053a742cba5a0eae7` tree
-`6c6ad0cdc6a3c6d30acc2f31bfeb64ed7222ebe9`. It starts from published
+`7c65a7cef309eded5def73ed528cbfcdb9b608e4` tree
+`66df724f8fc1bcdfacf502c1f92e71e3785bca50`. It starts from published
 `fix/0.7.1-security` `54355973e737f018e7d898a74449f9b04aaef26c` tree
 `b6442321b77f02382b821f27dc11f397559b2be6` and must merge with or after
 that parent. `d1625aaf` amends unpublished `ddfa50f3` so prepare seals
 an owned Kubo repo root to exactly `0700`. `6144fb2a` reports hosted
 selection facts in Assistant. `ee8b8cd8` records a shadow Jev Approval
-Lens on hosted Assistant `runs_create`. The sealed Linux
-ipfs-provider SHA-256 is still
-`8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731`. The
-built Runtime identity remains
-`42e31e30906a4a380654fa29c5d509e3e6385605` tree
-`67de379c49a54683a72964b80bd39b9025c44760`. The security parent still
-holds six committed security slices plus the later object-provider lock
-and two-platform admission commits:
+Lens on hosted Assistant `runs_create`. `d8cd6a05` records MA1-MA4
+installed evidence. `7c65a7ce` restores Assistant user prompt text from
+`modelText`. The sealed Linux ipfs-provider SHA-256 is still
+`8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731`. Darwin
+candidate Runtime SHA-256 is
+`a908e7b7c1d67b5107eba21f12847d4efecc1ee96601211af37d2ec80ab9f32c`. Isolated
+Linux `61942` Runtime SHA-256 is
+`07a8477cb7582c9d9e3099000716cc5e2fa3115353d94f6c7c6911960639f5a9`. The
+security parent still holds six committed security slices plus the later
+object-provider lock and two-platform admission commits:
 
 - `4b1a8a47` keep private data roots off `/capsule-data`
 - `9ffd25c7` require tokens for shell content writes
@@ -72,6 +74,17 @@ Assistant after a mode-`0500` llama.cpp engine bundle, a Ping reply,
 reload persist, full Runtime restart persist, and Stop
 `settlement_unknown` on run
 `run:sha256:b7aace10d6d00498755177be293dc57357812aa70d413d5e7592649085e338c3`.
+That Home now runs candidate musl Runtime SHA-256
+`07a8477cb7582c9d9e3099000716cc5e2fa3115353d94f6c7c6911960639f5a9`.
+Darwin candidate Runtime SHA-256
+`a908e7b7c1d67b5107eba21f12847d4efecc1ee96601211af37d2ec80ab9f32c`
+from `7c65a7ce` stays off holder `61680`. Assistant Settings on `61942`
+reports requested, resolved, provider, limits, privacy, cost and
+fallback. A renewed remote Qwen grant
+`services-remote-model-grant-503a0102ae5df303` produced a Carrier Ping
+and Home reload persist with zero extra `runs_create`. Hosted Chat
+Completions credential is the remaining operator input for a live
+hosted route. Candidate remote Stop and grant revoke stay pending.
 The ignored Kubo prepare fixture passed. A bounded no-holder Get on a
 temporary signed tiny catalogue failed at MetadataRead with zero
 payload. Isolated Mac holder and isolated Linux consumer share

@@ -175,8 +175,8 @@ verification separate from product acceptance and required human review.
 
 The working closeout branch is
 `feat/0.7.1-model-assistant-closeout`
-`ee8b8cd89db598709376184053a742cba5a0eae7` tree
-`6c6ad0cdc6a3c6d30acc2f31bfeb64ed7222ebe9`. It starts from published
+`7c65a7cef309eded5def73ed528cbfcdb9b608e4` tree
+`66df724f8fc1bcdfacf502c1f92e71e3785bca50`. It starts from published
 `fix/0.7.1-security` `54355973e737f018e7d898a74449f9b04aaef26c` tree
 `b6442321b77f02382b821f27dc11f397559b2be6` and must merge with or after
 that parent. `feat/remote-services`
@@ -185,14 +185,16 @@ that parent. `feat/remote-services`
 repo root to exactly `0700`, including umask `0775`, `0755` and `0750`.
 `6144fb2a` reports hosted selection facts in Assistant. `ee8b8cd8`
 records a shadow Jev Approval Lens on hosted Assistant `runs_create`.
-The earlier isolated Linux `0775` Get remains cause evidence. The
-installed sealed ipfs-provider SHA-256 is still
+`d8cd6a05` records MA1-MA4 installed evidence. `7c65a7ce` restores
+Assistant user prompt text from `modelText`. The earlier isolated Linux
+`0775` Get remains cause evidence. The installed sealed ipfs-provider
+SHA-256 is still
 `8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731` and
-covers that `0775` path. Exact-candidate reinstall belongs to MA5. The
-built Runtime identity remains
-`42e31e30906a4a380654fa29c5d509e3e6385605` tree
-`67de379c49a54683a72964b80bd39b9025c44760`. This closeout branch is
-local only.
+covers that `0775` path. Darwin candidate Runtime SHA-256
+`a908e7b7c1d67b5107eba21f12847d4efecc1ee96601211af37d2ec80ab9f32c`
+and Linux candidate Runtime SHA-256
+`07a8477cb7582c9d9e3099000716cc5e2fa3115353d94f6c7c6911960639f5a9`
+come from this branch. This closeout branch is local only.
 Public `release-head.json` reports 0.7.1, release CID
 `QmT16KDvZqA4wQc74ssFgy8JJN578Z64AAAhzYvkoE4NF8`, signed by live
 `did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj`. Platforms in
@@ -275,9 +277,25 @@ seed catalog SHA-256
 Seed Kubo holds that catalog file and supplies no Qwen payload. Stopping
 llama-server pid `12749` left Home `61680` at HTTP 200 with unchanged
 weights. Acquisition on `61942` left no durable llama-server process.
-Hosted Chat Completions credential is the remaining operator input for
-a live hosted route. Jev shadow source tests passed. Public deployment
-of the sealed ipfs-provider needs a separate approval.
+Isolated Linux `61942` now runs candidate musl Runtime SHA-256
+`07a8477cb7582c9d9e3099000716cc5e2fa3115353d94f6c7c6911960639f5a9`
+with Assistant `agent-stream.js` SHA-256
+`515d459139ffb83c44e28a8f683f406ac8d4653ae5d4a06418df97d0b3840575`.
+Marketplace still shows SmolLM2 Available. Assistant Settings reports
+requested, resolved, provider, limits, privacy, cost and fallback.
+Local Ping persist and remote Qwen Ping persist both restored model
+`qwen3-5-9b-q4-k-m-local` or
+`smollm2-135m-instruct-q8-0-local` with zero extra `runs_create`.
+The renewed grant is
+`services-remote-model-grant-503a0102ae5df303` and run
+`run:sha256:f5342520a04d9a76591803fc457ce311ecac8d6652118854a8256e8d72d5b073`. Darwin candidate
+Runtime SHA-256
+`a908e7b7c1d67b5107eba21f12847d4efecc1ee96601211af37d2ec80ab9f32c`
+from `7c65a7ce` stays off holder `61680`. Hosted Chat Completions
+credential is the remaining operator input for a live hosted route.
+Jev shadow source tests passed. Candidate remote Stop and grant revoke
+stay pending. Public deployment of the sealed ipfs-provider needs a
+separate approval.
 Protected receipts `isolated-qualification-61770.json`,
 `isolated-qualification-61780.json`, `isolated-qualification-61800.json`
 stay. Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining
