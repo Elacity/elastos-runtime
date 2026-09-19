@@ -899,7 +899,7 @@ export function renderActiveSession() {
           }
         }
       }
-      appendMessage(msg.role, msg.text, {
+      appendMessage(msg.role, msg.text || msg.modelText || "", {
         msgIndex: index,
         parts: msg.parts,
         modelText: msg.modelText,
@@ -1138,7 +1138,7 @@ function paintUserMessageBody(body, text, { parts = null, modelText = "" } = {})
     }
     body.append(row);
   }
-  const prose = String(text || "").trim();
+  const prose = String(text || modelText || "").trim();
   if (prose) {
     const block = document.createElement("div");
     block.className = "agent-msg-user-text";
