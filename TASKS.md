@@ -286,6 +286,9 @@ requested, resolved, provider, limits, privacy, cost and fallback.
 Local Ping persist and remote Qwen Ping persist both restored model
 `qwen3-5-9b-q4-k-m-local` or
 `smollm2-135m-instruct-q8-0-local` with zero extra `runs_create`.
+A full `61942` gateway restart then restored model
+`qwen3-5-9b-q4-k-m-local`, draft `keep this remote draft`, grant
+`503a0102` as `reachable`, and `createsAfterReload` 0.
 The renewed grant is
 `services-remote-model-grant-503a0102ae5df303` and run
 `run:sha256:f5342520a04d9a76591803fc457ce311ecac8d6652118854a8256e8d72d5b073`. Darwin candidate

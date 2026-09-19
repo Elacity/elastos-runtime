@@ -82,7 +82,10 @@ from `7c65a7ce` stays off holder `61680`. Assistant Settings on `61942`
 reports requested, resolved, provider, limits, privacy, cost and
 fallback. A renewed remote Qwen grant
 `services-remote-model-grant-503a0102ae5df303` produced a Carrier Ping
-and Home reload persist with zero extra `runs_create`. Hosted Chat
+and Home reload persist with zero extra `runs_create`. A later full
+gateway restart restored the same remote model, the draft
+`keep this remote draft`, grant `503a0102` as reachable, and
+`createsAfterReload` 0. Hosted Chat
 Completions credential is the remaining operator input for a live
 hosted route. Candidate remote Stop and grant revoke stay pending.
 The ignored Kubo prepare fixture passed. A bounded no-holder Get on a
