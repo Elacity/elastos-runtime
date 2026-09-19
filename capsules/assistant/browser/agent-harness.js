@@ -719,12 +719,20 @@ function syncModelTrigger() {
     name.textContent = offer?.label || liveInference.model || "No model";
   }
   if (tier) {
-    tier.textContent = "";
-    tier.hidden = true;
+    const facts = offer?.selectionFacts;
+    if (facts?.summary) {
+      tier.textContent = `${facts.provider} · cost ${facts.cost}`;
+      tier.hidden = false;
+    } else {
+      tier.textContent = "";
+      tier.hidden = true;
+    }
   }
-  btn.title = offer
-    ? `${offer.label} — model offer on this Home`
-    : "Chosen model unavailable. Open Models to prepare a model, or choose another offer.";
+  btn.title = offer?.selectionFacts?.summary
+    ? offer.selectionFacts.summary
+    : offer
+      ? `${offer.label} — model offer on this Home`
+      : "Chosen model unavailable. Open Models to prepare a model, or choose another offer.";
 }
 
 function buildInstalledModelRows(host, emptyText) {
@@ -751,7 +759,10 @@ function buildInstalledModelRows(host, emptyText) {
         `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
       row.querySelector(".agent-model-option-title").textContent = model.label;
       row.querySelector(".agent-model-option-desc").textContent =
-        model.detail || "Live · on this Home via gateway";
+        model.selectionFacts?.summary || model.detail || "Live · on this Home via gateway";
+      if (model.selectionFacts?.summary) {
+        row.title = model.selectionFacts.summary;
+      }
       host.append(row);
     }
   }

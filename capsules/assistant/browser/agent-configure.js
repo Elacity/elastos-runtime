@@ -9,6 +9,7 @@ import {
   normalizeLiveSystemPrompt,
   normalizeAgentNotes,
   probeLiveInference,
+  selectedLiveOffer,
 } from "./agent-live.js";
 
 /** @type {null | object} */
@@ -154,6 +155,36 @@ function syncConfigureSectionChips() {
   }
 }
 
+function renderModelSelectionFacts() {
+  const factsHost = document.querySelector("[data-model-selection-facts]");
+  if (!factsHost) {
+    return;
+  }
+  const facts = selectedLiveOffer()?.selectionFacts;
+  factsHost.replaceChildren();
+  if (!facts) {
+    factsHost.hidden = true;
+    return;
+  }
+  const rows = [
+    ["Requested model", facts.requestedModel],
+    ["Resolved model", facts.resolvedModel],
+    ["Provider", facts.provider],
+    ["Limits", facts.limits],
+    ["Privacy", facts.privacy],
+    ["Cost", facts.cost],
+    ["Fallback", facts.fallback],
+  ];
+  for (const [term, value] of rows) {
+    const dt = document.createElement("dt");
+    dt.textContent = term;
+    const dd = document.createElement("dd");
+    dd.textContent = value || "unknown";
+    factsHost.append(dt, dd);
+  }
+  factsHost.hidden = false;
+}
+
 /* Models = the offers this Home advertises, nothing else. Re-probe on open so
    a service installed a moment ago shows up without a reload. */
 function renderConfigureModels() {
@@ -165,10 +196,12 @@ function renderConfigureModels() {
   if (installed) {
     host.buildInstalledModelRows(installed, "No model offer on this Home yet.");
   }
+  renderModelSelectionFacts();
   void probeLiveInference({ force: true }).then(() => {
     if (harnessPage === "configure" && configureSection === "models" && installed) {
       host.buildInstalledModelRows(installed, "No model offer on this Home yet.");
       host.syncModelTrigger?.();
+      renderModelSelectionFacts();
     }
   });
 }

@@ -340,6 +340,7 @@ assert.deepEqual(textOffers.map((o) => o.id), ["offer-a"]);
 assert.deepEqual(contract.eligibleTextOffers({ offers: offersPayload.data.offers }).map((o) => o.id), ["offer-a"]);
 assert.deepEqual(contract.eligibleTextOffers(null), []);
 const rows = contract.textOfferRows(textOffers);
+const localFacts = contract.offerSelectionFacts(textOffers[0]);
 assert.deepEqual(rows, [
   {
     id: "live:offer-a",
@@ -348,8 +349,54 @@ assert.deepEqual(rows, [
     label: "Local chat",
     detail: "Model offer · this Home",
     streamOutput: true,
+    selectionFacts: localFacts,
   },
 ]);
+assert.equal(localFacts.requestedModel, "Local chat");
+assert.equal(localFacts.resolvedModel, "Local chat");
+assert.equal(localFacts.provider, "this Home");
+assert.equal(localFacts.privacy, "on this Home");
+assert.equal(localFacts.cost, "none");
+assert.equal(localFacts.fallback, "none");
+
+const hostedOffer = {
+  id: "offer-hosted",
+  title: "Hosted chat",
+  operation: "text.generate",
+  input_modalities: ["text/plain"],
+  output_modalities: ["text/plain"],
+  stream_output: true,
+  policy: {
+    concurrency_limit: 1,
+    input_bytes_limit: 4096,
+    runtime_ms_limit: 30000,
+  },
+  hosted: {
+    placement: "hosted",
+    backend_provider_label: "Fixture Provider",
+    selection_mode: "pinned",
+    requested_selector: "gpt-test",
+    privacy_policy_ref: "fixture:privacy:v1",
+    terms_ref: "fixture:terms:v1",
+    provider_request_policy: "single_dispatch_no_retry",
+    upstream_routing_fallback_assertion: "operator_asserted_disabled",
+  },
+};
+const hostedFacts = contract.offerSelectionFacts(hostedOffer);
+assert.equal(hostedFacts.requestedModel, "gpt-test");
+assert.equal(hostedFacts.resolvedModel, "unknown");
+assert.equal(hostedFacts.provider, "Fixture Provider");
+assert.equal(hostedFacts.privacy, "fixture:privacy:v1");
+assert.equal(hostedFacts.cost, "unknown");
+assert.equal(hostedFacts.fallback, "operator_asserted_disabled");
+assert.match(hostedFacts.limits, /concurrency 1/);
+const hostedResolved = contract.offerSelectionFacts(hostedOffer, {
+  resolved_model: { status: "reported", value: "gpt-test-resolved" },
+  cost: { status: "reported", value: { value: "0.02", unit: "USD" } },
+});
+assert.equal(hostedResolved.resolvedModel, "gpt-test-resolved");
+assert.equal(hostedResolved.cost, "0.02 USD");
+assert.equal(contract.textOfferRows([hostedOffer])[0].detail, "Hosted · Fixture Provider");
 
 const messages = [
   { role: "system", content: "Be brief." },
@@ -390,6 +437,7 @@ assert.deepEqual(page1, {
   textDeltas: ["Hel", "lo"],
   terminal: null,
   studioProgress: null,
+  backendReport: null,
 });
 
 const page2 = contract.applyRunEventsPage(
@@ -405,6 +453,28 @@ const page2 = contract.applyRunEventsPage(
 assert.equal(page2.terminal.status, "completed");
 assert.equal(contract.terminalOutputText(page2.terminal.output), "Hello");
 assert.equal(contract.terminalOutputText({ schema: "other", text: "x" }), "");
+const reported = contract.applyRunEventsPage(
+  {
+    events: [
+      {
+        sequence: 1,
+        kind: "completed",
+        terminal: true,
+        data: { schema: "elastos.model.output.text/v1", text: "Hi" },
+        backend_report: {
+          schema: "elastos.model.backend-report/v1",
+          resolved_model: { status: "reported", value: "gpt-test-resolved" },
+          usage: { status: "unknown" },
+          cost: { status: "reported", value: { value: "0.01", unit: "USD" } },
+        },
+      },
+    ],
+    next_cursor: 1,
+    has_more: false,
+  },
+  0,
+);
+assert.equal(reported.backendReport.resolved_model.value, "gpt-test-resolved");
 
 const prunedCompleted = contract.applyRunEventsPage(
   {
@@ -427,7 +497,7 @@ assert.deepEqual(failed.terminal, { status: "failed", output: null, error: { cod
 
 assert.deepEqual(
   contract.applyRunEventsPage({ events: [], next_cursor: 5 }, 5),
-  { nextCursor: 5, hasMore: false, textDeltas: [], terminal: null, studioProgress: null },
+  { nextCursor: 5, hasMore: false, textDeltas: [], terminal: null, studioProgress: null, backendReport: null },
 );
 assert.throws(() => contract.applyRunEventsPage({ events: [], next_cursor: 2 }, 5), /cursor went backwards/);
 assert.deepEqual(
@@ -441,14 +511,14 @@ assert.deepEqual(
     },
     0,
   ),
-  { nextCursor: 2, hasMore: false, textDeltas: ["a"], terminal: null, studioProgress: null },
+  { nextCursor: 2, hasMore: false, textDeltas: ["a"], terminal: null, studioProgress: null, backendReport: null },
 );
 assert.deepEqual(
   contract.applyRunEventsPage(
     { events: [{ sequence: 1, kind: "text_delta", data: { text: "a" } }], next_cursor: 1 },
     1,
   ),
-  { nextCursor: 1, hasMore: false, textDeltas: [], terminal: null, studioProgress: null },
+  { nextCursor: 1, hasMore: false, textDeltas: [], terminal: null, studioProgress: null, backendReport: null },
 );
 const replayedProgress = contract.applyRunEventsPage(
   {

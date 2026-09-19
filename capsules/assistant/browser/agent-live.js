@@ -96,8 +96,20 @@ export function getLiveInferenceState() {
 
 /** Chat offers → model-menu rows. An offer exists only when its backend is
  * configured (readiness-honest provider), so listing is the truth probe. */
+const lastBackendReports = Object.create(null);
+
 function chatOfferRows(offers) {
-  return textOfferRows(eligibleTextOffers(offers));
+  return textOfferRows(eligibleTextOffers(offers), lastBackendReports);
+}
+
+function rememberBackendReport(offerId, report) {
+  if (typeof offerId !== "string" || offerId.trim() === "" || !report || typeof report !== "object") {
+    return;
+  }
+  lastBackendReports[offerId] = report;
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
 }
 
 /* An existing choice stays exact. Only a workspace with no choice uses the
@@ -514,6 +526,7 @@ export async function streamChatViaContract(
     );
   };
   const createdTerminal = created.terminal && typeof created.terminal === "object" ? created.terminal : null;
+  rememberBackendReport(offer?.offerId, createdTerminal?.backend_report);
   if (createdTerminal && created.output_retained === false) {
     createdTerminal.outputRetained = false;
   }
@@ -540,6 +553,7 @@ export async function streamChatViaContract(
         return finish({ detached: true });
       }
       const applied = applyRunEventsPage(page, afterSequence);
+      rememberBackendReport(offer?.offerId, applied.backendReport);
       afterSequence = applied.nextCursor;
       let eventsInSlice = 0;
       let sliceStart = Date.now();

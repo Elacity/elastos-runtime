@@ -32,19 +32,124 @@ export function eligibleTextOffers(payload) {
   );
 }
 
+function backendFactText(fact, fallback) {
+  if (!fact || typeof fact !== "object") {
+    return fallback;
+  }
+  if (fact.status === "unknown") {
+    return "unknown";
+  }
+  if (fact.status === "reported") {
+    const value = fact.value;
+    if (typeof value === "string" && value.trim() !== "") {
+      return value.trim();
+    }
+    if (value && typeof value === "object") {
+      const amount = typeof value.value === "string" ? value.value.trim() : "";
+      const unit = typeof value.unit === "string" ? value.unit.trim() : "";
+      if (amount && unit) {
+        return `${amount} ${unit}`;
+      }
+      if (amount) {
+        return amount;
+      }
+    }
+  }
+  return fallback;
+}
+
+function offerPolicyLimits(policy) {
+  if (!policy || typeof policy !== "object") {
+    return "offer policy unavailable";
+  }
+  const parts = [];
+  if (Number.isFinite(Number(policy.concurrency_limit))) {
+    parts.push(`concurrency ${Number(policy.concurrency_limit)}`);
+  }
+  if (Number.isFinite(Number(policy.input_bytes_limit))) {
+    parts.push(`input ${Number(policy.input_bytes_limit)} B`);
+  }
+  if (Number.isFinite(Number(policy.runtime_ms_limit))) {
+    parts.push(`${Number(policy.runtime_ms_limit)} ms`);
+  }
+  return parts.length ? parts.join("; ") : "offer policy unavailable";
+}
+
+/** Selection facts the Assistant model picker must show. */
+export function offerSelectionFacts(offer, backendReport = null) {
+  const hosted = offer?.hosted && typeof offer.hosted === "object" ? offer.hosted : null;
+  const remoteName =
+    typeof offer?.remote_service?.display_name === "string" && offer.remote_service.display_name.trim() !== ""
+      ? offer.remote_service.display_name.trim()
+      : "";
+  const requestedModel =
+    (typeof hosted?.requested_selector === "string" && hosted.requested_selector.trim() !== ""
+      ? hosted.requested_selector.trim()
+      : "") || (typeof offer?.title === "string" ? offer.title : "");
+  const resolvedModel = backendFactText(
+    backendReport?.resolved_model,
+    hosted ? "unknown" : requestedModel || "unknown",
+  );
+  const provider = hosted
+    ? typeof hosted.backend_provider_label === "string" && hosted.backend_provider_label.trim() !== ""
+      ? hosted.backend_provider_label.trim()
+      : "hosted provider"
+    : remoteName || "this Home";
+  const privacy = hosted
+    ? typeof hosted.privacy_policy_ref === "string" && hosted.privacy_policy_ref.trim() !== ""
+      ? hosted.privacy_policy_ref.trim()
+      : "hosted privacy policy unavailable"
+    : "on this Home";
+  const cost = backendFactText(backendReport?.cost, hosted ? "unknown" : "none");
+  const fallback = hosted
+    ? typeof hosted.upstream_routing_fallback_assertion === "string" &&
+      hosted.upstream_routing_fallback_assertion.trim() !== ""
+      ? hosted.upstream_routing_fallback_assertion.trim()
+      : "unknown"
+    : "none";
+  const limits = offerPolicyLimits(offer?.policy);
+  return {
+    requestedModel,
+    resolvedModel,
+    provider,
+    limits,
+    privacy,
+    cost,
+    fallback,
+    summary: `requested ${requestedModel}; resolved ${resolvedModel}; provider ${provider}; limits ${limits}; privacy ${privacy}; cost ${cost}; fallback ${fallback}`,
+  };
+}
+
+function offerRowDetail(offer, facts) {
+  if (offer?.hosted && typeof offer.hosted === "object") {
+    return `Hosted · ${facts.provider}`;
+  }
+  if (
+    typeof offer?.remote_service?.display_name === "string" &&
+    offer.remote_service.display_name.trim() !== ""
+  ) {
+    return `Model offer · via ${offer.remote_service.display_name.trim()}`;
+  }
+  return "Model offer · this Home";
+}
+
 /** Menu rows for the composer's model chip; the id carries the offer. */
-export function textOfferRows(offers) {
-  return offers.map((offer) => ({
-    id: `live:${offer.id}`,
-    offerId: offer.id,
-    operation: offer.operation,
-    label: offer.title,
-    detail:
-      typeof offer.remote_service?.display_name === "string" && offer.remote_service.display_name.trim() !== ""
-        ? `Model offer · via ${offer.remote_service.display_name.trim()}`
-        : "Model offer · this Home",
-    streamOutput: offer.stream_output === true,
-  }));
+export function textOfferRows(offers, backendReports = {}) {
+  return offers.map((offer) => {
+    const facts = offerSelectionFacts(
+      offer,
+      backendReports && typeof backendReports === "object" ? backendReports[offer.id] : null,
+    );
+    return {
+      id: `live:${offer.id}`,
+      offerId: offer.id,
+      operation: offer.operation,
+      label: offer.title,
+      detail: offerRowDetail(offer, facts),
+      streamOutput: offer.stream_output === true,
+      selectionFacts: facts,
+    };
+  });
 }
 
 /**
@@ -136,6 +241,7 @@ export function applyRunEventsPage(page, afterSequence) {
   const textDeltas = [];
   let terminal = null;
   let studioProgress = null;
+  let backendReport = null;
   let lastSequence = afterSequence;
   for (const event of page.events) {
     const sequence = parseCursor(event?.sequence);
@@ -180,6 +286,9 @@ export function applyRunEventsPage(page, afterSequence) {
     if (event.terminal === true && !terminal) {
       terminal = { status: "completed", output: null, error: null };
     }
+    if (event.backend_report && typeof event.backend_report === "object") {
+      backendReport = event.backend_report;
+    }
   }
   if (terminal && page.output_retained === false) {
     terminal.outputRetained = false;
@@ -194,6 +303,7 @@ export function applyRunEventsPage(page, afterSequence) {
     textDeltas,
     terminal,
     studioProgress,
+    backendReport,
   };
 }
 
