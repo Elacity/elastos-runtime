@@ -1,20 +1,25 @@
 # State
 
-## Current model delivery checkpoint, 18 September 2026 UTC
+## Current model delivery checkpoint, 19 September 2026 UTC
 
 The model-delivery source line is `feat/remote-services`
-`8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` on `origin`. Working security
-branch `fix/0.7.1-security` has released code tip
-`a48ed2a70b9421a384848c2208e7bd6d8fe7f566` tree
-`04b3c271ab106300f4e3afd72b95ff791bdc718c`, published on
-`origin/fix/0.7.1-security`. It is the two-platform release-admission overlay.
-The documentation commit above it does not change product source. The built
-Runtime identity remains
+`8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` on `origin`. Working closeout
+branch `feat/0.7.1-model-assistant-closeout` is
+`ee8b8cd89db598709376184053a742cba5a0eae7` tree
+`6c6ad0cdc6a3c6d30acc2f31bfeb64ed7222ebe9`. It starts from published
+`fix/0.7.1-security` `54355973e737f018e7d898a74449f9b04aaef26c` tree
+`b6442321b77f02382b821f27dc11f397559b2be6` and must merge with or after
+that parent. `d1625aaf` amends unpublished `ddfa50f3` so prepare seals
+an owned Kubo repo root to exactly `0700`. `6144fb2a` reports hosted
+selection facts in Assistant. `ee8b8cd8` records a shadow Jev Approval
+Lens on hosted Assistant `runs_create`. The sealed Linux
+ipfs-provider SHA-256 is still
+`8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731`. The
+built Runtime identity remains
 `42e31e30906a4a380654fa29c5d509e3e6385605` tree
-`67de379c49a54683a72964b80bd39b9025c44760`. The branch depends on
-`feat/remote-services` and must merge with or after it. Six committed
-security slices plus the later object-provider lock and two-platform
-admission commits sit on this branch:
+`67de379c49a54683a72964b80bd39b9025c44760`. The security parent still
+holds six committed security slices plus the later object-provider lock
+and two-platform admission commits:
 
 - `4b1a8a47` keep private data roots off `/capsule-data`
 - `9ffd25c7` require tokens for shell content writes
@@ -51,9 +56,47 @@ the existing DID, passkeys and `sources.json` hash
 `96b62da57dbfe5d2245403464e99ec65b80968ad96b612724acdb1882aab0676`. Marketplace
 lists verified SmolLM2 CID
 `bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y`. Public Get
-fails at MetadataRead. After Kubo idle-stop, the live repo still pins that
-CID and later serves `_elastos_object.json` (726 bytes) locally. The product
-bounded read uses `offline=true&timeout=100ms` during backend restart.
+still fails at MetadataRead on the published ipfs-provider. The owning
+layer is Capacity against Kubo umask `0775`, not the 100ms bounded-read
+timeout. Isolated Linux Get with sealed ipfs-provider SHA-256
+`8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731`
+admitted the package, streamed Assistant `Pong`, settled Stop as
+`settlement_unknown`, and reused the same weights after Runtime restart
+with Bitswap payload received 0. Catalog status for the admitted
+operation is `admitted` and `dispatch_ready`. Workspace PUT on that
+Linux Home needs principal-root protection. First-owner passkey
+enrollment on that Home is blocked by `require_unowned`. A separate
+isolated Linux Home enrolled an admin passkey through virtual-auth.
+Isolated Linux `61942` completed Marketplace Get of SmolLM2, Open in
+Assistant after a mode-`0500` llama.cpp engine bundle, a Ping reply,
+reload persist, full Runtime restart persist, and Stop
+`settlement_unknown` on run
+`run:sha256:b7aace10d6d00498755177be293dc57357812aa70d413d5e7592649085e338c3`.
+The ignored Kubo prepare fixture passed. A bounded no-holder Get on a
+temporary signed tiny catalogue failed at MetadataRead with zero
+payload. Isolated Mac holder and isolated Linux consumer share
+collaboration-network startup config
+`elastos.collaboration-network.startup-config/v1` with no model offer
+in that file. People connected. Linux Ask to use and Mac owner
+approval produced grant
+`services-remote-model-grant-a21916fd3fd3241b`. The first remote Qwen
+reply is run
+`run:sha256:7bf00494cee50905ef135ccf3708893222c1c71885b0cd693691c23de9e4bbd7`
+request `7b9429c1-c02b-4991-9a16-0acaabff6157`. Home reload restored
+that conversation with zero `runs_create`. Remote Stop settled
+`settlement_unknown` as run
+`run:sha256:0d5a802737aba8e43f8ad028cddafa9c9470993451ab2dbabfdaabc766409592`.
+Mac `61680` holds complete Qwen weights
+`d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43`. Seed
+catalog SHA-256 matches Mac `61700`
+`c81d43574da91ad278300eda59330cfdf1fd6a924ef2ebf63658ab0e261d2f2c`.
+Stopping llama-server on `61680` left Home HTTP 200. Hosted Chat
+Completions credential is the remaining operator input for a live
+hosted route. Public Home stayed unchanged. A public ipfs-provider replace needs a
+separate approval. After Kubo idle-stop, a
+live repo can still pin that CID and later serve `_elastos_object.json`
+(726 bytes) locally. The product bounded read uses
+`offline=true&timeout=100ms` during backend restart.
 
 Fresh Apple silicon install from `https://elastos.elacitylabs.com/install.sh`
 completed ordinary Get, two Assistant replies, reload and Runtime restart with

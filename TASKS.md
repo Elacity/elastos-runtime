@@ -173,15 +173,26 @@ verification separate from product acceptance and required human review.
 
 ### Model delivery R14 — 0.7.1 on public Home
 
-The released code tip on `fix/0.7.1-security` is
-`a48ed2a70b9421a384848c2208e7bd6d8fe7f566` tree
-`04b3c271ab106300f4e3afd72b95ff791bdc718c`. It is the two-platform
-release-admission overlay. The built Runtime identity remains
+The working closeout branch is
+`feat/0.7.1-model-assistant-closeout`
+`ee8b8cd89db598709376184053a742cba5a0eae7` tree
+`6c6ad0cdc6a3c6d30acc2f31bfeb64ed7222ebe9`. It starts from published
+`fix/0.7.1-security` `54355973e737f018e7d898a74449f9b04aaef26c` tree
+`b6442321b77f02382b821f27dc11f397559b2be6` and must merge with or after
+that parent. `feat/remote-services`
+`8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` remains an ancestor. Commit
+`d1625aaf` amends unpublished `ddfa50f3` so prepare seals an owned Kubo
+repo root to exactly `0700`, including umask `0775`, `0755` and `0750`.
+`6144fb2a` reports hosted selection facts in Assistant. `ee8b8cd8`
+records a shadow Jev Approval Lens on hosted Assistant `runs_create`.
+The earlier isolated Linux `0775` Get remains cause evidence. The
+installed sealed ipfs-provider SHA-256 is still
+`8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731` and
+covers that `0775` path. Exact-candidate reinstall belongs to MA5. The
+built Runtime identity remains
 `42e31e30906a4a380654fa29c5d509e3e6385605` tree
-`67de379c49a54683a72964b80bd39b9025c44760`. The branch depends on
-`feat/remote-services` `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` and must
-merge with or after it. Both code tips are published on `origin` at those
-commits.
+`67de379c49a54683a72964b80bd39b9025c44760`. This closeout branch is
+local only.
 Public `release-head.json` reports 0.7.1, release CID
 `QmT16KDvZqA4wQc74ssFgy8JJN578Z64AAAhzYvkoE4NF8`, signed by live
 `did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj`. Platforms in
@@ -197,7 +208,76 @@ replies, then restored the same chat and model after Home reload and a full
 Runtime restart with unchanged weights mtime. Public Home
 https://elastos.elacitylabs.com/home/ runs that 0.7.1 Linux Runtime, keeps
 the existing account, and lists verified SmolLM2. Public Marketplace Get
-still fails at MetadataRead. Remote Qwen from the Mac is not restored.
+still fails at MetadataRead because public ipfs-provider remains the
+published `17128b5e` binary. An isolated public-style Linux Home with the
+sealed ipfs-provider admitted SmolLM2 through ordinary Marketplace Get,
+activated the CPU llama.cpp engine, returned streamed Assistant text
+`Pong`, settled Stop as `settlement_unknown`, then restored the same
+offer and a second streamed `Pong` after a full Runtime restart. Weights
+SHA-256
+`c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a`
+at 144811072 bytes kept the same mtime. Restart restored a complete
+local object replica. Reuse Get completed in under one second with
+Bitswap payload received 0. Catalog `content.status` for the admitted
+SmolLM2 operation returns `admitted` and `dispatch_ready`. A cid-only
+status poll returns HTTP 409 `preparation_unavailable`. That 409 is
+harness input, not product UI hide. Assistant `runs_get` without
+`request_id` is also harness; live Assistant issues a fresh
+`request_id` per run op. The ignored production prepare fixture
+`staged_directory_hash_matches_normal_cli_import_without_mutation`
+passed with live Kubo and `repo_mode` 448 (`0700`). A throwaway
+publisher/consumer with a temporary signed tiny catalogue entry and no
+holder completed ordinary Marketplace Get in 0.386 s as
+`failed`/`metadata_read` with `completed_bytes` 0 and a 30 KB repo.
+The admitted SmolLM2 Home cannot enroll a first-owner passkey because
+`require_unowned` sees existing audit ids. Do not wipe that audit. A
+fresh isolated Linux Home enrolled an admin passkey through the
+virtual-auth product path and created principal-root protection from
+that enrollment. Isolated Linux Home `127.0.0.1:61942` completed ordinary
+Marketplace Get of SmolLM2 CID
+`bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y` at
+144835448 bytes, then Open in Assistant after a real llama.cpp engine
+bundle at `libexec/llama.cpp/b10516/linux-amd64` with mode `0500`.
+Assistant returned a Ping reply on offer
+`model:01134137a7b2f7e75fe21e610c10bf839a3326770518df2f6d6b29d5216766aa`
+as run `run:sha256:c6d09e019c40ce00c248759ce638c34e29a5466829d66768e2d695644f175832`.
+Home reload and a full Runtime restart restored that Ping, model
+`smollm2-135m-instruct-q8-0-local`, and composer draft. Stop of a later
+run `run:sha256:b7aace10d6d00498755177be293dc57357812aa70d413d5e7592649085e338c3`
+settled `settlement_unknown` after `runs_cancel` HTTP 200. Public Home
+stayed unchanged. Isolated Mac holder and isolated Linux consumer now
+load the same `elastos.collaboration-network.startup-config/v1` file
+from `elastos collaboration-config`. File keys are only
+`schema`, `expected_network_id`, `trusted_profile_signer_dids`,
+`profile_chain_base64` and `default_conversation_grant_base64`. The
+file contains no model offer. People Profiles connected both ways.
+Linux Services projected `MA2 Mac guest's AI model`, sent Ask to use,
+and received owner approval. The first remote Qwen reply completed on
+offer `model:00c7b9dd517d19449e660149e57f8ec37b5fb7d424405f176fe3afa670f3e3c4`
+as run `run:sha256:7bf00494cee50905ef135ccf3708893222c1c71885b0cd693691c23de9e4bbd7`
+with request `7b9429c1-c02b-4991-9a16-0acaabff6157` and grant
+`services-remote-model-grant-a21916fd3fd3241b`. Transport was
+`carrier-provider-plane`. Home reload restored the same Ping
+conversation, model and composer draft with zero `runs_create`.
+Installed Mac Inbox capsules omit the `service-approve-request`
+button. Approval used the Inbox actions API from the Inbox frame.
+Remote Stop settled `settlement_unknown` as run
+`run:sha256:0d5a802737aba8e43f8ad028cddafa9c9470993451ab2dbabfdaabc766409592`
+request `3aa4f7b5-0c75-4815-9411-637cebaa9a2c`. Qwen capsule identity is
+CID `bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi`,
+content digest
+`sha256:93a66d041debbef5daad88c5673666e38187ee64ec136d51b526ab34cdcce212`,
+and weights SHA-256
+`d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43`
+at 6169341984 bytes on Mac holder `61680`, Mac catalog `61700`, and
+seed catalog SHA-256
+`c81d43574da91ad278300eda59330cfdf1fd6a924ef2ebf63658ab0e261d2f2c`.
+Seed Kubo holds that catalog file and supplies no Qwen payload. Stopping
+llama-server pid `12749` left Home `61680` at HTTP 200 with unchanged
+weights. Acquisition on `61942` left no durable llama-server process.
+Hosted Chat Completions credential is the remaining operator input for
+a live hosted route. Jev shadow source tests passed. Public deployment
+of the sealed ipfs-provider needs a separate approval.
 Protected receipts `isolated-qualification-61770.json`,
 `isolated-qualification-61780.json`, `isolated-qualification-61800.json`
 stay. Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining
