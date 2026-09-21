@@ -11,8 +11,10 @@ branch `feat/0.7.1-model-assistant-closeout` is
 `b6442321b77f02382b821f27dc11f397559b2be6` and must merge with or after
 that parent. `d1625aaf` amends unpublished `ddfa50f3` so prepare seals
 an owned Kubo repo root to exactly `0700`. `6144fb2a` reports hosted
-selection facts in Assistant. `ee8b8cd8` records a shadow Jev Approval
-Lens on hosted Assistant `runs_create`. `d8cd6a05` records MA1-MA4
+selection facts in Assistant. `ee8b8cd8` records a Jev Approval Lens
+skeleton on hosted Assistant `runs_create`. It writes
+`recommendation=unavailable`, `risk=unknown`, `confidence=0`, and
+`needs_human_review=true`. It does not call Jev or show Inbox. `d8cd6a05` records MA1-MA4
 installed evidence. `7c65a7ce` restores Assistant user prompt text from
 `modelText`. The sealed Linux ipfs-provider SHA-256 is still
 `8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731`. Darwin
@@ -153,7 +155,118 @@ from responsive download cancellation.
 Eight seed-only 64 KiB reads took 18.516 seconds, including 18.513 seconds inside
 the Content requests. Seed-local Kubo read the same amount in 0.04 seconds.
 This rules out the driver as the main delay; it does not identify the slow
-Runtime, Carrier or network stage. Full independent seed delivery remains open.
+Runtime, Carrier or network stage. On the installed Isolated WAN lane, dest
+copy of 8 MiB took 2.059 s and dest copy of 64 MiB took 4.524 s, both matching
+SHA-256 `e6d36653…` and `f8550531…` with UDP 55180 and zero relay addrs. A
+linear Qwen forecast from the 64 MiB sample is 415.9 s with 3184 s headroom
+inside 3600 s. Source dest-path cancel, silent-peer idle, truncated data and
+retry passed. Isolated Darwin 61953 dest-receive `elastos` SHA-256
+`79f51380…` and Isolated Linux 61954 holder `elastos` SHA-256 `cc77e402…`
+run the header-then-file dest-stream candidate. Isolated 61954 holds a
+recursive pin of Qwen CID
+`bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi` after holder
+restart. WAN dest copy of `weights.gguf` wrote 6,169,341,984 bytes in
+1092.804 s with SHA-256
+`d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43`. Isolated
+Darwin 61953 reconciled those verified bytes into inventory admission
+`2d690d11…` (6,169,366,387 bytes) on installed `elastos` SHA-256
+`d3aec5f097fb1c8b047f587fb12624e998c8e7b01eb191d2cba03a497b32553c`,
+source `9a922faa`, built `8d9b13d911ec638f…`. Marketplace `content.status`
+reports `dispatch_ready` true. The 16:32 Assistant UI Ping receipt is
+partial first-delta text (53 characters, 1508 ms). Journal run
+`run:sha256:7f792ef3…` on offer `model:00c7b9dd…` completed with 343
+characters of terminal output. Receipt
+`.audit/ma3-2-qwen-assistant-ping-journal-settlement-receipt.json`. The
+09:06 progress receipt stays transferred-bytes history. SmolLM2 admission
+`657460e0…` stays. Cold Isolated 61957 ordinary Marketplace Get `b280a1b9…`
+admitted 6,169,366,387 bytes from Isolated 61954, weights SHA-256
+`d784ce9e…` match, `dispatch_ready` true, offer `model:00c7b9dd…`. Assistant
+Ping on that copy completed with 520-character terminal output, journal
+`run:sha256:e7ad986b…`, request `3c3e05aa-5fca-4ddd-b764-bb2384957104`.
+The original 16:32 UI receipt stays partial first-delta. MA1 is Active as
+separate sub-gates. Accepted 12. Waiting 2. Needs one named proof 1.
+Receipt `.audit/ma1-acceptance-matrix-receipt.json`. Current signed
+catalogue Refresh is accepted. The successor catalogue waits on a catalog
+signing key. Cancel, retry admit, the live-window failed read, expiry
+recovery of a complete hashed stage, and interrupt restart recovery are
+accepted. Expiry recovery does not extend `created_at+3600`. Both
+acquisition orders still need one proof, and that proof needs a Qwen
+transfer this card does not start. Smol selection and the completed run
+`run:sha256:49bd09ab…` are accepted. That receipt has an empty request id.
+Stop is accepted: 61953 is honest `settlement_unknown`, and 61942 is
+confirmed completed. Coexistence removal, byte reuse, and Chosen model
+unavailable are accepted. Active-run Remove consent and local retention
+consent are accepted on disposable 61956. Global sole copy stays Waiting.
+MA2 is Partial/Waiting on DirectOnly Ask 61942 to 61680. Live prepare is
+`created_at+3600`. Recovery does not extend or close that budget.
+The completed MA4 fixture Home 61958 was removed after census. The 61956
+Ping after Cancel/Retry admit timed out and stays outside the accepted
+Smol execution clause. MA2 waits on DirectOnly Ask delivery.
+Release test `model_preparation_restart_reconciles_expired_rename_after_exact_hash`
+passed. Restart status admits an expired complete unrenamed stage after
+authority, catalogue, capacity, index, and CID/hash checks. Receipt
+`.audit/ma1-61956-expiry-parent-receipt.json`. Mac-alone
+delivery remains MA3.2 and is blocked: seed disk allows a cold consumer
+(51.44 GiB, 17.14% free, Qwen floor OK), but Mac holder 61700 has no kubo
+child and dest-stream Home 61953 presents only RFC1918 DirectOnly addrs.
+A second Mac Qwen reservation needs 63.28 GiB available; the volume has
+56.5 GiB. Receipt
+`.audit/ma3-2-mac-alone-linux-consumer-assessment-receipt.json`. Live MA4
+hosted credential is absent on 61680 and public live. The one-form System
+Models OpenRouter/Venice Settings surface is a shortcut, not the MA4 product
+boundary. Isolated Darwin 61960 proved two OpenRouter instances plus Venice on
+that instance surface. Secrets stay in Runtime files mode 0600. Share of Jev
+left DeepSeek and Venice private. Assistant selected Jev by name. Disconnect of
+DeepSeek left Jev and Venice. Restart recovered those two offers. Receipts
+`.audit/ma4-instance-pointer-ui-receipt.json` and
+`.audit/ma4-instance-installed-receipt.json`. Historical Isolated Darwin
+61958 one-form Settings fixture evidence stays on file and does not close this
+corrected boundary. Isolated Darwin 61958 overlay-matched that candidate and
+moved the live OpenRouter key into Runtime secret storage mode 0600. Offer id
+`model:openrouter` stayed. Ordinary Assistant Ping on that instance completed as
+journal `run:sha256:9c0b8c5b…` request `8cf4d28c-f123-4629-9c3a-fae0ba8afc56`.
+The Assistant composer still showed `Ask on this machine`, a Think chip, and
+`OpenRouter · cost unknown` on that Home. Isolated Darwin 61960 now shows
+placeholder Message Assistant, one user-chosen name on the trigger, and selector
+rows with a short route subtitle plus expanded facts at 1280, 768, and 390 CSS
+pixels. Receipt `.audit/ma4-composer-truth-ui-receipt.json`. DirectOnly second-Home Ask stays
+recorded once. Isolated Darwin 61960 installed this dirty candidate and
+proved ordinary Home Inbox shadow through a local Jev-compatible provider
+fixture. Pointer Approve kept the person as the authority. Venice, Alpha,
+and Beta each keep one request id for recommendation, human_decision, and
+actual_outcome. Records are mode 0600. Built unsigned elastos SHA-256
+`4cae1446…` matches installed unsigned; codesigned SHA-256 `40b75856…`.
+Receipts `.audit/ma4-61960-jev-overlay-receipt.json` and
+`.audit/ma4-61960-jev-inbox-fixture-receipt.json`. This is installed
+fixture evidence. Live TypeSafe/OpenRouter receipt and live-provider
+acceptance remain open. Auto-approve stays off. PR #69 `7285cba` is
+reconciled on this dirty tree without cherry-pick: fail-closed installer
+rules, shared Browser protocol 2.1, and sign-in wording stay, while README
+and Getting Started keep the deployed two-platform endpoint. PR #68
+`4f7d863` + `a9d0b43` stays a later presentation slice. Receipt
+`.audit/ma5-pr69-pr68-review-receipt.json`. Goal 1 classified and
+repaired the four remaining combined-candidate source-gate failures:
+stale Home-Agent vendor-ui target, stale home-agent size-0 prepare
+fixture plus Darwin rustc/cargo mocks, stale Carrier
+`elastos-identity` 0.6.0 versus workspace 0.7.0, and real clippy
+`needless_return` in `setup.rs` plus MA4 test-double tails. Receipt
+`.audit/ma5-goal1-source-gate-receipt.json`. The entropy pass kept demonstrated Home-Agent, offer-alias, secret-migration, and single-instance callers. It gitignores `/.audit/`. Receipt `.audit/ma5-entropy-receipt.json`. Full `just verify` waits. The dirty tree can be split into local commits. That split waits for an explicit request.
+Live Venice and extra
+named live Jev instances remain. Ordinary busy-Remove on Isolated
+Darwin 61956 after a product Get is proved. Pointer Get admitted `2eb4c281…` at
+144,835,448 bytes after a DirectOnly kubo pin from holder 61953. The first
+pointer Remove returned HTTP 200 and saved `withdrawal_pending` while llama
+stayed live. Repair of `content.reclaim` then returned HTTP 409 with copy Stop
+the current reply in Assistant, then try Remove again, kept that admission and
+weights SHA-256 `c4a3dd03…`, and left retirement none. After the reply ended,
+one Remove reclaimed `2eb4c281…`. Reload showed Removed from this device.
+Overlay codesigned `elastos` SHA-256 `9fa10cbb…`. `model-provider` SHA-256
+`fa851ca1…` stayed. Qwen on 61953 stayed admitted. Receipts
+`.audit/ma1-61956-ordinary-busy-remove-pointer-receipt.json` and
+`.audit/ma1-61956-ordinary-busy-remove-parent-receipt.json`. Terminal and key-file
+workarounds are rejected. Receipts
+`.audit/ma4-installed-settings-fixture-receipt.json` and
+`.audit/ma4-settings-pointer-parent-verify-receipt.json`.
 
 The installer catalogue-before-replacement repair is integrated. Publisher
 discovery reads health from one selected control coords file. Bootstrap comes
