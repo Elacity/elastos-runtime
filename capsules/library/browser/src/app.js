@@ -27,6 +27,7 @@ import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
 import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20260711d";
 import { createLibrarySelection } from "./selection.js";
+import { createLibraryThumbnails } from "./thumbnails.js";
 import {
   MUTATING_PROVIDER_OPS,
   cacheFolderListing,
@@ -245,6 +246,10 @@ import {
       perf,
       selectedObjects,
       state,
+      thumbnails: createLibraryThumbnails({
+        readObjectBlob: (uri) => downloadObjectRaw({ uri }).then((result) => result.blob),
+        root: elements.content,
+      }),
       visibleObjects,
     }));
     ({

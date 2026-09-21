@@ -9,6 +9,7 @@ import {
   isDirectory,
   visibilityContract,
 } from "./model.js";
+import { isThumbnailCandidate } from "./thumbnails.js";
 
 const LARGE_RENDER_THRESHOLD = 240;
 const INITIAL_RENDER_LIMIT = 120;
@@ -26,6 +27,7 @@ export function createLibraryRenderer({
   perf,
   selectedObjects,
   state,
+  thumbnails = null,
   visibleObjects,
 }) {
   function renderContent() {
@@ -132,6 +134,7 @@ export function createLibraryRenderer({
       cached.node.dataset.selected = isSelected(object.uri) ? "true" : "false";
       state.objectNodeCache.delete(object.uri);
       state.objectNodeCache.set(object.uri, cached);
+      if (thumbnails && isThumbnailCandidate(object)) thumbnails.observe(cached.node, object);
       return cached.node;
     }
     perf.objectNodeCacheMisses += 1;
@@ -161,6 +164,7 @@ export function createLibraryRenderer({
       ${badgesMarkup}
     `;
     state.objectNodeCache.set(object.uri, { signature, node: item });
+    if (thumbnails && isThumbnailCandidate(object)) thumbnails.observe(item, object);
     return item;
   }
 
