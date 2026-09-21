@@ -171,7 +171,7 @@ async function requestSystemWindow(entry, action, query = {}) {
     loaded = true;
   };
   frame.addEventListener("load", record.onLoad);
-  // Startup is bounded. The person's passkey decision has no Home transport timer.
+  // Startup is bounded. The person's sign-in decision has no Home transport timer.
   record.timer = window.setTimeout(() => finishSystemWindowRequest(record, false), 15000);
   probeSystemWindow(record);
   return record.promise;
