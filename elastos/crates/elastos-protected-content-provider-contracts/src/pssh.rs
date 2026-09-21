@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::media::CENC_FMP4_MEDIA_SUITE_ID_V1;
 
-/// Registered DRM System ID for `cenc:elastos-pq-hybrid-threshold-v0`.
+/// Registered DRM System ID for `cenc:elastos-pq-hybrid-threshold-v1`.
 /// UUID `b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0` · PSSH base64 `tuJU7w3FR/6U5w5y7R3HsA==`.
 pub const ELASTOS_PQ_SYSTEM_ID: [u8; 16] = [
     0xb6, 0xe2, 0x54, 0xef, 0x0d, 0xc5, 0x47, 0xfe, 0x94, 0xe7, 0x0e, 0x72, 0xed, 0x1d, 0xc7, 0xb0,
@@ -33,7 +33,7 @@ pub const ELASTOS_PQ_SYSTEM_ID: [u8; 16] = [
 pub const ELASTOS_PQ_PSSH_DATA_SCHEMA_V1: &str = "elastos.protected-content.cenc-pssh-data/v1";
 
 /// The protection scheme the system id is registered for.
-pub const ELASTOS_PQ_PROTECTION_SCHEME_V1: &str = "cenc:elastos-pq-hybrid-threshold-v0";
+pub const ELASTOS_PQ_PROTECTION_SCHEME_V1: &str = "cenc:elastos-pq-hybrid-threshold-v1";
 
 /// A `Data` payload larger than this is refused rather than parsed: the payload is
 /// a fixed set of identity fields, so anything near this size is malformed.
@@ -375,21 +375,29 @@ mod tests {
 
         // Every field is either a constant scheme name or a public identity
         // digest, so the JSON is exactly the declared field set and nothing else.
+        //
+        // The scheme name is interpolated from its constant rather than spelled
+        // out again: what this pins is the field set and their order, and a
+        // second copy of the name here would only be one more place to forget
+        // when the scheme is versioned.
         let json = String::from_utf8(value.to_json_bytes().unwrap()).unwrap();
         assert_eq!(
             json,
-            concat!(
-                r#"{"schema":"elastos.protected-content.cenc-pssh-data/v1","#,
-                r#""protection_scheme":"cenc:elastos-pq-hybrid-threshold-v0","#,
-                r#""content_encryption":"cenc-fmp4-aes128ctr/v1","#,
-                r#""key_encapsulation":"elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1","#,
-                r#""content_access_id":"55555555555555555555555555555555","#,
-                r#""custody_pool_sha256":"6161616161616161616161616161616161616161616161616161616161616161","#,
-                r#""custody_pool_bytes":512,"#,
-                r#""custody_epoch_sha256":"6262626262626262626262626262626262626262626262626262626262626262","#,
-                r#""custody_epoch_bytes":512,"#,
-                r#""custody_committee_authorization_sha256":"6363636363636363636363636363636363636363636363636363636363636363","#,
-                r#""custody_committee_authorization_bytes":512}"#,
+            format!(
+                concat!(
+                    r#"{{"schema":"elastos.protected-content.cenc-pssh-data/v1","#,
+                    r#""protection_scheme":"{scheme}","#,
+                    r#""content_encryption":"cenc-fmp4-aes128ctr/v1","#,
+                    r#""key_encapsulation":"elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1","#,
+                    r#""content_access_id":"55555555555555555555555555555555","#,
+                    r#""custody_pool_sha256":"6161616161616161616161616161616161616161616161616161616161616161","#,
+                    r#""custody_pool_bytes":512,"#,
+                    r#""custody_epoch_sha256":"6262626262626262626262626262626262626262626262626262626262626262","#,
+                    r#""custody_epoch_bytes":512,"#,
+                    r#""custody_committee_authorization_sha256":"6363636363636363636363636363636363636363636363636363636363636363","#,
+                    r#""custody_committee_authorization_bytes":512}}"#,
+                ),
+                scheme = ELASTOS_PQ_PROTECTION_SCHEME_V1,
             )
         );
     }

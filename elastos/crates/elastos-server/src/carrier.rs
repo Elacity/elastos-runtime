@@ -792,11 +792,27 @@ async fn join_gossip_topic(
         topic_name,
         bootstrap_peers.len()
     );
+    // Timed per await. This join sits on the publish critical path and has
+    // been measured taking ~44 s, which is the whole of a slow publish -- but
+    // by reading alone every await here should return promptly, since the
+    // `_no_wait` variant spawns its bootstrap. Timing each one separately is
+    // what names the one that does not, rather than inferring it from a gap
+    // between unrelated log lines.
+    let subscribe_started = std::time::Instant::now();
     let topic = state
         .gossip
         .subscribe_and_join_with_auto_discovery_no_wait(record_publisher)
         .await?;
+    let subscribe_ms = subscribe_started.elapsed().as_millis();
+    let split_started = std::time::Instant::now();
     let (sender, receiver) = topic.split().await?;
+    tracing::info!(
+        topic = %topic_name,
+        subscribe_ms,
+        split_ms = split_started.elapsed().as_millis(),
+        total_ms = subscribe_started.elapsed().as_millis(),
+        "carrier: gossip_join auto-discovery settled"
+    );
     state
         .buffers
         .lock()
@@ -2966,7 +2982,13 @@ impl CarrierAvailabilityProvider {
         let topic_name = content_availability_topic_name(cid);
         let topic_uri = content_availability_topic_uri(cid);
         let announced_at = now_secs();
+        // The lock and the join are timed apart. Both are on the publish
+        // critical path, and one global lock held across a topic join means a
+        // second publish waits for the first one's join as well as its own --
+        // a difference the total cannot show.
+        let lock_started = std::time::Instant::now();
         let mut state = self.state.lock().await;
+        let lock_wait_ms = lock_started.elapsed().as_millis();
 
         if !state.joined_topics.contains(&topic_name) {
             if state.joined_topics.len() >= MAX_TOPICS {
@@ -2975,12 +2997,29 @@ impl CarrierAvailabilityProvider {
                     "Carrier availability topic limit reached",
                 ));
             }
-            if let Err(err) = join_gossip_topic(&mut state, &topic_name, false).await {
+            let join_started = std::time::Instant::now();
+            let join_outcome = join_gossip_topic(&mut state, &topic_name, false).await;
+            tracing::info!(
+                cid = %cid,
+                lock_wait_ms,
+                join_ms = join_started.elapsed().as_millis(),
+                already_joined = false,
+                "carrier: availability announce topic ready"
+            );
+            if let Err(err) = join_outcome {
                 return Ok(carrier_availability_error(
                     "join_failed",
                     format!("Carrier availability topic join failed: {err}"),
                 ));
             }
+        } else {
+            tracing::info!(
+                cid = %cid,
+                lock_wait_ms,
+                join_ms = 0,
+                already_joined = true,
+                "carrier: availability announce topic ready"
+            );
         }
 
         let node_did = state
@@ -3150,17 +3189,37 @@ impl CarrierAvailabilityProvider {
                 .and_then(|registry| registry.upgrade())
             {
                 Some(registry) => {
+                    // Timed per candidate. This loop is sequential and carries
+                    // no overall deadline, so one unreachable peer delays every
+                    // candidate behind it and the whole publish with them --
+                    // and the total alone cannot say whether the time went to
+                    // one dead peer or was spread across all of them.
+                    let replication_started = std::time::Instant::now();
                     for candidate in remote_candidates {
                         if remote_proofs.len() >= remote_candidate_limit {
                             break;
                         }
                         attempted_remote_invocations =
                             attempted_remote_invocations.saturating_add(1);
-                        match ensure_content_via_carrier_provider_invocation(
+                        let candidate_started = std::time::Instant::now();
+                        let invocation = ensure_content_via_carrier_provider_invocation(
                             &registry, &candidate, cid, request,
                         )
-                        .await
-                        {
+                        .await;
+                        // The peer's identity is the point: "attempt 1 was
+                        // slow" says nothing if the ordering changes, and one
+                        // consistently slow peer that still SUCCEEDS keeps its
+                        // reputation and so keeps being tried first.
+                        tracing::info!(
+                            cid = %cid,
+                            attempt = attempted_remote_invocations,
+                            node_did = %candidate.node_did,
+                            reached = invocation.is_ok(),
+                            candidate_ms = candidate_started.elapsed().as_millis(),
+                            replication_ms = replication_started.elapsed().as_millis(),
+                            "carrier: availability replication candidate settled"
+                        );
+                        match invocation {
                             Ok(proof) => {
                                 self.record_peer_reputation(&candidate.node_did, true).await;
                                 remote_proofs.push(proof)
@@ -5282,8 +5341,9 @@ fn sort_replica_candidates(replicas: &mut [CarrierAvailabilityReplica]) {
 /// Operator-registered peers as replication candidates. They rank below a
 /// signed announcement of the same CID (base score 40 vs 50) so an actual
 /// holder is always preferred, carry the local reputation adjustment like
-/// every other candidate, and are skipped when the DID is this node or is
-/// already in the pool. Ticket validity is not judged here: an unreachable
+/// every other candidate, and are skipped when the DID is this node, when the
+/// peer does not host the content plane, or when it is already in the pool.
+/// Ticket validity is not judged here: an unreachable
 /// peer fails its invocation, which is recorded as a replication error and
 /// a reputation failure, exactly like a stale announcement would.
 fn append_operator_peer_store_replica_candidates(
@@ -5302,8 +5362,14 @@ fn append_operator_peer_store_replica_candidates(
     };
     for peer in &config.peers {
         let connect_ticket = peer.connect_ticket.trim();
+        // `hosts_content_storage` is the role gate: a custody-only node has no
+        // content plane worth pinning to, and making it a replica would put
+        // content availability behind the key-custody nodes. A peer that has
+        // not declared any capability is left eligible, so deployments
+        // registered before `provides` existed keep their behaviour.
         if connect_ticket.is_empty()
             || peer.did == self_did
+            || !peer.hosts_content_storage()
             || pool.iter().any(|replica| replica.node_did == peer.did)
         {
             continue;
@@ -6517,6 +6583,14 @@ fn carrier_provider_public_invoke_error(index: usize, err: &anyhow::Error) -> St
         error = %format_args!("{err:#}"),
         "Carrier provider invocation failed"
     );
+    // A peer that stopped answering reads very differently from one that
+    // refused, so keep that distinction in the caller-visible summary.
+    if let Some(timeout) = err.downcast_ref::<CarrierProviderResponseTimeout>() {
+        return format!(
+            "ticket[{index}] invoke response timed out after {}s",
+            timeout.timeout_secs
+        );
+    }
     format!("ticket[{index}] invoke failed")
 }
 
@@ -6683,6 +6757,63 @@ fn carrier_route_timeout_secs(route: &ProviderCarrierRoute) -> u64 {
     let timeout_ms = route.timeout_ms().unwrap_or(5_000).clamp(1, 60_000);
     timeout_ms.div_ceil(1_000)
 }
+
+/// Upper bound on how long a Carrier provider invocation waits for the
+/// remote's response line.
+///
+/// `carrier_route_timeout_secs` bounds only the connect leg. Without a bound
+/// on the read leg a peer that accepts the stream and never answers blocks the
+/// caller for as long as the remote takes — per candidate, sequentially — so a
+/// single wedged peer stalls the whole fan-out indefinitely.
+///
+/// 360 s is chosen to sit clear of the remote ipfs-provider's own 300 s pin
+/// ceiling: a legitimately slow pin still gets to finish and only a peer that
+/// has stopped answering trips this, at which point the candidate fails and
+/// the fan-out moves on.
+const CARRIER_PROVIDER_RESPONSE_TIMEOUT_SECS: u64 = 360;
+
+/// Env override, following the same shape as the other Carrier env knobs in
+/// this file. A value that is not a positive integer is ignored rather than
+/// obeyed, so a typo cannot silently remove the bound.
+const CARRIER_PROVIDER_RESPONSE_TIMEOUT_ENV: &str =
+    "ELASTOS_CARRIER_PROVIDER_RESPONSE_TIMEOUT_SECS";
+
+fn carrier_provider_response_timeout() -> Duration {
+    carrier_provider_response_timeout_from(
+        std::env::var(CARRIER_PROVIDER_RESPONSE_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn carrier_provider_response_timeout_from(value: Option<&str>) -> Duration {
+    let secs = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(CARRIER_PROVIDER_RESPONSE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// A provider response that never arrived. Typed so the fan-out can report
+/// "timed out" apart from a transport failure without matching on message
+/// text.
+#[derive(Debug)]
+struct CarrierProviderResponseTimeout {
+    op: String,
+    timeout_secs: u64,
+}
+
+impl std::fmt::Display for CarrierProviderResponseTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Carrier provider response timed out after {}s (op {})",
+            self.timeout_secs, self.op
+        )
+    }
+}
+
+impl std::error::Error for CarrierProviderResponseTimeout {}
 
 fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) -> bool {
     did_to_public_key(peer_did).is_some_and(|public_key| endpoint.id == public_key)
@@ -6907,7 +7038,21 @@ impl CarrierClient {
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let timeout = carrier_provider_response_timeout();
+        tokio::time::timeout(timeout, reader.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                tracing::debug!(
+                    peer = %self.conn.remote_id(),
+                    op = %invocation.op,
+                    timeout_secs = timeout.as_secs(),
+                    "Carrier provider response read timed out"
+                );
+                anyhow::Error::new(CarrierProviderResponseTimeout {
+                    op: invocation.op.clone(),
+                    timeout_secs: timeout.as_secs(),
+                })
+            })??;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         carrier_provider_invoke_result(response)
     }
@@ -8125,6 +8270,106 @@ mod tests {
     }
 
     #[test]
+    fn test_carrier_provider_response_timeout_surfaces_as_a_candidate_failure() {
+        // Exercising a real wedged socket would mean holding a stream open for
+        // the whole timeout, so this covers the construction and mapping the
+        // read path uses: the fan-out must see a named, per-ticket failure and
+        // move on to the next candidate instead of blocking.
+        let err = anyhow::Error::new(CarrierProviderResponseTimeout {
+            op: "pin".to_string(),
+            timeout_secs: 360,
+        });
+
+        assert_eq!(
+            carrier_provider_public_invoke_error(1, &err),
+            "ticket[1] invoke response timed out after 360s"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Carrier provider response timed out after 360s (op pin)"
+        );
+    }
+
+    #[test]
+    fn test_carrier_provider_response_timeout_default_clears_the_remote_pin_ceiling() {
+        // The remote ipfs-provider waits up to 300s on kubo, so the default
+        // must not cut a legitimate pin short.
+        assert_eq!(
+            carrier_provider_response_timeout_from(None),
+            Duration::from_secs(360)
+        );
+        assert!(carrier_provider_response_timeout_from(None) > Duration::from_secs(300));
+        assert_eq!(
+            carrier_provider_response_timeout_from(Some(" 30 ")),
+            Duration::from_secs(30)
+        );
+        // A typo must not remove the bound.
+        assert_eq!(
+            carrier_provider_response_timeout_from(Some("0")),
+            Duration::from_secs(360)
+        );
+        assert_eq!(
+            carrier_provider_response_timeout_from(Some("forever")),
+            Duration::from_secs(360)
+        );
+    }
+
+    #[test]
+    fn test_operator_peer_store_replica_candidates_skip_custody_only_peers() {
+        // A custody node's only role is key-share custody and release. It must
+        // never be conscripted as a content replica, or key custody becomes a
+        // content-availability failure point.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (_custody_sk, custody_did) = elastos_identity::derive_did(&[31u8; 32]);
+        let (_storage_sk, storage_did) = elastos_identity::derive_did(&[32u8; 32]);
+        let (_legacy_sk, legacy_did) = elastos_identity::derive_did(&[33u8; 32]);
+        let (_self_sk, self_did) = elastos_identity::derive_did(&[34u8; 32]);
+
+        for (did, label, provides) in [
+            (&custody_did, "custody-only", vec!["custody", "chain"]),
+            (
+                &storage_did,
+                "full-node",
+                vec!["custody", "ipfs", "availability", "chain"],
+            ),
+            (&legacy_did, "legacy", Vec::new()),
+        ] {
+            crate::operator_control::upsert_peer(
+                data_dir.path(),
+                crate::operator_control::OperatorPeer {
+                    did: did.clone(),
+                    label: label.to_string(),
+                    connect_ticket: "ticket-placeholder".to_string(),
+                    provides: provides.into_iter().map(str::to_string).collect(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let mut pool = Vec::new();
+        append_operator_peer_store_replica_candidates(
+            &mut pool,
+            data_dir.path(),
+            &self_did,
+            &HashMap::new(),
+            1_700_000_000,
+        );
+
+        let selected: Vec<&str> = pool
+            .iter()
+            .map(|replica| replica.node_did.as_str())
+            .collect();
+        assert!(!selected.contains(&custody_did.as_str()));
+        assert!(selected.contains(&storage_did.as_str()));
+        // Legacy record: capability unknown, so behaviour is unchanged.
+        assert!(selected.contains(&legacy_did.as_str()));
+        assert!(pool
+            .iter()
+            .all(|replica| replica.selection_reason.starts_with("operator_peer_store")));
+    }
+
+    #[test]
     fn test_content_availability_cid_validation_is_fail_closed() {
         assert!(validate_content_cid(
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
@@ -8978,6 +9223,7 @@ mod tests {
                 label: String::new(),
                 connect_ticket: encode_ticket_for(remote_addr.clone()),
                 allow: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -10810,6 +11056,7 @@ mod tests {
                 label: "custody-a".to_string(),
                 connect_ticket: remote_ticket.clone(),
                 allow: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -10821,6 +11068,7 @@ mod tests {
                 label: "self".to_string(),
                 connect_ticket: remote_ticket.clone(),
                 allow: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -10933,6 +11181,7 @@ mod tests {
                 label: "custody-c".to_string(),
                 connect_ticket: live_ticket.clone(),
                 allow: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();

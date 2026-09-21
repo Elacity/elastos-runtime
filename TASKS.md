@@ -119,8 +119,38 @@ review package are landed in source and recorded under Unreleased in
 Contract: [Protected content](docs/PROTECTED_CONTENT.md). What is and is not
 proven is in [state.md](state.md).
 
+Second slice, `feat/protected-content-0.7.1-followup` above `58686dd4`
+(PR [#62](https://github.com/Elacity/elastos-runtime/pull/62)), source-verified
+and not installed-proven: a mint that could not complete from the Creator now
+does. External wallets are accepted where signability, not proof type, is the
+precondition; the creator tail raises exactly one wallet effect; custody nodes
+carry `--role <storage|custody>` and a kubo peering mesh proven by block
+transfer; failures and waits answer as typed data rather than one shared
+sentence. [state.md](state.md#071-follow-up-second-slice-mint-path-repairs)
+records what is verified and what is not.
+
 Open:
 
+- [ ] Let a mint recover from a declined wallet approval. A rejected or expired
+  approval is reported accurately now instead of reading as "pending" forever,
+  but it leaves the mint at `EffectRaised`, and `discard_creator_state` refuses
+  that stage, so the object cannot be minted again. Allowing the discard means
+  asserting the raised effect is provably dead, which moves a safety guarantee
+  from the journal to its caller — an owner decision, not a repair to make in
+  passing.
+- [ ] Track the media transcode stage. Publish progress is read from the mint
+  journal now and "Publish to storage" is no longer untracked, but
+  "Transcode & fragment" still is: deriving it needs the media preparation
+  record by request id, which the creator tail does not hold.
+- [ ] Run `custody-harness-smoke` against this branch. Its path filter matches
+  the custody, proof-driver and `server_infra`/`provider_host` changes here, so
+  CI will run it; it was not run locally because it stops any live
+  `custody-host` compose project.
+- [ ] Update the installed proof driver for Base mainnet. Anders approved Base
+  mainnet for the bounded J5 acceptance journey, so
+  `scripts/protected-content-installed-e2e-proof.sh` and its receipt labels
+  need to match the chosen network, with the chain id, contract addresses and
+  RPC configuration recorded and a spending limit agreed before funded runs.
 - [ ] Prove the three journeys on an installed home with funded principals:
   Creator to Library to Player, Creator to Marketplace to Reader, and audio
   playback. None has ever been run. The deferred proofs from the object,
@@ -734,6 +764,51 @@ and applicable CI lessons. Current video uses `elacity-player`; document and
 3D viewers remain later typed-viewer work.
 
 ### Operator and audit hardening
+- [ ] Reclaim the custody shares left by mint attempts that could never finish.
+  When an attempt's content availability is never recorded, its content key
+  material does not outlive the request, so the attempt is discarded and the
+  object becomes mintable again (`discard_unfinishable_mint`). The shares
+  already provisioned on the nodes are left where they are: they seal against
+  an envelope that no longer exists and no listing will ever name them, so they
+  open nothing and nothing will ever ask for them. This is storage residue, not
+  exposure, and reclaiming it is housekeeping -- lowest priority. Doing it
+  needs a share-removal path that does not exist at any layer today
+  (`node_store.rs` exposes provision and load only), and any such path must be
+  authorized exactly as provisioning is: an unauthenticated "forget this share"
+  operation would be a destruction primitive.
+- [ ] Bound a single custody pin, and stop one slow node stalling a whole mint.
+  `LARGE_HTTP_TIMEOUT` (300s, `capsules/ipfs-provider`) is a `ureq` timeout,
+  which is per-read rather than total, so a pin that keeps trickling has no
+  upper bound at all: one was observed settling `ok=true` after 312s on
+  2026-09-17, and another ran past 240s before its node was restarted. The
+  replica fan-out is sequential, so a single slow node holds the creator at
+  "Encrypt & escrow" for as long as it likes, and pushes the publish into the
+  window where a node restart invalidates the availability receipt and
+  abandons the mint (observed twice the same day). Wanted: a real deadline for
+  one pin, a retry rather than an open-ended wait, and a concurrent fan-out so
+  one node cannot serialise the rest.
+  Lead worth following first: on 2026-09-17 three fetches across two different
+  nodes completed at 312.6s, 319.0s and 323.8s -- an 11s band just past 300s.
+  That is a fixed timeout being waited out, not variable slowness, and it is
+  not node-specific: every node that actually has to fetch pays it, while pins
+  for blocks already held locally return in 7-55ms. During the stall it held direct
+  QUIC connections to both the gateway and a node that already had the block,
+  had the CID in its wantlist, and had received zero blocks and zero bytes.
+  The same signature was then captured on a second node (custody-a) while it
+  stalled: connected to three peers holding the block, CID in its wantlist,
+  zero blocks and zero bytes received. So a node that is connected to a holder
+  and wants the block is not asking it, and only succeeds once some ~300s
+  discovery expires -- a bitswap behaviour problem, not slow transfer and not
+  missing peering. Kubo config is byte-identical across the three nodes
+  (`Routing.DelegatedRouters: auto`, same 4 `Peering` entries), so the cause is
+  runtime state rather than configuration. Note the 2026-09-15 finding that
+  kubo wants-broadcast was disabled: re-check that first. The nodes run kubo
+  0.42.0 with an empty `Bitswap` config block, so its defaults are in force,
+  and recent kubo releases added broadcast control that stops wants going to
+  every connected peer. Confirm what 0.42 defaults to and whether `Peering`
+  entries are exempt from it before changing anything else -- if peered nodes
+  are not broadcast targets, that alone explains a ~300s wait on a block a
+  directly-connected peer already holds.
 - [ ] Review the legacy-auth migration from PR15 (`0b43da8c`) as a separate
   compatibility decision. It preserves identity records but clears unchained
   audit history and starts a new chain. The current signed-checkpoint policy

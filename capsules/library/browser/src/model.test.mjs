@@ -137,3 +137,25 @@ test("Library sends protected media to the player and protected objects to the r
   );
   assert.equal(viewerForProtectedContent({}), "elacity-reader");
 });
+
+test("Library routes a minted capsule on the asset mime, not the .ddrm item", () => {
+  // A minted item is a `.ddrm` capsule: its own mime describes the capsule, so
+  // routing on it alone would send every protected film to the reader.
+  const capsule = (assetMime) => ({
+    mime: "application/json",
+    metadata: { protected_content: { asset_mime: assetMime } },
+  });
+  assert.equal(viewerForProtectedContent(capsule("video/mp4")), "elacity-player");
+  assert.equal(viewerForProtectedContent(capsule("audio/mpeg")), "elacity-player");
+  assert.equal(viewerForProtectedContent(capsule("application/pdf")), "elacity-reader");
+  // Anything published before capsules existed carries no recorded mime and
+  // must keep routing on the object's own.
+  assert.equal(
+    viewerForProtectedContent({ mime: "video/mp4", metadata: { protected_content: {} } }),
+    "elacity-player",
+  );
+  assert.equal(
+    viewerForProtectedContent({ mime: "video/mp4", metadata: { protected_content: { asset_mime: "  " } } }),
+    "elacity-player",
+  );
+});

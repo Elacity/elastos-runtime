@@ -2397,6 +2397,57 @@ fn load_profile_did_for_test(data_dir: &Path, principal_id: &str) -> String {
 }
 
 #[cfg(unix)]
+/// Every purchase written before minted copies existed spells the acquiring
+/// transaction `buy_stage` and carries no `acquisition`. Those records are on
+/// real disks, so they must keep loading, and must keep reading as bought --
+/// the field was renamed because a minted copy records its mint there, not
+/// because the old records meant anything different.
+#[test]
+fn a_purchase_written_before_minted_copies_still_loads_as_bought() {
+    let legacy = serde_json::json!({
+        "schema": super::RUNTIME_PURCHASE_SCHEMA_V1,
+        "principal_id": "person:local:legacy-buyer",
+        "profile_did": "did:key:z6MklegacybuyerprofiledidZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "mint_id": "11".repeat(32),
+        "content_id": "22".repeat(16),
+        "cid": "bafylegacycontent",
+        "listing_sha256": format!("sha256:{}", "33".repeat(32)),
+        "seller_address": "0x0000000000000000000000000000000000000011",
+        "chain_namespace": "eip155:8453",
+        "network": "base-mainnet",
+        "ledger": "0x0000000000000000000000000000000000000022",
+        "token_id": "0x77",
+        "operative": "0x00000000000000000000000000000000000000dd",
+        "price": "0x5",
+        "pay_token": "0x0000000000000000000000000000000000000000",
+        "availability_receipt_digest": format!("sha256:{}", "44".repeat(32)),
+        "account_id": "wallet-account-legacy",
+        "address": "0x00000000000000000000000000000000000000ee",
+        "buy_stage": {
+            "stage": "buy",
+            "effect_id": "runtime-effect:11111111111111111111111111111111",
+            "approval_request_id": "wallet-request:11111111111111111111111111111111",
+            "request_sha256": format!("sha256:{}", "ac".repeat(32)),
+            "chain_namespace": "eip155:8453",
+            "network": "base-mainnet",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value": "0x1",
+            "data": "0x1234",
+        },
+        "progress": { "state": "pending" },
+        "created_at": 1_700_000_000u64,
+        "updated_at": 1_700_000_000u64,
+    });
+    let decoded: super::RuntimeCustodyPurchaseRecord =
+        serde_json::from_value(legacy).expect("a legacy purchase record must still decode");
+    assert_eq!(
+        decoded.acquisition,
+        super::RuntimeCustodyAcquisitionV1::Bought
+    );
+    assert_eq!(decoded.acquisition_stage.stage, "buy");
+    assert_eq!(decoded.acquisition_stage.value, "0x1");
+}
+
 fn persist_runtime_custody_purchase_for_mint(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
@@ -2448,7 +2499,9 @@ fn persist_runtime_custody_purchase_for_mint(
         account_id: "wallet-account-alpha".to_string(),
         address: wallet_address_hex(wallet(7)),
         approval_stage: None,
-        buy_stage: RuntimeCustodyPurchaseStageRecord {
+        acquisition: super::RuntimeCustodyAcquisitionV1::Bought,
+        capsule_uri: None,
+        acquisition_stage: RuntimeCustodyPurchaseStageRecord {
             stage: "buy".to_string(),
             effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
             approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
@@ -2478,7 +2531,7 @@ fn persist_runtime_custody_purchase_for_mint(
                     observed_at: now,
                 },
                 confirmed_at: now,
-                bought_at: now,
+                acquired_at: now,
             },
         },
         created_at: now,
@@ -5481,7 +5534,9 @@ fn sample_purchase_record() -> (String, Digest32, RuntimeCustodyPurchaseRecord) 
         account_id: "wallet-account-fixture".to_string(),
         address: wallet_address_hex(wallet(7)),
         approval_stage: None,
-        buy_stage: RuntimeCustodyPurchaseStageRecord {
+        acquisition: super::RuntimeCustodyAcquisitionV1::Bought,
+        capsule_uri: None,
+        acquisition_stage: RuntimeCustodyPurchaseStageRecord {
             stage: "buy".to_string(),
             effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
             approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
@@ -5516,7 +5571,7 @@ fn sample_purchase_record() -> (String, Digest32, RuntimeCustodyPurchaseRecord) 
                     observed_at: 1,
                 },
                 confirmed_at: 1,
-                bought_at: 1,
+                acquired_at: 1,
             },
         },
         created_at: 1,
@@ -7315,8 +7370,12 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     }
     let mint_journal = RuntimeMintJournal::new(mint_root.clone());
     let custody_provisioned = mint_journal.load(mint_draft.mint_id()).unwrap();
-    assert!(custody_provisioned.any_effect_started());
     assert!(custody_provisioned.all_receipts_present());
+    assert_eq!(
+        custody_provisioned.uncertain_node_count(),
+        0,
+        "every node answered with a receipt, so none is left possibly holding a share"
+    );
     assert_eq!(custody_provisioned.accepted_orphans().len(), 3);
     let sealed_share_bytes = envelope.stored_shares()[0].canonical_bytes().unwrap();
     assert!(!any_file_contains(&mint_root, &sealed_share_bytes));
@@ -8418,6 +8477,7 @@ fn media_preparation_source_input(
     principal_id: &str,
 ) -> RuntimeCustodyLibrarySourceInput {
     RuntimeCustodyLibrarySourceInput {
+        listing: None,
         object_uri: format!(
             "{}/Documents/source.mp4",
             crate::auth::principal_localhost_root(principal_id)
@@ -8698,6 +8758,7 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
         &data_dir,
         Arc::new(ProviderRegistry::new()),
         RuntimeCustodyLibraryPublishInput {
+            listing: None,
             object_uri: "localhost://Users/test/Documents/media".to_string(),
             principal_id: "person:local:runtime-custody-missing-composition".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8752,6 +8813,7 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
         &data_dir,
         Arc::new(ProviderRegistry::new()),
         RuntimeCustodyLibraryPublishInput {
+            listing: None,
             object_uri: "localhost://Users/test/Documents/media".to_string(),
             principal_id: "person:local:runtime-custody-missing-device-key".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -8799,6 +8861,7 @@ fn library_publish_test_routes(
 fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublishInput {
     let (clear_init_segment, clear_segments) = clear_media_components(0x41);
     RuntimeCustodyLibraryPublishInput {
+        listing: None,
         object_uri: "localhost://Users/test/Documents/media".to_string(),
         principal_id: principal_id.to_string(),
         mime_type: MEDIA_MIME_TYPE_V1.to_string(),
@@ -9126,7 +9189,16 @@ async fn runtime_custody_library_publish_adopts_completed_mint_after_lost_comple
 
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_custody_library_publish_requires_reconciliation_for_partial_settled_mint() {
+/// A settled attempt that provisioned nothing durable and recorded no
+/// availability can neither be rolled forward nor adopted, and its intent
+/// settled before any draft existed. Keeping either of them makes the object
+/// permanently unmintable, because the intent's identity is the object path.
+///
+/// This attempt still fails -- there is nothing to hand back -- but it leaves
+/// nothing behind, so the creator's next attempt on that file starts from
+/// nothing rather than meeting the same wall forever. Observed on Base: a node
+/// restart mid-publish, and the file could not be minted again at all.
+async fn runtime_custody_library_publish_clears_a_partial_settled_mint_so_the_object_mints_again() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     owner_only_dir(&data_dir);
@@ -9138,23 +9210,41 @@ async fn runtime_custody_library_publish_requires_reconciliation_for_partial_set
     let error =
         publish_runtime_custody_library_object(&data_dir, Arc::new(ProviderRegistry::new()), input)
             .await
-            .expect_err(
-                "partially provisioned settled mint work must fail closed for reconciliation",
-            );
+            .expect_err("a settled attempt with nothing durable cannot be handed back");
     assert!(
         error
             .to_string()
-            .contains(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE),
+            .contains(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE),
         "{error}"
     );
 
-    let intent = runtime_mint_journal(&data_dir)
-        .load_intent(request_id)
-        .unwrap();
-    assert!(intent.protect_terminal_before_draft());
-    assert_eq!(intent.completed_mint_id(), None);
-    let record = runtime_mint_journal(&data_dir).load(mint_id).unwrap();
-    assert_eq!(record.custody_terminal(), None);
+    // Both are gone: nothing is left for the next attempt to collide with.
+    assert!(
+        runtime_mint_journal(&data_dir).load(mint_id).is_err(),
+        "the unfinishable record must be discarded"
+    );
+    assert!(
+        runtime_mint_journal(&data_dir)
+            .load_intent(request_id)
+            .is_err(),
+        "the unmintable intent must be discarded"
+    );
+
+    // The object is mintable again: the next attempt gets past the wall that
+    // used to be permanent, and fails for want of providers instead.
+    let retried = publish_runtime_custody_library_object(
+        &data_dir,
+        Arc::new(ProviderRegistry::new()),
+        library_publish_test_input("person:local:runtime-custody-partial-settled"),
+    )
+    .await
+    .expect_err("no providers are registered, so the fresh attempt still cannot finish");
+    assert!(
+        !retried
+            .to_string()
+            .contains(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE),
+        "a cleared object must no longer abort before it starts: {retried}"
+    );
 }
 
 #[cfg(unix)]
@@ -9305,6 +9395,7 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
     )
     .unwrap();
     let source = RuntimeCustodyLibrarySourceInput {
+        listing: None,
         object_uri: retry_object_uri.clone(),
         principal_id: retry_principal.to_string(),
         source_file_path: source_file_path.clone(),
@@ -14375,4 +14466,94 @@ fn object_chunk_admission_bounds_the_request_by_the_chunk_count() {
         .is_err());
     // A previously released chunk is still refused by the ordering rule.
     assert!(record.require_object_chunk_index(0, CHUNK_COUNT).is_err());
+}
+
+/// The two codes the custody capsule emits only from paths that precede its
+/// durable write. Everything else — `backend_unavailable` above all, which the
+/// capsule returns both for a refusal before the write and for a failure after
+/// it — must stay uncertain.
+#[test]
+fn custody_refusal_codes_claim_no_effect_only_where_the_capsule_proves_it() {
+    for code in ["invalid_request", "provisioning_refused", "rights_denied"] {
+        assert_eq!(
+            super::classify_custody_failure(
+                "provision_node_share",
+                &super::ProviderInvocationFailure::Refused {
+                    code: code.to_string(),
+                    message: "refused".to_string(),
+                },
+            ),
+            RuntimeProviderCallError::RefusedWithoutEffect,
+            "{code} is emitted only before the durable write"
+        );
+    }
+    for code in ["backend_unavailable", "invalid_config", "unknown", ""] {
+        // `backend_unavailable` is the one that matters here: the capsule
+        // returns it both for a refusal before the write and for a failure
+        // after it.
+        assert_eq!(
+            super::classify_custody_failure(
+                "provision_node_share",
+                &super::ProviderInvocationFailure::Refused {
+                    code: code.to_string(),
+                    message: "refused".to_string(),
+                },
+            ),
+            RuntimeProviderCallError::NoExactResult,
+            "{code} spans acted and did-not-act paths"
+        );
+    }
+}
+
+/// A reply that never arrived is not a node that never acted: the capsule can
+/// complete its write and then fail to answer.
+#[test]
+fn a_missing_or_malformed_custody_reply_is_effect_uncertain() {
+    assert_eq!(
+        super::classify_custody_failure(
+            "provision_node_share",
+            &super::ProviderInvocationFailure::NotCompleted {
+                detail: "transport closed".to_string(),
+            },
+        ),
+        RuntimeProviderCallError::NoExactResult
+    );
+    assert_eq!(
+        super::classify_custody_failure(
+            "provision_node_share",
+            &super::ProviderInvocationFailure::MalformedResponse {
+                detail: "custody provider provision_node_share response is missing status"
+                    .to_string(),
+            },
+        ),
+        RuntimeProviderCallError::NoExactResult
+    );
+}
+
+/// Widening the typed layer must not change a single message the
+/// string-returning callers have always produced.
+#[test]
+fn classified_failures_format_exactly_as_before() {
+    assert_eq!(
+        super::ProviderInvocationFailure::NotCompleted {
+            detail: "boom".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share invocation failed: boom"
+    );
+    assert_eq!(
+        super::ProviderInvocationFailure::Refused {
+            code: "rights_denied".to_string(),
+            message: "no".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share rejected the request: rights_denied: no"
+    );
+    assert_eq!(
+        super::ProviderInvocationFailure::MalformedResponse {
+            detail: "custody provider provision_node_share response is missing data".to_string(),
+        }
+        .into_message("custody", "provision_node_share"),
+        "custody provider provision_node_share response is missing data"
+    );
 }

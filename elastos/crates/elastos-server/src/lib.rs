@@ -51,6 +51,7 @@ pub mod notifications;
 pub mod operator_control;
 pub mod ownership;
 pub mod protected_content_config;
+pub(crate) mod protected_content_elacity_metadata;
 pub mod protected_content_runtime;
 pub mod provider_resource;
 pub mod resource_bridge;

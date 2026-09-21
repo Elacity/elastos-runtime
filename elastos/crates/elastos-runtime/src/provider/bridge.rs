@@ -18,6 +18,10 @@ use super::registry::{
 
 /// Timeout for provider requests (30 seconds)
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Above this, a provider call is slow enough to be worth a DEBUG line even
+/// when it succeeded: it is the kind of thing someone asking "where did the
+/// time go" needs, and it is rare enough not to drown the log.
+const SLOW_PROVIDER_REQUEST_MS: u64 = 1_000;
 /// How often a still-pending raw provider request is named at warn.
 const PENDING_REQUEST_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -418,11 +422,27 @@ impl ProviderBridge {
                 }
             });
             let mut io = io.lock().await;
-            tracing::debug!(
-                op = %op,
-                lock_wait_ms = started.elapsed().as_millis() as u64,
-                "provider request sent"
-            );
+            // Give frequent polling operations their own filter without hiding
+            // mint diagnostics or the long-wait warnings above.
+            let polling = matches!(op.as_str(), "events" | "wallet_contract");
+            // TRACE: everything this line carries, the settled line below
+            // repeats with the outcome and the duration attached. Two lines per
+            // request doubles the cost of every polled wait and tells a reader
+            // nothing the second line does not.
+            if polling {
+                tracing::trace!(
+                    target: "elastos_runtime::provider::bridge::polling",
+                    op = %op,
+                    lock_wait_ms = started.elapsed().as_millis() as u64,
+                    "provider request sent"
+                );
+            } else {
+                tracing::trace!(
+                    op = %op,
+                    lock_wait_ms = started.elapsed().as_millis() as u64,
+                    "provider request sent"
+                );
+            }
             let result: Result<String, BridgeError> = async {
                 io.writer
                     .write_all(json.as_bytes())
@@ -444,12 +464,31 @@ impl ProviderBridge {
             }
             .await;
             let _ = stop_tx.send(());
-            tracing::debug!(
-                op = %op,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                ok = result.is_ok(),
-                "provider request settled"
-            );
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let ok = result.is_ok();
+            // A request that succeeded quickly is noise. The long waits here
+            // are polled, so the same op settles every few seconds for minutes
+            // and buries the calls that happened once. Worth DEBUG is a call
+            // that failed, or one slow enough to explain where the time went --
+            // which is exactly what a reader chasing a stalled mint is looking
+            // for. The rest stays at TRACE for whoever wants the transcript.
+            let noteworthy = !ok || elapsed_ms >= SLOW_PROVIDER_REQUEST_MS;
+            match (polling, noteworthy) {
+                (true, true) => tracing::debug!(
+                    target: "elastos_runtime::provider::bridge::polling",
+                    op = %op, elapsed_ms, ok, "provider request settled"
+                ),
+                (true, false) => tracing::trace!(
+                    target: "elastos_runtime::provider::bridge::polling",
+                    op = %op, elapsed_ms, ok, "provider request settled"
+                ),
+                (false, true) => {
+                    tracing::debug!(op = %op, elapsed_ms, ok, "provider request settled");
+                }
+                (false, false) => {
+                    tracing::trace!(op = %op, elapsed_ms, ok, "provider request settled");
+                }
+            }
             result
         })
         .await
