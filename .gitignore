@@ -76,6 +76,9 @@ __pycache__/
 
 # --- Operator-local / internal tooling (not part of public runtime) ---
 
+# Private operator evidence receipts
+/.audit/
+
 # Fabro workflow orchestrator (internal ops)
 fabro/
 fabro.toml
