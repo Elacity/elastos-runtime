@@ -13,6 +13,21 @@ const EXIT_SERVICE_KIND = "remote_exit";
 const BROWSER_ENGINE_SERVICE_KIND = "browser_engine";
 const MODEL_SERVICE_KIND = "remote_model";
 const CONFIGURED_REMOTE_EXIT_SOURCE = "configured_remote_exit";
+const HOSTED_SHARE_SOURCE = "hosted_connection";
+const HOSTED_SHARE_TERMS_BY_PROCESSOR = {
+  OpenRouter: {
+    ack: "openrouter-5.1-5.2+model",
+    label: "I accept OpenRouter Terms 5.1-5.2 and the selected model terms. This Home pays. OpenRouter receives prompts.",
+  },
+  Venice: {
+    ack: "venice-7.3+model",
+    label: "I accept Venice TOS 7.3 End User API terms for this model. Section 7.1 is personal use and is not a Share grant. This Home pays. Venice receives prompts.",
+  },
+};
+const HOSTED_SHARE_TERMS = {
+  "model:openrouter": HOSTED_SHARE_TERMS_BY_PROCESSOR.OpenRouter,
+  "model:venice": HOSTED_SHARE_TERMS_BY_PROCESSOR.Venice,
+};
 const VISIBLE_SERVICE_KINDS = new Set([BROWSER_ENGINE_SERVICE_KIND, MODEL_SERVICE_KIND, EXIT_SERVICE_KIND]);
 const SERVICE_KIND_COPY = {
   [BROWSER_ENGINE_SERVICE_KIND]: {
@@ -31,8 +46,8 @@ const SERVICE_KIND_COPY = {
     noun: "AI model",
     mineTitle: { shared: "My AI model is shared", private: "Share my AI model" },
     mineCopy: {
-      shared: "People you trust can run your local AI model after you approve each request. The model and every run stay on this device; hosted models stay private.",
-      private: "Let People you trust run your local AI model. Access stays under your approval and you can revoke it.",
+      shared: "People you trust can run your local AI model after you approve each request. The model and every run stay on this device.",
+      private: "Let People you trust run your local AI model. Access stays under your approval and you can revoke it. Hosted connections stay private until you enable Share for that provider and model after the terms check.",
     },
     consumer: "Assistant",
     otherFallback: "this person's AI model",
@@ -216,15 +231,20 @@ function renderServiceCard(offer, source, selected) {
           ${readOnly ? '<span class="status-badge" data-tone="ok">Managed by config</span>' : ""}
         </div>
       </div>
-      ${pending ? renderInlineConfirmation(primaryAction) : ""}
+      ${pending ? renderInlineConfirmation(primaryAction, offer, nextSelected === "true") : ""}
     </article>
   `;
 }
 
-function renderInlineConfirmation(actionLabel) {
+function renderInlineConfirmation(actionLabel, offer, enabling) {
+  const terms = hostedShareTerms(offer);
+  const termsBlock = enabling && terms
+    ? `<label class="service-terms"><input type="checkbox" data-service-terms-ack="${escapeHtml(terms.ack)}"> ${escapeHtml(terms.label)}</label>`
+    : "";
   return `
     <div class="service-confirm" role="alert">
-      <p>${escapeHtml(confirmMessage(actionLabel))}</p>
+      <p>${escapeHtml(confirmMessage(actionLabel, enabling && !!terms))}</p>
+      ${termsBlock}
       <div class="service-confirm-actions">
         <button class="pc2-btn" type="button" data-confirm-service-action="cancel">Cancel</button>
         <button class="pc2-btn pc2-btn-danger" type="button" data-confirm-service-action="apply">${escapeHtml(actionLabel)}</button>
@@ -233,7 +253,10 @@ function renderInlineConfirmation(actionLabel) {
   `;
 }
 
-function confirmMessage(actionLabel) {
+function confirmMessage(actionLabel, hostedTerms) {
+  if (hostedTerms) {
+    return "Share this hosted model after you accept the named terms for this provider and model?";
+  }
   return actionLabel === "Stop sharing"
     ? "Stop sharing this Service?"
     : "Remove this Service from your subscriptions?";
@@ -244,7 +267,8 @@ async function handleServiceOfferAction(button) {
     return;
   }
   const selected = button.dataset.serviceSelected === "true";
-  if (!selected) {
+  const offerId = readText(button.dataset.serviceOfferId);
+  if (!selected || hostedShareTerms(offerId) || hostedShareTerms(findServiceOffer(offerId))) {
     requestServiceActionConfirmation(button);
     return;
   }
@@ -261,7 +285,7 @@ function requestServiceActionConfirmation(button) {
   pendingServiceAction = {
     offerId,
     section,
-    selected: false,
+    selected: button.dataset.serviceSelected === "true",
   };
   renderServices(currentServices);
   showStatus("Confirm the change in the Service card.", "muted");
@@ -279,6 +303,15 @@ async function handlePendingServiceAction(button) {
     return;
   }
   const pending = pendingServiceAction;
+  const terms = hostedShareTerms(pending.offerId) || hostedShareTerms(findServiceOffer(pending.offerId));
+  if (pending.selected && terms) {
+    const checked = button.closest(".service-confirm")?.querySelector("[data-service-terms-ack]");
+    if (!(checked instanceof HTMLInputElement) || !checked.checked) {
+      showStatus("Accept the named terms for this provider and model before Share.", "error");
+      return;
+    }
+    pending.termsAck = readText(checked.getAttribute("data-service-terms-ack")) || terms.ack;
+  }
   pendingServiceAction = null;
   await setServiceOfferSelection(pending);
 }
@@ -287,6 +320,7 @@ async function setServiceOfferSelection(button) {
   const offerId = readText(button?.dataset?.serviceOfferId || button?.offerId);
   const section = readText(button?.dataset?.serviceSection || button?.section);
   const selected = button?.dataset?.serviceSelected === "true" || button?.selected === true;
+  const termsAck = readText(button?.termsAck);
   if (!offerId || !section) {
     throw new Error("This service could not be selected. Refresh and try again.");
   }
@@ -296,10 +330,14 @@ async function setServiceOfferSelection(button) {
   }
   showStatus(selectionProgressMessage(section, selected), "muted");
   try {
+    const payload = { offer_id: offerId, section, selected };
+    if (selected && termsAck) {
+      payload.terms_ack = termsAck;
+    }
     const services = await fetchJson("/api/apps/services/offers", {
       method: "POST",
       headers: shellHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ offer_id: offerId, section, selected }),
+      body: JSON.stringify(payload),
     });
     renderServices(services);
     showStatus(selectionDoneMessage(section, selected), "ok");
@@ -337,6 +375,10 @@ function serviceKindCopy(offer) {
 
 function serviceTitle(offer, source, selected) {
   const copy = serviceKindCopy(offer);
+  if (source === "mine" && isHostedShareOffer(offer)) {
+    const name = readText(offer?.display_name) || copy.noun;
+    return selected ? `${name} is shared` : `Share ${name}`;
+  }
   if (source === "mine") {
     return selected ? copy.mineTitle.shared : copy.mineTitle.private;
   }
@@ -345,6 +387,15 @@ function serviceTitle(offer, source, selected) {
 
 function serviceCopy(offer, source, selected) {
   const copy = serviceKindCopy(offer);
+  if (source === "mine" && isHostedShareOffer(offer)) {
+    const policy = readText(offer?.policy_summary);
+    if (policy) {
+      return policy;
+    }
+    return selected
+      ? "People you trust can run this hosted model after you approve each request. This Home pays. The external processor receives prompts."
+      : "Hosted connections stay private until you enable Share for this provider and model after the terms check. This Home pays. The external processor receives prompts.";
+  }
   if (source === "mine") {
     return selected ? copy.mineCopy.shared : copy.mineCopy.private;
   }
@@ -448,6 +499,44 @@ function serviceStatusTone(offer, source) {
     return serviceRequestStatus(offer) === "approved" ? "ok" : "warn";
   }
   return "muted";
+}
+
+function isHostedShareOffer(offer) {
+  return readText(offer?.source) === HOSTED_SHARE_SOURCE || Boolean(hostedShareTerms(offer));
+}
+
+function hostedShareTerms(offerOrId) {
+  if (typeof offerOrId === "string") {
+    if (HOSTED_SHARE_TERMS[offerOrId]) {
+      return HOSTED_SHARE_TERMS[offerOrId];
+    }
+    offerOrId = findServiceOffer(offerOrId);
+    if (!offerOrId) {
+      return null;
+    }
+  }
+  const id = readText(offerOrId?.offer_id);
+  const processor = readText(offerOrId?.provider_label);
+  return HOSTED_SHARE_TERMS[id] || HOSTED_SHARE_TERMS_BY_PROCESSOR[processor] || null;
+}
+
+function findServiceOffer(offerId) {
+  const id = readText(offerId);
+  if (!id || !currentServices) {
+    return null;
+  }
+  const lists = [
+    currentServices.local_offers,
+    currentServices.available_local_offers,
+    currentServices.remote_offers,
+    currentServices.available_remote_offers,
+  ];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    const found = list.find((offer) => readText(offer?.offer_id) === id);
+    if (found) return found;
+  }
+  return null;
 }
 
 function isReadOnlyServiceOffer(offer) {

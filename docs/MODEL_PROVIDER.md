@@ -37,7 +37,7 @@ placement are independent:
 | Backend | Same-Runtime use | Granted cross-Runtime use |
 | --- | --- | --- |
 | Local engine | Operator-configured local inference | Share the selected local capability after remote acceptance |
-| Hosted API | Operator-configured hosted inference | Share after remote acceptance and upstream terms, privacy, and cost review |
+| Hosted API | Home owner creates named hosted instances on the model-provider capsule. Default is private. | Owner-funded share after explicit Share, grant, and exact-model terms check |
 
 Both consumption paths use the existing model operations and service-offer
 contract. Carrier admits the `model` target through the destination Runtime's
@@ -209,17 +209,60 @@ Hosted gateways such as OpenRouter and local engines such as llama.cpp or
 Ollama are provider implementations, not architecture. Their model identifiers
 and availability can change independently of ElastOS.
 
-Operators select a model or routing policy from the provider's catalog.
-That configuration stays behind the provider boundary. Product UI should
-show the requested selector, resolved model when known, and whether explicit
-fallback was enabled. Canonical architecture documents do not freeze a
-commercial model name or claim that a catalog entry will remain available.
+The owner of this Home enters hosted credentials in Home Settings. Assistant
+and Marketplace open that Settings tab. The Home stores the key in the
+existing owner-only model-provider config. After an explicit run, the
+selected hosted processor receives the prompt. Product UI names the Home
+that stores the key, the processor that receives prompts, the requested
+selector, the resolved model when known, and whether explicit fallback is
+enabled. Assistant keeps one model selector. The composer placeholder is
+Message Assistant. The trigger shows the user-chosen instance name. Each
+selector row shows that name and a short route subtitle. Expanded detail
+names the processor, prompt destination, payer, limits, privacy, and
+availability. Cost appears in a completed run receipt when the backend
+reports it. The UI never shows the secret.
+
+Runtime validates the credential separately from a consented paid test.
+Validate uses the pinned public HTTPS hosts when the Home has no owner-scoped
+`providers/model-provider/validate-fixtures.json`. That file, when present,
+may bind validate HTTP only to `http://127.0.0.1` with an explicit port.
+Save stays private and publishes no service offer. A later Share action uses
+existing Marketplace, Services, grants, Carrier routing, and run journals.
+Services summary reports `share_enabled` on hosted cards. That field matches
+the stored share state. The key stays on the provider Home. Consumers see the
+intermediary Home, the selected upstream processor (OpenRouter or Venice), and
+the payer. One
+connection budget covers that provider's private and shared offers, including
+unresolved spend. Provider-side key and account caps cover activity outside
+this Runtime. Qualify the exact model and provider terms before Share.
+OpenRouter Terms 5.1–5.2 and Venice TOS 7.3 End User API terms are starting
+points, not blanket model qualification. Catalogues, browser persistence,
+logs, and API responses omit keys and private URLs. The product surface is
+the generic model-provider capsule with repeatable owner-bound instances.
+Each instance has a stable offer identity, display name, adapter, selected
+model, Runtime secret reference, privacy and share policy, limits, and
+lifecycle. One Home can keep several instances of the same provider, for
+example Jev via OpenRouter, private DeepSeek via OpenRouter, and shared
+Venice. Private is the default. Changing or disconnecting one instance leaves
+the others. Existing `model:openrouter` and `model:venice` offers migrate into
+named instances without losing secrets.
+
+The on-disk operator form remains `providers/model-provider/config.json` with
+mode 0600 under parent mode 0700. Secrets live in Runtime-owned secret
+storage beside that provider root. That file is the provider boundary, not a
+user-facing editor. Terminal, JSON, and key-file workarounds are not the
+product path. System supplies generic installed-capsule and secret
+management. The capsule UI is Add hosted model, Name, Provider, API key,
+Model, Test, and Save, then Use in Assistant, Share as service, Replace key,
+and Disconnect.
+
+Canonical architecture documents do not freeze a commercial model name or
+claim that a catalog entry will remain available.
 
 Hosted configuration records privacy policy, cost and rate limits, requested
 selector, resolved model when the backend reports it, and explicit fallback
-policy. Credentials start in the current owner-only provider config. Secret
-indirection can use an existing secure service when one is available; it does
-not require a new secret store.
+policy. The secret stays in Runtime-owned storage on the provider Home. It
+does not enter catalogues, offers, logs, or a consumer Home.
 
 ## Local content selection and retention
 
@@ -298,15 +341,26 @@ pass installed lifecycle tests before it can be shared:
    the model provider owns start, health, limits, streaming, cancellation,
    shutdown, restart, and orphan cleanup. Consider MLX only if the common
    engine path proves insufficient.
-3. Prove hosted inference locally. Use the current OpenAI-compatible Chat
-   Completions seam where it conforms for OpenRouter, Venice, and xAI/Grok.
-   Prove the existing provider-internal OpenAI Responses API adapter separately.
+3. Deliver owner-bound hosted instances through the existing model-provider
+   capsule and the OpenAI-compatible Chat Completions seam. OpenRouter and
+   Venice remain required adapters. A user can create several named instances
+   of the same provider. Use the seam only where official docs confirm the
+   request. Private setup publishes no offer.
+   Prove a live authorized private hosted run for each provider after the
+   owner enters that provider's key in Home. Prove the existing
+   provider-internal OpenAI Responses API adapter separately. xAI/Grok stays
+   later.
 4. Prove optional sharing of the accepted Mac local model with another Runtime.
-   This requires signed offer and grant admission plus bounded Carrier ingress;
-   hosted credentials and a Jetson deployment are separate acceptance tracks.
-5. Prove hosted sharing only after upstream terms and resale policy permit it,
-   with owner-enforced cost and rate limits. Later, prove a full destination
-   Runtime on Jetson before considering a smaller provider host.
+   This requires signed offer and grant admission plus bounded Carrier ingress.
+   A Jetson deployment is a separate acceptance track.
+5. After each private connection exists, add an explicit owner-funded Share of
+   that exact provider and model through existing Services and Marketplace.
+   Qualify OpenRouter Terms 5.1–5.2 or Venice TOS 7.3, plus the selected model
+   terms, before Share. Keep one connection budget across that provider's
+   private and shared offers, with per-consumer limits. Commercial billing,
+   staking, and wider providers stay Later. Later, prove a full destination
+   Runtime on Jetson. Jev stays on TypeSafe/OpenRouter until a separate proof
+   shows it on another processor.
 
 Installed acceptance covers Brave inference, ordered streaming, reconnect,
 cancellation, one terminal result, restart, engine crash and orphan cleanup,

@@ -306,6 +306,8 @@ pub(super) struct ServicesOfferUpdateRequest {
     offer_id: String,
     section: String,
     selected: bool,
+    #[serde(default)]
+    terms_ack: Option<String>,
 }
 
 enum ServicesPeerTransportBlocking {
@@ -2080,7 +2082,15 @@ pub(super) async fn services_offer_update(
                 {
                     anyhow::bail!("service offer is not available in Mine");
                 }
-                if req.selected {
+                if crate::api::operator_has_hosted_offer(&data_dir, offer_id) {
+                    require_admin_principal(&data_dir, &context)?;
+                    crate::api::set_hosted_offer_share(
+                        &data_dir,
+                        offer_id,
+                        req.selected,
+                        req.terms_ack.as_deref(),
+                    )?;
+                } else if req.selected {
                     services_state.local_offer_ids.insert(offer_id.to_string());
                 } else {
                     services_state.local_offer_ids.remove(offer_id);
@@ -2476,6 +2486,19 @@ fn home_services_local_model_shared(
         .contains(super::MODEL_LOCAL_OFFER))
 }
 
+pub(in crate::api::gateway) fn local_model_offer_is_shared(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+) -> bool {
+    let context = HomeLaunchTokenContext {
+        principal_id: principal_id.to_string(),
+        session_id: String::new(),
+        proof_binding_id: None,
+        grant_id: String::new(),
+    };
+    home_services_local_model_shared(data_dir, &context).unwrap_or(false)
+}
+
 fn home_services_local_engine_shared(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -2497,7 +2520,8 @@ fn home_services_request_shared(
     } else if request.service_kind == super::MODEL_SERVICE_KIND
         && request.service_uri == super::MODEL_SERVICE_URI
     {
-        home_services_local_model_shared(data_dir, context)
+        Ok(home_services_local_model_shared(data_dir, context)?
+            || crate::api::any_hosted_model_shared(data_dir))
     } else if request.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
         && request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
     {
@@ -3602,7 +3626,8 @@ pub(crate) fn authorize_home_service_model(
                     && record.status == "approved"
                     && record.service_uri == super::MODEL_SERVICE_URI
                     && record.service_kind == super::MODEL_SERVICE_KIND
-                    && home_services_local_model_shared(data_dir, &context)?,
+                    && (home_services_local_model_shared(data_dir, &context)?
+                        || crate::api::any_hosted_model_shared(data_dir)),
                 "model grant is not active"
             );
             let profile = load_profile_authority_for_context(data_dir, &context)?
@@ -3944,7 +3969,7 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
     } else if kind == super::MODEL_SERVICE_KIND && uri == super::MODEL_SERVICE_URI {
         (
             "AI model",
-            "Approval lets their Assistant run your shared local model through your Runtime. Your Runtime decides every request and keeps hosted models private.",
+            "Approval lets their Assistant run a shared model through your Runtime. Your Runtime decides every request. Hosted connections stay private until you enable Share for that provider and model.",
         )
     } else {
         (
@@ -4194,6 +4219,34 @@ fn home_services_record_access_decision(
     })
 }
 
+fn require_admin_principal(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<()> {
+    let Some(proof_binding_id) = context.proof_binding_id.as_deref() else {
+        anyhow::bail!("admin passkey required");
+    };
+    let principal = crate::auth::load_principal_for_proof_binding(data_dir, proof_binding_id)?;
+    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
+    if !crate::auth::is_admin(&principal) {
+        anyhow::bail!("admin passkey required");
+    }
+    Ok(())
+}
+
+fn apply_hosted_share_selection(data_dir: &std::path::Path, selected: &mut BTreeSet<String>) {
+    let Ok(cards) = crate::api::hosted_model_share_cards(data_dir) else {
+        return;
+    };
+    for card in cards {
+        if card.share_enabled {
+            selected.insert(card.offer_id);
+        } else {
+            selected.remove(&card.offer_id);
+        }
+    }
+}
+
 fn apply_home_services_selection(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -4203,8 +4256,10 @@ fn apply_home_services_selection(
     let local_offers = std::mem::take(&mut services.local_offers);
     let remote_offers = std::mem::take(&mut services.remote_offers);
 
+    let mut local_selected = state.local_offer_ids.clone();
+    apply_hosted_share_selection(data_dir, &mut local_selected);
     let (local_offers, available_local_offers) =
-        partition_service_offers(local_offers, &state.local_offer_ids);
+        partition_service_offers(local_offers, &local_selected);
     let (mut remote_offers, available_remote_offers) =
         partition_service_offers(remote_offers, &state.remote_offer_ids);
     let now = now_ts();

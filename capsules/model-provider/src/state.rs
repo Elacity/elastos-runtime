@@ -3,7 +3,7 @@ use crate::adapters::{
     DispatchResult, ReconcileResult, WorkerApplyGuard,
 };
 use crate::config::{
-    journal_root, BridgeProviderConfig, ConfiguredOffer, ProviderInitExtra,
+    journal_root, AdapterConfig, BridgeProviderConfig, ConfiguredOffer, ProviderInitExtra,
     MAX_RUN_EVENTS_PAGE_BYTES_LIMIT, MAX_RUN_EVENTS_PAGE_COUNT_LIMIT,
     MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT, MAX_RUN_EVENT_COUNT_LIMIT,
 };
@@ -29,6 +29,69 @@ pub(crate) struct ConfigRefresh {
     config: BridgeProviderConfig,
     offers: BTreeMap<String, ConfiguredOffer>,
     pub(crate) retire_offer: Option<String>,
+}
+
+const HOME_OWNED_HOSTED_CHAT_URLS: &[&str] = &[
+    "https://openrouter.ai/api/v1/chat/completions",
+    "https://api.venice.ai/api/v1/chat/completions",
+];
+
+fn is_home_owned_hosted_offer(offer: &ConfiguredOffer) -> bool {
+    let AdapterConfig::OpenAiCompatibleText { api_url, .. } = &offer.adapter else {
+        return false;
+    };
+    HOME_OWNED_HOSTED_CHAT_URLS.contains(&api_url.as_str())
+}
+
+fn home_owned_hosted_key_model_replace(old: &ConfiguredOffer, proposed: &ConfiguredOffer) -> bool {
+    if !is_home_owned_hosted_offer(old)
+        || !is_home_owned_hosted_offer(proposed)
+        || old.id != proposed.id
+    {
+        return false;
+    }
+    let mut proposed = proposed.clone();
+    match (&old.adapter, &mut proposed.adapter) {
+        (
+            AdapterConfig::OpenAiCompatibleText {
+                api_key,
+                model,
+                hosted,
+                ..
+            },
+            AdapterConfig::OpenAiCompatibleText {
+                api_key: next_key,
+                model: next_model,
+                hosted: next_hosted,
+                ..
+            },
+        ) => {
+            *next_key = api_key.clone();
+            *next_model = model.clone();
+            next_hosted.model_privacy = hosted.model_privacy.clone();
+        }
+        _ => return false,
+    }
+    proposed.title = old.title.clone();
+    &proposed == old
+}
+
+fn offer_has_unresolved_activity<A: AdapterExecutor>(
+    state: &ModelProviderState<A>,
+    offer_id: &str,
+    extra: &ProviderInitExtra,
+    retained_workers: &[String],
+) -> Result<bool, ProviderFault> {
+    let runs = state.journal.scan_runs()?;
+    Ok(runs.iter().any(|(_, run)| {
+        run.offer.id == offer_id
+            && (!run.status.is_terminal()
+                || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown))
+    }) || retained_workers.iter().any(|worker| {
+        runs.iter()
+            .find(|(_, run)| run.run_id == *worker)
+            .is_none_or(|(_, run)| run.offer.id == offer_id)
+    }))
 }
 
 impl<A: AdapterExecutor> ModelProviderState<A> {
@@ -82,7 +145,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
     /// any exact engine. Configuration and journal ownership remain unchanged.
     pub(crate) fn plan_refresh(
         &self,
-        config: BridgeProviderConfig,
+        mut config: BridgeProviderConfig,
         execution_owned: bool,
         retained_workers: &[String],
     ) -> Result<ConfigRefresh, ProviderFault> {
@@ -100,10 +163,12 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         if let Some(value) = old_identity.as_object_mut() {
             let _ = value.remove("offers");
             let _ = value.remove("runtime_admitted_offers");
+            let _ = value.remove("owner_reclaim");
         }
         if let Some(value) = new_identity.as_object_mut() {
             let _ = value.remove("offers");
             let _ = value.remove("runtime_admitted_offers");
+            let _ = value.remove("owner_reclaim");
         }
         if old_identity != new_identity {
             return Err(ProviderFault::invalid_request(
@@ -132,17 +197,25 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .collect();
         let offers: BTreeMap<_, _> = extra
             .offers
-            .into_iter()
-            .map(|o| (o.id.clone(), o))
+            .iter()
+            .map(|o| (o.id.clone(), o.clone()))
             .collect();
         let mut retired = Vec::new();
         for old in &previous.offers {
             if let Some(proposed) = offers.get(&old.id) {
-                if proposed != old
+                let hosted_replace = home_owned_hosted_key_model_replace(old, proposed);
+                if (proposed != old && !hosted_replace)
                     || admissions.get(old.id.as_str()) != old_admissions.get(old.id.as_str())
                 {
                     return Err(ProviderFault::invalid_request(
                         "existing model offers changed",
+                    ));
+                }
+                if hosted_replace
+                    && offer_has_unresolved_activity(self, &old.id, &extra, retained_workers)?
+                {
+                    return Err(ProviderFault::selection_unavailable(
+                        "model retirement pending",
                     ));
                 }
                 // A failed close disabled this exact offer. Only the same
@@ -154,6 +227,12 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 }
             } else if old_admissions.contains_key(old.id.as_str()) {
                 retired.push(old.id.clone());
+            } else if is_home_owned_hosted_offer(old) {
+                if offer_has_unresolved_activity(self, &old.id, &extra, retained_workers)? {
+                    return Err(ProviderFault::selection_unavailable(
+                        "model retirement pending",
+                    ));
+                }
             } else {
                 return Err(ProviderFault::invalid_request(
                     "existing model offers changed",
@@ -171,7 +250,8 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             let runs = self.journal.scan_runs()?;
             if runs.iter().any(|(_, run)| {
                 run.offer.id == *id
-                    && (!run.status.is_terminal() || run.status == RunStatus::SettlementUnknown)
+                    && (!run.status.is_terminal()
+                        || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown))
             }) || retained_workers.iter().any(|worker| {
                 runs.iter()
                     .find(|(_, run)| run.run_id == *worker)
@@ -184,12 +264,19 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         } else if addition
             && (execution_owned
                 || self.journal.scan_runs()?.iter().any(|(_, r)| {
-                    !r.status.is_terminal() || r.status == RunStatus::SettlementUnknown
+                    !r.status.is_terminal()
+                        || (r.status == RunStatus::SettlementUnknown
+                            && self.offers.contains_key(&r.offer.id))
                 }))
         {
             return Err(ProviderFault::selection_unavailable(
                 "model activation pending",
             ));
+        }
+        if extra.owner_reclaim {
+            if let Some(value) = config.extra.as_object_mut() {
+                let _ = value.remove("owner_reclaim");
+            }
         }
         Ok(ConfigRefresh {
             config,
@@ -758,7 +845,7 @@ fn require_retained_run_bindings(
     offers: &BTreeMap<String, ConfiguredOffer>,
 ) -> Result<(), ProviderFault> {
     for (_, run) in journal.scan_runs()? {
-        if !run.status.is_terminal() || run.status == RunStatus::SettlementUnknown {
+        if !run.status.is_terminal() {
             let offer = offers.get(&run.offer.id).ok_or_else(|| {
                 ProviderFault::selection_unavailable("retained model binding unavailable")
             })?;
@@ -770,6 +857,18 @@ fn require_retained_run_bindings(
                 return Err(ProviderFault::selection_unavailable(
                     "retained model binding changed",
                 ));
+            }
+        } else if run.status == RunStatus::SettlementUnknown {
+            if let Some(offer) = offers.get(&run.offer.id) {
+                if offer
+                    .execution_binding_hash()
+                    .map_err(|_| ProviderFault::invalid_request("invalid model binding"))?
+                    != run.execution_binding_hash
+                {
+                    return Err(ProviderFault::selection_unavailable(
+                        "retained model binding changed",
+                    ));
+                }
             }
         }
     }
@@ -1716,10 +1815,125 @@ mod tests {
         assert!(ModelProviderState::from_init(drift, adapters.clone()).is_err());
         let mut missing = same.clone();
         missing.extra["offers"] = json!([]);
-        assert!(ModelProviderState::from_init(missing, adapters.clone()).is_err());
+        ModelProviderState::from_init(missing, adapters.clone()).unwrap();
         restarted.plan_refresh(same, false, &[]).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+    }
+
+    fn home_owned_hosted_offer(id: &str, api_url: &str, api_key: &str) -> ConfiguredOffer {
+        let mut hosted = offer(id);
+        hosted.title = id.to_string();
+        hosted.adapter = AdapterConfig::OpenAiCompatibleText {
+            api_url: api_url.to_string(),
+            api_key: Some(api_key.to_string()),
+            model: "fixture/model".to_string(),
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        hosted
+    }
+
+    #[test]
+    fn home_owned_hosted_replace_and_disconnect_succeed_when_idle() {
+        let root = temp_root("hosted-home-owned");
+        let openrouter = home_owned_hosted_offer(
+            "model:openrouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "sk-or-fixture-valid",
+        );
+        let venice = home_owned_hosted_offer(
+            "model:venice",
+            "https://api.venice.ai/api/v1/chat/completions",
+            "sk-vnz-fixture-valid",
+        );
+        let operator = offer("operator");
+        let mut state = init_state(
+            &root,
+            vec![openrouter.clone(), venice.clone(), operator.clone()],
+            FakeAdapters::default(),
+        );
+        let mut replaced_venice = venice.clone();
+        if let AdapterConfig::OpenAiCompatibleText {
+            api_key,
+            model,
+            hosted,
+            ..
+        } = &mut replaced_venice.adapter
+        {
+            *api_key = Some("sk-vnz-fixture-replaced".to_string());
+            *model = "fixture/replaced".to_string();
+            hosted.model_privacy = "private".to_string();
+        }
+        let mut replaced_config = state.config.clone();
+        replaced_config.extra["offers"] =
+            json!([openrouter.clone(), replaced_venice, operator.clone()]);
+        state
+            .plan_refresh(replaced_config, false, &[])
+            .expect("idle Venice replace");
+        let mut disconnected_venice = state.config.clone();
+        disconnected_venice.extra["offers"] = json!([openrouter.clone(), operator.clone()]);
+        state
+            .plan_refresh(disconnected_venice, false, &[])
+            .expect("idle Venice disconnect");
+        let mut replaced_openrouter = openrouter.clone();
+        if let AdapterConfig::OpenAiCompatibleText { api_key, model, .. } =
+            &mut replaced_openrouter.adapter
+        {
+            *api_key = Some("sk-or-fixture-replaced".to_string());
+            *model = "fixture/replaced".to_string();
+        }
+        let mut replaced_openrouter_config = state.config.clone();
+        replaced_openrouter_config.extra["offers"] =
+            json!([replaced_openrouter, venice.clone(), operator.clone()]);
+        state
+            .plan_refresh(replaced_openrouter_config, false, &[])
+            .expect("idle OpenRouter replace");
+        let mut disconnected_openrouter = state.config.clone();
+        disconnected_openrouter.extra["offers"] = json!([venice.clone(), operator.clone()]);
+        state
+            .plan_refresh(disconnected_openrouter, false, &[])
+            .expect("idle OpenRouter disconnect");
+        let mut mutated_operator = state.config.clone();
+        mutated_operator.extra["offers"][2]["title"] = json!("changed operator");
+        assert!(state.plan_refresh(mutated_operator, false, &[]).is_err());
+        let hosted_a = home_owned_hosted_offer(
+            "model:hosted-0123456789abcdef0123456789abcdef",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "sk-or-instance-a",
+        );
+        let hosted_b = home_owned_hosted_offer(
+            "model:hosted-fedcba9876543210fedcba9876543210",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "sk-or-instance-b",
+        );
+        let mut two_instances = state.config.clone();
+        two_instances.extra["offers"] = json!([
+            hosted_a.clone(),
+            hosted_b.clone(),
+            venice.clone(),
+            operator.clone()
+        ]);
+        let refresh = state
+            .plan_refresh(two_instances, false, &[])
+            .expect("idle same-provider hosted instances");
+        state.apply_refresh(refresh);
+        let mut renamed = hosted_a.clone();
+        renamed.title = "Jev".to_string();
+        let mut renamed_config = state.config.clone();
+        renamed_config.extra["offers"] = json!([
+            renamed.clone(),
+            hosted_b.clone(),
+            venice.clone(),
+            operator.clone()
+        ]);
+        state
+            .plan_refresh(renamed_config, false, &[])
+            .expect("idle hosted instance rename");
+        let mut drop_b = state.config.clone();
+        drop_b.extra["offers"] = json!([renamed, venice, operator]);
+        state
+            .plan_refresh(drop_b, false, &[])
+            .expect("idle hosted instance disconnect");
     }
 
     #[cfg(unix)]
@@ -1880,7 +2094,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         state.journal.prune_expired_terminal_runs().unwrap();
         assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
-        assert!(ModelProviderState::from_init(desired.clone(), FakeAdapters::default()).is_err());
+        ModelProviderState::from_init(desired.clone(), FakeAdapters::default()).unwrap();
         state =
             ModelProviderState::from_init(state.config.clone(), FakeAdapters::default()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -1900,6 +2114,58 @@ mod tests {
             .plan_refresh(desired.clone(), false, &["missing-worker-record".into()])
             .is_err());
         assert!(state.plan_refresh(desired, false, &[]).is_ok());
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_reclaim_withdraws_settlement_unknown_without_retained_worker() {
+        let mut state = retirement_state();
+        let mut desired = withdrawal(&state);
+        desired.extra["owner_reclaim"] = json!(true);
+        let local = state.offers["admitted"].clone();
+        let binding = create_binding(
+            "request:owner-reclaim-unknown",
+            &local.id,
+            &json!({"prompt": "x"}),
+        );
+        let mut run = prepared_run_for_offer(binding, &local, now_ms());
+        transition_terminal(
+            &local,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&run).unwrap();
+        assert_eq!(
+            match state.plan_refresh(withdrawal(&state), false, &[]) {
+                Err(error) => error.code(),
+                Ok(_) => panic!("capacity withdrawal ignored settlement_unknown"),
+            },
+            "selection_unavailable"
+        );
+        assert_eq!(
+            match state.plan_refresh(desired.clone(), false, &[run.run_id.clone()]) {
+                Err(error) => error.code(),
+                Ok(_) => panic!("owner reclaim ignored retained worker"),
+            },
+            "selection_unavailable"
+        );
+        let refresh = state.plan_refresh(desired, false, &[]).unwrap();
+        assert_eq!(refresh.retire_offer.as_deref(), Some(local.id.as_str()));
+        assert!(refresh.config.extra.get("owner_reclaim").is_none());
+        state.apply_refresh(refresh);
+        let mut restored = state.config.clone();
+        restored.extra["offers"] = json!([local.clone(), state.offers["operator"].clone()]);
+        restored.extra["runtime_admitted_offers"] = json!([{"offer_id": local.id}]);
+        let restored_refresh = state.plan_refresh(restored, false, &[]).unwrap();
+        assert!(restored_refresh.retire_offer.is_none());
         assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
     }
 

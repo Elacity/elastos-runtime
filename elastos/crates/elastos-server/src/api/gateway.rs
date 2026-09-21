@@ -64,6 +64,8 @@ mod gateway_home_agent;
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
 mod gateway_home_system;
+#[path = "gateway_home_system_ai_provider.rs"]
+mod gateway_home_system_ai_provider;
 #[path = "gateway_home_terminal.rs"]
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
@@ -151,6 +153,13 @@ pub(super) use gateway_home_token::{
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
+};
+
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(super) use gateway_home_system_ai_provider::{
+    clear_hosted_ai_validate_doubles, install_openrouter_models_double,
+    install_venice_validate_double, OpenRouterModelsDouble, VeniceAuthDouble,
 };
 
 #[cfg(test)]
@@ -761,6 +770,20 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/access/guest-registration",
             post(system_guest_registration_update),
+        )
+        .route(
+            "/api/apps/system/ai-provider",
+            get(gateway_home_system_ai_provider::system_ai_provider_get)
+                .post(gateway_home_system_ai_provider::system_ai_provider_save)
+                .delete(gateway_home_system_ai_provider::system_ai_provider_delete),
+        )
+        .route(
+            "/api/apps/system/ai-provider/validate",
+            post(gateway_home_system_ai_provider::system_ai_provider_validate),
+        )
+        .route(
+            "/api/apps/system/ai-provider/share",
+            post(gateway_home_system_ai_provider::system_ai_provider_share),
         )
         .route(
             "/api/apps/system/wallet/approvals",
@@ -1464,6 +1487,9 @@ fn system_error_response(err: anyhow::Error) -> Response {
     if let Some(text) = gateway_home_system::home_appearance_preference_request_message(&err) {
         return (StatusCode::BAD_REQUEST, text.to_string()).into_response();
     }
+    if let Some(text) = gateway_home_system_ai_provider::ai_provider_request_message(&err) {
+        return (StatusCode::BAD_REQUEST, text.to_string()).into_response();
+    }
     let text = err.to_string();
     let status = if text.contains("home launch token")
         || text.contains("admin passkey required")
@@ -1484,6 +1510,8 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("WalletConnect connector")
         || text.contains("approval method")
         || text.contains("built-in wallet request")
+        || text.contains("share terms")
+        || text.contains("hosted connection is required")
     {
         StatusCode::BAD_REQUEST
     } else {
@@ -1501,6 +1529,12 @@ fn home_error_response(err: anyhow::Error) -> Response {
         .unwrap_or_else(|| err.to_string());
     if text.contains("home launch token") || text.contains("gateway identity") {
         return (StatusCode::FORBIDDEN, text).into_response();
+    }
+    if text.contains("admin passkey required") {
+        return (StatusCode::FORBIDDEN, text).into_response();
+    }
+    if text.contains("share terms") || text.contains("hosted connection is required") {
+        return (StatusCode::BAD_REQUEST, text).into_response();
     }
     if profile_required.is_some() {
         return (StatusCode::CONFLICT, text).into_response();

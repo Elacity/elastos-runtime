@@ -1106,6 +1106,7 @@ pub(super) fn home_service_offers_for_people_contact(
             grant_scope: "chat_room_contact".to_string(),
             capsule_contract: "chat-room -> Home launch grant -> room.access -> conversation provider".to_string(),
             source: "people_contact".to_string(),
+            share_enabled: None,
             runtime_contract: None,
             contact_id: Some(contact.contact_id.clone()),
             capsule_hint: Some(CHAT_ROOM_CAPSULE_ID.to_string()),
@@ -1127,6 +1128,7 @@ pub(super) fn home_service_offers_for_people_contact(
         grant_scope: "principal_scoped_remote_exit_grant".to_string(),
         capsule_contract: "browser -> runtime capability -> remote Exit grant -> provider".to_string(),
         source: "people_contact".to_string(),
+        share_enabled: None,
         runtime_contract: None,
         contact_id: Some(contact.contact_id.clone()),
         capsule_hint: Some("browser".to_string()),
@@ -1144,7 +1146,7 @@ pub(super) fn home_service_offers_for_people_contact(
         status: "requestable".to_string(), enabled: false, grant_required: true,
         grant_scope: crate::carrier::browser_engine_binding::EXECUTION_SCOPE.to_string(),
         capsule_contract: "browser -> Runtime service grant -> owner-bound Engine page".to_string(),
-        source: "people_contact".to_string(), runtime_contract: None,
+        source: "people_contact".to_string(), share_enabled: None, runtime_contract: None,
         contact_id: Some(contact.contact_id.clone()), capsule_hint: Some("browser".to_string()), route: None,
     });
     offers.push(HomeServiceOfferSummary {
@@ -1155,13 +1157,14 @@ pub(super) fn home_service_offers_for_people_contact(
         display_name: format!("{}'s AI model", contact.display_name),
         provider_uri: Some("elastos://model/*".to_string()),
         provider_label: "Remote model".to_string(),
-        policy_summary: "Ask this person to run their local AI model for you. Their Runtime keeps the model and decides every request; your conversation stays on your Home.".to_string(),
+        policy_summary: "Ask this person to run a shared AI model for you. Their Runtime keeps the keys and decides every request; your conversation stays on your Home.".to_string(),
         status: "requestable".to_string(),
         enabled: false,
         grant_required: true,
         grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
         capsule_contract: "assistant -> Runtime service grant -> owner-bound model run".to_string(),
         source: "people_contact".to_string(),
+        share_enabled: None,
         runtime_contract: None,
         contact_id: Some(contact.contact_id.clone()),
         capsule_hint: Some("assistant".to_string()),
@@ -1241,6 +1244,7 @@ fn home_configured_remote_exit_offer(
         grant_scope: "installed_remote_carrier_exit_grant".to_string(),
         capsule_contract: "browser -> runtime capability -> installed remote Exit grant -> provider".to_string(),
         source: "configured_remote_exit".to_string(),
+        share_enabled: None,
         runtime_contract: None,
         contact_id: None,
         capsule_hint: Some("browser".to_string()),
@@ -1428,6 +1432,7 @@ fn home_local_service_offers(
         grant_scope: "room.access".to_string(),
         capsule_contract: "chat-room -> room.access -> conversation provider".to_string(),
         source: "local_runtime".to_string(),
+        share_enabled: None,
         runtime_contract: None,
         contact_id: None,
         capsule_hint: Some(CHAT_ROOM_CAPSULE_ID.to_string()),
@@ -1449,6 +1454,7 @@ fn home_local_service_offers(
             grant_scope: "principal_scoped_exit_grant".to_string(),
             capsule_contract: "browser -> net capability -> exit grant -> Exit provider".to_string(),
             source: "local_provider".to_string(),
+            share_enabled: None,
             runtime_contract: None,
             contact_id: None,
             capsule_hint: Some("browser".to_string()),
@@ -1482,6 +1488,7 @@ fn home_local_service_offers(
             capsule_contract: "browser -> browser-engine capability -> Browser Engine Adapter"
                 .to_string(),
             source: "local_provider".to_string(),
+            share_enabled: None,
             runtime_contract: Some(runtime_contract),
             contact_id: None,
             capsule_hint: Some("browser".to_string()),
@@ -1497,18 +1504,53 @@ fn home_local_service_offers(
             display_name: "AI model".to_string(),
             provider_uri: Some("elastos://model/*".to_string()),
             provider_label: "Model provider".to_string(),
-            policy_summary: "Share your local AI model with accepted contacts. Each request needs your approval in Inbox; hosted models stay private; this Runtime decides every run and can revoke access.".to_string(),
+            policy_summary: "Share your local AI model with accepted contacts. Each request needs your approval in Inbox. Hosted connections stay private until you enable Share for that provider and model after the terms check. This Runtime decides every run and can revoke access.".to_string(),
             status: "configured".to_string(),
             enabled: true,
             grant_required: true,
             grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
             capsule_contract: "assistant -> model capability -> model provider".to_string(),
             source: "local_provider".to_string(),
+            share_enabled: None,
             runtime_contract: None,
             contact_id: None,
             capsule_hint: Some("assistant".to_string()),
             route: Some("/apps/assistant/".to_string()),
         });
+    }
+    if let Ok(cards) = crate::api::hosted_model_share_cards(data_dir) {
+        for card in cards {
+            let status = if card.share_enabled {
+                "configured"
+            } else {
+                "available"
+            };
+            offers.push(HomeServiceOfferSummary {
+                schema: "elastos.service.offer/v1".to_string(),
+                offer_id: card.offer_id,
+                service_uri: super::MODEL_SERVICE_URI.to_string(),
+                service_kind: super::MODEL_SERVICE_KIND.to_string(),
+                display_name: if card.name.is_empty() {
+                    format!("{} {}", card.processor, card.model)
+                } else {
+                    card.name
+                },
+                provider_uri: Some("elastos://model/*".to_string()),
+                provider_label: card.processor,
+                policy_summary: card.terms_summary,
+                status: status.to_string(),
+                enabled: true,
+                grant_required: true,
+                grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
+                capsule_contract: "assistant -> model capability -> model provider".to_string(),
+                source: "hosted_connection".to_string(),
+                share_enabled: Some(card.share_enabled),
+                runtime_contract: None,
+                contact_id: None,
+                capsule_hint: Some("assistant".to_string()),
+                route: Some("/apps/assistant/".to_string()),
+            });
+        }
     }
     if data_dir.join("bin/ipfs-provider").is_file() {
         offers.push(HomeServiceOfferSummary {
@@ -1526,6 +1568,7 @@ fn home_local_service_offers(
             grant_scope: "principal_scoped_content_grant".to_string(),
             capsule_contract: "capsule -> content capability -> availability provider -> ipfs-provider".to_string(),
             source: "local_provider".to_string(),
+            share_enabled: None,
             runtime_contract: None,
             contact_id: None,
             capsule_hint: Some(LIBRARY_CAPSULE_ID.to_string()),
@@ -1548,6 +1591,7 @@ fn home_local_service_offers(
             grant_scope: "principal_scoped_object_grant".to_string(),
             capsule_contract: "capsule -> object capability -> Object provider".to_string(),
             source: "local_provider".to_string(),
+            share_enabled: None,
             runtime_contract: None,
             contact_id: None,
             capsule_hint: Some(LIBRARY_CAPSULE_ID.to_string()),
@@ -1570,6 +1614,7 @@ fn home_local_service_offers(
             grant_scope: "principal_scoped_webspace_grant".to_string(),
             capsule_contract: "capsule -> publish capability -> Webspace provider".to_string(),
             source: "local_provider".to_string(),
+            share_enabled: None,
             runtime_contract: None,
             contact_id: None,
             capsule_hint: None,

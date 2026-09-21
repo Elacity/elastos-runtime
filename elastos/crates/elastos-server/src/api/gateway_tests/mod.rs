@@ -1,3 +1,7 @@
+pub(super) use super::gateway_home_system_ai_provider::{
+    clear_hosted_ai_validate_doubles, install_openrouter_models_double,
+    install_venice_validate_double, OpenRouterModelsDouble, VeniceAuthDouble,
+};
 use super::*;
 use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
 use axum::body::Body;

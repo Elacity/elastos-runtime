@@ -193,6 +193,8 @@ struct HomeServiceOfferSummary {
     capsule_contract: String,
     source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    share_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_contract: Option<HomeServiceRuntimeContractSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     contact_id: Option<String>,

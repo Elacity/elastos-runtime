@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-20260819f">
+<link rel="stylesheet" href="./style.css?v=system-20260921a">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -298,6 +298,38 @@
 
         <section class="settings-content" data-settings="models" aria-labelledby="models-title">
           <h1 id="models-title">Models</h1>
+          <section class="pc2-section" data-ai-provider aria-labelledby="ai-provider-title">
+            <h2 id="ai-provider-title" class="pc2-section-title">Hosted models</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <p class="pc2-card-sublabel">This Home stores the key.</p>
+                <p class="pc2-card-sublabel">The selected processor receives prompts outside this Home.</p>
+                <p class="pc2-card-sublabel" data-ai-provider-venice-fact hidden>This Home owns the system prompt for Venice.</p>
+                <p class="pc2-card-value system-status" data-field="ai-provider-state" aria-live="polite"></p>
+                <p class="pc2-card-value system-status" data-field="ai-provider-privacy" hidden></p>
+                <div id="ai-provider-instances" class="ai-provider-instances"></div>
+                <button id="ai-provider-add" class="pc2-btn" type="button">Add hosted model</button>
+                <div id="ai-provider-form" class="ai-provider-form" hidden>
+                  <label class="pc2-card-label" for="ai-provider-name">Name</label>
+                  <input id="ai-provider-name" class="pc2-input" type="text" autocomplete="off" spellcheck="false" aria-label="Hosted model name">
+                  <label class="pc2-card-label" for="ai-provider-kind">Hosted by</label>
+                  <select id="ai-provider-kind" class="pc2-input" aria-label="Hosted by">
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="venice">Venice</option>
+                  </select>
+                  <label class="pc2-card-label" for="ai-provider-key" data-ai-provider-key-label>API key</label>
+                  <input id="ai-provider-key" class="pc2-input" type="password" autocomplete="off" spellcheck="false" aria-label="API key">
+                  <label class="pc2-card-label" for="ai-provider-model">Model</label>
+                  <select id="ai-provider-model" class="pc2-input" aria-label="Selected model"></select>
+                  <div class="system-inline-row">
+                    <button id="ai-provider-validate" class="pc2-btn pc2-btn-secondary" type="button">Test</button>
+                    <button id="ai-provider-save" class="pc2-btn" type="button">Save</button>
+                    <button id="ai-provider-cancel" class="pc2-btn pc2-btn-secondary" type="button">Cancel</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
           <div data-model-management hidden></div>
         </section>
         <section class="settings-content" data-settings="catalog" aria-labelledby="catalog-title">
@@ -425,6 +457,6 @@
       });
     })();
   </script>
-  <script type="module" src="./system.js?v=system-20260819f"></script>
+  <script type="module" src="./system.js?v=system-20260921a"></script>
 </body>
 </html>

@@ -126,6 +126,28 @@ impl AdapterFault {
         }
     }
 
+    pub fn authentication(message: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            error: RunError {
+                class: ErrorClass::AuthenticationRejected,
+                code: "authentication_rejected".to_string(),
+                message: message.to_string(),
+            },
+            detail: Some(bound_detail(detail.into())),
+        }
+    }
+
+    pub fn rate_limited(message: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            error: RunError {
+                class: ErrorClass::RateLimited,
+                code: "rate_limited".to_string(),
+                message: message.to_string(),
+            },
+            detail: Some(bound_detail(detail.into())),
+        }
+    }
+
     pub fn log(&self) {
         if let Some(detail) = &self.detail {
             eprintln!("[model-provider] adapter {}: {}", self.error.code, detail);
@@ -1374,10 +1396,7 @@ async fn run_http_artifact_create_worker_inner(
     };
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_backend_http_status(response.status()));
     }
     let value = read_bounded_json_response_async(response).await?;
     let job_id = value.get("job_id").and_then(Value::as_str).ok_or_else(|| {
@@ -1434,10 +1453,7 @@ async fn run_http_artifact_status_worker_inner(
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_backend_http_status(response.status()));
     }
     let value = read_bounded_json_response_async(response).await?;
     parse_http_job_status_result(value, offer, state, poll_interval_ms)
@@ -1522,10 +1538,7 @@ async fn run_local_text_worker_inner(
         response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_backend_http_status(response.status()));
     }
 
     let mut response = response;
@@ -1697,6 +1710,11 @@ fn text_generation_request_body(
     if let Some(enable_thinking) = enable_thinking {
         body["chat_template_kwargs"] = json!({
             "enable_thinking": enable_thinking,
+        });
+    }
+    if offer.id == "model:venice" {
+        body["venice_parameters"] = json!({
+            "include_venice_system_prompt": false,
         });
     }
     body
@@ -2083,6 +2101,18 @@ fn map_reqwest_failure(err: reqwest::Error) -> AdapterFault {
     )
 }
 
+fn map_backend_http_status(status: reqwest::StatusCode) -> AdapterFault {
+    let code = status.as_u16();
+    let detail = format!("unexpected backend status {code}");
+    match code {
+        401 | 403 => AdapterFault::authentication("model backend rejected authentication", detail),
+        408 | 504 => AdapterFault::timeout("model backend timed out", detail),
+        429 => AdapterFault::rate_limited("model backend rate limited the request", detail),
+        400 | 413 | 422 => AdapterFault::context("model backend rejected the request", detail),
+        _ => AdapterFault::backend_failed("model backend failed", detail),
+    }
+}
+
 async fn read_bounded_json_response_async(
     mut response: reqwest::Response,
 ) -> std::result::Result<Value, AdapterFault> {
@@ -2257,10 +2287,7 @@ async fn run_http_artifact_cancel_worker_inner(
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_backend_http_status(response.status()));
     }
     if response.status() != reqwest::StatusCode::NO_CONTENT {
         let _ = read_bounded_json_response_async(response).await?;
@@ -3106,6 +3133,14 @@ mod tests {
                 "chat_template_kwargs": { "enable_thinking": false },
             })
         );
+        let mut venice = openai_offer("https://api.venice.ai/api/v1/chat/completions");
+        venice.id = "model:venice".to_string();
+        let venice_body = text_generation_request_body(&venice, "hosted", "hello", None);
+        assert_eq!(
+            venice_body["venice_parameters"],
+            json!({ "include_venice_system_prompt": false })
+        );
+        assert!(hosted.get("venice_parameters").is_none());
         assert_eq!(
             responses,
             json!({
@@ -3123,6 +3158,143 @@ mod tests {
         offer.policy.inline_output_bytes_limit = 4_096;
         assert_eq!(text_generation_max_tokens(&offer), 1_024);
         assert_ne!(text_generation_max_tokens(&offer), first);
+    }
+
+    #[test]
+    fn map_backend_http_status_classifies_hosted_failures() {
+        let cases = [
+            (
+                401,
+                ErrorClass::AuthenticationRejected,
+                "authentication_rejected",
+            ),
+            (
+                403,
+                ErrorClass::AuthenticationRejected,
+                "authentication_rejected",
+            ),
+            (408, ErrorClass::BackendTimeout, "backend_timeout"),
+            (429, ErrorClass::RateLimited, "rate_limited"),
+            (400, ErrorClass::ContextRejected, "context_rejected"),
+            (413, ErrorClass::ContextRejected, "context_rejected"),
+            (422, ErrorClass::ContextRejected, "context_rejected"),
+            (504, ErrorClass::BackendTimeout, "backend_timeout"),
+            (500, ErrorClass::BackendFailed, "backend_failed"),
+        ];
+        for (code, class, error_code) in cases {
+            let fault =
+                map_backend_http_status(reqwest::StatusCode::from_u16(code).expect("test status"));
+            assert_eq!(fault.error.class, class, "status {code}");
+            assert_eq!(fault.error.code, error_code, "status {code}");
+            assert_eq!(
+                fault.detail.as_deref(),
+                Some(format!("unexpected backend status {code}").as_str()),
+                "status {code}"
+            );
+        }
+    }
+
+    fn hosted_openai_status_fault(status_line: &'static str) -> AdapterFault {
+        let server = start_server(vec![HttpResponseSpec {
+            status_line,
+            body: br#"{"error":{"message":"fixture-denied-body"}}"#.to_vec(),
+            headers: Vec::new(),
+        }]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            run_id: "run-hosted-status".to_string(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
+            offer: openai_offer(&format!("{}/chat", server.base_url)),
+            deadline_ms: now_ms().saturating_add(30_000),
+            prompt: "hello".to_string(),
+            cancel_rx,
+            updates: update_tx,
+        };
+        let fault = runtime
+            .block_on(run_local_text_worker_inner(&mut task))
+            .unwrap_err();
+        assert!(update_rx.try_recv().is_err());
+        let encoded = format!("{fault:?}");
+        assert!(
+            !encoded.contains("fixture-denied-body"),
+            "hosted fault must omit backend body"
+        );
+        assert!(
+            !encoded.contains("secret"),
+            "hosted fault must omit the configured credential"
+        );
+        fault
+    }
+
+    #[test]
+    fn hosted_openai_compatible_401_is_authentication_rejected() {
+        let fault = hosted_openai_status_fault("401 Unauthorized");
+        assert_eq!(fault.error.class, ErrorClass::AuthenticationRejected);
+        assert_eq!(fault.error.code, "authentication_rejected");
+    }
+
+    #[test]
+    fn hosted_openai_compatible_429_is_rate_limited() {
+        let fault = hosted_openai_status_fault("429 Too Many Requests");
+        assert_eq!(fault.error.class, ErrorClass::RateLimited);
+        assert_eq!(fault.error.code, "rate_limited");
+    }
+
+    #[test]
+    fn hosted_openai_compatible_400_is_context_rejected() {
+        let fault = hosted_openai_status_fault("400 Bad Request");
+        assert_eq!(fault.error.class, ErrorClass::ContextRejected);
+        assert_eq!(fault.error.code, "context_rejected");
+    }
+
+    #[test]
+    fn hosted_openai_compatible_deadline_is_backend_timeout() {
+        let server = start_server_with_first_byte_delay(
+            vec![HttpResponseSpec {
+                status_line: "200 OK",
+                body: sse_body(&[], true),
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            }],
+            Duration::from_millis(1_200),
+        );
+        let mut offer = openai_offer(&format!("{}/chat", server.base_url));
+        offer.policy.runtime_ms_limit = 200;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            run_id: "run-hosted-timeout".to_string(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
+            offer,
+            deadline_ms: now_ms().saturating_add(200),
+            prompt: "hello".to_string(),
+            cancel_rx,
+            updates: update_tx,
+        };
+        let fault = runtime
+            .block_on(run_local_text_worker_inner(&mut task))
+            .unwrap_err();
+        assert_eq!(fault.error.class, ErrorClass::BackendTimeout);
+        assert_eq!(fault.error.code, "backend_timeout");
+        assert!(update_rx.try_recv().is_err());
     }
 
     #[test]

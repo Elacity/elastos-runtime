@@ -101,6 +101,10 @@ pub struct ProviderInitExtra {
     pub offers: Vec<ConfiguredOffer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_admitted_offers: Vec<RuntimeAdmittedOffer>,
+    /// One-shot owner Remove. Runtime sets this on Init so an unresolved Stop
+    /// journal does not pin the exact admission.
+    #[serde(default)]
+    pub owner_reclaim: bool,
 }
 
 /// Private Init provenance projected by Runtime from its verified inventory.
@@ -185,6 +189,8 @@ pub struct HostedDisclosureConfig {
     pub privacy_policy_ref: String,
     pub terms_ref: String,
     pub upstream_routing_fallback_assertion: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_privacy: String,
 }
 
 impl HostedDisclosureConfig {
@@ -213,6 +219,13 @@ impl HostedDisclosureConfig {
                 "hosted upstream_routing_fallback_assertion must be operator_asserted_disabled"
             );
         }
+        if !self.model_privacy.is_empty() {
+            validate_bounded_trimmed(
+                &self.model_privacy,
+                "hosted model_privacy",
+                MAX_HOSTED_PROVIDER_LABEL_BYTES,
+            )?;
+        }
         Ok(())
     }
 
@@ -239,6 +252,7 @@ pub(crate) fn test_hosted_disclosure() -> HostedDisclosureConfig {
         terms_ref: "fixture:terms:v1".to_string(),
         upstream_routing_fallback_assertion: UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
             .to_string(),
+        model_privacy: String::new(),
     }
 }
 
@@ -915,6 +929,7 @@ mod tests {
         fs::set_permissions(&model, fs::Permissions::from_mode(0o600)).unwrap();
         let extra = ProviderInitExtra {
             runtime_admitted_offers: Vec::new(),
+            owner_reclaim: false,
             provider_id: Some("model-provider".to_string()),
             journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
             offers: vec![local_llama_offer(&engine, &model)],
@@ -1014,6 +1029,7 @@ mod tests {
     fn adapter_config_rejects_unsafe_urls_and_secret_length() {
         let config = ProviderInitExtra {
             runtime_admitted_offers: Vec::new(),
+            owner_reclaim: false,
             provider_id: None,
             journal_dir: Some("/tmp/model-provider".to_string()),
             offers: vec![ConfiguredOffer {

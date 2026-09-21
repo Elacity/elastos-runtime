@@ -3,8 +3,10 @@
 //! A seed Runtime routes typed model operations over Carrier `provider_invoke`
 //! with target `model`. This Runtime owns the decision. It verifies the grant
 //! from the source endpoint key, rewrites the request into a destination-owned
-//! binding, filters offers to local engines, calls its own model provider, and
-//! records every run it created for that grant so revocation can find them.
+//! binding, filters offers to shared local engines and hosted offers the owner
+//! enabled for Share, calls its own model provider, and records every run it
+//! created for that grant so revocation can find them. Unshared hosted
+//! connections stay private.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -629,8 +631,8 @@ fn remote_context(record_principal: &str, grant_id: &str) -> HomeLaunchTokenCont
     }
 }
 
-/// Local engine offers are the shareable set. Hosted adapters stay private to
-/// this Runtime's owner.
+/// Local engine offers are shareable. A hosted offer is shareable only after
+/// the owner enables Share on that connection.
 fn shareable_offers(result: &Value) -> Vec<Value> {
     result
         .pointer("/data/offers")
@@ -639,11 +641,102 @@ fn shareable_offers(result: &Value) -> Vec<Value> {
         .map(|offers| {
             offers
                 .iter()
-                .filter(|offer| offer.get("hosted").is_none_or(Value::is_null))
+                .filter(|offer| crate::api::offer_is_shareable(offer))
                 .cloned()
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn listed_offers_array_mut(result: &mut Value) -> Option<&mut Vec<Value>> {
+    let offers = if result.pointer("/data/offers").is_some() {
+        result.pointer_mut("/data/offers")
+    } else {
+        result.get_mut("offers")
+    };
+    match offers {
+        Some(Value::Array(offers)) => Some(offers),
+        _ => None,
+    }
+}
+
+fn annotate_listed_offers_with_hosted_share(result: &mut Value, data_dir: &Path) {
+    let Ok(operator_offers) = crate::api::load_model_provider_operator_offers(data_dir) else {
+        return;
+    };
+    let Some(listed) = listed_offers_array_mut(result) else {
+        return;
+    };
+    for offer in listed {
+        let Some(id) = offer.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(operator) = operator_offers
+            .iter()
+            .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))
+        else {
+            continue;
+        };
+        if let Some(share) = operator.get("share") {
+            offer["share"] = share.clone();
+        }
+        if let Some(enabled) = operator.get("enabled") {
+            offer["enabled"] = enabled.clone();
+        }
+        if operator
+            .pointer("/adapter/api_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            offer["key_present"] = Value::Bool(true);
+        }
+    }
+}
+
+fn listed_offer_is_hosted(offer: &Value) -> bool {
+    offer.get("hosted").is_some_and(|value| !value.is_null())
+        || offer
+            .pointer("/adapter/hosted")
+            .is_some_and(|value| !value.is_null())
+}
+
+fn shareable_listed_offers(result: &Value, include_local: bool) -> Vec<Value> {
+    shareable_offers(result)
+        .into_iter()
+        .filter(|offer| include_local || listed_offer_is_hosted(offer))
+        .collect()
+}
+
+fn public_shared_offer(mut offer: Value) -> Value {
+    if let Some(object) = offer.as_object_mut() {
+        object.remove("share");
+        object.remove("key_present");
+        object.remove("enabled");
+    }
+    if let Some(hosted) = offer.get_mut("hosted").and_then(Value::as_object_mut) {
+        hosted.remove("privacy_policy_ref");
+        hosted.remove("terms_ref");
+        if !hosted.contains_key("payer") {
+            hosted.insert("payer".to_string(), Value::String("this Home".to_string()));
+        }
+        if !hosted.contains_key("intermediary") {
+            hosted.insert(
+                "intermediary".to_string(),
+                Value::String("this Home".to_string()),
+            );
+        }
+    }
+    offer
+}
+
+fn shareable_offers_for_home(result: &Value, data_dir: &Path, include_local: bool) -> Vec<Value> {
+    let mut annotated = result.clone();
+    annotate_listed_offers_with_hosted_share(&mut annotated, data_dir);
+    shareable_listed_offers(&annotated, include_local)
+        .into_iter()
+        .map(public_shared_offer)
+        .collect()
 }
 
 fn with_offers(mut result: Value, offers: Vec<Value>) -> Value {
@@ -1020,7 +1113,7 @@ pub(crate) async fn invoke(
     local_object.remove("_runtime_invocation");
     local_object.remove("op");
 
-    let (context, indexed_run) = match operation {
+    let (context, indexed_run, include_local) = match operation {
         "offers_list" | "runs_create" => {
             let grant =
                 match read_authority(data_dir, &network, source, grant_id, requester_principal_id)
@@ -1036,12 +1129,17 @@ pub(crate) async fn invoke(
                 tracing::info!("remote model grant rejected: {err}");
                 return denied("denied", "model grant is not active for this requester");
             }
+            let include_local = super::gateway_home_system::local_model_offer_is_shared(
+                data_dir,
+                &grant.provider_principal_id,
+            );
             (
                 remote_context(
                     &remote_principal_id(&source_did, requester_principal_id),
                     &grant.grant_id,
                 ),
                 None,
+                include_local,
             )
         }
         _ => {
@@ -1073,6 +1171,7 @@ pub(crate) async fn invoke(
             (
                 remote_context(&record.remote_principal_id, grant_id),
                 Some((run_id, record)),
+                true,
             )
         }
     };
@@ -1094,7 +1193,7 @@ pub(crate) async fn invoke(
             .send_raw("model", &json!({ "op": "offers_list" }))
             .await
         {
-            Ok(result) => shareable_offers(&result),
+            Ok(result) => shareable_offers_for_home(&result, data_dir, include_local),
             Err(err) => {
                 tracing::warn!("remote model offers unavailable: {err}");
                 return denied(
@@ -1250,7 +1349,10 @@ pub(crate) async fn invoke(
     };
 
     let result = match operation {
-        "offers_list" => with_offers(result.clone(), shareable_offers(&result)),
+        "offers_list" => with_offers(
+            result.clone(),
+            shareable_offers_for_home(&result, data_dir, include_local),
+        ),
         "runs_create" => {
             if let Some(run_id) = reply.run_id.clone() {
                 let record = RemoteModelRunRecord {
@@ -1481,6 +1583,41 @@ mod tests {
         assert_eq!(ids, vec!["qwen", "local-2"]);
         let filtered = with_offers(result.clone(), shareable_offers(&result));
         assert_eq!(filtered["data"]["offers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shareable_offers_include_explicitly_shared_hosted() {
+        let result = json!({ "status": "ok", "data": { "offers": [
+            { "id": "qwen", "hosted": null },
+            {
+                "id": "model:openrouter",
+                "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" },
+                "share": { "enabled": true, "terms_ack": "openrouter-5.1-5.2+model", "processor": "OpenRouter", "payer": "this Home", "model": "fixture/model" },
+                "key_present": true
+            },
+            { "id": "model:venice", "hosted": { "placement": "hosted", "backend_provider_label": "Venice" } }
+        ] } });
+        let ids: Vec<_> = shareable_offers(&result)
+            .into_iter()
+            .map(|offer| offer["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["qwen", "model:openrouter"]);
+        let published = public_shared_offer(shareable_offers(&result)[1].clone());
+        assert_eq!(published["id"], "model:openrouter");
+        assert!(published.get("share").is_none());
+        assert_eq!(published["hosted"]["payer"], "this Home");
+        assert_eq!(published["hosted"]["intermediary"], "this Home");
+        assert_eq!(published["hosted"]["backend_provider_label"], "OpenRouter");
+        assert!(published["hosted"].get("privacy_policy_ref").is_none());
+        assert!(published["hosted"].get("terms_ref").is_none());
+        let encoded = published.to_string();
+        assert!(!encoded.contains("openrouter.ai"));
+        assert!(!encoded.contains("api_key"));
+        let hosted_only: Vec<_> = shareable_listed_offers(&result, false)
+            .into_iter()
+            .map(|offer| offer["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(hosted_only, vec!["model:openrouter"]);
     }
 
     #[test]

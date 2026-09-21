@@ -481,6 +481,13 @@ code {
   flex-wrap: wrap;
 }
 
+.ai-provider-instances,
+.ai-provider-form,
+.ai-provider-instance {
+  display: grid;
+  gap: 8px;
+}
+
 .pc2-input,
 .system-input {
   font-size: 11px;

@@ -1,16 +1,156 @@
 //! Runtime-owned model configuration shared by startup and admitted-content activation.
 use anyhow::Context as _;
 use elastos_runtime::provider;
-use serde::Deserialize;
+use rand::RngCore as _;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const MODEL_PROVIDER_ID: &str = "model-provider";
 const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
+const MODEL_PROVIDER_VALIDATE_FIXTURES_FILE_NAME: &str = "validate-fixtures.json";
+const MODEL_PROVIDER_VALIDATE_FIXTURES_MAX_BYTES: usize = 8 * 1024;
+const HOSTED_ADAPTER_KIND: &str = "open_ai_compatible_text";
+const MODEL_PROVIDER_SECRETS_DIR_NAME: &str = "secrets";
+const HOSTED_DISPLAY_NAME_MAX_BYTES: usize = 80;
+const HOSTED_SECRET_REF_PREFIX: &str = "runtime:model-provider:";
+static MODEL_PROVIDER_CONFIG_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Loopback HTTP URL accepted only from owner-scoped validate-fixtures.json.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoopbackHttpUrl(String);
+
+impl LoopbackHttpUrl {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostedValidateFixtures {
+    pub openrouter_models_url: LoopbackHttpUrl,
+    pub venice_rate_limits_url: LoopbackHttpUrl,
+    pub venice_models_url: LoopbackHttpUrl,
+    pub openrouter_chat_url: Option<LoopbackHttpUrl>,
+    pub venice_chat_url: Option<LoopbackHttpUrl>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidateFixturesFile {
+    openrouter_models_url: String,
+    venice_rate_limits_url: String,
+    venice_models_url: String,
+    #[serde(default)]
+    openrouter_chat_url: Option<String>,
+    #[serde(default)]
+    venice_chat_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostedAiProvider {
+    OpenRouter,
+    Venice,
+}
+
+impl HostedAiProvider {
+    pub(crate) const ALL: [Self; 2] = [Self::OpenRouter, Self::Venice];
+
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "openrouter" => Ok(Self::OpenRouter),
+            "venice" => Ok(Self::Venice),
+            _ => Err(anyhow::anyhow!("invalid AI provider")),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::Venice => "venice",
+        }
+    }
+
+    pub(crate) fn offer_id(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "model:openrouter",
+            Self::Venice => "model:venice",
+        }
+    }
+
+    pub(crate) fn chat_url(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
+            Self::Venice => "https://api.venice.ai/api/v1/chat/completions",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::Venice => "Venice",
+        }
+    }
+
+    fn privacy_policy_ref(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "https://openrouter.ai/privacy",
+            Self::Venice => "https://docs.venice.ai/overview/privacy",
+        }
+    }
+
+    fn terms_ref(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "https://openrouter.ai/terms",
+            Self::Venice => "https://venice.ai/legal/tos",
+        }
+    }
+
+    pub(crate) fn from_offer_id(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.offer_id() == value.trim())
+    }
+
+    pub(crate) fn from_api_url(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.chat_url() == value.trim())
+    }
+
+    pub(crate) fn share_terms_ack(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter-5.1-5.2+model",
+            Self::Venice => "venice-7.3+model",
+        }
+    }
+
+    pub(crate) fn share_payer(self) -> &'static str {
+        let _ = self;
+        "this Home"
+    }
+
+    pub(crate) fn share_terms_summary(self) -> &'static str {
+        match self {
+            Self::OpenRouter => {
+                "OpenRouter Terms 5.1-5.2 plus the selected model terms. This Home pays. OpenRouter receives prompts."
+            }
+            Self::Venice => {
+                "Venice TOS 7.3 End User API terms apply to the selected model. Section 7.1 is personal use and is not a Share grant. This Home pays. Venice receives prompts."
+            }
+        }
+    }
+}
+
+const HOSTED_SHARE_PAYER: &str = "this Home";
+const HOSTED_SHARE_TERMS_ACK_MAX_BYTES: usize = 64;
+const HOSTED_SHARE_PROCESSOR_MAX_BYTES: usize = 64;
+const HOSTED_SHARE_MODEL_MAX_BYTES: usize = 256;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +166,162 @@ fn model_provider_config_path(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join(MODEL_PROVIDER_CONFIG_FILE_NAME)
 }
 
+fn model_provider_validate_fixtures_path(data_dir: &Path) -> PathBuf {
+    model_provider_root_dir(data_dir).join(MODEL_PROVIDER_VALIDATE_FIXTURES_FILE_NAME)
+}
+
+fn model_provider_secrets_dir(data_dir: &Path) -> PathBuf {
+    model_provider_root_dir(data_dir).join(MODEL_PROVIDER_SECRETS_DIR_NAME)
+}
+
+fn hosted_secret_file_name(offer_id: &str) -> anyhow::Result<String> {
+    let offer_id = offer_id.trim();
+    if offer_id.is_empty()
+        || offer_id.bytes().any(|byte| {
+            !byte.is_ascii_alphanumeric() && byte != b':' && byte != b'-' && byte != b'_'
+        })
+    {
+        anyhow::bail!("invalid hosted instance id");
+    }
+    Ok(offer_id.replace(':', "_"))
+}
+
+fn new_hosted_instance_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("model:hosted-{hex}")
+}
+
+fn hosted_secret_ref(offer_id: &str) -> String {
+    format!("{HOSTED_SECRET_REF_PREFIX}{offer_id}")
+}
+
+fn hosted_provider_from_offer(offer: &serde_json::Value) -> Option<HostedAiProvider> {
+    if let Some(provider) = offer
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(HostedAiProvider::from_offer_id)
+    {
+        return Some(provider);
+    }
+    offer
+        .pointer("/adapter/api_url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(HostedAiProvider::from_api_url)
+}
+
+fn offer_id_of(offer: &serde_json::Value) -> Option<&str> {
+    offer
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_hosted_instance_offer(offer: &serde_json::Value) -> bool {
+    hosted_provider_from_offer(offer).is_some()
+        || offer
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.starts_with("model:hosted-"))
+}
+
+/// Parse a validate-fixture URL. Accept only http, host 127.0.0.1, an explicit
+/// numeric port, and a path. Reject DNS, IPv6, localhost, credentials, and
+/// fragments.
+pub(crate) fn parse_loopback_http_url(raw: &str) -> anyhow::Result<LoopbackHttpUrl> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|_| anyhow::anyhow!("hosted validate fixture URL is invalid"))?;
+    if parsed.scheme() != "http" {
+        anyhow::bail!("hosted validate fixture URL must use http");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("hosted validate fixture URL must omit credentials");
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(addr)) if addr.octets() == [127, 0, 0, 1] => {}
+        _ => anyhow::bail!("hosted validate fixture URL must use host 127.0.0.1"),
+    }
+    let Some(port) = parsed.port() else {
+        anyhow::bail!("hosted validate fixture URL must include a numeric port");
+    };
+    if port == 0 {
+        anyhow::bail!("hosted validate fixture URL must include a numeric port");
+    }
+    if parsed.fragment().is_some() {
+        anyhow::bail!("hosted validate fixture URL must omit a fragment");
+    }
+    let path = parsed.path();
+    if !path.starts_with('/') || path.len() < 2 {
+        anyhow::bail!("hosted validate fixture URL must include a path");
+    }
+    Ok(LoopbackHttpUrl(parsed.as_str().to_string()))
+}
+
+fn optional_loopback_http_url(raw: Option<&str>) -> anyhow::Result<Option<LoopbackHttpUrl>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => parse_loopback_http_url(value).map(Some),
+    }
+}
+
+fn load_hosted_validate_fixtures_unlocked(
+    data_dir: &Path,
+) -> anyhow::Result<Option<HostedValidateFixtures>> {
+    let path = model_provider_validate_fixtures_path(data_dir);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect model-provider validate fixtures {}",
+                    path.display()
+                )
+            })
+        }
+    };
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    let bytes = read_model_provider_private_file(
+        &path,
+        &metadata,
+        MODEL_PROVIDER_VALIDATE_FIXTURES_MAX_BYTES,
+        "model-provider validate fixtures",
+    )?;
+    let file: ValidateFixturesFile = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("model-provider validate fixtures are invalid"))?;
+    Ok(Some(HostedValidateFixtures {
+        openrouter_models_url: parse_loopback_http_url(&file.openrouter_models_url)?,
+        venice_rate_limits_url: parse_loopback_http_url(&file.venice_rate_limits_url)?,
+        venice_models_url: parse_loopback_http_url(&file.venice_models_url)?,
+        openrouter_chat_url: optional_loopback_http_url(file.openrouter_chat_url.as_deref())?,
+        venice_chat_url: optional_loopback_http_url(file.venice_chat_url.as_deref())?,
+    }))
+}
+
+/// Load owner-scoped validate fixtures. An absent file keeps the public HTTPS pins.
+pub(crate) fn load_hosted_validate_fixtures(
+    data_dir: &Path,
+) -> anyhow::Result<Option<HostedValidateFixtures>> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    load_hosted_validate_fixtures_unlocked(data_dir)
+}
+
 fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("journal")
 }
@@ -38,7 +334,20 @@ pub fn model_provider_bridge_config(
     let canonical_data_dir =
         fs::canonicalize(data_dir).context("model-provider Runtime root is unavailable")?;
     let data_dir = canonical_data_dir.as_path();
-    let offers = load_model_provider_operator_offers(data_dir)?;
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let loaded = load_model_provider_operator_offers(data_dir)?;
+    if offers_need_secret_migration(&loaded) {
+        persist_model_provider_operator_offers(data_dir, loaded.clone())?;
+    }
+    let fixtures = load_hosted_validate_fixtures_unlocked(data_dir)?;
+    let offers: Vec<serde_json::Value> = load_model_provider_operator_offers(data_dir)?
+        .into_iter()
+        .map(|offer| materialize_provider_offer(data_dir, offer, fixtures.as_ref()))
+        .map(strip_runtime_share_fields)
+        .collect();
     Ok(provider::BridgeProviderConfig {
         base_path: data_dir.to_string_lossy().into_owned(),
         extra: serde_json::json!({
@@ -71,7 +380,9 @@ pub async fn model_provider_config(
     }
 }
 
-fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+pub(crate) fn load_model_provider_operator_offers(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<serde_json::Value>> {
     let config_path = model_provider_config_path(data_dir);
     let metadata = match fs::symlink_metadata(&config_path) {
         Ok(metadata) => metadata,
@@ -106,6 +417,7 @@ fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<se
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostedModelOfferHint {
+    pub offer_title: String,
     pub provider_label: String,
     pub requested_selector: String,
     pub privacy_policy_ref: String,
@@ -135,7 +447,11 @@ fn hosted_hint_from_offers(
         .find(|offer| offer.get("id").and_then(serde_json::Value::as_str) == Some(offer_id))?;
     let adapter = offer.get("adapter")?;
     let kind = adapter.get("kind").and_then(serde_json::Value::as_str)?;
-    if kind != "openai_compatible_text" && kind != "openai_responses_text" {
+    if kind != "open_ai_compatible_text"
+        && kind != "openai_compatible_text"
+        && kind != "open_ai_responses_text"
+        && kind != "openai_responses_text"
+    {
         return None;
     }
     let hosted = adapter.get("hosted")?;
@@ -148,7 +464,15 @@ fn hosted_hint_from_offers(
     if provider_label.is_empty() {
         return None;
     }
+    let offer_title = offer
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&provider_label)
+        .to_string();
     Some(HostedModelOfferHint {
+        offer_title,
         provider_label,
         requested_selector: adapter
             .get("model")
@@ -169,6 +493,716 @@ fn hosted_hint_from_offers(
             .trim()
             .to_string(),
     })
+}
+
+/// Named Jev instance used as the Approval Lens evaluator.
+/// Runtime matches the owner-chosen title `Jev`.
+pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedModelOfferHint)> {
+    let offers = load_model_provider_operator_offers(data_dir).ok()?;
+    for offer in &offers {
+        let title = offer
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !title.eq_ignore_ascii_case("jev") {
+            continue;
+        }
+        let offer_id = offer.get("id").and_then(serde_json::Value::as_str)?;
+        let hint = hosted_hint_from_offers(std::slice::from_ref(offer), offer_id)?;
+        return Some((offer_id.to_string(), hint));
+    }
+    None
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AiProviderConnection {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub connected: bool,
+    pub processor_label: String,
+    pub processor_kind: String,
+    pub selected_model: Option<String>,
+    pub key_present: bool,
+    pub share_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AiProviderStatus {
+    pub storage_home: String,
+    pub connections: Vec<AiProviderConnection>,
+}
+
+fn is_same_hosted_instance(offer: &serde_json::Value, offer_id: &str) -> bool {
+    offer_id_of(offer) == Some(offer_id.trim())
+}
+
+fn hosted_offer(
+    provider: HostedAiProvider,
+    offer_id: &str,
+    name: &str,
+    model: &str,
+    privacy: Option<&str>,
+) -> serde_json::Value {
+    let mut hosted = serde_json::json!({
+        "backend_provider_label": provider.label(),
+        "selection_mode": "pinned",
+        "privacy_policy_ref": provider.privacy_policy_ref(),
+        "terms_ref": provider.terms_ref(),
+        "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+    });
+    if let Some(privacy) = privacy.map(str::trim).filter(|value| !value.is_empty()) {
+        hosted["model_privacy"] = serde_json::Value::String(privacy.to_string());
+    }
+    serde_json::json!({
+        "id": offer_id,
+        "title": name,
+        "operation": "text.generate",
+        "input_modalities": ["text/plain"],
+        "output_modalities": ["text/plain"],
+        "enabled": true,
+        "policy": {
+            "concurrency_limit": 1,
+            "input_bytes_limit": 32768,
+            "inline_output_bytes_limit": 65536,
+            "event_bytes_limit": 66560,
+            "runtime_ms_limit": 120000,
+            "retention_secs": 3600,
+            "cancel_settlement_timeout_ms": 15000
+        },
+        "adapter": {
+            "kind": HOSTED_ADAPTER_KIND,
+            "api_url": provider.chat_url(),
+            "model": model,
+            "secret_ref": hosted_secret_ref(offer_id),
+            "hosted": hosted
+        }
+    })
+}
+
+fn connection_from_offer(offer: &serde_json::Value) -> Option<AiProviderConnection> {
+    let provider = hosted_provider_from_offer(offer)?;
+    let id = offer_id_of(offer)?.to_string();
+    let name = offer
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| provider.label())
+        .to_string();
+    let adapter = offer.get("adapter");
+    let selected_model = adapter
+        .and_then(|value| value.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let key_present = operator_offer_has_key(offer);
+    let privacy = adapter
+        .and_then(|value| value.get("hosted"))
+        .and_then(|value| value.get("model_privacy"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let connected =
+        offer.get("enabled").and_then(serde_json::Value::as_bool) != Some(false) && key_present;
+    Some(AiProviderConnection {
+        id,
+        name,
+        provider: provider.as_str().to_string(),
+        connected,
+        processor_label: provider.label().to_string(),
+        processor_kind: "external".to_string(),
+        selected_model,
+        key_present,
+        share_enabled: hosted_share_enabled(offer),
+        privacy,
+    })
+}
+
+fn status_from_offers(offers: &[serde_json::Value]) -> AiProviderStatus {
+    AiProviderStatus {
+        storage_home: "this Home".to_string(),
+        connections: offers.iter().filter_map(connection_from_offer).collect(),
+    }
+}
+
+fn write_model_provider_config_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("model-provider config has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("model-provider config has no file name"))?;
+    let temp = parent.join(format!(
+        ".{file_name}.{:016x}.tmp",
+        rand::thread_rng().next_u64()
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&temp)
+            .with_context(|| format!("failed to stage model-provider config {}", temp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path).with_context(|| {
+            format!("failed to replace model-provider config {}", path.display())
+        })?;
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn strip_runtime_share_fields(mut offer: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = offer.as_object_mut() {
+        object.remove("share");
+    }
+    offer
+}
+
+fn operator_offer_has_key(offer: &serde_json::Value) -> bool {
+    let inline = offer
+        .pointer("/adapter/api_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let referenced = offer
+        .pointer("/adapter/secret_ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    inline || referenced
+}
+
+fn operator_offer_enabled(offer: &serde_json::Value) -> bool {
+    offer.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
+}
+
+fn listed_or_operator_is_hosted(offer: &serde_json::Value) -> bool {
+    let hosted = offer
+        .get("hosted")
+        .or_else(|| offer.pointer("/adapter/hosted"));
+    hosted.is_some_and(|value| !value.is_null())
+}
+
+fn hosted_share_enabled(offer: &serde_json::Value) -> bool {
+    offer
+        .get("share")
+        .and_then(|share| share.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+pub(crate) fn offer_is_shareable(offer: &serde_json::Value) -> bool {
+    if !listed_or_operator_is_hosted(offer) {
+        return true;
+    }
+    hosted_share_enabled(offer)
+        && operator_offer_enabled(offer)
+        && (operator_offer_has_key(offer)
+            || offer
+                .get("key_present")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true))
+}
+
+fn existing_hosted_share(
+    offers: &[serde_json::Value],
+    offer_id: &str,
+) -> Option<serde_json::Value> {
+    offers
+        .iter()
+        .find(|offer| is_same_hosted_instance(offer, offer_id))
+        .and_then(|offer| offer.get("share"))
+        .filter(|share| share.is_object())
+        .cloned()
+}
+
+fn preserve_hosted_share(
+    mut offer: serde_json::Value,
+    provider: HostedAiProvider,
+    model: &str,
+    share: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let Some(mut share) = share else {
+        return offer;
+    };
+    if let Some(object) = share.as_object_mut() {
+        object.insert(
+            "processor".to_string(),
+            serde_json::Value::String(provider.label().to_string()),
+        );
+        object.insert(
+            "payer".to_string(),
+            serde_json::Value::String(HOSTED_SHARE_PAYER.to_string()),
+        );
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    offer["share"] = share;
+    offer
+}
+
+fn hosted_secret_path(data_dir: &Path, offer_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(model_provider_secrets_dir(data_dir).join(hosted_secret_file_name(offer_id)?))
+}
+
+fn write_hosted_secret(data_dir: &Path, offer_id: &str, api_key: &str) -> anyhow::Result<()> {
+    let dir = model_provider_secrets_dir(data_dir);
+    crate::auth::create_owner_only_dir_all(data_dir, &dir)?;
+    let path = hosted_secret_path(data_dir, offer_id)?;
+    write_model_provider_config_atomic(&path, api_key.as_bytes())
+}
+
+fn read_hosted_secret(data_dir: &Path, offer_id: &str) -> anyhow::Result<Option<String>> {
+    let path = hosted_secret_path(data_dir, offer_id)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to inspect hosted secret {}", path.display()))
+        }
+    };
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_secrets_dir(data_dir),
+        "model-provider secrets",
+    )?;
+    let bytes =
+        read_model_provider_private_file(&path, &metadata, 8 * 1024, "hosted model secret")?;
+    let secret = String::from_utf8(bytes).context("hosted model secret must be UTF-8")?;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(secret.to_string()))
+}
+
+fn delete_hosted_secret(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
+    let path = hosted_secret_path(data_dir, offer_id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to remove hosted secret {}", path.display()))
+        }
+    }
+}
+
+fn take_adapter_api_key(offer: &mut serde_json::Value) -> Option<String> {
+    let adapter = offer.get_mut("adapter")?.as_object_mut()?;
+    let key = adapter
+        .remove("api_key")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)?;
+    Some(key)
+}
+
+fn store_operator_offer_secret(
+    data_dir: &Path,
+    mut offer: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    if !is_hosted_instance_offer(&offer) {
+        return Ok(offer);
+    }
+    let Some(id) = offer_id_of(&offer).map(ToOwned::to_owned) else {
+        return Ok(offer);
+    };
+    if let Some(api_key) = take_adapter_api_key(&mut offer) {
+        write_hosted_secret(data_dir, &id, &api_key)?;
+    }
+    if let Some(adapter) = offer
+        .get_mut("adapter")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        adapter.insert(
+            "secret_ref".to_string(),
+            serde_json::Value::String(hosted_secret_ref(&id)),
+        );
+        adapter.remove("api_key");
+    }
+    Ok(offer)
+}
+
+fn apply_fixture_chat_url(
+    fixtures: Option<&HostedValidateFixtures>,
+    offer: &mut serde_json::Value,
+) {
+    let Some(fixtures) = fixtures else {
+        return;
+    };
+    let Some(provider) = hosted_provider_from_offer(offer) else {
+        return;
+    };
+    let rewrite = match provider {
+        HostedAiProvider::OpenRouter => fixtures.openrouter_chat_url.as_ref(),
+        HostedAiProvider::Venice => fixtures.venice_chat_url.as_ref(),
+    };
+    let Some(url) = rewrite else {
+        return;
+    };
+    if let Some(adapter) = offer
+        .get_mut("adapter")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        adapter.insert(
+            "api_url".to_string(),
+            serde_json::Value::String(url.as_str().to_string()),
+        );
+    }
+}
+
+fn materialize_provider_offer(
+    data_dir: &Path,
+    mut offer: serde_json::Value,
+    fixtures: Option<&HostedValidateFixtures>,
+) -> serde_json::Value {
+    let Some(id) = offer_id_of(&offer).map(ToOwned::to_owned) else {
+        return offer;
+    };
+    let secret = read_hosted_secret(data_dir, &id).ok().flatten();
+    if let Some(adapter) = offer
+        .get_mut("adapter")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        adapter.remove("secret_ref");
+        if let Some(secret) = secret {
+            adapter.insert("api_key".to_string(), serde_json::Value::String(secret));
+        }
+    }
+    apply_fixture_chat_url(fixtures, &mut offer);
+    offer
+}
+
+fn offers_need_secret_migration(offers: &[serde_json::Value]) -> bool {
+    offers.iter().any(|offer| {
+        offer
+            .pointer("/adapter/api_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn normalize_display_name(value: &str, fallback: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    let name = if trimmed.is_empty() {
+        fallback.trim()
+    } else {
+        trimmed
+    };
+    if name.is_empty()
+        || name.len() > HOSTED_DISPLAY_NAME_MAX_BYTES
+        || name.contains('\n')
+        || name.contains('\r')
+    {
+        anyhow::bail!("invalid hosted instance name");
+    }
+    Ok(name.to_string())
+}
+
+fn validate_hosted_instance_id(offer_id: &str) -> anyhow::Result<()> {
+    let offer_id = offer_id.trim();
+    if HostedAiProvider::from_offer_id(offer_id).is_some() {
+        return Ok(());
+    }
+    let Some(hex) = offer_id.strip_prefix("model:hosted-") else {
+        anyhow::bail!("invalid hosted instance id");
+    };
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid hosted instance id");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostedModelShareCard {
+    pub offer_id: String,
+    pub name: String,
+    pub processor: String,
+    pub model: String,
+    pub payer: String,
+    pub terms_ack: String,
+    pub terms_summary: String,
+    pub share_enabled: bool,
+}
+
+pub(crate) fn hosted_model_share_cards(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<HostedModelShareCard>> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let offers = load_model_provider_operator_offers(data_dir)?;
+    Ok(offers
+        .iter()
+        .filter_map(|offer| {
+            let connection = connection_from_offer(offer)?;
+            if !connection.connected {
+                return None;
+            }
+            let provider = hosted_provider_from_offer(offer)?;
+            let model = connection.selected_model.clone()?;
+            Some(HostedModelShareCard {
+                offer_id: connection.id,
+                name: connection.name,
+                processor: provider.label().to_string(),
+                model,
+                payer: provider.share_payer().to_string(),
+                terms_ack: provider.share_terms_ack().to_string(),
+                terms_summary: provider.share_terms_summary().to_string(),
+                share_enabled: hosted_share_enabled(offer),
+            })
+        })
+        .collect())
+}
+
+pub(crate) fn any_hosted_model_shared(data_dir: &Path) -> bool {
+    hosted_model_share_cards(data_dir)
+        .ok()
+        .is_some_and(|cards| cards.iter().any(|card| card.share_enabled))
+}
+
+pub(crate) fn operator_has_hosted_offer(data_dir: &Path, offer_id: &str) -> bool {
+    load_model_provider_operator_offers(data_dir)
+        .ok()
+        .is_some_and(|offers| {
+            offers.iter().any(|offer| {
+                is_same_hosted_instance(offer, offer_id) && is_hosted_instance_offer(offer)
+            })
+        })
+}
+
+pub(crate) fn set_hosted_offer_share(
+    data_dir: &Path,
+    offer_id: &str,
+    enabled: bool,
+    terms_ack: Option<&str>,
+) -> anyhow::Result<AiProviderStatus> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    validate_hosted_instance_id(offer_id)?;
+    let mut offers = load_model_provider_operator_offers(data_dir)?;
+    let Some(index) = offers
+        .iter()
+        .position(|offer| is_same_hosted_instance(offer, offer_id))
+    else {
+        anyhow::bail!("hosted connection is required");
+    };
+    let connection = connection_from_offer(&offers[index])
+        .ok_or_else(|| anyhow::anyhow!("hosted connection is required"))?;
+    let provider = hosted_provider_from_offer(&offers[index])
+        .ok_or_else(|| anyhow::anyhow!("hosted connection is required"))?;
+    if !connection.connected {
+        anyhow::bail!("hosted connection is required");
+    }
+    if enabled {
+        let ack = terms_ack.map(str::trim).unwrap_or_default();
+        if ack.is_empty() {
+            anyhow::bail!("share terms acknowledgment is required");
+        }
+        if ack != provider.share_terms_ack()
+            || ack.len() > HOSTED_SHARE_TERMS_ACK_MAX_BYTES
+            || provider.label().len() > HOSTED_SHARE_PROCESSOR_MAX_BYTES
+        {
+            anyhow::bail!("invalid share terms acknowledgment");
+        }
+        let model = connection.selected_model.clone().unwrap_or_default();
+        if model.is_empty() || model.len() > HOSTED_SHARE_MODEL_MAX_BYTES {
+            anyhow::bail!("hosted connection is required");
+        }
+        offers[index]["share"] = serde_json::json!({
+            "enabled": true,
+            "terms_ack": ack,
+            "processor": provider.label(),
+            "payer": HOSTED_SHARE_PAYER,
+            "model": model
+        });
+    } else if let Some(object) = offers[index].as_object_mut() {
+        object.remove("share");
+    }
+    persist_model_provider_operator_offers(data_dir, offers)?;
+    Ok(status_from_offers(&load_model_provider_operator_offers(
+        data_dir,
+    )?))
+}
+
+fn persist_model_provider_operator_offers(
+    data_dir: &Path,
+    offers: Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let root = model_provider_root_dir(data_dir);
+    crate::auth::create_owner_only_dir_all(data_dir, &root)?;
+    let mut stored = Vec::with_capacity(offers.len());
+    for offer in offers {
+        stored.push(store_operator_offer_secret(data_dir, offer)?);
+    }
+    let path = model_provider_config_path(data_dir);
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "offers": stored }))
+        .context("failed to encode model-provider operator config")?;
+    if bytes.len() > MODEL_PROVIDER_CONFIG_MAX_BYTES {
+        anyhow::bail!("model-provider operator config exceeds its byte limit");
+    }
+    write_model_provider_config_atomic(&path, &bytes)
+}
+
+async fn refresh_registered_model_provider(
+    data_dir: &Path,
+    registry: Option<&provider::ProviderRegistry>,
+) -> anyhow::Result<()> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    let (config, _guard) = model_provider_config(data_dir, registry).await?;
+    registry
+        .refresh_local_model_configuration(&config)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(())
+}
+
+pub(crate) fn ai_provider_status(data_dir: &Path) -> anyhow::Result<AiProviderStatus> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let loaded = load_model_provider_operator_offers(data_dir)?;
+    if offers_need_secret_migration(&loaded) {
+        persist_model_provider_operator_offers(data_dir, loaded)?;
+    }
+    Ok(status_from_offers(&load_model_provider_operator_offers(
+        data_dir,
+    )?))
+}
+
+pub(crate) async fn save_hosted_offer(
+    data_dir: &Path,
+    registry: Option<&provider::ProviderRegistry>,
+    provider: HostedAiProvider,
+    api_key: &str,
+    model: &str,
+    privacy: Option<&str>,
+    name: &str,
+    instance_id: Option<&str>,
+) -> anyhow::Result<AiProviderStatus> {
+    {
+        let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current = load_model_provider_operator_offers(data_dir)?;
+        let name = normalize_display_name(name, provider.label())?;
+        let offer_id = match instance_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(id) => {
+                validate_hosted_instance_id(id)?;
+                if let Some(existing) = current
+                    .iter()
+                    .find(|offer| is_same_hosted_instance(offer, id))
+                {
+                    let existing_provider = hosted_provider_from_offer(existing)
+                        .ok_or_else(|| anyhow::anyhow!("hosted connection is required"))?;
+                    if existing_provider != provider {
+                        anyhow::bail!("hosted instance provider does not match");
+                    }
+                }
+                id.to_string()
+            }
+            None => new_hosted_instance_id(),
+        };
+        write_hosted_secret(data_dir, &offer_id, api_key)?;
+        let share = existing_hosted_share(&current, &offer_id);
+        let replacement = preserve_hosted_share(
+            hosted_offer(provider, &offer_id, &name, model, privacy),
+            provider,
+            model,
+            share,
+        );
+        let mut offers = current
+            .into_iter()
+            .filter(|offer| !is_same_hosted_instance(offer, &offer_id))
+            .collect::<Vec<_>>();
+        offers.push(replacement);
+        persist_model_provider_operator_offers(data_dir, offers)?;
+    }
+    if let Err(error) = refresh_registered_model_provider(data_dir, registry).await {
+        let text = error.to_string();
+        if text.contains("model retirement pending")
+            || text.contains("model activation pending")
+            || text.contains("selection_unavailable")
+        {
+            return Err(error);
+        }
+    }
+    ai_provider_status(data_dir)
+}
+
+pub(crate) async fn remove_hosted_offer(
+    data_dir: &Path,
+    registry: Option<&provider::ProviderRegistry>,
+    offer_id: &str,
+) -> anyhow::Result<AiProviderStatus> {
+    {
+        let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        validate_hosted_instance_id(offer_id)?;
+        let offers = load_model_provider_operator_offers(data_dir)?
+            .into_iter()
+            .filter(|offer| !is_same_hosted_instance(offer, offer_id))
+            .collect::<Vec<_>>();
+        persist_model_provider_operator_offers(data_dir, offers)?;
+        delete_hosted_secret(data_dir, offer_id)?;
+    }
+    if let Err(error) = refresh_registered_model_provider(data_dir, registry).await {
+        let text = error.to_string();
+        if text.contains("model retirement pending")
+            || text.contains("model activation pending")
+            || text.contains("selection_unavailable")
+        {
+            return Err(error);
+        }
+    }
+    ai_provider_status(data_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn seed_model_provider_operator_offers_for_test(
+    data_dir: &Path,
+    offers: Vec<serde_json::Value>,
+) -> anyhow::Result<()> {
+    persist_model_provider_operator_offers(data_dir, offers)
 }
 
 fn validate_model_provider_private_directory(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -244,7 +1278,7 @@ fn read_model_provider_private_file(
 
 #[cfg(test)]
 mod hosted_hint_tests {
-    use super::hosted_hint_from_offers;
+    use super::{hosted_hint_from_offers, hosted_offer, status_from_offers, HostedAiProvider};
     use serde_json::json;
 
     #[test]
@@ -252,7 +1286,7 @@ mod hosted_hint_tests {
         let offers = vec![json!({
             "id": "offer-hosted",
             "adapter": {
-                "kind": "openai_compatible_text",
+                "kind": "open_ai_compatible_text",
                 "api_url": "https://example.invalid/v1/chat/completions",
                 "api_key": "secret-should-not-leak",
                 "model": "gpt-test",
@@ -271,6 +1305,65 @@ mod hosted_hint_tests {
         let encoded = format!("{hint:?}");
         assert!(!encoded.contains("https://"));
         assert!(!encoded.contains("secret-should-not-leak"));
+        let alias = vec![json!({
+            "id": "offer-hosted-alias",
+            "adapter": {
+                "kind": "openai_compatible_text",
+                "model": "gpt-test",
+                "hosted": {
+                    "backend_provider_label": "Fixture Provider",
+                    "privacy_policy_ref": "fixture:privacy:v1",
+                    "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                }
+            }
+        })];
+        assert_eq!(
+            hosted_hint_from_offers(&alias, "offer-hosted-alias")
+                .unwrap()
+                .provider_label,
+            "Fixture Provider"
+        );
+        let status = status_from_offers(&[
+            hosted_offer(
+                HostedAiProvider::OpenRouter,
+                "model:openrouter",
+                "OpenRouter",
+                "fixture/model",
+                None,
+            ),
+            hosted_offer(
+                HostedAiProvider::Venice,
+                "model:venice",
+                "Venice",
+                "fixture/model",
+                Some("private"),
+            ),
+        ]);
+        assert_eq!(status.storage_home, "this Home");
+        assert_eq!(status.connections.len(), 2);
+        assert_eq!(status.connections[0].id, "model:openrouter");
+        assert_eq!(status.connections[0].name, "OpenRouter");
+        assert_eq!(status.connections[0].provider, "openrouter");
+        assert_eq!(status.connections[0].connected, true);
+        assert_eq!(
+            status.connections[0].selected_model.as_deref(),
+            Some("fixture/model")
+        );
+        assert_eq!(status.connections[0].key_present, true);
+        assert_eq!(status.connections[0].privacy, None);
+        assert_eq!(status.connections[1].provider, "venice");
+        assert_eq!(status.connections[1].connected, true);
+        assert_eq!(status.connections[1].privacy.as_deref(), Some("private"));
+        let status_json = serde_json::to_string(&status).unwrap();
+        let status_debug = format!("{status:?}");
+        assert!(!status_json.contains("sk-or-fixture-valid"));
+        assert!(!status_json.contains("sk-vnz-fixture-valid"));
+        assert!(!status_json.contains("openrouter.ai"));
+        assert!(!status_json.contains("venice.ai"));
+        assert!(!status_json.contains("api_key"));
+        assert!(!status_json.contains("api_url"));
+        assert!(!status_debug.contains("sk-or-fixture-valid"));
+        assert!(!status_debug.contains("openrouter.ai"));
     }
 
     #[test]
@@ -280,5 +1373,329 @@ mod hosted_hint_tests {
             "adapter": { "kind": "local_llama_cpp_text" }
         })];
         assert!(hosted_hint_from_offers(&offers, "local").is_none());
+    }
+
+    #[test]
+    fn offer_is_shareable_keeps_local_and_explicit_hosted_share() {
+        assert!(super::offer_is_shareable(&json!({ "id": "qwen" })));
+        assert!(super::offer_is_shareable(
+            &json!({ "id": "qwen", "hosted": null })
+        ));
+        assert!(!super::offer_is_shareable(&json!({
+            "id": "gpt",
+            "hosted": { "placement": "hosted" }
+        })));
+        assert!(super::offer_is_shareable(&json!({
+            "id": "model:openrouter",
+            "hosted": { "placement": "hosted" },
+            "share": { "enabled": true },
+            "key_present": true
+        })));
+        assert!(super::offer_is_shareable(&json!({
+            "id": "model:hosted-0123456789abcdef0123456789abcdef",
+            "hosted": { "placement": "hosted" },
+            "share": { "enabled": true },
+            "key_present": true
+        })));
+        assert!(!super::offer_is_shareable(&json!({
+            "id": "model:venice",
+            "hosted": { "placement": "hosted" },
+            "share": { "enabled": false },
+            "key_present": true
+        })));
+        assert!(!super::offer_is_shareable(&json!({
+            "id": "model:openrouter",
+            "hosted": { "placement": "hosted" },
+            "share": { "enabled": true },
+            "enabled": false,
+            "key_present": true
+        })));
+    }
+
+    #[test]
+    fn preserve_hosted_share_keeps_enabled_and_updates_model() {
+        let preserved = super::preserve_hosted_share(
+            json!({ "id": "model:openrouter" }),
+            HostedAiProvider::OpenRouter,
+            "fixture/replaced",
+            Some(json!({
+                "enabled": true,
+                "terms_ack": "openrouter-5.1-5.2+model",
+                "processor": "OpenRouter",
+                "payer": "this Home",
+                "model": "fixture/model"
+            })),
+        );
+        assert_eq!(preserved["share"]["enabled"], true);
+        assert_eq!(preserved["share"]["terms_ack"], "openrouter-5.1-5.2+model");
+        assert_eq!(preserved["share"]["model"], "fixture/replaced");
+        assert_eq!(preserved["share"]["processor"], "OpenRouter");
+        assert_eq!(preserved["share"]["payer"], "this Home");
+    }
+}
+
+#[cfg(test)]
+mod validate_fixture_tests {
+    use super::{load_hosted_validate_fixtures, parse_loopback_http_url};
+
+    fn write_validate_fixtures(data_dir: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let providers = data_dir.join("providers");
+        let root = providers.join("model-provider");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&providers, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("validate-fixtures.json");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn fixtures_json(openrouter: &str, venice_rate: &str, venice_models: &str) -> String {
+        serde_json::json!({
+            "openrouter_models_url": openrouter,
+            "venice_rate_limits_url": venice_rate,
+            "venice_models_url": venice_models
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_loopback_http_url_accepts_explicit_127() {
+        let url =
+            parse_loopback_http_url("http://127.0.0.1:43721/openrouter/api/v1/models").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:43721/openrouter/api/v1/models"
+        );
+        let venice =
+            parse_loopback_http_url("http://127.0.0.1:43721/venice/api/v1/models?type=text")
+                .unwrap();
+        assert_eq!(
+            venice.as_str(),
+            "http://127.0.0.1:43721/venice/api/v1/models?type=text"
+        );
+    }
+
+    #[test]
+    fn parse_loopback_http_url_rejects_public_https() {
+        assert!(parse_loopback_http_url("https://openrouter.ai/api/v1/models").is_err());
+        assert!(
+            parse_loopback_http_url("https://api.venice.ai/api/v1/api_keys/rate_limits").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_loopback_http_url_rejects_non_loopback_ip() {
+        assert!(parse_loopback_http_url("http://8.8.8.8:80/openrouter/api/v1/models").is_err());
+        assert!(
+            parse_loopback_http_url("http://localhost:43721/openrouter/api/v1/models").is_err()
+        );
+        assert!(parse_loopback_http_url("http://[::1]:43721/openrouter/api/v1/models").is_err());
+        assert!(parse_loopback_http_url(
+            "http://user:pass@127.0.0.1:43721/openrouter/api/v1/models"
+        )
+        .is_err());
+        assert!(parse_loopback_http_url("http://127.0.0.1/openrouter/api/v1/models").is_err());
+    }
+
+    #[test]
+    fn load_hosted_validate_fixtures_absent_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_hosted_validate_fixtures(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_hosted_validate_fixtures_accepts_loopback_http() {
+        let dir = tempfile::tempdir().unwrap();
+        write_validate_fixtures(
+            dir.path(),
+            &fixtures_json(
+                "http://127.0.0.1:43721/openrouter/api/v1/models",
+                "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits",
+                "http://127.0.0.1:43721/venice/api/v1/models?type=text",
+            ),
+        );
+        let loaded = load_hosted_validate_fixtures(dir.path())
+            .unwrap()
+            .expect("fixtures present");
+        assert_eq!(
+            loaded.openrouter_models_url.as_str(),
+            "http://127.0.0.1:43721/openrouter/api/v1/models"
+        );
+        assert_eq!(
+            loaded.venice_rate_limits_url.as_str(),
+            "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits"
+        );
+        assert_eq!(
+            loaded.venice_models_url.as_str(),
+            "http://127.0.0.1:43721/venice/api/v1/models?type=text"
+        );
+        assert!(loaded.openrouter_chat_url.is_none());
+        assert!(loaded.venice_chat_url.is_none());
+    }
+
+    #[test]
+    fn load_hosted_validate_fixtures_accepts_optional_loopback_chat_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        write_validate_fixtures(
+            dir.path(),
+            &serde_json::json!({
+                "openrouter_models_url": "http://127.0.0.1:43721/openrouter/api/v1/models",
+                "venice_rate_limits_url": "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits",
+                "venice_models_url": "http://127.0.0.1:43721/venice/api/v1/models?type=text",
+                "openrouter_chat_url": "http://127.0.0.1:43721/openrouter/api/v1/chat/completions",
+                "venice_chat_url": "http://127.0.0.1:43721/venice/api/v1/chat/completions"
+            })
+            .to_string(),
+        );
+        let loaded = load_hosted_validate_fixtures(dir.path())
+            .unwrap()
+            .expect("fixtures present");
+        assert_eq!(
+            loaded.openrouter_chat_url.as_ref().map(|url| url.as_str()),
+            Some("http://127.0.0.1:43721/openrouter/api/v1/chat/completions")
+        );
+        assert_eq!(
+            loaded.venice_chat_url.as_ref().map(|url| url.as_str()),
+            Some("http://127.0.0.1:43721/venice/api/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn load_hosted_validate_fixtures_rejects_public_chat_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_validate_fixtures(
+            dir.path(),
+            &serde_json::json!({
+                "openrouter_models_url": "http://127.0.0.1:43721/openrouter/api/v1/models",
+                "venice_rate_limits_url": "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits",
+                "venice_models_url": "http://127.0.0.1:43721/venice/api/v1/models?type=text",
+                "openrouter_chat_url": "https://openrouter.ai/api/v1/chat/completions"
+            })
+            .to_string(),
+        );
+        assert!(load_hosted_validate_fixtures(dir.path()).is_err());
+    }
+
+    #[test]
+    fn bridge_config_applies_loopback_chat_urls_without_rewriting_operator_config() {
+        let dir = tempfile::tempdir().unwrap();
+        super::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![
+                serde_json::json!({
+                    "id": "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "title": "Jev",
+                    "operation": "text.generate",
+                    "input_modalities": ["text/plain"],
+                    "output_modalities": ["text/plain"],
+                    "enabled": true,
+                    "adapter": {
+                        "kind": "open_ai_compatible_text",
+                        "api_url": "https://openrouter.ai/api/v1/chat/completions",
+                        "api_key": "sk-or-fixture-valid",
+                        "model": "fixture/model",
+                        "hosted": {
+                            "backend_provider_label": "OpenRouter",
+                            "selection_mode": "pinned",
+                            "privacy_policy_ref": "fixture:privacy:v1",
+                            "terms_ref": "fixture:terms:v1",
+                            "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "id": "model:hosted-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "title": "Venice",
+                    "operation": "text.generate",
+                    "input_modalities": ["text/plain"],
+                    "output_modalities": ["text/plain"],
+                    "enabled": true,
+                    "adapter": {
+                        "kind": "open_ai_compatible_text",
+                        "api_url": "https://api.venice.ai/api/v1/chat/completions",
+                        "api_key": "sk-vnz-fixture-valid",
+                        "model": "fixture/model",
+                        "hosted": {
+                            "backend_provider_label": "Venice",
+                            "selection_mode": "pinned",
+                            "privacy_policy_ref": "fixture:privacy:v1",
+                            "terms_ref": "fixture:terms:v1",
+                            "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                        }
+                    }
+                }),
+            ],
+        )
+        .unwrap();
+        write_validate_fixtures(
+            dir.path(),
+            &serde_json::json!({
+                "openrouter_models_url": "http://127.0.0.1:43721/openrouter/api/v1/models",
+                "venice_rate_limits_url": "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits",
+                "venice_models_url": "http://127.0.0.1:43721/venice/api/v1/models?type=text",
+                "openrouter_chat_url": "http://127.0.0.1:43721/openrouter/api/v1/chat/completions",
+                "venice_chat_url": "http://127.0.0.1:43721/venice/api/v1/chat/completions"
+            })
+            .to_string(),
+        );
+        let config = super::model_provider_bridge_config(dir.path()).unwrap();
+        let offers = config.extra["offers"].as_array().expect("offers");
+        let jev = offers
+            .iter()
+            .find(|offer| offer["title"] == "Jev")
+            .expect("Jev");
+        let venice = offers
+            .iter()
+            .find(|offer| offer["title"] == "Venice")
+            .expect("Venice");
+        assert_eq!(
+            jev["adapter"]["api_url"],
+            "http://127.0.0.1:43721/openrouter/api/v1/chat/completions"
+        );
+        assert_eq!(
+            venice["adapter"]["api_url"],
+            "http://127.0.0.1:43721/venice/api/v1/chat/completions"
+        );
+        let disk = std::fs::read_to_string(
+            dir.path()
+                .join("providers")
+                .join("model-provider")
+                .join("config.json"),
+        )
+        .unwrap();
+        assert!(disk.contains("https://openrouter.ai/api/v1/chat/completions"));
+        assert!(disk.contains("https://api.venice.ai/api/v1/chat/completions"));
+        assert!(!disk.contains("127.0.0.1:43721"));
+        assert!(!disk.contains("sk-or-fixture-valid"));
+        assert!(!disk.contains("sk-vnz-fixture-valid"));
+    }
+
+    #[test]
+    fn load_hosted_validate_fixtures_rejects_public_https() {
+        let dir = tempfile::tempdir().unwrap();
+        write_validate_fixtures(
+            dir.path(),
+            &fixtures_json(
+                "https://openrouter.ai/api/v1/models",
+                "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits",
+                "http://127.0.0.1:43721/venice/api/v1/models?type=text",
+            ),
+        );
+        assert!(load_hosted_validate_fixtures(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_hosted_validate_fixtures_rejects_non_loopback_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        write_validate_fixtures(
+            dir.path(),
+            &fixtures_json(
+                "http://8.8.8.8:80/openrouter/api/v1/models",
+                "http://127.0.0.1:43721/venice/api/v1/api_keys/rate_limits",
+                "http://127.0.0.1:43721/venice/api/v1/models?type=text",
+            ),
+        );
+        assert!(load_hosted_validate_fixtures(dir.path()).is_err());
     }
 }

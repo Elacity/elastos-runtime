@@ -149,7 +149,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
-  models: ["models", "use", "keep", "preparation"],
+  models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
   about: ["about", "device", "version", "source", "network", "did"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
@@ -178,6 +178,7 @@ async function boot() {
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
+  configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
   configureChainAccess();
@@ -677,6 +678,231 @@ async function onGuestRegistrationChange() {
     showGuestRegistrationStatus(String(error.message || error), "error");
   } finally {
     setGuestRegistrationControlState();
+  }
+}
+
+function configureAiProvider() {
+  const instancesNode = document.querySelector("#ai-provider-instances");
+  const addButton = document.querySelector("#ai-provider-add");
+  const formNode = document.querySelector("#ai-provider-form");
+  const nameInput = document.querySelector("#ai-provider-name");
+  const providerSelect = document.querySelector("#ai-provider-kind");
+  const keyInput = document.querySelector("#ai-provider-key");
+  const modelSelect = document.querySelector("#ai-provider-model");
+  const validateButton = document.querySelector("#ai-provider-validate");
+  const saveButton = document.querySelector("#ai-provider-save");
+  const cancelButton = document.querySelector("#ai-provider-cancel");
+  const veniceFact = document.querySelector("[data-ai-provider-venice-fact]");
+  if (!instancesNode || !addButton || !formNode || !nameInput || !providerSelect || !keyInput || !modelSelect || !validateButton || !saveButton || !cancelButton) {
+    return;
+  }
+  const selectedProvider = () => (providerSelect.value === "venice" ? "venice" : "openrouter");
+  let editingId = "";
+  let latestStatus = null;
+  const setBusy = (busy) => {
+    addButton.disabled = busy || !hasShellAccess();
+    nameInput.disabled = busy || !hasShellAccess();
+    providerSelect.disabled = busy || !hasShellAccess() || Boolean(editingId);
+    keyInput.disabled = busy || !hasShellAccess();
+    modelSelect.disabled = busy || !hasShellAccess();
+    validateButton.disabled = busy || !hasShellAccess();
+    saveButton.disabled = busy || !hasShellAccess();
+    cancelButton.disabled = busy;
+    instancesNode.querySelectorAll("button").forEach((button) => {
+      button.disabled = busy || !hasShellAccess();
+    });
+  };
+  const showState = (message, tone) => {
+    setTextFields("ai-provider-state", message);
+    for (const node of document.querySelectorAll('[data-field="ai-provider-state"]')) {
+      node.hidden = !message;
+      node.dataset.tone = tone || "";
+    }
+  };
+  const showPrivacy = (privacy) => {
+    const text = readText(privacy);
+    setTextFields("ai-provider-privacy", text ? `Discovered privacy: ${text}.` : "");
+    for (const node of document.querySelectorAll('[data-field="ai-provider-privacy"]')) {
+      node.hidden = !text;
+    }
+  };
+  const applyProviderChrome = () => {
+    if (veniceFact) veniceFact.hidden = selectedProvider() !== "venice";
+  };
+  const fillModels = (models, selected) => {
+    const values = [];
+    const privacyById = new Map();
+    for (const model of models) {
+      const id = typeof model === "string" ? readText(model) : readText(model && model.id);
+      if (!id || values.includes(id)) continue;
+      values.push(id);
+      const privacy = model && typeof model === "object" ? readText(model.privacy) : "";
+      if (privacy) privacyById.set(id, privacy);
+    }
+    const current = readText(selected);
+    if (current && !values.includes(current)) values.unshift(current);
+    modelSelect.replaceChildren();
+    for (const id of values) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = id;
+      option.dataset.privacy = privacyById.get(id) || "";
+      modelSelect.append(option);
+    }
+    if (current) modelSelect.value = current;
+    const selectedOption = modelSelect.selectedOptions[0];
+    showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
+  };
+  const hideForm = () => {
+    editingId = "";
+    formNode.hidden = true;
+    addButton.hidden = false;
+    nameInput.value = "";
+    keyInput.value = "";
+    providerSelect.value = "openrouter";
+    fillModels([], "");
+    applyProviderChrome();
+  };
+  const showForm = (instance) => {
+    formNode.hidden = false;
+    addButton.hidden = true;
+    editingId = instance && instance.id ? String(instance.id) : "";
+    nameInput.value = instance && instance.name ? String(instance.name) : "";
+    providerSelect.value = instance && instance.provider === "venice" ? "venice" : "openrouter";
+    keyInput.value = "";
+    fillModels([], instance && instance.selected_model ? instance.selected_model : "");
+    applyProviderChrome();
+    saveButton.textContent = editingId ? "Save" : "Save";
+  };
+  const renderInstances = (status) => {
+    const connections = status && Array.isArray(status.connections) ? status.connections : [];
+    instancesNode.replaceChildren();
+    for (const connection of connections) {
+      if (!connection || connection.connected !== true) continue;
+      const card = document.createElement("div");
+      card.className = "ai-provider-instance";
+      const title = document.createElement("p");
+      title.className = "pc2-card-label";
+      title.textContent = readText(connection.name) || "Hosted model";
+      const detail = document.createElement("p");
+      detail.className = "pc2-card-sublabel";
+      detail.textContent = `${readText(connection.processor_label) || "Hosted"} · ${readText(connection.selected_model)}`;
+      const actions = document.createElement("div");
+      actions.className = "system-inline-row";
+      const useButton = document.createElement("button");
+      useButton.className = "pc2-btn";
+      useButton.type = "button";
+      useButton.textContent = "Use in Assistant";
+      useButton.addEventListener("click", () => openCapsuleTarget("assistant"));
+      const shareButton = document.createElement("button");
+      shareButton.className = "pc2-btn pc2-btn-secondary";
+      shareButton.type = "button";
+      shareButton.textContent = connection.share_enabled ? "Shared as service" : "Share as service";
+      shareButton.addEventListener("click", () => openCapsuleTarget("services"));
+      const replaceButton = document.createElement("button");
+      replaceButton.className = "pc2-btn pc2-btn-secondary";
+      replaceButton.type = "button";
+      replaceButton.textContent = "Replace key";
+      replaceButton.addEventListener("click", () => {
+        showForm(connection);
+        showState(`Replace the key for ${readText(connection.name)}.`, "");
+      });
+      const disconnectButton = document.createElement("button");
+      disconnectButton.className = "pc2-btn pc2-btn-secondary";
+      disconnectButton.type = "button";
+      disconnectButton.textContent = "Disconnect";
+      disconnectButton.addEventListener("click", async () => {
+        if (!hasShellAccess()) return;
+        setBusy(true);
+        showState("", "");
+        try {
+          latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+            method: "DELETE",
+            headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: connection.id }),
+          });
+          hideForm();
+          renderInstances(latestStatus);
+          showState(`${readText(connection.name)} is disconnected.`, "");
+        } catch (error) {
+          showState(publicSystemError(error, "This Home could not disconnect that hosted model."), "error");
+        } finally {
+          setBusy(false);
+        }
+      });
+      actions.append(useButton, shareButton, replaceButton, disconnectButton);
+      card.append(title, detail, actions);
+      instancesNode.append(card);
+    }
+  };
+  const refreshStatus = async () => {
+    latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
+    renderInstances(latestStatus);
+    return latestStatus;
+  };
+  addButton.addEventListener("click", () => {
+    showForm(null);
+    showState("Name this hosted model, then Test and Save.", "");
+  });
+  cancelButton.addEventListener("click", () => {
+    hideForm();
+    showState("", "");
+  });
+  providerSelect.addEventListener("change", applyProviderChrome);
+  modelSelect.addEventListener("change", () => {
+    const selectedOption = modelSelect.selectedOptions[0];
+    showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
+  });
+  validateButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    showState("", "");
+    try {
+      const result = await fetchJson("/api/apps/system/ai-provider/validate", {
+        method: "POST",
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value }),
+      });
+      fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
+      showState("This key is valid.", "success");
+    } catch (error) {
+      showState(publicSystemError(error, "This key is invalid."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+  saveButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    showState("", "");
+    try {
+      const body = {
+        provider: selectedProvider(),
+        name: nameInput.value,
+        api_key: keyInput.value,
+        model: modelSelect.value,
+      };
+      if (editingId) body.id = editingId;
+      latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+        method: "POST",
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      hideForm();
+      renderInstances(latestStatus);
+      showState("This hosted model is saved on this Home.", "success");
+    } catch (error) {
+      showState(publicSystemError(error, "This Home could not save that hosted model."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+  hideForm();
+  setBusy(false);
+  if (hasShellAccess()) {
+    refreshStatus().catch((error) => {
+      showState(publicSystemError(error, "Hosted model status is unavailable."), "error");
+    });
   }
 }
 
