@@ -458,16 +458,6 @@
       flex: 0 1 auto;
     }
 
-    /* Transient status must never push the search and view controls. */
-    #status-text {
-      flex: 0 1 auto;
-      min-width: 0;
-      max-width: 220px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
     .toolbar-search {
       display: flex;
       align-items: center;
@@ -1030,6 +1020,14 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+
+    /* Transient status lives in the footer so it can never push toolbar
+       controls; it takes the spare middle space and truncates first. */
+    .statusbar #status-text {
+      flex: 1 1 auto;
+      text-align: center;
+      color: var(--muted);
     }
 
     .context-menu {

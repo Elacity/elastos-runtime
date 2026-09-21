@@ -35,7 +35,7 @@ export function createLibraryPreview({
       showProperties(object);
       return;
     }
-    setStatus(`Loading preview for ${object.name}...`);
+    setStatus("Loading preview...");
     const data = await providerApi("read", { uri: object.uri });
     const blob = base64ToBlob(data.data, data.object?.mime || object.mime);
     revokePreviewUrl();
