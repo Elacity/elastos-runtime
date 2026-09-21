@@ -4717,6 +4717,43 @@ async fn test_system_updates_home_background_image() {
         serde_json::json!(HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT)
     );
 
+    // The active Home GUI shell renders the desktop from an opaque frame and
+    // fetches the wallpaper with its own launch token.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let shell_image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shell_image.status(), StatusCode::OK);
+    let shell_image_body = axum::body::to_bytes(shell_image.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(shell_image_body.as_ref(), b"admin-image");
+
+    // Ordinary app capsules hold no appearance authority.
+    let app_token =
+        projection_launch_token_for_authority_context(dir.path(), "regular-app", &admin);
+    let app_image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", app_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(app_image.status(), StatusCode::FORBIDDEN);
+
     let overlay = app
         .clone()
         .oneshot(

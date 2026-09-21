@@ -6973,7 +6973,9 @@ pub(super) async fn home_background_image(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    // The active shell renders the desktop, so it holds the same appearance
+    // authority it already uses to write preferences.
+    let context = match require_home_active_shell_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return home_error_response(err),
     };
