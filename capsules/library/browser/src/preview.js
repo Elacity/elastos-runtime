@@ -35,7 +35,7 @@ export function createLibraryPreview({
       showProperties(object);
       return;
     }
-    setStatus(`Loading preview for ${object.name}...`);
+    setStatus("Loading preview...");
     const data = await providerApi("read", { uri: object.uri });
     const blob = base64ToBlob(data.data, data.object?.mime || object.mime);
     revokePreviewUrl();
@@ -76,7 +76,9 @@ export function createLibraryPreview({
     `;
     dialog.dataset.previewUri = object.uri;
     dialog.classList.remove("hidden");
-    setStatus(`Previewing ${object.name}.`);
+    // The dialog heading names the file; a toolbar message would only push
+    // the search and view controls out of place.
+    setStatus("");
   }
 
   return {

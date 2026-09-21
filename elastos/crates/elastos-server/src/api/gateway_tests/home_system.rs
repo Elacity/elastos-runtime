@@ -4717,6 +4717,43 @@ async fn test_system_updates_home_background_image() {
         serde_json::json!(HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT)
     );
 
+    // The active Home GUI shell renders the desktop from an opaque frame and
+    // fetches the wallpaper with its own launch token.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let shell_image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shell_image.status(), StatusCode::OK);
+    let shell_image_body = axum::body::to_bytes(shell_image.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(shell_image_body.as_ref(), b"admin-image");
+
+    // Ordinary app capsules hold no appearance authority.
+    let app_token =
+        projection_launch_token_for_authority_context(dir.path(), "regular-app", &admin);
+    let app_image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", app_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(app_image.status(), StatusCode::FORBIDDEN);
+
     let overlay = app
         .clone()
         .oneshot(
@@ -4801,6 +4838,14 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
+    // Home GUI loads the wallpaper from an opaque frame under COEP require-corp.
+    assert_eq!(
+        image
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
+    );
     let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -4824,6 +4869,13 @@ async fn test_system_updates_home_background_image() {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
         Some("image/jpeg")
+    );
+    assert_eq!(
+        guest_image
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
     );
     let guest_image_body = axum::body::to_bytes(guest_image.into_body(), usize::MAX)
         .await
@@ -4921,6 +4973,152 @@ async fn test_system_updates_home_background_image() {
         .await
         .unwrap();
     assert_eq!(guest_image_after_admin_reset.status(), StatusCode::OK);
+}
+
+/// Stores `bytes` as a protected object at `<principal root>/<relative>`,
+/// the way Library saves a picture.
+fn write_home_principal_object_bytes_for_authority(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    relative: &str,
+    bytes: &[u8],
+) -> String {
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{localhost_root}/{relative}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    crate::auth::create_owner_only_dir_all(data_dir, path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+        &uri,
+        &path,
+        bytes,
+    )
+    .unwrap();
+    uri
+}
+
+const PNG_SIGNATURE_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nlibrary-picture";
+
+#[tokio::test]
+async fn test_home_sets_background_image_from_own_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let _admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let _guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/hills.png",
+        PNG_SIGNATURE_BYTES,
+    );
+    let text_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Documents/notes.txt",
+        b"not an image",
+    );
+    let guest_picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &guest,
+        "Pictures/guest.png",
+        PNG_SIGNATURE_BYTES,
+    );
+
+    let set_background = |token: String, source_uri: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                    .method("POST")
+                    .uri("/api/apps/home/appearance/background-image")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "source_uri": source_uri }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Library only expresses the intent; it never holds appearance authority.
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), "library", &admin);
+    let from_library = set_background(library_token, picture_uri.clone()).await;
+    assert_eq!(from_library.status(), StatusCode::FORBIDDEN);
+
+    let foreign = set_background(admin.home_token.clone(), guest_picture_uri).await;
+    assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
+    let not_image = set_background(admin.home_token.clone(), text_uri).await;
+    assert_eq!(not_image.status(), StatusCode::BAD_REQUEST);
+    let not_localhost = set_background(
+        admin.home_token.clone(),
+        "elastos://bafy/hills.png".to_string(),
+    )
+    .await;
+    assert_eq!(not_localhost.status(), StatusCode::BAD_REQUEST);
+    let missing = set_background(
+        admin.home_token.clone(),
+        format!(
+            "{}/Pictures/missing.png",
+            crate::auth::principal_localhost_root(&admin.principal_id)
+        ),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let updated = set_background(admin.home_token.clone(), picture_uri).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated_body = axum::body::to_bytes(updated.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let updated_payload: serde_json::Value = serde_json::from_slice(&updated_body).unwrap();
+    let background_url = updated_payload["background_image_url"]
+        .as_str()
+        .expect("background url");
+    assert!(
+        background_url.starts_with("/api/apps/home/appearance/background-image?scope="),
+        "{background_url}"
+    );
+
+    // The wallpaper the shell fetches is the object's bytes with a sniffed type.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image.status(), StatusCode::OK);
+    assert_eq!(
+        image
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(image_body.as_ref(), PNG_SIGNATURE_BYTES);
 }
 
 #[tokio::test]

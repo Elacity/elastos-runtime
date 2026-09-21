@@ -17,6 +17,7 @@ import {
   toolbarInboxButton,
   toolbarSignOutButton,
   ensureHomeGuiDom,
+  fetchBlob,
   initializeRecentTargets,
   initializeShellLayout,
   rememberSharedUiPreferences,
@@ -884,11 +885,52 @@ export function syncHomeGuiAppearance(summary) {
   }
   desktopBackdrop.dataset.overlay = overlayEnabled ? "true" : "false";
   desktopBackdrop.style.setProperty("--desktop-overlay-opacity", String(overlayOpacity));
-  if (!imageUrl) {
-    desktopBackdrop.style.removeProperty("--desktop-wallpaper");
+  void applyDesktopWallpaper(imageUrl);
+}
+
+// The summary URL carries `v=` so it changes whenever the user uploads or
+// resets the image; that string is the cache key for the loaded object URL.
+const wallpaperLoad = { sourceUrl: "", objectUrl: "" };
+
+function clearDesktopWallpaper() {
+  desktopBackdrop.style.removeProperty("--desktop-wallpaper");
+  if (wallpaperLoad.objectUrl) {
+    URL.revokeObjectURL(wallpaperLoad.objectUrl);
+  }
+  wallpaperLoad.objectUrl = "";
+}
+
+async function applyDesktopWallpaper(imageUrl) {
+  if (wallpaperLoad.sourceUrl === imageUrl) {
     return;
   }
-  desktopBackdrop.style.setProperty("--desktop-wallpaper", `url("${imageUrl}")`);
+  wallpaperLoad.sourceUrl = imageUrl;
+  if (!imageUrl) {
+    clearDesktopWallpaper();
+    return;
+  }
+  let objectUrl = "";
+  try {
+    objectUrl = URL.createObjectURL(await fetchBlob(imageUrl));
+  } catch (error) {
+    // Fail closed to the default wallpaper instead of a broken image. The
+    // source URL stays recorded so summary refreshes do not retry until the
+    // Runtime advertises a new image version.
+    if (wallpaperLoad.sourceUrl === imageUrl) {
+      clearDesktopWallpaper();
+    }
+    console.warn("home-gui wallpaper unavailable", error);
+    return;
+  }
+  if (wallpaperLoad.sourceUrl !== imageUrl) {
+    URL.revokeObjectURL(objectUrl);
+    return;
+  }
+  if (wallpaperLoad.objectUrl) {
+    URL.revokeObjectURL(wallpaperLoad.objectUrl);
+  }
+  wallpaperLoad.objectUrl = objectUrl;
+  desktopBackdrop.style.setProperty("--desktop-wallpaper", `url("${objectUrl}")`);
 }
 
 function targetsChanged(previous, next) {

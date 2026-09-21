@@ -957,6 +957,52 @@ function acceptAppearance(appearance) {
   return true;
 }
 
+// System runs in an opaque sandboxed frame, so a CSS url() cannot carry the
+// Home session. Fetch the wallpaper with the launch token like every other
+// System request; the versioned summary URL is the cache key.
+const backgroundPreviewLoad = { sourceUrl: "", objectUrl: "" };
+
+function showDefaultBackgroundPreview() {
+  backgroundPreview.style.backgroundImage = `url("${DEFAULT_BACKGROUND_IMAGE_URL}")`;
+  if (backgroundPreviewLoad.objectUrl) {
+    URL.revokeObjectURL(backgroundPreviewLoad.objectUrl);
+  }
+  backgroundPreviewLoad.objectUrl = "";
+}
+
+async function applyBackgroundPreview(imageUrl) {
+  if (backgroundPreviewLoad.sourceUrl === imageUrl) {
+    return;
+  }
+  backgroundPreviewLoad.sourceUrl = imageUrl;
+  if (!imageUrl) {
+    showDefaultBackgroundPreview();
+    return;
+  }
+  let objectUrl = "";
+  try {
+    const response = await fetch(imageUrl, { headers: { "x-elastos-home-token": apiHomeToken } });
+    if (!response.ok) {
+      throw new Error(`request failed: ${response.status}`);
+    }
+    objectUrl = URL.createObjectURL(await response.blob());
+  } catch (_error) {
+    if (backgroundPreviewLoad.sourceUrl === imageUrl) {
+      showDefaultBackgroundPreview();
+    }
+    return;
+  }
+  if (backgroundPreviewLoad.sourceUrl !== imageUrl) {
+    URL.revokeObjectURL(objectUrl);
+    return;
+  }
+  if (backgroundPreviewLoad.objectUrl) {
+    URL.revokeObjectURL(backgroundPreviewLoad.objectUrl);
+  }
+  backgroundPreviewLoad.objectUrl = objectUrl;
+  backgroundPreview.style.backgroundImage = `url("${objectUrl}")`;
+}
+
 function applyAppearance(appearance) {
   if (!appearance) {
     return;
@@ -968,8 +1014,8 @@ function applyAppearance(appearance) {
   window.elastosTheme?.setAccentCustom?.(appearance.accent_custom);
   window.elastosTheme?.setAccent?.(appearance.accent);
   if (backgroundPreview) {
-    backgroundPreview.style.backgroundImage = `url("${imageUrl || DEFAULT_BACKGROUND_IMAGE_URL}")`;
     backgroundPreview.dataset.empty = imageUrl ? "false" : "true";
+    void applyBackgroundPreview(imageUrl);
   }
   if (backgroundResetButton) {
     backgroundResetButton.disabled = !hasShellAccess() || imageUrl.length === 0;
