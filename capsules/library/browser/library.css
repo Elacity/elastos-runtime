@@ -458,6 +458,16 @@
       flex: 0 1 auto;
     }
 
+    /* Transient status must never push the search and view controls. */
+    #status-text {
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 220px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
     .toolbar-search {
       display: flex;
       align-items: center;
@@ -729,6 +739,19 @@
       max-width: 15px;
       max-height: 15px;
       display: block;
+    }
+
+    /* Image files show their own thumbnail in place of the generic icon. */
+    .item--thumbnail .file-icon img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: 3px;
+    }
+
+    .content[data-view="grid"] .item--thumbnail .file-icon {
+      overflow: hidden;
+      border-radius: 4px;
     }
 
     .item-name {
