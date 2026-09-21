@@ -514,6 +514,17 @@ code {
   border: 0;
 }
 
+/* The browser refocuses a file input when its picker closes and scrolls the
+   nearest scrollable ancestors to reveal it — including overflow:hidden
+   .settings-container, which shifts the whole window. Anchoring the input to
+   the viewport means it is always "in view" and nothing has to scroll. */
+input[type="file"].visually-hidden {
+  position: fixed;
+  top: 0;
+  left: 0;
+  margin: 0;
+}
+
 .system-file-button {
   display: inline-flex;
   align-items: center;
