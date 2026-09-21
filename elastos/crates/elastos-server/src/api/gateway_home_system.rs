@@ -6992,15 +6992,30 @@ pub(super) async fn home_background_image(
     ) {
         Ok(bytes) => {
             let mut response = bytes.into_response();
-            response.headers_mut().insert(
+            let headers = response.headers_mut();
+            headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static(entry.content_type),
+            );
+            // Home GUI renders the wallpaper from an opaque sandboxed frame under
+            // the gateway's COEP `require-corp`. Without this header the browser
+            // blocks the image even though the bytes were served.
+            headers.insert(
+                axum::http::HeaderName::from_static("cross-origin-resource-policy"),
+                HeaderValue::from_static(HOME_BACKGROUND_IMAGE_RESOURCE_POLICY),
+            );
+            headers.insert(
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
             );
             response
         }
         Err(err) => home_error_response(anyhow::anyhow!(err)),
     }
 }
+
+/// Matches the capsule asset route so wallpaper bytes pass the same COEP check.
+pub(super) const HOME_BACKGROUND_IMAGE_RESOURCE_POLICY: &str = "cross-origin";
 
 #[cfg(test)]
 mod home_realtime_tests {

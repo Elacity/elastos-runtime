@@ -4801,6 +4801,14 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
+    // Home GUI loads the wallpaper from an opaque frame under COEP require-corp.
+    assert_eq!(
+        image
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
+    );
     let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -4824,6 +4832,13 @@ async fn test_system_updates_home_background_image() {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
         Some("image/jpeg")
+    );
+    assert_eq!(
+        guest_image
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
     );
     let guest_image_body = axum::body::to_bytes(guest_image.into_body(), usize::MAX)
         .await
