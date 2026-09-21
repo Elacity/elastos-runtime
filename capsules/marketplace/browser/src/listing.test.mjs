@@ -46,6 +46,7 @@ function objectFixture(overrides = {}) {
     seller_address: "0xab5028bdbb0826ad6f1885478e421db677b0001a",
     token_id: "0x66a0fd4edeb6869c2cc3168145f8010117f11f244df754600f5fea05958134ac",
     published_at: 1789656297,
+    purchase_in_flight: false,
     availability: availabilityFixture(),
     access_state: "available",
     ...overrides,
@@ -87,6 +88,14 @@ test("an object row Runtime publishes today is accepted, empty codecs and all", 
   assert.equal(listing.codecs, "");
   assert.equal(listing.displayName, "1409899-uhd_3840_2160_25fps.png");
   assert.equal(listing.listingUri, "elastos://QmcHh9eQuLiisfxZo4m4TxaVTSYzs4AF4LaVcmkd2o2Y76");
+});
+
+test("a purchase already under way survives the page that started it", () => {
+  const idle = parseRuntimeCustodyListing(objectFixture());
+  assert.equal(idle.purchaseInFlight, false);
+  const running = parseRuntimeCustodyListing(objectFixture({ purchase_in_flight: true }));
+  assert.equal(running.purchaseInFlight, true);
+  assert.equal(running.accessState, "available", "it is not theirs until it settles");
 });
 
 test("the availability receipt digest is accepted and stays out of the rendered row", () => {
@@ -133,6 +142,7 @@ test("a field Runtime always sends may not go missing", () => {
     "seller_address",
     "token_id",
     "published_at",
+    "purchase_in_flight",
     "availability",
     "access_state",
   ]) {
@@ -153,6 +163,7 @@ test("values that could mislead a buyer are refused", () => {
     ["a kind Runtime does not publish", { content_kind: "document" }],
     ["an empty kind", { content_kind: "" }],
     ["a link that is not a listing link", { listing_uri: "https://example.com/listing" }],
+    ["a purchase state that is not a fact", { purchase_in_flight: "yes" }],
     ["display name with a control character", { display_name: "one\u0007two" }],
     ["empty display name", { display_name: "" }],
   ];

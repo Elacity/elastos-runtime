@@ -34,6 +34,7 @@ import {
   // page stays open, and pressing Buy again after a reload resumes the same
   // attempt rather than starting a second one.
   const pendingMediaBuys = new Map();
+  const pendingDownloads = new Set();
   let importInFlight = false;
   const BUY_POLL_MS = 4000;
   const BUY_POLL_BUDGET_MS = 15 * 60 * 1000;
@@ -798,7 +799,11 @@ import {
 
   function buyStateNoteMarkup(listing) {
     const buyState = pendingMediaBuys.get(listing.mintId);
-    const note = buyState ? buyStateNote(buyState) : "";
+    const note = buyState
+      ? buyStateNote(buyState)
+      : (listing.accessState === "available" && listing.purchaseInFlight
+        ? "A purchase of this is already under way."
+        : "");
     return note ? `<span class="store-row-fact store-row-buy-note">${escapeHtml(note)}</span>` : "";
   }
 
@@ -811,6 +816,13 @@ import {
   function mediaActionButton(listing) {
     const mint = escapeAttr(listing.mintId);
     const buyState = listing.accessState === "available" ? pendingMediaBuys.get(listing.mintId) : null;
+    // A purchase Runtime is still holding, from a visit this page does not
+    // remember. Pressing Continue resumes that attempt rather than starting a
+    // second one, and the terms it was started on are already fixed by the
+    // record, so it does not ask for them again.
+    if (!buyState && listing.accessState === "available" && listing.purchaseInFlight) {
+      return `<button class="store-pill" type="button" data-action="resume-buy" data-mint="${mint}">Continue</button>`;
+    }
     if (buyState) {
       // Whose turn it is decides what the control does. When it is the
       // person's, the control takes them to the wallet holding the request;
@@ -826,12 +838,21 @@ import {
     const action = listing.accessState === "available" ? "buy-media" : "open-media";
     const label = listing.accessState === "available" ? "Buy" : "Open";
     const open = `<button class="store-pill" type="button" data-action="${escapeAttr(action)}" data-mint="${mint}">${label}</button>`;
-    // Only the person who listed it has anything to pass on. A buyer's copy is
-    // theirs to open, and the link belongs to whoever is selling.
-    if (listing.accessState !== "creator") {
+    if (listing.accessState === "available") {
       return open;
     }
-    return `<button class="store-pill" type="button" data-action="share-listing" data-mint="${mint}">Share</button>${open}`;
+    // An owned copy can always be built again: the chain says it is theirs and
+    // the file is made of material anyone can fetch. So the person who holds it
+    // is offered that, whether the copy never arrived or they deleted it.
+    const download = pendingDownloads.has(listing.mintId)
+      ? `<button class="store-pill" type="button" data-action="download-copy" data-mint="${mint}" disabled aria-busy="true">Downloading...</button>`
+      : `<button class="store-pill" type="button" data-action="download-copy" data-mint="${mint}">Download</button>`;
+    // Only the person who listed it has anything to pass on. A bought copy is
+    // theirs to open, and the link belongs to whoever is selling.
+    const share = listing.accessState === "creator"
+      ? `<button class="store-pill" type="button" data-action="share-listing" data-mint="${mint}">Share</button>`
+      : "";
+    return `${share}${download}${open}`;
   }
 
   // What the row says while a purchase settles. Each stage is a different fact
@@ -1293,6 +1314,27 @@ import {
     }
   }
 
+  // Ask Runtime to build this copy again. It reads the chain to see the item is
+  // theirs, fetches the metadata the token URI points at and the content the
+  // listing names, and files the result where the person will find it. Nothing
+  // here decides ownership, and nothing here is a second way to get a copy.
+  async function downloadOwnedCopy(mintId) {
+    if (!RUNTIME_CUSTODY_MINT_ID.test(mintId) || pendingDownloads.has(mintId)) {
+      return;
+    }
+    pendingDownloads.add(mintId);
+    render();
+    try {
+      await postObjectProvider("download_owned_copy", { mint_id: mintId });
+      showToast("Downloaded. The copy is in your Library.", false);
+    } catch (error) {
+      showToast(publicError(error.message, "That copy could not be downloaded."), true);
+    } finally {
+      pendingDownloads.delete(mintId);
+      render();
+    }
+  }
+
   function setBuyState(mintId, outcome) {
     pendingMediaBuys.set(mintId, outcome);
     render();
@@ -1371,6 +1413,12 @@ import {
         }
         if (action === "share-listing") {
           showShareListing(target.dataset.mint);
+        }
+        if (action === "resume-buy") {
+          buyMedia(target.dataset.mint);
+        }
+        if (action === "download-copy") {
+          downloadOwnedCopy(target.dataset.mint);
         }
         if (action === "open-media") {
           openMedia(target.dataset.mint);

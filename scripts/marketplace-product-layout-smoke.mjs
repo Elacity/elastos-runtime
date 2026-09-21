@@ -59,6 +59,7 @@ function mediaListing({ mintId, displayName, accessState, quantity, price, codec
     seller_address: mediaSellerAddress,
     token_id: mediaTokenId,
     published_at: 1_756_293_600,
+    purchase_in_flight: false,
     availability: mediaAvailability,
     access_state: accessState,
   };
@@ -364,6 +365,16 @@ function startServer() {
           quantity: "0x4",
           price: "0x8",
         }),
+        {
+          ...mediaListing({
+            mintId: mediaImportedMint,
+            displayName: "Half-bought Video",
+            accessState: "available",
+            quantity: "0x5",
+            price: "0x9",
+          }),
+          purchase_in_flight: true,
+        },
       ],
     },
   };
@@ -511,6 +522,21 @@ function startServer() {
           return;
         }
         json(response, { status: "ok", data: mediaListResponse(state[token]?.mediaListings || []) });
+        return;
+      }
+      if (url.pathname === "/api/provider/object/download_owned_copy") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        const body = await readJsonBody(request);
+        requestLog.push({ path: url.pathname, token, method: request.method, body });
+        json(response, {
+          status: "ok",
+          data: {
+            schema: "elastos.library.runtime-custody-download/v1",
+            mint_id: body?.mint_id,
+            capsule_uri: "localhost://Users/test/Pictures/Owned Video.ddrm",
+            acquisition: "bought",
+          },
+        });
         return;
       }
       if (url.pathname === "/api/provider/object/import_runtime_custody") {
@@ -1032,6 +1058,23 @@ async function run() {
     await waitForFrameWidth(frame, 640);
     await assertNoHorizontalOverflow(frame, "narrow Marketplace layout");
 
+    // A copy someone owns can be built again, whether it never arrived or was
+    // deleted. The control belongs to copies they hold and to nothing else.
+    const downloadsBefore = requestLog.filter(
+      (entry) => entry.path === "/api/provider/object/download_owned_copy",
+    ).length;
+    await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="download-copy"]`).click();
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/download_owned_copy", downloadsBefore + 1);
+    const downloadRequest = requestLog.find(
+      (entry) => entry.path === "/api/provider/object/download_owned_copy",
+    );
+    assert(
+      downloadRequest?.method === "POST"
+        && JSON.stringify(downloadRequest.body) === JSON.stringify({ mint_id: mediaPurchasedMint }),
+      "Download must ask Runtime to rebuild exactly the copy the row names",
+      downloadRequest,
+    );
+
     // The person who listed an item has a link to pass on. It is the other
     // half of Add a listing: without it, reaching an item on another Home
     // meant already knowing its address.
@@ -1073,6 +1116,21 @@ async function run() {
       (await pendingBuyFrame.locator(".store-error-card").count()) === 0,
       "A purchase in progress must not be reported as a failed surface",
     );
+    // A purchase Runtime is still holding, from a visit this page does not
+    // remember. The row says so and offers to carry on rather than looking
+    // untouched, which is what it did before.
+    assert(
+      (await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="download-copy"]`).count()) === 0,
+      "An item on offer is not a copy to download",
+    );
+    const resumeRowText = await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaImportedMint}"]`).textContent();
+    assert(
+      /Continue/.test(resumeRowText || "")
+        && /A purchase of this is already under way/.test(resumeRowText || ""),
+      "A purchase already under way must survive the page that started it",
+      { resumeRowText },
+    );
+
     const walletOpensBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
     await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="open-wallet"]`).click();
     const walletMessages = await readHomeMessages(page);

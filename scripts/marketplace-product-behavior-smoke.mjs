@@ -131,6 +131,17 @@ assert(
   "The listing parser must accept exactly what Runtime publishes for both media and object rows, with tests that say so.",
 );
 assert(
+  // An owned copy can always be built again: the chain says whose it is, and
+  // the file is made of material anyone can fetch. So a person who holds one
+  // is offered that, whether the copy never arrived or they deleted it.
+  js.includes('postObjectProvider("download_owned_copy", { mint_id: mintId })')
+    && js.includes("async function downloadOwnedCopy(mintId) {")
+    && js.includes('data-action="download-copy"')
+    && js.includes("const pendingDownloads = new Set();")
+    && js.includes('if (listing.accessState === "available") {'),
+  "Marketplace must let a person rebuild a copy they own, and offer it only on copies they own.",
+);
+assert(
   // The other half of adding a listing: the person who listed it has the link
   // to pass on. Runtime has answered with it since listings existed and no
   // surface showed it, so reaching an item on another Home meant already
@@ -174,6 +185,19 @@ assert(
     && js.includes("abbreviateAddress(listing.sellerAddress)")
     && js.includes("showBuyConfirmation(target.dataset.mint)"),
   "Marketplace must show a purchase's terms, and what follows them, before it spends anything.",
+);
+assert(
+  // A purchase lives in Runtime, not in the page that started it. Saying so is
+  // its own field rather than another access_state value, because a new value
+  // falls silently into a consumer's default while an unknown field is refused
+  // loudly by the parser on the other side of this contract.
+  listingJs.includes('"purchase_in_flight",')
+    && listingJs.includes("purchaseInFlight: value.purchase_in_flight,")
+    && js.includes('data-action="resume-buy"')
+    && js.includes("listing.purchaseInFlight")
+    && js.includes("A purchase of this is already under way.")
+    && listingTests.includes("a purchase already under way survives the page that started it"),
+  "Marketplace must show a purchase that is still under way after the page that started it has gone.",
 );
 assert(
   // A purchase is a sequence of waits. The app reads which one it is in from

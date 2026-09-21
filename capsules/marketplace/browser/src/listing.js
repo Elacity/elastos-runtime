@@ -61,6 +61,7 @@ const LISTING_KEYS = [
   "pay_token",
   "price",
   "published_at",
+  "purchase_in_flight",
   "quantity",
   "schema",
   "seller_address",
@@ -139,6 +140,12 @@ export function parseRuntimeCustodyListing(value) {
   // An object has no codecs and Runtime sends the empty string for it, so this
   // is the one public text field where empty is the producer's own answer.
   const codecs = boundedText(value.codecs, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
+  // A purchase this person started and has not finished. It is a fact about
+  // them and this item, not about the listing, and it survives the page that
+  // started it.
+  if (typeof value.purchase_in_flight !== "boolean") {
+    throw new Error("invalid protected item purchase state");
+  }
   const quantity = boundedString(value.quantity, 66);
   const price = boundedString(value.price, 66);
   const payToken = boundedString(value.pay_token, 42);
@@ -169,6 +176,7 @@ export function parseRuntimeCustodyListing(value) {
     payToken,
     price,
     publishedAt,
+    purchaseInFlight: value.purchase_in_flight,
     quantity,
     sellerAddress,
     tokenId,

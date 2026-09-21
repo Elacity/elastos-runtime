@@ -272,6 +272,10 @@ fn object_operation_action(op: &str) -> Option<Action> {
         | "read_viewer"
         | "close_viewer" => Some(Action::Read),
         "import_runtime_custody" => Some(Action::Write),
+        // Rebuilding an owned copy writes a file and spends nothing. What
+        // makes it safe is the chain read at its door, not the authority it
+        // asks for here.
+        "download_owned_copy" => Some(Action::Write),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
         | "unpublish" | "repair" | "share" => Some(Action::Write),
         // `buy` spends the user's money: it must never be satisfied by a
@@ -411,6 +415,7 @@ fn object_resource(op: &str) -> Result<String, String> {
             "list_runtime_custody",
             "import_runtime_custody",
             "buy",
+            "download_owned_copy",
             "open_viewer",
             "read_viewer",
             "close_viewer",

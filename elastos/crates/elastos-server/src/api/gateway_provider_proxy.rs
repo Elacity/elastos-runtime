@@ -211,6 +211,64 @@ fn runtime_custody_buy_progress(
         .context(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE)
 }
 
+/// Download refuses for one reason a person can act on -- the copy is not
+/// theirs -- and fails closed for everything else, with the cause in the log.
+macro_rules! download_denied {
+    () => {
+        |error| {
+            tracing::warn!(
+                line = line!(),
+                error = ?error,
+                "Runtime custody download denied without an owned copy"
+            );
+            anyhow::anyhow!("{:?}", error)
+                .context(format!("{}:{}", file!(), line!()))
+                .context(crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE)
+        }
+    };
+}
+
+macro_rules! download_denied_missing {
+    () => {
+        || {
+            tracing::warn!(
+                line = line!(),
+                "Runtime custody download denied without an owned copy"
+            );
+            anyhow::anyhow!("{}:{}", file!(), line!())
+                .context(crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE)
+        }
+    };
+}
+
+macro_rules! download_unavailable {
+    () => {
+        |error| {
+            tracing::warn!(
+                line = line!(),
+                error = ?error,
+                "Runtime custody download failed closed"
+            );
+            anyhow::anyhow!("{:?}", error)
+                .context(format!("{}:{}", file!(), line!()))
+                .context(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_UNAVAILABLE_MESSAGE,
+                )
+        }
+    };
+}
+
+macro_rules! download_unavailable_missing {
+    () => {
+        || {
+            tracing::warn!(line = line!(), "Runtime custody download failed closed");
+            anyhow::anyhow!("{}:{}", file!(), line!()).context(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_UNAVAILABLE_MESSAGE,
+            )
+        }
+    };
+}
+
 /// Same operator-log discipline for the buyer side: "purchase is denied
 /// before buy" is one opaque message over many fail-closed preconditions.
 macro_rules! purchase_denied {
@@ -1743,7 +1801,9 @@ pub(super) async fn gateway_provider_proxy(
                 &[ELACITY_PLAYER_CAPSULE_ID, ELACITY_READER_CAPSULE_ID]
             }
             "import_runtime_custody" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
-            "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
+            "list_runtime_custody" | "buy" | "download_owned_copy" => {
+                &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID]
+            }
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -2046,15 +2106,17 @@ pub(super) async fn gateway_provider_proxy(
         && (library_operation_needs_runtime_coordinator(&op)
             || library_request_targets_webspace(&request))
     {
-        let wallet_authority =
-            if (op == "publish" && request.get("protection").is_some()) || op == "buy" {
-                match runtime_wallet_authority(&required) {
-                    Ok(authority) => Some(authority),
-                    Err(err) => return gateway_provider_error_response(&scheme, err),
-                }
-            } else {
-                None
-            };
+        let wallet_authority = if (op == "publish" && request.get("protection").is_some())
+            || op == "buy"
+            || op == "download_owned_copy"
+        {
+            match runtime_wallet_authority(&required) {
+                Ok(authority) => Some(authority),
+                Err(err) => return gateway_provider_error_response(&scheme, err),
+            }
+        } else {
+            None
+        };
         crate::library::handle_object_provider_runtime_request_with_gateway(
             &state.data_dir,
             Arc::clone(&registry),
@@ -3621,6 +3683,91 @@ pub(crate) async fn runtime_custody_publish_object_via_gateway(
         .await
 }
 
+/// Rebuild the local copy of an item this principal owns.
+///
+/// The `.ddrm` capsule is made of public material — the metadata document the
+/// token URI resolves to, and the content the listing names — so the only
+/// question is whether the copy is theirs to hold. That answer lives on the
+/// chain and nowhere else: the access token, read at the head block for the
+/// wallet account this principal transacts with. A purchase record on this Home
+/// is neither necessary nor sufficient, which is the point. It is not necessary
+/// because someone who bought on one Home owns the same token on another, and
+/// it is not sufficient because a record is local state and the grant is not.
+///
+/// Buying and minting both write the capsule already. This exists because
+/// neither offers a way to ask again: a write that failed, a file since
+/// deleted, or a Home that has never held the copy all end in the same place,
+/// with a person who owns something they cannot see.
+pub(crate) async fn runtime_custody_download_owned_copy_via_gateway(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    registry: Arc<ProviderRegistry>,
+    input: crate::protected_content_runtime::RuntimeCustodyBuyInput,
+) -> anyhow::Result<serde_json::Value> {
+    let mint_id = hex::decode(&input.mint_id)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(Digest32::new)
+        .ok_or_else(download_denied_missing!())?;
+    let listing_record =
+        crate::protected_content_runtime::load_runtime_custody_listing(&state.data_dir, mint_id)?
+            .ok_or_else(download_denied_missing!())?;
+    let listing = &listing_record.package;
+    let owner_account =
+        resolve_runtime_custody_buyer_account(state, authority, &listing.chain_namespace)
+            .await
+            .map_err(download_denied!())?;
+    let access = resolve_runtime_custody_purchase_access(
+        state,
+        listing,
+        &owner_account,
+        // The listing's own content access id, which is the value the chain
+        // binds the grant to. `import_runtime_custody` verified it against the
+        // package before this listing could exist here.
+        &listing.content_access_id,
+        &format!("download-access:{}", input.mint_id),
+    )
+    .await
+    .map_err(download_unavailable!())?;
+    if access.is_none() {
+        tracing::warn!(
+            line = line!(),
+            mint_id = %input.mint_id,
+            "runtime custody download: the chain does not grant this account the copy"
+        );
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE);
+    }
+    // What the copy says about how it was acquired comes from the record when
+    // this Home has one, because that is the fact it already wrote down. A Home
+    // that has never held the copy has nothing to say about how the token was
+    // come by, and the chain does not carry that either, so it records a
+    // purchase -- the only acquisition it can witness from here.
+    let acquisition = crate::protected_content_runtime::load_runtime_custody_purchase(
+        &state.data_dir,
+        &input.principal_id,
+        mint_id,
+    )?
+    .map_or(
+        crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Bought,
+        |purchase| purchase.acquisition,
+    );
+    let capsule_uri = write_runtime_custody_owned_capsule(
+        state,
+        registry.as_ref(),
+        listing,
+        &input.principal_id,
+        acquisition,
+    )
+    .await
+    .ok_or_else(download_unavailable_missing!())?;
+    Ok(serde_json::json!({
+        "schema": crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_SCHEMA_V1,
+        "mint_id": input.mint_id,
+        "capsule_uri": capsule_uri,
+        "acquisition": acquisition.wire_value(),
+    }))
+}
+
 pub(crate) async fn runtime_custody_buy_via_gateway(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
@@ -5174,6 +5321,7 @@ fn library_operation_needs_runtime_coordinator(op: &str) -> bool {
             | "list_runtime_custody"
             | "import_runtime_custody"
             | "buy"
+            | "download_owned_copy"
             | "open_viewer"
             | "read_viewer"
             | "close_viewer"

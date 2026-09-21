@@ -296,6 +296,10 @@ pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE: &str =
     "Runtime custody purchase target is not bound on chain";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody purchase is unavailable";
+pub(crate) const RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE: &str =
+    "Runtime custody download is denied without an owned copy";
+pub(crate) const RUNTIME_CUSTODY_DOWNLOAD_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody download is unavailable";
 pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
     "Runtime custody open is denied before purchase";
 pub(crate) const RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE: &str =
@@ -8073,6 +8077,20 @@ pub(crate) enum RuntimeCustodyAcquisitionV1 {
     Minted,
 }
 
+impl RuntimeCustodyAcquisitionV1 {
+    /// How a copy says it was come by, in the spelling its record carries.
+    pub(crate) const fn wire_value(self) -> &'static str {
+        match self {
+            Self::Bought => "bought",
+            Self::Minted => "minted",
+        }
+    }
+}
+
+/// Wire identity of the answer to a request to rebuild an owned copy.
+pub(crate) const RUNTIME_CUSTODY_DOWNLOAD_SCHEMA_V1: &str =
+    "elastos.library.runtime-custody-download/v1";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCustodyPurchaseRecord {
@@ -8593,6 +8611,8 @@ fn runtime_custody_listing_summary(
 ) -> anyhow::Result<Value> {
     let availability = runtime_custody_listing_availability(record);
     let access_state = runtime_custody_listing_access_state(data_dir, principal_id, record)?;
+    let purchase_in_flight =
+        runtime_custody_listing_purchase_in_flight(data_dir, principal_id, record)?;
     let content_identity = record.package.decode_and_validate()?.content_identity;
     // `mime_type`/`codecs` keep their exact media values (the listing summary
     // is a pre-existing public shape); an object listing reports its declared
@@ -8624,6 +8644,12 @@ fn runtime_custody_listing_summary(
         "published_at": record.package.published_at,
         "availability": availability,
         "access_state": access_state,
+        // A purchase this person started and has not finished. It is its own
+        // field rather than another `access_state`, because a state is a value
+        // consumers switch on and a new one falls silently into whatever their
+        // default does -- while an unknown FIELD is refused loudly by the
+        // parser on the other side of this contract.
+        "purchase_in_flight": purchase_in_flight,
     }))
 }
 
@@ -8638,6 +8664,33 @@ fn runtime_custody_listing_availability(record: &RuntimeCustodyListingRecord) ->
         "recheck_before_buy": true,
         "recheck_before_open": true,
     })
+}
+
+/// Whether this person has a purchase of this item under way.
+///
+/// A purchase lives in Runtime, not in the page that started it, so closing
+/// Marketplace or reloading it leaves the attempt running and the row looking
+/// untouched. Pressing Buy again resumes the same attempt against the same
+/// effect rather than starting a second one, which is safe but invisible --
+/// and a person who cannot see that their purchase is still going has no way
+/// to tell it from one that never started.
+///
+/// A record that has reached `Complete` is not in flight: the copy is theirs
+/// and `access_state` already says so.
+fn runtime_custody_listing_purchase_in_flight(
+    data_dir: &Path,
+    principal_id: &str,
+    record: &RuntimeCustodyListingRecord,
+) -> anyhow::Result<bool> {
+    let mint_id = parse_mint_id_hex(&record.package.mint_id)?;
+    Ok(
+        load_runtime_custody_purchase(data_dir, principal_id, mint_id)?.is_some_and(|purchase| {
+            matches!(
+                purchase.progress,
+                RuntimeCustodyPurchaseProgress::Pending { .. }
+            )
+        }),
+    )
 }
 
 fn runtime_custody_listing_access_state(
