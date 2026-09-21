@@ -156,6 +156,7 @@ verify:
     node --test capsules/library/browser/src/*.test.mjs
     node --test capsules/creator/browser/*.test.mjs
     node --test capsules/elacity-reader/browser/*.test.mjs
+    node --test capsules/elacity-player/browser/*.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     ./scripts/browser-local-exit-orphan-cleanup-smoke.sh

@@ -8,7 +8,11 @@
 !elastos/Cargo.lock
 
 # Node.js
-node_modules/
+# Matches a directory, and also a symlink of that name. A trailing slash would
+# match only the directory, which is how a self-referential `node_modules`
+# symlink carrying an absolute operator path was once committed and then
+# replaced a real install on checkout.
+node_modules
 dist/
 
 # IDE

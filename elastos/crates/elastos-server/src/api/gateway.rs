@@ -85,7 +85,7 @@ mod gateway_site;
 #[path = "gateway_transaction_effects.rs"]
 mod gateway_transaction_effects;
 #[path = "gateway_wallet.rs"]
-mod gateway_wallet;
+pub(crate) mod gateway_wallet;
 #[path = "gateway_wallet_adapter.rs"]
 mod gateway_wallet_adapter;
 #[cfg(test)]

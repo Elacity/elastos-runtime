@@ -3512,57 +3512,60 @@ async fn ensure_content_via_carrier_provider_invocation(
         ensure_request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
     }
 
-    let mut ensure_response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: "content".to_string(),
-            op: "ensure".to_string(),
-            request: ensure_request,
-            transfer: ProviderTransfer::Json,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Carrier(route.clone()),
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("remote content ensure failed: {err}"))?;
-    if ensure_response
-        .get("status")
-        .and_then(|value| value.as_str())
-        == Some("error")
+    // Fresh placement transfers the bytes before it asks for a pin. The
+    // publisher already holds them, so the admitted peer receives them over
+    // the authenticated Carrier route in about two seconds and then pins
+    // blocks it already has.
+    //
+    // Asking the peer to pin by CID first sent it hunting the new DAG on its
+    // own IPFS network instead. In the measured run three candidates each
+    // spent the IPFS provider's full 300 s pin ceiling with zero blocks
+    // received, and that wait was 99.5% of the publish.
+    //
+    // An object too large or too fragmented to transfer still pins by CID,
+    // because there is nothing smaller to send it.
+    let ensure_response = match import_content_via_carrier_provider_invocation(
+        registry,
+        replica,
+        cid,
+        source_request,
+        None,
+    )
+    .await
     {
-        let message = ensure_response
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown provider error");
-        ensure_response = import_content_via_carrier_provider_invocation(
-            registry,
-            replica,
-            cid,
-            source_request,
-            Some(message),
-        )
-        .await?;
-    }
-    let ensure_status = ensure_response
-        .get("data")
-        .and_then(|data| data.get("availability"))
-        .and_then(|availability| availability.get("status"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    if matches!(
-        ensure_status.as_str(),
-        "repair_needed" | "local_unpinned" | "unknown"
-    ) {
-        ensure_response = import_content_via_carrier_provider_invocation(
-            registry,
-            replica,
-            cid,
-            source_request,
-            Some(&ensure_status),
-        )
-        .await?;
-    }
+        Ok(response) => response,
+        Err(transfer_err) => {
+            tracing::debug!(
+                cid,
+                error = %transfer_err,
+                "carrier: replica transfer unavailable, asking the peer to fetch the CID"
+            );
+            let response = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "carrier-availability".to_string(),
+                    target: "content".to_string(),
+                    op: "ensure".to_string(),
+                    request: ensure_request,
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Carrier(route.clone()),
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("remote content ensure failed: {err}"))?;
+            if response.get("status").and_then(|value| value.as_str()) == Some("error") {
+                let message = response
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown provider error");
+                anyhow::bail!(
+                    "remote content transfer failed ({transfer_err}) \
+                     and pin by CID returned error: {message}"
+                );
+            }
+            response
+        }
+    };
     let ensure_status = ensure_response
         .get("data")
         .and_then(|data| data.get("availability"))
@@ -4308,7 +4311,6 @@ async fn import_content_via_carrier_provider_invocation(
         registry,
         replica,
         cid,
-        source_request,
         ensure_failure,
     )
     .await
@@ -4507,11 +4509,16 @@ async fn local_content_fetch_bytes_for_import(
     remote_content_provider_response_bytes(&response)
 }
 
+/// Copies the exact local object to an admitted peer.
+///
+/// It deliberately takes no source request. Everything that shapes the copy
+/// comes from the local manifest, so the receiver reproduces the same root CID.
+/// The replication source's accounting identity is a separate fact and the
+/// receiver derives its own.
 async fn import_object_content_via_carrier_provider_invocation(
     registry: &ProviderRegistry,
     replica: &CarrierAvailabilityReplica,
     cid: &str,
-    source_request: &serde_json::Value,
     ensure_failure: Option<&str>,
 ) -> Result<serde_json::Value> {
     let manifest_bytes =
@@ -4577,20 +4584,21 @@ async fn import_object_content_via_carrier_provider_invocation(
         import_request["links"] = serde_json::to_value(&manifest.links)
             .map_err(|err| anyhow::anyhow!("content object links encode failed: {err}"))?;
     }
-    if let Some(object_did) = manifest.object_did.or_else(|| {
-        source_request
-            .get("object_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    }) {
+    // The published object's identity is part of its bytes: these two fields
+    // decide the manifest, and the manifest decides the root CID the receiver
+    // has to reproduce. A manifest that omitted them must import as one that
+    // still omits them, so the copy keeps the original CID.
+    //
+    // An effective publisher chosen for accounting is a different fact and
+    // stays out of the copy. The receiver already derives its own accounting
+    // identity through `effective_publisher_did`, so nothing is lost by
+    // leaving it out here. Filling these in from the source request rewrote
+    // identity-free directories, changed their CID, and left the receiver
+    // unpinning the wrong object it had just added.
+    if let Some(object_did) = manifest.object_did {
         import_request["object_did"] = serde_json::Value::String(object_did);
     }
-    if let Some(publisher_did) = manifest.publisher_did.or_else(|| {
-        source_request
-            .get("publisher_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    }) {
+    if let Some(publisher_did) = manifest.publisher_did {
         import_request["publisher_did"] = serde_json::Value::String(publisher_did);
     }
     import_request["import_summary"] = serde_json::json!({
@@ -7702,7 +7710,9 @@ mod tests {
         }
     }
 
-    struct MockCarrierObjectContentProvider;
+    struct MockCarrierObjectContentProvider {
+        manifest_has_identity: bool,
+    }
     struct MockCarrierBlockGraphProvider;
 
     #[async_trait::async_trait]
@@ -7745,7 +7755,9 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             let bytes = match path {
-                CONTENT_OBJECT_MANIFEST_PATH => carrier_test_object_manifest_bytes(),
+                CONTENT_OBJECT_MANIFEST_PATH => {
+                    carrier_test_object_manifest_bytes_with_identity(self.manifest_has_identity)
+                }
                 "index.md" => carrier_test_object_file_bytes(),
                 _ => {
                     return Ok(serde_json::json!({
@@ -8855,6 +8867,12 @@ mod tests {
     }
 
     fn carrier_test_object_manifest_bytes() -> Vec<u8> {
+        carrier_test_object_manifest_bytes_with_identity(true)
+    }
+
+    /// `with_identity = false` is the shape the measured metadata directory
+    /// actually had: a valid manifest that names no object and no publisher.
+    fn carrier_test_object_manifest_bytes_with_identity(with_identity: bool) -> Vec<u8> {
         let bytes = carrier_test_object_file_bytes();
         let file_sha = format!("{:x}", Sha256::digest(&bytes));
         let mut hasher = Sha256::new();
@@ -8864,7 +8882,7 @@ mod tests {
         hasher.update(b"\0");
         hasher.update(bytes.len().to_string().as_bytes());
         hasher.update(b"\0");
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "schema": "elastos.content.object.manifest/v1",
             "kind": "document",
             "content_digest": format!("sha256:{:x}", hasher.finalize()),
@@ -8874,9 +8892,11 @@ mod tests {
                 "size": bytes.len()
             }],
             "links": [],
-            "object_did": "did:key:zObject",
-            "publisher_did": "did:key:zPublisher"
         });
+        if with_identity {
+            manifest["object_did"] = serde_json::json!("did:key:zObject");
+            manifest["publisher_did"] = serde_json::json!("did:key:zPublisher");
+        }
         serde_json::to_vec(&manifest).unwrap()
     }
 
@@ -10099,6 +10119,14 @@ mod tests {
     }
 
     #[tokio::test]
+    /// A peer whose object manifest cannot be read still gets the bytes: the
+    /// transfer falls back from object import to an exact-byte import.
+    ///
+    /// The name is historical. Placement no longer begins with a remote pin,
+    /// so nothing here depends on that pin failing; the fallback is chosen by
+    /// the missing manifest. `scripts/home-entropy-check.mjs` pins this exact
+    /// name, and that script has one integration owner, so renaming it is a
+    /// separate coordinated change.
     async fn test_carrier_replication_falls_back_to_exact_import_when_remote_pin_fails() {
         let registry = ProviderRegistry::new();
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
@@ -10141,17 +10169,16 @@ mod tests {
         assert_eq!(proof.remote_receipt.as_ref().unwrap()["verified"], true);
 
         let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert_eq!(requests[2]["op"], "import_exact");
-        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(requests[1]["op"], "import_exact");
+        assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
         assert_eq!(
-            requests[2]["request"]["stream"]["schema"],
+            requests[1]["request"]["stream"]["schema"],
             "elastos.provider.stream/v1"
         );
-        assert_eq!(requests[3]["op"], "status");
-        assert!(!requests[2]["request"]
+        assert_eq!(requests[2]["op"], "status");
+        assert!(!requests[1]["request"]
             .to_string()
             .contains("ticket:internal-secret"));
     }
@@ -10217,7 +10244,12 @@ mod tests {
         let registry = ProviderRegistry::new();
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
-            fail_ensure: true,
+            // The mock fails only the first ensure. That used to be how this
+            // test reached the import fallback, because placement began with a
+            // speculative pin. Placement now transfers first, so the block
+            // graph provider is reached directly and the only ensure here is
+            // the one that pins the blocks it just delivered.
+            fail_ensure: false,
             fail_tickets: Vec::new(),
             reject_admission: false,
             omit_admission_receipt: false,
@@ -10264,33 +10296,98 @@ mod tests {
         );
 
         let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 5);
+        // The graph transfer comes straight after admission. The ensure that
+        // follows it pins blocks the peer already holds.
+        assert_eq!(requests.len(), 4);
         assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert_eq!(requests[2]["target"], CONTENT_BLOCK_GRAPH_TARGET);
-        assert_eq!(requests[2]["op"], "import_graph");
+        assert_eq!(requests[1]["target"], CONTENT_BLOCK_GRAPH_TARGET);
+        assert_eq!(requests[1]["op"], "import_graph");
         assert_eq!(
-            requests[2]["request"]["graph"]["schema"],
+            requests[1]["request"]["graph"]["schema"],
             CONTENT_BLOCK_GRAPH_SCHEMA
         );
-        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
         assert_eq!(
-            requests[2]["request"]["publisher_did"],
+            requests[1]["request"]["publisher_did"],
             "did:key:zPublisher"
         );
-        assert_eq!(requests[3]["target"], "content");
-        assert_eq!(requests[3]["op"], "ensure");
+        assert_eq!(requests[2]["target"], "content");
+        assert_eq!(requests[2]["op"], "ensure");
         assert_eq!(
-            requests[3]["request"]["availability_policy"],
+            requests[2]["request"]["availability_policy"],
             "carrier_block_graph_import"
         );
-        assert_eq!(requests[4]["op"], "status");
+        assert_eq!(requests[3]["op"], "status");
         assert!(!requests
             .iter()
             .any(|request| request["op"] == "import_exact"));
         assert!(!requests
             .iter()
             .any(|request| request["op"] == "import_object"));
+    }
+
+    /// The measured metadata directory carried no identity of its own, and the
+    /// replication source request carried the publisher chosen for accounting.
+    /// Filling the manifest in from that source rewrote the object, changed its
+    /// root CID, and made every remote peer unpin the copy it had just added —
+    /// which is why the metadata publish finished with one replica, the
+    /// creator's own node, after three candidates each spent minutes on it.
+    #[tokio::test]
+    async fn test_carrier_object_import_preserves_an_identity_free_manifest() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: true,
+            fail_tickets: Vec::new(),
+            reject_admission: false,
+            omit_admission_receipt: false,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        registry
+            .register_sub_provider(
+                "content",
+                Arc::new(MockCarrierObjectContentProvider {
+                    manifest_has_identity: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "object_did": "did:key:zAccountingObject",
+                "publisher_did": "did:key:zAccountingPublisher"
+            }),
+        )
+        .await
+        .unwrap();
+
+        let requests = invoker.requests.lock().await;
+        let import = requests
+            .iter()
+            .find(|request| request["op"] == "import_object")
+            .expect("an identity-free manifest still imports as an object");
+        let import = import["request"].as_object().unwrap();
+        for identity in ["object_did", "publisher_did"] {
+            assert!(
+                !import.contains_key(identity),
+                "{identity} was absent from the source manifest and must stay absent, \
+                 or the receiver reproduces a different CID"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10305,7 +10402,12 @@ mod tests {
         });
         registry.set_carrier_invoker(invoker.clone()).await;
         registry
-            .register_sub_provider("content", Arc::new(MockCarrierObjectContentProvider))
+            .register_sub_provider(
+                "content",
+                Arc::new(MockCarrierObjectContentProvider {
+                    manifest_has_identity: true,
+                }),
+            )
             .await
             .unwrap();
         let replica = CarrierAvailabilityReplica {
@@ -10335,24 +10437,25 @@ mod tests {
         assert_eq!(proof.status_availability["status"], "local_pinned");
 
         let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 4);
+        // Admission, then the transfer, then the proof. No pin-by-CID in
+        // front of the transfer: the publisher holds the bytes already.
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert_eq!(requests[2]["op"], "import_object");
-        assert_eq!(requests[2]["request"]["object_kind"], "document");
-        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(requests[1]["op"], "import_object");
+        assert_eq!(requests[1]["request"]["object_kind"], "document");
+        assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
         assert_eq!(
-            requests[2]["request"]["publisher_did"],
+            requests[1]["request"]["publisher_did"],
             "did:key:zPublisher"
         );
-        assert_eq!(requests[2]["request"]["files"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[1]["request"]["files"].as_array().unwrap().len(), 1);
         assert_eq!(
-            requests[2]["request"]["files"][0]["path"],
+            requests[1]["request"]["files"][0]["path"],
             serde_json::Value::String("index.md".to_string())
         );
-        assert!(requests[2]["request"].get("stream").is_none());
-        assert_eq!(requests[3]["op"], "status");
-        assert!(!requests[2]["request"]
+        assert!(requests[1]["request"].get("stream").is_none());
+        assert_eq!(requests[2]["op"], "status");
+        assert!(!requests[1]["request"]
             .to_string()
             .contains("ticket:internal-secret"));
     }

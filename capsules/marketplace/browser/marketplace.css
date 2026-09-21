@@ -897,3 +897,60 @@ button {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Add a listing. The control sits above the shelf it adds to and uses the
+   same input and pill shapes as the rest of the surface. */
+.store-import {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 16px;
+}
+
+.store-import.hidden {
+  display: none;
+}
+
+.store-import-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.store-import-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.store-import-input {
+  flex: 1 1 260px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 12px;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  font-family: inherit;
+  font-size: 13px;
+  letter-spacing: 0;
+}
+
+.store-import-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.store-import-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+/* What a purchase is waiting for, beside the item's own facts. */
+.store-row-buy-note {
+  color: var(--text-secondary);
+}

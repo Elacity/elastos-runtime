@@ -27,6 +27,13 @@ const AVAILABILITY_RECEIPT_SCHEMA: &str = "elastos.content.availability.receipt/
 const AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.receipt.v1";
 const AVAILABILITY_DASHBOARD_SCHEMA: &str = "elastos.content.availability.dashboard/v1";
 const CONTENT_ADMISSION_DOMAIN: &str = "elastos.content.admission.v1";
+/// The policies a publisher sends when it asks one admitted peer to hold one
+/// copy on itself. `carrier_replica` asks for the copy; `carrier_block_graph_import`
+/// confirms one whose blocks the publisher has just delivered. Both are answered
+/// by that peer's own verified pin.
+/// See `ContentProvider::is_local_replica_request`.
+pub(crate) const LOCAL_REPLICA_AVAILABILITY_POLICIES: [&str; 2] =
+    ["carrier_replica", "carrier_block_graph_import"];
 const CONTENT_ACCOUNTING_SCHEMA: &str = "elastos.content.accounting/v1";
 const CONTENT_STORAGE_ACCOUNTING_LEDGER_SCHEMA: &str =
     "elastos.content.storage-accounting.ledger/v1";
@@ -3734,6 +3741,24 @@ impl ContentProvider {
             .await
     }
 
+    /// Distinguishes the two facts an availability request can ask for.
+    ///
+    /// The publisher asking this admitted peer for one copy on itself is
+    /// answered completely by a verified local pin, and the publisher counts
+    /// this node as one distinct peer. That covers `carrier_replica`, and
+    /// `carrier_block_graph_import` for a graph whose blocks the publisher has
+    /// just delivered.
+    ///
+    /// Every other policy is this node asking the network for placement, which
+    /// still goes to the configured availability provider under its requested
+    /// requirements.
+    fn is_local_replica_request(request: &Value) -> bool {
+        request
+            .get("availability_policy")
+            .and_then(|value| value.as_str())
+            .is_some_and(|policy| LOCAL_REPLICA_AVAILABILITY_POLICIES.contains(&policy))
+    }
+
     async fn repair(&self, request: &Value) -> Result<Value, ProviderError> {
         self.pin_for_availability(request, "local_repair_pin", "local_repair_failed", false)
             .await
@@ -3816,23 +3841,24 @@ impl ContentProvider {
             .transpose()?
             .map(|receipt| content_accounting_observation_from_value(&receipt.payload.accounting))
             .unwrap_or_default();
-        let outcome = if local_outcome.status == "local_pinned" {
-            self.ensure_network_availability(
-                &registry,
-                cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: object_did.as_deref(),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation,
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome)
-        } else {
-            local_outcome
-        };
+        let outcome =
+            if local_outcome.status == "local_pinned" && !Self::is_local_replica_request(request) {
+                self.ensure_network_availability(
+                    &registry,
+                    cid,
+                    request,
+                    &local_outcome,
+                    AvailabilityRequestContext {
+                        object_did: object_did.as_deref(),
+                        publisher_did: publisher_did.as_deref(),
+                        accounting_observation,
+                    },
+                )
+                .await?
+                .unwrap_or(local_outcome)
+            } else {
+                local_outcome
+            };
 
         let receipt = self.write_receipt(ReceiptInput {
             cid: cid.to_string(),
@@ -10328,6 +10354,75 @@ mod tests {
 
         let requests = availability.requests.lock().await;
         assert_eq!(requests.len(), 2);
+    }
+
+    /// A `carrier_replica` ensure asks this peer for exactly one copy on
+    /// itself. The publisher admitted it and counts it as one distinct peer,
+    /// so its own verified local pin is the whole requested placement.
+    ///
+    /// Before this, a successful local pin was still forwarded to the
+    /// configured external placement service. On the custody hosts that target
+    /// is the Compose default `https://replica.invalid/ensure`, so a pin that
+    /// had already succeeded came back `repair_needed` and the publisher
+    /// re-imported the entire object it had just placed.
+    #[tokio::test]
+    async fn carrier_replica_ensure_proves_the_local_pin_without_external_placement() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "availability": {
+                    "status": "repair_needed",
+                    "provider": "availability-provider",
+                    "policy": "network_default",
+                    "replicas": 0,
+                    "reason": "https://replica.invalid/ensure is unreachable",
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+
+        // Both policies mean the same thing to this peer: the publisher has
+        // handed it the object and wants it held. `carrier_block_graph_import`
+        // is the arbitrary-DAG path, where the blocks arrived immediately
+        // before this call.
+        // Listed literally rather than read from the production constant, so
+        // dropping a policy from that constant fails here instead of quietly
+        // shrinking what this test covers.
+        for policy in ["carrier_replica", "carrier_block_graph_import"] {
+            let response = content
+                .send_raw(&json!({
+                    "op": "ensure",
+                    "cid": TEST_CID,
+                    "availability_policy": policy,
+                    "availability_requirements": {
+                        "min_replicas": 1,
+                        "max_replicas": 1,
+                        "require_live_multi_peer_proof": false,
+                    },
+                }))
+                .await
+                .unwrap();
+
+            assert_eq!(response["status"], "ok", "policy {policy}");
+            assert_eq!(
+                response["data"]["availability"]["status"], "local_pinned",
+                "policy {policy}"
+            );
+            assert_eq!(
+                response["data"]["availability"]["replicas"], 1,
+                "policy {policy}"
+            );
+            assert!(
+                ipfs.pinned.lock().await.iter().any(|cid| cid == TEST_CID),
+                "the local replica must be really pinned before it is claimed ({policy})"
+            );
+            assert!(
+                availability.requests.lock().await.is_empty(),
+                "one local copy must not depend on an unrelated external \
+                 placement service ({policy})"
+            );
+        }
     }
 
     #[tokio::test]

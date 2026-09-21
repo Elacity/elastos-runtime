@@ -6,7 +6,7 @@
   <title>Apps · ElastOS</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
-  <link rel="stylesheet" href="marketplace.css?v=marketplace-20260826a">
+  <link rel="stylesheet" href="marketplace.css?v=marketplace-20260921a">
 </head>
 <body>
   <div class="store-shell">
@@ -70,6 +70,25 @@
 
     <main id="store-main" class="store-main">
       <h1 id="store-title" class="store-title">Discover</h1>
+      <!-- Items listed on another Home reach this one by their link. The
+           control lives in the page rather than in the rendered shelf so that
+           a refresh finishing mid-typing cannot empty the field. -->
+      <form id="import-listing" class="store-import hidden" autocomplete="off">
+        <label class="store-import-label" for="import-listing-uri">Add a listing</label>
+        <div class="store-import-row">
+          <input
+            id="import-listing-uri"
+            class="store-import-input"
+            type="text"
+            name="listing_uri"
+            placeholder="elastos://..."
+            spellcheck="false"
+            aria-describedby="import-listing-hint"
+          >
+          <button id="import-listing-submit" class="store-pill" type="submit">Add</button>
+        </div>
+        <p id="import-listing-hint" class="store-import-hint">Paste the link the creator gave you.</p>
+      </form>
       <section id="loading-state" class="store-loading" aria-label="Loading"></section>
       <section id="load-error" class="store-error hidden" aria-live="polite"></section>
       <div id="store-sections" class="store-sections"></div>
@@ -82,6 +101,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="marketplace.js?v=marketplace-20260826a"></script>
+  <script type="module" src="marketplace.js?v=marketplace-20260921a"></script>
 </body>
 </html>

@@ -1,17 +1,20 @@
+// Marketplace reads the capsule catalog and the protected-item shelf, and asks
+// Home to launch what a person chooses. The listing contract it reads lives in
+// `src/listing.js`, beside the tests that pin it against Runtime's producer.
+import {
+  MAX_RUNTIME_CUSTODY_LISTINGS,
+  RUNTIME_CUSTODY_MINT_ID,
+  buyOutcomeFromAnswer,
+  listingUriFromInput,
+  parseRuntimeCustodyListings,
+  uint256Decimal,
+  viewerForListing,
+} from "./src/listing.js";
+
 (function () {
   const params = new URLSearchParams(window.location.search);
   const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
   const homeParentOrigin = params.get("home_origin") || "";
-  const RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1 = "elastos.library.runtime-custody-listings/v1";
-  const RUNTIME_CUSTODY_LISTING_SCHEMA_V1 = "elastos.library.runtime-custody-listing/v1";
-  const RUNTIME_CUSTODY_AVAILABILITY_SCHEMA_V1 = "elastos.library.runtime-custody-availability-summary/v1";
-  const MAX_RUNTIME_CUSTODY_LISTINGS = 128;
-  const MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES = 256;
-  const MAX_U32 = 0xffffffff;
-  const MAX_SAFE_TIMESTAMP = Number.MAX_SAFE_INTEGER;
-  const RUNTIME_CUSTODY_MINT_ID = /^[0-9a-f]{64}$/;
-  const UINT256_HEX = /^0x(?:0|[1-9a-f][0-9a-f]{0,63})$/;
-  const ADDRESS_HEX = /^0x[0-9a-f]{40}$/;
 
   const state = {
     apps: [],
@@ -23,9 +26,17 @@
     appLoadError: null,
     mediaLoadError: null,
     mediaTruncated: false,
+    mediaRejected: 0,
   };
 
-  const pendingMediaBuys = new Set();
+  // What each purchase in flight is waiting for, keyed by mint. A purchase
+  // lives in Runtime, not here: this only remembers what to show while this
+  // page stays open, and pressing Buy again after a reload resumes the same
+  // attempt rather than starting a second one.
+  const pendingMediaBuys = new Map();
+  let importInFlight = false;
+  const BUY_POLL_MS = 4000;
+  const BUY_POLL_BUDGET_MS = 15 * 60 * 1000;
   let detailPreviousFocus = null;
   let homeChromeReady = false;
   let lastHomeMenuManifestSignature = "";
@@ -40,6 +51,9 @@
     detailModal: document.querySelector("#detail-modal"),
     detailContent: document.querySelector("#detail-content"),
     searchInput: document.querySelector("#search-input"),
+    importForm: document.querySelector("#import-listing"),
+    importInput: document.querySelector("#import-listing-uri"),
+    importSubmit: document.querySelector("#import-listing-submit"),
     toast: document.querySelector("#toast"),
   };
 
@@ -114,7 +128,12 @@
   }
 
   function bindEvents() {
-    els.searchInput.addEventListener("input", (event) => {
+    els.importForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    importListing(els.importInput.value);
+  });
+
+  els.searchInput.addEventListener("input", (event) => {
       state.search = event.target.value.trim().toLowerCase();
       renderSections();
     });
@@ -270,10 +289,12 @@
       const parsed = parseRuntimeCustodyListings(payload);
       state.mediaListings = parsed.listings;
       state.mediaTruncated = parsed.truncated;
+      state.mediaRejected = parsed.rejected;
     } catch (error) {
       state.mediaListings = [];
       state.mediaTruncated = false;
-      state.mediaLoadError = publicError(error.message, "Couldn’t load media.");
+      state.mediaRejected = 0;
+      state.mediaLoadError = publicError(error.message, "Couldn’t load your items.");
     } finally {
       state.mediaLoading = false;
     }
@@ -474,6 +495,9 @@
       else node.removeAttribute("aria-current");
     });
     els.storeTitle.textContent = destinationTitle(state.destination);
+    // Adding a listing belongs to the shelf it adds to, so the control appears
+    // with that surface and nowhere else.
+    els.importForm.classList.toggle("hidden", state.destination !== "media");
     if (!options.silent) {
       const surfaceBlocked = renderSurfaceState();
       if (!surfaceBlocked) {
@@ -535,7 +559,7 @@
         loading: state.mediaLoading,
         error: state.mediaLoadError,
         retryAction: "retry-media",
-        title: "Couldn’t load media",
+        title: "Couldn’t load your items",
       };
     }
     return {
@@ -626,17 +650,18 @@
 
   function renderMediaSections() {
     const listings = filteredMediaListings();
+    const notice = shelfNotice();
     if (!listings.length) {
-      els.storeSections.innerHTML = emptyState(
-        state.search ? "No results" : "No protected media available",
-        state.search ? "Try a different search." : "Protected listings on this Home will appear here.",
+      // The note rides with the empty shelf too. A person whose only item was
+      // refused is looking at an empty surface that needs an explanation more
+      // than a full one does.
+      els.storeSections.innerHTML = notice + emptyState(
+        state.search ? "No results" : "No protected items yet",
+        state.search ? "Try a different search." : "Items listed on this Home appear here.",
         icons.media,
       );
       return;
     }
-    const notice = state.mediaTruncated
-      ? `<p class="store-inline-note">Showing the first ${MAX_RUNTIME_CUSTODY_LISTINGS} protected items.</p>`
-      : "";
     els.storeSections.innerHTML = `
       ${notice}
       <section class="store-section">
@@ -649,6 +674,23 @@
       </section>
     `;
     bindAppActions(els.storeSections);
+  }
+
+  // Two facts belong above the shelf, and only when they are true: Runtime
+  // sent more items than it will list, and this app refused a row it could not
+  // read. A refused row is the app's own limitation, so it says so plainly
+  // rather than describing the item.
+  function shelfNotice() {
+    const notes = [];
+    if (state.mediaTruncated) {
+      notes.push(`Showing the first ${MAX_RUNTIME_CUSTODY_LISTINGS} items.`);
+    }
+    if (state.mediaRejected > 0) {
+      notes.push(state.mediaRejected === 1
+        ? "One item could not be read and is hidden."
+        : `${state.mediaRejected} items could not be read and are hidden.`);
+    }
+    return notes.length ? `<p class="store-inline-note">${escapeHtml(notes.join(" "))}</p>` : "";
   }
 
   function filteredMediaListings() {
@@ -745,10 +787,19 @@
             <span class="store-row-fact">${escapeHtml(availabilitySummary(listing.availability))}</span>
             <span class="store-row-fact">${escapeHtml(accessStateLabel(listing.accessState))}</span>
           </div>
+          <div class="store-row-facts">
+            ${buyStateNoteMarkup(listing)}
+          </div>
         </div>
         ${mediaActionButton(listing)}
       </article>
     `;
+  }
+
+  function buyStateNoteMarkup(listing) {
+    const buyState = pendingMediaBuys.get(listing.mintId);
+    const note = buyState ? buyStateNote(buyState) : "";
+    return note ? `<span class="store-row-fact store-row-buy-note">${escapeHtml(note)}</span>` : "";
   }
 
   function mediaSubtitle(listing) {
@@ -758,12 +809,60 @@
   }
 
   function mediaActionButton(listing) {
-    if (listing.accessState === "available" && pendingMediaBuys.has(listing.mintId)) {
-      return `<button class="store-pill" type="button" data-action="buy-media" data-mint="${escapeAttr(listing.mintId)}" disabled aria-busy="true">Buying...</button>`;
+    const mint = escapeAttr(listing.mintId);
+    const buyState = listing.accessState === "available" ? pendingMediaBuys.get(listing.mintId) : null;
+    if (buyState) {
+      // Whose turn it is decides what the control does. When it is the
+      // person's, the control takes them to the wallet holding the request;
+      // when it is the network's, there is nothing to press.
+      if (buyState.kind === "declined") {
+        return `<button class="store-pill" type="button" data-action="buy-media" data-mint="${mint}">Buy again</button>`;
+      }
+      if (buyState.awaitsPerson) {
+        return `<button class="store-pill" type="button" data-action="open-wallet" data-mint="${mint}">Approve in wallet</button>`;
+      }
+      return `<button class="store-pill" type="button" data-action="buy-media" data-mint="${mint}" disabled aria-busy="true">${escapeHtml(buyStateLabel(buyState))}</button>`;
     }
     const action = listing.accessState === "available" ? "buy-media" : "open-media";
     const label = listing.accessState === "available" ? "Buy" : "Open";
-    return `<button class="store-pill" type="button" data-action="${escapeAttr(action)}" data-mint="${escapeAttr(listing.mintId)}">${label}</button>`;
+    const open = `<button class="store-pill" type="button" data-action="${escapeAttr(action)}" data-mint="${mint}">${label}</button>`;
+    // Only the person who listed it has anything to pass on. A buyer's copy is
+    // theirs to open, and the link belongs to whoever is selling.
+    if (listing.accessState !== "creator") {
+      return open;
+    }
+    return `<button class="store-pill" type="button" data-action="share-listing" data-mint="${mint}">Share</button>${open}`;
+  }
+
+  // What the row says while a purchase settles. Each stage is a different fact
+  // about who is waiting for what, and none of them is a failure.
+  function buyStateLabel(buyState) {
+    const labels = {
+      allowance_approval: "Allowing payment...",
+      purchase_approval: "Approving...",
+      chain_settlement: "Confirming...",
+      access_evidence: "Almost yours...",
+      declined: "Declined",
+    };
+    return labels[buyState.stage] || "Buying...";
+  }
+
+  function buyStateNote(buyState) {
+    if (buyState.kind === "declined") {
+      return "You declined this in your wallet.";
+    }
+    if (buyState.awaitsPerson) {
+      return buyState.connectorId
+        ? `Approve this purchase in ${buyState.connectorId}.`
+        : "Approve this purchase in your wallet.";
+    }
+    if (buyState.stage === "chain_settlement") {
+      return "The network is confirming your purchase.";
+    }
+    if (buyState.stage === "access_evidence") {
+      return "Confirming the copy is yours.";
+    }
+    return "";
   }
 
   function availabilitySummary(availability) {
@@ -785,13 +884,6 @@
       return value;
     }
     return `${value.slice(0, 8)}...${value.slice(-6)}`;
-  }
-
-  function uint256Decimal(value) {
-    if (!UINT256_HEX.test(value)) {
-      throw new Error("invalid protected media quantity");
-    }
-    return BigInt(value).toString(10);
   }
 
   function actionButton(app) {
@@ -879,6 +971,96 @@
     const focusTarget = els.detailContent.querySelector(".modal-btn.primary")
       || els.detailContent.querySelector("[data-action='close-detail']");
     focusTarget?.focus();
+  }
+
+  // What a purchase costs, who is selling it, and what happens next. The
+  // wallet asks for a signature, not for a decision, and it arrives after the
+  // availability re-check -- so a person who has not seen the terms by then
+  // has already waited minutes to see them.
+  function showBuyConfirmation(mintId) {
+    const listing = state.mediaListings.find((entry) => entry.mintId === mintId);
+    if (!listing || listing.accessState !== "available" || pendingMediaBuys.has(mintId)) {
+      return;
+    }
+    detailPreviousFocus = document.activeElement;
+    els.detailContent.innerHTML = `
+      <header class="modal-header">
+        <div class="modal-title-section">
+          <div class="modal-title">${escapeHtml(listing.displayName)}</div>
+          <div class="modal-developer">${escapeHtml(mediaSubtitle(listing))}</div>
+        </div>
+        <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
+      </header>
+      <div class="modal-body">
+        <section class="modal-section">
+          <div class="modal-section-title">What you pay</div>
+          <ul class="permissions-list">
+            <li><span class="permission-icon">${icons.check}</span>${escapeHtml(uint256Decimal(listing.price))} base units of ${escapeHtml(abbreviateAddress(listing.payToken))}</li>
+            <li><span class="permission-icon">${icons.check}</span>One copy, of ${escapeHtml(uint256Decimal(listing.quantity))} still listed</li>
+            <li><span class="permission-icon">${icons.check}</span>Sold by ${escapeHtml(abbreviateAddress(listing.sellerAddress))}</li>
+            <li><span class="permission-icon">${icons.check}</span>${escapeHtml(availabilitySummary(listing.availability))}</li>
+          </ul>
+        </section>
+        <section class="modal-section">
+          <div class="modal-section-title">What happens next</div>
+          <p class="store-inline-note">Your wallet asks you to approve the payment. The item arrives in your Library once the network confirms it.</p>
+        </section>
+      </div>
+      <footer class="modal-footer">
+        <div class="modal-footer-price"></div>
+        <div class="modal-footer-actions">
+          <button class="modal-btn secondary" type="button" data-action="close-detail">Cancel</button>
+          <button class="modal-btn primary" type="button" data-action="confirm-buy" data-mint="${escapeAttr(listing.mintId)}">Buy</button>
+        </div>
+      </footer>
+    `;
+    bindAppActions(els.detailContent);
+    els.detailModal.classList.add("active");
+    els.detailContent.querySelector(".modal-btn.primary")?.focus();
+  }
+
+  // The link a listing lives at, for the person who listed it to pass on.
+  // Runtime has answered with it since listings existed and no surface has ever
+  // shown it, so the only way anyone could reach an item on another Home was to
+  // already know its address.
+  //
+  // The link is handed over selected rather than copied for them. Reading a
+  // capsule's clipboard authority is a boundary this app does not cross, and
+  // its own gate holds that line, so the honest control is the text itself,
+  // ready for the copy key.
+  function showShareListing(mintId) {
+    const listing = state.mediaListings.find((entry) => entry.mintId === mintId);
+    if (!listing || listing.accessState !== "creator") {
+      return;
+    }
+    detailPreviousFocus = document.activeElement;
+    els.detailContent.innerHTML = `
+      <header class="modal-header">
+        <div class="modal-title-section">
+          <div class="modal-title">Share ${escapeHtml(listing.displayName)}</div>
+          <div class="modal-developer">Anyone with this link can add your listing and buy a copy.</div>
+        </div>
+        <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
+      </header>
+      <div class="modal-body">
+        <section class="modal-section">
+          <div class="modal-section-title">Listing link</div>
+          <input id="share-listing-uri" class="store-import-input" type="text" readonly value="${escapeAttr(listing.listingUri)}">
+          <p class="store-inline-note">The link is selected: press the copy key, then send it. They paste it into Add a listing on their own Home.</p>
+        </section>
+      </div>
+      <footer class="modal-footer">
+        <div class="modal-footer-price"></div>
+        <div class="modal-footer-actions">
+          <button class="modal-btn primary" type="button" data-action="close-detail">Close</button>
+        </div>
+      </footer>
+    `;
+    bindAppActions(els.detailContent);
+    els.detailModal.classList.add("active");
+    const field = els.detailContent.querySelector("#share-listing-uri");
+    field?.focus();
+    field?.select();
   }
 
   function closeDetail() {
@@ -1010,37 +1192,123 @@
     if (!RUNTIME_CUSTODY_MINT_ID.test(mintId)) {
       return;
     }
+    // The viewer follows the item, not the surface it was opened from. Every
+    // item used to go to the player, so a picture arrived at a video frame.
+    const listing = state.mediaListings.find((entry) => entry.mintId === mintId);
+    if (!listing) {
+      return;
+    }
     if (window.top === window || !homeParentOrigin) {
-      showToast("Open Apps from Home to launch apps.", true);
+      showToast("Open Apps from Home to open items.", true);
       return;
     }
     window.top.postMessage({
       type: "home:open-target",
-      target: "elacity-player",
+      target: viewerForListing(listing),
       query: { mint_id: mintId },
       homeToken,
     }, homeParentOrigin);
   }
 
+  // A listing published on another Home reaches this one by its link. This
+  // checks the link's shape and hands it to Runtime, which fetches the package
+  // and verifies its metadata, its chain record and its content before the
+  // item appears on the shelf. Nothing here decides that an item is genuine.
+  async function importListing(value) {
+    const listingUri = listingUriFromInput(value);
+    if (!listingUri) {
+      showToast("That does not look like a listing link.", true);
+      return;
+    }
+    if (importInFlight) {
+      return;
+    }
+    importInFlight = true;
+    els.importSubmit.disabled = true;
+    els.importSubmit.setAttribute("aria-busy", "true");
+    try {
+      await postObjectProvider("import_runtime_custody", { listing_uri: listingUri });
+      els.importInput.value = "";
+      showToast("Listing added.", false);
+      await loadMediaData();
+    } catch (error) {
+      showToast(publicError(error.message, "That listing could not be added."), true);
+    } finally {
+      importInFlight = false;
+      els.importSubmit.disabled = false;
+      els.importSubmit.removeAttribute("aria-busy");
+      render();
+    }
+  }
+
+  // A purchase is a sequence of waits, and re-issuing the identical buy is how
+  // each one is collected: Runtime resumes the attempt it already holds against
+  // the same effect, so asking again continues the purchase rather than making
+  // a second one. Asking stops when the answer stops being a wait, when the
+  // budget runs out, or when the person leaves the page.
   async function buyMedia(mintId) {
     if (!RUNTIME_CUSTODY_MINT_ID.test(mintId)) {
-      showToast("Media action could not be completed.", true);
+      showToast("This item cannot be bought.", true);
       return;
     }
     if (pendingMediaBuys.has(mintId)) {
       return;
     }
-    pendingMediaBuys.add(mintId);
-    render();
+    setBuyState(mintId, { kind: "waiting", stage: "", awaitsPerson: false, connectorId: "" });
+    const deadline = Date.now() + BUY_POLL_BUDGET_MS;
     try {
-      await postObjectProvider("buy", { mint_id: mintId });
-      await loadMediaData();
-    } catch (error) {
-      showToast(publicError(error.message, "Media action could not be completed."), true);
+      for (;;) {
+        try {
+          await postObjectProvider("buy", { mint_id: mintId });
+          pendingMediaBuys.delete(mintId);
+          showToast("Bought. The item is in your Library.", false);
+          await loadMediaData();
+          return;
+        } catch (error) {
+          const outcome = buyOutcomeFromAnswer(error.answer);
+          if (outcome.kind === "failed") {
+            pendingMediaBuys.delete(mintId);
+            showToast(publicError(error.message, "The purchase did not finish."), true);
+            return;
+          }
+          if (outcome.kind === "declined") {
+            // The person answered. Nothing here asks again on their behalf.
+            setBuyState(mintId, outcome);
+            return;
+          }
+          if (Date.now() > deadline) {
+            // Out of the time this page will spend watching. The purchase is
+            // still Runtime's, so say what is true rather than calling it
+            // failed: pressing Buy picks the same attempt back up.
+            pendingMediaBuys.delete(mintId);
+            showToast("This purchase is still settling. Press Buy to pick it up again.", false);
+            return;
+          }
+          setBuyState(mintId, outcome);
+          await new Promise((resolve) => { window.setTimeout(resolve, BUY_POLL_MS); });
+        }
+      }
     } finally {
-      pendingMediaBuys.delete(mintId);
       render();
     }
+  }
+
+  function setBuyState(mintId, outcome) {
+    pendingMediaBuys.set(mintId, outcome);
+    render();
+  }
+
+  function openWalletForApproval() {
+    if (window.top === window || !homeParentOrigin) {
+      showToast("Open Apps from Home to reach your wallet.", true);
+      return;
+    }
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "wallet",
+      query: {},
+      homeToken,
+    }, homeParentOrigin);
   }
 
   function bindAppActions(root) {
@@ -1084,14 +1352,25 @@
           loadMediaData()
             .then(render)
             .catch((error) => {
-              showToast(publicError(error.message, "Couldn’t load media."), true);
+              showToast(publicError(error.message, "Couldn’t load your items."), true);
             });
         }
         if (action === "see-all") {
           selectDestination(target.dataset.destination);
         }
         if (action === "buy-media") {
-          buyMedia(target.dataset.mint);
+          showBuyConfirmation(target.dataset.mint);
+        }
+        if (action === "confirm-buy") {
+          const mintId = target.dataset.mint;
+          closeDetail();
+          buyMedia(mintId);
+        }
+        if (action === "open-wallet") {
+          openWalletForApproval();
+        }
+        if (action === "share-listing") {
+          showShareListing(target.dataset.mint);
         }
         if (action === "open-media") {
           openMedia(target.dataset.mint);
@@ -1156,19 +1435,28 @@
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(providerErrorMessage(response, data));
+      throw providerFailure(response, data);
     }
     if (data && typeof data === "object" && data.status === "error") {
-      throw new Error(providerErrorMessage(response, data.error || data));
+      throw providerFailure(response, data.error || data);
     }
     return data && typeof data === "object" && "data" in data ? data.data : data;
   }
 
+  // The sentence is for a person; the answer beside it is for this app. A
+  // refusal that carries its state as data is how the app decides what to
+  // offer, instead of matching words written to be read.
+  function providerFailure(response, answer) {
+    const failure = new Error(providerErrorMessage(response, answer));
+    failure.answer = answer && typeof answer === "object" ? answer : {};
+    return failure;
+  }
+
   function providerErrorMessage(response, payload) {
     if (response.status === 404) {
-      return "Protected media is unavailable. Update ElastOS and try again.";
+      return "Protected items are unavailable. Update ElastOS and try again.";
     }
-    return publicError(payload.error || payload.message, "Protected media could not be loaded.");
+    return publicError(payload.error || payload.message, "Your items could not be loaded.");
   }
 
   function publicDescription(capsule) {
@@ -1204,150 +1492,6 @@
       return fallback;
     }
     return message;
-  }
-
-  function parseRuntimeCustodyListings(payload) {
-    assertExactKeys(payload, ["schema", "listings", "truncated"]);
-    if (payload.schema !== RUNTIME_CUSTODY_LISTINGS_RESPONSE_SCHEMA_V1) {
-      throw new Error("invalid protected media schema");
-    }
-    if (!Array.isArray(payload.listings) || payload.listings.length > MAX_RUNTIME_CUSTODY_LISTINGS) {
-      throw new Error("invalid protected media list");
-    }
-    if (typeof payload.truncated !== "boolean") {
-      throw new Error("invalid protected media truncation state");
-    }
-    return {
-      truncated: payload.truncated,
-      listings: payload.listings.map(parseRuntimeCustodyListing),
-    };
-  }
-
-  function parseRuntimeCustodyListing(value) {
-    assertExactKeys(value, [
-      "access_state",
-      "availability",
-      "codecs",
-      "display_name",
-      "mime_type",
-      "mint_id",
-      "pay_token",
-      "price",
-      "published_at",
-      "quantity",
-      "schema",
-      "seller_address",
-      "token_id",
-    ]);
-    if (value.schema !== RUNTIME_CUSTODY_LISTING_SCHEMA_V1) {
-      throw new Error("invalid protected media entry");
-    }
-    const accessState = boundedString(value.access_state, 16);
-    if (!["available", "creator", "purchased"].includes(accessState)) {
-      throw new Error("invalid protected media access state");
-    }
-    const mintId = boundedString(value.mint_id, 64);
-    const displayName = boundedString(value.display_name, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
-    const mimeType = boundedString(value.mime_type, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
-    const codecs = boundedString(value.codecs, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
-    const quantity = boundedString(value.quantity, 66);
-    const price = boundedString(value.price, 66);
-    const payToken = boundedString(value.pay_token, 42);
-    const publishedAt = boundedTimestamp(value.published_at);
-    const sellerAddress = boundedString(value.seller_address, 42);
-    const tokenId = boundedString(value.token_id, 66);
-    if (!RUNTIME_CUSTODY_MINT_ID.test(mintId)) {
-      throw new Error("invalid protected media mint");
-    }
-    if (!UINT256_HEX.test(quantity) || !UINT256_HEX.test(price)) {
-      throw new Error("invalid protected media quantity");
-    }
-    if (!ADDRESS_HEX.test(payToken) || !ADDRESS_HEX.test(sellerAddress)) {
-      throw new Error("invalid protected media address");
-    }
-    if (!UINT256_HEX.test(tokenId)) {
-      throw new Error("invalid protected media token");
-    }
-    return {
-      accessState,
-      availability: parseAvailabilitySummary(value.availability),
-      codecs,
-      displayName,
-      mimeType,
-      mintId,
-      payToken,
-      price,
-      publishedAt,
-      quantity,
-    };
-  }
-
-  function parseAvailabilitySummary(value) {
-    assertExactKeys(value, [
-      "checked_at",
-      "observed_replicas",
-      "recheck_before_buy",
-      "recheck_before_open",
-      "required_replicas",
-      "schema",
-      "status",
-    ]);
-    if (value.schema !== RUNTIME_CUSTODY_AVAILABILITY_SCHEMA_V1 || value.status !== "last_verified_receipt") {
-      throw new Error("invalid protected media availability");
-    }
-    const checkedAt = boundedTimestamp(value.checked_at);
-    const requiredReplicas = boundedCount(value.required_replicas);
-    const observedReplicas = boundedCount(value.observed_replicas);
-    if (
-      requiredReplicas === 0
-      || observedReplicas < requiredReplicas
-      || value.recheck_before_buy !== true
-      || value.recheck_before_open !== true
-    ) {
-      throw new Error("invalid protected media availability state");
-    }
-    return {
-      checkedAt,
-      observedReplicas,
-      requiredReplicas,
-    };
-  }
-
-  function boundedString(value, maxBytes) {
-    if (
-      typeof value !== "string"
-      || !value
-      || new TextEncoder().encode(value).length > maxBytes
-      || /[\u0000-\u001f\u007f]/.test(value)
-    ) {
-      throw new Error("invalid protected media field");
-    }
-    return value;
-  }
-
-  function boundedCount(value) {
-    if (!Number.isInteger(value) || value < 0 || value > MAX_U32) {
-      throw new Error("invalid protected media count");
-    }
-    return value;
-  }
-
-  function boundedTimestamp(value) {
-    if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_SAFE_TIMESTAMP) {
-      throw new Error("invalid protected media timestamp");
-    }
-    return value;
-  }
-
-  function assertExactKeys(value, keys) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("invalid protected media object");
-    }
-    const actual = Object.keys(value).sort().join("\n");
-    const expected = [...keys].sort().join("\n");
-    if (actual !== expected) {
-      throw new Error("invalid protected media shape");
-    }
   }
 
   function badgeLabel(badge) {

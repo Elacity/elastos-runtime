@@ -17,18 +17,27 @@ const errorToken = "marketplace-error-token";
 const mediaErrorToken = "marketplace-media-error-token";
 const mediaMalformedToken = "marketplace-media-malformed-token";
 const mediaEmptyToken = "marketplace-media-empty-token";
+const mediaPendingBuyToken = "marketplace-media-pending-buy-token";
 const mediaCreatorMint = "a".repeat(64);
 const mediaPurchasedMint = "b".repeat(64);
 const mediaAvailableMint = "c".repeat(64);
+const mediaImportedMint = "d".repeat(64);
+// What a creator hands out: `elastos://` and the listing package's CID.
+const importedListingUri = "elastos://QmcHh9eQuLiisfxZo4m4TxaVTSYzs4AF4LaVcmkd2o2Y76";
 const mediaPayToken = "0x1111111111111111111111111111111111111111";
 const mediaSellerAddress = "0x2222222222222222222222222222222222222222";
 const mediaTokenId = "0x7";
+// Exactly the document `runtime_custody_listing_availability` publishes,
+// receipt digest included. This fixture once matched the parser instead of the
+// producer, so the surface it renders here stayed green while every real row
+// was refused in front of a person.
 const mediaAvailability = {
   schema: "elastos.library.runtime-custody-availability-summary/v1",
   status: "last_verified_receipt",
   checked_at: 1_756_295_696,
   required_replicas: 3,
   observed_replicas: 3,
+  receipt_digest: "357bc17ce614dda83ef2542c01f574c4db5571fe648e2e60eb9977c8b5f0c8ef",
   recheck_before_buy: true,
   recheck_before_open: true,
 };
@@ -38,6 +47,10 @@ function mediaListing({ mintId, displayName, accessState, quantity, price, codec
     schema: "elastos.library.runtime-custody-listing/v1",
     mint_id: mintId,
     display_name: displayName,
+    listing_uri: importedListingUri,
+    // Runtime names the kind; the shelf and the viewer session read the same
+    // two words rather than each deciding from the MIME.
+    content_kind: "media",
     mime_type: "video/mp4",
     codecs,
     quantity,
@@ -341,6 +354,18 @@ function startServer() {
     [mediaErrorToken]: { catalogFailuresRemaining: 0 },
     [mediaMalformedToken]: { catalogFailuresRemaining: 0 },
     [mediaEmptyToken]: { catalogFailuresRemaining: 0 },
+    [mediaPendingBuyToken]: {
+      catalogFailuresRemaining: 0,
+      mediaListings: [
+        mediaListing({
+          mintId: mediaAvailableMint,
+          displayName: "Store Video",
+          accessState: "available",
+          quantity: "0x4",
+          price: "0x8",
+        }),
+      ],
+    },
   };
   const server = createServer(async (request, response) => {
     try {
@@ -378,6 +403,15 @@ function startServer() {
       if (url.pathname === "/fixture-media-error") {
         const topOrigin = `http://${request.headers.host}`;
         const appSrc = `/apps/marketplace/?home_origin=${encodeURIComponent(topOrigin)}#home_token=${encodeURIComponent(mediaErrorToken)}`;
+        const shellSrc = `/fixture-shell?app_src=${encodeURIComponent(appSrc)}`;
+        const body = Buffer.from(buildFixtureHtml(shellSrc));
+        response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
+        response.end(body);
+        return;
+      }
+      if (url.pathname === "/fixture-media-pending-buy") {
+        const topOrigin = `http://${request.headers.host}`;
+        const appSrc = `/apps/marketplace/?home_origin=${encodeURIComponent(topOrigin)}#home_token=${encodeURIComponent(mediaPendingBuyToken)}`;
         const shellSrc = `/fixture-shell?app_src=${encodeURIComponent(appSrc)}`;
         const body = Buffer.from(buildFixtureHtml(shellSrc));
         response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
@@ -479,10 +513,55 @@ function startServer() {
         json(response, { status: "ok", data: mediaListResponse(state[token]?.mediaListings || []) });
         return;
       }
+      if (url.pathname === "/api/provider/object/import_runtime_custody") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        const body = await readJsonBody(request);
+        requestLog.push({ path: url.pathname, token, method: request.method, body });
+        if (token === normalToken && body?.listing_uri === importedListingUri) {
+          state[normalToken].mediaListings = [
+            ...state[normalToken].mediaListings,
+            mediaListing({
+              mintId: mediaImportedMint,
+              displayName: "Imported Video",
+              accessState: "available",
+              quantity: "0x9",
+              price: "0xa",
+            }),
+          ];
+          json(response, {
+            status: "ok",
+            data: {
+              schema: "elastos.library.runtime-custody-import/v1",
+              listing_uri: importedListingUri,
+              mint_id: mediaImportedMint,
+              status: "verified",
+            },
+          });
+          return;
+        }
+        json(response, { message: "runtime import unavailable" }, 500);
+        return;
+      }
       if (url.pathname === "/api/provider/object/buy") {
         const token = String(request.headers["x-elastos-home-token"] || "");
         const body = await readJsonBody(request);
         requestLog.push({ path: url.pathname, token, method: request.method, body });
+        if (token === mediaPendingBuyToken) {
+          json(response, {
+            status: "error",
+            code: "library_error",
+            message: "Runtime custody purchase is pending exact Wallet or Chain settlement",
+            buy_progress: {
+              schema: "elastos.protected-content.buy-progress/v1",
+              stage: "purchase_approval",
+              resumable: true,
+              awaits_person: true,
+              external_signer: true,
+              connector_id: "wallet-metamask",
+            },
+          });
+          return;
+        }
         if (token === normalToken && body?.mint_id === mediaAvailableMint) {
           state[normalToken].mediaListings = state[normalToken].mediaListings.map((listing) =>
             listing.mint_id === mediaAvailableMint
@@ -744,7 +823,29 @@ async function run() {
     );
 
     const listCountBeforeBuy = requestLog.filter((entry) => entry.token === normalToken && entry.path === "/api/provider/object/list_runtime_custody").length;
-    const pendingBuyState = await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).evaluate((button) => {
+    // Buy asks first. Cancelling leaves nothing behind: no request, and the
+    // row exactly as it was.
+    const buyRequestsBeforeCancel = requestLog.filter((entry) => entry.path === "/api/provider/object/buy").length;
+    await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).click();
+    await frame.locator('[data-action="confirm-buy"]').waitFor();
+    const buyTermsText = await frame.locator("#detail-content").textContent();
+    assert(
+      /base units/.test(buyTermsText || "")
+        && /still listed/.test(buyTermsText || "")
+        && /Sold by/.test(buyTermsText || "")
+        && /Your wallet asks you to approve the payment/.test(buyTermsText || ""),
+      "Marketplace must show what a purchase costs and what happens next before it spends anything",
+      { buyTermsText },
+    );
+    await frame.locator('#detail-content .modal-btn[data-action="close-detail"]').click();
+    assert(
+      requestLog.filter((entry) => entry.path === "/api/provider/object/buy").length === buyRequestsBeforeCancel,
+      "Cancelling the terms must leave the purchase unstarted",
+    );
+
+    await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).click();
+    await frame.locator('[data-action="confirm-buy"]').waitFor();
+    const pendingBuyState = await frame.locator('[data-action="confirm-buy"]').evaluate((button) => {
       button.click();
       button.click();
       const activeButton = document.querySelector(`.store-row-media[data-mint="${button.dataset.mint}"] [data-action="buy-media"]`);
@@ -772,6 +873,56 @@ async function run() {
     await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="open-media"]`).waitFor();
     const boughtRowText = await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"]`).textContent();
     assert(/Owned/.test(boughtRowText || ""), "Marketplace must reload the media list after buy", { boughtRowText });
+
+    // A listing published on another Home arrives by its link. The control
+    // belongs to this shelf and appears with it, the link's shape is checked
+    // before Runtime is asked, and a verified import puts the item on the
+    // shelf without the person reloading anything.
+    assert(
+      await frame.locator("#import-listing").isVisible(),
+      "Marketplace must offer the add-a-listing control on the protected shelf",
+    );
+    const importCountBeforeInvalid = requestLog.filter(
+      (entry) => entry.path === "/api/provider/object/import_runtime_custody",
+    ).length;
+    await frame.locator("#import-listing-uri").fill("https://example.com/not-a-listing");
+    await frame.locator("#import-listing-submit").click();
+    await frame.locator(".toast").waitFor();
+    const invalidImportToast = await frame.locator(".toast").textContent();
+    assert(
+      /does not look like a listing link/.test(invalidImportToast || ""),
+      "Marketplace must refuse a link that is not a listing link",
+      { invalidImportToast },
+    );
+    assert(
+      requestLog.filter((entry) => entry.path === "/api/provider/object/import_runtime_custody").length
+        === importCountBeforeInvalid,
+      "Marketplace must not ask Runtime about a link it already knows is wrong",
+    );
+
+    await frame.locator("#import-listing-uri").fill(importedListingUri);
+    await frame.locator("#import-listing-submit").click();
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/import_runtime_custody", 1);
+    const importRequest = requestLog.find(
+      (entry) => entry.token === normalToken && entry.path === "/api/provider/object/import_runtime_custody",
+    );
+    assert(
+      importRequest?.method === "POST"
+        && JSON.stringify(importRequest.body) === JSON.stringify({ listing_uri: importedListingUri }),
+      "Marketplace must send the listing link as the one typed request Runtime verifies",
+      importRequest,
+    );
+    await frame.locator(`.store-row-media[data-mint="${mediaImportedMint}"]`).waitFor();
+    const importedRowText = await frame.locator(`.store-row-media[data-mint="${mediaImportedMint}"]`).textContent();
+    assert(
+      /Imported Video/.test(importedRowText || "") && /Buy/.test(importedRowText || ""),
+      "An imported listing must reach the shelf with a Buy control",
+      { importedRowText },
+    );
+    assert(
+      (await frame.locator("#import-listing-uri").inputValue()) === "",
+      "Marketplace must clear the link field once the listing is added",
+    );
 
     const purchasedOpenCountBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
     await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="open-media"]`).click();
@@ -881,13 +1032,66 @@ async function run() {
     await waitForFrameWidth(frame, 640);
     await assertNoHorizontalOverflow(frame, "narrow Marketplace layout");
 
+    // The person who listed an item has a link to pass on. It is the other
+    // half of Add a listing: without it, reaching an item on another Home
+    // meant already knowing its address.
+    const creatorRowText = await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"]`).textContent();
+    assert(
+      /Share/.test(creatorRowText || "") && /You listed this/.test(creatorRowText || ""),
+      "A creator's own row must offer the link to their listing",
+      { creatorRowText },
+    );
+    assert(
+      (await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="share-listing"]`).count()) === 0,
+      "A bought copy is not a listing to share",
+    );
+    await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"] [data-action="share-listing"]`).click();
+    await frame.locator("#share-listing-uri").waitFor();
+    assert(
+      (await frame.locator("#share-listing-uri").inputValue()) === importedListingUri,
+      "The share control must show the address Runtime published the listing at",
+    );
+    await frame.locator('#detail-content .modal-btn[data-action="close-detail"]').click();
+
+    // A purchase waiting on the person is not a failed purchase. The row says
+    // whose turn it is, the control goes where the approval is, and nothing
+    // reports an error over a purchase that is proceeding normally.
+    await page.goto(`http://127.0.0.1:${port}/fixture-media-pending-buy`);
+    const pendingBuyFrame = await waitForMarketplaceFrame(page);
+    await pendingBuyFrame.locator('[data-destination="media"]').click();
+    await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).click();
+    await pendingBuyFrame.locator('[data-action="confirm-buy"]').click();
+    await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="open-wallet"]`).waitFor();
+    const pendingRowText = await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"]`).textContent();
+    assert(
+      /Approve in wallet/.test(pendingRowText || "")
+        && /Approve this purchase in wallet-metamask/.test(pendingRowText || ""),
+      "A purchase waiting on the person must say whose turn it is and where",
+      { pendingRowText },
+    );
+    assert(
+      (await pendingBuyFrame.locator(".store-error-card").count()) === 0,
+      "A purchase in progress must not be reported as a failed surface",
+    );
+    const walletOpensBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
+    await pendingBuyFrame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="open-wallet"]`).click();
+    const walletMessages = await readHomeMessages(page);
+    const walletOpen = walletMessages.filter((entry) => entry.type === "home:open-target").at(-1);
+    assert(
+      walletMessages.filter((entry) => entry.type === "home:open-target").length === walletOpensBefore + 1
+        && walletOpen?.target === "wallet"
+        && walletOpen.homeToken === mediaPendingBuyToken,
+      "The approval control must take the person to the wallet holding the request",
+      walletOpen,
+    );
+
     await page.goto(`http://127.0.0.1:${port}/fixture-media-error`);
     const mediaErrorFrame = await waitForMarketplaceFrame(page);
     await mediaErrorFrame.locator('.store-row[data-app="people"]').first().waitFor();
     await mediaErrorFrame.locator('[data-destination="media"]').click();
     await mediaErrorFrame.locator(".store-error-card").waitFor();
     const mediaErrorText = await mediaErrorFrame.locator("#load-error").textContent();
-    assert(/Couldn’t load media/.test(mediaErrorText || ""), "Marketplace must show a bounded public media error", { mediaErrorText });
+    assert(/Couldn’t load your items/.test(mediaErrorText || ""), "Marketplace must show a bounded public error when the shelf itself cannot load", { mediaErrorText });
     assert(!/runtime service unavailable/.test(mediaErrorText || ""), "Marketplace must keep raw Runtime errors out of visible media text", { mediaErrorText });
     await mediaErrorFrame.locator('[data-destination="discover"]').click();
     await mediaErrorFrame.locator('.store-row[data-app="people"]').first().waitFor();
@@ -897,14 +1101,30 @@ async function run() {
     await mediaEmptyFrame.locator('[data-destination="media"]').click();
     await mediaEmptyFrame.locator(".empty-state").waitFor();
     const mediaEmptyText = await mediaEmptyFrame.locator("#store-main").textContent();
-    assert(/No protected media available/.test(mediaEmptyText || ""), "Marketplace must keep a clear empty media state", { mediaEmptyText });
+    assert(/No protected items yet/.test(mediaEmptyText || ""), "Marketplace must keep a clear empty state for the protected shelf", { mediaEmptyText });
 
+    // A row this app cannot read is refused on its own. It never reaches the
+    // shelf, and the person is told one item is hidden rather than losing the
+    // whole surface to it -- which is what used to happen, for every row,
+    // whenever the listing contract moved.
     await page.goto(`http://127.0.0.1:${port}/fixture-media-malformed`);
     const mediaMalformedFrame = await waitForMarketplaceFrame(page);
     await mediaMalformedFrame.locator('[data-destination="media"]').click();
-    await mediaMalformedFrame.locator(".store-error-card").waitFor();
-    const mediaMalformedText = await mediaMalformedFrame.locator("#load-error").textContent();
-    assert(/Couldn’t load media/.test(mediaMalformedText || ""), "Marketplace must fail closed on malformed media listings", { mediaMalformedText });
+    await mediaMalformedFrame.locator(".store-inline-note").waitFor();
+    const mediaMalformedText = await mediaMalformedFrame.locator("#store-main").textContent();
+    assert(
+      /One item could not be read and is hidden/.test(mediaMalformedText || ""),
+      "Marketplace must say when it refused a listing row",
+      { mediaMalformedText },
+    );
+    assert(
+      (await mediaMalformedFrame.locator(".store-row-media").count()) === 0,
+      "Marketplace must keep a refused listing row off the shelf",
+    );
+    assert(
+      (await mediaMalformedFrame.locator(".store-error-card").count()) === 0,
+      "Marketplace must keep one refused row from reading as a failed surface",
+    );
 
     await page.goto(`http://127.0.0.1:${port}/fixture-error`);
     const errorFrame = await waitForMarketplaceFrame(page);

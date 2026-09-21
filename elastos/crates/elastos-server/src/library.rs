@@ -7329,6 +7329,16 @@ fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
     {
         response["effect_pending"] = pending.as_json();
     }
+    // The buy twin of `open_progress`. A purchase is a sequence of waits, and
+    // an app has to tell "approve this in your wallet" from "the network is
+    // confirming it" from "you declined". All three arrived as one sentence
+    // that Marketplace then dropped, so a purchase in progress read as a
+    // purchase that had failed.
+    if let Some(progress) =
+        error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyBuyProgress>()
+    {
+        response["buy_progress"] = progress.as_json();
+    }
     // The opposite of pending: an approval that is finished and did not
     // succeed. Its own key, so an app polling for completion can tell "stop
     // waiting" from "keep waiting" without reading either sentence.
@@ -7336,6 +7346,14 @@ fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
         error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyApprovalClosed>()
     {
         response["approval_closed"] = closed.as_json();
+    }
+    // How far an open has got. A viewer reads `resumable` here to choose
+    // between waiting for the person's Wallet approval and offering them a
+    // retry, so that choice stops depending on the words in `message`.
+    if let Some(progress) =
+        error.downcast_ref::<crate::protected_content_runtime::RuntimeCustodyOpenProgress>()
+    {
+        response["open_progress"] = progress.as_json();
     }
     response
 }
@@ -7632,6 +7650,183 @@ mod tests {
 
         let plain = super::provider_error_from("library_error", &anyhow!("only"));
         assert!(plain.get("effect_pending").is_none());
+    }
+
+    /// How far an open has got, carried as data. The fact a viewer needs is
+    /// `resumable`: one of these means "ask again once the person answers the
+    /// Wallet" and another means "asking again answers the same". Both used to
+    /// arrive as one sentence, so the viewer showed the sentence and stopped --
+    /// which turned the ordinary first open of every protected item into a dead
+    /// end, because every first rights-signature request needs an approval.
+    #[test]
+    fn provider_error_from_carries_the_typed_open_progress_state() {
+        let external =
+            crate::protected_content_runtime::RuntimeCustodyOpenProgress::awaiting_rights_approval(
+                true,
+                Some("metamask"),
+                "approval-7",
+                1_700_000_290,
+            );
+        assert!(external.awaits_person());
+        assert_eq!(external.stage_label(), "rights_approval");
+        let actionable = external.to_string();
+        let value = super::provider_error_from(
+            "library_error",
+            &anyhow::Error::new(external)
+                .context("Runtime custody viewer release is pending exact Wallet approval"),
+        );
+        assert_eq!(
+            value["message"],
+            "Runtime custody viewer release is pending exact Wallet approval"
+        );
+        assert_eq!(
+            value["open_progress"]["schema"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_PROGRESS_SCHEMA_V1
+        );
+        assert_eq!(value["open_progress"]["stage"], "rights_approval");
+        assert_eq!(value["open_progress"]["resumable"], true);
+        assert_eq!(value["open_progress"]["awaits_person"], true);
+        assert_eq!(value["open_progress"]["connector_id"], "metamask");
+        // The exact approval the person answers, as data. It already reached
+        // callers inside the cause chain; a viewer can now name it without
+        // parsing it back out of a sentence.
+        assert_eq!(value["open_progress"]["approval_request_id"], "approval-7");
+        assert_eq!(value["open_progress"]["expires_at"], 1_700_000_290u64);
+        // Names where to go, not merely that something is pending.
+        assert_eq!(value["detail"], actionable);
+        assert!(actionable.contains("metamask"), "{actionable}");
+
+        // A managed approval is outstanding too, and nobody has to act on it.
+        // The open still resumes, so the viewer keeps waiting either way.
+        let managed =
+            crate::protected_content_runtime::RuntimeCustodyOpenProgress::awaiting_rights_approval(
+                false,
+                None,
+                "approval-8",
+                1_700_000_290,
+            );
+        assert!(!managed.awaits_person());
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(managed));
+        assert_eq!(value["open_progress"]["awaits_person"], false);
+        assert_eq!(value["open_progress"]["resumable"], true);
+        assert_eq!(
+            value["open_progress"]["connector_id"],
+            serde_json::Value::Null
+        );
+
+        // Absent for now: the same open can succeed later, and nobody is being
+        // waited on, so no approval is described.
+        let unavailable =
+            crate::protected_content_runtime::RuntimeCustodyOpenProgress::unavailable();
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(unavailable));
+        assert_eq!(value["open_progress"]["stage"], "unavailable");
+        assert_eq!(value["open_progress"]["resumable"], true);
+        assert_eq!(value["open_progress"]["awaits_person"], false);
+        assert!(value["open_progress"].get("approval_request_id").is_none());
+        assert!(value["open_progress"].get("expires_at").is_none());
+
+        // Refused: this is the one a viewer must not keep asking about.
+        let denied = crate::protected_content_runtime::RuntimeCustodyOpenProgress::denied();
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(denied));
+        assert_eq!(value["open_progress"]["stage"], "denied");
+        assert_eq!(value["open_progress"]["resumable"], false);
+        assert_eq!(value["open_progress"]["awaits_person"], false);
+
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("open_progress").is_none());
+    }
+
+    /// How far a purchase has got, carried as data. A buyer's three waits look
+    /// the same from the outside and mean different things: one asks them to
+    /// answer their wallet, one asks nothing while the network confirms, and
+    /// one is their own refusal. All three used to arrive as the same sentence,
+    /// which Marketplace then dropped for containing the word "Runtime", so a
+    /// purchase that was proceeding normally read as one that had failed.
+    #[test]
+    fn provider_error_from_carries_the_typed_buy_progress_state() {
+        use crate::protected_content_runtime::{RuntimeCustodyBuyProgress, RuntimeCustodyBuyStage};
+
+        let external = RuntimeCustodyBuyProgress::awaiting_approval(
+            RuntimeCustodyBuyStage::PurchaseApproval,
+            true,
+            Some("wallet-metamask"),
+        );
+        assert!(external.awaits_person());
+        assert_eq!(external.stage_label(), "purchase_approval");
+        let actionable = external.to_string();
+        let value = super::provider_error_from(
+            "library_error",
+            &anyhow::Error::new(external).context(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE,
+            ),
+        );
+        assert_eq!(
+            value["message"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE,
+            "the sentence older callers match on stays outermost"
+        );
+        assert_eq!(
+            value["buy_progress"]["schema"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_BUY_PROGRESS_SCHEMA_V1
+        );
+        assert_eq!(value["buy_progress"]["stage"], "purchase_approval");
+        assert_eq!(value["buy_progress"]["resumable"], true);
+        assert_eq!(value["buy_progress"]["awaits_person"], true);
+        assert_eq!(value["buy_progress"]["connector_id"], "wallet-metamask");
+        // Names where to go, not merely that something is pending.
+        assert_eq!(value["detail"], actionable);
+        assert!(actionable.contains("wallet-metamask"), "{actionable}");
+
+        // An allowance is a different approval from the purchase, and a buyer
+        // asked for two in a row needs to know which one they are answering.
+        let allowance = RuntimeCustodyBuyProgress::awaiting_approval(
+            RuntimeCustodyBuyStage::AllowanceApproval,
+            true,
+            None,
+        );
+        assert!(allowance.to_string().contains("Allow the payment"));
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(allowance));
+        assert_eq!(value["buy_progress"]["stage"], "allowance_approval");
+        assert_eq!(value["buy_progress"]["awaits_person"], true);
+
+        // A managed account has an approval outstanding too, and nobody has to
+        // act on it.
+        let managed = RuntimeCustodyBuyProgress::awaiting_approval(
+            RuntimeCustodyBuyStage::PurchaseApproval,
+            false,
+            None,
+        );
+        assert!(!managed.awaits_person());
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(managed));
+        assert_eq!(value["buy_progress"]["awaits_person"], false);
+        assert_eq!(value["buy_progress"]["resumable"], true);
+
+        // Two waits that name nobody: the chain, and the right becoming
+        // readable. The signer has already done everything asked of them.
+        for (stage, wire) in [
+            (RuntimeCustodyBuyStage::ChainSettlement, "chain_settlement"),
+            (RuntimeCustodyBuyStage::AccessEvidence, "access_evidence"),
+        ] {
+            let waiting = RuntimeCustodyBuyProgress::waiting(stage);
+            assert!(!waiting.awaits_person());
+            let value = super::provider_error_from("library_error", &anyhow::Error::new(waiting));
+            assert_eq!(value["buy_progress"]["stage"], wire);
+            assert_eq!(value["buy_progress"]["resumable"], true);
+            assert!(value["buy_progress"].get("external_signer").is_none());
+            assert!(value["buy_progress"].get("connector_id").is_none());
+        }
+
+        // Declining is an answer, and asking again cannot change it. That is
+        // what stops an app polling a purchase that will never settle.
+        let declined = RuntimeCustodyBuyProgress::declined();
+        assert!(!declined.awaits_person());
+        assert_eq!(declined.stage_label(), "declined");
+        let value = super::provider_error_from("library_error", &anyhow::Error::new(declined));
+        assert_eq!(value["buy_progress"]["stage"], "declined");
+        assert_eq!(value["buy_progress"]["resumable"], false);
+
+        let plain = super::provider_error_from("library_error", &anyhow!("only"));
+        assert!(plain.get("buy_progress").is_none());
     }
 
     fn listing_request(json: serde_json::Value) -> super::LibraryPublishListingRequest {

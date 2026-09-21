@@ -310,6 +310,30 @@ pub(crate) const RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE: &str =
 pub(crate) const RUNTIME_CUSTODY_OPEN_PENDING_MESSAGE: &str =
     "Runtime custody viewer release is pending exact Wallet approval";
 
+/// How long one viewer open stays resumable while the person answers the
+/// Wallet.
+///
+/// Every first rights-signature request answers `requires_approval`, so this
+/// window is the whole of the time a person has to approve an open. It used to
+/// be 60 s, which most human approvals lost: past it the record was torn down,
+/// a fresh recipient and a new Wallet request were raised, and the approval the
+/// person had just granted had nothing left to complete.
+///
+/// 290 s is the largest window that stays inside both contracts the open
+/// depends on. `MAX_RECIPIENT_KEY_AUTHORIZATION_LIFETIME_SECS` and
+/// `MAX_RIGHTS_REQUEST_LIFETIME_SECS` are each 300 s measured from `issued_at`,
+/// and the open issues both 5 s behind `now`. The short-lived artifacts of the
+/// release itself -- release request, release operation, node contribution,
+/// terminal receipt -- are all minted after the signature comes back, so human
+/// latency never reaches them and none of them is widened here.
+///
+/// The Wallet's own approval record expires at the rights request's own
+/// `expires_at`, so both sides of the wait now lapse together: a window that
+/// closes here is a window that closed there, and the Wallet's existing
+/// lapsed-request path accepts the fresh ask rather than colliding with a
+/// stale one.
+pub(crate) const RUNTIME_CUSTODY_OPEN_APPROVAL_WINDOW_SECS: u64 = 290;
+
 /// Fail-closed mapping for the viewer release path: logs the cause and source
 /// line at warn and keeps the stable message outermost while carrying the
 /// cause chain (surfaced as the library error `detail`).
@@ -474,6 +498,212 @@ impl std::fmt::Display for RuntimeCustodyCreatorMintBlocked {
 }
 
 impl std::error::Error for RuntimeCustodyCreatorMintBlocked {}
+
+/// Wire identity of the state an app renders while a purchase settles.
+pub(crate) const RUNTIME_CUSTODY_BUY_PROGRESS_SCHEMA_V1: &str =
+    "elastos.protected-content.buy-progress/v1";
+
+/// Where one purchase has got to.
+///
+/// A purchase is a sequence of waits, not a request: the wallet holds an
+/// approval the person answers, the chain takes its own time to confirm what
+/// they approved, and the right they bought becomes readable a block later
+/// still. Each of those used to arrive as the same sentence, and Marketplace
+/// dropped the sentence and showed "Media action could not be completed", so a
+/// purchase that was proceeding normally read as one that had failed.
+///
+/// The stages are the buy twin of [`RuntimeCustodyOpenStage`] and carry the
+/// same two facts an app decides from: whether asking again can answer
+/// differently, and whether a person has to do something first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyBuyStage {
+    /// The seller's payment token needs an allowance before the purchase can
+    /// move it. Only an ERC-20 listing reaches this stage; a listing priced in
+    /// the chain's own coin never does.
+    AllowanceApproval,
+    /// The Wallet holds the purchase itself. This is the approval that spends.
+    PurchaseApproval,
+    /// Approved, and the chain has not yet produced the evidence the purchase
+    /// needs. Nobody can hurry it and nobody need act.
+    ChainSettlement,
+    /// The purchase is on the chain and the right it bought is not yet
+    /// readable at the block Runtime trusts. The same purchase completes as
+    /// soon as it is.
+    AccessEvidence,
+    /// The person answered the Wallet by declining. Asking again re-raises the
+    /// same request rather than changing this answer, so an app offers a fresh
+    /// purchase instead of a retry.
+    Declined,
+}
+
+impl RuntimeCustodyBuyStage {
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::AllowanceApproval => "allowance_approval",
+            Self::PurchaseApproval => "purchase_approval",
+            Self::ChainSettlement => "chain_settlement",
+            Self::AccessEvidence => "access_evidence",
+            Self::Declined => "declined",
+        }
+    }
+
+    /// Whether re-issuing the identical buy can produce a different answer.
+    const fn resumable(self) -> bool {
+        match self {
+            Self::AllowanceApproval
+            | Self::PurchaseApproval
+            | Self::ChainSettlement
+            | Self::AccessEvidence => true,
+            Self::Declined => false,
+        }
+    }
+
+    /// Whether the person has to act before this stage can move.
+    const fn needs_an_answer(self) -> bool {
+        matches!(self, Self::AllowanceApproval | Self::PurchaseApproval)
+    }
+}
+
+/// How far a purchase has got, carried as data beside the stable message.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyBuyProgress {
+    stage: RuntimeCustodyBuyStage,
+    /// Who is being waited on, and only while that is a fact worth stating. A
+    /// chain wait names nobody: the signer has already done everything asked
+    /// of them.
+    approval: Option<RuntimeCustodyBuyApproval>,
+}
+
+/// Who answers the Wallet for a purchase, and where they answer it.
+#[derive(Debug, Clone)]
+struct RuntimeCustodyBuyApproval {
+    /// True when the account is an external wallet reached through a
+    /// connector, so the outstanding approval needs the person to act there.
+    external_signer: bool,
+    /// Names the connector when there is one, so an app can say "MetaMask"
+    /// rather than "your wallet".
+    connector_id: Option<String>,
+}
+
+impl RuntimeCustodyBuyProgress {
+    /// The Wallet holds an approval for this purchase.
+    pub(crate) fn awaiting_approval(
+        stage: RuntimeCustodyBuyStage,
+        external_signer: bool,
+        connector_id: Option<&str>,
+    ) -> Self {
+        Self {
+            stage,
+            approval: Some(RuntimeCustodyBuyApproval {
+                external_signer,
+                connector_id: connector_id.map(ToString::to_string),
+            }),
+        }
+    }
+
+    /// A wait that asks nothing of anyone: the chain, or the right becoming
+    /// readable.
+    pub(crate) const fn waiting(stage: RuntimeCustodyBuyStage) -> Self {
+        Self {
+            stage,
+            approval: None,
+        }
+    }
+
+    /// The person declined the Wallet request.
+    pub(crate) const fn declined() -> Self {
+        Self {
+            stage: RuntimeCustodyBuyStage::Declined,
+            approval: None,
+        }
+    }
+
+    /// Stage name for the operator log. Carries no account and no address.
+    pub(crate) const fn stage_label(&self) -> &'static str {
+        self.stage.wire_value()
+    }
+
+    /// Whether the person has to do something, or the purchase is simply
+    /// waiting. An app polls in both cases; only one of them asks anything of
+    /// the buyer.
+    pub(crate) const fn awaits_person(&self) -> bool {
+        match self.approval {
+            Some(ref approval) => self.stage.needs_an_answer() && approval.external_signer,
+            None => false,
+        }
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        let mut answer = json!({
+            "schema": RUNTIME_CUSTODY_BUY_PROGRESS_SCHEMA_V1,
+            "stage": self.stage.wire_value(),
+            "resumable": self.stage.resumable(),
+            "awaits_person": self.awaits_person(),
+        });
+        if let Some(approval) = self.approval.as_ref() {
+            answer["external_signer"] = Value::Bool(approval.external_signer);
+            answer["connector_id"] = approval
+                .connector_id
+                .as_ref()
+                .map_or(Value::Null, |id| Value::String(id.clone()));
+        }
+        answer
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyBuyProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.stage {
+            RuntimeCustodyBuyStage::AllowanceApproval
+            | RuntimeCustodyBuyStage::PurchaseApproval
+                if self.awaits_person() =>
+            {
+                let what = if matches!(self.stage, RuntimeCustodyBuyStage::AllowanceApproval) {
+                    "Allow the payment"
+                } else {
+                    "Approve this purchase"
+                };
+                match self
+                    .approval
+                    .as_ref()
+                    .and_then(|approval| approval.connector_id.as_deref())
+                {
+                    Some(connector) => write!(
+                        formatter,
+                        "{what} in {connector}; the purchase continues on its own once you do"
+                    ),
+                    None => write!(
+                        formatter,
+                        "{what} in your wallet; the purchase continues on its own once you do"
+                    ),
+                }
+            }
+            RuntimeCustodyBuyStage::AllowanceApproval
+            | RuntimeCustodyBuyStage::PurchaseApproval => {
+                write!(
+                    formatter,
+                    "The wallet approval is still completing; nothing else is needed"
+                )
+            }
+            RuntimeCustodyBuyStage::ChainSettlement => write!(
+                formatter,
+                "The purchase is approved and waiting for the network to confirm it; nothing \
+                 else is needed"
+            ),
+            RuntimeCustodyBuyStage::AccessEvidence => write!(
+                formatter,
+                "The purchase is on the network and the copy is being confirmed as yours; \
+                 nothing else is needed"
+            ),
+            RuntimeCustodyBuyStage::Declined => write!(
+                formatter,
+                "This purchase was declined in the wallet, so it did not go ahead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCustodyBuyProgress {}
 
 /// Wire identity of the typed answer an app gets when the wallet's transaction
 /// default for a chain cannot carry a protected-content transaction.
@@ -977,6 +1207,191 @@ impl std::fmt::Display for RuntimeCustodyEffectPending {
 }
 
 impl std::error::Error for RuntimeCustodyEffectPending {}
+
+/// Wire identity of the state an app renders while a protected item opens.
+pub(crate) const RUNTIME_CUSTODY_OPEN_PROGRESS_SCHEMA_V1: &str =
+    "elastos.protected-content.open-progress/v1";
+
+/// Where one open has got to.
+///
+/// The open ceremony has three outcomes a viewer has to present differently,
+/// and until now all three arrived as one English sentence in an error. The
+/// viewer showed the sentence and stopped, so the ordinary case -- the Wallet
+/// holding a rights-signature request that the person is about to approve --
+/// read exactly like a file that could never be opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCustodyOpenStage {
+    /// The Wallet holds the rights-signature request for this exact open. The
+    /// person approves it there, and the identical open then resumes the same
+    /// attempt against the recipient the decrypt provider still holds.
+    RightsApproval,
+    /// Something this open depends on is absent for now: verified content
+    /// availability, the decrypt provider, or the custody composition. The same
+    /// open can succeed later.
+    Unavailable,
+    /// This principal may not open this item. Asking again answers the same.
+    Denied,
+}
+
+impl RuntimeCustodyOpenStage {
+    const fn wire_value(self) -> &'static str {
+        match self {
+            Self::RightsApproval => "rights_approval",
+            Self::Unavailable => "unavailable",
+            Self::Denied => "denied",
+        }
+    }
+
+    /// Whether re-issuing the identical open can produce a different answer.
+    ///
+    /// This is the one fact a viewer needs to choose between waiting and
+    /// offering the person a retry, and it is a property of the stage rather
+    /// than of the words describing it.
+    const fn resumable(self) -> bool {
+        match self {
+            Self::RightsApproval | Self::Unavailable => true,
+            Self::Denied => false,
+        }
+    }
+}
+
+/// Who is being waited on for a rights approval, and where they act.
+#[derive(Debug, Clone)]
+struct RuntimeCustodyOpenApproval {
+    /// True when the account is an external wallet reached through a
+    /// connector, so the outstanding approval needs the person to act there.
+    external_signer: bool,
+    /// Names the connector when there is one, so a viewer can say "MetaMask"
+    /// rather than "your wallet". A connector id is a local wallet-surface
+    /// identifier, not a secret and not an account.
+    connector_id: Option<String>,
+    /// The approval the person answers. It already reached callers inside the
+    /// diagnostic cause chain; carrying it as data lets a viewer name the exact
+    /// request instead of parsing it back out of a sentence.
+    approval_request_id: String,
+}
+
+/// How far an open has got, carried as data beside the stable message.
+///
+/// A viewer reads `resumable` to decide whether to keep asking, and
+/// `awaits_person` to decide whether to ask the person for anything at all.
+/// Neither decision is taken by matching words in `message`.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeCustodyOpenProgress {
+    stage: RuntimeCustodyOpenStage,
+    /// Present only for a rights approval; the other stages wait on nobody.
+    approval: Option<RuntimeCustodyOpenApproval>,
+    /// When the resumable window closes, for the stages that have one.
+    expires_at: Option<u64>,
+}
+
+impl RuntimeCustodyOpenProgress {
+    /// The Wallet holds this open's rights-signature request.
+    pub(crate) fn awaiting_rights_approval(
+        external_signer: bool,
+        connector_id: Option<&str>,
+        approval_request_id: &str,
+        expires_at: u64,
+    ) -> Self {
+        Self {
+            stage: RuntimeCustodyOpenStage::RightsApproval,
+            approval: Some(RuntimeCustodyOpenApproval {
+                external_signer,
+                connector_id: connector_id.map(ToString::to_string),
+                approval_request_id: approval_request_id.to_string(),
+            }),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    /// Something the open depends on is absent for now.
+    pub(crate) const fn unavailable() -> Self {
+        Self {
+            stage: RuntimeCustodyOpenStage::Unavailable,
+            approval: None,
+            expires_at: None,
+        }
+    }
+
+    /// This principal may not open this item.
+    pub(crate) const fn denied() -> Self {
+        Self {
+            stage: RuntimeCustodyOpenStage::Denied,
+            approval: None,
+            expires_at: None,
+        }
+    }
+
+    /// Stage code for the operator log. Carries no account and no address.
+    pub(crate) const fn stage_label(&self) -> &'static str {
+        self.stage.wire_value()
+    }
+
+    /// Whether the person has to do something, or the open is simply waiting.
+    /// A managed approval is outstanding too, and nobody has to act on it.
+    pub(crate) fn awaits_person(&self) -> bool {
+        self.approval
+            .as_ref()
+            .is_some_and(|approval| approval.external_signer)
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        let mut answer = json!({
+            "schema": RUNTIME_CUSTODY_OPEN_PROGRESS_SCHEMA_V1,
+            "stage": self.stage.wire_value(),
+            "resumable": self.stage.resumable(),
+            "awaits_person": self.awaits_person(),
+        });
+        if let Some(approval) = self.approval.as_ref() {
+            answer["external_signer"] = Value::Bool(approval.external_signer);
+            answer["connector_id"] = approval
+                .connector_id
+                .as_ref()
+                .map_or(Value::Null, |id| Value::String(id.clone()));
+            answer["approval_request_id"] = Value::String(approval.approval_request_id.clone());
+        }
+        if let Some(expires_at) = self.expires_at {
+            answer["expires_at"] = json!(expires_at);
+        }
+        answer
+    }
+}
+
+impl std::fmt::Display for RuntimeCustodyOpenProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.stage {
+            RuntimeCustodyOpenStage::RightsApproval if self.awaits_person() => {
+                match self
+                    .approval
+                    .as_ref()
+                    .and_then(|approval| approval.connector_id.as_deref())
+                {
+                    Some(connector) => write!(
+                        formatter,
+                        "Approve opening this item in {connector}; it opens on its own once you do"
+                    ),
+                    None => write!(
+                        formatter,
+                        "Approve opening this item in your wallet; it opens on its own once you do"
+                    ),
+                }
+            }
+            RuntimeCustodyOpenStage::RightsApproval => write!(
+                formatter,
+                "Approve opening this item in your wallet; it opens on its own once you do"
+            ),
+            RuntimeCustodyOpenStage::Unavailable => write!(
+                formatter,
+                "This item is unavailable for now; opening it again later can succeed"
+            ),
+            RuntimeCustodyOpenStage::Denied => {
+                write!(formatter, "This item belongs to a different account")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeCustodyOpenProgress {}
 
 /// Drop the creator terms recorded for one object so its owner can start over.
 ///
@@ -6834,6 +7249,22 @@ pub(crate) struct RuntimeCustodyListingRecord {
     pub(crate) availability: RuntimeCustodyListingAvailabilitySummary,
 }
 
+impl RuntimeCustodyListingOrigin {
+    /// The `elastos://` address this listing's package was published at.
+    ///
+    /// Both origins carry it: a local creator's listing keeps the URI it
+    /// published to, and an imported one keeps the URI it was fetched from.
+    /// Either way it names the same package, so passing it on is how a listing
+    /// travels between Homes.
+    pub(crate) fn listing_uri(&self) -> &str {
+        match self {
+            Self::LocalCreator { listing_uri, .. } | Self::Imported { listing_uri, .. } => {
+                listing_uri
+            }
+        }
+    }
+}
+
 impl RuntimeCustodyListingRecord {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema != RUNTIME_LISTING_SCHEMA_V1 {
@@ -8171,6 +8602,18 @@ fn runtime_custody_listing_summary(
         "schema": RUNTIME_LISTING_SCHEMA_V1,
         "mint_id": record.package.mint_id,
         "display_name": record.package.display_name,
+        // Where this listing's package lives, which is the whole of what one
+        // person needs to give another for the item to reach their shelf. It
+        // is a public content address that the listing already published; the
+        // answer to `publish` has carried it since listings existed, and no
+        // surface has ever shown it.
+        "listing_uri": record.origin.listing_uri(),
+        // What this item is, in the two words the viewer session already
+        // speaks. An app used to read the kind out of `mime_type`, which is a
+        // second rule for a question Runtime answers here from the identity
+        // itself, and a second rule can disagree with the one the open path
+        // enforces.
+        "content_kind": runtime_custody_content_kind(&content_identity),
         "mime_type": content_identity.content_type(),
         "codecs": runtime_portable_content_codecs(&content_identity),
         "quantity": record.package.quantity,
@@ -8340,6 +8783,23 @@ pub(crate) async fn verify_fresh_runtime_custody_availability(
     })
 }
 
+/// A refused open, carried as data so a viewer presents it as final.
+///
+/// The sentence stays outermost for the consumers that still read it; the
+/// typed state underneath is what tells a viewer to offer no retry.
+fn runtime_custody_open_denied() -> anyhow::Error {
+    anyhow::Error::new(RuntimeCustodyOpenProgress::denied())
+        .context(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE)
+}
+
+/// An open blocked by something absent for now, carried as data so a viewer
+/// offers the person a retry. The original cause rides the detail chain.
+fn runtime_custody_open_unavailable(message: &'static str, cause: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RuntimeCustodyOpenProgress::unavailable())
+        .context(format!("{cause:?}"))
+        .context(message)
+}
+
 pub(crate) async fn open_runtime_custody_viewer(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
@@ -8350,13 +8810,13 @@ pub(crate) async fn open_runtime_custody_viewer(
         acquire_runtime_custody_viewer_lifecycle_guard(data_dir, &input.principal_id, mint_id)
             .await;
     let purchase = load_runtime_custody_purchase(data_dir, &input.principal_id, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE))?;
+        .ok_or_else(runtime_custody_open_denied)?;
     if purchase.principal_id != input.principal_id {
-        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+        return Err(runtime_custody_open_denied());
     }
     let profile_did = load_runtime_custody_profile_did(data_dir, &input.principal_id)?;
-    let listing = load_runtime_custody_listing(data_dir, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE))?;
+    let listing =
+        load_runtime_custody_listing(data_dir, mint_id)?.ok_or_else(runtime_custody_open_denied)?;
     let asset = validate_runtime_custody_viewer_asset(
         &listing,
         &input.principal_id,
@@ -8402,7 +8862,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     // from re-fetched, re-verified content); this one only makes sure a
     // cross-kind actor can never reach a shortcut that returns a session.
     if input.executable_actor != expected_runtime_custody_viewer_capsule(&asset.content_identity) {
-        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+        return Err(runtime_custody_open_denied());
     }
     // An open-pending record that still waits on the Wallet approval of its
     // rights-signature request is resumed for the same runtime session
@@ -8418,7 +8878,7 @@ pub(crate) async fn open_runtime_custody_viewer(
             mint_id,
             &purchase.content_id,
         ) {
-            anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+            return Err(runtime_custody_open_denied());
         }
         let viewer_now = crate::auth::now_ts();
         match record.lifecycle_status {
@@ -8462,7 +8922,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                 if !record.matches_runtime_session_binding(&runtime_session_binding)
                     && !record.is_expired(viewer_now) =>
             {
-                anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+                return Err(runtime_custody_open_denied());
             }
             RuntimeCustodyViewerLifecycleStatus::OpenPending
             | RuntimeCustodyViewerLifecycleStatus::Active
@@ -8471,7 +8931,7 @@ pub(crate) async fn open_runtime_custody_viewer(
                     && !record.is_expired(viewer_now)
                     && !record.matches_runtime_session_binding(&runtime_session_binding)
                 {
-                    anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+                    return Err(runtime_custody_open_denied());
                 }
                 let _ = settle_runtime_custody_viewer_cleanup(
                     data_dir,
@@ -8513,14 +8973,22 @@ pub(crate) async fn open_runtime_custody_viewer(
     // derived over `executable_actor`, so a cross-kind actor can never match a
     // session opened by the correct one.
     if input.executable_actor != expected_runtime_custody_viewer_capsule(draft.content_identity()) {
-        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+        return Err(runtime_custody_open_denied());
     }
     if fresh_availability.content_cid() != purchase.cid {
-        anyhow::bail!(RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE);
+        return Err(runtime_custody_open_unavailable(
+            RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE,
+            &anyhow::anyhow!("fresh availability CID differs from the purchased CID"),
+        ));
     }
     let buy = reconstructed_buy_receipt(&draft, &fresh_availability, &purchase, &profile_did)?;
-    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let composition =
+        load_runtime_custody_composition(data_dir, registry.clone())?.ok_or_else(|| {
+            runtime_custody_open_unavailable(
+                RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
+                &anyhow::anyhow!("no signed custody composition is installed"),
+            )
+        })?;
     let (device_key, _) =
         crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)?
             .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
@@ -8596,12 +9064,17 @@ pub(crate) async fn open_runtime_custody_viewer(
                 audit_request_id,
                 runtime_issuer,
                 now.saturating_sub(5),
-                now + 60,
+                now + RUNTIME_CUSTODY_OPEN_APPROVAL_WINDOW_SECS,
             )
             .await
             {
                 Ok(prepared) => prepared,
-                Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
+                Err(error) => {
+                    return Err(runtime_custody_open_unavailable(
+                        RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
+                        &anyhow::anyhow!("{error:?}"),
+                    ))
+                }
             };
             let open_pending =
                 RuntimeCustodyViewerRecord::from_open_pending(RuntimeCustodyOpenPendingInput {
@@ -8653,6 +9126,8 @@ pub(crate) async fn open_runtime_custody_viewer(
             Ok(RuntimeReleaseWalletOutcome::PendingApproval {
                 request_bytes,
                 approval_request_id,
+                external_signer,
+                connector_id,
             }) => {
                 // First pending answer: remember the exact request and the
                 // recipient identity so the next open replays it; the prepared
@@ -8672,12 +9147,24 @@ pub(crate) async fn open_runtime_custody_viewer(
                         &open_pending,
                     )?;
                 }
-                return Err(anyhow::anyhow!(
-                    "{}:{}: approval_request_id={approval_request_id}",
-                    file!(),
-                    line!()
-                )
-                .context(RUNTIME_CUSTODY_OPEN_PENDING_MESSAGE));
+                // A waiting state, carried as data. The viewer reads it to show
+                // the ceremony and to re-issue this identical open once the
+                // person answers, instead of reading the sentence below and
+                // stopping.
+                let progress = RuntimeCustodyOpenProgress::awaiting_rights_approval(
+                    external_signer,
+                    connector_id.as_deref(),
+                    &approval_request_id,
+                    open_pending.expires_at,
+                );
+                tracing::debug!(
+                    stage = progress.stage_label(),
+                    awaits_person = progress.awaits_person(),
+                    "runtime custody open: answering with typed open progress"
+                );
+                return Err(anyhow::Error::new(progress)
+                    .context(format!("{}:{}", file!(), line!()))
+                    .context(RUNTIME_CUSTODY_OPEN_PENDING_MESSAGE));
             }
             Err(error) => {
                 let _ = settle_runtime_custody_viewer_cleanup(
@@ -8942,7 +9429,10 @@ pub(crate) async fn open_runtime_custody_viewer(
                 open_pending.clone(),
             )
             .await;
-            anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE);
+            return Err(runtime_custody_open_unavailable(
+                RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
+                &anyhow::anyhow!("opening the decrypt viewer session failed"),
+            ));
         }
     };
     let handle = *session.viewer_session_handle();
@@ -10163,11 +10653,18 @@ enum RuntimeReleaseWalletOutcome {
         /// Boxed: the signed rights request dwarfs the pending arm.
         signed_rights: Box<WalletSignedRightsRequestV1>,
     },
-    /// A managed account needs the principal's explicit approval first; the
-    /// exact request must be replayed once the approval is completed.
+    /// The account needs the principal's explicit approval first; the exact
+    /// request must be replayed once the approval is completed. Every first
+    /// rights-signature request lands here, for managed and external accounts
+    /// alike, so this is the ordinary path rather than an edge case.
     PendingApproval {
         request_bytes: Vec<u8>,
         approval_request_id: String,
+        /// Read from the approval record the Wallet just created, which names
+        /// the account the approval actually belongs to. An external account
+        /// is waiting on its connector, which means it is waiting on a person.
+        external_signer: bool,
+        connector_id: Option<String>,
     },
 }
 
@@ -10210,7 +10707,7 @@ fn runtime_release_wallet_request(
         buy.action(),
         recipient.clone(),
         now.saturating_sub(5),
-        now + 180,
+        now + RUNTIME_CUSTODY_OPEN_APPROVAL_WINDOW_SECS,
         ReplayNonce16::new(replay_nonce),
     )
     .map_err(release_unavailable!())?;
@@ -10302,19 +10799,35 @@ async fn invoke_runtime_release_wallet(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        let approval_request_id = payload
+        let approval = payload
             .get("approval_request")
-            .and_then(|approval| approval.get("request_id"))
+            .ok_or_else(release_unavailable_missing!())?;
+        let approval_request_id = approval
+            .get("request_id")
             .and_then(Value::as_str)
             .ok_or_else(release_unavailable_missing!())?
             .to_string();
+        let external_signer =
+            !crate::api::gateway::gateway_wallet::gateway_wallet_send::is_managed_wallet_proof_type(
+                approval
+                    .get("proof_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+        let connector_id = approval
+            .get("connector_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         tracing::debug!(
             %approval_request_id,
+            external_signer,
             "runtime custody open: viewer release awaits exact Wallet approval"
         );
         return Ok(RuntimeReleaseWalletOutcome::PendingApproval {
             request_bytes,
             approval_request_id,
+            external_signer,
+            connector_id,
         });
     }
     let signed_rights = wallet_signed_rights_from_bytes(&request_bytes, &response_bytes)
@@ -10714,6 +11227,24 @@ fn expected_runtime_custody_viewer_capsule(
 
 /// Object twin of [`RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA`].
 pub(crate) const RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT: &str = "object";
+
+/// The kind of one protected item, in the same two words the viewer session
+/// already speaks.
+///
+/// This exists so that a listing can say what it is before anyone opens it.
+/// Marketplace used to decide the viewer from the item's MIME, which is a
+/// second rule for a question [`expected_runtime_custody_viewer_capsule`]
+/// already answers, and a second rule can disagree. The arms here are that
+/// function's arms: media is the player's, an object is the reader's, and a
+/// test holds the two together.
+pub(crate) const fn runtime_custody_content_kind(
+    content_identity: &RuntimeContentIdentityV1,
+) -> &'static str {
+    match content_identity {
+        RuntimeContentIdentityV1::Media(_) => RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA,
+        RuntimeContentIdentityV1::Object(_) => RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT,
+    }
+}
 
 /// Object twin of [`runtime_custody_viewer_public_response`]. Carries the same
 /// five kind-independent fields in the same order (`schema`, `content_kind`,

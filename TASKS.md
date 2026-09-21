@@ -156,6 +156,19 @@ Open:
   playback. None has ever been run. The deferred proofs from the object,
   reader and audio work all collapse into this one item; `state.md` records
   what to run and what to look for.
+- [ ] Build the locked renderer for the object path, pictures first. Elacity
+  Reader receives plaintext today, which the containment claim allows and
+  states. Two decisions are settled and recorded in
+  [locked renderer design](docs/audits/2026-09-21-protected-content-locked-renderer-design.md):
+  the decoder sits inside the decrypt provider under a pure-Rust rule, because
+  a sibling provider would create a plaintext crossing that does not exist
+  today; and the five picture types that decode in pure Rust are locked while
+  AVIF keeps its current path, because its usual decoder is C and would sit in
+  the process holding the CEK. That design also carries the per-kind table: a
+  lock is possible only where the rendered form differs from the file, so
+  comics follow pictures almost for free, PDF is gated by the pure-Rust rule,
+  EPUB and 3D are product changes, and text cannot be locked at all. What
+  remains open when this resumes is listed at the end of that document.
 - [ ] Give protected audio a thumbnail. The player already prefers an image
   track, then a poster, then controls alone, but nothing in the Runtime
   populates `thumbnail_uri`, so protected audio always lands on the

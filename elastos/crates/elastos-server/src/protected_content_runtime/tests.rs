@@ -1429,11 +1429,16 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
     let creator_listing = creator_view["listings"][0].as_object().unwrap();
     assert_eq!(
         creator_listing.keys().cloned().collect::<Vec<_>>(),
+        // The same list lives in `capsules/marketplace/browser/src/listing.js`
+        // as LISTING_KEYS. The shelf parses these exactly, so a field added
+        // here and forgotten there is refused in front of a person.
         vec![
             "access_state",
             "availability",
             "codecs",
+            "content_kind",
             "display_name",
+            "listing_uri",
             "mime_type",
             "mint_id",
             "pay_token",
@@ -1446,6 +1451,12 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
         ]
     );
     assert_eq!(creator_listing["display_name"], "protected-video.mp4");
+    assert!(
+        creator_listing["listing_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("elastos://")),
+        "a listing names the address a creator passes on"
+    );
     assert_eq!(creator_listing["mime_type"], MEDIA_MIME_TYPE_V1);
     assert_eq!(creator_listing["codecs"], MEDIA_CODECS_V1);
     assert_eq!(creator_listing["quantity"], "0x2");
@@ -10580,6 +10591,11 @@ impl Provider for ManagedReleaseWalletProvider {
             "request_id": wallet_request.request_id,
             "intent": "protected_content_rights_signature",
             "status": if approved { "completed" } else { "pending" },
+            // The Wallet names the account the approval belongs to. A managed
+            // account completes in place, so the open reports that nobody has
+            // to go anywhere; an external one would carry its connector here.
+            "proof_type": "managed_evm",
+            "connector_id": Value::Null,
         });
         let data = if approved {
             let (account_id, canonical_rights_request_hex) = match &wallet_request.operation {
@@ -10712,7 +10728,15 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
         super::RuntimeReleaseWalletOutcome::PendingApproval {
             request_bytes,
             approval_request_id,
-        } => (request_bytes, approval_request_id),
+            external_signer,
+            connector_id,
+        } => {
+            // Read from the approval record rather than assumed, so a viewer
+            // can say whose turn it is.
+            assert!(!external_signer);
+            assert_eq!(connector_id, None);
+            (request_bytes, approval_request_id)
+        }
         super::RuntimeReleaseWalletOutcome::Signed { .. } => panic!("expected pending approval"),
     };
     let decoded = WalletProviderRequestV2::decode_at(&request_bytes, now).unwrap();
@@ -10734,6 +10758,7 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
         super::RuntimeReleaseWalletOutcome::PendingApproval {
             request_bytes: replayed,
             approval_request_id: replayed_id,
+            ..
         } => {
             assert_eq!(replayed, request_bytes);
             assert_eq!(replayed_id, approval_request_id);
@@ -14555,5 +14580,113 @@ fn classified_failures_format_exactly_as_before() {
         }
         .into_message("custody", "provision_node_share"),
         "custody provider provision_node_share response is missing data"
+    );
+}
+
+/// A listing says what kind of item it is, and both kinds publish one shape.
+///
+/// `runtime_custody_listings_project_public_summary_and_access_state` carries
+/// the canonical key list for a media row; the same list lives in
+/// `capsules/marketplace/browser/src/listing.js` as LISTING_KEYS, and the
+/// Marketplace parser refuses any row that does not match it exactly. That is
+/// the pair that had drifted: the producer gained an availability
+/// `receipt_digest` and the consumer did not, so every protected row was
+/// refused in front of a person for twenty-four days.
+///
+/// What that test does not cover is an object. This one does, and it holds the
+/// two kinds to one shape rather than repeating the list.
+#[test]
+fn listing_summary_names_the_kind_and_publishes_one_shape_for_both() {
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .expect("a summary is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let media = runtime_custody_listing_record_for_test(
+        Digest32::new([0x7a; 32]),
+        "person:local:creator",
+        "clip.mp4",
+        NOW,
+    );
+    let media_summary =
+        super::runtime_custody_listing_summary(temp.path(), "person:local:buyer", &media).unwrap();
+    assert_eq!(media_summary["content_kind"], "media");
+    assert_eq!(media_summary["access_state"], "available");
+
+    let (_, package) = object_listing_package_for_test(0x7b);
+    let object = super::RuntimeCustodyListingRecord {
+        origin: super::RuntimeCustodyListingOrigin::LocalCreator {
+            principal_id: "person:local:creator".to_string(),
+            listing_uri: format!("elastos://{}", ContentAvailabilityTestProvider::CID),
+            package_sha256: hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&package).unwrap(),
+            )),
+        },
+        package,
+        ..media
+    };
+    // Read as the creator who listed it, which is the other access state the
+    // shelf renders and the one that never offers a Buy control.
+    let object_summary =
+        super::runtime_custody_listing_summary(temp.path(), "person:local:creator", &object)
+            .unwrap();
+    assert_eq!(
+        sorted_keys(&object_summary),
+        sorted_keys(&media_summary),
+        "a shelf parses one row shape, whatever kind the item is"
+    );
+    assert_eq!(
+        sorted_keys(&object_summary["availability"]),
+        sorted_keys(&media_summary["availability"])
+    );
+    assert_eq!(object_summary["content_kind"], "object");
+    assert_eq!(object_summary["mime_type"], "application/pdf");
+    assert_eq!(
+        object_summary["codecs"], "",
+        "an object declares no codecs, and the shelf accepts that as its answer"
+    );
+    assert_eq!(
+        object_summary["access_state"], "creator",
+        "the creator of a listing is never offered their own item to buy"
+    );
+}
+
+/// The kind a listing announces and the viewer the open path admits are two
+/// readings of one decision. They are separate functions, so this holds them
+/// to the same answer for both variants; a third spelling of either word would
+/// let a shelf offer an item to a viewer Runtime will refuse.
+#[test]
+fn a_listing_announces_the_kind_the_open_path_enforces() {
+    let media = RuntimeContentIdentityV1::Media(
+        mint_draft_for_composition_journal_test()
+            .media_identity()
+            .unwrap()
+            .clone(),
+    );
+    assert_eq!(
+        super::runtime_custody_content_kind(&media),
+        super::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA
+    );
+    assert_eq!(
+        super::expected_runtime_custody_viewer_capsule(&media),
+        super::ELACITY_PLAYER_CAPSULE_ID
+    );
+
+    let (object_identity, _) = object_listing_package_for_test(0x7c);
+    let object = RuntimeContentIdentityV1::Object(object_identity);
+    assert_eq!(
+        super::runtime_custody_content_kind(&object),
+        super::RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_OBJECT
+    );
+    assert_eq!(
+        super::expected_runtime_custody_viewer_capsule(&object),
+        super::ELACITY_READER_CAPSULE_ID
     );
 }

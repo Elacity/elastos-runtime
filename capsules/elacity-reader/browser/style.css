@@ -224,6 +224,29 @@ body {
   font-size: 0.9375rem;
 }
 
+/* The one control an empty panel ever offers: ask again. It borrows the page
+   bar's shape so a person meets one kind of button in this reader, not two. */
+.reader-action {
+  margin-top: 4px;
+  padding: 8px 18px;
+  border: 1px solid rgba(214, 222, 240, 0.28);
+  border-radius: 999px;
+  background: rgba(244, 247, 251, 0.08);
+  color: #f4f7fb;
+  font: inherit;
+  font-size: 0.9375rem;
+  cursor: pointer;
+}
+
+.reader-action:hover {
+  background: rgba(244, 247, 251, 0.16);
+}
+
+.reader-action:focus-visible {
+  outline: 2px solid #8ab4ff;
+  outline-offset: 2px;
+}
+
 .view-note {
   margin: 0;
   padding: 8px 24px 16px;
