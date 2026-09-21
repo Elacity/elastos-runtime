@@ -2995,7 +2995,6 @@ export function bindShellSurfaceDom(options = {}) {
   bindAssistantFace({
     easeDockPillWidth,
     targetById,
-    mountGlyph,
     launchHomeTarget,
     iframeSandboxForLaunch,
     iframeAllowForLaunch,
