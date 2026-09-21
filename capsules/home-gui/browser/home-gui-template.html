@@ -582,7 +582,28 @@
         hidden
       >
         <span class="taskbar-icon">
-          <span class="taskbar-item-icon"></span>
+          <!-- Home's Assistant mark: orange chevron beneath the frosted glass one,
+               composited live. Motion lives in shell-assistant-mark.js. -->
+          <span class="taskbar-item-icon assistant-mark" data-tone="raster">
+            <img
+              class="assistant-mark-layer"
+              data-assistant-layer="orange"
+              src="./icons/assistant-mark/orange/icon-128.png?v=home-20260813a"
+              srcset="./icons/assistant-mark/orange/icon-128.png?v=home-20260813a 128w, ./icons/assistant-mark/orange/icon-256.png?v=home-20260813a 256w"
+              sizes="64px"
+              alt=""
+              draggable="false"
+            >
+            <img
+              class="assistant-mark-layer"
+              data-assistant-layer="glass"
+              src="./icons/assistant-mark/glass/icon-128.png?v=home-20260813a"
+              srcset="./icons/assistant-mark/glass/icon-128.png?v=home-20260813a 128w, ./icons/assistant-mark/glass/icon-256.png?v=home-20260813a 256w"
+              sizes="64px"
+              alt=""
+              draggable="false"
+            >
+          </span>
         </span>
       </button>
       <button

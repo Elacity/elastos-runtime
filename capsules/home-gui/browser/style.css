@@ -3576,6 +3576,33 @@ body.dock-autohide::after {
   --dock-shift: 0px;
 }
 
+/* Assistant mark: both chevron layers fill the same square so their equal
+   and opposite travel meets exactly. Transform-only, still at rest; the
+   sequence is driven from shell-assistant-mark.js. */
+.assistant-mark {
+  position: relative;
+  overflow: visible;
+}
+
+/* The chevron artwork spans 64.5% of its square; the launcher glyph spans
+   58.6% of its own. Drawing the layers at 90.9% of the slot puts the mark's
+   top and bottom on the launcher glyph's. Explicit size: an absolutely
+   positioned image keeps its intrinsic size under width:auto. */
+.assistant-mark-layer {
+  position: absolute;
+  top: 4.55%;
+  left: 4.55%;
+  width: 90.9%;
+  height: 90.9%;
+  display: block;
+  object-fit: contain;
+  transform: translate3d(0, 0, 0);
+  transform-origin: 50% 50%;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
 .taskbar-icon {
   position: relative;
   width: 100%;
