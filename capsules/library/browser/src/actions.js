@@ -35,6 +35,7 @@ export function createLibraryActions({
   providerApi,
   renderUploads,
   selectedObjects,
+  setDesktopBackground,
   setStatus,
   setUploadProgress,
   showMenuForObject,
@@ -246,6 +247,15 @@ export function createLibraryActions({
   async function downloadObject(object) {
     const data = await downloadObjectRaw({ uri: object.uri });
     saveDownloadBlob(data.blob, data.filename || object.name || "download");
+  }
+
+  async function setObjectAsDesktopBackground(object) {
+    setStatus("Setting desktop background...");
+    if (await setDesktopBackground(object.uri)) {
+      setStatus("Desktop background updated.");
+      return;
+    }
+    setStatus("Could not set this image as the desktop background.");
   }
 
   async function downloadObjectAsZip(object) {
@@ -713,6 +723,7 @@ export function createLibraryActions({
     restoreObject,
     restoreSelectedObjects,
     setClipboard,
+    setObjectAsDesktopBackground,
     shareObject,
     showStatusObject,
     trashObject,

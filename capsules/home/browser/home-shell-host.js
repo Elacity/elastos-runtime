@@ -92,6 +92,9 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   documents: new Set(["chat-room"]),
   library: new Set(["archive-manager", "browser", "chat-room"]),
 });
+// Apps that may ask Home to make one of the person's own objects the wallpaper.
+const SHELL_MESSAGE_DESKTOP_BACKGROUND_SOURCES = new Set(["library"]);
+const DESKTOP_BACKGROUND_SOURCE_URI_MAX_LENGTH = 2048;
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
 const pendingBrowserAuthorityRenewals = new Map();
@@ -1747,6 +1750,10 @@ window.addEventListener("message", (event) => {
     });
     return;
   }
+  if (data.type === "home:set-desktop-background") {
+    handleSetDesktopBackgroundMessage(event, context, data);
+    return;
+  }
   if (data.type === "home:deliver-to-target") {
     const target = typeof data.target === "string" ? data.target.trim() : "";
     if (!target || !canDeliverTargetFromHomeMessage(context, target)) {
@@ -2031,6 +2038,39 @@ function canOpenTargetFromHomeMessage(context, target) {
     return normalizedActiveShellName(target) !== HOME_GUI_SHELL_ID;
   }
   return policy.has(target);
+}
+
+// The app expresses intent; Home performs the change with its own appearance
+// authority, so the app never gains one. The Runtime re-checks that the object
+// belongs to the signed-in person and is an image.
+function handleSetDesktopBackgroundMessage(event, context, data) {
+  const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+  const uri = typeof data.uri === "string" ? data.uri.trim() : "";
+  if (
+    context.kind !== "app-frame" ||
+    !SHELL_MESSAGE_DESKTOP_BACKGROUND_SOURCES.has(context.targetId) ||
+    !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "uri"]) ||
+    !requestId ||
+    requestId.length > 128 ||
+    !uri.startsWith("localhost://Users/") ||
+    uri.length > DESKTOP_BACKGROUND_SOURCE_URI_MAX_LENGTH
+  ) {
+    console.warn("home ignored unauthorized set-desktop-background message", context.targetId);
+    replyToShellRequest(event, requestId, null, new Error("Home denied the desktop background change"));
+    return;
+  }
+  fetchJson("/api/apps/home/appearance/background-image", {
+    method: "POST",
+    body: JSON.stringify({ source_uri: uri }),
+  })
+    .then(() => {
+      requestShellSummaryRefresh({ reason: "desktop-background" });
+      replyToShellRequest(event, requestId, { accepted: true });
+    })
+    .catch((error) => {
+      console.warn("home could not set the desktop background", error);
+      replyToShellRequest(event, requestId, { accepted: false });
+    });
 }
 
 function canDeliverTargetFromHomeMessage(context, target) {
