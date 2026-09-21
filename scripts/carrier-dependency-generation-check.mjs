@@ -142,7 +142,7 @@ function inspectGraph(manifestPath, graphName) {
   requireReachable(
     metadata,
     graphName,
-    { name: "elastos-identity", version: "0.6.0" },
+    { name: "elastos-identity", version: "0.7.0" },
     { name: "ed25519-dalek", version: "2.2.0" },
   );
   requireReachable(

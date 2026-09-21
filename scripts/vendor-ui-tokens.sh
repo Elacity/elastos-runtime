@@ -123,7 +123,7 @@ for target_dir in marketplace/browser system/browser; do
   done
 done
 
-for target_dir in assistant/browser home-agent/browser; do
+for target_dir in assistant/browser; do
   model_target="capsules/$target_dir/model-selection.js"
   if [[ "$MODE" == "--check" ]]; then
     if ! cmp -s capsules/_shared/model-selection.js "$model_target"; then

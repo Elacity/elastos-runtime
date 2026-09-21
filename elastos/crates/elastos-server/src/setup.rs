@@ -3028,7 +3028,7 @@ fn ensure_bundle_executable_link(
             let _ = fs::remove_file(&temporary);
             return Err(err.into());
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]

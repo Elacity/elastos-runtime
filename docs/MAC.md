@@ -1,8 +1,8 @@
 # Mac Runtime Notes
 
-The current Mac path is source-home staging on Apple silicon
-(`darwin-arm64`). It is the path used for local Mac verification while the
-public installer and `.dmg` packaging are still separate release goals.
+The public installer looks up Apple silicon (`aarch64-darwin`) releases. This
+runbook is the source-home staging path for local Mac verification, Browser VM
+artifacts, and `.dmg` packaging work.
 
 ## From Fresh Mac To Home
 
