@@ -82,38 +82,83 @@ test("Library routes identifiers and resource URIs through distinct closed write
   );
 });
 
-test("Library launches protected video in elacity-player with mint_id only", async () => {
+test("Library opens each protected item in the viewer for its kind with mint_id only", async () => {
+  const cases = [
+    ["localhost://Library/movie.mp4", "movie.mp4", "video/mp4", "elacity-player"],
+    ["localhost://Library/song.mp3", "song.mp3", "audio/mpeg", "elacity-player"],
+    ["localhost://Library/report.pdf", "report.pdf", "application/pdf", "elacity-reader"],
+    ["localhost://Library/photo.png", "photo.png", "image/png", "elacity-reader"],
+    ["localhost://Library/book.epub", "book.epub", "application/epub+zip", "elacity-reader"],
+    [
+      "localhost://Library/issue.cbz",
+      "issue.cbz",
+      "application/vnd.comicbook+zip",
+      "elacity-reader",
+    ],
+  ];
+
+  for (const [uri, name, mime, expectedViewer] of cases) {
+    const launches = [];
+    const previews = [];
+    const actions = makeActions({
+      openTarget(target, query) {
+        launches.push({ target, query });
+        return true;
+      },
+      async previewObject(object) {
+        previews.push(object.uri);
+      },
+    });
+
+    await actions.openObject({
+      uri,
+      name,
+      mime,
+      metadata: {
+        protected_content: {
+          schema: "elastos.library.protected-content-identity/v1",
+          mint_id: "ab".repeat(32),
+        },
+      },
+    });
+
+    assert.deepEqual(
+      launches,
+      [{ target: expectedViewer, query: { mint_id: "ab".repeat(32) } }],
+      mime,
+    );
+    assert.deepEqual(previews, [], mime);
+  }
+});
+
+test("Library opens a protected archive in the reader instead of the archive viewer", async () => {
   const launches = [];
-  const previews = [];
   const actions = makeActions({
     openTarget(target, query) {
       launches.push({ target, query });
       return true;
     },
-    async previewObject(object) {
-      previews.push(object.uri);
-    },
   });
 
   await actions.openObject({
-    uri: "localhost://Library/movie.mp4",
-    name: "movie.mp4",
-    mime: "video/mp4",
+    uri: "localhost://Library/bundle.zip",
+    name: "bundle.zip",
+    mime: "application/zip",
     metadata: {
+      archive_support: { family: "zip" },
       protected_content: {
         schema: "elastos.library.protected-content-identity/v1",
-        mint_id: "ab".repeat(32),
+        mint_id: "cd".repeat(32),
       },
     },
   });
 
   assert.deepEqual(launches, [
     {
-      target: "elacity-player",
-      query: { mint_id: "ab".repeat(32) },
+      target: "elacity-reader",
+      query: { mint_id: "cd".repeat(32) },
     },
   ]);
-  assert.deepEqual(previews, []);
 });
 
 test("Library keeps ordinary video preview behavior", async () => {
@@ -139,7 +184,7 @@ test("Library keeps ordinary video preview behavior", async () => {
   assert.deepEqual(previews, ["localhost://Library/movie.mp4"]);
 });
 
-test("Library fails closed on malformed protected video mint_id", async () => {
+test("Library fails closed on a malformed protected content mint_id", async () => {
   const launches = [];
   const previews = [];
   const statuses = [];
@@ -156,21 +201,29 @@ test("Library fails closed on malformed protected video mint_id", async () => {
     },
   });
 
-  await actions.openObject({
-    uri: "localhost://Library/movie.mp4",
-    name: "movie.mp4",
-    mime: "video/mp4",
-    metadata: {
-      protected_content: {
-        schema: "elastos.library.protected-content-identity/v1",
-        mint_id: "ABC123",
+  for (const [uri, name, mime] of [
+    ["localhost://Library/movie.mp4", "movie.mp4", "video/mp4"],
+    ["localhost://Library/report.pdf", "report.pdf", "application/pdf"],
+  ]) {
+    await actions.openObject({
+      uri,
+      name,
+      mime,
+      metadata: {
+        protected_content: {
+          schema: "elastos.library.protected-content-identity/v1",
+          mint_id: "ABC123",
+        },
       },
-    },
-  });
+    });
+  }
 
   assert.deepEqual(launches, []);
   assert.deepEqual(previews, []);
-  assert.deepEqual(statuses, ["Protected video is unavailable."]);
+  assert.deepEqual(statuses, [
+    "Protected content is unavailable.",
+    "Protected content is unavailable.",
+  ]);
 });
 
 test("Library converts positive decimal integers to canonical hex quantities", () => {
@@ -247,6 +300,51 @@ test("Library protect and list sends the exact runtime custody publish shape", a
   assert.deepEqual(reloads, ["reload"]);
 });
 
+test("Library protect and list accepts non-media files", async () => {
+  const cases = [
+    ["report.pdf", "application/pdf"],
+    ["photo.png", "image/png"],
+    ["book.epub", "application/epub+zip"],
+    ["issue.cbz", "application/vnd.comicbook+zip"],
+  ];
+
+  for (const [name, mime] of cases) {
+    const requests = [];
+    const actions = makeActions({
+      async providerApi(op, payload) {
+        requests.push({ op, payload });
+        return { object: { uri: payload.uri } };
+      },
+      async showProtectAndListDialog() {
+        return { copies: "1", price: "5" };
+      },
+    });
+
+    await actions.protectAndListObject({
+      uri: `localhost://Users/test/Documents/${name}`,
+      revision: `rev:${name}`,
+      name,
+      mime,
+      capabilities: ["publish"],
+    });
+
+    assert.deepEqual(
+      requests,
+      [
+        {
+          op: "publish",
+          payload: {
+            uri: `localhost://Users/test/Documents/${name}`,
+            if_revision: `rev:${name}`,
+            protection: { mode: "runtime_custody", copies: "0x1", price: "0x5" },
+          },
+        },
+      ],
+      mime,
+    );
+  }
+});
+
 test("Library plain publish stays unchanged", async () => {
   const requests = [];
   const actions = makeActions({
@@ -296,10 +394,10 @@ test("Library protect and list ignores ineligible objects", async () => {
       capabilities: ["publish"],
     },
     {
-      uri: "localhost://Users/test/Documents/image.png",
+      uri: "localhost://Users/test/Documents/notes.xyz",
       kind: "file",
-      name: "image.png",
-      mime: "image/png",
+      name: "notes.xyz",
+      mime: "application/octet-stream",
       capabilities: ["publish"],
     },
     {

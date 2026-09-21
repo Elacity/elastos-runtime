@@ -109,6 +109,7 @@ fn parse_action(value: &str) -> Result<Action, InvokeError> {
         "message" => Ok(Action::Message),
         "delete" => Ok(Action::Delete),
         "admin" => Ok(Action::Admin),
+        "buy" => Ok(Action::Buy),
         other => Err(InvokeError::UnknownDeclaredAction(other.to_string())),
     }
 }

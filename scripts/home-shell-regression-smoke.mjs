@@ -2551,8 +2551,8 @@ const inventory = readdirSync(new URL("../capsules/", import.meta.url)).flatMap(
   const path = new URL(`../capsules/${name}/capsule.json`, import.meta.url);
   return existsSync(path) ? [JSON.parse(readFileSync(path, "utf8"))] : [];
 });
-assert(inventory.length === 36, "Update the exact capsule role/policy inventory when membership changes");
-for (const [policy, count] of [["single", 10], ["hybrid", 6], ["multiple", 1]]) {
+assert(inventory.length === 38, "Update the exact capsule role/policy inventory when membership changes");
+for (const [policy, count] of [["single", 11], ["hybrid", 6], ["multiple", 2]]) {
   assert(inventory.filter((manifest) => manifest.window_policy === policy).length === count, `${policy} inventory drift`);
 }
 for (const [role, count] of [["provider", 14], ["content", 2], ["shell", 2]]) {
@@ -2561,7 +2561,7 @@ for (const [role, count] of [["provider", 14], ["content", 2], ["shell", 2]]) {
 }
 assert(inventory.filter((manifest) => manifest.role === "app" && !manifest.window_policy).map((manifest) => manifest.name).sort().join(",") === "home",
   "Home alone owns the app host role without a window policy");
-console.log("[home-shell-regression] all36 roles, own menus and selected Player: PASS");
+console.log("[home-shell-regression] all38 roles, own menus and selected Player: PASS");
 
 // A verified in-app selection must replace only that window's
 // persisted presentation selector, then restore through a fresh Runtime launch.

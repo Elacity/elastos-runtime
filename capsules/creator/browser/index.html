@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'">
+  <title>Creator · ElastOS</title>
+  <script src="./elastos-theme.js"></script>
+  <link rel="stylesheet" href="./elastos-ui.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <section id="locked-shell" class="locked-shell hidden">
+    <div class="locked-card">
+      <p class="eyebrow">ElastOS</p>
+      <h1>Open from Home</h1>
+      <p class="subtitle">Open Creator from Home.</p>
+    </div>
+  </section>
+
+  <main id="creator-shell" class="shell hidden">
+    <header class="creator-header">
+      <h1>Creator</h1>
+      <p class="subtitle">Protect a file and list it for sale in one flow.</p>
+    </header>
+
+    <section class="card">
+      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a file to protect and list">
+        <strong id="drop-title" class="drop-title">Choose a file</strong>
+        <p id="drop-meta" class="drop-meta">
+          <span id="drop-meta-text">Any file &middot; click or drop</span>
+          <span id="drop-badge" class="badge hidden"></span>
+        </p>
+        <input id="file-input" class="hidden" type="file" aria-label="Choose a file">
+      </div>
+    </section>
+
+    <section id="creator-form" class="card form-card">
+      <div class="field">
+        <label for="title">Title</label>
+        <input id="title" type="text" placeholder="My asset" autocomplete="off">
+        <p class="hint">Not sent — the listing name is generated automatically from the file.</p>
+      </div>
+
+      <div class="field">
+        <label for="desc">Description</label>
+        <textarea id="desc" placeholder="What is it?"></textarea>
+        <p class="hint">Not sent — descriptions aren't stored yet.</p>
+      </div>
+
+      <div class="field">
+        <label for="thumb-input">Cover thumbnail (optional)</label>
+        <div id="thumb-drop" class="drop drop-compact" tabindex="0" role="button" aria-label="Choose a cover image">
+          <strong id="thumb-drop-title" class="drop-title">Add a cover image</strong>
+          <p id="thumb-drop-meta" class="drop-meta">click or drop</p>
+          <input id="thumb-input" class="hidden" type="file" accept="image/*" aria-label="Choose a cover image">
+        </div>
+        <div id="thumb-preview-wrap" class="thumb-preview-wrap hidden">
+          <img id="thumb-preview-img" class="thumb-preview-img" alt="Cover preview">
+          <button id="thumb-remove" class="btn" type="button">Remove</button>
+        </div>
+        <p class="hint">Not sent — this preview stays local; a listing has no cover image yet.</p>
+      </div>
+
+      <div class="field">
+        <label>Access method</label>
+        <div id="method-grid" class="method-grid">
+          <div class="method" data-method="free" role="button" tabindex="0" aria-pressed="false">
+            <strong>Free</strong>
+            <span class="method-desc">Open access</span>
+            <span class="badge badge-muted">Not connected</span>
+          </div>
+          <div class="method sel" data-method="buy_once" role="button" tabindex="0" aria-pressed="true">
+            <strong>Buy now</strong>
+            <span class="method-desc">One-time sale</span>
+          </div>
+          <div class="method" data-method="buy_and_resell" role="button" tabindex="0" aria-pressed="false">
+            <strong>Buy &amp; resell</strong>
+            <span class="method-desc">Tradable + royalty</span>
+            <span class="badge badge-muted">Not connected</span>
+          </div>
+        </div>
+        <p id="method-hint" class="hint">Buy now is the only method connected in this build.</p>
+      </div>
+
+      <div id="price-row" class="row">
+        <div class="field">
+          <label for="price-input">Price</label>
+          <input id="price-input" type="text" inputmode="decimal" placeholder="0.001" autocomplete="off" spellcheck="false">
+          <p class="hint">The amount a buyer pays for one copy, in the currency selected.</p>
+        </div>
+        <div class="field">
+          <label for="currency">Currency</label>
+          <select id="currency">
+            <option value="ELA">ELA</option>
+            <option value="USDC">USDC</option>
+            <option value="ETH">ETH</option>
+          </select>
+          <p class="hint">Not sent — used only to convert your amount into base units.</p>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="copies-input">Copies</label>
+          <input id="copies-input" type="text" inputmode="numeric" placeholder="1" autocomplete="off" spellcheck="false">
+          <p class="hint">How many copies of this listing can be sold.</p>
+        </div>
+        <div class="field">
+          <label for="category">Category</label>
+          <select id="category">
+            <option value="">Auto-detect</option>
+            <option value="art">Art</option>
+            <option value="music">Music</option>
+            <option value="video">Video</option>
+            <option value="image">Image</option>
+            <option value="document">Document</option>
+            <option value="ebook">eBook</option>
+            <option value="comic">Comic</option>
+            <option value="3d-model">3D model</option>
+            <option value="ai-model">AI model</option>
+          </select>
+          <p class="hint">Not sent — categorization isn't stored yet.</p>
+        </div>
+      </div>
+
+      <div id="resell-field" class="field hidden">
+        <label for="reseller-cut">Resale royalty (RRL %)</label>
+        <input id="reseller-cut" type="number" min="0" max="100" step="0.1" value="90">
+        <p class="hint">Not sent — resale terms aren't supported yet.</p>
+      </div>
+
+      <div id="royalty-field" class="field">
+        <label>Royalty split</label>
+        <div id="royalty-rows"></div>
+        <button id="royalty-add" class="btn-add" type="button">+ Add payee</button>
+        <p id="royalty-total" class="royalty-total"></p>
+        <p class="hint">Not sent — shown here is the default split this chain actually applies
+          (95% to you, 5% to Elacity); editing it doesn't change what's paid out.</p>
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input id="ai-licensing" type="checkbox">
+          <span>Grant AI training rights</span>
+        </label>
+        <p class="hint">Not sent — licensing terms aren't recorded yet.</p>
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input id="adult-flag" type="checkbox">
+          <span>Adult content (18+)</span>
+        </label>
+        <p class="hint">Not sent — content flags aren't recorded yet.</p>
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input id="legal-attest" type="checkbox">
+          <span>I own or have the rights to distribute this content</span>
+        </label>
+        <p class="hint">Not sent — not recorded with the listing yet.</p>
+      </div>
+
+      <div id="preview-settings" class="field hidden">
+        <label class="check">
+          <input id="preview-enabled" type="checkbox">
+          <span>Free preview clip (video/audio)</span>
+        </label>
+        <div id="preview-controls" class="preview-controls hidden">
+          <input id="preview-duration" type="range" min="5" max="60" step="5" value="15">
+          <p class="hint">Plays the first <strong id="preview-duration-display">15s</strong> unencrypted as a public teaser (max 60s).</p>
+        </div>
+        <p class="hint">Not sent — free preview clips aren't supported yet.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <button id="submit-button" class="btn btn-primary" type="button" disabled>Protect and list</button>
+
+      <details class="tech-progress" open>
+        <summary>Protection progress</summary>
+        <ul id="progress-steps" class="steps" aria-label="Progress">
+          <li data-stage="analyze"><span class="dot"></span> Analyze source</li>
+          <li data-stage="transcode" class="hidden"><span class="dot"></span> Transcode &amp; fragment <span class="not-tracked">(not tracked)</span></li>
+          <li data-stage="encrypt"><span class="dot"></span> Encrypt &amp; escrow</li>
+          <li data-stage="publish"><span class="dot"></span> Publish to storage <span class="not-tracked">(not tracked)</span></li>
+          <li data-stage="assemble"><span class="dot"></span> Assemble listing</li>
+        </ul>
+      </details>
+
+      <p id="status-text" class="status" aria-live="polite"></p>
+
+      <button id="enable-trading-button" class="btn" type="button" disabled>Step 2 — Enable trading</button>
+      <p class="hint">Not part of this build — Protect and list already makes the asset available for purchase.</p>
+
+      <section id="success-panel" class="success-panel hidden">
+        <p class="success-title">Listed for sale.</p>
+        <p id="mint-id-text" class="mint-id"></p>
+        <div class="success-actions">
+          <button id="open-library-button" class="btn" type="button">Open in Library</button>
+          <button id="reset-button" class="btn btn-secondary" type="button">Protect another file</button>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script type="module" src="creator.js?v=creator-20260910a"></script>
+</body>
+</html>

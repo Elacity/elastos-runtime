@@ -26,10 +26,12 @@ pub use node_store::{
     ProvisionedNodeLocalShareV1,
 };
 pub use payload::{
-    decrypt_payload_to_staging_writer_from_authenticated_operation_v1,
-    seal_payload_to_staging_writer_v1, AuthenticatedChunkPayloadHeaderV1,
-    AuthenticatedPayloadDecryptInputsV1, DecryptedPayloadMetadataV1, SealedPayloadMetadataV1,
-    MAX_PAYLOAD_CONTENT_TYPE_BYTES_V1, PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1,
+    decrypt_payload_to_staging_writer_from_authenticated_operation_v1, framed_chunk_ranges_v1,
+    reconstruct_content_key_for_object_session, seal_payload_to_staging_writer_v1,
+    AuthenticatedChunkPayloadHeaderV1, AuthenticatedPayloadDecryptInputsV1,
+    DecryptedPayloadMetadataV1, PayloadChunkDecrypterV1, PayloadSealerV1, SealedPayloadMetadataV1,
+    UnprovisionedSealedPayloadV1, MAX_PAYLOAD_CONTENT_TYPE_BYTES_V1,
+    PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1,
 };
 pub use play::{
     decrypt_validated_cenc_fmp4_segment_to_clear_v1, rewrite_validated_cenc_fmp4_init_to_clear_v1,

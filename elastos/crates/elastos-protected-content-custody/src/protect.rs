@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    CencFmp4MediaIdentityV1, ElastosPqPsshDataV1, ValidatedClearFmp4MediaSessionLayoutV1,
     ValidatedClearFmp4SegmentLayoutV1,
 };
 use zeroize::Zeroizing;
@@ -14,13 +14,13 @@ use crate::{
 pub fn protect_validated_clear_fmp4_init_to_cenc_v1(
     layout: &ValidatedClearFmp4MediaSessionLayoutV1,
     clear_init_segment: &[u8],
-    key_id: [u8; 16],
+    pssh_data: &ElastosPqPsshDataV1,
 ) -> Result<Vec<u8>, CustodyError> {
     if clear_init_segment.is_empty() {
         return Err(CustodyError::InvalidPayload("clear_init_segment"));
     }
     layout
-        .rewrite_protected_init(clear_init_segment, key_id)
+        .rewrite_protected_init(clear_init_segment, pssh_data)
         .map_err(Into::into)
 }
 
@@ -56,14 +56,14 @@ pub fn protect_validated_clear_cenc_fmp4_media_v1(
     mime_type: &str,
     codecs: &str,
     content_key: &ContentEncryptionKeyV1,
-    key_id: [u8; 16],
+    pssh_data: &ElastosPqPsshDataV1,
     segment_sample_ivs: &[Vec<[u8; 8]>],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>, CencFmp4MediaIdentityV1), CustodyError> {
     if clear_segments.is_empty() || clear_segments.len() != segment_sample_ivs.len() {
         return Err(CustodyError::InvalidPayload("clear_segments"));
     }
     let protected_init =
-        protect_validated_clear_fmp4_init_to_cenc_v1(layout, clear_init_segment, key_id)?;
+        protect_validated_clear_fmp4_init_to_cenc_v1(layout, clear_init_segment, pssh_data)?;
     let mut protected_segments = Vec::with_capacity(clear_segments.len());
     for (clear_segment, sample_ivs) in clear_segments.iter().zip(segment_sample_ivs) {
         let segment_layout = layout
@@ -116,6 +116,10 @@ fn encrypt_validated_clear_segment_samples_v1(
 
 #[cfg(test)]
 mod tests {
+    use elastos_protected_content_contracts::{
+        ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
+        CustodyPoolIdentityV1, Digest32,
+    };
     use elastos_protected_content_provider_contracts::ValidatedCencFmp4MediaSessionLayoutV1;
     use rand09::{rngs::StdRng as HpkeStdRng, SeedableRng as _};
 
@@ -131,6 +135,15 @@ mod tests {
     const TRUN_FLAG_SAMPLE_SIZE: u32 = 0x000200;
     const VISUAL_SAMPLE_ENTRY_FIXED_BYTES: usize = 78;
     const AUDIO_SAMPLE_ENTRY_FIXED_BYTES: usize = 28;
+
+    fn pssh_data() -> ElastosPqPsshDataV1 {
+        ElastosPqPsshDataV1::new(
+            ContentAccessIdV1::new([0x55; 16]).unwrap(),
+            &CustodyPoolIdentityV1::new(Digest32::new([0x61; 32]), 512).unwrap(),
+            &CustodyEpochIdentityV1::new(Digest32::new([0x62; 32]), 512).unwrap(),
+            &CustodyCommitteeAuthorizationIdentityV1::new(Digest32::new([0x63; 32]), 512).unwrap(),
+        )
+    }
 
     fn wrapped_cek(
         cek: &ContentEncryptionKeyV1,
@@ -289,7 +302,7 @@ mod tests {
                 "video/mp4",
                 "avc1.64001f,mp4a.40.2",
                 &cek,
-                [0x55; 16],
+                &pssh_data(),
                 &[vec![[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11]]],
             )
             .unwrap();
@@ -387,7 +400,7 @@ mod tests {
                 "video/mp4",
                 "avc1.64001f,mp4a.40.2",
                 &cek,
-                [0x55; 16],
+                &pssh_data(),
                 &[vec![[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11]]],
             )
             .unwrap();

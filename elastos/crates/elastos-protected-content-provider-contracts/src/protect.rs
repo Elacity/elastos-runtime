@@ -2,14 +2,19 @@ use std::collections::BTreeSet;
 
 use elastos_protected_content_contracts::{
     ContentAccessIdV1, ContractError, CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1,
-    CustodyEpochIdentityV1, CustodyPoolIdentityV1, Digest32, NodeCustodyPublicKeyV1, NodePublicKey,
-    PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
+    CustodyEpochIdentityV1, CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, ThresholdV1, PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
 };
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::media::{
     validate_visible_ascii, CencFmp4MediaIdentityV1, MAX_CENC_FMP4_MEDIA_IDENTITY_BYTES_V1,
     MAX_MEDIA_DECLARATION_BYTES_V1,
+};
+use crate::object::{
+    ChunkedPayloadObjectIdentityV1, MAX_CHUNKED_PAYLOAD_OBJECT_IDENTITY_BYTES_V1,
+    MAX_OBJECT_FRAMED_CHUNK_BYTES_V1, MAX_OBJECT_FRAMED_HEADER_BYTES_V1,
+    MAX_OBJECT_PLAINTEXT_BYTES_V1, MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
 };
 use crate::wire::{
     contract_decode_error, decode_json, encode_json, validate_schema, CanonicalBlob,
@@ -25,11 +30,20 @@ pub const MAX_PROTECT_MEDIA_PART_BYTES_V1: usize = 2 * 1024 * 1024;
 pub const MAX_PROTECT_MEDIA_SEGMENTS_V1: u32 = 512;
 const REQUIRED_THRESHOLD_REQUIRED_V1: u8 = 2;
 const REQUIRED_THRESHOLD_TOTAL_V1: u8 = 3;
+/// Bound for the canonical byte encoding of `EncryptedContentIdentityV1` when
+/// carried as a `CanonicalBlob`; the encoding is a domain string plus a
+/// digest and a length, well under this bound.
+const MAX_ENCRYPTED_CONTENT_IDENTITY_BYTES_V1: usize = 256;
 
 type IdentityBlobV1 = CanonicalBlob<MAX_PROVIDER_BINDING_BYTES_V1>;
 type MediaIdentityBlobV1 = CanonicalBlob<MAX_CENC_FMP4_MEDIA_IDENTITY_BYTES_V1>;
 type CustodyEnvelopeBlobV1 = CanonicalBlob<MAX_CUSTODY_ENVELOPE_BYTES_V1>;
 type MediaPartBlobV1 = CanonicalBlob<MAX_PROTECT_MEDIA_PART_BYTES_V1>;
+type ObjectIdentityBlobV1 = CanonicalBlob<MAX_CHUNKED_PAYLOAD_OBJECT_IDENTITY_BYTES_V1>;
+type ObjectPlaintextChunkBlobV1 = CanonicalBlob<MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1>;
+type ObjectFramedChunkBlobV1 = CanonicalBlob<MAX_OBJECT_FRAMED_CHUNK_BYTES_V1>;
+type ObjectFramedHeaderBlobV1 = CanonicalBlob<MAX_OBJECT_FRAMED_HEADER_BYTES_V1>;
+type EncryptedContentBlobV1 = CanonicalBlob<MAX_ENCRYPTED_CONTENT_IDENTITY_BYTES_V1>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectProviderRequestOpV1 {
@@ -38,6 +52,9 @@ pub enum ProtectProviderRequestOpV1 {
     FinalizeProtectionSession,
     CancelProtectionSession,
     CloseProtectionSession,
+    OpenObjectProtectionSession,
+    ProtectObjectChunk,
+    FinalizeObjectProtectionSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +131,30 @@ enum ProtectProviderRequestKindV1 {
         schema: String,
         protection_session_handle: OpaqueHandleV1,
     },
+    OpenObjectProtectionSession {
+        schema: String,
+        session_id: [u8; 32],
+        content_access_id: IdentityBlobV1,
+        custody_pool: IdentityBlobV1,
+        custody_epoch: IdentityBlobV1,
+        custody_committee_authorization: IdentityBlobV1,
+        threshold_required: u8,
+        threshold_total: u8,
+        content_type: String,
+        plaintext_bytes: u64,
+        nodes: Vec<ProtectionSessionNodeV1>,
+    },
+    ProtectObjectChunk {
+        schema: String,
+        session_id: [u8; 32],
+        chunk_index: u32,
+        plaintext: ObjectPlaintextChunkBlobV1,
+    },
+    FinalizeObjectProtectionSession {
+        schema: String,
+        session_id: [u8; 32],
+        encrypted_content: EncryptedContentBlobV1,
+    },
 }
 
 impl ProtectProviderRequestV1 {
@@ -133,6 +174,15 @@ impl ProtectProviderRequestV1 {
             }
             ProtectProviderRequestKindV1::CloseProtectionSession { .. } => {
                 ProtectProviderRequestOpV1::CloseProtectionSession
+            }
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession { .. } => {
+                ProtectProviderRequestOpV1::OpenObjectProtectionSession
+            }
+            ProtectProviderRequestKindV1::ProtectObjectChunk { .. } => {
+                ProtectProviderRequestOpV1::ProtectObjectChunk
+            }
+            ProtectProviderRequestKindV1::FinalizeObjectProtectionSession { .. } => {
+                ProtectProviderRequestOpV1::FinalizeObjectProtectionSession
             }
         }
     }
@@ -222,12 +272,153 @@ impl ProtectProviderRequestV1 {
         Ok(value)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the producer session must bind the exact committee identities, object declaration, and threshold, mirroring new_open_protection_session"
+    )]
+    pub fn new_open_object_protection_session(
+        session_id: Digest32,
+        content_access_id: ContentAccessIdV1,
+        custody_pool: CustodyPoolIdentityV1,
+        custody_epoch: CustodyEpochIdentityV1,
+        custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+        threshold_required: u8,
+        threshold_total: u8,
+        content_type: impl Into<String>,
+        plaintext_bytes: u64,
+        nodes: Vec<ProtectionSessionNodeV1>,
+    ) -> Result<Self, ContractError> {
+        let value = Self(ProtectProviderRequestKindV1::OpenObjectProtectionSession {
+            schema: PROTECT_PROVIDER_REQUEST_SCHEMA_V1.to_string(),
+            session_id: *session_id.as_bytes(),
+            content_access_id: CanonicalBlob::from_contract(&content_access_id)?,
+            custody_pool: CanonicalBlob::from_contract(&custody_pool)?,
+            custody_epoch: CanonicalBlob::from_contract(&custody_epoch)?,
+            custody_committee_authorization: CanonicalBlob::from_contract(
+                &custody_committee_authorization,
+            )?,
+            threshold_required,
+            threshold_total,
+            content_type: content_type.into(),
+            plaintext_bytes,
+            nodes,
+        });
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    pub fn new_protect_object_chunk(
+        session_id: Digest32,
+        chunk_index: u32,
+        plaintext: &[u8],
+    ) -> Result<Self, ContractError> {
+        let value = Self(ProtectProviderRequestKindV1::ProtectObjectChunk {
+            schema: PROTECT_PROVIDER_REQUEST_SCHEMA_V1.to_string(),
+            session_id: *session_id.as_bytes(),
+            chunk_index,
+            plaintext: ObjectPlaintextChunkBlobV1::new(plaintext.to_vec())?,
+        });
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    pub fn new_finalize_object_protection_session(
+        session_id: Digest32,
+        encrypted_content: &EncryptedContentIdentityV1,
+    ) -> Result<Self, ContractError> {
+        let value = Self(
+            ProtectProviderRequestKindV1::FinalizeObjectProtectionSession {
+                schema: PROTECT_PROVIDER_REQUEST_SCHEMA_V1.to_string(),
+                session_id: *session_id.as_bytes(),
+                encrypted_content: CanonicalBlob::from_contract(encrypted_content)?,
+            },
+        );
+        value.validate_structure()?;
+        Ok(value)
+    }
+
     pub fn to_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
         encode_json(self)
     }
 
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         Self::decode_wire(bytes)
+    }
+
+    pub fn session_id(&self) -> Option<Digest32> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession { session_id, .. }
+            | ProtectProviderRequestKindV1::ProtectObjectChunk { session_id, .. }
+            | ProtectProviderRequestKindV1::FinalizeObjectProtectionSession {
+                session_id, ..
+            } => Some(Digest32::new(*session_id)),
+            _ => None,
+        }
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession { content_type, .. } => {
+                Some(content_type.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn plaintext_bytes(&self) -> Option<u64> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession {
+                plaintext_bytes, ..
+            } => Some(*plaintext_bytes),
+            _ => None,
+        }
+    }
+
+    pub fn threshold_required(&self) -> Option<u8> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession {
+                threshold_required,
+                ..
+            } => Some(*threshold_required),
+            _ => None,
+        }
+    }
+
+    pub fn threshold_total(&self) -> Option<u8> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession {
+                threshold_total, ..
+            } => Some(*threshold_total),
+            _ => None,
+        }
+    }
+
+    pub fn chunk_index(&self) -> Option<u32> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::ProtectObjectChunk { chunk_index, .. } => {
+                Some(*chunk_index)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn plaintext(&self) -> Option<&[u8]> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::ProtectObjectChunk { plaintext, .. } => {
+                Some(plaintext.as_slice())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn encrypted_content(&self) -> Result<Option<EncryptedContentIdentityV1>, ContractError> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::FinalizeObjectProtectionSession {
+                encrypted_content,
+                ..
+            } => Ok(Some(encrypted_content.decode()?)),
+            _ => Ok(None),
+        }
     }
 
     pub fn protection_session_request_id(&self) -> Option<Digest32> {
@@ -242,7 +433,8 @@ impl ProtectProviderRequestV1 {
 
     pub fn custody_pool(&self) -> Result<Option<CustodyPoolIdentityV1>, ContractError> {
         match &self.0 {
-            ProtectProviderRequestKindV1::OpenProtectionSession { custody_pool, .. } => {
+            ProtectProviderRequestKindV1::OpenProtectionSession { custody_pool, .. }
+            | ProtectProviderRequestKindV1::OpenObjectProtectionSession { custody_pool, .. } => {
                 Ok(Some(custody_pool.decode()?))
             }
             _ => Ok(None),
@@ -253,6 +445,9 @@ impl ProtectProviderRequestV1 {
         match &self.0 {
             ProtectProviderRequestKindV1::OpenProtectionSession {
                 content_access_id, ..
+            }
+            | ProtectProviderRequestKindV1::OpenObjectProtectionSession {
+                content_access_id, ..
             } => Ok(Some(content_access_id.decode()?)),
             _ => Ok(None),
         }
@@ -260,7 +455,8 @@ impl ProtectProviderRequestV1 {
 
     pub fn custody_epoch(&self) -> Result<Option<CustodyEpochIdentityV1>, ContractError> {
         match &self.0 {
-            ProtectProviderRequestKindV1::OpenProtectionSession { custody_epoch, .. } => {
+            ProtectProviderRequestKindV1::OpenProtectionSession { custody_epoch, .. }
+            | ProtectProviderRequestKindV1::OpenObjectProtectionSession { custody_epoch, .. } => {
                 Ok(Some(custody_epoch.decode()?))
             }
             _ => Ok(None),
@@ -272,6 +468,10 @@ impl ProtectProviderRequestV1 {
     ) -> Result<Option<CustodyCommitteeAuthorizationIdentityV1>, ContractError> {
         match &self.0 {
             ProtectProviderRequestKindV1::OpenProtectionSession {
+                custody_committee_authorization,
+                ..
+            }
+            | ProtectProviderRequestKindV1::OpenObjectProtectionSession {
                 custody_committee_authorization,
                 ..
             } => Ok(Some(custody_committee_authorization.decode()?)),
@@ -317,7 +517,10 @@ impl ProtectProviderRequestV1 {
 
     pub fn nodes(&self) -> Option<&[ProtectionSessionNodeV1]> {
         match &self.0 {
-            ProtectProviderRequestKindV1::OpenProtectionSession { nodes, .. } => Some(nodes),
+            ProtectProviderRequestKindV1::OpenProtectionSession { nodes, .. }
+            | ProtectProviderRequestKindV1::OpenObjectProtectionSession { nodes, .. } => {
+                Some(nodes)
+            }
             _ => None,
         }
     }
@@ -435,6 +638,93 @@ impl ProtectProviderRequestV1 {
                     "protect_provider_request.schema",
                 )
             }
+            ProtectProviderRequestKindV1::OpenObjectProtectionSession {
+                schema,
+                session_id,
+                threshold_required,
+                threshold_total,
+                content_type,
+                plaintext_bytes,
+                nodes,
+                ..
+            } => {
+                validate_schema(
+                    schema,
+                    PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+                    "protect_provider_request.schema",
+                )?;
+                if *session_id == [0u8; 32] {
+                    return Err(ContractError::InvalidField("session_id"));
+                }
+                let _ = self
+                    .content_access_id()?
+                    .ok_or(ContractError::InvalidField("content_access_id"))?;
+                let threshold = ThresholdV1::new(*threshold_required, *threshold_total)
+                    .map_err(|_| ContractError::InvalidField("threshold"))?;
+                validate_visible_ascii(
+                    content_type,
+                    "content_type",
+                    MAX_MEDIA_DECLARATION_BYTES_V1,
+                )?;
+                if *plaintext_bytes == 0 || *plaintext_bytes > MAX_OBJECT_PLAINTEXT_BYTES_V1 {
+                    return Err(ContractError::InvalidField("plaintext_bytes"));
+                }
+                if nodes.len() != usize::from(threshold.total()) {
+                    return Err(ContractError::InvalidField("nodes"));
+                }
+                let mut node_keys = BTreeSet::new();
+                let mut custody_keys = BTreeSet::new();
+                for node in nodes {
+                    let node_public_key = node.node_public_key()?;
+                    let node_custody_public_key = node.node_custody_public_key()?;
+                    if !node_keys.insert(node_public_key)
+                        || !custody_keys.insert(node_custody_public_key)
+                    {
+                        return Err(ContractError::InvalidField("nodes"));
+                    }
+                }
+                let _ = self
+                    .custody_pool()?
+                    .ok_or(ContractError::InvalidField("custody_pool"))?;
+                let _ = self
+                    .custody_epoch()?
+                    .ok_or(ContractError::InvalidField("custody_epoch"))?;
+                let _ =
+                    self.custody_committee_authorization()?
+                        .ok_or(ContractError::InvalidField(
+                            "custody_committee_authorization",
+                        ))?;
+                Ok(())
+            }
+            ProtectProviderRequestKindV1::ProtectObjectChunk {
+                schema, session_id, ..
+            } => {
+                validate_schema(
+                    schema,
+                    PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+                    "protect_provider_request.schema",
+                )?;
+                if *session_id == [0u8; 32] {
+                    return Err(ContractError::InvalidField("session_id"));
+                }
+                Ok(())
+            }
+            ProtectProviderRequestKindV1::FinalizeObjectProtectionSession {
+                schema,
+                session_id,
+                encrypted_content,
+            } => {
+                validate_schema(
+                    schema,
+                    PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+                    "protect_provider_request.schema",
+                )?;
+                if *session_id == [0u8; 32] {
+                    return Err(ContractError::InvalidField("session_id"));
+                }
+                let _ = encrypted_content.decode::<EncryptedContentIdentityV1>()?;
+                Ok(())
+            }
         }
     }
 
@@ -455,6 +745,9 @@ pub enum ProtectProviderResponseStatusV1 {
     ProtectionSessionCancelled,
     ProtectionSessionClosed,
     ProtectionSessionAlreadyAbsent,
+    ObjectProtectionSessionOpened,
+    ObjectChunkProtected,
+    ObjectProtectionSessionFinalized,
     Failure,
 }
 
@@ -493,6 +786,20 @@ enum ProtectProviderResponseKindV1 {
         schema: String,
         protection_session_handle: OpaqueHandleV1,
     },
+    ObjectProtectionSessionOpened {
+        schema: String,
+        framed_header: ObjectFramedHeaderBlobV1,
+    },
+    ObjectChunkProtected {
+        schema: String,
+        framed_chunk: ObjectFramedChunkBlobV1,
+    },
+    ObjectProtectionSessionFinalized {
+        schema: String,
+        object_identity: ObjectIdentityBlobV1,
+        content_key_commitment: [u8; 32],
+        custody_envelope: CustodyEnvelopeBlobV1,
+    },
     Failure {
         schema: String,
         failure_code: ProviderFailureCodeV1,
@@ -519,6 +826,15 @@ impl ProtectProviderResponseV1 {
             }
             ProtectProviderResponseKindV1::ProtectionSessionAlreadyAbsent { .. } => {
                 ProtectProviderResponseStatusV1::ProtectionSessionAlreadyAbsent
+            }
+            ProtectProviderResponseKindV1::ObjectProtectionSessionOpened { .. } => {
+                ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened
+            }
+            ProtectProviderResponseKindV1::ObjectChunkProtected { .. } => {
+                ProtectProviderResponseStatusV1::ObjectChunkProtected
+            }
+            ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized { .. } => {
+                ProtectProviderResponseStatusV1::ObjectProtectionSessionFinalized
             }
             ProtectProviderResponseKindV1::Failure { .. } => {
                 ProtectProviderResponseStatusV1::Failure
@@ -604,6 +920,43 @@ impl ProtectProviderResponseV1 {
         Ok(value)
     }
 
+    pub fn new_object_opened(framed_header: &[u8]) -> Result<Self, ContractError> {
+        let value = Self(
+            ProtectProviderResponseKindV1::ObjectProtectionSessionOpened {
+                schema: PROTECT_PROVIDER_RESPONSE_SCHEMA_V1.to_string(),
+                framed_header: ObjectFramedHeaderBlobV1::new(framed_header.to_vec())?,
+            },
+        );
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    pub fn new_object_chunk_protected(framed_chunk: &[u8]) -> Result<Self, ContractError> {
+        let value = Self(ProtectProviderResponseKindV1::ObjectChunkProtected {
+            schema: PROTECT_PROVIDER_RESPONSE_SCHEMA_V1.to_string(),
+            framed_chunk: ObjectFramedChunkBlobV1::new(framed_chunk.to_vec())?,
+        });
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    pub fn new_object_finalized(
+        object_identity: &ChunkedPayloadObjectIdentityV1,
+        content_key_commitment: Digest32,
+        custody_envelope: &CustodyEnvelopeV1,
+    ) -> Result<Self, ContractError> {
+        let value = Self(
+            ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized {
+                schema: PROTECT_PROVIDER_RESPONSE_SCHEMA_V1.to_string(),
+                object_identity: CanonicalBlob::from_contract(object_identity)?,
+                content_key_commitment: *content_key_commitment.as_bytes(),
+                custody_envelope: CanonicalBlob::from_contract(custody_envelope)?,
+            },
+        );
+        value.validate_structure()?;
+        Ok(value)
+    }
+
     pub fn new_failure(failure_code: ProviderFailureCodeV1) -> Result<Self, ContractError> {
         let value = Self(ProtectProviderResponseKindV1::Failure {
             schema: PROTECT_PROVIDER_RESPONSE_SCHEMA_V1.to_string(),
@@ -652,7 +1005,10 @@ impl ProtectProviderResponseV1 {
                 protection_session_handle,
                 ..
             } => Ok(Some(*protection_session_handle.as_bytes())),
-            ProtectProviderResponseKindV1::Failure { .. } => Ok(None),
+            ProtectProviderResponseKindV1::ObjectProtectionSessionOpened { .. }
+            | ProtectProviderResponseKindV1::ObjectChunkProtected { .. }
+            | ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized { .. }
+            | ProtectProviderResponseKindV1::Failure { .. } => Ok(None),
         }
     }
 
@@ -697,8 +1053,50 @@ impl ProtectProviderResponseV1 {
         match &self.0 {
             ProtectProviderResponseKindV1::ProtectionSessionFinalized {
                 custody_envelope, ..
+            }
+            | ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized {
+                custody_envelope,
+                ..
             } => Ok(Some(custody_envelope.decode()?)),
             _ => Ok(None),
+        }
+    }
+
+    pub fn framed_header(&self) -> Option<&[u8]> {
+        match &self.0 {
+            ProtectProviderResponseKindV1::ObjectProtectionSessionOpened {
+                framed_header, ..
+            } => Some(framed_header.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn framed_chunk(&self) -> Option<&[u8]> {
+        match &self.0 {
+            ProtectProviderResponseKindV1::ObjectChunkProtected { framed_chunk, .. } => {
+                Some(framed_chunk.as_slice())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn object_identity(&self) -> Result<Option<ChunkedPayloadObjectIdentityV1>, ContractError> {
+        match &self.0 {
+            ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized {
+                object_identity,
+                ..
+            } => Ok(Some(object_identity.decode()?)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn content_key_commitment(&self) -> Option<Digest32> {
+        match &self.0 {
+            ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized {
+                content_key_commitment,
+                ..
+            } => Some(Digest32::new(*content_key_commitment)),
+            _ => None,
         }
     }
 
@@ -717,6 +1115,9 @@ impl ProtectProviderResponseV1 {
             | ProtectProviderResponseKindV1::ProtectionSessionCancelled { schema, .. }
             | ProtectProviderResponseKindV1::ProtectionSessionClosed { schema, .. }
             | ProtectProviderResponseKindV1::ProtectionSessionAlreadyAbsent { schema, .. }
+            | ProtectProviderResponseKindV1::ObjectProtectionSessionOpened { schema, .. }
+            | ProtectProviderResponseKindV1::ObjectChunkProtected { schema, .. }
+            | ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized { schema, .. }
             | ProtectProviderResponseKindV1::Failure { schema, .. } => validate_schema(
                 schema,
                 PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
@@ -734,6 +1135,26 @@ impl ProtectProviderResponseV1 {
             if custody_envelope.manifest().encrypted_content() != media_identity.encrypted_content()
             {
                 return Err(ContractError::InvalidField("custody_envelope"));
+            }
+        }
+        if let ProtectProviderResponseKindV1::ObjectProtectionSessionFinalized {
+            object_identity,
+            content_key_commitment,
+            custody_envelope,
+            ..
+        } = &self.0
+        {
+            let object_identity = object_identity.decode::<ChunkedPayloadObjectIdentityV1>()?;
+            let custody_envelope = custody_envelope.decode::<CustodyEnvelopeV1>()?;
+            if custody_envelope.manifest().encrypted_content()
+                != object_identity.encrypted_content()
+            {
+                return Err(ContractError::InvalidField("custody_envelope"));
+            }
+            if custody_envelope.manifest().content_key_commitment()
+                != Digest32::new(*content_key_commitment)
+            {
+                return Err(ContractError::InvalidField("content_key_commitment"));
             }
         }
         Ok(())
@@ -784,9 +1205,10 @@ impl<'de> Deserialize<'de> for ProtectProviderResponseV1 {
 
 #[cfg(test)]
 mod tests {
+    use crate::object::MAX_OBJECT_CHUNKS_V1;
     use crate::test_support::{
-        custody_envelope_for_media, digest, media_components, media_identity,
-        node_custody_public_key, node_public_key,
+        custody_envelope_for_encrypted_content, custody_envelope_for_media, digest,
+        media_components, media_identity, node_custody_public_key, node_public_key,
     };
 
     use super::*;
@@ -1057,5 +1479,362 @@ mod tests {
             ProtectProviderResponseV1::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .is_err()
         );
+    }
+
+    fn object_identity_for(seed: u8, plaintext_bytes: u64) -> ChunkedPayloadObjectIdentityV1 {
+        ChunkedPayloadObjectIdentityV1::new(
+            EncryptedContentIdentityV1::new(digest(seed), plaintext_bytes + 64).unwrap(),
+            "application/octet-stream",
+            plaintext_bytes,
+            64,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_object_request_with(
+        content_type: &str,
+        plaintext_bytes: u64,
+        nodes: Vec<ProtectionSessionNodeV1>,
+        threshold_required: u8,
+        threshold_total: u8,
+    ) -> Result<ProtectProviderRequestV1, ContractError> {
+        ProtectProviderRequestV1::new_open_object_protection_session(
+            digest(0xa1),
+            content_access_id(),
+            custody_pool_identity(),
+            custody_epoch_identity(),
+            custody_committee_authorization_identity(),
+            threshold_required,
+            threshold_total,
+            content_type,
+            plaintext_bytes,
+            nodes,
+        )
+    }
+
+    #[test]
+    fn object_open_request_round_trips_and_enforces_bounds() {
+        let request =
+            open_object_request_with("application/octet-stream", 4096, nodes(), 2, 3).unwrap();
+        let decoded =
+            ProtectProviderRequestV1::from_json_slice(&request.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(
+            decoded.op(),
+            ProtectProviderRequestOpV1::OpenObjectProtectionSession
+        );
+        assert_eq!(decoded.session_id(), Some(digest(0xa1)));
+        assert_eq!(decoded.content_type(), Some("application/octet-stream"));
+        assert_eq!(decoded.plaintext_bytes(), Some(4096));
+        assert_eq!(decoded.threshold_required(), Some(2));
+        assert_eq!(decoded.threshold_total(), Some(3));
+        assert_eq!(decoded.nodes().unwrap().len(), 3);
+        assert_eq!(
+            decoded.content_access_id().unwrap(),
+            Some(content_access_id())
+        );
+        assert_eq!(
+            decoded.custody_pool().unwrap(),
+            Some(custody_pool_identity())
+        );
+        assert_eq!(
+            decoded.custody_epoch().unwrap(),
+            Some(custody_epoch_identity())
+        );
+        assert_eq!(
+            decoded.custody_committee_authorization().unwrap(),
+            Some(custody_committee_authorization_identity())
+        );
+
+        assert!(
+            ProtectProviderRequestV1::new_open_object_protection_session(
+                Digest32::new([0u8; 32]),
+                content_access_id(),
+                custody_pool_identity(),
+                custody_epoch_identity(),
+                custody_committee_authorization_identity(),
+                2,
+                3,
+                "application/octet-stream",
+                4096,
+                nodes(),
+            )
+            .is_err()
+        );
+        let too_long = "a".repeat(MAX_MEDIA_DECLARATION_BYTES_V1 + 1);
+        assert!(open_object_request_with(&too_long, 4096, nodes(), 2, 3).is_err());
+        assert!(open_object_request_with("application/octet-stream", 0, nodes(), 2, 3).is_err());
+        assert!(open_object_request_with(
+            "application/octet-stream",
+            MAX_OBJECT_PLAINTEXT_BYTES_V1 + 1,
+            nodes(),
+            2,
+            3,
+        )
+        .is_err());
+        assert!(open_object_request_with("application/octet-stream", 4096, nodes(), 1, 3).is_err());
+        assert!(open_object_request_with(
+            "application/octet-stream",
+            4096,
+            nodes()[..2].to_vec(),
+            2,
+            3,
+        )
+        .is_err());
+
+        let mut dup =
+            serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
+        dup["nodes"][1]["node_public_key"] = dup["nodes"][0]["node_public_key"].clone();
+        assert!(
+            ProtectProviderRequestV1::from_json_slice(&serde_json::to_vec(&dup).unwrap()).is_err()
+        );
+
+        let mut unknown =
+            serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(
+            ProtectProviderRequestV1::from_json_slice(&serde_json::to_vec(&unknown).unwrap())
+                .is_err()
+        );
+
+        let response = ProtectProviderResponseV1::new_object_opened(b"framed-header").unwrap();
+        let decoded_response =
+            ProtectProviderResponseV1::from_json_slice(&response.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded_response, response);
+        assert_eq!(
+            decoded_response.status(),
+            ProtectProviderResponseStatusV1::ObjectProtectionSessionOpened
+        );
+        assert_eq!(
+            decoded_response.framed_header(),
+            Some(b"framed-header".as_slice())
+        );
+
+        let mut unknown_response =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        unknown_response["unexpected"] = serde_json::json!(true);
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&unknown_response).unwrap()
+        )
+        .is_err());
+
+        let oversized_header = serde_json::json!(vec![7u8; MAX_OBJECT_FRAMED_HEADER_BYTES_V1 + 1]);
+        let mut oversized =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        oversized["framed_header"] = oversized_header;
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&oversized).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn object_chunk_round_trips_rejects_unknown_fields_and_oversize_blobs() {
+        let request =
+            ProtectProviderRequestV1::new_protect_object_chunk(digest(0xb1), 3, b"clear-chunk")
+                .unwrap();
+        let decoded =
+            ProtectProviderRequestV1::from_json_slice(&request.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.op(), ProtectProviderRequestOpV1::ProtectObjectChunk);
+        assert_eq!(decoded.session_id(), Some(digest(0xb1)));
+        assert_eq!(decoded.chunk_index(), Some(3));
+        assert_eq!(decoded.plaintext(), Some(b"clear-chunk".as_slice()));
+
+        assert!(ProtectProviderRequestV1::new_protect_object_chunk(
+            Digest32::new([0u8; 32]),
+            3,
+            b"clear-chunk",
+        )
+        .is_err());
+        assert!(ProtectProviderRequestV1::new_protect_object_chunk(
+            digest(0xb1),
+            3,
+            &vec![0u8; MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1 + 1],
+        )
+        .is_err());
+        assert!(ProtectProviderRequestV1::new_protect_object_chunk(digest(0xb1), 3, &[]).is_err());
+
+        let mut unknown =
+            serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(
+            ProtectProviderRequestV1::from_json_slice(&serde_json::to_vec(&unknown).unwrap())
+                .is_err()
+        );
+
+        let response =
+            ProtectProviderResponseV1::new_object_chunk_protected(b"framed-chunk").unwrap();
+        let decoded_response =
+            ProtectProviderResponseV1::from_json_slice(&response.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded_response, response);
+        assert_eq!(
+            decoded_response.status(),
+            ProtectProviderResponseStatusV1::ObjectChunkProtected
+        );
+        assert_eq!(
+            decoded_response.framed_chunk(),
+            Some(b"framed-chunk".as_slice())
+        );
+
+        assert!(ProtectProviderResponseV1::new_object_chunk_protected(&vec![
+            0u8;
+            MAX_OBJECT_FRAMED_CHUNK_BYTES_V1
+                + 1
+        ],)
+        .is_err());
+
+        let mut unknown_response =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        unknown_response["unexpected"] = serde_json::json!(true);
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&unknown_response).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn object_finalize_round_trips_and_binds_object_identity_and_commitment() {
+        let object_identity = object_identity_for(0x21, 4096);
+        let custody_envelope = custody_envelope_for_encrypted_content(
+            object_identity.encrypted_content().clone(),
+            0x21,
+        );
+
+        let request = ProtectProviderRequestV1::new_finalize_object_protection_session(
+            digest(0xc1),
+            object_identity.encrypted_content(),
+        )
+        .unwrap();
+        let decoded =
+            ProtectProviderRequestV1::from_json_slice(&request.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(
+            decoded.op(),
+            ProtectProviderRequestOpV1::FinalizeObjectProtectionSession
+        );
+        assert_eq!(decoded.session_id(), Some(digest(0xc1)));
+        assert_eq!(
+            decoded.encrypted_content().unwrap().unwrap(),
+            *object_identity.encrypted_content()
+        );
+
+        assert!(
+            ProtectProviderRequestV1::new_finalize_object_protection_session(
+                Digest32::new([0u8; 32]),
+                object_identity.encrypted_content(),
+            )
+            .is_err()
+        );
+
+        let mut unknown =
+            serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(
+            ProtectProviderRequestV1::from_json_slice(&serde_json::to_vec(&unknown).unwrap())
+                .is_err()
+        );
+
+        let mut oversized_encrypted_content =
+            serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
+        oversized_encrypted_content["encrypted_content"] =
+            serde_json::json!(vec![9u8; MAX_ENCRYPTED_CONTENT_IDENTITY_BYTES_V1 + 1]);
+        assert!(ProtectProviderRequestV1::from_json_slice(
+            &serde_json::to_vec(&oversized_encrypted_content).unwrap()
+        )
+        .is_err());
+
+        let content_key_commitment = custody_envelope.manifest().content_key_commitment();
+        let response = ProtectProviderResponseV1::new_object_finalized(
+            &object_identity,
+            content_key_commitment,
+            &custody_envelope,
+        )
+        .unwrap();
+        let decoded_response =
+            ProtectProviderResponseV1::from_json_slice(&response.to_json_vec().unwrap()).unwrap();
+        assert_eq!(decoded_response, response);
+        assert_eq!(
+            decoded_response.status(),
+            ProtectProviderResponseStatusV1::ObjectProtectionSessionFinalized
+        );
+        assert_eq!(
+            decoded_response.object_identity().unwrap().unwrap(),
+            object_identity
+        );
+        assert_eq!(
+            decoded_response.content_key_commitment().unwrap(),
+            content_key_commitment
+        );
+        assert_eq!(
+            decoded_response.custody_envelope().unwrap().unwrap(),
+            custody_envelope
+        );
+
+        let mismatched_envelope = custody_envelope_for_encrypted_content(
+            object_identity_for(0x31, 4096).encrypted_content().clone(),
+            0x31,
+        );
+        assert!(ProtectProviderResponseV1::new_object_finalized(
+            &object_identity,
+            content_key_commitment,
+            &mismatched_envelope,
+        )
+        .is_err());
+
+        let mut mismatched_commitment =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        mismatched_commitment["content_key_commitment"] = serde_json::json!(vec![0u8; 32]);
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&mismatched_commitment).unwrap()
+        )
+        .is_err());
+
+        let mut oversized_object_identity =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        oversized_object_identity["object_identity"] =
+            serde_json::json!(vec![9u8; MAX_CHUNKED_PAYLOAD_OBJECT_IDENTITY_BYTES_V1 + 1]);
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&oversized_object_identity).unwrap()
+        )
+        .is_err());
+
+        let mut oversized_custody_envelope =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        oversized_custody_envelope["custody_envelope"] =
+            serde_json::json!(vec![9u8; MAX_CUSTODY_ENVELOPE_BYTES_V1 + 1]);
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&oversized_custody_envelope).unwrap()
+        )
+        .is_err());
+
+        let mut unknown_response =
+            serde_json::from_slice::<serde_json::Value>(&response.to_json_vec().unwrap()).unwrap();
+        unknown_response["unexpected"] = serde_json::json!(true);
+        assert!(ProtectProviderResponseV1::from_json_slice(
+            &serde_json::to_vec(&unknown_response).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn maximum_object_chunk_requests_stay_within_provider_frame_limit() {
+        let chunk_request = ProtectProviderRequestV1::new_protect_object_chunk(
+            digest(0xd1),
+            MAX_OBJECT_CHUNKS_V1 - 1,
+            &vec![0x77; MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1],
+        )
+        .unwrap();
+        let chunk_json = chunk_request.to_json_vec().unwrap();
+        assert!(chunk_json.len() <= crate::MAX_PROVIDER_FRAME_BYTES_V1);
+
+        let chunk_response = ProtectProviderResponseV1::new_object_chunk_protected(&vec![
+            0x88;
+            MAX_OBJECT_FRAMED_CHUNK_BYTES_V1
+        ])
+        .unwrap();
+        let chunk_response_json = chunk_response.to_json_vec().unwrap();
+        assert!(chunk_response_json.len() <= crate::MAX_PROVIDER_FRAME_BYTES_V1);
     }
 }

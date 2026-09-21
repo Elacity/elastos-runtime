@@ -5,8 +5,30 @@ const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
 export const MAX_VIEWER_SEGMENT_COUNT = 512;
 export const MAX_VIEWER_MEDIA_PART_BYTES = 2 * 1024 * 1024;
 const MAX_VIEWER_MEDIA_PART_BASE64_BYTES = Math.ceil(MAX_VIEWER_MEDIA_PART_BYTES / 3) * 4;
+const VIEWER_CONTENT_KIND_MEDIA = "media";
+const AUDIO_ONLY_CLASS = "audio-only";
+// Codec families that paint a frame. A rendition whose declared codec list has
+// one of these carries a picture the decoder draws for us; anything else (AAC,
+// Opus, FLAC, ...) is sound only.
+const IMAGE_TRACK_CODEC_PREFIXES = [
+  "avc1.",
+  "avc3.",
+  "hev1.",
+  "hvc1.",
+  "hvc2.",
+  "av01.",
+  "vp08",
+  "vp09",
+  "vp8",
+  "vp9",
+  "mp4v.",
+];
+export const PRESENTATION_IMAGE_TRACK = "image-track";
+export const PRESENTATION_POSTER = "poster";
+export const PRESENTATION_CONTROLS_ONLY = "controls-only";
 const OPEN_RESPONSE_KEYS = [
   "codecs",
+  "content_kind",
   "expires_at",
   "has_init_segment",
   "mime_type",
@@ -107,6 +129,9 @@ export function parseViewerOpenData(data, expectedMintId) {
   const expiresAt = Number(data.expires_at);
   if (
     data.schema !== VIEWER_OPEN_SCHEMA ||
+    // The player renders media sessions only: an object session's geometry is
+    // not a segment ladder, so refuse it here rather than misread its fields.
+    data.content_kind !== VIEWER_CONTENT_KIND_MEDIA ||
     mintId !== expectedMintId ||
     !MINT_ID_HEX_RE.test(mintId) ||
     !VIEWER_HANDLE_HEX_RE.test(viewerSessionHandle) ||
@@ -133,39 +158,39 @@ export function parseViewerOpenData(data, expectedMintId) {
 function decodeBase64(base64Text) {
   const value = String(base64Text || "");
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
-    throw new Error("Video data is unavailable.");
+    throw new Error("Media data is unavailable.");
   }
   if (value.length > MAX_VIEWER_MEDIA_PART_BASE64_BYTES) {
-    throw new Error("Video data is unavailable.");
+    throw new Error("Media data is unavailable.");
   }
   try {
     if (typeof atob === "function") {
       const binary = atob(value);
       if (btoa(binary) !== value) {
-        throw new Error("Video data is unavailable.");
+        throw new Error("Media data is unavailable.");
       }
       const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
       if (bytes.length > MAX_VIEWER_MEDIA_PART_BYTES) {
-        throw new Error("Video data is unavailable.");
+        throw new Error("Media data is unavailable.");
       }
       return bytes;
     }
     const buffer = Buffer.from(value, "base64");
     if (buffer.toString("base64") !== value) {
-      throw new Error("Video data is unavailable.");
+      throw new Error("Media data is unavailable.");
     }
     if (buffer.length > MAX_VIEWER_MEDIA_PART_BYTES) {
-      throw new Error("Video data is unavailable.");
+      throw new Error("Media data is unavailable.");
     }
     return Uint8Array.from(buffer);
   } catch {
-    throw new Error("Video data is unavailable.");
+    throw new Error("Media data is unavailable.");
   }
 }
 
 export function parseViewerPartData(data, expectedMintId, expectedHandle) {
   if (!hasExactKeys(data, PART_RESPONSE_KEYS)) {
-    throw new Error("Video data is unavailable.");
+    throw new Error("Media data is unavailable.");
   }
   const mintId = String(data.mint_id || "");
   const viewerSessionHandle = String(data.viewer_session_handle || "");
@@ -177,13 +202,42 @@ export function parseViewerPartData(data, expectedMintId, expectedHandle) {
     !MINT_ID_HEX_RE.test(mintId) ||
     !VIEWER_HANDLE_HEX_RE.test(viewerSessionHandle)
   ) {
-    throw new Error("Video data is unavailable.");
+    throw new Error("Media data is unavailable.");
   }
   const bytes = decodeBase64(String(data.data || ""));
   if (!bytes.length) {
-    throw new Error("Video data is unavailable.");
+    throw new Error("Media data is unavailable.");
   }
   return bytes;
+}
+
+/**
+ * Whether the rendition carries an image track of its own. Read from the
+ * declared codec list rather than the container type, so a rendition that
+ * carries a picture is recognised whichever container it arrives in.
+ */
+export function renditionHasImageTrack(codecs) {
+  return String(codecs || "")
+    .split(",")
+    .map((codec) => codec.trim().toLowerCase())
+    .some((codec) => IMAGE_TRACK_CODEC_PREFIXES.some((prefix) => codec.startsWith(prefix)));
+}
+
+/**
+ * How to present a session, highest precedence first:
+ *
+ *   1. the rendition's own image track - the decoder paints the frame;
+ *   2. a poster set on the element - shown in the frame instead;
+ *   3. neither - the frame collapses to the height of its own controls.
+ *
+ * Nothing is substituted at step 3: with no image track and no poster the
+ * player shows no picture at all rather than standing in for one.
+ */
+export function presentationFor(session, poster) {
+  if (renditionHasImageTrack(session?.codecs)) {
+    return PRESENTATION_IMAGE_TRACK;
+  }
+  return String(poster || "").trim() ? PRESENTATION_POSTER : PRESENTATION_CONTROLS_ONLY;
 }
 
 function mediaSourceSupported(MediaSourceLike, mimeType) {
@@ -206,7 +260,7 @@ function createDeferred() {
 
 function appendBytes(sourceBuffer, bytes) {
   if (!(bytes instanceof Uint8Array) || !bytes.length) {
-    return Promise.reject(new Error("Video data is unavailable."));
+    return Promise.reject(new Error("Media data is unavailable."));
   }
   const deferred = createDeferred();
   const onUpdateEnd = () => {
@@ -215,7 +269,7 @@ function appendBytes(sourceBuffer, bytes) {
   };
   const onError = () => {
     cleanup();
-    deferred.reject(new Error("Video data is unavailable."));
+    deferred.reject(new Error("Media data is unavailable."));
   };
   const cleanup = () => {
     sourceBuffer.removeEventListener("updateend", onUpdateEnd);
@@ -227,14 +281,14 @@ function appendBytes(sourceBuffer, bytes) {
     sourceBuffer.appendBuffer(bytes);
   } catch (error) {
     cleanup();
-    deferred.reject(error instanceof Error ? error : new Error("Video data is unavailable."));
+    deferred.reject(error instanceof Error ? error : new Error("Media data is unavailable."));
   }
   return deferred.promise;
 }
 
 function responseFallback(op) {
-  if (op === "open_viewer") return "Protected video is unavailable.";
-  if (op === "read_viewer") return "Video data is unavailable.";
+  if (op === "open_viewer") return "Protected media is unavailable.";
+  if (op === "read_viewer") return "Media data is unavailable.";
   return "Viewer session is unavailable.";
 }
 
@@ -274,7 +328,7 @@ export function createPlayerController({
     overlay.hidden = true;
   }
 
-  function clearVideo() {
+  function clearMedia() {
     try {
       video.pause?.();
     } catch {}
@@ -292,7 +346,7 @@ export function createPlayerController({
 
   async function postProvider(op, body, options = {}) {
     if (!homeToken) {
-      throw new Error("Protected video is unavailable.");
+      throw new Error("Protected media is unavailable.");
     }
     const response = await fetchImpl(`/api/provider/object/${op}`, {
       method: "POST",
@@ -331,7 +385,7 @@ export function createPlayerController({
       return;
     }
     failed = true;
-    clearVideo();
+    clearMedia();
     showOverlay(message, "error");
     await closeViewer({ quiet: true });
   }
@@ -347,21 +401,25 @@ export function createPlayerController({
 
   async function startPlayback() {
     if (!MINT_ID_HEX_RE.test(mintId)) {
-      showOverlay("Protected video is unavailable.", "error");
+      showOverlay("Protected media is unavailable.", "error");
       return;
     }
     if (!mediaSourceClass) {
-      showOverlay("This browser cannot play protected video.", "error");
+      showOverlay("This browser cannot play protected media.", "error");
       return;
     }
-    showOverlay("Loading video...");
+    showOverlay("Loading media...");
     try {
       session = parseViewerOpenData(await postProvider("open_viewer", { mint_id: mintId }), mintId);
       const mimeType = buildViewerMimeType(session.mimeType, session.codecs);
       if (!mediaSourceSupported(mediaSourceClass, mimeType)) {
-        await fail("This browser cannot play protected video.");
+        await fail("This browser cannot play protected media.");
         return;
       }
+      // Only a rendition with neither an image track nor a poster collapses to
+      // the height of its own controls; either kind of picture keeps the frame.
+      const presentation = presentationFor(session, video.getAttribute?.("poster") ?? video.poster);
+      video.classList?.toggle?.(AUDIO_ONLY_CLASS, presentation === PRESENTATION_CONTROLS_ONLY);
       const mediaSource = new mediaSourceClass();
       objectUrl = urlObject.createObjectURL(mediaSource);
       video.src = objectUrl;
@@ -381,7 +439,7 @@ export function createPlayerController({
       mediaSource.endOfStream?.();
     } catch (error) {
       const message =
-        error instanceof Error && error.message ? error.message : "Protected video is unavailable.";
+        error instanceof Error && error.message ? error.message : "Protected media is unavailable.";
       await fail(message);
     }
   }

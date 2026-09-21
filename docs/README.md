@@ -82,6 +82,9 @@ Each top-level ledger has one job:
   replaceable dKMS/dDRM boundary, migration rules, delivery slices, and acceptance
 - [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
   identity, rights, custody and release schemas
+- [Protected-content crypto review](PROTECTED_CONTENT_CRYPTO_REVIEW.md): review
+  package for an external cryptographer; suite card, threat model and golden
+  vectors. External review remains open
 - [Rights evaluation](RIGHTS_PROVIDER.md): Runtime-owned Chain rights evidence
 - [Decrypt provider](DECRYPT_PROVIDER.md): Runtime-only decrypt and media read
   boundary

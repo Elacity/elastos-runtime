@@ -53,6 +53,16 @@ body {
   object-fit: contain;
 }
 
+/* A rendition with no image track AND no poster draws no picture at all: the
+   frame shrinks to its controls and sits centred instead of stretching over the
+   whole viewport. A poster keeps the full frame so it has somewhere to show. */
+#player-video.audio-only {
+  height: auto;
+  min-height: 54px;
+  max-width: min(640px, calc(100vw - 32px));
+  margin: calc(50vh - 27px) auto 0;
+}
+
 .player-overlay {
   position: absolute;
   inset: 0;
