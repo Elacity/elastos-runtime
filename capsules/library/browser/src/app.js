@@ -6,6 +6,7 @@ import {
   hasCapability,
   inTrash,
   isBlockedObject,
+  isDesktopBackgroundCandidate,
   isDirectory,
   isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
@@ -73,6 +74,7 @@ import {
       openTarget,
       openPublishedUri,
       deliverToTarget,
+      setDesktopBackground,
       closeSelf,
     } = createLibraryRuntime({ getHomeToken: () => state.homeToken });
 
@@ -146,6 +148,7 @@ import {
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
     let setClipboard = () => {};
+    let setObjectAsDesktopBackground = async () => {};
     let shareObject = async () => {};
     let showStatusObject = async () => {};
     let trashObject = async () => {};
@@ -302,6 +305,7 @@ import {
       restoreObject,
       restoreSelectedObjects,
       setClipboard,
+      setObjectAsDesktopBackground,
       shareObject,
       showStatusObject,
       trashObject,
@@ -325,6 +329,7 @@ import {
       providerApi,
       renderUploads,
       selectedObjects,
+      setDesktopBackground,
       setStatus,
       setUploadProgress,
       showMenuForObject,
@@ -995,6 +1000,9 @@ import {
           actions.push(menuAction("Open With", null, {
             children: viewers.map((viewer) => menuAction(viewer.label || viewer.id, () => openWithViewer(object, viewer.id))),
           }));
+        }
+        if (!isAttachMode() && isDesktopBackgroundCandidate(object)) {
+          actions.push(menuAction("Set as Desktop Background", () => setObjectAsDesktopBackground(object)));
         }
       }
       if (hasCapability(object, "download")) {
