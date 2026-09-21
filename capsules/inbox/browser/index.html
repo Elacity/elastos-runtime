@@ -397,6 +397,7 @@
       font-size: 13px;
       letter-spacing: 0;
       line-height: 1.45;
+      white-space: pre-wrap;
     }
 
     .entry-actions {
@@ -1081,6 +1082,9 @@
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("hosted-http-approve:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "hosted-http-deny:" + actionId.slice("hosted-http-approve:".length), "danger"));
       }
 
       if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant") {

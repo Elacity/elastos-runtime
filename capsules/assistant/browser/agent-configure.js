@@ -162,25 +162,16 @@ function renderModelSelectionFacts() {
   }
   const facts = selectedLiveOffer()?.selectionFacts;
   factsHost.replaceChildren();
-  if (!facts) {
+  const rows = Array.isArray(facts?.detailRows) ? facts.detailRows : [];
+  if (!facts || !rows.length) {
     factsHost.hidden = true;
     return;
   }
-  const rows = [
-    ["Requested model", facts.requestedModel],
-    ["Resolved model", facts.resolvedModel],
-    ["Provider", facts.provider],
-    ["Execution", facts.execution],
-    ["Limits", facts.limits],
-    ["Privacy", facts.privacy],
-    ["Cost", facts.cost],
-    ["Fallback", facts.fallback],
-  ];
-  for (const [term, value] of rows) {
+  for (const row of rows) {
     const dt = document.createElement("dt");
-    dt.textContent = term;
+    dt.textContent = row.term;
     const dd = document.createElement("dd");
-    dd.textContent = value || "unknown";
+    dd.textContent = row.value;
     factsHost.append(dt, dd);
   }
   factsHost.hidden = false;

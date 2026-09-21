@@ -32,12 +32,12 @@ export function eligibleTextOffers(payload) {
   );
 }
 
-function backendFactText(fact, fallback) {
+function backendFactText(fact, fallback = "") {
   if (!fact || typeof fact !== "object") {
     return fallback;
   }
   if (fact.status === "unknown") {
-    return "unknown";
+    return fallback;
   }
   if (fact.status === "reported") {
     const value = fact.value;
@@ -58,21 +58,33 @@ function backendFactText(fact, fallback) {
   return fallback;
 }
 
+function reportedRunFact(fact) {
+  if (!fact || typeof fact !== "object") {
+    return "";
+  }
+  if (fact.status === "unknown") {
+    return "Not reported";
+  }
+  return backendFactText(fact, "Not reported");
+}
+
 function offerPolicyLimits(policy) {
   if (!policy || typeof policy !== "object") {
-    return "offer policy unavailable";
+    return "";
   }
   const parts = [];
   if (Number.isFinite(Number(policy.concurrency_limit))) {
-    parts.push(`concurrency ${Number(policy.concurrency_limit)}`);
+    const count = Number(policy.concurrency_limit);
+    parts.push(count === 1 ? "1 run at a time" : `${count} runs at a time`);
   }
   if (Number.isFinite(Number(policy.input_bytes_limit))) {
-    parts.push(`input ${Number(policy.input_bytes_limit)} B`);
+    parts.push(`prompts up to ${Number(policy.input_bytes_limit)} bytes`);
   }
   if (Number.isFinite(Number(policy.runtime_ms_limit))) {
-    parts.push(`${Number(policy.runtime_ms_limit)} ms`);
+    const ms = Number(policy.runtime_ms_limit);
+    parts.push(ms % 1000 === 0 ? `${ms / 1000} seconds` : `${ms} ms`);
   }
-  return parts.length ? parts.join("; ") : "offer policy unavailable";
+  return parts.join("; ");
 }
 
 function hostedObject(offer) {
@@ -87,13 +99,94 @@ function remoteServiceName(offer) {
 
 /** Route that will execute the selected offer. */
 export function offerRouteKind(offer) {
-  if (hostedObject(offer)) {
+  const hosted = hostedObject(offer);
+  const remote = offer?.remote_service && typeof offer.remote_service === "object";
+  if (hosted && remote) {
+    return "remote_hosted";
+  }
+  if (hosted) {
     return "hosted";
   }
-  if (offer?.remote_service && typeof offer.remote_service === "object") {
+  if (remote) {
     return "remote";
   }
   return "local";
+}
+
+/** Short route line under an instance name. */
+export function offerRouteSubtitle(offer) {
+  const hosted = hostedObject(offer);
+  const kind = offerRouteKind(offer);
+  const remoteName = remoteServiceName(offer);
+  const processor =
+    typeof hosted?.backend_provider_label === "string" && hosted.backend_provider_label.trim() !== ""
+      ? hosted.backend_provider_label.trim()
+      : "";
+  if (kind === "hosted") {
+    return `${processor || "Hosted"} · hosted`;
+  }
+  if (kind === "remote") {
+    return remoteName ? `via ${remoteName}` : "via another Home";
+  }
+  if (kind === "remote_hosted") {
+    return remoteName ? `via ${remoteName}` : "via another Home";
+  }
+  return "This Home · local";
+}
+
+function promptDestination(kind, facts) {
+  if (kind === "remote_hosted") {
+    const home = facts.intermediary || "another Home";
+    const processor = facts.processor || "a hosted processor";
+    return `${home}, then ${processor}`;
+  }
+  if (kind === "hosted") {
+    return facts.processor || "a hosted processor";
+  }
+  if (kind === "remote") {
+    return facts.intermediary || "another Home";
+  }
+  return "This Home";
+}
+
+function privacyLabel(kind, facts) {
+  if (kind === "hosted" || kind === "remote_hosted") {
+    return facts.privacy || "Not reported";
+  }
+  if (kind === "remote") {
+    return "The prompt leaves this Home";
+  }
+  return "This Home keeps the prompt";
+}
+
+function availabilityLabel(kind, facts) {
+  if (kind === "remote_hosted") {
+    return facts.intermediary ? `Through ${facts.intermediary}` : "Through another Home";
+  }
+  if (kind === "hosted") {
+    return "Hosted";
+  }
+  if (kind === "remote") {
+    return facts.intermediary ? `Through ${facts.intermediary}` : "Through another Home";
+  }
+  return "On this Home";
+}
+
+function offerDetailRows(kind, facts) {
+  const rows = [];
+  const push = (term, value) => {
+    if (typeof value === "string" && value.trim() !== "") {
+      rows.push({ term, value: value.trim() });
+    }
+  };
+  push("Processor", kind === "local" ? "This Home" : facts.processor || facts.intermediary);
+  push("Prompt destination", promptDestination(kind, facts));
+  push("Payer", facts.payer === "this Home" ? "This Home" : facts.payer);
+  push("Limits", facts.limits);
+  push("Privacy", privacyLabel(kind, facts));
+  push("Availability", availabilityLabel(kind, facts));
+  push("Cost", facts.cost);
+  return rows;
 }
 
 /** Selection facts the Assistant model picker must show. */
@@ -105,33 +198,50 @@ export function offerSelectionFacts(offer, backendReport = null) {
     (typeof hosted?.requested_selector === "string" && hosted.requested_selector.trim() !== ""
       ? hosted.requested_selector.trim()
       : "") || (typeof offer?.title === "string" ? offer.title : "");
-  const resolvedModel = backendFactText(backendReport?.resolved_model, "unknown");
-  const provider = kind === "hosted"
-    ? typeof hosted?.backend_provider_label === "string" && hosted.backend_provider_label.trim() !== ""
-      ? hosted.backend_provider_label.trim()
-      : "hosted provider"
-    : kind === "remote"
-      ? remoteName || "remote Home"
-      : "this Home";
-  const execution = kind === "hosted"
-    ? `hosted via ${provider}`
-    : kind === "remote"
-      ? `via ${remoteName || "remote Home"}`
-      : "this Home";
-  const privacy = kind === "hosted"
+  const resolvedModel = reportedRunFact(backendReport?.resolved_model);
+  const processor = typeof hosted?.backend_provider_label === "string" && hosted.backend_provider_label.trim() !== ""
+    ? hosted.backend_provider_label.trim()
+    : "";
+  const intermediary = remoteName
+    || (typeof hosted?.intermediary === "string" && hosted.intermediary.trim() !== ""
+      ? hosted.intermediary.trim()
+      : "");
+  const payer = typeof hosted?.payer === "string" && hosted.payer.trim() !== ""
+    ? hosted.payer.trim()
+    : kind === "remote_hosted"
+      ? "this Home"
+      : kind === "hosted"
+        ? "this Home"
+        : "";
+  const provider = kind === "remote_hosted"
+    ? processor || "hosted provider"
+    : kind === "hosted"
+      ? processor || "hosted provider"
+      : kind === "remote"
+        ? remoteName || "remote Home"
+        : "this Home";
+  const execution = kind === "remote_hosted"
+    ? `via ${intermediary || "remote Home"}; ${processor || "hosted provider"}; payer ${payer || "this Home"}`
+    : kind === "hosted"
+      ? `hosted via ${provider}`
+      : kind === "remote"
+        ? `via ${remoteName || "remote Home"}`
+        : "this Home";
+  const privacy = kind === "hosted" || kind === "remote_hosted"
     ? typeof hosted?.privacy_policy_ref === "string" && hosted.privacy_policy_ref.trim() !== ""
       ? hosted.privacy_policy_ref.trim()
-      : "unknown"
-    : "unknown";
-  const cost = backendFactText(backendReport?.cost, "unknown");
-  const fallback = kind === "hosted"
+      : ""
+    : "";
+  const cost = reportedRunFact(backendReport?.cost);
+  const fallback = kind === "hosted" || kind === "remote_hosted"
     ? typeof hosted?.upstream_routing_fallback_assertion === "string" &&
       hosted.upstream_routing_fallback_assertion.trim() !== ""
       ? hosted.upstream_routing_fallback_assertion.trim()
-      : "unknown"
-    : "unknown";
+      : ""
+    : "";
   const limits = offerPolicyLimits(offer?.policy);
-  return {
+  const routeSubtitle = offerRouteSubtitle(offer);
+  const facts = {
     requestedModel,
     resolvedModel,
     provider,
@@ -140,19 +250,18 @@ export function offerSelectionFacts(offer, backendReport = null) {
     privacy,
     cost,
     fallback,
-    summary: `requested ${requestedModel}; resolved ${resolvedModel}; provider ${provider}; execution ${execution}; limits ${limits}; privacy ${privacy}; cost ${cost}; fallback ${fallback}`,
+    intermediary,
+    processor,
+    payer,
+    routeSubtitle,
+    summary: `${typeof offer?.title === "string" ? offer.title : requestedModel}. ${routeSubtitle}`,
   };
+  facts.detailRows = offerDetailRows(kind, facts);
+  return facts;
 }
 
 function offerRowDetail(offer, facts) {
-  const kind = offerRouteKind(offer);
-  if (kind === "hosted") {
-    return `Hosted · ${facts.provider}`;
-  }
-  if (kind === "remote") {
-    return `Model offer · ${facts.execution}`;
-  }
-  return "Model offer · this Home";
+  return facts.routeSubtitle || offerRouteSubtitle(offer);
 }
 
 /** Menu rows for the composer's model chip; the id carries the offer. */

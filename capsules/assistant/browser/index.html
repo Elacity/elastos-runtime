@@ -323,6 +323,16 @@
               <p class="agent-harness-page-foot">
                 Notes append to the system prompt for Live · never leave this Home · UI ≠ authority
               </p>
+              <label class="agent-prompt-label agent-prompt-check" for="agent-show-reasoning">
+                <input
+                  id="agent-show-reasoning"
+                  type="checkbox"
+                  data-truth-thinking-toggle
+                  aria-label="Show reasoning on replies"
+                  checked
+                />
+                Show reasoning on replies
+              </label>
               <div class="agent-prompt-params">
                 <label class="agent-prompt-param">
                   <span>Context budget (tokens)</span>
@@ -370,7 +380,7 @@
               id="agent-composer-input"
               class="agent-composer-input"
               rows="1"
-              placeholder="Ask on this machine"
+              placeholder="Message Assistant"
               autocomplete="off"
               spellcheck="true"
             ></textarea>
@@ -420,16 +430,6 @@
               >
                 <span aria-hidden="true">+</span>
               </button>
-              <button
-                type="button"
-                class="agent-think-btn"
-                data-truth-thinking-toggle
-                aria-pressed="true"
-                aria-label="Show model thinking"
-                title="Show model thinking blocks"
-              >
-                Think
-              </button>
             </div>
             <div class="agent-composer-tools-right">
               <div class="agent-model-wrap">
@@ -437,10 +437,11 @@
                   id="agent-model-picker"
                   class="agent-model-btn"
                   type="button"
-                  aria-haspopup="dialog"
+                  aria-haspopup="listbox"
                   aria-expanded="false"
                   aria-controls="agent-model-menu"
-                  title="Model offer on this Home"
+                  aria-label="Choose a model"
+                  title="Choose a model"
                 >
                   <span class="agent-model-name">No model</span>
                   <span class="agent-model-tier" hidden></span>
@@ -483,12 +484,12 @@
 <div
   id="agent-model-menu"
   class="agent-model-menu"
-  role="dialog"
-  aria-label="Choose a model offer"
+  role="listbox"
+  aria-label="Choose a model"
   tabindex="-1"
   hidden
 >
-  <div class="agent-model-menu-list" data-model-menu-list role="listbox" aria-label="Models"></div>
+  <div class="agent-model-menu-list" data-model-menu-list></div>
   <button type="button" class="agent-model-menu-add" data-model-add>All models</button>
 </div>
 

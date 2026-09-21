@@ -426,6 +426,22 @@ async fn dispatch_inbox_action(
         )?;
         return Ok("Rejected Wallet market-price source.".to_string());
     }
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::jev_approval_lens::HOSTED_HTTP_APPROVE_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        crate::jev_approval_lens::record_human_decision(data_dir, request_id, "approve")?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok("Approved this hosted connection. Send again from Assistant.".to_string());
+    }
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::jev_approval_lens::HOSTED_HTTP_DENY_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        crate::jev_approval_lens::record_human_decision(data_dir, request_id, "deny")?;
+        let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
+        return Ok("Denied this hosted connection.".to_string());
+    }
     anyhow::bail!("unknown inbox action");
 }
 

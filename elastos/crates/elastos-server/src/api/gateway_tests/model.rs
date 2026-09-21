@@ -6,6 +6,7 @@ use elastos_model_contract::{
     model_input_hash, RuntimeAccessBinding, RuntimeCreateBinding, RUNTIME_ACCESS_BINDING_SCHEMA,
     RUNTIME_CREATE_BINDING_SCHEMA,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -1267,4 +1268,611 @@ fn runtime_validates_typed_model_outputs_before_assistant_projection() {
         });
         assert!(project_model_provider_response("runs_events", &mut response).is_err());
     }
+}
+
+#[derive(Clone)]
+struct ScriptedModelProvider {
+    requests: Arc<TokioMutex<Vec<Value>>>,
+    replies: Arc<TokioMutex<HashMap<String, Value>>>,
+    get_replies: Arc<TokioMutex<HashMap<String, Value>>>,
+}
+
+impl Default for ScriptedModelProvider {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(TokioMutex::new(Vec::new())),
+            replies: Arc::new(TokioMutex::new(HashMap::new())),
+            get_replies: Arc::new(TokioMutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ScriptedModelProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "resource requests are not used in this test".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["model"]
+    }
+
+    fn name(&self) -> &'static str {
+        "scripted-model-provider"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        self.requests.lock().await.push(request.clone());
+        if request.get("op").and_then(Value::as_str) == Some("runs_get") {
+            if let Some(run_id) = request.get("run_id").and_then(Value::as_str) {
+                if let Some(reply) = self.get_replies.lock().await.get(run_id).cloned() {
+                    return Ok(reply);
+                }
+            }
+        }
+        let offer_id = request
+            .get("offer_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(reply) = self.replies.lock().await.get(&offer_id).cloned() {
+            return Ok(reply);
+        }
+        Ok(json!({ "status": "ok" }))
+    }
+}
+
+async fn scripted_model_state(
+    cache_dir: &std::path::Path,
+    provider: ScriptedModelProvider,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("model", Arc::new(provider))
+        .await
+        .unwrap();
+    GatewayState {
+        provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        carrier_endpoint: None,
+        collaboration_discovery_service: None,
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+fn hosted_test_offer(
+    id: &str,
+    title: &str,
+    processor: &str,
+    api_url: &str,
+    api_key: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "title": title,
+        "operation": "text.generate",
+        "input_modalities": ["text/plain"],
+        "output_modalities": ["text/plain"],
+        "enabled": true,
+        "adapter": {
+            "kind": "open_ai_compatible_text",
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": "fixture/model",
+            "hosted": {
+                "backend_provider_label": processor,
+                "selection_mode": "pinned",
+                "privacy_policy_ref": "fixture:privacy:v1",
+                "terms_ref": "fixture:terms:v1",
+                "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+            }
+        }
+    })
+}
+
+fn typed_jev_reply(body: &str) -> Value {
+    json!({
+        "status": "ok",
+        "data": {
+            "terminal": {
+                "output": { "text": body }
+            }
+        }
+    })
+}
+
+async fn status_json(response: Response) -> (StatusCode, Value) {
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+fn inbox_action_request(token: String, action_id: &str) -> Request<Body> {
+    test_browser_request("localhost:61180", "null")
+        .method("POST")
+        .uri("/api/apps/inbox/actions")
+        .header("x-elastos-home-token", token)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "action_id": action_id })).unwrap(),
+        ))
+        .unwrap()
+}
+
+fn inbox_summary_request(token: String) -> Request<Body> {
+    test_browser_request("localhost:61180", "null")
+        .uri("/api/apps/inbox/summary")
+        .header("x-elastos-home-token", token)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:openrouter",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "sk-or-fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:venice",
+                "Venice",
+                "Venice",
+                "https://api.venice.ai/api/v1/chat/completions",
+                "sk-vnz-fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let provider = ScriptedModelProvider::default();
+    provider.replies.lock().await.insert(
+        "model:openrouter".to_string(),
+        typed_jev_reply(
+            "{\"recommendation\":\"approve\",\"reason\":\"Matches the named connection.\",\"risk\":\"low\",\"confidence\":80}",
+        ),
+    );
+    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let assistant_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token.clone(),
+                "runs_create",
+                json!({
+                    "offer_id": "model:venice",
+                    "operation": "text.generate",
+                    "request_id": "request-venice-1",
+                    "input": { "messages": [{ "role": "user", "content": "hello" }] }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["code"], "approval_required");
+    let requests = provider.requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["offer_id"], "model:openrouter");
+    let eval_request_id = requests[0]["runtime_binding"]["request_id"]
+        .as_str()
+        .unwrap();
+    assert!(
+        eval_request_id.starts_with("jev-eval:hosted-http:model_venice:"),
+        "{eval_request_id}"
+    );
+    let eval_prompt = requests[0]["input"]["prompt"].as_str().unwrap();
+    assert_eq!(
+        requests[0]["input"]["schema"],
+        "elastos.model.input.text/v1"
+    );
+    assert!(eval_prompt.contains("Venice"));
+    assert!(!eval_prompt.contains("sk-or-fixture-secret"));
+    assert!(!eval_prompt.contains("sk-vnz-fixture-secret"));
+    assert!(!eval_prompt.contains("api_key"));
+    assert!(!eval_prompt.contains("openrouter.ai"));
+    assert!(!eval_prompt.contains("hello"));
+
+    let (status, summary) = status_json(
+        app.clone()
+            .oneshot(inbox_summary_request(inbox_token.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let entry = summary["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "external_http_request")
+        .unwrap();
+    let body_text = entry["body"].as_str().unwrap();
+    assert!(body_text.contains("Action: send a prompt through a hosted model connection"));
+    assert!(body_text.contains("Affected resource: Venice"));
+    assert!(body_text.contains("Jev recommendation: approve"));
+    assert!(body_text.contains("Reason: Matches the named connection."));
+    assert!(body_text.contains("Risk: low"));
+    assert!(body_text.contains("Confidence: 80"));
+    assert!(body_text.contains("You remain the authority."));
+    assert!(!body_text.contains("sk-or-fixture-secret"));
+    assert!(!body_text.contains("sk-vnz-fixture-secret"));
+    let action_id = entry["action_ref"]["action_id"].as_str().unwrap();
+    assert!(action_id.starts_with("hosted-http-approve:"));
+
+    let (status, acted) = status_json(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), action_id))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{acted}");
+
+    let request_id = crate::jev_approval_lens::hosted_http_request_id("model:venice").unwrap();
+    let record = crate::jev_approval_lens::load_record(dir.path(), &request_id).unwrap();
+    assert_eq!(record.recommendation.recommendation, "approve");
+    assert_eq!(record.human_decision.as_deref(), Some("approve"));
+    assert!(record.actual_outcome.is_none());
+    assert!(record
+        .policy
+        .blocked_choices
+        .iter()
+        .any(|choice| choice == "auto_approve"));
+
+    let (status, retry) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token,
+                "runs_create",
+                json!({
+                    "offer_id": "model:venice",
+                    "operation": "text.generate",
+                    "request_id": "request-venice-2",
+                    "input": { "messages": [{ "role": "user", "content": "hello" }] }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["status"], "ok");
+    let requests = provider.requests.lock().await.clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[1]["offer_id"], "model:venice");
+    let record = crate::jev_approval_lens::load_record(dir.path(), &request_id).unwrap();
+    assert_eq!(record.human_decision.as_deref(), Some("approve"));
+    assert_eq!(record.actual_outcome.as_deref(), Some("accepted"));
+    let encoded = serde_json::to_string(&record).unwrap();
+    assert!(!encoded.contains("sk-or-fixture-secret"));
+    assert!(!encoded.contains("sk-vnz-fixture-secret"));
+}
+
+#[tokio::test]
+async fn named_jev_waits_for_run_terminal_before_inbox_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:openrouter",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "sk-or-fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:venice",
+                "Venice",
+                "Venice",
+                "https://api.venice.ai/api/v1/chat/completions",
+                "sk-vnz-fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let run_id = format!("run:sha256:{}", "ab".repeat(32));
+    let provider = ScriptedModelProvider::default();
+    provider.replies.lock().await.insert(
+        "model:openrouter".to_string(),
+        json!({ "status": "ok", "data": { "run_id": run_id } }),
+    );
+    provider.get_replies.lock().await.insert(
+        run_id.clone(),
+        typed_jev_reply(
+            "{\"recommendation\":\"approve\",\"reason\":\"Accepted after the run settled.\",\"risk\":\"low\",\"confidence\":70}",
+        ),
+    );
+    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let assistant_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token,
+                "runs_create",
+                json!({
+                    "offer_id": "model:venice",
+                    "operation": "text.generate",
+                    "request_id": "request-venice-terminal",
+                    "input": { "messages": [{ "role": "user", "content": "hello" }] }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "approval_required");
+    let requests = provider.requests.lock().await.clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["op"] == "runs_create"
+                && request["offer_id"] == "model:openrouter"),
+        "{requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["op"] == "runs_get" && request["run_id"] == run_id),
+        "{requests:?}"
+    );
+    let (status, summary) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let entry = summary["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "external_http_request")
+        .unwrap();
+    let body_text = entry["body"].as_str().unwrap();
+    assert!(body_text.contains("Jev recommendation: approve"));
+    assert!(body_text.contains("Accepted after the run settled."));
+}
+
+#[tokio::test]
+async fn named_jev_malformed_or_failed_reply_still_opens_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:openrouter",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "sk-or-fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:venice",
+                "Venice",
+                "Venice",
+                "https://api.venice.ai/api/v1/chat/completions",
+                "sk-vnz-fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let provider = ScriptedModelProvider::default();
+    provider.replies.lock().await.insert(
+        "model:openrouter".to_string(),
+        typed_jev_reply(
+            "{\"recommendation\":\"approve\",\"reason\":\"x\",\"risk\":\"low\",\"confidence\":9,\"auto_approve\":true}",
+        ),
+    );
+    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let assistant_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token,
+                "runs_create",
+                json!({
+                    "offer_id": "model:venice",
+                    "operation": "text.generate",
+                    "request_id": "request-venice-bad",
+                    "input": { "messages": [{ "role": "user", "content": "hello" }] }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "approval_required");
+    let (status, summary) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let body_text = summary["notifications"]["entries"][0]["body"]
+        .as_str()
+        .unwrap();
+    assert!(body_text.contains("Jev recommendation: unavailable"));
+    assert!(body_text.contains("Risk: unknown"));
+    assert!(body_text.contains("Confidence: 0"));
+    let request_id = crate::jev_approval_lens::hosted_http_request_id("model:venice").unwrap();
+    let record = crate::jev_approval_lens::load_record(dir.path(), &request_id).unwrap();
+    assert_eq!(record.recommendation.recommendation, "unavailable");
+    assert!(record.recommendation.needs_human_review);
+}
+
+#[tokio::test]
+async fn named_jev_provider_failure_still_opens_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:openrouter",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "sk-or-fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:venice",
+                "Venice",
+                "Venice",
+                "https://api.venice.ai/api/v1/chat/completions",
+                "sk-vnz-fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let provider = ScriptedModelProvider::default();
+    provider.replies.lock().await.insert(
+        "model:openrouter".to_string(),
+        json!({ "status": "error", "code": "provider_error", "message": "upstream timeout" }),
+    );
+    let app = gateway_router(scripted_model_state(dir.path(), provider).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let assistant_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token,
+                "runs_create",
+                json!({
+                    "offer_id": "model:venice",
+                    "operation": "text.generate",
+                    "request_id": "request-venice-fail",
+                    "input": { "messages": [{ "role": "user", "content": "hello" }] }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "approval_required");
+    let (status, summary) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let body_text = summary["notifications"]["entries"][0]["body"]
+        .as_str()
+        .unwrap();
+    assert!(body_text.contains("Jev recommendation: unavailable"));
+    assert!(body_text.contains("You remain the authority."));
+}
+
+#[tokio::test]
+async fn named_jev_retries_eval_after_unsigned_record_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:openrouter",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "sk-or-fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:venice",
+                "Venice",
+                "Venice",
+                "https://api.venice.ai/api/v1/chat/completions",
+                "sk-vnz-fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let provider = ScriptedModelProvider::default();
+    provider.replies.lock().await.insert(
+        "model:openrouter".to_string(),
+        typed_jev_reply(
+            "{\"recommendation\":\"approve\",\"reason\":\"Matches the named connection.\",\"risk\":\"low\",\"confidence\":80}",
+        ),
+    );
+    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let assistant_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let create = json!({
+        "offer_id": "model:venice",
+        "operation": "text.generate",
+        "request_id": "request-venice-retry",
+        "input": { "messages": [{ "role": "user", "content": "hello" }] }
+    });
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token.clone(),
+                "runs_create",
+                create.clone(),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], "approval_required");
+    let request_id = crate::jev_approval_lens::hosted_http_request_id("model:venice").unwrap();
+    let record_path = dir
+        .path()
+        .join("jev-approval-lens")
+        .join(format!("{}.json", request_id.replace(':', "_")));
+    std::fs::remove_file(&record_path).unwrap();
+    let (status, retry) = status_json(
+        app.oneshot(post_model(assistant_token, "runs_create", create))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["code"], "approval_required");
+    let requests = provider.requests.lock().await.clone();
+    let eval_ids: Vec<&str> = requests
+        .iter()
+        .filter(|request| request["offer_id"] == "model:openrouter")
+        .map(|request| request["runtime_binding"]["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(eval_ids.len(), 2, "{requests:?}");
+    assert_ne!(eval_ids[0], eval_ids[1], "{eval_ids:?}");
 }

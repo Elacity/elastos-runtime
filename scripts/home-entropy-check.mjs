@@ -1053,6 +1053,7 @@ assert(
 assert(
   systemJs.includes('"/api/apps/system/summary"') &&
     systemJs.includes('"/api/apps/system/appearance/preferences"') &&
+    systemJs.includes('"/api/apps/system/ai-provider"') &&
     systemJs.includes("createHomeClipboardClient") &&
     systemJs.includes('targetId: "system"') &&
     systemJs.includes('purpose: "identity.did"') &&
@@ -2625,11 +2626,12 @@ assert(
   "Home must allow Library picker results to return only to Archive, Browser and Chat Room",
 );
 assert(
-  shellJs.includes('assistant: new Set(["marketplace"])') &&
-    shellJs.includes('"home-agent": new Set(["marketplace"])') &&
+  shellJs.includes('assistant: new Set(["marketplace", "system"])') &&
+    shellJs.includes('"home-agent": new Set(["marketplace", "system"])') &&
     shellJs.includes("assistantModelsMarketplaceQuery") &&
+    shellJs.includes("assistantAiProviderSettingsQuery") &&
     shellJs.includes("marketplaceAssistantHandoffQuery"),
-  "Open Models must hand off through Marketplace with a bounded Assistant CID query",
+  "Open Models must hand off through Marketplace, and AI provider Settings through System, with bounded queries",
 );
 assert(
   shellJs.includes('marketplace: "runtime-target"') &&
@@ -2757,8 +2759,9 @@ assert(
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260819a") &&
-    servicesIndex.includes("services-20260711i") &&
+    servicesIndex.includes("services-20260921b") &&
+    servicesIndex.includes("./style.css?v=services-20260921b") &&
+    servicesIndex.includes("./services.js?v=services-20260921b") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
     servicesScript.includes("Browser Engine") &&
@@ -2770,6 +2773,12 @@ assert(
     servicesScript.includes('const EXIT_SERVICE_KIND = "remote_exit"') &&
     servicesScript.includes('const BROWSER_ENGINE_SERVICE_KIND = "browser_engine"') &&
     servicesScript.includes('const CONFIGURED_REMOTE_EXIT_SOURCE = "configured_remote_exit"') &&
+    servicesScript.includes('const HOSTED_SHARE_SOURCE = "hosted_connection"') &&
+    servicesScript.includes("HOSTED_SHARE_TERMS_BY_PROCESSOR") &&
+    servicesScript.includes("openrouter-5.1-5.2+model") &&
+    servicesScript.includes("venice-7.3+model") &&
+    servicesScript.includes("Hosted connections stay private until you enable Share") &&
+    !servicesScript.includes("hosted models stay private") &&
     servicesScript.includes("VISIBLE_SERVICE_KINDS") &&
     servicesScript.includes("visibleServiceOffers") &&
     servicesScript.includes("isReadOnlyServiceOffer") &&
@@ -2790,6 +2799,7 @@ assert(
     servicesStyle.includes(".settings-sidebar") &&
     servicesStyle.includes(".services-toolbar") &&
     servicesStyle.includes(".service-confirm") &&
+    servicesStyle.includes(".service-terms") &&
     servicesStyle.includes(".pc2-btn-danger") &&
     (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 4 &&
     (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
@@ -5097,6 +5107,25 @@ assert(
   "Marketplace must accept Models navigation and open a ready CID in Assistant",
 );
 assert(
+  marketplaceUi.includes('data-action="open-ai-provider-settings"') &&
+    marketplaceUi.includes("Open Settings") &&
+    !marketplaceUi.includes("OpenRouter") &&
+    read("capsules/assistant/browser/agent-harness.js").includes("Open Settings") &&
+    !read("capsules/assistant/browser/agent-harness.js").includes("OpenRouter"),
+  "Assistant and Marketplace AI-provider links must name Settings",
+);
+assert(
+  assistantIndex.includes('placeholder="Message Assistant"') &&
+    !assistantIndex.includes("Ask on this machine") &&
+    !assistantIndex.includes("agent-think-btn") &&
+    assistantIndex.includes("Show reasoning on replies") &&
+    assistantIndex.includes('aria-haspopup="listbox"') &&
+    (assistantIndex.match(/id="agent-model-picker"/g) || []).length === 1 &&
+    !read("capsules/assistant/browser/agent-harness.js").includes("cost unknown") &&
+    !read("capsules/assistant/browser/agent-shelf.js").includes("Ask on this machine"),
+  "Assistant composer must stay route-neutral with one model selector and no Think chip",
+);
+assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
     marketplaceUi.includes("function acceptedContentLabels(") &&
     marketplaceUi.includes("function executableActions(") &&
@@ -5473,7 +5502,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260819f";
+const systemAssetVersion = "system-20260921a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -5783,6 +5812,8 @@ assert(
     inbox.includes('entry.kind !== "inspect_action_request"') &&
     inbox.includes("wallet-price-http-approve:") &&
     inbox.includes("wallet-price-http-deny:") &&
+    inbox.includes("hosted-http-approve:") &&
+    inbox.includes("hosted-http-deny:") &&
     gatewayApi.includes("append_runtime_capability_notifications") &&
     gatewayApi.includes("/api/capability/pending") &&
     gatewayTests.includes(
@@ -6911,6 +6942,15 @@ assert(
     modelServiceRuntime.includes("fn remote_principal_id(") &&
     modelServiceRuntime.includes('local_object.remove("_runtime_invocation");') &&
     modelServiceRuntime.includes("fn shareable_offers(") &&
+    modelServiceRuntime.includes("fn shareable_offers_for_home(") &&
+    modelServiceRuntime.includes("fn shareable_listed_offers(") &&
+    modelServiceRuntime.includes("fn public_shared_offer(") &&
+    modelServiceRuntime.includes("crate::api::offer_is_shareable(offer)") &&
+    modelServiceRuntime.includes("shareable_offers_include_explicitly_shared_hosted") &&
+    gatewayApi.includes("/api/apps/system/ai-provider/share") &&
+    gatewayApi.includes("Hosted connections stay private until you enable Share") &&
+    gatewayHomeSystemTests.includes("test_system_ai_provider_share_guest_forbidden") &&
+    gatewayHomeSystemTests.includes("test_system_ai_provider_share_requires_terms_and_preserves_peer") &&
     modelServiceRuntime.includes("fn redact_provider_error(") &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
@@ -7487,6 +7527,37 @@ assert(
   system.includes(`style.css?v=${systemAssetVersion}`) &&
     system.includes(`system.js?v=${systemAssetVersion}`),
   "System browser assets must be cache-busted after UI changes",
+);
+assert(
+  system.includes('data-settings="models"') &&
+    system.includes('data-ai-provider') &&
+    system.includes("Hosted models") &&
+    system.includes("Add hosted model") &&
+    system.includes("This Home stores the key.") &&
+    system.includes("The selected processor receives prompts outside this Home.") &&
+    system.includes("This Home owns the system prompt for Venice.") &&
+    system.includes('id="ai-provider-name"') &&
+    system.includes('id="ai-provider-kind"') &&
+    system.includes("Hosted by") &&
+    system.includes('value="openrouter"') &&
+    system.includes('value="venice"') &&
+    system.includes('id="ai-provider-key"') &&
+    system.includes('type="password"') &&
+    system.includes('autocomplete="off"') &&
+    system.includes('id="ai-provider-validate"') &&
+    system.includes('id="ai-provider-save"') &&
+    system.includes(">Test<") &&
+    system.includes(">Save<") &&
+    !system.includes("Share OpenRouter") &&
+    !system.includes("Share Venice") &&
+    systemJs.includes('"/api/apps/system/ai-provider/validate"') &&
+    systemJs.includes("provider: selectedProvider()") &&
+    systemJs.includes("Use in Assistant") &&
+    systemJs.includes("Share as service") &&
+    systemJs.includes("Replace key") &&
+    systemJs.includes("Disconnect") &&
+    systemJs.includes("ElastosModelManagement.create"),
+  "System Models tab must host named hosted-model instances with a masked key",
 );
 assert(
   (systemJs.match(/function notifyHomeSummaryChanged\(/g) || []).length === 1,

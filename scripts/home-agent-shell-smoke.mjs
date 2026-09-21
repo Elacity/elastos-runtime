@@ -112,7 +112,7 @@ assert.ok(harnessHost.includes("mergeWorkspaceDocuments(lastSnapshot || {}, loca
 
 assert.equal(manifest.name, "assistant");
 const methods = manifest.interfaces.flatMap((i) => i.methods.map((m) => m.operation)).sort();
-assert.deepEqual(methods, ["offers_list", "retention", "runs_cancel", "runs_create", "runs_events", "runs_get"]);
+assert.deepEqual(methods, ["offers_list", "reclaim", "retention", "runs_cancel", "runs_create", "runs_events", "runs_get"]);
 assert.ok(components.external?.assistant, "components.json installs Assistant");
 assert.ok(!components.external?.["home-agent"], "the legacy app is retired from installation");
 assert.ok(
@@ -213,6 +213,13 @@ assert.ok(agentShelf.includes("export function leaveAgentRoom()") && agentShelf.
 /* Every way out of the room asks Home: the composer's Home chip, Esc, and the
    sidebar's Home row. */
 assert.ok(indexHtml.includes('id="agent-shelf-flip-back"'), "the composer keeps its Home chip");
+assert.ok(indexHtml.includes('placeholder="Message Assistant"'), "composer placeholder is route-neutral");
+assert.ok(!indexHtml.includes("Ask on this machine"), "composer must not claim this machine");
+assert.ok(!indexHtml.includes("agent-think-btn"), "composer has no Think chip");
+assert.ok(indexHtml.includes("Show reasoning on replies"), "reasoning disclosure stays in Prompt settings");
+assert.equal((indexHtml.match(/id="agent-model-picker"/g) || []).length, 1, "one composer model selector");
+assert.ok(indexHtml.includes('aria-haspopup="listbox"'), "the model trigger opens a listbox");
+assert.ok(!agentHarness.includes("cost unknown"), "composer trigger omits unknown cost");
 assert.ok(
   /closest\?\.\("#agent-shelf-flip-back"\)\)\s*\{\s*event\.preventDefault\(\);\s*leaveAgentRoom\(\);/.test(agentShelf),
   "the composer's Home chip asks Home to leave",
@@ -347,18 +354,21 @@ assert.deepEqual(rows, [
     offerId: "offer-a",
     operation: "text.generate",
     label: "Local chat",
-    detail: "Model offer · this Home",
+    detail: "This Home · local",
     streamOutput: true,
     selectionFacts: localFacts,
   },
 ]);
 assert.equal(localFacts.requestedModel, "Local chat");
-assert.equal(localFacts.resolvedModel, "unknown");
+assert.equal(localFacts.resolvedModel, "");
 assert.equal(localFacts.provider, "this Home");
 assert.equal(localFacts.execution, "this Home");
-assert.equal(localFacts.privacy, "unknown");
-assert.equal(localFacts.cost, "unknown");
-assert.equal(localFacts.fallback, "unknown");
+assert.equal(localFacts.privacy, "");
+assert.equal(localFacts.cost, "");
+assert.equal(localFacts.fallback, "");
+assert.equal(localFacts.routeSubtitle, "This Home · local");
+assert.equal(rows[0].detail, "This Home · local");
+assert.equal(localFacts.detailRows.find((row) => row.term === "Cost"), undefined);
 
 const hostedOffer = {
   id: "offer-hosted",
@@ -385,20 +395,35 @@ const hostedOffer = {
 };
 const hostedFacts = contract.offerSelectionFacts(hostedOffer);
 assert.equal(hostedFacts.requestedModel, "gpt-test");
-assert.equal(hostedFacts.resolvedModel, "unknown");
+assert.equal(hostedFacts.resolvedModel, "");
 assert.equal(hostedFacts.provider, "Fixture Provider");
 assert.equal(hostedFacts.privacy, "fixture:privacy:v1");
-assert.equal(hostedFacts.cost, "unknown");
+assert.equal(hostedFacts.cost, "");
 assert.equal(hostedFacts.fallback, "operator_asserted_disabled");
-assert.match(hostedFacts.limits, /concurrency 1/);
+assert.match(hostedFacts.limits, /1 run at a time/);
 assert.equal(hostedFacts.execution, "hosted via Fixture Provider");
+assert.equal(hostedFacts.routeSubtitle, "Fixture Provider · hosted");
+assert.equal(hostedFacts.payer, "this Home");
+assert.equal(hostedFacts.detailRows.find((row) => row.term === "Payer")?.value, "This Home");
+assert.equal(hostedFacts.detailRows.find((row) => row.term === "Processor")?.value, "Fixture Provider");
+assert.equal(hostedFacts.detailRows.find((row) => row.term === "Prompt destination")?.value, "Fixture Provider");
+assert.equal(hostedFacts.detailRows.find((row) => row.term === "Availability")?.value, "Hosted");
+assert.equal(hostedFacts.detailRows.find((row) => row.term === "Cost"), undefined);
 const hostedResolved = contract.offerSelectionFacts(hostedOffer, {
   resolved_model: { status: "reported", value: "gpt-test-resolved" },
   cost: { status: "reported", value: { value: "0.02", unit: "USD" } },
 });
 assert.equal(hostedResolved.resolvedModel, "gpt-test-resolved");
 assert.equal(hostedResolved.cost, "0.02 USD");
-assert.equal(contract.textOfferRows([hostedOffer])[0].detail, "Hosted · Fixture Provider");
+assert.equal(
+  hostedResolved.detailRows.find((row) => row.term === "Cost")?.value,
+  "0.02 USD",
+);
+assert.equal(
+  contract.offerSelectionFacts(hostedOffer, { cost: { status: "unknown" } }).cost,
+  "Not reported",
+);
+assert.equal(contract.textOfferRows([hostedOffer])[0].detail, "Fixture Provider · hosted");
 
 const remoteOffer = {
   id: "offer-remote",
@@ -411,21 +436,45 @@ const remoteOffer = {
 };
 const remoteFacts = contract.offerSelectionFacts(remoteOffer);
 assert.equal(remoteFacts.requestedModel, "qwen3-5-9b-q4-k-m-local");
-assert.equal(remoteFacts.resolvedModel, "unknown");
+assert.equal(remoteFacts.resolvedModel, "");
 assert.equal(remoteFacts.provider, "MA2 Mac guest's AI model");
 assert.equal(remoteFacts.execution, "via MA2 Mac guest's AI model");
-assert.equal(remoteFacts.privacy, "unknown");
-assert.equal(remoteFacts.cost, "unknown");
-assert.equal(remoteFacts.fallback, "unknown");
+assert.equal(remoteFacts.privacy, "");
+assert.equal(remoteFacts.cost, "");
+assert.equal(remoteFacts.fallback, "");
+assert.equal(remoteFacts.routeSubtitle, "via MA2 Mac guest's AI model");
 assert.equal(contract.offerRouteKind(remoteOffer), "remote");
+const remoteHostedOffer = {
+  id: "remote:grant:model:openrouter",
+  title: "OpenRouter",
+  operation: "text.generate",
+  input_modalities: ["text/plain"],
+  output_modalities: ["text/plain"],
+  stream_output: true,
+  hosted: {
+    placement: "hosted",
+    backend_provider_label: "OpenRouter",
+    requested_selector: "fixture/model",
+    payer: "this Home",
+    intermediary: "this Home",
+  },
+  remote_service: { display_name: "Owner Home", grant_id: "grant-hosted" },
+};
+const remoteHostedFacts = contract.offerSelectionFacts(remoteHostedOffer);
+assert.equal(contract.offerRouteKind(remoteHostedOffer), "remote_hosted");
+assert.equal(remoteHostedFacts.intermediary, "Owner Home");
+assert.equal(remoteHostedFacts.processor, "OpenRouter");
+assert.equal(remoteHostedFacts.payer, "this Home");
+assert.equal(remoteHostedFacts.execution, "via Owner Home; OpenRouter; payer this Home");
+assert.equal(contract.textOfferRows([remoteHostedOffer])[0].detail, "via Owner Home");
 const remoteRows = contract.textOfferRows([remoteOffer, hostedOffer], {
   "offer-hosted": {
     resolved_model: { status: "reported", value: "stale-hosted" },
     cost: { status: "reported", value: "9 USD" },
   },
 });
-assert.equal(remoteRows[0].selectionFacts.resolvedModel, "unknown");
-assert.equal(remoteRows[0].selectionFacts.cost, "unknown");
+assert.equal(remoteRows[0].selectionFacts.resolvedModel, "");
+assert.equal(remoteRows[0].selectionFacts.cost, "");
 assert.equal(remoteRows[1].selectionFacts.resolvedModel, "stale-hosted");
 
 const messages = [

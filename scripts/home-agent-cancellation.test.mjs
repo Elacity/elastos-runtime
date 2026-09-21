@@ -61,12 +61,40 @@ test("content intent survives missing catalog and overlapping refresh; hosted re
   read = () => { newerStarted.resolve(); return newer.promise; };
   const fresh = live.probeLiveInference({ force: true });
   await newerStarted.promise;
-  assert.equal(live.selectedLiveOffer(), null);
+  assert.equal(live.selectedLiveOffer().offerId, "other");
   const shared = live.probeLiveInference();
   newer.resolve([other]);
   await Promise.all([fresh, shared]);
   assert.equal(live.selectedLiveOffer().offerId, "other");
   live.selectLiveOffer("");
+});
+
+test("an in-flight offers refresh keeps the current offer selectable", async t => {
+  t.after(() => live.selectLiveOffer(""));
+  const chosen = {
+    id: "chosen",
+    title: "Chosen",
+    operation: "text",
+    input_modalities: ["text/plain"],
+    output_modalities: ["text/plain"],
+  };
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ offers: [chosen] }) });
+  live.selectLiveOffer("chosen");
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.selectedLiveOffer().offerId, "chosen");
+  const pending = defer();
+  const started = defer();
+  globalThis.fetch = async () => {
+    started.resolve();
+    return { ok: true, json: async () => ({ offers: await pending.promise }) };
+  };
+  const refresh = live.probeLiveInference({ force: true });
+  await started.promise;
+  assert.equal(live.selectedLiveOffer().offerId, "chosen");
+  assert.equal(live.getLiveInferenceState().live, true);
+  pending.resolve([chosen]);
+  await refresh;
+  assert.equal(live.selectedLiveOffer().offerId, "chosen");
 });
 
 test("an unavailable chosen offer cannot become another model or cached readiness", async t => {
@@ -128,6 +156,20 @@ test("nested Agent Models intent registers top Home with exact origin and leaves
   window.location.href = "https://home.example/apps/home-agent/?home_origin=null";
   assert.equal(openModelsFromAgent(), false);
   assert.equal(messages.length, 2);
+  window.location.href = prior.href; window.top = prior.top;
+});
+
+test("nested Agent Settings intent opens System models with exact origin", async () => {
+  const { openAiProviderSettingsFromAgent } = await import("../capsules/assistant/browser/harness-host.js");
+  const prior = { href: window.location.href, top: window.top };
+  const messages = [];
+  window.top = { postMessage: (message, origin) => messages.push({ message, origin }) };
+  window.location.href = "https://home.example/apps/home-agent/?home_origin=https%3A%2F%2Fhome.example";
+  assert.equal(openAiProviderSettingsFromAgent(), true);
+  assert.deepEqual(messages, [
+    { origin: "https://home.example", message: { type: "home:app-ready", homeToken: "fixture" } },
+    { origin: "https://home.example", message: { type: "home:open-target", homeToken: "fixture", target: "system", query: { settings: "models" } } },
+  ]);
   window.location.href = prior.href; window.top = prior.top;
 });
 

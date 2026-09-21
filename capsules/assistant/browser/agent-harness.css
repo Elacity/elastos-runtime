@@ -1283,6 +1283,20 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   letter-spacing: 0.01em;
 }
 
+.agent-prompt-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: 0;
+}
+
+.agent-prompt-check input {
+  margin: 0;
+}
+
 .agent-prompt-textarea {
   width: 100%;
   min-height: 160px;
@@ -1484,39 +1498,6 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   font-weight: 520;
   letter-spacing: -0.01em;
   text-transform: none;
-}
-
-/* Think toggle — composer chip (same 32px row as Home / Ask / model). */
-.taskbar.is-agent-face .agent-think-btn {
-  box-sizing: border-box;
-  height: 32px;
-  min-height: 32px;
-  max-height: 32px;
-  margin: 0;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  color: color-mix(in srgb, var(--text) 72%, transparent);
-  font: inherit;
-  font-size: 13px;
-  font-weight: 560;
-  letter-spacing: -0.01em;
-  line-height: 1;
-  cursor: pointer;
-  align-self: center;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.taskbar.is-agent-face .agent-think-btn:hover {
-  background: color-mix(in srgb, var(--text) 12%, transparent);
-}
-
-.taskbar.is-agent-face .agent-think-btn[aria-pressed="true"] {
-  background: color-mix(in srgb, var(--accent, #f97316) 18%, transparent);
-  color: color-mix(in srgb, var(--text) 88%, transparent);
 }
 
 /* Follow-up queue — ChatGPT-style bumps stacked above the composer field.
@@ -2921,9 +2902,10 @@ html[data-agent-reasoning="off"] .agent-thinking {
   outline-offset: 2px;
 }
 
-/* Model on the right — ChatGPT "5.6 Sol Light ▾" role. */
+/* Model on the right — one user-chosen instance name. */
 .taskbar.is-agent-face .agent-model-btn {
-  max-width: min(200px, 36vw);
+  max-width: min(280px, 58vw);
+  min-width: 0;
   padding: 0 10px;
   color: color-mix(in srgb, var(--text) 78%, transparent);
   font-size: 13px;
@@ -2931,24 +2913,16 @@ html[data-agent-reasoning="off"] .agent-thinking {
 }
 
 .taskbar.is-agent-face .agent-model-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  transform: none;
-}
-
-.taskbar.is-agent-face .agent-model-tier {
-  display: block;
-  max-width: 220px;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11px;
-  font-weight: 500;
-  opacity: 0.72;
+  transform: none;
 }
 
-.taskbar.is-agent-face .agent-model-tier[hidden] {
-  display: none;
+.taskbar.is-agent-face .agent-model-tier,
+.agent-model-tier {
+  display: none !important;
 }
 
 .taskbar.is-agent-face .agent-model-chevron {
@@ -3410,12 +3384,15 @@ html[data-agent-reasoning="off"] .agent-thinking {
 }
 
 .agent-model-menu {
-  width: min(280px, calc(100vw - 24px));
+  width: min(360px, calc(100vw - 24px));
 }
 
-/* Quick switcher is one-line rows — detail lives on the Models page. */
 .agent-model-menu .agent-model-option-desc {
-  display: none;
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-model-menu-add {
@@ -3471,8 +3448,14 @@ html[data-agent-reasoning="off"] .agent-thinking {
 }
 
 .agent-model-option:hover,
-.agent-model-option.is-active {
+.agent-model-option.is-active,
+.agent-model-option.is-keyboard {
   background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.agent-model-option.is-keyboard {
+  outline: 2px solid color-mix(in srgb, var(--text) 55%, transparent);
+  outline-offset: -2px;
 }
 
 .agent-model-option .agent-approve-option-check {
@@ -3498,9 +3481,21 @@ html[data-agent-reasoning="off"] .agent-thinking {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  container-type: inline-size;
+  container-name: model-option;
+}
+
+@container model-option (max-width: 160px) {
+  .agent-model-option-desc {
+    display: none;
+  }
 }
 
 .agent-model-option-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 620;
   line-height: 1.25;
@@ -3513,32 +3508,54 @@ html[data-agent-reasoning="off"] .agent-thinking {
   line-height: 1.35;
 }
 
+.agent-model-option-facts {
+  display: grid;
+  grid-template-columns: minmax(7em, auto) minmax(0, 1fr);
+  gap: 2px 10px;
+  margin: 6px 0 0;
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.agent-model-option-facts[hidden] {
+  display: none;
+}
+
+.agent-model-option-facts dt {
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+}
+
+.agent-model-option-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .agent-model-btn {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   height: 28px;
   padding: 0 6px;
-  max-width: 200px;
+  max-width: min(280px, 58vw);
+  min-width: 0;
   font-size: 13px;
   line-height: 1;
 }
 
-.agent-model-name,
-.agent-model-tier {
+.agent-model-name {
   display: inline-block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   line-height: 1;
   transform: translateY(0.5px); /* optical center vs icons */
-}
-
-.agent-model-name {
   color: var(--text);
   font-weight: 550;
-}
-
-.agent-model-tier {
-  color: color-mix(in srgb, var(--text) 48%, transparent);
-  font-weight: 450;
 }
 
 .agent-model-chevron {

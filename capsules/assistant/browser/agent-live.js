@@ -177,8 +177,7 @@ export function liveOfferChoice() {
 }
 
 export function selectedLiveOffer() {
-  if (!liveState.live || liveState.checking) return null;
-  return currentChoice(liveState.models, liveState.catalogModels);
+  return currentChoice(liveState.models, liveState.catalogModels) || null;
 }
 
 /** Cached offers_list — model menu + Configure panel + probe share it. */
@@ -219,7 +218,6 @@ export async function probeLiveInference({ force = false } = {}) {
   }
   const epoch = ++probeEpoch;
   liveState.checking = true;
-  liveState.live = false;
   probePromise = (async () => {
     try {
       /* Reachability and offers in one call: the 0.7.1 model-provider contract
@@ -396,6 +394,8 @@ export async function modelRunCall(op, body = {}) {
     const error = new Error(data?.message || data?.code || `model ${op} failed (${res.status})`);
     error.code = data?.code || "model_error";
     error.status = res.status;
+    error.preDispatchRefusal =
+      data?.code === "approval_required" || data?.code === "approval_denied";
     throw error;
   }
   return data?.data ?? data;
