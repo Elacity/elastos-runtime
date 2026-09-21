@@ -2035,6 +2035,51 @@ assert(
   "Stages list the Agent room as a Space and only ask the face to open or close it: no harness, shelf morph, capsule import or workspace snapshot hook in Stages or Mission Control",
 );
 assert(
+  (() => {
+    const shellAssistantFace = read("capsules/home-gui/browser/shell-assistant-face.js");
+    const shellAssistantMark = read("capsules/home-gui/browser/shell-assistant-mark.js");
+    const toggleStart = homeGuiTemplateHtml.indexOf('id="assistant-toggle"');
+    const toggleEnd = homeGuiTemplateHtml.indexOf("</button>", toggleStart);
+    const toggleMarkup = toggleStart >= 0 ? homeGuiTemplateHtml.slice(toggleStart, toggleEnd) : "";
+    const orangeAt = toggleMarkup.indexOf('data-assistant-layer="orange"');
+    const glassAt = toggleMarkup.indexOf('data-assistant-layer="glass"');
+    return (
+      orangeAt >= 0 &&
+      glassAt > orangeAt &&
+      toggleMarkup.includes('class="taskbar-item-icon assistant-mark" data-tone="raster"') &&
+      ["glass", "orange"].every((layer) =>
+        [128, 256].every((size) =>
+          fileExists(`capsules/home-gui/browser/icons/assistant-mark/${layer}/icon-${size}.png`))) &&
+      shellAssistantFace.includes("bindAssistantMark(toggleEl(), {") &&
+      !shellAssistantFace.includes("mountGlyph") &&
+      !/addEventListener\("click"[^)]*toggleAssistantFace/.test(shellAssistantFace) &&
+      shellAssistantMark.includes("export const ASSISTANT_MARK_CONTACT_MS = 240;") &&
+      shellAssistantMark.includes("export const ASSISTANT_MARK_RETURN_MS = 170;") &&
+      shellAssistantMark.includes('const CONTACT_TRAVEL = "10.35%";') &&
+      !read("capsules/home-gui/browser/style.css").includes("assistant-mark-ghost") &&
+      !/setInterval|requestAnimationFrame|mouseenter|pointerenter|focusin/.test(shellAssistantMark) &&
+      shellAssistantMark.includes("prefersReducedMotion") &&
+      read("justfile").includes("node --test scripts/home-assistant-mark.test.mjs")
+    );
+  })(),
+  "The Assistant toggle wears Home's own two-layer mark (orange beneath glass) and its only motion is the click-driven contact — close, return to rest — played in full before the face opens (shell-assistant-mark.js): no capsule glyph, no idle or hover animation, reduced motion honored, unit test wired into verify",
+);
+assert(
+  (() => {
+    const shellAssistantFace = read("capsules/home-gui/browser/shell-assistant-face.js");
+    const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
+    return (
+      shellAssistantFace.split("deps.restoreDockFocus(toggleEl());").length === 3 &&
+      !/toggleEl\(\)\?\.focus\(/.test(shellAssistantFace) &&
+      shellSurface.includes("function restoreDockFocus(item) {") &&
+      shellSurface.includes("dockState.restoringFocus = true;") &&
+      shellSurface.includes("if (item && !dockState.restoringFocus) {") &&
+      /bindAssistantFace\(\{[^}]*restoreDockFocus,/s.test(shellSurface)
+    );
+  })(),
+  "Closing the Assistant face hands focus back to the toggle through the dock (restoreDockFocus), and that focus raises no dock label: the label answers only the person's own hover or keyboard arrival",
+);
+assert(
   !/fetch\(/.test(shellStages) &&
     !/fetch\(/.test(shellExpose) &&
     shellStages.includes("UI ≠ authority: Space switches never mint Capsule/Carrier grants."),
