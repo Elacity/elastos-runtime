@@ -298,6 +298,10 @@ The Runtime and private providers use it in the inactive source path, including
 the process-backed two-Runtime proof. Installed activation and external
 cryptographic review remain open; this contract alone is not production
 confidentiality evidence.
+[Protected-content crypto review](PROTECTED_CONTENT_CRYPTO_REVIEW.md) carries
+the reviewer-facing suite card: each primitive with its resolved crate version
+and parameters, the exact domain separation and AAD binding of every seal, and
+the committed golden vectors that pin them.
 
 ## Terminal result
 
@@ -317,6 +321,12 @@ is audit/result evidence, not a portable grant that can authorize another
 release.
 
 ## Threat model and fail-closed rules
+
+This section is a list of the inputs these contracts reject. The threat model
+proper — assets, principals, trust boundaries, and what a compromised viewer
+capsule, a compromised single custody node, a replayed release operation and a
+tampered staged file each can and cannot do, each with the test that pins it —
+is in [Protected-content crypto review](PROTECTED_CONTENT_CRYPTO_REVIEW.md).
 
 Tests reject wrong Wallet, attacker-signed victim address, wrong content,
 policy, evidence request, node set, threshold, Profile, session, action,

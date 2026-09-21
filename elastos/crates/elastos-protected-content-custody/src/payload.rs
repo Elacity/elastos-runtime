@@ -96,11 +96,7 @@ impl AuthenticatedChunkPayloadHeaderV1 {
     }
 
     fn chunk_count(&self) -> Result<u64, CustodyError> {
-        self.plaintext_bytes
-            .checked_add(u64::from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1 - 1))
-            .ok_or(CustodyError::InvalidPayload("chunk_count"))?
-            .checked_div(u64::from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1))
-            .ok_or(CustodyError::InvalidPayload("chunk_count"))
+        chunk_count_for_plaintext_bytes(self.plaintext_bytes)
     }
 
     fn encoded_len(&self) -> usize {
@@ -164,6 +160,41 @@ pub struct SealedPayloadMetadataV1 {
     header: AuthenticatedChunkPayloadHeaderV1,
     encrypted_content_identity: EncryptedContentIdentityV1,
     custody_envelope: CustodyEnvelopeV1,
+}
+
+/// Result of [`PayloadSealerV1::finish_unprovisioned`]: everything a caller
+/// needs to provision a custody envelope, without this crate committing to
+/// any particular provisioning entrypoint. [`PayloadSealerV1::finish`] is
+/// exactly this type immediately followed by [`crate::provision_custody_envelope`];
+/// a caller whose context only carries bare committee identities (not a
+/// fully verified `ValidatedCustodyCommitteeV1`) — such as a sandboxed
+/// protect-provider that only has what a Runtime-issued protection-session
+/// request declares — calls `finish_unprovisioned` and then
+/// [`crate::provision_custody_envelope_for_exact_nodes`] itself, mirroring
+/// how this crate's fMP4/CENC media protection path already works.
+///
+/// `content_key()` returns a reference, not an owned value:
+/// `ContentEncryptionKeyV1` is intentionally not `Clone`, and this type does
+/// not widen access to its raw bytes — callers get exactly the same
+/// reference-shaped access the media protection session already holds.
+pub struct UnprovisionedSealedPayloadV1 {
+    header: AuthenticatedChunkPayloadHeaderV1,
+    encrypted_content_identity: EncryptedContentIdentityV1,
+    content_key: ContentEncryptionKeyV1,
+}
+
+impl UnprovisionedSealedPayloadV1 {
+    pub const fn header(&self) -> &AuthenticatedChunkPayloadHeaderV1 {
+        &self.header
+    }
+
+    pub const fn encrypted_content_identity(&self) -> &EncryptedContentIdentityV1 {
+        &self.encrypted_content_identity
+    }
+
+    pub const fn content_key(&self) -> &ContentEncryptionKeyV1 {
+        &self.content_key
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,8 +266,36 @@ pub fn seal_payload_to_staging_writer_v1<R: Read, W: Write>(
         plaintext_bytes,
         plaintext,
         staging_ciphertext,
-        &context,
+        context,
         committee,
+    )
+}
+
+/// Reconstruct the content key for a non-media object session so a sandboxed
+/// decrypt provider can drive [`PayloadChunkDecrypterV1`] directly, one
+/// framed chunk at a time, instead of decrypting a whole staged file. Same
+/// reconstruction path as
+/// [`decrypt_payload_to_staging_writer_from_authenticated_operation_v1`]
+/// above; this crate's `reconstruct_content_key_from_authenticated_operation`
+/// is `pub(crate)`, so callers outside the crate (the sandboxed decrypt
+/// provider) need this public wrapper. No new cryptography.
+pub fn reconstruct_content_key_for_object_session(
+    operation: &AuthenticatedRuntimeReleaseOperationV1,
+    content_key_commitment: Digest32,
+    contributions: &[SignedNodeContributionV1],
+    terminal_receipt: &SignedTerminalReceiptV1,
+    expected_terminal_issuer: TerminalReceiptIssuerKey,
+    recipient_secret: &RecipientSecretKeyV1,
+    now: u64,
+) -> Result<ContentEncryptionKeyV1, CustodyError> {
+    crate::reconstruct_content_key_from_authenticated_operation(
+        operation,
+        content_key_commitment,
+        contributions,
+        terminal_receipt,
+        expected_terminal_issuer,
+        recipient_secret,
+        now,
     )
 }
 
@@ -269,35 +328,105 @@ pub fn decrypt_payload_to_staging_writer_from_authenticated_operation_v1<
     )
 }
 
-fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
-    content_type: &str,
-    plaintext_bytes: u64,
-    plaintext: &mut R,
-    staging_ciphertext: &mut W,
-    context: &PayloadSealContextV1,
-    committee: &ValidatedCustodyCommitteeV1,
-) -> Result<SealedPayloadMetadataV1, CustodyError> {
-    let header = AuthenticatedChunkPayloadHeaderV1::new_authenticated(
-        content_type,
-        plaintext_bytes,
-        context.base_nonce,
-        context.content_key.commitment(),
-    )?;
-    let header_bytes = header.encoded_bytes()?;
-    let prefix_bytes = header.framed_prefix_bytes()?;
-    let chunk_count = header.chunk_count()?;
+/// Streaming EPC1 sealer: the chunk loop of [`seal_payload_to_staging_writer_v1`]
+/// exposed as a stateful type so a sandboxed protect provider can seal one
+/// frame at a time instead of staging the whole plaintext through a single
+/// call. Same AAD (`domain ‖ header ‖ index`), nonce derivation, and identity
+/// computation as the one-shot path below, which now drives this type
+/// internally so there is exactly one sealing code path.
+pub struct PayloadSealerV1 {
+    header: AuthenticatedChunkPayloadHeaderV1,
+    header_bytes: Vec<u8>,
+    content_key: ContentEncryptionKeyV1,
+    next_index: u64,
+    hasher: Sha256,
+    framed_bytes: u64,
+}
 
-    let mut hasher = Sha256::new();
-    let mut written_bytes = 0u64;
+impl PayloadSealerV1 {
+    /// Open a sealer for a fresh, internally generated content key and base
+    /// nonce. Returns the sealer and the framed header prefix (magic, length,
+    /// and encoded header); the caller must emit that prefix before any chunk
+    /// returned by [`Self::seal_chunk`].
+    pub fn open(content_type: &str, plaintext_bytes: u64) -> Result<(Self, Vec<u8>), CustodyError> {
+        Self::open_with_context(
+            content_type,
+            plaintext_bytes,
+            ContentEncryptionKeyV1::generate()?,
+            random_base_nonce()?,
+        )
+    }
 
-    write_all_counted(
-        staging_ciphertext,
-        &prefix_bytes,
-        &mut hasher,
-        &mut written_bytes,
-    )?;
+    fn open_with_context(
+        content_type: &str,
+        plaintext_bytes: u64,
+        content_key: ContentEncryptionKeyV1,
+        base_nonce: [u8; PAYLOAD_BASE_NONCE_BYTES_V1],
+    ) -> Result<(Self, Vec<u8>), CustodyError> {
+        let header = AuthenticatedChunkPayloadHeaderV1::new_authenticated(
+            content_type,
+            plaintext_bytes,
+            base_nonce,
+            content_key.commitment(),
+        )?;
+        let header_bytes = header.encoded_bytes()?;
+        let framed_prefix = header.framed_prefix_bytes()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&framed_prefix);
+        let framed_bytes = u64::try_from(framed_prefix.len())
+            .map_err(|_| CustodyError::InvalidPayload("framed_ciphertext_bytes"))?;
+        Ok((
+            Self {
+                header,
+                header_bytes,
+                content_key,
+                next_index: 0,
+                hasher,
+                framed_bytes,
+            },
+            framed_prefix,
+        ))
+    }
 
-    {
+    /// Test-only hook so the streaming path can be driven with the same fixed
+    /// key and nonce as [`seal_with_context_for_tests`], to prove byte-for-byte
+    /// equivalence with the one-shot sealer.
+    #[cfg(test)]
+    pub fn open_with_context_for_tests(
+        content_type: &str,
+        plaintext_bytes: u64,
+        content_key: &ContentEncryptionKeyV1,
+        base_nonce: [u8; PAYLOAD_BASE_NONCE_BYTES_V1],
+    ) -> (Self, Vec<u8>) {
+        Self::open_with_context(
+            content_type,
+            plaintext_bytes,
+            ContentEncryptionKeyV1::from_test_bytes(content_key.with_bytes(|bytes| *bytes)),
+            base_nonce,
+        )
+        .expect("fixed test key and nonce must produce a valid header")
+    }
+
+    /// Seal one chunk. `chunk_index` must equal the number of chunks already
+    /// sealed (no gaps, no reordering, no replays), and `plaintext` must be
+    /// exactly [`PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1`] bytes, except for the
+    /// final chunk which may be shorter.
+    pub fn seal_chunk(
+        &mut self,
+        chunk_index: u32,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CustodyError> {
+        let chunk_index = u64::from(chunk_index);
+        if chunk_index != self.next_index {
+            return Err(CustodyError::InvalidPayload("chunk_index"));
+        }
+        let expected_len = chunk_plaintext_len(&self.header, chunk_index)?;
+        if plaintext.len() != expected_len {
+            return Err(CustodyError::InvalidPayload("payload_chunk"));
+        }
+        let nonce = derive_chunk_nonce(&self.header, chunk_index)?;
+        let aad = chunk_aad_bytes(&self.header_bytes, chunk_index);
+
         // Keep the expanded AEAD state inside the shortest possible scope.
         // This crate explicitly zeroizes CEK bytes and plaintext chunk buffers.
         // The enabled upstream `aes` zeroize support clears AES round keys
@@ -308,54 +437,234 @@ fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
         // keep the cipher lifetime as short as possible and report any stronger
         // whole-AEAD-state erasure claim as unsupported by the current audited
         // primitive stack.
-        let cipher = context.content_key.with_bytes(|bytes| {
+        let cipher = self.content_key.with_bytes(|bytes| {
             Aes256Gcm::new_from_slice(bytes)
                 .map_err(|_| CustodyError::InvalidPayload("content_key"))
         })?;
+        let encrypted_chunk = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CustodyError::InvalidPayload("payload_chunk"))?;
 
-        for chunk_index in 0..chunk_count {
-            let chunk_len = chunk_plaintext_len(&header, chunk_index)?;
-            let mut plaintext_chunk = Zeroizing::new(vec![0u8; chunk_len]);
-            read_exact_plaintext(plaintext, plaintext_chunk.as_mut_slice())?;
-            let nonce = derive_chunk_nonce(&header, chunk_index)?;
-            let aad = chunk_aad_bytes(&header_bytes, chunk_index);
-            let encrypted_chunk = cipher
-                .encrypt(
-                    Nonce::from_slice(&nonce),
-                    Payload {
-                        msg: plaintext_chunk.as_slice(),
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| CustodyError::InvalidPayload("payload_chunk"))?;
-            write_all_counted(
-                staging_ciphertext,
-                &encrypted_chunk,
-                &mut hasher,
-                &mut written_bytes,
-            )?;
+        self.framed_bytes = self
+            .framed_bytes
+            .checked_add(u64::try_from(encrypted_chunk.len()).unwrap())
+            .ok_or(CustodyError::InvalidPayload("framed_ciphertext_bytes"))?;
+        self.hasher.update(&encrypted_chunk);
+        self.next_index += 1;
+        Ok(encrypted_chunk)
+    }
+
+    /// Finish sealing without provisioning anything. Errors unless every
+    /// chunk declared by the header has been sealed (`next_index ==
+    /// chunk_count`) and the total framed byte count matches what the header
+    /// declares (`framed_bytes == expected_framed_bytes`) — the same two
+    /// completeness checks [`Self::finish`] enforces, so every caller of
+    /// either method inherits them. On success, returns the sealed header,
+    /// the [`EncryptedContentIdentityV1`] computed from the running hash, and
+    /// the [`crate::ContentEncryptionKeyV1`] the caller now owns and must
+    /// provision (via [`crate::provision_custody_envelope`],
+    /// [`crate::provision_custody_envelope_for_exact_nodes`], or discard on
+    /// its own error path — this method does not provision, so there is
+    /// nothing to undo if the caller decides not to).
+    pub fn finish_unprovisioned(self) -> Result<UnprovisionedSealedPayloadV1, CustodyError> {
+        let chunk_count = self.header.chunk_count()?;
+        if self.next_index != chunk_count {
+            return Err(CustodyError::InvalidPayload("chunk_count"));
         }
+        let expected_bytes = self.header.expected_framed_bytes()?;
+        if self.framed_bytes != expected_bytes {
+            return Err(CustodyError::InvalidPayload("framed_ciphertext_bytes"));
+        }
+        let encrypted_content_identity = EncryptedContentIdentityV1::new(
+            Digest32::new(self.hasher.finalize().into()),
+            self.framed_bytes,
+        )?;
+        Ok(UnprovisionedSealedPayloadV1 {
+            header: self.header,
+            encrypted_content_identity,
+            content_key: self.content_key,
+        })
+    }
+
+    /// Finish sealing and provision the custody envelope exactly like
+    /// [`seal_payload_to_staging_writer_v1`]. Errors, without provisioning
+    /// anything, unless every chunk declared by the header has been sealed.
+    /// This is [`Self::finish_unprovisioned`] immediately followed by
+    /// [`crate::provision_custody_envelope`] — the single place either
+    /// completeness check or the committee-based provisioning call lives, so
+    /// this and [`Self::finish_unprovisioned`] cannot drift apart.
+    pub fn finish(
+        self,
+        committee: &ValidatedCustodyCommitteeV1,
+    ) -> Result<SealedPayloadMetadataV1, CustodyError> {
+        let unprovisioned = self.finish_unprovisioned()?;
+        let custody_envelope = crate::provision_custody_envelope(
+            unprovisioned.encrypted_content_identity.clone(),
+            &unprovisioned.content_key,
+            committee,
+        )?;
+        Ok(SealedPayloadMetadataV1 {
+            header: unprovisioned.header,
+            encrypted_content_identity: unprovisioned.encrypted_content_identity,
+            custody_envelope,
+        })
+    }
+}
+
+/// Streaming EPC1 chunk decrypter: the per-chunk decryption body of
+/// [`decrypt_payload_to_staging_writer_with_content_key_v1`] exposed as a
+/// stateless-per-chunk type so a sandboxed decrypt provider can open one
+/// frame at a time. Same AAD, nonce derivation, and commitment check as the
+/// one-shot path below, which now drives this type internally.
+pub struct PayloadChunkDecrypterV1 {
+    header: AuthenticatedChunkPayloadHeaderV1,
+    header_bytes: Vec<u8>,
+    cipher: Aes256Gcm,
+}
+
+impl PayloadChunkDecrypterV1 {
+    /// Parse a framed header (the same magic + length + encoded header bytes
+    /// returned by [`PayloadSealerV1::open`]) and check it commits to
+    /// `content_key`.
+    pub fn new(
+        framed_header: &[u8],
+        content_key: &ContentEncryptionKeyV1,
+    ) -> Result<Self, CustodyError> {
+        let (header, header_bytes) = parse_framed_header_bytes(framed_header)?;
+        if !content_key.matches_commitment(header.content_key_commitment) {
+            return Err(CustodyError::ContentKeyCommitmentMismatch);
+        }
+        // See the scoping comment on `PayloadSealerV1::seal_chunk`: the
+        // cipher, not the content key, is what this type retains for its
+        // lifetime.
+        let cipher = content_key.with_bytes(|bytes| {
+            Aes256Gcm::new_from_slice(bytes)
+                .map_err(|_| CustodyError::InvalidPayload("content_key"))
+        })?;
+        Ok(Self {
+            header,
+            header_bytes,
+            cipher,
+        })
+    }
+
+    pub const fn header(&self) -> &AuthenticatedChunkPayloadHeaderV1 {
+        &self.header
+    }
+
+    /// Decrypt one framed chunk (ciphertext + AEAD tag). `framed_chunk` must
+    /// be exactly the framed length for `chunk_index`; a chunk sealed under a
+    /// different index (reordered or spliced) fails AAD verification here.
+    ///
+    /// Returns `Zeroizing<Vec<u8>>`, not a bare `Vec<u8>`: this crate's
+    /// zeroization discipline for plaintext chunk buffers (see the scoping
+    /// comment on [`PayloadSealerV1::seal_chunk`]) extends to whoever calls
+    /// this method — including the sandboxed decrypt provider, which is
+    /// exactly where decrypted content lives longest. `Zeroizing<Vec<u8>>`
+    /// derefs to `[u8]`, so this is source-compatible with plain `Vec<u8>`
+    /// use at the call site.
+    pub fn decrypt_chunk(
+        &self,
+        chunk_index: u32,
+        framed_chunk: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, CustodyError> {
+        let chunk_index = u64::from(chunk_index);
+        let expected_len = chunk_ciphertext_len(&self.header, chunk_index)?;
+        if framed_chunk.len() != expected_len {
+            return Err(CustodyError::InvalidPayload("framed_ciphertext_bytes"));
+        }
+        let nonce = derive_chunk_nonce(&self.header, chunk_index)?;
+        let aad = chunk_aad_bytes(&self.header_bytes, chunk_index);
+        self.cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: framed_chunk,
+                    aad: &aad,
+                },
+            )
+            .map(Zeroizing::new)
+            .map_err(|_| CustodyError::InvalidPayload("payload_chunk"))
+    }
+}
+
+/// Byte ranges of each framed chunk inside a sealed object, given the framed
+/// header length and the plaintext size — the same inputs carried by
+/// `elastos-protected-content-provider-contracts`'
+/// `ChunkedPayloadObjectIdentityV1`. Ranges are contiguous, starting at
+/// `framed_header_bytes` and ending at the total framed file length, so a
+/// provider can read/seek each chunk directly without re-deriving the framing
+/// arithmetic.
+///
+/// This function validates nothing about its inputs and never panics or
+/// allocates proportionally to `plaintext_bytes`: it is a lazy iterator over
+/// up to `chunk_count_for_plaintext_bytes(plaintext_bytes)` items (which, at
+/// this crate's own `MAX_ENCRYPTED_CONTENT_BYTES` header ceiling, can be over
+/// a billion), not a materialized `Vec`. An out-of-range or overflowing
+/// `plaintext_bytes` degrades to a shorter iterator or to ranges saturated at
+/// `u64::MAX`, never to a panic; callers that need the strict guarantees
+/// `AuthenticatedChunkPayloadHeaderV1::new_authenticated` enforces (a
+/// `plaintext_bytes` that actually fits under the framed-size ceiling) must
+/// validate a header first, as `PayloadSealerV1`/`PayloadChunkDecrypterV1`
+/// already do.
+pub fn framed_chunk_ranges_v1(
+    framed_header_bytes: u32,
+    plaintext_bytes: u64,
+) -> impl Iterator<Item = std::ops::Range<u64>> {
+    let chunk_count = chunk_count_for_plaintext_bytes(plaintext_bytes).unwrap_or(0);
+    let mut cursor = u64::from(framed_header_bytes);
+    (0..chunk_count).map(move |chunk_index| {
+        let plaintext_len =
+            chunk_plaintext_len_for_plaintext_bytes(plaintext_bytes, chunk_index).unwrap_or(0);
+        let framed_len = u64::try_from(plaintext_len)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(PAYLOAD_TAG_BYTES_V1).unwrap());
+        let start = cursor;
+        cursor = cursor.saturating_add(framed_len);
+        start..cursor
+    })
+}
+
+fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
+    content_type: &str,
+    plaintext_bytes: u64,
+    plaintext: &mut R,
+    staging_ciphertext: &mut W,
+    context: PayloadSealContextV1,
+    committee: &ValidatedCustodyCommitteeV1,
+) -> Result<SealedPayloadMetadataV1, CustodyError> {
+    let (mut sealer, framed_prefix) = PayloadSealerV1::open_with_context(
+        content_type,
+        plaintext_bytes,
+        context.content_key,
+        context.base_nonce,
+    )?;
+    staging_ciphertext
+        .write_all(&framed_prefix)
+        .map_err(|_| CustodyError::PayloadIo)?;
+
+    let chunk_count = sealer.header.chunk_count()?;
+    for chunk_index in 0..chunk_count {
+        let chunk_len = chunk_plaintext_len(&sealer.header, chunk_index)?;
+        let mut plaintext_chunk = Zeroizing::new(vec![0u8; chunk_len]);
+        read_exact_plaintext(plaintext, plaintext_chunk.as_mut_slice())?;
+        let chunk_index =
+            u32::try_from(chunk_index).map_err(|_| CustodyError::InvalidPayload("chunk_index"))?;
+        let framed_chunk = sealer.seal_chunk(chunk_index, plaintext_chunk.as_slice())?;
+        staging_ciphertext
+            .write_all(&framed_chunk)
+            .map_err(|_| CustodyError::PayloadIo)?;
     }
 
     reject_trailing_plaintext(plaintext)?;
 
-    let expected_bytes = header.expected_framed_bytes()?;
-    if written_bytes != expected_bytes {
-        return Err(CustodyError::InvalidPayload("framed_ciphertext_bytes"));
-    }
-
-    let encrypted_content_identity =
-        EncryptedContentIdentityV1::new(Digest32::new(hasher.finalize().into()), written_bytes)?;
-    let custody_envelope = crate::provision_custody_envelope(
-        encrypted_content_identity.clone(),
-        &context.content_key,
-        committee,
-    )?;
-    Ok(SealedPayloadMetadataV1 {
-        header,
-        encrypted_content_identity,
-        custody_envelope,
-    })
+    sealer.finish(committee)
 }
 
 fn decrypt_payload_to_staging_writer_with_content_key_v1<R: Read + Seek, W: Write>(
@@ -368,30 +677,14 @@ fn decrypt_payload_to_staging_writer_with_content_key_v1<R: Read + Seek, W: Writ
         ciphertext_source,
         expected_encrypted_content_identity,
     )?;
-    if !content_key.matches_commitment(header.content_key_commitment) {
-        return Err(CustodyError::ContentKeyCommitmentMismatch);
-    }
-    let header_bytes = header.encoded_bytes()?;
+    let framed_header = header.framed_prefix_bytes()?;
+    let decrypter = PayloadChunkDecrypterV1::new(&framed_header, content_key)?;
     let chunk_count = header.chunk_count()?;
 
     seek_to_start(ciphertext_source)?;
     ciphertext_source
         .seek(SeekFrom::Start(prefix_len))
         .map_err(|_| CustodyError::PayloadIo)?;
-
-    // Keep the expanded AEAD state inside the shortest possible scope.
-    // This crate explicitly zeroizes CEK bytes and plaintext chunk buffers.
-    // The enabled upstream `aes` zeroize support clears AES round keys
-    // where that dependency implements it. However, the composite
-    // `Aes256Gcm`/GHASH state does not expose a complete public
-    // zeroization contract across all backends; notably, the AArch64 PMULL
-    // POLYVAL path does not provide a full zeroizing `Drop`. We therefore
-    // keep the cipher lifetime as short as possible and report any stronger
-    // whole-AEAD-state erasure claim as unsupported by the current audited
-    // primitive stack.
-    let cipher = content_key.with_bytes(|bytes| {
-        Aes256Gcm::new_from_slice(bytes).map_err(|_| CustodyError::InvalidPayload("content_key"))
-    })?;
 
     for chunk_index in 0..chunk_count {
         let ciphertext_chunk_len = chunk_ciphertext_len(&header, chunk_index)?;
@@ -401,19 +694,9 @@ fn decrypt_payload_to_staging_writer_with_content_key_v1<R: Read + Seek, W: Writ
             &mut ciphertext_chunk,
             "framed_ciphertext_bytes",
         )?;
-        let nonce = derive_chunk_nonce(&header, chunk_index)?;
-        let aad = chunk_aad_bytes(&header_bytes, chunk_index);
-        let plaintext_chunk = Zeroizing::new(
-            cipher
-                .decrypt(
-                    Nonce::from_slice(&nonce),
-                    Payload {
-                        msg: &ciphertext_chunk,
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| CustodyError::InvalidPayload("payload_chunk"))?,
-        );
+        let chunk_index_u32 =
+            u32::try_from(chunk_index).map_err(|_| CustodyError::InvalidPayload("chunk_index"))?;
+        let plaintext_chunk = decrypter.decrypt_chunk(chunk_index_u32, &ciphertext_chunk)?;
         plaintext_staging
             .write_all(plaintext_chunk.as_slice())
             .map_err(|_| CustodyError::PayloadIo)?;
@@ -462,23 +745,43 @@ fn chunk_aad_bytes(header_bytes: &[u8], chunk_index: u64) -> Vec<u8> {
     aad
 }
 
-fn chunk_plaintext_len(
-    header: &AuthenticatedChunkPayloadHeaderV1,
+/// Number of chunks a plaintext object of this size is framed into. Standalone
+/// (not `AuthenticatedChunkPayloadHeaderV1`-bound) so it can back both the
+/// header's own [`AuthenticatedChunkPayloadHeaderV1::chunk_count`] and
+/// [`framed_chunk_ranges_v1`], which only ever sees `plaintext_bytes`.
+fn chunk_count_for_plaintext_bytes(plaintext_bytes: u64) -> Result<u64, CustodyError> {
+    plaintext_bytes
+        .checked_add(u64::from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1 - 1))
+        .ok_or(CustodyError::InvalidPayload("chunk_count"))?
+        .checked_div(u64::from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1))
+        .ok_or(CustodyError::InvalidPayload("chunk_count"))
+}
+
+/// Plaintext byte length of one chunk, standalone over `plaintext_bytes` for
+/// the same reason as [`chunk_count_for_plaintext_bytes`].
+fn chunk_plaintext_len_for_plaintext_bytes(
+    plaintext_bytes: u64,
     chunk_index: u64,
 ) -> Result<usize, CustodyError> {
-    if chunk_index >= header.chunk_count()? {
+    if chunk_index >= chunk_count_for_plaintext_bytes(plaintext_bytes)? {
         return Err(CustodyError::InvalidPayload("chunk_index"));
     }
     let chunk_bytes = u64::from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1);
     let start = chunk_index
         .checked_mul(chunk_bytes)
         .ok_or(CustodyError::InvalidPayload("chunk_index"))?;
-    let remaining = header
-        .plaintext_bytes()
+    let remaining = plaintext_bytes
         .checked_sub(start)
         .ok_or(CustodyError::InvalidPayload("chunk_index"))?;
     usize::try_from(remaining.min(chunk_bytes))
         .map_err(|_| CustodyError::InvalidPayload("chunk_index"))
+}
+
+fn chunk_plaintext_len(
+    header: &AuthenticatedChunkPayloadHeaderV1,
+    chunk_index: u64,
+) -> Result<usize, CustodyError> {
+    chunk_plaintext_len_for_plaintext_bytes(header.plaintext_bytes(), chunk_index)
 }
 
 fn chunk_ciphertext_len(
@@ -562,22 +865,6 @@ fn read_fixed<const N: usize>(
         .map_err(|_| CustodyError::InvalidPayload(field))?;
     *offset = end;
     Ok(value)
-}
-
-fn write_all_counted(
-    writer: &mut impl Write,
-    bytes: &[u8],
-    hasher: &mut Sha256,
-    written_bytes: &mut u64,
-) -> Result<(), CustodyError> {
-    writer
-        .write_all(bytes)
-        .map_err(|_| CustodyError::PayloadIo)?;
-    hasher.update(bytes);
-    *written_bytes = written_bytes
-        .checked_add(u64::try_from(bytes.len()).unwrap())
-        .ok_or(CustodyError::InvalidPayload("framed_ciphertext_bytes"))?;
-    Ok(())
 }
 
 fn read_exact_plaintext(reader: &mut impl Read, buffer: &mut [u8]) -> Result<(), CustodyError> {
@@ -687,6 +974,32 @@ fn read_exact_payload_bytes(
     Ok(())
 }
 
+/// Parse an in-memory framed header (magic + length + encoded header, with no
+/// trailing bytes) as produced by [`AuthenticatedChunkPayloadHeaderV1::framed_prefix_bytes`]
+/// / returned by [`PayloadSealerV1::open`]. Returns the decoded header
+/// alongside the raw encoded-header bytes (not a re-encoding of them), so the
+/// AAD built from them is guaranteed to match whatever was actually framed.
+fn parse_framed_header_bytes(
+    framed_header: &[u8],
+) -> Result<(AuthenticatedChunkPayloadHeaderV1, Vec<u8>), CustodyError> {
+    let mut offset = 0usize;
+    let magic =
+        read_fixed::<{ PAYLOAD_MAGIC_V1.len() }>(framed_header, &mut offset, "payload_magic")?;
+    if magic != PAYLOAD_MAGIC_V1 {
+        return Err(CustodyError::InvalidPayload("payload_magic"));
+    }
+    let header_len = usize::from(read_u16(framed_header, &mut offset, "header_bytes")?);
+    let end = offset
+        .checked_add(header_len)
+        .ok_or(CustodyError::InvalidPayload("header_bytes"))?;
+    if end != framed_header.len() {
+        return Err(CustodyError::InvalidPayload("header_bytes"));
+    }
+    let header_bytes = framed_header[offset..end].to_vec();
+    let header = decode_header_bytes_v1(&header_bytes)?;
+    Ok((header, header_bytes))
+}
+
 fn decode_header_bytes_v1(bytes: &[u8]) -> Result<AuthenticatedChunkPayloadHeaderV1, CustodyError> {
     let mut offset = 0usize;
     let schema = read_len_prefixed(bytes, &mut offset, "schema")?;
@@ -748,7 +1061,7 @@ fn seal_payload_to_vec_with_test_material(
         u64::try_from(plaintext.len()).unwrap(),
         &mut reader,
         &mut framed,
-        &PayloadSealContextV1 {
+        PayloadSealContextV1 {
             content_key: ContentEncryptionKeyV1::from_test_bytes(
                 content_key.with_bytes(|bytes| *bytes),
             ),
@@ -757,6 +1070,22 @@ fn seal_payload_to_vec_with_test_material(
         &crate::test_support::validated_custody_committee(),
     )?;
     Ok((framed, metadata))
+}
+
+/// Test-only hook over the one-shot sealer with a fixed key and nonce,
+/// returning only the framed bytes, for direct comparison against
+/// [`PayloadSealerV1::open_with_context_for_tests`] plus
+/// [`PayloadSealerV1::seal_chunk`] output.
+#[cfg(test)]
+fn seal_with_context_for_tests(
+    content_type: &str,
+    plaintext: &[u8],
+    content_key: &ContentEncryptionKeyV1,
+    base_nonce: [u8; PAYLOAD_BASE_NONCE_BYTES_V1],
+) -> Vec<u8> {
+    seal_payload_to_vec_with_test_material(content_type, plaintext, content_key, base_nonce)
+        .expect("fixed test key and nonce must seal successfully")
+        .0
 }
 
 #[cfg(test)]
@@ -1856,7 +2185,7 @@ mod tests {
             4096,
             &mut reader,
             &mut writer,
-            &PayloadSealContextV1 {
+            PayloadSealContextV1 {
                 content_key,
                 base_nonce: [0x64; PAYLOAD_BASE_NONCE_BYTES_V1],
             },
@@ -2000,5 +2329,328 @@ mod tests {
             *slot = *base ^ *derived;
         }
         u64::from_be_bytes(index_bytes)
+    }
+
+    fn fixed_test_key_and_nonce() -> (ContentEncryptionKeyV1, [u8; PAYLOAD_BASE_NONCE_BYTES_V1]) {
+        (
+            ContentEncryptionKeyV1::from_test_bytes([0x59; 32]),
+            [0x5a; PAYLOAD_BASE_NONCE_BYTES_V1],
+        )
+    }
+
+    /// Non-constant, non-repeating filler so a chunk-boundary bug (an
+    /// off-by-one in a chunk length, or two chunks silently swapped) cannot
+    /// hide behind a payload where every byte, or every chunk, looks alike.
+    fn deterministic_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| {
+                let index = u64::try_from(index).unwrap();
+                (index.wrapping_mul(2_654_435_761).wrapping_add(index >> 13) & 0xff) as u8
+            })
+            .collect()
+    }
+
+    fn range_usize(range: &std::ops::Range<u64>) -> std::ops::Range<usize> {
+        usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()
+    }
+
+    #[test]
+    fn streaming_sealer_matches_one_shot_seal_byte_for_byte() {
+        let (key, nonce) = fixed_test_key_and_nonce();
+        let chunk_bytes = usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap();
+        let plaintext = deterministic_bytes(3 * chunk_bytes + 12345);
+
+        let one_shot = seal_with_context_for_tests("application/pdf", &plaintext, &key, nonce);
+
+        let (mut sealer, header) = PayloadSealerV1::open_with_context_for_tests(
+            "application/pdf",
+            u64::try_from(plaintext.len()).unwrap(),
+            &key,
+            nonce,
+        );
+        let mut framed = header;
+        for (index, chunk) in plaintext.chunks(chunk_bytes).enumerate() {
+            framed.extend(
+                sealer
+                    .seal_chunk(u32::try_from(index).unwrap(), chunk)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(framed, one_shot);
+    }
+
+    #[test]
+    fn chunk_decrypter_round_trips_and_rejects_reordered_chunks() {
+        let content_key = ContentEncryptionKeyV1::from_test_bytes([0x5b; 32]);
+        let chunk_bytes = usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap();
+        let plaintext = deterministic_bytes(chunk_bytes * 2 + 777);
+        let (framed, metadata) = seal_payload_to_vec_with_test_material(
+            "application/octet-stream",
+            &plaintext,
+            &content_key,
+            [0x5c; PAYLOAD_BASE_NONCE_BYTES_V1],
+        )
+        .unwrap();
+
+        let prefix_end = framed_prefix_end_for_tests(&framed);
+        let decrypter = PayloadChunkDecrypterV1::new(&framed[..prefix_end], &content_key).unwrap();
+        let ranges: Vec<_> = framed_chunk_ranges_v1(
+            u32::try_from(prefix_end).unwrap(),
+            metadata.header().plaintext_bytes(),
+        )
+        .collect();
+        assert_eq!(ranges.len(), 3);
+
+        let mut recovered = Vec::new();
+        for (index, range) in ranges.iter().enumerate() {
+            let plaintext_chunk = decrypter
+                .decrypt_chunk(u32::try_from(index).unwrap(), &framed[range_usize(range)])
+                .unwrap();
+            recovered.extend_from_slice(&plaintext_chunk);
+        }
+        assert_eq!(recovered, plaintext);
+
+        // Swap chunk 0 and chunk 1 in the framed buffer, then decrypt each at
+        // its original index: the chunk index is bound into the AAD, so a
+        // chunk sealed under a different index must fail authentication
+        // rather than silently decrypt into the wrong position.
+        let mut reordered = framed.clone();
+        let first = framed[range_usize(&ranges[0])].to_vec();
+        let second = framed[range_usize(&ranges[1])].to_vec();
+        reordered[range_usize(&ranges[0])].copy_from_slice(&second);
+        reordered[range_usize(&ranges[1])].copy_from_slice(&first);
+
+        assert!(decrypter
+            .decrypt_chunk(0, &reordered[range_usize(&ranges[0])])
+            .is_err());
+        assert!(decrypter
+            .decrypt_chunk(1, &reordered[range_usize(&ranges[1])])
+            .is_err());
+    }
+
+    #[test]
+    fn framed_chunk_ranges_cover_the_sealed_file_exactly() {
+        let content_key = ContentEncryptionKeyV1::from_test_bytes([0x5d; 32]);
+        let chunk_bytes = usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap();
+        let plaintext = deterministic_bytes(chunk_bytes * 2 + 501);
+        let (framed, metadata) = seal_payload_to_vec_with_test_material(
+            "application/octet-stream",
+            &plaintext,
+            &content_key,
+            [0x5e; PAYLOAD_BASE_NONCE_BYTES_V1],
+        )
+        .unwrap();
+        let prefix_end = framed_prefix_end_for_tests(&framed);
+
+        let ranges: Vec<_> = framed_chunk_ranges_v1(
+            u32::try_from(prefix_end).unwrap(),
+            metadata.header().plaintext_bytes(),
+        )
+        .collect();
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(
+            ranges.first().unwrap().start,
+            u64::try_from(prefix_end).unwrap()
+        );
+        assert_eq!(
+            ranges.last().unwrap().end,
+            u64::try_from(framed.len()).unwrap()
+        );
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "ranges must be contiguous");
+        }
+        for range in &ranges {
+            assert!(range.start < range.end);
+        }
+    }
+
+    #[test]
+    fn sealer_finish_requires_every_chunk() {
+        let chunk_bytes = usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap();
+        let (mut sealer, _header) = PayloadSealerV1::open(
+            "application/octet-stream",
+            u64::try_from(chunk_bytes * 2).unwrap(),
+        )
+        .unwrap();
+        sealer.seal_chunk(0, &vec![0x22; chunk_bytes]).unwrap();
+
+        let err = sealer
+            .finish(&crate::test_support::validated_custody_committee())
+            .unwrap_err();
+        assert!(matches!(err, CustodyError::InvalidPayload("chunk_count")));
+    }
+
+    #[test]
+    fn seal_chunk_rejects_out_of_order_duplicate_and_wrong_length_chunks() {
+        let chunk_bytes = usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap();
+        let (mut sealer, _header) = PayloadSealerV1::open(
+            "application/octet-stream",
+            u64::try_from(chunk_bytes * 3).unwrap(),
+        )
+        .unwrap();
+
+        // Out of order: index 1 before index 0 has ever been sealed.
+        assert!(matches!(
+            sealer.seal_chunk(1, &vec![0x11; chunk_bytes]),
+            Err(CustodyError::InvalidPayload("chunk_index"))
+        ));
+
+        // Wrong length for a non-final chunk.
+        assert!(matches!(
+            sealer.seal_chunk(0, &vec![0x11; chunk_bytes - 1]),
+            Err(CustodyError::InvalidPayload("payload_chunk"))
+        ));
+
+        sealer.seal_chunk(0, &vec![0x11; chunk_bytes]).unwrap();
+
+        // Duplicate / replayed index: index 0 again after it already advanced
+        // `next_index` to 1.
+        assert!(matches!(
+            sealer.seal_chunk(0, &vec![0x11; chunk_bytes]),
+            Err(CustodyError::InvalidPayload("chunk_index"))
+        ));
+    }
+
+    #[test]
+    fn chunk_decrypter_new_rejects_trailing_bytes_after_framed_header() {
+        let content_key = ContentEncryptionKeyV1::from_test_bytes([0x5f; 32]);
+        let (framed, _metadata) = seal_payload_to_vec_with_test_material(
+            "application/octet-stream",
+            b"trailing bytes after the framed header must be rejected",
+            &content_key,
+            [0x60; PAYLOAD_BASE_NONCE_BYTES_V1],
+        )
+        .unwrap();
+        let prefix_end = framed_prefix_end_for_tests(&framed);
+
+        let mut framed_header_with_trailing_byte = framed[..prefix_end].to_vec();
+        framed_header_with_trailing_byte.push(0x00);
+
+        assert!(matches!(
+            PayloadChunkDecrypterV1::new(&framed_header_with_trailing_byte, &content_key),
+            Err(CustodyError::InvalidPayload("header_bytes"))
+        ));
+    }
+
+    #[test]
+    fn reconstruct_content_key_for_object_session_matches_direct_reconstruction() {
+        let fixture = authenticated_decrypt_fixture(b"object session content key".to_vec());
+        let content_key_commitment = fixture
+            .sealed
+            .custody_envelope()
+            .manifest()
+            .content_key_commitment();
+
+        let reconstructed = reconstruct_content_key_for_object_session(
+            &fixture.operation,
+            content_key_commitment,
+            &fixture.contributions,
+            &fixture.terminal,
+            fixture.terminal_issuer,
+            &fixture.recipient_secret,
+            crate::test_support::NOW + 8,
+        )
+        .unwrap();
+        assert!(reconstructed.matches_commitment(content_key_commitment));
+
+        // End-to-end: the reconstructed key must actually open the sealed
+        // object via the streaming decrypter, exactly like the one-shot
+        // authenticated decrypt path does internally with the same key.
+        let prefix_end = framed_prefix_end_for_tests(&fixture.framed);
+        let decrypter =
+            PayloadChunkDecrypterV1::new(&fixture.framed[..prefix_end], &reconstructed).unwrap();
+        let first_chunk_len = chunk_ciphertext_len(fixture.sealed.header(), 0).unwrap();
+        let plaintext_chunk = decrypter
+            .decrypt_chunk(0, &fixture.framed[prefix_end..prefix_end + first_chunk_len])
+            .unwrap();
+        assert_eq!(&plaintext_chunk[..], &fixture.plaintext[..]);
+    }
+
+    #[test]
+    fn framed_chunk_ranges_v1_is_lazy_for_a_huge_plaintext_size() {
+        // At this crate's own header ceiling (`MAX_ENCRYPTED_CONTENT_BYTES =
+        // 1 << 50`, enforced by `AuthenticatedChunkPayloadHeaderV1::validate`)
+        // `chunk_count_for_plaintext_bytes` returns roughly 1.07e9. Before
+        // this was made lazy, computing ranges for a plaintext this size
+        // eagerly allocated a `Vec` of that many `Range<u64>` (~17 GB) up
+        // front. Taking only the first few items must be fast and correct
+        // without ever materializing the rest.
+        let huge_plaintext_bytes = MAX_ENCRYPTED_CONTENT_BYTES;
+        let framed_header_bytes = 128u32;
+        let chunk_bytes = u64::from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1);
+        let framed_chunk_bytes = chunk_bytes + u64::try_from(PAYLOAD_TAG_BYTES_V1).unwrap();
+
+        let first_three: Vec<_> = framed_chunk_ranges_v1(framed_header_bytes, huge_plaintext_bytes)
+            .take(3)
+            .collect();
+
+        assert_eq!(first_three.len(), 3);
+        assert_eq!(
+            first_three[0],
+            u64::from(framed_header_bytes)..u64::from(framed_header_bytes) + framed_chunk_bytes
+        );
+        assert_eq!(first_three[1].start, first_three[0].end);
+        assert_eq!(
+            first_three[1].end - first_three[1].start,
+            framed_chunk_bytes
+        );
+        assert_eq!(first_three[2].start, first_three[1].end);
+        assert_eq!(
+            first_three[2].end - first_three[2].start,
+            framed_chunk_bytes
+        );
+
+        // `u64::MAX` overflows the chunk-count arithmetic
+        // (`plaintext_bytes + (chunk_bytes - 1)`); the function must degrade
+        // to an empty iterator rather than panicking or hanging.
+        let absurd_plaintext_bytes = u64::MAX;
+        let absurd_first: Vec<_> =
+            framed_chunk_ranges_v1(framed_header_bytes, absurd_plaintext_bytes)
+                .take(2)
+                .collect();
+        assert!(absurd_first.is_empty());
+    }
+
+    #[test]
+    fn max_object_framed_chunk_bytes_v1_covers_the_real_framed_chunk_len() {
+        // Task 8 defined `MAX_OBJECT_FRAMED_CHUNK_BYTES_V1` in the sibling
+        // `elastos-protected-content-provider-contracts` crate as
+        // `MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1 + 16 + 8` (AEAD tag + framing
+        // slack) and deferred verifying it against this crate's real framing,
+        // since that crate cannot see `payload.rs`'s constants. This crate
+        // depends on it, so the assertion belongs here (controller ruling
+        // R2). The only per-chunk overhead this file's framing adds is the
+        // AEAD tag (chunks are concatenated ciphertext blocks with no
+        // per-chunk length/magic of their own) — derived here from
+        // `PAYLOAD_TAG_BYTES_V1`, not copied as a literal.
+        assert_eq!(
+            elastos_protected_content_provider_contracts::MAX_OBJECT_PLAINTEXT_CHUNK_BYTES_V1,
+            usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap(),
+            "the two crates' plaintext-chunk-size constants must agree exactly"
+        );
+        let real_max_framed_chunk_bytes = usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1)
+            .unwrap()
+            .checked_add(PAYLOAD_TAG_BYTES_V1)
+            .unwrap();
+        assert!(
+            elastos_protected_content_provider_contracts::MAX_OBJECT_FRAMED_CHUNK_BYTES_V1
+                >= real_max_framed_chunk_bytes,
+            "MAX_OBJECT_FRAMED_CHUNK_BYTES_V1 must be large enough to hold the real \
+             plaintext-chunk-plus-AEAD-tag length this crate actually frames"
+        );
+        // Pin the deliberate slack itself (the object.rs comment's literal
+        // "+ 8") as a companion upper bound: without it, the lower bound
+        // above alone would let the contracts-side constant be inflated to
+        // any value and still pass, silently masking a real framing
+        // mismatch instead of catching one.
+        const DOCUMENTED_FRAMING_SLACK_BYTES: usize = 8;
+        assert_eq!(
+            elastos_protected_content_provider_contracts::MAX_OBJECT_FRAMED_CHUNK_BYTES_V1,
+            real_max_framed_chunk_bytes + DOCUMENTED_FRAMING_SLACK_BYTES,
+            "MAX_OBJECT_FRAMED_CHUNK_BYTES_V1 must be exactly the real per-chunk length plus \
+             the documented 8-byte framing slack, not an unbounded margin above it"
+        );
     }
 }

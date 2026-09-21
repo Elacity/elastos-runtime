@@ -155,8 +155,8 @@ pub(crate) use gateway_provider_proxy::runtime_custody_publish_creator_tail_for_
 use gateway_provider_proxy::*;
 pub(crate) use gateway_provider_proxy::{
     resolve_runtime_custody_creator_publish_binding, runtime_custody_buy_via_gateway,
-    runtime_custody_publish_via_gateway, ResolvedProtectedContentMintReceipt,
-    ResolvedProtectedContentVerifiedListing,
+    runtime_custody_publish_object_via_gateway, runtime_custody_publish_via_gateway,
+    ResolvedProtectedContentMintReceipt, ResolvedProtectedContentVerifiedListing,
 };
 use gateway_room::*;
 pub(crate) use gateway_room::{
@@ -222,6 +222,7 @@ const HOME_BROWSER_STATE_SCHEMA: &str = "elastos.home.browser-state/v1";
 const HOME_BROWSER_STATE_MAX_BYTES: usize = 64 * 1024;
 const DOCUMENTS_CAPSULE_ID: &str = "documents";
 const LIBRARY_CAPSULE_ID: &str = "library";
+const CREATOR_CAPSULE_ID: &str = "creator";
 const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
 const PEOPLE_CAPSULE_ID: &str = "people";

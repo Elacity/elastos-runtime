@@ -383,6 +383,65 @@ pub fn custody_envelope_for_media(seed: u8, base_time: u64) -> CustodyEnvelopeV1
     .unwrap()
 }
 
+/// Seal `chunks` as a real EPC1 object via the same
+/// `elastos-protected-content-custody` streaming sealer the protect-provider
+/// capsule drives, and provision a custody envelope for the exact content
+/// key the sealer generated — so, unlike [`custody_envelope_for_media`]
+/// above (whose fixture bytes are never actually encrypted under the
+/// envelope's key, since the media decrypt path's tests only assert box
+/// structure, not exact plaintext), the returned framed header/chunks and
+/// envelope are genuinely consistent: reconstructing the content key from
+/// this envelope's custody flow and feeding it to `PayloadChunkDecrypterV1`
+/// will decrypt these exact framed chunks back to `chunks` byte-for-byte.
+/// Returns `(framed_header, framed_chunks, object_identity, envelope)`.
+///
+/// This module is compiled twice — once as `tests/process.rs`'s `mod
+/// support`, once as `src/lib.rs`'s `#[path] mod support` for its own
+/// inline `#[cfg(test)]` module — and only the former calls this helper, so
+/// the latter compilation sees it as dead code.
+#[allow(dead_code)]
+pub fn object_components(
+    content_type: &str,
+    chunks: &[Vec<u8>],
+    base_time: u64,
+) -> (
+    Vec<u8>,
+    Vec<Vec<u8>>,
+    elastos_protected_content_provider_contracts::ChunkedPayloadObjectIdentityV1,
+    CustodyEnvelopeV1,
+) {
+    let plaintext_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+    let (mut sealer, framed_header) =
+        elastos_protected_content_custody::PayloadSealerV1::open(content_type, plaintext_bytes)
+            .unwrap();
+    let framed_chunks: Vec<Vec<u8>> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            sealer
+                .seal_chunk(u32::try_from(index).unwrap(), chunk)
+                .unwrap()
+        })
+        .collect();
+    let metadata = sealer
+        .finish(&validated_custody_committee(base_time))
+        .unwrap();
+    let object_identity =
+        elastos_protected_content_provider_contracts::ChunkedPayloadObjectIdentityV1::new(
+            metadata.encrypted_content_identity().clone(),
+            content_type,
+            plaintext_bytes,
+            u32::try_from(framed_header.len()).unwrap(),
+        )
+        .unwrap();
+    (
+        framed_header,
+        framed_chunks,
+        object_identity,
+        metadata.custody_envelope().clone(),
+    )
+}
+
 pub fn binding_for_envelope(envelope: &CustodyEnvelopeV1) -> ProtectedContentBindingV1 {
     let policy = policy_body();
     ProtectedContentBindingV1::new(

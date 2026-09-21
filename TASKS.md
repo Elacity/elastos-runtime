@@ -107,6 +107,41 @@ Open gates, in order:
 The operator-owned model-provider configuration remains a separate installed
 Assistant proof item. Missing configuration is an honest zero-offer state.
 
+### Protected-content 0.7.1 follow-up (#42, #48, #49)
+
+The #49 cleanups, the #42 product surface (Creator app, protection on any file
+the Runtime accepts, the non-media object path end to end, the Elacity Reader
+viewer, session binding on the verified executable actor, audio as a
+first-class media rendition, and the CENC `pssh` header) and the #48 crypto
+review package are landed in source and recorded under Unreleased in
+[elastos/CHANGELOG.md](elastos/CHANGELOG.md). Plan and per-task briefs:
+[2026-09-08 protected-content 0.7.1 follow-up](docs/audits/2026-09-08-protected-content-0.7.1-followup-plan.md).
+Contract: [Protected content](docs/PROTECTED_CONTENT.md). What is and is not
+proven is in [state.md](state.md).
+
+Open:
+
+- [ ] Prove the three journeys on an installed home with funded principals:
+  Creator to Library to Player, Creator to Marketplace to Reader, and audio
+  playback. None has ever been run. The deferred proofs from the object,
+  reader and audio work all collapse into this one item; `state.md` records
+  what to run and what to look for.
+- [ ] Give protected audio a thumbnail. The player already prefers an image
+  track, then a poster, then controls alone, but nothing in the Runtime
+  populates `thumbnail_uri`, so protected audio always lands on the
+  controls-only frame. Needs a Runtime source for the poster — extracted cover
+  art, or a creator-supplied image — before the player's precedence can show.
+- [ ] Carry the media-integrity constraint into any frontend-only client.
+  CENC sample encryption is AES-128-CTR with no per-sample authentication tag,
+  which is inherent to the standard; tamper-evidence is the staged segment's
+  hash check, not the cipher. A client that fetches segments over a network
+  instead of reading Runtime-staged bytes must carry that check itself.
+  [Protected-content crypto review](docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md)
+  documents it.
+- [ ] External cryptographic review itself remains open before any public dKMS
+  or production confidentiality claim. The #48 package is the input to that
+  review, not a substitute for it.
+
 ### Home audit follow-up
 
 - [ ] Diagnose and prove direct Desktop/Terminal switching on the installed

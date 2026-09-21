@@ -284,6 +284,21 @@ def run_smoke():
         ).is_file():
             raise AssertionError(f"missing Elacity Player icon asset {icon_file}")
 
+    reader_manifest = json.loads(
+        (ROOT / "capsules" / "elacity-reader" / "capsule.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if reader_manifest.get("name") != "elacity-reader":
+        raise AssertionError("Elacity Reader manifest name drifted")
+    if reader_manifest.get("icon") != "browser/icons":
+        raise AssertionError("Elacity Reader must keep capsule-owned icons")
+    for icon_file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"]:
+        if not (
+            ROOT / "capsules" / "elacity-reader" / "browser" / "icons" / icon_file
+        ).is_file():
+            raise AssertionError(f"missing Elacity Reader icon asset {icon_file}")
+
     source_components = json.loads((ROOT / "components.json").read_text(encoding="utf-8"))
     if (
         source_components["external"]["elacity-player"]["install_path"]
@@ -292,9 +307,18 @@ def run_smoke():
         raise AssertionError(
             "components.json must install Elacity Player from its capsule tree"
         )
+    if (
+        source_components["external"]["elacity-reader"]["install_path"]
+        != "capsules/elacity-reader"
+    ):
+        raise AssertionError(
+            "components.json must install Elacity Reader from its capsule tree"
+        )
     for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"]:
         if "elacity-player" not in source_components["profiles"][profile]["components"]:
             raise AssertionError(f"profile {profile} must include Elacity Player")
+        if "elacity-reader" not in source_components["profiles"][profile]["components"]:
+            raise AssertionError(f"profile {profile} must include Elacity Reader")
 
     with tempfile.TemporaryDirectory() as temp:
         temp_root = Path(temp)

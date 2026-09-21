@@ -1,0 +1,29 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "creator",
+  "version": "0.1.0",
+  "description": "Protect a file and list it for sale in one flow",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "author": "elastos",
+  "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
+  "interfaces": [
+    {
+      "id": "elastos.creator.protect",
+      "version": "0.1.0",
+      "description": "Upload a file into Library, protect it, and list copies at a price",
+      "methods": [
+        { "id": "library.roots", "description": "Find the Library folder to upload into.", "risk": "read", "approval": "runtime_policy", "audit": "summary", "resource": "elastos://object/*", "operation": "roots" },
+        { "id": "library.stat", "description": "Confirm the uploaded file before protecting it.", "risk": "read", "approval": "runtime_policy", "audit": "summary", "resource": "elastos://object/*", "operation": "stat" },
+        { "id": "content.protect_and_list", "description": "Protect the uploaded file and list copies at a price.", "risk": "write", "approval": "user", "audit": "full", "resource": "elastos://object/*", "operation": "publish" }
+      ]
+    }
+  ],
+  "requires": [{ "name": "object-provider", "kind": "capsule" }],
+  "resources": { "memory_mb": 32, "gpu": false }
+}
