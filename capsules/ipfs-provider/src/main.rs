@@ -1499,23 +1499,54 @@ impl IpfsProvider {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("ELASTOS_DATA_DIR") {
-        PathBuf::from(dir)
-    } else if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("elastos")
-    } else if let Some(home) = std::env::var_os("HOME") {
+struct DataDirChoice<'a> {
+    explicit: Option<&'a str>,
+    parent_content_repo: Option<&'a Path>,
+    xdg_data_home: Option<&'a str>,
+    home: Option<&'a Path>,
+}
+
+fn select_data_dir(choice: DataDirChoice<'_>) -> PathBuf {
+    if let Some(dir) = choice.explicit.map(str::trim).filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(parent) = choice.parent_content_repo {
+        if parent.is_absolute() && parent.join("ipfs-repo").join("config").is_file() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(dir) = choice
+        .xdg_data_home
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    {
+        return PathBuf::from(dir).join("elastos");
+    }
+    if let Some(home) = choice.home {
         #[cfg(target_os = "macos")]
         {
-            PathBuf::from(home).join("Library/Application Support/elastos")
+            return home.join("Library/Application Support/elastos");
         }
         #[cfg(not(target_os = "macos"))]
         {
-            PathBuf::from(home).join(".local/share/elastos")
+            return home.join(".local/share/elastos");
         }
-    } else {
-        PathBuf::from("/tmp/elastos")
     }
+    PathBuf::from("/tmp/elastos")
+}
+
+fn data_dir() -> PathBuf {
+    let explicit = std::env::var("ELASTOS_DATA_DIR").ok();
+    let parent = std::env::var("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR").ok();
+    let parent_path = parent.as_deref().map(Path::new);
+    let xdg = std::env::var("XDG_DATA_HOME").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    select_data_dir(DataDirChoice {
+        explicit: explicit.as_deref(),
+        parent_content_repo: parent_path,
+        xdg_data_home: xdg.as_deref(),
+        home: home.as_deref(),
+    })
 }
 
 fn now_unix_secs() -> u64 {
@@ -2893,15 +2924,18 @@ mod tests {
             headers
         });
         let mut provider = bounded_cat_fixture_provider(root.path(), port);
-        let response = provider.handle(parse_request(
-            &serde_json::json!({
-                "op": "cat_to_path",
-                "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
-                "path": "weights.gguf",
-                "dest": dest.to_string_lossy(),
-            })
-            .to_string(),
-        ).unwrap());
+        let response = provider.handle(
+            parse_request(
+                &serde_json::json!({
+                    "op": "cat_to_path",
+                    "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                    "path": "weights.gguf",
+                    "dest": dest.to_string_lossy(),
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
         let headers = backend.join().unwrap();
         assert!(matches!(response, Response::Ok { .. }), "{response:?}");
         assert!(headers.starts_with("POST /api/v0/cat?"));
@@ -2919,6 +2953,53 @@ mod tests {
         assert_eq!(written, data.len() as u64);
         assert_eq!(std::fs::read(&dest).unwrap(), data);
         assert!(!dest.with_extension("bin.part").exists());
+    }
+
+    #[test]
+    fn managed_home_content_attaches_to_existing_parent_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("gateway");
+        let child = root.path().join("child-xdg");
+        std::fs::create_dir_all(parent.join("ipfs-repo")).unwrap();
+        std::fs::write(parent.join("ipfs-repo").join("config"), b"{}\n").unwrap();
+        let selected = select_data_dir(DataDirChoice {
+            explicit: None,
+            parent_content_repo: Some(&parent),
+            xdg_data_home: Some(child.to_str().unwrap()),
+            home: Some(root.path()),
+        });
+        assert_eq!(selected, parent);
+    }
+
+    #[test]
+    fn explicit_data_dir_overrides_parent_content_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("gateway");
+        let explicit = root.path().join("explicit");
+        std::fs::create_dir_all(parent.join("ipfs-repo")).unwrap();
+        std::fs::write(parent.join("ipfs-repo").join("config"), b"{}\n").unwrap();
+        let selected = select_data_dir(DataDirChoice {
+            explicit: Some(explicit.to_str().unwrap()),
+            parent_content_repo: Some(&parent),
+            xdg_data_home: Some(root.path().join("xdg").to_str().unwrap()),
+            home: Some(root.path()),
+        });
+        assert_eq!(selected, explicit);
+    }
+
+    #[test]
+    fn absent_parent_repo_keeps_the_child_data_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("gateway");
+        let child = root.path().join("child-xdg");
+        std::fs::create_dir_all(&parent).unwrap();
+        let selected = select_data_dir(DataDirChoice {
+            explicit: None,
+            parent_content_repo: Some(&parent),
+            xdg_data_home: Some(child.to_str().unwrap()),
+            home: Some(root.path()),
+        });
+        assert_eq!(selected, child.join("elastos"));
     }
 
     #[test]
