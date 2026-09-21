@@ -346,6 +346,14 @@ struct SystemBackgroundOverlayRequest {
     opacity: f64,
 }
 
+/// Sets the wallpaper from an object the caller already owns; the Runtime
+/// reads the bytes itself so they never traverse a capsule.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeBackgroundImageSourceRequest {
+    source_uri: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HomeAppearancePreferencesUpdate {

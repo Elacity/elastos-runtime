@@ -6838,13 +6838,96 @@ fn parse_background_image_upload(
         "image/gif" => "background-image.gif",
         _ => anyhow::bail!("background image must be PNG, JPEG, WebP, or GIF"),
     };
-    if body.is_empty() {
-        anyhow::bail!("background image is empty");
-    }
-    if body.len() > HOME_BACKGROUND_IMAGE_MAX_BYTES {
-        anyhow::bail!("background image is larger than 5 MB");
-    }
+    validate_background_image_len(body.len())?;
     Ok((file_name, body.to_vec()))
+}
+
+// Typed so the Home route answers 400; the System route matches on the text.
+fn validate_background_image_len(len: usize) -> anyhow::Result<()> {
+    if len == 0 {
+        return Err(home_appearance_preference_request_error(
+            "background image is empty",
+        ));
+    }
+    if len > HOME_BACKGROUND_IMAGE_MAX_BYTES {
+        return Err(home_appearance_preference_request_error(
+            "background image is larger than 5 MB",
+        ));
+    }
+    Ok(())
+}
+
+/// A stored object carries no trusted content type, so the format is taken
+/// from the bytes themselves. Same four formats as the byte upload.
+fn background_image_file_name_for_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("background-image.png");
+    }
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        return Some("background-image.jpg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("background-image.gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("background-image.webp");
+    }
+    None
+}
+
+// Protected objects are stored as base64 envelopes, so the on-disk size is
+// bounded to roughly this multiple of the plaintext limit before reading.
+const HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES: u64 =
+    (HOME_BACKGROUND_IMAGE_MAX_BYTES as u64) * 2;
+
+fn home_save_background_image_from_object(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    source_uri: &str,
+) -> anyhow::Result<HomeAppearanceSummary> {
+    let source_uri = source_uri.trim();
+    if source_uri.is_empty() || source_uri.len() > 2048 || !source_uri.starts_with("localhost://") {
+        return Err(home_appearance_preference_request_error(
+            "background image source must be a localhost:// object",
+        ));
+    }
+    let localhost_root = home_browser_localhost_root(context);
+    let under_root = source_uri
+        .strip_prefix(localhost_root.as_str())
+        .is_some_and(|rest| rest.starts_with('/'));
+    if !under_root {
+        return Err(home_appearance_preference_request_error(
+            "background image source must be one of your own objects",
+        ));
+    }
+    let path = rooted_localhost_fs_path(data_dir, source_uri).ok_or_else(|| {
+        home_appearance_preference_request_error("background image source path is invalid")
+    })?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        home_appearance_preference_request_error("background image source was not found")
+    })?;
+    if !metadata.is_file() {
+        return Err(home_appearance_preference_request_error(
+            "background image source must be a file",
+        ));
+    }
+    if metadata.len() > HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES {
+        return Err(home_appearance_preference_request_error(
+            "background image is larger than 5 MB",
+        ));
+    }
+    let bytes = crate::auth::read_principal_root_object(
+        data_dir,
+        &home_browser_principal_id(context),
+        &localhost_root,
+        source_uri,
+        &path,
+    )?;
+    validate_background_image_len(bytes.len())?;
+    let file_name = background_image_file_name_for_bytes(&bytes).ok_or_else(|| {
+        home_appearance_preference_request_error("background image must be PNG, JPEG, WebP, or GIF")
+    })?;
+    home_save_background_image(data_dir, context, file_name, bytes)
 }
 
 fn update_profile_for_context(
@@ -6966,6 +7049,24 @@ pub(super) async fn system_background_overlay_update(
     match home_save_background_overlay(&state.data_dir, &context, req.enabled, req.opacity) {
         Ok(summary) => Json(summary).into_response(),
         Err(err) => system_error_response(err),
+    }
+}
+
+/// Home arbitrates "set as desktop background" intents from apps and holds the
+/// same appearance authority as the preferences update; the app that asked
+/// never gains one. The source object must already belong to the caller.
+pub(super) async fn home_background_image_set_from_object(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<HomeBackgroundImageSourceRequest>,
+) -> Response {
+    let context = match require_home_active_shell_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    match home_save_background_image_from_object(&state.data_dir, &context, &req.source_uri) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => home_error_response(err),
     }
 }
 
