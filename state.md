@@ -210,12 +210,33 @@ Content repo. The managed Home runtime attaches to that repo. One Kubo holds
 the repo lock. Its parent is the Content ipfs-provider. The signed CID stayed
 recursively pinned after the Kubo restart. Authenticated Content read 4096
 bytes and then 65536 bytes of `weights.gguf`. Both hashes matched the admitted
-file. Carrier availability read the same ranges. The holder ticket had two
-private addresses and zero relay addresses. Free space stayed above the 10
-percent floor. The managed child repo stayed 285,892 KiB. Holder 61700 still
-has no Kubo child. Full seed acquisition stays unstarted. Receipts
-`.audit/ma3-2-mac-holder-range-proof-receipt.json` and
-`.audit/ma3-2-mac-holder-64kib-range-receipt.json`. The local split through
+file. Carrier availability read the same ranges. The holder ticket has two
+private addresses and zero relay addresses. The seed has no on-link route to
+those addresses. A separate DirectOnly seed consumer, node `fc3c1262`, has two
+public addresses and zero relay addresses. The Mac Content runtime connected
+outbound to that ticket. The seed then read 4096 bytes in 0.601 s and 65536
+bytes in 1.038 s through ordinary Content and Carrier. Both hashes matched the
+admitted file. Availability policy was `carrier_provider_invoke`. During the
+4096-byte read, 10 UDP datagrams used the consumer's published ports, and the
+longest was 1452 bytes. The seed consumer repository stayed 136 KiB. Free space
+stayed above the 10 percent floor. The managed child repo stayed 285,892 KiB.
+Holder 61700 still has no Kubo child. A fresh DirectOnly seed Home at
+`127.0.0.1:61962` sent one Marketplace `content.use` for CID
+`bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi`. The
+three-copy charge stayed above the 10 percent floor. Mac holder node
+`3ddc07c6` connected outbound to managed Home node `b043677c` in 0.199 s.
+The preparation read used the gateway carrier. That carrier joined direct
+gossip with 0 bootstrap peers. The local offline read of
+`_elastos_object.json` returned HTTP 500. Operation `bf2ff7d0…` stopped at
+`metadata_read`, provider error kind Provider, 0 completed bytes, and
+`cancel_requested` false. `content.cancel` stayed declared. The attempt sent
+18 public UDP datagrams and 0 datagrams to seed holder 61954. The gateway
+repository stayed 128 KiB. Assistant execution remains unproven for this
+Linux consumer.
+Receipts `.audit/ma3-2-mac-holder-range-proof-receipt.json`,
+`.audit/ma3-2-mac-holder-64kib-range-receipt.json`,
+`.audit/ma3-2-seed-to-mac-route-receipt.json`, and
+`.audit/ma3-2-cold-consumer-receipt.json`. The local split through
 the MA1 record is `f6242b51`. The branch has no upstream. Live MA4
 hosted credential is absent on 61680 and public live. The one-form System
 Models OpenRouter/Venice Settings surface is a shortcut, not the MA4 product
