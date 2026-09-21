@@ -39,13 +39,13 @@
       <div class="field">
         <label for="title">Title</label>
         <input id="title" type="text" placeholder="My asset" autocomplete="off">
-        <p class="hint">Not sent — the listing name is generated automatically from the file.</p>
+        <p class="hint">Shown as the listing name. Defaults to the file name.</p>
       </div>
 
       <div class="field">
         <label for="desc">Description</label>
         <textarea id="desc" placeholder="What is it?"></textarea>
-        <p class="hint">Not sent — descriptions aren't stored yet.</p>
+        <p class="hint">Shown on the listing.</p>
       </div>
 
       <div class="field">
@@ -59,7 +59,7 @@
           <img id="thumb-preview-img" class="thumb-preview-img" alt="Cover preview">
           <button id="thumb-remove" class="btn" type="button">Remove</button>
         </div>
-        <p class="hint">Not sent — this preview stays local; a listing has no cover image yet.</p>
+        <p class="hint">Published with the listing as its cover image.</p>
       </div>
 
       <div class="field">
@@ -120,7 +120,7 @@
             <option value="3d-model">3D model</option>
             <option value="ai-model">AI model</option>
           </select>
-          <p class="hint">Not sent — categorization isn't stored yet.</p>
+          <p class="hint">Recorded on the listing.</p>
         </div>
       </div>
 
@@ -135,8 +135,10 @@
         <div id="royalty-rows"></div>
         <button id="royalty-add" class="btn-add" type="button">+ Add payee</button>
         <p id="royalty-total" class="royalty-total"></p>
-        <p class="hint">Not sent — shown here is the default split this chain actually applies
-          (95% to you, 5% to Elacity); editing it doesn't change what's paid out.</p>
+        <p class="hint">Rows show every share of the sale and must come to 100%. The 5% to
+          Elacity is minted by the contract and is fixed. Your 95% is split across the payees
+          you name: put a real 0x… address on every row and they're paid as listed. Leave the
+          default and your whole share goes to you.</p>
       </div>
 
       <div class="field">
@@ -144,7 +146,7 @@
           <input id="ai-licensing" type="checkbox">
           <span>Grant AI training rights</span>
         </label>
-        <p class="hint">Not sent — licensing terms aren't recorded yet.</p>
+        <p class="hint">Recorded on the listing. Not enforced on chain.</p>
       </div>
 
       <div class="field">
@@ -152,7 +154,7 @@
           <input id="adult-flag" type="checkbox">
           <span>Adult content (18+)</span>
         </label>
-        <p class="hint">Not sent — content flags aren't recorded yet.</p>
+        <p class="hint">Recorded on the listing.</p>
       </div>
 
       <div class="field">
@@ -160,7 +162,7 @@
           <input id="legal-attest" type="checkbox">
           <span>I own or have the rights to distribute this content</span>
         </label>
-        <p class="hint">Not sent — not recorded with the listing yet.</p>
+        <p class="hint">Recorded on the listing as your attestation.</p>
       </div>
 
       <div id="preview-settings" class="field hidden">
@@ -183,20 +185,25 @@
         <summary>Protection progress</summary>
         <ul id="progress-steps" class="steps" aria-label="Progress">
           <li data-stage="analyze"><span class="dot"></span> Analyze source</li>
-          <li data-stage="transcode" class="hidden"><span class="dot"></span> Transcode &amp; fragment <span class="not-tracked">(not tracked)</span></li>
+          <li data-stage="transcode" class="hidden"><span class="dot"></span> Transcode &amp; fragment</li>
           <li data-stage="encrypt"><span class="dot"></span> Encrypt &amp; escrow</li>
-          <li data-stage="publish"><span class="dot"></span> Publish to storage <span class="not-tracked">(not tracked)</span></li>
+          <li data-stage="publish"><span class="dot"></span> Publish to storage</li>
           <li data-stage="assemble"><span class="dot"></span> Assemble listing</li>
         </ul>
       </details>
 
       <p id="status-text" class="status" aria-live="polite"></p>
 
-      <button id="enable-trading-button" class="btn" type="button" disabled>Step 2 — Enable trading</button>
-      <p class="hint">Not part of this build — Protect and list already makes the asset available for purchase.</p>
+      <details id="failure-details" class="failure-details hidden">
+        <summary>Details</summary>
+        <dl id="failure-details-list" class="failure-details-list"></dl>
+      </details>
+
+      <div id="recovery-actions" class="success-actions hidden"></div>
 
       <section id="success-panel" class="success-panel hidden">
-        <p class="success-title">Listed for sale.</p>
+        <p id="success-title" class="success-title">Listed for sale.</p>
+        <p id="success-detail" class="hint" hidden></p>
         <p id="mint-id-text" class="mint-id"></p>
         <div class="success-actions">
           <button id="open-library-button" class="btn" type="button">Open in Library</button>

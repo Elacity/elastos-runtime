@@ -95,6 +95,23 @@ pub(super) struct ProtectedContentCreatorMintMethod {
     pub(super) pay_token: String,
     pub(super) asset_created_emitter: String,
     pub(super) abi: ProtectedContentCreatorMintAbi,
+    /// How deep a mint's block must be buried before its receipt is accepted.
+    ///
+    /// This used to be L1 finality, which is the strongest bar there is and
+    /// costs the creator twelve minutes on a good day -- longer when Ethereum
+    /// finality lags, which it does. Nothing is spent after this point: the
+    /// mint already carries its own listing, so what the depth protects is a
+    /// local record, not money. Configured rather than constant so the bar can
+    /// be raised for a chain or a deployment that wants it without a rebuild.
+    #[serde(default = "default_protected_content_mint_confirmations")]
+    pub(super) mint_confirmations: u64,
+}
+
+/// Twelve blocks is roughly twenty-four seconds on Base, which is far past any
+/// ordinary sequencer reorg and short enough that a creator sees their listing
+/// appear rather than wonders whether it failed.
+pub(super) const fn default_protected_content_mint_confirmations() -> u64 {
+    12
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +192,18 @@ pub(super) struct ProtectedContentPolicySource {
 #[serde(rename_all = "snake_case")]
 pub(super) enum RightsMethodAbi {
     HasAccessByContentIdAddressBytes16,
+}
+
+/// One royalty payee, in ERC-1155 `ROYALTY_SHARE` units.
+///
+/// Units are what the mint encodes, so units are what crosses this boundary:
+/// 1000 exist per asset, one unit is 0.1% of the sale, and the creator splits
+/// 950 of them. Nothing is converted here, so nothing can be converted wrongly.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentRoyaltyShare {
+    pub address: String,
+    pub units: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +297,10 @@ pub(super) enum Request {
         content_access_id: String,
         copies: String,
         price: String,
+        /// Who the creator's royalty share is paid to. Absent or empty means
+        /// the default: the whole creator share to the creator.
+        #[serde(default)]
+        royalties: Vec<ProtectedContentRoyaltyShare>,
     },
     ResolveProtectedContentMintReceipt {
         network: String,

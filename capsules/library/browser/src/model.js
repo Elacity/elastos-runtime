@@ -188,8 +188,19 @@ export function isRuntimeCustodyProtectable(object) {
   );
 }
 
+// A minted item is a `.ddrm` capsule, so its own mime says "application/json"
+// and tells us nothing about what it protects. The gateway records the asset's
+// real mime on the protected-content identity; prefer that, and fall back to
+// the object's own mime for anything published before capsules existed.
+export function assetMimeForProtectedContent(object) {
+  const recorded = object?.metadata?.protected_content?.asset_mime;
+  return typeof recorded === "string" && recorded.trim() !== ""
+    ? recorded
+    : String(object?.mime || "");
+}
+
 export function viewerForProtectedContent(object) {
-  return protectedContentKindFor(object?.mime) === "media"
+  return protectedContentKindFor(assetMimeForProtectedContent(object)) === "media"
     ? "elacity-player"
     : "elacity-reader";
 }

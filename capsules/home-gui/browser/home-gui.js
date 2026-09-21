@@ -140,16 +140,6 @@ import {
   inboxRailOpen,
   inboxRailSessionMounted,
 } from "./shell-inbox-rail.js?v=home-20260813a";
-import {
-  attachAuthorizedConnectorSheet,
-  bindConnectorSheet,
-  connectorSheetFrame,
-  connectorSheetTarget,
-  isConnectorSheetTarget,
-  noteConnectorSheetSummaryRefresh,
-  retireConnectorSheet,
-  showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -169,7 +159,6 @@ bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow 
 bindControlCentre();
 bindWalletRail();
 bindInboxRail();
-bindConnectorSheet();
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -184,7 +173,6 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#wallet-rail",
   "#inbox-rail",
   "#setup-sheet",
-  "#connector-sheet",
   "#spotlight",
   "#window-switcher",
   "#quick-look",
@@ -277,7 +265,6 @@ export function retireHomeGuiSurface(options = {}) {
   retireWalletRail();
   retireInboxRail();
   retireAssistantSpace();
-  retireConnectorSheet();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
@@ -370,24 +357,7 @@ export function closeHomeGuiWindowsForTarget(targetId) {
 }
 
 export function openHomeGuiTarget(target, options = {}) {
-  const query = options.query && typeof options.query === "object" ? options.query : {};
-  if (
-    isConnectorSheetTarget(target) &&
-    (query.presentation === "sheet" || walletRailOpen())
-  ) {
-    void showConnectorSheet(target, {
-      ...options,
-      query: { ...query, presentation: "sheet" },
-    }).catch((error) => {
-      console.error("connector sheet open failed", error);
-    });
-    return;
-  }
   openTarget(target, options);
-}
-
-export function noteHomeGuiConnectorSheetSummaryRefresh(homeToken) {
-  noteConnectorSheetSummaryRefresh(homeToken);
 }
 
 export function homeGuiHasWindows() {
@@ -602,27 +572,6 @@ export function homeGuiMessageContextForSource(source, origin, homeToken) {
     }
     return null;
   }
-  const sheetFrame = connectorSheetFrame();
-  let sheetWindow = null;
-  try {
-    sheetWindow = sheetFrame?.contentWindow || null;
-  } catch (_error) {
-    sheetWindow = null;
-  }
-  if (sheetWindow && sheetWindow === source) {
-    const expectedToken = homeLaunchTokenFromRoute(
-      sheetFrame?.dataset?.route || sheetFrame?.getAttribute("src") || "",
-    );
-    if (expectedToken && expectedToken === homeToken) {
-      return {
-        kind: "app-frame",
-        targetId: connectorSheetTarget() || "wallet-metamask",
-        windowId: "connector-sheet",
-        homeToken,
-      };
-    }
-    return null;
-  }
   for (const entry of shellState.windows.values()) {
     const frame = entry?.node?.querySelector(".window-frame");
     let frameWindow = null;
@@ -710,9 +659,8 @@ export function relaunchHomeGuiWindowForToken(homeToken) {
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
-  if (walletRailOpen() && isConnectorSheetTarget(launched?.target)) {
-    return attachAuthorizedConnectorSheet(launched);
-  }
+  // Every connector opens as a window, whether Wallet is a window or the
+  // rail: one workflow for the same approval, wherever it was clicked.
   return attachAuthorizedTarget(launched);
 }
 

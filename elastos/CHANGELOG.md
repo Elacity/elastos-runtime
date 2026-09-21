@@ -27,7 +27,26 @@ All notable changes to the public ElastOS Runtime repository.
   model naming the test that pins each claim, a build card, and committed
   golden vectors replayed against the shipped code.
 
+- A minted asset publishes the Elacity listing metadata a marketplace reads:
+  `metadata.json`, `content.json`, `contract.json` and the per-token-type
+  documents, carrying the creator's title, description, cover, category and
+  content flags. A creator-named royalty split reaches the chain in ERC-1155
+  `ROYALTY_SHARE` units.
+
 ### Fixed
+- A protected-content mint completes on the custody harness again. A replica
+  a publisher places on a custody node over Carrier, by `ensure` or by
+  `import_object`, is proven by that node's own verified local pin and is never
+  forwarded to an external placement service. The model-content object import
+  had made every such replica consult the harness's unreachable
+  `https://replica.invalid/ensure` placeholder, so a mint that placed all three
+  copies settled `repair_needed` with one and the Creator stopped at "Publish
+  to storage". Model-content local-object restore is unchanged.
+- A mint's on-chain token URI names the metadata directory rather than a file
+  inside it. The Operative appends its own suffixes, so the previous URI
+  produced `…/metadata.json/0000…0001.json` and resolved to nothing: the mint
+  completed and the asset was unlistable. The Runtime's own document moved to
+  `manifest.json`, and listings published before the rename still verify.
 - Library opens protected video through the shell instead of a dead route,
   and the phantom viewer ids are gone.
 - Library offers protection on any file the Runtime accepts and routes by
@@ -49,6 +68,11 @@ All notable changes to the public ElastOS Runtime repository.
   existing effect instead of starting a second one.
 
 ### Removed
+- The custody-host storage role's external availability plane: it no longer
+  runs `availability-provider`, needs no `ELASTOS_AVAILABILITY_ENSURE_URL`, and
+  the Compose `https://replica.invalid/ensure` placeholder is gone. Nodes
+  declare `custody,chain,ipfs`. Carrier provider invocation no longer admits
+  the retired `drm`, `rights`, `key` and `decrypt` targets.
 - The provisional `drm-provider`, `rights-provider`, `key-provider`, and
   `decrypt-provider` capsules, the `elastos://drm`, `elastos://rights`,
   `elastos://key`, and `elastos://decrypt` provider schemes, the

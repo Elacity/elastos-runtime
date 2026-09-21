@@ -1541,12 +1541,111 @@ impl RuntimeMintDraft {
     }
 }
 
+/// What is known about one node's provisioning call.
+///
+/// This replaces a bare `effect_started: bool`, which could not tell *we do not
+/// know what happened* apart from *the node says it did nothing*. The
+/// difference decides whether a share may be stranded on that node, which is
+/// the only question an operator reading a failed mint actually has.
+///
+/// `RefusedWithoutEffect` is **node-asserted, not proven**. The capsule's error
+/// frame is unsigned and unbound to the node key, so this describes an outcome
+/// and must never authorize re-dispatching a share to that node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMintNodeEffectV1 {
+    /// No call was dispatched. Nothing can be stored.
+    NotDispatched,
+    /// A call was dispatched and no usable answer came back. The node may hold
+    /// the share and only the node can say.
+    Uncertain,
+    /// The node answered that it refused before its durable write.
+    RefusedWithoutEffect,
+}
+
+impl RuntimeMintNodeEffectV1 {
+    /// The wire byte. `0`/`1` are exactly the old `false`/`true`, so an
+    /// `epc-mj06` record written before this existed decodes unchanged: a
+    /// legacy `effect_started == true` means precisely `Uncertain`.
+    const fn wire_byte(self) -> u8 {
+        match self {
+            Self::NotDispatched => 0,
+            Self::Uncertain => 1,
+            Self::RefusedWithoutEffect => 2,
+        }
+    }
+
+    /// Decode, treating anything unrecognised as `Uncertain` rather than
+    /// rejecting the record. A byte this Runtime does not know was written by a
+    /// newer one that could describe an outcome more precisely; the safe
+    /// reading of "some call happened" is that its effect is unknown.
+    const fn from_wire_byte(byte: u8) -> Self {
+        match byte {
+            0 => Self::NotDispatched,
+            2 => Self::RefusedWithoutEffect,
+            _ => Self::Uncertain,
+        }
+    }
+
+    /// Whether this node might be holding the share.
+    pub const fn may_hold_share(self) -> bool {
+        matches!(self, Self::Uncertain)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct MintNodeState {
     binding: RuntimeMintNodeBinding,
-    effect_started: bool,
+    effect: RuntimeMintNodeEffectV1,
     receipt: Option<RuntimeMintNodeReceipt>,
 }
+
+/// One creator-side royalty payee, in ERC-1155 `ROYALTY_SHARE` units.
+///
+/// Units are what the chain carries, so they are what is recorded: 1000 exist
+/// per asset and one unit is 0.1% of the sale. The creator side is 950 of them
+/// and the protocol owner's 50 are minted by the contracts themselves from
+/// `CentralStorage.protocolShares()`, so a creator splits 950 and never sees
+/// the other 50. Recording units rather than a percentage means no conversion
+/// stands between what is agreed and what is encoded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMintRoyaltyShare {
+    address: String,
+    units: u32,
+}
+
+impl RuntimeMintRoyaltyShare {
+    pub fn new(address: impl Into<String>, units: u32) -> Result<Self, RuntimeMintJournalError> {
+        let value = Self {
+            address: address.into().to_ascii_lowercase(),
+            units,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        // Lowercase `0x` + 40 hex, the same spelling every other address in
+        // this journal is held to.
+        validate_intent_evm_address(&self.address)?;
+        // A payee owed nothing is a mistake, not a split.
+        if self.units == 0 {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        Ok(())
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub const fn units(&self) -> u32 {
+        self.units
+    }
+}
+
+/// The creator's whole share of a primary sale, in `ROYALTY_SHARE` units.
+pub const RUNTIME_MINT_CREATOR_ROYALTY_UNITS: u32 = 950;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1554,6 +1653,19 @@ pub struct RuntimeMintCreatorDesiredTerms {
     wallet_account_id: String,
     copies: String,
     price: String,
+    /// Who the creator's share is paid to. Empty means the chain default, a
+    /// single payee: the creator.
+    ///
+    /// Recorded rather than derived at mint time because a retry compares
+    /// desired terms and re-encodes the chain call from them. A split held
+    /// only in the request could differ between attempts and silently change
+    /// what the transaction pays out.
+    ///
+    /// Defaulted so every record written before this field existed decodes as
+    /// "chain default" — the creator state is JSON inside the record, so a
+    /// missing key needs no format change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    royalties: Vec<RuntimeMintRoyaltyShare>,
 }
 
 impl RuntimeMintCreatorDesiredTerms {
@@ -1561,6 +1673,7 @@ impl RuntimeMintCreatorDesiredTerms {
         wallet_account_id: impl Into<String>,
         copies: impl Into<String>,
         price: impl Into<String>,
+        royalties: Vec<RuntimeMintRoyaltyShare>,
     ) -> Result<Self, RuntimeMintJournalError> {
         let wallet_account_id = wallet_account_id.into();
         let copies = normalize_intent_hex_quantity(&copies.into())?;
@@ -1569,6 +1682,7 @@ impl RuntimeMintCreatorDesiredTerms {
             wallet_account_id,
             copies,
             price,
+            royalties,
         };
         value.validate()?;
         Ok(value)
@@ -1578,6 +1692,22 @@ impl RuntimeMintCreatorDesiredTerms {
         validate_intent_text(&self.wallet_account_id)?;
         validate_canonical_intent_hex_quantity(&self.copies)?;
         validate_canonical_intent_hex_quantity(&self.price)?;
+        // Absent is the chain default and always allowed. Present must be
+        // exactly the creator share: a split that does not total it is not one
+        // the chain can honour, so recording it would describe a payout that
+        // will not happen.
+        if !self.royalties.is_empty() {
+            let mut total: u32 = 0;
+            for royalty in &self.royalties {
+                royalty.validate()?;
+                total = total
+                    .checked_add(royalty.units)
+                    .ok_or(RuntimeMintJournalError::InvalidSelection)?;
+            }
+            if total != RUNTIME_MINT_CREATOR_ROYALTY_UNITS {
+                return Err(RuntimeMintJournalError::InvalidSelection);
+            }
+        }
         Ok(())
     }
 
@@ -1591,6 +1721,10 @@ impl RuntimeMintCreatorDesiredTerms {
 
     pub fn price(&self) -> &str {
         &self.price
+    }
+
+    pub fn royalties(&self) -> &[RuntimeMintRoyaltyShare] {
+        &self.royalties
     }
 }
 
@@ -1806,6 +1940,28 @@ impl RuntimeMintCreatorTerminalEvidence {
     }
 }
 
+/// How far a recorded creator mint has actually got.
+///
+/// The three stages differ in what may still be done with the record, so they
+/// are one enum rather than a pair of `is_some()` tests repeated at every call
+/// site:
+///
+/// * [`RuntimeMintCreatorStage::Recorded`] — the terms are on record and
+///   nothing has been raised on any ledger. Dropping the record leaves no
+///   ledger entry behind and no holder, so it is safe.
+/// * [`RuntimeMintCreatorStage::EffectRaised`] — a ledger transaction was
+///   raised behind a wallet approval the creator may still complete, so it can
+///   still settle later. Dropping the record would leave that settlement with
+///   nothing recording it, so it is refused.
+/// * [`RuntimeMintCreatorStage::Settled`] — the mint settled with a seller and
+///   a token id. Nothing about it can change any more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMintCreatorStage {
+    Recorded,
+    EffectRaised,
+    Settled,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeMintCreatorState {
@@ -1862,6 +2018,19 @@ impl RuntimeMintCreatorState {
 
     pub fn desired_terms(&self) -> &RuntimeMintCreatorDesiredTerms {
         &self.desired_terms
+    }
+
+    /// Classify this record for callers that must decide what is still
+    /// permitted, without reaching into which optional fields happen to be
+    /// populated.
+    pub const fn stage(&self) -> RuntimeMintCreatorStage {
+        if self.terminal.is_some() {
+            RuntimeMintCreatorStage::Settled
+        } else if self.effect.is_some() || self.operator_approval.is_some() {
+            RuntimeMintCreatorStage::EffectRaised
+        } else {
+            RuntimeMintCreatorStage::Recorded
+        }
     }
 
     pub fn metadata_cid(&self) -> &str {
@@ -1983,8 +2152,20 @@ impl PersistedRuntimeMint {
             .collect()
     }
 
-    pub fn any_effect_started(&self) -> bool {
-        self.node_states.iter().any(|state| state.effect_started)
+    /// Nodes that were called and may be holding a share.
+    ///
+    /// This is the record-level question: a node that was never called, or that
+    /// said it refused before writing, strands nothing. Only an unknown outcome
+    /// does.
+    pub fn uncertain_node_count(&self) -> usize {
+        self.node_states
+            .iter()
+            .filter(|state| state.receipt.is_none() && state.effect.may_hold_share())
+            .count()
+    }
+
+    pub fn any_effect_uncertain(&self) -> bool {
+        self.uncertain_node_count() > 0
     }
 
     pub fn all_receipts_present(&self) -> bool {
@@ -2028,7 +2209,7 @@ impl RuntimeMintJournal {
                 .iter()
                 .map(|binding| MintNodeState {
                     binding: binding.clone(),
-                    effect_started: false,
+                    effect: RuntimeMintNodeEffectV1::NotDispatched,
                     receipt: None,
                 })
                 .collect(),
@@ -2074,13 +2255,14 @@ impl RuntimeMintJournal {
     pub fn find_mint_record_for_intent(
         &self,
         request_id: Digest32,
-    ) -> Result<Option<PersistedRuntimeMint>, RuntimeMintJournalError> {
+    ) -> Result<RuntimeMintIntentRecordScanV1, RuntimeMintJournalError> {
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.ensure_root_dir()?;
         let intent = self.read_intent(request_id)?;
         let entries =
             fs::read_dir(&self.root_dir).map_err(|_| RuntimeMintJournalError::Unavailable)?;
-        let mut matched: Option<PersistedRuntimeMint> = None;
+        let mut open: Option<PersistedRuntimeMint> = None;
+        let mut abandoned = Vec::new();
         let mut scanned = 0usize;
         for entry in entries {
             let entry = entry.map_err(|_| RuntimeMintJournalError::Unavailable)?;
@@ -2095,12 +2277,31 @@ impl RuntimeMintJournal {
             if !record_matches_intent(&record, &intent) {
                 continue;
             }
-            if matched.is_some() {
+            // An aborted fan-out can never be continued: the envelope its
+            // shares were sealed against does not outlive the request that
+            // produced them. Such a record is history, not a candidate, and
+            // leaving it in the running is what made a second attempt collide
+            // with the first and strand the intent for good. It is carried out
+            // of here rather than dropped, because what it left on the nodes
+            // still has to be reported.
+            if record.custody_terminal == Some(RuntimeCustodyTerminalKind::AbortedPartialProvision)
+            {
+                abandoned.push(RuntimeMintAbandonedRecordV1 {
+                    mint_id,
+                    accepted_orphan_count: record.accepted_orphans().len(),
+                    uncertain_node_count: record.uncertain_node_count(),
+                });
+                continue;
+            }
+            // Two live records for one intent is still ambiguity nothing can
+            // resolve, and the guard stays exactly as strict for that case.
+            if open.is_some() {
                 return Err(RuntimeMintJournalError::Conflict);
             }
-            matched = Some(record);
+            open = Some(record);
         }
-        Ok(matched)
+        abandoned.sort_by_key(|record| record.mint_id);
+        Ok(RuntimeMintIntentRecordScanV1 { open, abandoned })
     }
 
     pub fn persist_media_preparation(
@@ -2373,7 +2574,51 @@ impl RuntimeMintJournal {
             .iter_mut()
             .find(|state| state.binding.node_public_key == node_public_key)
             .ok_or(RuntimeMintJournalError::InvalidSelection)?;
-        node.effect_started = true;
+        if node.receipt.is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        node.effect = RuntimeMintNodeEffectV1::Uncertain;
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    /// Record that a node answered that it refused before storing anything.
+    ///
+    /// The only transition that walks a node's effect back, and it narrows the
+    /// record rather than reopening it: the node is no longer counted as
+    /// possibly holding a share. It does **not** make the node dispatchable
+    /// again — the assertion is unsigned, and the envelope needed to re-dispatch
+    /// is gone once the publish request ends.
+    pub fn mark_node_refused_without_effect(
+        &self,
+        mint_id: Digest32,
+        node_public_key: NodePublicKey,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        if record.custody_terminal.is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        let node = record
+            .node_states
+            .iter_mut()
+            .find(|state| state.binding.node_public_key == node_public_key)
+            .ok_or(RuntimeMintJournalError::InvalidSelection)?;
+        // A node that returned a receipt cannot also have refused before
+        // writing. One of the two is a lie, so neither is trusted.
+        if node.receipt.is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        match node.effect {
+            RuntimeMintNodeEffectV1::RefusedWithoutEffect => return Ok(record),
+            RuntimeMintNodeEffectV1::Uncertain => {}
+            // Nothing was dispatched, so nothing can have been refused.
+            RuntimeMintNodeEffectV1::NotDispatched => {
+                return Err(RuntimeMintJournalError::Conflict)
+            }
+        }
+        node.effect = RuntimeMintNodeEffectV1::RefusedWithoutEffect;
         self.write_replace(&record)?;
         Ok(record)
     }
@@ -2394,7 +2639,10 @@ impl RuntimeMintJournal {
             .iter_mut()
             .find(|state| state.binding.node_public_key == receipt.node_public_key)
             .ok_or(RuntimeMintJournalError::InvalidSelection)?;
-        if !node.effect_started {
+        // A receipt is admissible only for a call whose outcome was open. A
+        // node that was never called cannot produce one, and a node that said
+        // it refused before writing is now contradicting itself.
+        if !matches!(node.effect, RuntimeMintNodeEffectV1::Uncertain) {
             return Err(RuntimeMintJournalError::Conflict);
         }
         if node.binding.owner_state_root != receipt.owner_state_root {
@@ -2501,17 +2749,23 @@ impl RuntimeMintJournal {
     pub fn bind_creator_effect(
         &self,
         mint_id: Digest32,
+        expected: &RuntimeMintCreatorState,
         effect: RuntimeMintCreatorEffectBinding,
     ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.ensure_root_dir()?;
         let mut record = self.read_record(mint_id)?;
-        let creator_state = record
+        let current = record
             .creator_state
-            .take()
-            .ok_or(RuntimeMintJournalError::Conflict)?
-            .with_effect(effect)?;
-        record.creator_state = Some(creator_state);
+            .as_ref()
+            .ok_or(RuntimeMintJournalError::Conflict)?;
+        let bound = expected.clone().with_effect(effect)?;
+        // Planning happens outside the lock. Discarding or changing terms must
+        // invalidate a request planned against the previous creator state.
+        if current != expected && current != &bound {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        record.creator_state = Some(bound);
         self.write_replace(&record)?;
         Ok(record)
     }
@@ -2532,6 +2786,92 @@ impl RuntimeMintJournal {
         record.creator_state = Some(creator_state);
         self.write_replace(&record)?;
         Ok(record)
+    }
+
+    /// Drop a recorded creator mint that never reached a ledger, so the
+    /// creator can start over at different terms.
+    ///
+    /// Refused at every later stage: once a transaction has been raised behind
+    /// a wallet approval the creator may still complete it, and once the mint
+    /// has settled a holder exists. This is the only place that rule lives —
+    /// no caller may decide it. A record with nothing bound is already in the
+    /// requested state, so the call replays as a no-op.
+    pub fn discard_creator_state(
+        &self,
+        mint_id: Digest32,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        match record
+            .creator_state
+            .as_ref()
+            .map(RuntimeMintCreatorState::stage)
+        {
+            None => return Ok(record),
+            Some(RuntimeMintCreatorStage::Recorded) => {}
+            Some(RuntimeMintCreatorStage::EffectRaised | RuntimeMintCreatorStage::Settled) => {
+                return Err(RuntimeMintJournalError::Conflict)
+            }
+        }
+        record.creator_state = None;
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    /// Forget an intent that can never produce a mint, so the object it names
+    /// can be minted again.
+    ///
+    /// An intent whose protect session was settled before any draft was
+    /// persisted is terminal: there is no draft to roll forward and no record
+    /// to adopt, so every later attempt on that object aborts at the same
+    /// point, forever. Since the intent's identity is derived from the object
+    /// path, that path stays dead until someone edits the journal by hand.
+    ///
+    /// Removing it lets the next attempt start from nothing, which is what a
+    /// creator asking to mint that file again means. Refuses an intent that
+    /// completed a mint: that one still names the record it produced.
+    pub fn discard_unmintable_intent(
+        &self,
+        request_id: Digest32,
+    ) -> Result<(), RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let intent = self.read_intent(request_id)?;
+        if intent.completed_mint_id().is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        fs::remove_file(self.intent_path(request_id))
+            .map_err(|_| RuntimeMintJournalError::Unavailable)
+    }
+
+    /// Forget an attempt that can never finish, so the object it was minted
+    /// from can be minted again.
+    ///
+    /// An attempt whose content availability was never recorded cannot be
+    /// rolled forward: the content key material does not outlive the request
+    /// that produced it. Keeping such a record only wedges the intent -- the
+    /// scan finds it, refuses to treat it as a candidate, and every later
+    /// attempt on that object path fails the same way, permanently.
+    ///
+    /// What it left on the nodes is not taken back here. Those shares seal
+    /// against an envelope that is gone and no listing will ever name them, so
+    /// they open nothing; they are storage residue, and reclaiming them is a
+    /// housekeeping job rather than a condition for minting again.
+    ///
+    /// Refuses a record that recorded availability: that one may still be
+    /// adoptable, and discarding it would throw away a mint that worked.
+    pub fn discard_unfinishable_mint(
+        &self,
+        mint_id: Digest32,
+    ) -> Result<(), RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let record = self.read_record(mint_id)?;
+        if record.content_availability().is_some() {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        fs::remove_file(self.record_path(mint_id)).map_err(|_| RuntimeMintJournalError::Unavailable)
     }
 
     pub fn mark_creator_completed(
@@ -2812,7 +3152,7 @@ fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJo
         payload.extend_from_slice(state.binding.operator_id.as_bytes());
         payload.extend_from_slice(state.binding.failure_domain_id.as_bytes());
         payload.extend_from_slice(state.binding.owner_state_root.as_bytes());
-        payload.push(u8::from(state.effect_started));
+        payload.push(state.effect.wire_byte());
         match &state.receipt {
             None => payload.push(0),
             Some(receipt) => {
@@ -2900,6 +3240,42 @@ fn mint_id_from_record_file_name(name: &std::ffi::OsStr) -> Option<Digest32> {
     Some(Digest32::new(bytes))
 }
 
+/// What a closed attempt left behind on the custody nodes.
+///
+/// Both numbers are needed and they mean different things: an accepted receipt
+/// is a share this Runtime knows is held, while an uncertain node is one that
+/// was called and never answered, which may be holding one without ever having
+/// said so. Neither can be reused -- they are sealed against an envelope that
+/// no longer exists -- so they are inert, but they occupy node storage until
+/// something retires them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeMintAbandonedRecordV1 {
+    pub mint_id: Digest32,
+    pub accepted_orphan_count: usize,
+    pub uncertain_node_count: usize,
+}
+
+/// Every mint record bound to one intent, separated into the one that can still
+/// go somewhere and the ones that cannot.
+#[derive(Clone, Debug)]
+pub struct RuntimeMintIntentRecordScanV1 {
+    open: Option<PersistedRuntimeMint>,
+    abandoned: Vec<RuntimeMintAbandonedRecordV1>,
+}
+
+impl RuntimeMintIntentRecordScanV1 {
+    /// The record a caller may still act on, if there is one.
+    pub const fn open(&self) -> Option<&PersistedRuntimeMint> {
+        self.open.as_ref()
+    }
+
+    /// Closed attempts, oldest mint id first. A caller must report these rather
+    /// than skip them: they are the only trace of custody state left stranded.
+    pub fn abandoned(&self) -> &[RuntimeMintAbandonedRecordV1] {
+        &self.abandoned
+    }
+}
+
 fn record_matches_intent(record: &PersistedRuntimeMint, intent: &RuntimeMintIntent) -> bool {
     let draft = &record.draft;
     draft.content_access_id == intent.content_access_id
@@ -2970,7 +3346,7 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
             failure_domain_id,
             owner_state_root,
         )?;
-        let effect_started = read_u8(payload, &mut off)? != 0;
+        let effect = RuntimeMintNodeEffectV1::from_wire_byte(read_u8(payload, &mut off)?);
         let has_receipt = read_u8(payload, &mut off)? != 0;
         let receipt = if has_receipt {
             let provisioning_id =
@@ -2991,7 +3367,7 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
         nodes.push(binding.clone());
         node_states.push(MintNodeState {
             binding,
-            effect_started,
+            effect,
             receipt,
         });
     }
@@ -3722,8 +4098,20 @@ impl ExclusiveFileLock {
     }
 }
 
+/// Recursive so that the FIRST journal operation on a data dir works: the
+/// store lives two levels down (`protected-content/runtime-mint`), and
+/// `ExclusiveFileLock::acquire` creates only its own parent, before
+/// `ensure_root_dir` — the one place that knew to create both — has run. A
+/// non-recursive create therefore failed with `Unavailable` on a data dir
+/// that had no `protected-content/` yet, which a read path then reported as
+/// "mint intent is unavailable" rather than "nothing recorded".
+///
+/// `DirBuilder`'s mode applies to every directory it creates, so each level is
+/// still owner-only, and every caller re-checks with
+/// `validate_owner_only_directory`.
 fn create_owner_only_directory(path: &Path) -> Result<(), RuntimeMintJournalError> {
     let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -4026,7 +4414,7 @@ mod tests {
     }
 
     fn creator_desired_terms() -> RuntimeMintCreatorDesiredTerms {
-        RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x3", "0x5").unwrap()
+        RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x3", "0x5", Vec::new()).unwrap()
     }
 
     fn creator_effect_binding() -> RuntimeMintCreatorEffectBinding {
@@ -4241,6 +4629,123 @@ mod tests {
         );
     }
 
+    /// The three node effects, and the two contradictions that must fail closed.
+    ///
+    /// A refusal is only meaningful for a call that was actually dispatched,
+    /// and a node cannot both return a receipt and claim it stored nothing.
+    #[test]
+    fn node_effects_separate_no_receipt_from_no_effect() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let draft = draft();
+        journal.persist_bound(&draft).unwrap();
+
+        // Nothing dispatched: nobody can be holding anything.
+        assert_eq!(
+            journal
+                .load(draft.mint_id())
+                .unwrap()
+                .uncertain_node_count(),
+            0
+        );
+
+        // A refusal for a node that was never called is a contradiction.
+        assert_eq!(
+            journal.mark_node_refused_without_effect(draft.mint_id(), node_public_key(1)),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_public_key(1))
+            .unwrap();
+        assert_eq!(
+            journal
+                .load(draft.mint_id())
+                .unwrap()
+                .uncertain_node_count(),
+            1,
+            "dispatched and unanswered is the only state that strands anything"
+        );
+
+        journal
+            .mark_node_refused_without_effect(draft.mint_id(), node_public_key(1))
+            .unwrap();
+        let narrowed = journal.load(draft.mint_id()).unwrap();
+        assert_eq!(narrowed.uncertain_node_count(), 0);
+        assert!(narrowed.accepted_orphans().is_empty());
+
+        // Idempotent, and still not a receipt.
+        journal
+            .mark_node_refused_without_effect(draft.mint_id(), node_public_key(1))
+            .unwrap();
+        assert_eq!(
+            journal.mark_node_receipt(draft.mint_id(), receipt(&binding(1), 0x81)),
+            Err(RuntimeMintJournalError::Conflict),
+            "a node that said it stored nothing cannot then produce a receipt"
+        );
+
+        // And the reverse contradiction.
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_public_key(2))
+            .unwrap();
+        journal
+            .mark_node_receipt(draft.mint_id(), receipt(&binding(2), 0x82))
+            .unwrap();
+        assert_eq!(
+            journal.mark_node_refused_without_effect(draft.mint_id(), node_public_key(2)),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert_eq!(
+            journal.mark_node_effect_started(draft.mint_id(), node_public_key(2)),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+    }
+
+    /// The widened byte needs no `STORE_MAGIC` bump, and this is why: a record
+    /// written before the third state existed still decodes, and a legacy
+    /// `effect_started == true` means exactly `Uncertain` -- the reading that
+    /// keeps a possibly-stranded share visible.
+    #[test]
+    fn a_record_written_before_the_third_node_state_still_decodes() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let draft = draft();
+        journal.persist_bound(&draft).unwrap();
+        journal
+            .mark_node_effect_started(draft.mint_id(), node_public_key(1))
+            .unwrap();
+
+        // The byte a pre-change Runtime would have written for this state is
+        // the same `1` written today, so the encoded record is byte-identical.
+        let path = root.join(hex::encode(draft.mint_id().as_bytes()));
+        let encoded = fs::read(&path).unwrap();
+        assert!(
+            encoded.windows(8).any(|window| window == STORE_MAGIC),
+            "still an epc-mj06 record; the widening did not need a new magic"
+        );
+        let reloaded = RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap();
+        assert_eq!(reloaded.uncertain_node_count(), 1);
+
+        // An unrecognised byte from some future Runtime reads as uncertain
+        // rather than corrupting the record: "a call happened, effect unknown"
+        // is the safe reading of anything we cannot interpret.
+        assert_eq!(
+            RuntimeMintNodeEffectV1::from_wire_byte(7),
+            RuntimeMintNodeEffectV1::Uncertain
+        );
+        assert_eq!(
+            RuntimeMintNodeEffectV1::from_wire_byte(0),
+            RuntimeMintNodeEffectV1::NotDispatched
+        );
+        assert_eq!(
+            RuntimeMintNodeEffectV1::from_wire_byte(2),
+            RuntimeMintNodeEffectV1::RefusedWithoutEffect
+        );
+    }
+
     #[test]
     fn persist_before_effects_replays_exactly_and_never_provisions_partial_abort() {
         let temp = tempdir().unwrap();
@@ -4249,7 +4754,7 @@ mod tests {
 
         let persisted = journal.persist_bound(&draft).unwrap();
         assert!(persisted.custody_terminal().is_none());
-        assert!(!persisted.any_effect_started());
+        assert!(!persisted.any_effect_uncertain());
         assert_eq!(
             journal.persist_bound(&draft).unwrap().draft(),
             persisted.draft()
@@ -4401,6 +4906,75 @@ mod tests {
             .unwrap()
     }
 
+    /// An attempt whose custody succeeded but whose availability was never
+    /// recorded can never finish, and keeping it wedges the object it was
+    /// minted from: the scan keeps finding it, and every later attempt on that
+    /// path fails the same way forever. Discarding it is what makes the path
+    /// mintable again.
+    #[test]
+    fn an_attempt_that_can_never_finish_is_discarded_and_stops_wedging_its_intent() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+        let matching = draft_with(0x21, 0x52, 0x35);
+        custody_provision_all(&journal, &matching);
+
+        // Custody is provisioned; availability never was.
+        let found = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        let open = found.open().expect("the attempt must start out wedging");
+        assert_eq!(
+            open.custody_terminal(),
+            Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        );
+        assert!(open.content_availability().is_none());
+
+        journal
+            .discard_unfinishable_mint(matching.mint_id())
+            .expect("an attempt that cannot finish must be discardable");
+
+        // Nothing is left for a fresh attempt to collide with.
+        let rescanned = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        assert!(
+            rescanned.open().is_none(),
+            "a discarded attempt must not keep wedging its intent"
+        );
+        assert!(
+            journal.load(matching.mint_id()).is_err(),
+            "the discarded record must be gone from the store"
+        );
+    }
+
+    /// The discard exists to clear attempts that cannot finish, and must never
+    /// reach one that did. A record with its availability recorded is a mint
+    /// that worked and may still be adopted, so discarding it is refused.
+    #[test]
+    fn an_attempt_that_recorded_its_availability_is_never_discarded() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let draft = draft();
+        custody_provision_all(&journal, &draft);
+        journal
+            .mark_content_available(
+                draft.mint_id(),
+                &availability_requirement(),
+                availability_evidence(&draft, 0x71),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            journal.discard_unfinishable_mint(draft.mint_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        ));
+        assert!(
+            journal.load(draft.mint_id()).is_ok(),
+            "a mint that worked must survive"
+        );
+    }
+
     #[test]
     fn find_mint_record_for_intent_links_settled_intent_to_its_record() {
         let temp = tempdir().unwrap();
@@ -4416,7 +4990,9 @@ mod tests {
 
         let found = journal
             .find_mint_record_for_intent(settled.request_id())
-            .unwrap()
+            .unwrap();
+        let found = found
+            .open()
             .expect("record sharing access id and custody selection must be found");
         assert_eq!(found.draft().mint_id(), matching.mint_id());
         assert_eq!(
@@ -4433,12 +5009,74 @@ mod tests {
         // Same content-access id, different custody pool identity.
         custody_provision_all(&journal, &draft_with(0x21, 0x52, 0x75));
 
+        assert!(journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap()
+            .open()
+            .is_none());
+    }
+
+    /// A second attempt after a failed one must be possible.
+    ///
+    /// A failed fan-out can never be continued — the envelope its shares were
+    /// sealed against does not outlive the request — so re-protecting is the
+    /// only way forward, and re-protecting produces a *different* mint id
+    /// because `compute_mint_id` hashes the envelope. Both records then match
+    /// the one intent. Counting the closed one as a candidate made that
+    /// ambiguous and stranded the intent permanently; it is now history, and
+    /// what it left on the nodes is carried out for the caller to report.
+    #[test]
+    fn a_fresh_attempt_after_an_abort_is_not_ambiguous() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let settled = settled_closed_intent(&journal);
+
+        // First attempt: one node accepted, a second was called and never
+        // answered, then the fan-out closed.
+        let first = draft_with(0x21, 0x52, 0x35);
+        journal.persist_bound(&first).unwrap();
+        journal
+            .mark_node_effect_started(first.mint_id(), node_public_key(1))
+            .unwrap();
+        journal
+            .mark_node_receipt(first.mint_id(), receipt(&binding(1), 0x81))
+            .unwrap();
+        journal
+            .mark_node_effect_started(first.mint_id(), node_public_key(2))
+            .unwrap();
+        journal
+            .mark_aborted_partial_provision(first.mint_id())
+            .unwrap();
+
+        // With only the closed attempt on disk the intent has nothing open.
+        let scan = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        assert!(scan.open().is_none());
         assert_eq!(
-            journal
-                .find_mint_record_for_intent(settled.request_id())
-                .unwrap(),
-            None
+            scan.abandoned(),
+            &[RuntimeMintAbandonedRecordV1 {
+                mint_id: first.mint_id(),
+                accepted_orphan_count: 1,
+                uncertain_node_count: 1,
+            }],
+            "the closed attempt is reported, never silently skipped"
         );
+
+        // Second attempt, a different envelope and so a different mint id.
+        let second = draft_with(0x27, 0x52, 0x35);
+        assert_ne!(second.mint_id(), first.mint_id());
+        custody_provision_all(&journal, &second);
+
+        let scan = journal
+            .find_mint_record_for_intent(settled.request_id())
+            .unwrap();
+        assert_eq!(
+            scan.open().map(|record| record.draft().mint_id()),
+            Some(second.mint_id()),
+            "the live attempt resolves even though a closed one shares the intent"
+        );
+        assert_eq!(scan.abandoned().len(), 1);
     }
 
     #[test]
@@ -4450,8 +5088,10 @@ mod tests {
         custody_provision_all(&journal, &draft_with(0x27, 0x52, 0x35));
 
         assert_eq!(
-            journal.find_mint_record_for_intent(settled.request_id()),
-            Err(RuntimeMintJournalError::Conflict)
+            journal
+                .find_mint_record_for_intent(settled.request_id())
+                .err(),
+            Some(RuntimeMintJournalError::Conflict)
         );
     }
 
@@ -4469,8 +5109,10 @@ mod tests {
         fs::set_permissions(&bogus, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert_eq!(
-            journal.find_mint_record_for_intent(settled.request_id()),
-            Err(RuntimeMintJournalError::Corrupt)
+            journal
+                .find_mint_record_for_intent(settled.request_id())
+                .err(),
+            Some(RuntimeMintJournalError::Corrupt)
         );
     }
 
@@ -4481,8 +5123,8 @@ mod tests {
         custody_provision_all(&journal, &draft());
 
         assert_eq!(
-            journal.find_mint_record_for_intent(digest(0x5b)),
-            Err(RuntimeMintJournalError::NotFound)
+            journal.find_mint_record_for_intent(digest(0x5b)).err(),
+            Some(RuntimeMintJournalError::NotFound)
         );
     }
 
@@ -4615,7 +5257,7 @@ mod tests {
         );
 
         let with_effect = journal
-            .bind_creator_effect(draft.mint_id(), creator_effect_binding())
+            .bind_creator_effect(draft.mint_id(), &creator_state, creator_effect_binding())
             .unwrap();
         assert!(
             with_effect
@@ -4641,9 +5283,121 @@ mod tests {
     }
 
     #[test]
+    fn creator_state_discard_is_allowed_only_before_anything_is_raised() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let draft = draft();
+        custody_provision_all(&journal, &draft);
+        let requirement = availability_requirement();
+        let evidence = availability_evidence(&draft, 0x77);
+        journal
+            .mark_content_available(draft.mint_id(), &requirement, evidence)
+            .unwrap();
+
+        // Nothing recorded yet: the record is already in the requested state.
+        assert!(journal
+            .discard_creator_state(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_none());
+
+        let creator_state = RuntimeMintCreatorState::new(
+            creator_desired_terms(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+        let bound = journal
+            .bind_creator_state(draft.mint_id(), creator_state.clone())
+            .unwrap();
+        assert_eq!(
+            bound.creator_state().map(RuntimeMintCreatorState::stage),
+            Some(RuntimeMintCreatorStage::Recorded)
+        );
+
+        // Terms on record, nothing raised: dropping them is safe and durable.
+        assert!(journal
+            .discard_creator_state(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_none());
+        assert!(RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_none());
+
+        // An in-flight request planned before the discard cannot bind an effect.
+        assert_eq!(
+            journal.bind_creator_effect(draft.mint_id(), &creator_state, creator_effect_binding()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+
+        // Re-terming after a discard is what start over means.
+        let restarted = RuntimeMintCreatorState::new(
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x64", "0x186a0", Vec::new())
+                .unwrap(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+        journal
+            .bind_creator_state(draft.mint_id(), restarted.clone())
+            .unwrap();
+
+        // The old request also cannot attach its effect to newly recorded terms.
+        assert_eq!(
+            journal.bind_creator_effect(draft.mint_id(), &creator_state, creator_effect_binding()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert!(journal.load(draft.mint_id()).unwrap().creator_state() == Some(&restarted));
+
+        // A raised transaction may still settle, so the record must stay.
+        let raised = journal
+            .bind_creator_effect(draft.mint_id(), &restarted, creator_effect_binding())
+            .unwrap();
+        assert_eq!(
+            raised.creator_state().map(RuntimeMintCreatorState::stage),
+            Some(RuntimeMintCreatorStage::EffectRaised)
+        );
+        assert_eq!(
+            journal.discard_creator_state(draft.mint_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+
+        // Replaying the same plan is idempotent.
+        assert_eq!(
+            journal
+                .bind_creator_effect(draft.mint_id(), &restarted, creator_effect_binding())
+                .unwrap(),
+            raised
+        );
+
+        // A settled mint has a holder; nothing about it can change.
+        let settled = journal
+            .mark_creator_completed(draft.mint_id(), creator_terminal_evidence())
+            .unwrap();
+        assert_eq!(
+            settled.creator_state().map(RuntimeMintCreatorState::stage),
+            Some(RuntimeMintCreatorStage::Settled)
+        );
+        assert_eq!(
+            journal.discard_creator_state(draft.mint_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert!(RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap()
+            .creator_state()
+            .is_some());
+    }
+
+    #[test]
     fn creator_desired_terms_normalize_hex_quantities() {
         let terms =
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x05", "0x000A").unwrap();
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x05", "0x000A", Vec::new())
+                .unwrap();
         assert_eq!(terms.wallet_account_id(), "wallet-account-1");
         assert_eq!(terms.copies(), "0x5");
         assert_eq!(terms.price(), "0xa");
@@ -4668,10 +5422,120 @@ mod tests {
             ("0x1", oversized.as_str()),
         ] {
             assert!(matches!(
-                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", copies, price),
+                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", copies, price, Vec::new()),
                 Err(RuntimeMintJournalError::InvalidSelection)
             ));
         }
+    }
+
+    fn payee(byte: u8, units: u32) -> RuntimeMintRoyaltyShare {
+        RuntimeMintRoyaltyShare::new(format!("0x{}", hex::encode([byte; 20])), units).unwrap()
+    }
+
+    /// Records written before royalties existed decode as "chain default".
+    ///
+    /// This is why the store magic does not move: the creator state is JSON
+    /// inside the binary record, and `deny_unknown_fields` rejects unknown
+    /// keys, never missing ones. A defaulted field is therefore backward
+    /// compatible on its own, unlike the positional content identity that
+    /// forced the `mj05` fallback.
+    #[test]
+    fn creator_terms_without_royalties_decode_as_the_chain_default() {
+        let legacy = serde_json::json!({
+            "wallet_account_id": "wallet-account-1",
+            "copies": "0x2",
+            "price": "0x5",
+        });
+        let terms: RuntimeMintCreatorDesiredTerms = serde_json::from_value(legacy).unwrap();
+        assert!(terms.royalties().is_empty());
+        assert_eq!(terms.copies(), "0x2");
+
+        // And a defaulted split is not re-serialised, so a record written by
+        // this build is byte-identical to one written before the field.
+        let encoded = serde_json::to_value(&terms).unwrap();
+        assert!(encoded.get("royalties").is_none(), "{encoded}");
+    }
+
+    #[test]
+    fn creator_terms_round_trip_explicit_payees() {
+        let terms = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0xab, 900), payee(0x7b, 50)],
+        )
+        .unwrap();
+        let decoded: RuntimeMintCreatorDesiredTerms =
+            serde_json::from_slice(&serde_json::to_vec(&terms).unwrap()).unwrap();
+        assert!(decoded == terms);
+        assert_eq!(decoded.royalties().len(), 2);
+        assert_eq!(decoded.royalties()[0].units(), 900);
+    }
+
+    /// The chain applies 9500 basis points to the creator side. A split that
+    /// does not total it is not one the chain can honour, so recording it
+    /// would describe a payout that will not happen.
+    #[test]
+    fn creator_terms_reject_a_split_that_is_not_the_creator_share() {
+        for royalties in [
+            vec![payee(0xab, 949)],
+            vec![payee(0xab, 951)],
+            vec![payee(0xab, 900), payee(0x7b, 40)],
+            vec![payee(0xab, 1000)],
+        ] {
+            assert!(matches!(
+                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", royalties),
+                Err(RuntimeMintJournalError::InvalidSelection)
+            ));
+        }
+        // Exactly the creator share is accepted, split any number of ways.
+        RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0xab, 950)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn creator_royalty_payees_reject_a_bad_address_or_an_unpayable_share() {
+        // Not an address.
+        for address in [
+            "0xnothex",
+            "ab5028bdbb0826ad6f1885478e421db677b0001a",
+            "0xab50",
+            "",
+        ] {
+            assert!(RuntimeMintRoyaltyShare::new(address, 950).is_err());
+        }
+        // A payee owed nothing is a mistake, not a split.
+        assert!(RuntimeMintRoyaltyShare::new(format!("0x{}", hex::encode([0xab; 20])), 0).is_err());
+    }
+
+    /// A retry re-encodes the chain call from the recorded terms, so terms that
+    /// differ only in payees must not compare equal.
+    #[test]
+    fn creator_terms_equality_distinguishes_payees() {
+        let one = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0xab, 950)],
+        )
+        .unwrap();
+        let other = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            vec![payee(0x7b, 950)],
+        )
+        .unwrap();
+        let default =
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", Vec::new())
+                .unwrap();
+        assert!(one != other);
+        assert!(one != default);
     }
 
     #[test]
@@ -4688,13 +5552,15 @@ mod tests {
             .unwrap();
 
         let initial_state = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x02", "0x05").unwrap(),
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x02", "0x05", Vec::new())
+                .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )
         .unwrap();
         let replay_state = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5").unwrap(),
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", Vec::new())
+                .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )
@@ -4959,7 +5825,7 @@ mod tests {
             .iter()
             .map(|binding| MintNodeState {
                 binding: binding.clone(),
-                effect_started: false,
+                effect: RuntimeMintNodeEffectV1::NotDispatched,
                 receipt: None,
             })
             .collect();

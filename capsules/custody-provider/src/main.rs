@@ -42,6 +42,10 @@ const INIT_ERROR_CODE: &str = "invalid_config";
 const REQUEST_ERROR_CODE: &str = "invalid_request";
 const BACKEND_ERROR_CODE: &str = "backend_unavailable";
 const RIGHTS_DENIED_ERROR_CODE: &str = "rights_denied";
+/// A refusal raised before the share store was touched. Distinct from
+/// `backend_unavailable`, which this capsule also returns from paths that fail
+/// *after* the durable write and so proves nothing about the share.
+const PROVISIONING_REFUSED_ERROR_CODE: &str = "provisioning_refused";
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -184,7 +188,7 @@ impl CustodyProvider {
                     Ok(provision) => provision,
                     Err(_) => return invalid_request(),
                 };
-                match state.share_store.provision_node_share(
+                match state.share_store.provision_node_share_classified(
                     provision.custody_node_provisioning_record(),
                     provision.signed_runtime_custody_provisioning(),
                     state.expected_runtime_issuer,
@@ -192,6 +196,13 @@ impl CustodyProvider {
                     now,
                 ) {
                     Ok(_) => typed_response(CustodyProviderResponseV1::new_provisioned(provision)),
+                    // The store was never touched, so the caller can keep its
+                    // mint open instead of stranding it. Expiry, a binding
+                    // mismatch and a bad runtime signature all land here.
+                    Err(error) if error.proves_not_stored() => ProviderResponse::error(
+                        PROVISIONING_REFUSED_ERROR_CODE,
+                        "custody provider refused the node share before storing it",
+                    ),
                     Err(_) => ProviderResponse::error(
                         BACKEND_ERROR_CODE,
                         "custody provider could not provision the node share",

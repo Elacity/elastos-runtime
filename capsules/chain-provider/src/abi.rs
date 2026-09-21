@@ -288,6 +288,66 @@ pub(super) fn decode_protected_content_listing(
     })
 }
 
+/// `keccak256("ItemListed(address,address,uint256,uint256,uint256,address)")`.
+///
+/// Since the v3 protocol bundled listing into minting, the trade gateway emits
+/// this inside the mint transaction itself -- along with the `ApprovalForAll`
+/// that used to be a separate call a creator had to sign. A mint receipt
+/// therefore already carries the listing it created, which is why the creator
+/// tail no longer reads it back from chain state.
+pub(super) const PROTECTED_CONTENT_ITEM_LISTED_TOPIC0: &str =
+    "0x90aecdd7f5269ac7f11bea516b4768d0391e0a54aabc19aea64c7758104f66d2";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProtectedContentItemListedLog {
+    pub(super) seller: String,
+    pub(super) operative: String,
+    pub(super) token_id: String,
+    pub(super) listing: ProtectedContentListingRead,
+}
+
+/// Decode one `ItemListed`, in the same shape as the `listing` call it replaces
+/// so that a caller cannot tell where the facts came from.
+pub(super) fn decode_protected_content_item_listed_log(
+    entry: &Value,
+) -> Result<ProtectedContentItemListedLog, String> {
+    let topics = entry
+        .get("topics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ItemListed log topics missing".to_string())?;
+    if topics.len() != 4 {
+        return Err("ItemListed log must contain exactly four topics".to_string());
+    }
+    let seller = topic_to_address(topics.get(1), "seller topic")?;
+    let operative = topic_to_address(topics.get(2), "op topic")?;
+    let token_id = topics
+        .get(3)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ItemListed tkId topic missing".to_string())
+        .and_then(|value| decode_hex(value, Some(32), "ItemListed tkId topic"))
+        .map(|bytes| normalize_hex_quantity_bytes(&bytes))?;
+    let data = entry
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ItemListed log data missing".to_string())?;
+    let data_bytes = decode_hex(data, None, "ItemListed log data")?;
+    // quantity, pricePerToken, payToken -- the three unindexed parameters, and
+    // exactly the three words the `listing` call returns.
+    if data_bytes.len() != 96 {
+        return Err("ItemListed log data must contain exactly three ABI words".to_string());
+    }
+    Ok(ProtectedContentItemListedLog {
+        seller,
+        operative,
+        token_id,
+        listing: ProtectedContentListingRead {
+            quantity: normalize_hex_quantity_bytes(&data_bytes[0..32]),
+            price: normalize_hex_quantity_bytes(&data_bytes[32..64]),
+            pay_token: word_to_address(&data_bytes[64..96])?,
+        },
+    })
+}
+
 pub(super) fn decode_protected_content_asset_created_log(
     entry: &Value,
 ) -> Result<ProtectedContentAssetCreatedLog, String> {

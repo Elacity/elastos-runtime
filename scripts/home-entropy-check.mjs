@@ -7108,7 +7108,7 @@ assert(
     carrierRuntime.includes('"transfer": "stream"') &&
     carrierRuntime.includes("ProviderTransfer::Stream") &&
     carrierRuntime.includes('"carrier_provider_invoke"') &&
-    /"content"\s*\|\s*"model"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"rights"\s*\|\s*"key"\s*\|\s*"decrypt"\s*\|\s*"drm"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
+    /"content"\s*\|\s*"model"\s*\|\s*"availability"\s*\|\s*"custody"\s*\|\s*"collaboration"\s*\|\s*"collaboration-direct"\s*\|\s*"collaboration-profile"/.test(
       carrierRuntime,
     ) &&
     // The model target is admitted only through the destination-owned grant

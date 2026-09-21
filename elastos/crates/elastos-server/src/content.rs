@@ -3371,6 +3371,12 @@ impl ContentProvider {
                 "content publish exceeds the principal storage quota",
             ));
         }
+        // Writing bytes into the local store and replicating them across the
+        // availability plane are different orders of magnitude -- the first is
+        // local I/O, the second waits on other nodes -- so they are timed
+        // apart. A publish that takes minutes is almost always the second, and
+        // saying so should not require inferring it.
+        let started = std::time::Instant::now();
         let ipfs_response = self
             .invoke_provider(
                 &registry,
@@ -3381,24 +3387,46 @@ impl ContentProvider {
             )
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
+        tracing::debug!(
+            phase = "ipfs_add",
+            op = %ipfs_op,
+            bytes = accounting_observation.bytes.unwrap_or_default(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "content publish phase"
+        );
         let local_outcome = AvailabilityOutcome::local_publish(pin);
         let outcome = if pin {
-            self.ensure_network_availability(
-                &registry,
-                &cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: object_did.as_deref(),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation,
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome)
+            let started = std::time::Instant::now();
+            let ensured = self
+                .ensure_network_availability(
+                    &registry,
+                    &cid,
+                    request,
+                    &local_outcome,
+                    AvailabilityRequestContext {
+                        object_did: object_did.as_deref(),
+                        publisher_did: publisher_did.as_deref(),
+                        accounting_observation,
+                    },
+                )
+                .await?
+                .unwrap_or(local_outcome);
+            tracing::debug!(
+                phase = "availability_ensure",
+                status = %ensured.status,
+                replicas = ensured.replicas,
+                elapsed_ms = started.elapsed().as_millis(),
+                "content publish phase"
+            );
+            ensured
         } else {
             local_outcome
         };
+        // The tail after availability. Measured at ~14 s for a 29 KB object
+        // while a Mainline DHT put_mutable timed out on the same millisecond,
+        // which is a coincidence worth either proving or discarding: the work
+        // here is local file writes and should be immeasurable.
+        let tail_started = std::time::Instant::now();
         let receipt = self.write_receipt(ReceiptInput {
             cid: cid.clone(),
             object_did,
@@ -3420,7 +3448,18 @@ impl ContentProvider {
                 storage_quota,
             ),
         })?;
+        let receipt_ms = tail_started.elapsed().as_millis();
         let repair_task = self.record_repair_task(&receipt, &outcome, requirements, false)?;
+        tracing::debug!(
+            phase = "publish_tail",
+            receipt_ms,
+            repair_task_ms = tail_started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(receipt_ms),
+            total_ms = tail_started.elapsed().as_millis(),
+            "content publish phase"
+        );
 
         Ok(provider_ok(json!({
             "cid": cid,
@@ -3825,7 +3864,12 @@ impl ContentProvider {
             ));
         }
 
-        let local_outcome = AvailabilityOutcome {
+        // An import is a publisher handing this peer one exact copy to hold,
+        // so the verified local pin is the whole placement. It is never
+        // forwarded to the configured external placement service: the
+        // publisher counts this peer as one distinct replica, and a copy that
+        // already exists here must not fail because an unrelated service does.
+        let outcome = AvailabilityOutcome {
             provider: "ipfs-provider".to_string(),
             policy: "carrier_object_import".to_string(),
             status: "local_pinned".to_string(),
@@ -3838,23 +3882,6 @@ impl ContentProvider {
             repair_graph: local_repair_graph_json(),
             abuse_controls: local_abuse_controls_json(),
         };
-        let outcome = self
-            .ensure_network_availability(
-                &registry,
-                cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: request.get("object_did").and_then(|value| value.as_str()),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation: ContentAccountingObservation {
-                        files: Some(file_count as u64),
-                        bytes: Some(total_bytes as u64),
-                    },
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome);
         let object_did = request
             .get("object_did")
             .and_then(|value| value.as_str())
@@ -10988,6 +11015,65 @@ mod tests {
 
         let requests = availability.requests.lock().await;
         assert_eq!(requests.len(), 2);
+    }
+
+    /// `import_object` is the Carrier replica fallback: a publisher hands this
+    /// peer the exact object and asks it to hold one copy. Reproducing the
+    /// root CID and pinning it is the whole placement, exactly as for the
+    /// `carrier_replica` ensure above.
+    ///
+    /// The import must therefore never be forwarded to the configured
+    /// external placement service. Doing so made every protected-content
+    /// replica on the custody hosts fail against the then Compose placeholder
+    /// `https://replica.invalid/ensure`, so a mint that had placed all three
+    /// copies settled `repair_needed` with one.
+    #[tokio::test]
+    async fn carrier_object_import_proves_the_local_copy_without_external_placement() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "availability": {
+                    "status": "repair_needed",
+                    "provider": "availability-provider",
+                    "policy": "network_default",
+                    "replicas": 0,
+                    "reason": "https://replica.invalid/ensure is unreachable",
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+
+        let response = content
+            .send_raw(&json!({
+                "op": "import_object",
+                "cid": TEST_CID,
+                "object_kind": "document",
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher",
+                "files": [{"path": "index.md", "data": "IyBUZXN0Cg=="}],
+                "_runtime_invocation": carrier_import_object_invocation(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["availability"]["status"], "local_pinned");
+        assert_eq!(response["data"]["availability"]["replicas"], 1);
+        assert_eq!(
+            response["data"]["availability"]["policy"],
+            "carrier_object_import"
+        );
+        assert_eq!(response["data"]["import"]["verified_cid"], true);
+        assert_eq!(
+            ipfs.added_directories.lock().await.len(),
+            1,
+            "the copy must really be added before it is claimed"
+        );
+        assert!(
+            availability.requests.lock().await.is_empty(),
+            "a replica import must not depend on an unrelated external placement service"
+        );
     }
 
     #[tokio::test]

@@ -29,6 +29,42 @@ const MAX_STORE_FILE_BYTES: usize =
     STORE_HEADER_BYTES + MAX_RECORD_BYTES + MAX_SIGNED_PROVISIONING_BYTES + STORE_DIGEST_BYTES;
 const MAX_NODE_SHARE_RECORDS: usize = 4096;
 
+/// A provisioning failure, classified by whether the store was reached.
+///
+/// `RefusedBeforeWrite` is a proof: the share was not stored. `StoreUncertain`
+/// is the absence of one — it covers failures before, during and after the
+/// durable write alike, and a caller must treat it as "may have been stored".
+#[derive(Debug, Error)]
+pub enum NodeShareProvisionErrorV1 {
+    #[error("node share provisioning was refused before the store was touched")]
+    RefusedBeforeWrite(#[source] crate::CustodyError),
+    #[error("node share provisioning outcome is uncertain")]
+    StoreUncertain(#[source] crate::CustodyError),
+}
+
+impl NodeShareProvisionErrorV1 {
+    /// Whether this failure proves the share was not stored.
+    #[must_use]
+    pub const fn proves_not_stored(&self) -> bool {
+        matches!(self, Self::RefusedBeforeWrite(_))
+    }
+
+    #[must_use]
+    pub fn into_cause(self) -> crate::CustodyError {
+        match self {
+            Self::RefusedBeforeWrite(cause) | Self::StoreUncertain(cause) => cause,
+        }
+    }
+}
+
+/// The result of everything that precedes the store, carried across the
+/// boundary so the two halves cannot be accidentally re-interleaved.
+struct PreparedNodeShareV1 {
+    entry: StoreEntryV1,
+    receipt: NodeLocalShareReceiptV1,
+    node_share: NodeLocalStoredShareV1,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NodeLocalShareStoreErrorV1 {
     #[error("node share store is unavailable")]
@@ -138,6 +174,68 @@ impl NodeLocalShareStoreV1 {
         node_custody_secret: &NodeCustodySecretKeyV1,
         now: u64,
     ) -> Result<ProvisionedNodeLocalShareV1, crate::CustodyError> {
+        self.provision_node_share_classified(
+            record,
+            signed_provisioning,
+            expected_runtime_issuer,
+            node_custody_secret,
+            now,
+        )
+        .map_err(NodeShareProvisionErrorV1::into_cause)
+    }
+
+    /// The same provisioning, reporting whether the failure happened before the
+    /// store was touched.
+    ///
+    /// A caller holding a durable journal has to decide whether a failed call
+    /// might have left a share behind. That question is answered by *where* the
+    /// failure happened, not by which error it was, so the boundary is drawn
+    /// structurally: everything up to `ensure_root_dir` is computation and
+    /// verification against the supplied record and cannot write, and from the
+    /// lock onward the store is in play. The second half is reported as
+    /// uncertain even where a particular path happens to be harmless — an
+    /// unknown effect must never be reported as an absent one.
+    pub fn provision_node_share_classified(
+        &self,
+        record: &CustodyNodeProvisioningRecordV1,
+        signed_provisioning: &SignedRuntimeCustodyProvisioningV1,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+        node_custody_secret: &NodeCustodySecretKeyV1,
+        now: u64,
+    ) -> Result<ProvisionedNodeLocalShareV1, NodeShareProvisionErrorV1> {
+        let prepared = self
+            .prepare_node_share(
+                record,
+                signed_provisioning,
+                expected_runtime_issuer,
+                node_custody_secret,
+                now,
+            )
+            .map_err(NodeShareProvisionErrorV1::RefusedBeforeWrite)?;
+        let PreparedNodeShareV1 {
+            entry,
+            receipt,
+            node_share,
+        } = prepared;
+        self.commit_node_share(
+            entry,
+            receipt,
+            node_share,
+            expected_runtime_issuer,
+            node_custody_secret,
+        )
+        .map_err(NodeShareProvisionErrorV1::StoreUncertain)
+    }
+
+    /// Everything that precedes the store. Nothing here can write.
+    fn prepare_node_share(
+        &self,
+        record: &CustodyNodeProvisioningRecordV1,
+        signed_provisioning: &SignedRuntimeCustodyProvisioningV1,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+        node_custody_secret: &NodeCustodySecretKeyV1,
+        now: u64,
+    ) -> Result<PreparedNodeShareV1, crate::CustodyError> {
         let record_bytes = canonical_record_bytes(record)?;
         let signed_bytes = canonical_signed_provisioning_bytes(signed_provisioning)?;
         let authenticated =
@@ -165,6 +263,23 @@ impl NodeLocalShareStoreV1 {
             receipt_hash: receipt.receipt_hash(),
         };
 
+        Ok(PreparedNodeShareV1 {
+            entry,
+            receipt,
+            node_share,
+        })
+    }
+
+    /// Everything from the store lock onward, including the paths that can fail
+    /// after the durable write.
+    fn commit_node_share(
+        &self,
+        entry: StoreEntryV1,
+        receipt: NodeLocalShareReceiptV1,
+        node_share: NodeLocalStoredShareV1,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
+        node_custody_secret: &NodeCustodySecretKeyV1,
+    ) -> Result<ProvisionedNodeLocalShareV1, crate::CustodyError> {
         self.ensure_root_dir()?;
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.cleanup_stale_temps()?;
@@ -1307,6 +1422,83 @@ mod tests {
             ))
         ));
         assert!(temp_path.exists());
+    }
+
+    /// The classification a caller's abort decision rests on. Everything that
+    /// fails before the store is touched — an expired statement above all —
+    /// must prove the share was not written, and a failure from inside the
+    /// store must not, even when it happens to be harmless.
+    #[test]
+    fn node_share_store_classifies_refusals_by_whether_the_store_was_reached() {
+        let temp = temp_root();
+        let node_store = store(temp.path(), 1);
+        let record = provisioning_record(1);
+        let signed = signed_provisioning(&record, 0x7a, 0xf1, NOW, NOW + 60);
+
+        for (issuer_seed, secret_seed, now, case) in [
+            (0x7bu8, 1u8, NOW + 1, "wrong runtime issuer"),
+            (0x7a, 2, NOW + 1, "wrong node custody secret"),
+            (0x7a, 1, NOW + 60, "expired provisioning statement"),
+        ] {
+            let error = node_store
+                .provision_node_share_classified(
+                    &record,
+                    &signed,
+                    runtime_issuer(issuer_seed),
+                    &node_custody_secret(secret_seed),
+                    now,
+                )
+                .expect_err(case);
+            assert!(
+                error.proves_not_stored(),
+                "{case} is raised before the store is touched"
+            );
+        }
+
+        // None of those reached the store, so it holds nothing.
+        assert!(node_store
+            .load_node_share(
+                record.key_envelope_identity(),
+                runtime_issuer(0x7a),
+                &node_custody_secret(1),
+            )
+            .is_err());
+
+        // The same classified path still stores a good request.
+        assert!(node_store
+            .provision_node_share_classified(
+                &record,
+                &signed,
+                runtime_issuer(0x7a),
+                &node_custody_secret(1),
+                NOW + 1,
+            )
+            .is_ok());
+        assert!(node_store
+            .load_node_share(
+                record.key_envelope_identity(),
+                runtime_issuer(0x7a),
+                &node_custody_secret(1),
+            )
+            .is_ok());
+
+        // A slot conflict is refused from inside the store. It happens to leave
+        // this share unwritten, but the boundary is structural, so it is
+        // reported as uncertain rather than as proof.
+        let different_operation = signed_provisioning(&record, 0x7a, 0xf2, NOW, NOW + 60);
+        let conflict = node_store
+            .provision_node_share_classified(
+                &record,
+                &different_operation,
+                runtime_issuer(0x7a),
+                &node_custody_secret(1),
+                NOW + 1,
+            )
+            .expect_err("a different operation for the same slot conflicts");
+        assert!(
+            !conflict.proves_not_stored(),
+            "a failure from inside the store never proves the share is absent"
+        );
     }
 
     #[test]

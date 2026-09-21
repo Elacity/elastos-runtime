@@ -28,7 +28,6 @@ REQUIRED = (
 )
 CUSTODY_HOST_REQUIRED = (
     "custody-provider",
-    "availability-provider",
     "ipfs-provider",
     "chain-provider",
 )

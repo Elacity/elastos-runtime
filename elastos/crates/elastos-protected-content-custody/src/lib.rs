@@ -23,7 +23,7 @@ use thiserror::Error;
 pub use node_share::NodeLocalStoredShareV1;
 pub use node_store::{
     NodeLocalShareReceiptV1, NodeLocalShareStoreErrorV1, NodeLocalShareStoreV1,
-    ProvisionedNodeLocalShareV1,
+    NodeShareProvisionErrorV1, ProvisionedNodeLocalShareV1,
 };
 pub use payload::{
     decrypt_payload_to_staging_writer_from_authenticated_operation_v1, framed_chunk_ranges_v1,

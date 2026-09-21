@@ -25,8 +25,7 @@ use thiserror::Error;
 use crate::{
     PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
     RuntimeCustodyTerminalKind, RuntimeMintDraft, RuntimeMintJournal, RuntimeMintJournalError,
-    RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeProviderCallError,
-    RuntimeVerifiedContentAvailability,
+    RuntimeMintNodeBinding, RuntimeMintNodeReceipt, RuntimeVerifiedContentAvailability,
 };
 
 const PROVISIONING_ID_DOMAIN: &[u8] =
@@ -273,6 +272,7 @@ pub struct RuntimeMintCoordinator<'a> {
     expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
     sign_statement: Box<RuntimeMintSigner>,
     selected: Vec<RuntimeMintSelectedNode<'a>>,
+    dispatch_clock: Option<fn() -> u64>,
 }
 
 impl fmt::Debug for RuntimeMintCoordinator<'_> {
@@ -318,7 +318,31 @@ impl<'a> RuntimeMintCoordinator<'a> {
             expected_runtime_issuer,
             sign_statement: Box::new(sign_statement),
             selected,
+            dispatch_clock: None,
         })
+    }
+
+    /// Stamp each node's provisioning statement from a live clock instead of
+    /// the operation-start `now`. A mint reads `now` before protection, and
+    /// protection is unbounded — encrypting and fragmenting a large source
+    /// routinely outlives the
+    /// `MAX_RUNTIME_CUSTODY_PROVISIONING_LIFETIME_SECS` window, so a frozen
+    /// `now` hands every node a statement that expired before it was sent.
+    /// The same drift accumulates *inside* the fan-out: the third node
+    /// receives a statement stamped before the first node was even called.
+    /// The clock is only ever moved forward — `now_unix_seconds` remains the
+    /// floor — so an injected clock can never backdate a statement.
+    #[must_use]
+    pub fn with_dispatch_clock(mut self, dispatch_clock: fn() -> u64) -> Self {
+        self.dispatch_clock = Some(dispatch_clock);
+        self
+    }
+
+    fn dispatch_now(&self, floor_unix_seconds: u64) -> u64 {
+        match self.dispatch_clock {
+            Some(clock) => clock().max(floor_unix_seconds),
+            None => floor_unix_seconds,
+        }
     }
 
     pub async fn provision(
@@ -344,16 +368,20 @@ impl<'a> RuntimeMintCoordinator<'a> {
         }
         for node in draft.nodes() {
             let selected = self.selected_for(node.node_public_key())?;
-            self.journal
-                .mark_node_effect_started(draft.mint_id(), node.node_public_key())?;
+            let dispatched_at = self.dispatch_now(now_unix_seconds);
+            // Build before marking: signing the statement is local and cannot
+            // reach the node, so a failure here must not leave the record
+            // claiming an effect started.
             let request = signed_provision_request(
                 draft,
                 envelope,
                 node,
                 self.expected_runtime_issuer,
                 self.sign_statement.as_ref(),
-                now_unix_seconds,
+                dispatched_at,
             )?;
+            self.journal
+                .mark_node_effect_started(draft.mint_id(), node.node_public_key())?;
             match selected.custody.provision_node_share(&request).await {
                 Ok(response) => {
                     response
@@ -361,7 +389,7 @@ impl<'a> RuntimeMintCoordinator<'a> {
                             &request,
                             self.expected_runtime_issuer,
                             node.node_public_key(),
-                            now_unix_seconds,
+                            self.dispatch_now(dispatched_at),
                         )
                         .map_err(|_| RuntimeMintCoordinatorError::ProviderResult)?;
                     let receipt = RuntimeMintNodeReceipt::new(
@@ -376,7 +404,19 @@ impl<'a> RuntimeMintCoordinator<'a> {
                     )?;
                     self.journal.mark_node_receipt(draft.mint_id(), receipt)?;
                 }
-                Err(RuntimeProviderCallError::NoExactResult) => {
+                // Either way the fan-out is over: the envelope these shares
+                // were sealed against lives only for this request, so nothing
+                // can continue it afterwards. What differs is what was left
+                // behind, and that is recorded per node before the record is
+                // closed -- a node that says it refused before writing strands
+                // nothing, and is no longer counted among those that might.
+                Err(error) => {
+                    if error.proves_no_effect() {
+                        self.journal.mark_node_refused_without_effect(
+                            draft.mint_id(),
+                            node.node_public_key(),
+                        )?;
+                    }
                     let aborted = self
                         .journal
                         .mark_aborted_partial_provision(draft.mint_id())?;
@@ -452,7 +492,7 @@ impl RuntimeMintCoordinator<'_> {
             Some(RuntimeCustodyTerminalKind::AbortedPartialProvision) => {
                 Ok(Some(abort_outcome(persisted)))
             }
-            None if persisted.any_effect_started() => {
+            None if persisted.any_effect_uncertain() => {
                 Ok(Some(RuntimeMintCoordinatorOutcome::Nonterminal {
                     mint_id: persisted.draft().mint_id(),
                     reason: RuntimeMintNonterminalReason::ProviderEffectAlreadyStarted,
@@ -548,6 +588,7 @@ fn mint_node_provisioning_id(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -575,18 +616,43 @@ mod tests {
 
     use super::*;
     use crate::test_media;
-    use crate::RuntimeMintJournal;
+    use crate::{RuntimeMintJournal, RuntimeProviderCallError};
 
     const NOW: u64 = 2_000_000_000;
     const RUNTIME_SEED: u8 = 0x71;
     const PQ_HYBRID_AEAD_NONCE_BYTES: usize = 12;
     const PQ_HYBRID_WRAPPED_SHARE_BYTES: usize = 48;
 
+    thread_local! {
+        /// Wall clock shared by the injected dispatch clock and the fakes that
+        /// advance it, so a test can make a node call *take* time. Thread-local
+        /// because `#[tokio::test]` gives each test its own thread and a
+        /// current-thread runtime, so no test can see another's clock.
+        static DISPATCH_CLOCK_SECS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn dispatch_clock() -> u64 {
+        DISPATCH_CLOCK_SECS.with(Cell::get)
+    }
+
+    fn set_dispatch_clock(unix_seconds: u64) {
+        DISPATCH_CLOCK_SECS.with(|clock| clock.set(unix_seconds));
+    }
+
+    fn advance_dispatch_clock(seconds: u64) {
+        DISPATCH_CLOCK_SECS.with(|clock| clock.set(clock.get() + seconds));
+    }
+
     struct FakeMintCustody {
         expected_issuer: RuntimeOperationIssuerKeyV1,
         node: NodePublicKey,
         fail: bool,
+        /// What `fail` returns. Defaults to the effect-uncertain variant.
+        refusal: RuntimeProviderCallError,
         now: u64,
+        /// `Some(seconds)` validates against `DISPATCH_CLOCK_SECS` and then
+        /// advances it, standing in for the time this node's call took.
+        call_duration_secs: Option<u64>,
         journal_root: PathBuf,
         mint_id: Digest32,
         requests: Mutex<Vec<CustodyProviderRequestV1>>,
@@ -598,15 +664,35 @@ mod tests {
                 expected_issuer: runtime_issuer(),
                 node,
                 fail,
+                refusal: RuntimeProviderCallError::NoExactResult,
                 now: NOW + 10,
+                call_duration_secs: None,
                 journal_root,
                 mint_id,
                 requests: Mutex::new(Vec::new()),
             }
         }
 
+        fn refusing(mut self, refusal: RuntimeProviderCallError) -> Self {
+            self.fail = true;
+            self.refusal = refusal;
+            self
+        }
+
+        fn taking(mut self, call_duration_secs: u64) -> Self {
+            self.call_duration_secs = Some(call_duration_secs);
+            self
+        }
+
         fn request_count(&self) -> usize {
             self.requests.lock().unwrap().len()
+        }
+
+        fn validation_now(&self) -> u64 {
+            match self.call_duration_secs {
+                Some(_) => dispatch_clock(),
+                None => self.now,
+            }
         }
     }
 
@@ -629,7 +715,7 @@ mod tests {
             }
             self.requests.lock().unwrap().push(request.clone());
             if self.fail {
-                return Err(RuntimeProviderCallError::NoExactResult);
+                return Err(self.refusal);
             }
             let bytes = request
                 .to_json_vec()
@@ -638,9 +724,12 @@ mod tests {
                 &bytes,
                 self.expected_issuer,
                 self.node,
-                self.now,
+                self.validation_now(),
             )
             .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
+            if let Some(seconds) = self.call_duration_secs {
+                advance_dispatch_clock(seconds);
+            }
             let provision = validated
                 .provision_node_share()
                 .map_err(|_| RuntimeProviderCallError::NoExactResult)?;
@@ -1160,6 +1249,321 @@ mod tests {
         assert_eq!(replay, outcome);
         assert_eq!(node1.request_count(), 1);
         assert_eq!(node3.request_count(), 0);
+    }
+
+    /// Protection is unbounded; the mint reads `now` before it starts. A mint
+    /// whose protect step outlived
+    /// `MAX_RUNTIME_CUSTODY_PROVISIONING_LIFETIME_SECS` must still provision,
+    /// because the statement is stamped when the node is called, not when the
+    /// operation began.
+    #[tokio::test]
+    async fn clock_read_at_dispatch_survives_a_long_protect_step() {
+        let temp = tempdir().unwrap();
+        let journal_root = owner_only_journal_root(&temp);
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let nodes = [1u8, 2, 3].map(|seed| {
+            FakeMintCustody::new(
+                node_public_key(seed),
+                false,
+                journal_root.clone(),
+                draft.mint_id(),
+            )
+        });
+        let [node1, node2, node3] = &nodes;
+        let coordinator = coordinator_with(
+            RuntimeMintJournal::new(&journal_root),
+            vec![
+                RuntimeMintSelectedNode::new(binding(1), node1),
+                RuntimeMintSelectedNode::new(binding(2), node2),
+                RuntimeMintSelectedNode::new(binding(3), node3),
+            ],
+        )
+        .with_dispatch_clock(|| NOW + 10);
+
+        // Ten minutes of protection before the first node is called.
+        let protect_started_at = NOW + 10 - 600;
+        let outcome = coordinator
+            .provision(&draft, &envelope, protect_started_at)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RuntimeMintCoordinatorOutcome::CustodyProvisioned {
+                mint_id: draft.mint_id()
+            }
+        );
+        assert_eq!(node1.request_count(), 1);
+        assert_eq!(node3.request_count(), 1);
+    }
+
+    /// The same mint without an injected clock: the statement expired before it
+    /// was sent, every node refuses it, and the first refusal is a durable
+    /// abort. This is the failure the dispatch clock exists to remove.
+    #[tokio::test]
+    async fn frozen_operation_clock_aborts_after_a_long_protect_step() {
+        let temp = tempdir().unwrap();
+        let journal_root = owner_only_journal_root(&temp);
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let nodes = [1u8, 2, 3].map(|seed| {
+            FakeMintCustody::new(
+                node_public_key(seed),
+                false,
+                journal_root.clone(),
+                draft.mint_id(),
+            )
+        });
+        let [node1, node2, node3] = &nodes;
+        let coordinator = coordinator_with(
+            RuntimeMintJournal::new(&journal_root),
+            vec![
+                RuntimeMintSelectedNode::new(binding(1), node1),
+                RuntimeMintSelectedNode::new(binding(2), node2),
+                RuntimeMintSelectedNode::new(binding(3), node3),
+            ],
+        );
+
+        let outcome = coordinator
+            .provision(&draft, &envelope, NOW + 10 - 600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RuntimeMintCoordinatorOutcome::AbortedPartialProvision {
+                mint_id: draft.mint_id(),
+                accepted_orphan_count: 0,
+            }
+        );
+        assert_eq!(node1.request_count(), 1);
+        assert_eq!(node2.request_count(), 0);
+        assert_eq!(node3.request_count(), 0);
+    }
+
+    /// Drift also accumulates inside the fan-out. Three nodes taking 45s each
+    /// put the last dispatch 90s after the first, past the statement lifetime;
+    /// each node must get its own freshly stamped statement.
+    #[tokio::test]
+    async fn each_node_in_the_fan_out_is_stamped_at_its_own_dispatch() {
+        set_dispatch_clock(NOW + 10);
+        let temp = tempdir().unwrap();
+        let journal_root = owner_only_journal_root(&temp);
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let nodes = [1u8, 2, 3].map(|seed| {
+            FakeMintCustody::new(
+                node_public_key(seed),
+                false,
+                journal_root.clone(),
+                draft.mint_id(),
+            )
+            .taking(45)
+        });
+        let [node1, node2, node3] = &nodes;
+        let coordinator = coordinator_with(
+            RuntimeMintJournal::new(&journal_root),
+            vec![
+                RuntimeMintSelectedNode::new(binding(1), node1),
+                RuntimeMintSelectedNode::new(binding(2), node2),
+                RuntimeMintSelectedNode::new(binding(3), node3),
+            ],
+        )
+        .with_dispatch_clock(dispatch_clock);
+
+        let outcome = coordinator
+            .provision(&draft, &envelope, NOW + 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RuntimeMintCoordinatorOutcome::CustodyProvisioned {
+                mint_id: draft.mint_id()
+            }
+        );
+        assert_eq!(node3.request_count(), 1);
+        assert_eq!(dispatch_clock(), NOW + 10 + 135);
+    }
+
+    /// A node that says it refused before writing strands nothing *on that
+    /// node*, and the record says so -- but the fan-out is still over, because
+    /// the envelope these shares were sealed against does not outlive the
+    /// request. The mint closes, and what it left behind is legible: one share
+    /// accepted, and nobody left who might be holding another.
+    #[tokio::test]
+    async fn refusal_without_effect_closes_the_mint_and_records_what_was_left() {
+        let temp = tempdir().unwrap();
+        let journal_root = owner_only_journal_root(&temp);
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let node1 = FakeMintCustody::new(
+            node_public_key(1),
+            false,
+            journal_root.clone(),
+            draft.mint_id(),
+        );
+        let node2 = FakeMintCustody::new(
+            node_public_key(2),
+            false,
+            journal_root.clone(),
+            draft.mint_id(),
+        )
+        .refusing(RuntimeProviderCallError::RefusedWithoutEffect);
+        let node3 = FakeMintCustody::new(
+            node_public_key(3),
+            false,
+            journal_root.clone(),
+            draft.mint_id(),
+        );
+        let coordinator = coordinator_with(
+            RuntimeMintJournal::new(&journal_root),
+            vec![
+                RuntimeMintSelectedNode::new(binding(1), &node1),
+                RuntimeMintSelectedNode::new(binding(2), &node2),
+                RuntimeMintSelectedNode::new(binding(3), &node3),
+            ],
+        );
+
+        assert_eq!(
+            coordinator
+                .provision(&draft, &envelope, NOW + 10)
+                .await
+                .unwrap(),
+            RuntimeMintCoordinatorOutcome::AbortedPartialProvision {
+                mint_id: draft.mint_id(),
+                accepted_orphan_count: 1,
+            }
+        );
+        assert_eq!(node3.request_count(), 0);
+
+        let loaded = RuntimeMintJournal::new(&journal_root)
+            .load(draft.mint_id())
+            .unwrap();
+        assert_eq!(
+            loaded.custody_terminal(),
+            Some(RuntimeCustodyTerminalKind::AbortedPartialProvision),
+            "a fan-out that cannot continue must close, whatever the reason"
+        );
+        assert_eq!(loaded.accepted_orphans().len(), 1);
+        assert_eq!(
+            loaded.uncertain_node_count(),
+            0,
+            "the refusing node said it stored nothing and the third was never \
+             called, so nobody is left who might be holding a share"
+        );
+    }
+
+    /// The same shape with an effect-uncertain refusal still aborts durably:
+    /// an unknown effect is not an absent one.
+    #[tokio::test]
+    async fn effect_uncertain_refusal_still_aborts_durably() {
+        let temp = tempdir().unwrap();
+        let journal_root = owner_only_journal_root(&temp);
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let node1 = FakeMintCustody::new(
+            node_public_key(1),
+            false,
+            journal_root.clone(),
+            draft.mint_id(),
+        );
+        let node2 = FakeMintCustody::new(
+            node_public_key(2),
+            false,
+            journal_root.clone(),
+            draft.mint_id(),
+        )
+        .refusing(RuntimeProviderCallError::NoExactResult);
+        let node3 = FakeMintCustody::new(
+            node_public_key(3),
+            false,
+            journal_root.clone(),
+            draft.mint_id(),
+        );
+        let coordinator = coordinator_with(
+            RuntimeMintJournal::new(&journal_root),
+            vec![
+                RuntimeMintSelectedNode::new(binding(1), &node1),
+                RuntimeMintSelectedNode::new(binding(2), &node2),
+                RuntimeMintSelectedNode::new(binding(3), &node3),
+            ],
+        );
+
+        assert_eq!(
+            coordinator
+                .provision(&draft, &envelope, NOW + 10)
+                .await
+                .unwrap(),
+            RuntimeMintCoordinatorOutcome::AbortedPartialProvision {
+                mint_id: draft.mint_id(),
+                accepted_orphan_count: 1,
+            }
+        );
+        assert_eq!(node3.request_count(), 0);
+        let loaded = RuntimeMintJournal::new(&journal_root)
+            .load(draft.mint_id())
+            .unwrap();
+        assert_eq!(
+            loaded.custody_terminal(),
+            Some(RuntimeCustodyTerminalKind::AbortedPartialProvision)
+        );
+        assert_eq!(
+            loaded.uncertain_node_count(),
+            1,
+            "the node was called and never answered usefully, so it may be \
+             holding a share and the record must keep saying so"
+        );
+    }
+
+    /// Only the two variants whose contract guarantees the refusal precedes any
+    /// durable write may claim it. Unknown is never absent.
+    #[test]
+    fn only_dispatch_and_pre_write_refusals_prove_no_effect() {
+        assert!(RuntimeProviderCallError::NotDispatched.proves_no_effect());
+        assert!(RuntimeProviderCallError::RefusedWithoutEffect.proves_no_effect());
+        assert!(!RuntimeProviderCallError::NoExactResult.proves_no_effect());
+    }
+
+    /// An injected clock that runs behind the operation's `now` must never
+    /// backdate a statement: `now_unix_seconds` is the floor.
+    #[tokio::test]
+    async fn dispatch_clock_never_moves_a_statement_backwards() {
+        let temp = tempdir().unwrap();
+        let journal_root = owner_only_journal_root(&temp);
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let nodes = [1u8, 2, 3].map(|seed| {
+            FakeMintCustody::new(
+                node_public_key(seed),
+                false,
+                journal_root.clone(),
+                draft.mint_id(),
+            )
+        });
+        let [node1, node2, node3] = &nodes;
+        let coordinator = coordinator_with(
+            RuntimeMintJournal::new(&journal_root),
+            vec![
+                RuntimeMintSelectedNode::new(binding(1), node1),
+                RuntimeMintSelectedNode::new(binding(2), node2),
+                RuntimeMintSelectedNode::new(binding(3), node3),
+            ],
+        )
+        .with_dispatch_clock(|| NOW - 5_000);
+
+        let outcome = coordinator
+            .provision(&draft, &envelope, NOW + 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RuntimeMintCoordinatorOutcome::CustodyProvisioned {
+                mint_id: draft.mint_id()
+            }
+        );
     }
 
     #[tokio::test]
