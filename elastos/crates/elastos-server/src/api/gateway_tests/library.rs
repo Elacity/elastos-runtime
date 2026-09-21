@@ -12094,3 +12094,109 @@ async fn test_creator_token_is_refused_library_only_ops() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "op={op}");
     }
 }
+
+/// A copy someone owns can always be built again, and one they do not own
+/// cannot be built at all.
+///
+/// The `.ddrm` file is made of public material — the metadata document the
+/// token URI resolves to, and the content the listing names — so the only
+/// question the door asks is whether the chain grants this account the access
+/// token. Buying and minting both write the file as a side effect and neither
+/// offers a way to ask again, which left a person who owned something and
+/// could not see it with nothing to press.
+#[tokio::test]
+async fn test_runtime_custody_download_rebuilds_an_owned_copy_and_refuses_one_that_is_not() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-download",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x94, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    // The metadata document the token URI resolves to. The rebuild reads it to
+    // learn what the copy protects, exactly as a marketplace indexer would.
+    reset_mock_immutable_content_objects();
+    seed_mock_immutable_content_object(
+        TEST_CIDV0,
+        "protected-content-metadata",
+        "metadata.json",
+        serde_json::to_vec(&json!({
+            "name": "protected-download",
+            "media": { "contentType": "video/mp4" },
+        }))
+        .unwrap(),
+        None,
+        None,
+        Vec::new(),
+    );
+    let app = gateway_router(state);
+    let request = json!({ "mint_id": hex::encode(facts.mint_id.as_bytes()) });
+
+    // The chain says this account holds no such grant. Nothing is written.
+    set_mock_protected_content_purchase_access_denied();
+    let (_, refused) =
+        post_library(app.clone(), &token, "download_owned_copy", request.clone()).await;
+    assert_eq!(refused["status"], "error");
+    assert_eq!(
+        refused["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE
+    );
+
+    // The grant is readable, so the copy is theirs and the file is rebuilt.
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    let (status, built) =
+        post_library(app.clone(), &token, "download_owned_copy", request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(built["status"], "ok", "{built}");
+    assert_eq!(
+        built["data"]["schema"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_SCHEMA_V1
+    );
+    let capsule_uri = built["data"]["capsule_uri"]
+        .as_str()
+        .expect("a rebuilt copy names the file it wrote")
+        .to_string();
+    assert!(capsule_uri.ends_with(".ddrm"), "{capsule_uri}");
+
+    // Asking twice is the whole point: a person presses this when the file is
+    // missing, and pressing it again has to be safe.
+    let (_, again) = post_library(app, &token, "download_owned_copy", request).await;
+    assert_eq!(again["status"], "ok", "{again}");
+    assert_eq!(again["data"]["capsule_uri"], capsule_uri);
+}

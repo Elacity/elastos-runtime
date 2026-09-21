@@ -1444,6 +1444,7 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
             "pay_token",
             "price",
             "published_at",
+            "purchase_in_flight",
             "quantity",
             "schema",
             "seller_address",
@@ -1456,6 +1457,10 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
             .as_str()
             .is_some_and(|uri| uri.starts_with("elastos://")),
         "a listing names the address a creator passes on"
+    );
+    assert_eq!(
+        creator_listing["purchase_in_flight"], false,
+        "nobody is part way through buying this"
     );
     assert_eq!(creator_listing["mime_type"], MEDIA_MIME_TYPE_V1);
     assert_eq!(creator_listing["codecs"], MEDIA_CODECS_V1);

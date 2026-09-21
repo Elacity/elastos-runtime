@@ -375,6 +375,19 @@ enum ObjectProviderRequest {
         principal_id: String,
         mint_id: String,
     },
+    /// Rebuild the local copy of an item this principal owns.
+    ///
+    /// A `.ddrm` capsule is made out of public material: the metadata document
+    /// the token URI resolves to, and the content the listing names. Owning the
+    /// access token is what makes the copy theirs, and that lives on the chain,
+    /// so the local file can always be built again from those same sources.
+    /// Buying and minting both write it as a side effect; this is how a person
+    /// asks for it on its own, when that write never happened, when the file
+    /// was deleted, or when they hold the token on a Home that never held it.
+    DownloadOwnedCopy {
+        principal_id: String,
+        mint_id: String,
+    },
     OpenViewer {
         principal_id: String,
         mint_id: String,
@@ -646,6 +659,7 @@ impl Provider for ObjectProvider {
             | ObjectProviderRequest::ImportRuntimeCustody { .. }
             | ObjectProviderRequest::DiscardProtection { .. }
             | ObjectProviderRequest::Buy { .. }
+            | ObjectProviderRequest::DownloadOwnedCopy { .. }
             | ObjectProviderRequest::OpenViewer { .. }
             | ObjectProviderRequest::ReadViewer { .. }
             | ObjectProviderRequest::CloseViewer { .. }) => {
@@ -699,6 +713,7 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
         | ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::DownloadOwnedCopy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
         | ObjectProviderRequest::CloseViewer { .. } => Err(anyhow!(
@@ -938,6 +953,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::DiscardProtection { .. }
         | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::DownloadOwnedCopy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
         | ObjectProviderRequest::CloseViewer { .. }) => {
@@ -1148,6 +1164,9 @@ fn handle_library_request(
     request: ObjectProviderRequest,
 ) -> anyhow::Result<Value> {
     match request {
+        ObjectProviderRequest::DownloadOwnedCopy { .. } => {
+            unreachable!("download of an owned copy is handled asynchronously")
+        }
         ObjectProviderRequest::Roots { principal_id } => {
             Ok(json!({ "roots": library_roots(data_dir, &principal_id) }))
         }
@@ -1819,6 +1838,26 @@ async fn handle_runtime_custody_library_request(
                 registry,
                 &principal_id,
                 &listing_uri,
+            )
+            .await
+        }
+        ObjectProviderRequest::DownloadOwnedCopy {
+            principal_id,
+            mint_id,
+        } => {
+            let Some((state, authority)) = gateway_authority else {
+                anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE
+                );
+            };
+            crate::api::gateway::runtime_custody_download_owned_copy_via_gateway(
+                state,
+                authority,
+                registry,
+                crate::protected_content_runtime::RuntimeCustodyBuyInput {
+                    principal_id,
+                    mint_id,
+                },
             )
             .await
         }
@@ -3363,6 +3402,9 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
     }
 
     match request {
+        // Named for the same reason `Buy` is: it carries a mint, never a URI,
+        // so no WebSpace path can be hiding in it.
+        ObjectProviderRequest::DownloadOwnedCopy { .. } => false,
         ObjectProviderRequest::List { uri: Some(uri), .. } => any_webspace(&[uri]),
         ObjectProviderRequest::Stat { uri, .. }
         | ObjectProviderRequest::Read { uri, .. }
