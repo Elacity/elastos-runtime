@@ -502,7 +502,7 @@ export function hideAssistantFace({ instant = false } = {}) {
     setFaceOpen(false);
     setPhase(taskbar, "");
     closing = false;
-    toggleEl()?.focus({ preventScroll: true });
+    deps.restoreDockFocus(toggleEl());
   };
 
   if (instant || reducedMotion()) {
@@ -549,7 +549,7 @@ export function hideAssistantFace({ instant = false } = {}) {
       after(RETURN_MS + 16, () => {
         setPhase(taskbar, "");
         closing = false;
-        toggleEl()?.focus({ preventScroll: true });
+        deps.restoreDockFocus(toggleEl());
       });
     });
   });
@@ -567,6 +567,7 @@ export function toggleAssistantFace() {
  * Wire the face once the GUI template is in the DOM.
  * @param {{
  *   easeDockPillWidth: (fromW: number, durationName?: string) => void,
+ *   restoreDockFocus: (item: HTMLElement | null) => void,
  *   targetById: (summary: unknown, targetId: string) => unknown,
  *   launchHomeTarget: (targetId: string, query: object) => Promise<object>,
  *   iframeSandboxForLaunch: (launched: object) => string,

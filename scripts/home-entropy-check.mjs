@@ -2065,6 +2065,21 @@ assert(
   "The Assistant toggle wears Home's own two-layer mark (orange beneath glass) and its only motion is the click-driven contact — close, return to rest — played in full before the face opens (shell-assistant-mark.js): no capsule glyph, no idle or hover animation, reduced motion honored, unit test wired into verify",
 );
 assert(
+  (() => {
+    const shellAssistantFace = read("capsules/home-gui/browser/shell-assistant-face.js");
+    const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
+    return (
+      shellAssistantFace.split("deps.restoreDockFocus(toggleEl());").length === 3 &&
+      !/toggleEl\(\)\?\.focus\(/.test(shellAssistantFace) &&
+      shellSurface.includes("function restoreDockFocus(item) {") &&
+      shellSurface.includes("dockState.restoringFocus = true;") &&
+      shellSurface.includes("if (item && !dockState.restoringFocus) {") &&
+      /bindAssistantFace\(\{[^}]*restoreDockFocus,/s.test(shellSurface)
+    );
+  })(),
+  "Closing the Assistant face hands focus back to the toggle through the dock (restoreDockFocus), and that focus raises no dock label: the label answers only the person's own hover or keyboard arrival",
+);
+assert(
   !/fetch\(/.test(shellStages) &&
     !/fetch\(/.test(shellExpose) &&
     shellStages.includes("UI ≠ authority: Space switches never mint Capsule/Carrier grants."),
