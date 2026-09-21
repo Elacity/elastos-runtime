@@ -695,15 +695,35 @@
     bindAppActions(els.storeSections);
   }
 
+  function openAiProviderSettings() {
+    if (window.top === window || !homeParentOrigin) {
+      showToast("Open Apps from Home to open Settings.", true);
+      return;
+    }
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "system",
+      query: { settings: "models" },
+      homeToken,
+    }, homeParentOrigin);
+  }
+
+  function modelsSettingsChrome() {
+    return `<div class="store-models-settings">
+      <button class="store-nav-item" type="button" data-action="open-ai-provider-settings">Open Settings</button>
+    </div>`;
+  }
+
   function renderCategorySections() {
     const apps = filteredByDestination();
     if (!apps.length) {
       if (state.destination === "models" && !state.search) {
-        els.storeSections.innerHTML = emptyState(
+        els.storeSections.innerHTML = `${modelsSettingsChrome()}${emptyState(
           state.modelCatalogState === "unavailable" ? "Models are unavailable" : "No models available",
           state.modelCatalogState === "unavailable" ? "The model catalog could not be verified. Refresh to check again." : "Verified models on this Home will appear here.",
           icons.package,
-        );
+        )}`;
+        bindAppActions(els.storeSections);
         return;
       }
       els.storeSections.innerHTML = emptyState(
@@ -713,7 +733,8 @@
       );
       return;
     }
-    els.storeSections.innerHTML = renderSection(destinationTitle(state.destination), apps, { showHeading: false });
+    const heading = state.destination === "models" ? modelsSettingsChrome() : "";
+    els.storeSections.innerHTML = `${heading}${renderSection(destinationTitle(state.destination), apps, { showHeading: false })}`;
     bindAppActions(els.storeSections);
   }
 
@@ -969,7 +990,10 @@
         <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
       </header>
       <div class="modal-body">
-        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>` : `<section class="modal-section">
+        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>
+        <section class="modal-section">
+          <button class="modal-btn secondary" type="button" data-action="open-ai-provider-settings">Open Settings</button>
+        </section>` : `<section class="modal-section">
           <div class="modal-section-title">About</div>
           <div class="modal-description">${escapeHtml(app.description)}</div>
         </section>
@@ -1233,6 +1257,9 @@
         }
         if (action === "close-detail") {
           closeDetail();
+        }
+        if (action === "open-ai-provider-settings") {
+          openAiProviderSettings();
         }
       });
       node.addEventListener("keydown", (event) => {

@@ -297,21 +297,33 @@ impl Inventory {
                             || next.phase == super::RetirementPhase::Withdrawn),
                     "retirement target changed"
                 ),
-                None => ensure!(
-                    retirement.phase == super::RetirementPhase::Withdrawn
+                None => {
+                    let finished = retirement.phase == super::RetirementPhase::Withdrawn
                         && state
                             .records
                             .iter()
                             .filter(|r| r.admission_id == retirement.admission_id)
-                            .all(|r| matches!(
-                                r.state,
-                                super::PreparationState::Reclaimed
-                                    | super::PreparationState::Cancelled
-                                    | super::PreparationState::Expired
-                                    | super::PreparationState::Failed
-                            ) && r.reserved_bytes == 0),
-                    "unresolved retirement removed"
-                ),
+                            .all(|r| {
+                                matches!(
+                                    r.state,
+                                    super::PreparationState::Reclaimed
+                                        | super::PreparationState::Cancelled
+                                        | super::PreparationState::Expired
+                                        | super::PreparationState::Failed
+                                ) && r.reserved_bytes == 0
+                            });
+                    let owner_reclaim_abort = retirement.phase
+                        == super::RetirementPhase::WithdrawalPending
+                        && retirement.operation_id == retirement.admission_id
+                        && state.records.iter().any(|r| {
+                            r.operation_id == retirement.admission_id
+                                && r.state == super::PreparationState::Admitted
+                        });
+                    ensure!(
+                        finished || owner_reclaim_abort,
+                        "unresolved retirement removed"
+                    );
+                }
             }
         }
         let mut next = open_at(

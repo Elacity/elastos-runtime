@@ -1200,8 +1200,21 @@ impl ProviderRegistry {
                     unavailable()
                 })?;
         let data = &response["data"];
-        if response["status"] != "ok"
-            || data["provider"] != "model-provider"
+        if response["status"] != "ok" {
+            let code = response["code"].as_str().unwrap_or("");
+            let message = response["message"].as_str().unwrap_or("");
+            let detail = [code, message]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(": ");
+            return Err(ProviderError::Provider(if detail.is_empty() {
+                "model activation pending".into()
+            } else {
+                detail
+            }));
+        }
+        if data["provider"] != "model-provider"
             || data["protocol_version"] != "elastos.model-provider/v1"
             || data["offers_ready"].as_u64().is_none_or(|n| n > 64)
         {
@@ -2837,7 +2850,35 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            ProviderError::Provider("model activation pending".into()).to_string()
+            ProviderError::Provider("private failure".into()).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn model_refresh_propagates_provider_selection_unavailable() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        *provider.response.lock().await = Some(serde_json::json!({
+            "status":"error",
+            "code":"selection_unavailable",
+            "message":"model offer is not available"
+        }));
+        registry
+            .register_sub_provider("model", provider)
+            .await
+            .unwrap();
+        let err = registry
+            .refresh_local_model_configuration(&super::super::BridgeProviderConfig::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("selection_unavailable"),
+            "Init error code must reach the gateway, got {err}"
+        );
+        assert!(
+            err.contains("model offer is not available"),
+            "Init error message must reach the gateway, got {err}"
         );
     }
 

@@ -50,7 +50,7 @@ pub(super) fn runtime_capsule_affordance_binding(
     match (resource, operation) {
         ("elastos://capsules/*", "list") => Some(RuntimeCapsuleAffordanceBinding::CatalogList),
         ("elastos://capsules/*", "launch") => Some(RuntimeCapsuleAffordanceBinding::CapsuleLaunch),
-        ("elastos://capsules/*", "use" | "status" | "cancel" | "retention") => {
+        ("elastos://capsules/*", "use" | "status" | "cancel" | "retention" | "reclaim") => {
             Some(RuntimeCapsuleAffordanceBinding::ModelPreparation)
         }
         _ => None,
@@ -213,5 +213,21 @@ mod retention_tests {
             assert!(runtime_capsule_affordance_binding(resource, "retention").is_none());
         }
         assert!(runtime_capsule_affordance_binding("elastos://capsules/*", "keep").is_none());
+    }
+
+    #[test]
+    fn model_reclaim_binding_uses_only_existing_capsule_resource() {
+        assert!(matches!(
+            runtime_capsule_affordance_binding("elastos://capsules/*", "reclaim"),
+            Some(RuntimeCapsuleAffordanceBinding::ModelPreparation)
+        ));
+        for resource in [
+            "elastos://model/*",
+            "elastos://capsules/model",
+            "elastos://capsules/*/extra",
+            "",
+        ] {
+            assert!(runtime_capsule_affordance_binding(resource, "reclaim").is_none());
+        }
     }
 }

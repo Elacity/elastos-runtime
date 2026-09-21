@@ -1472,6 +1472,11 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("passkey step-up")
     {
         StatusCode::FORBIDDEN
+    } else if text.contains("model retirement pending")
+        || text.contains("model activation pending")
+        || text.contains("selection_unavailable")
+    {
+        StatusCode::CONFLICT
     } else if text.contains("nickname must")
         || text.contains("missing")
         || text.contains("background image")

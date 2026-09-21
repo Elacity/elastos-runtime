@@ -26,6 +26,7 @@ let loseUseResponse = false;
 let malformedRuntime = false;
 let mismatchRetention = false;
 let delayCatalog = null;
+let protectReclaim = false;
 const fixtureErrors = [];
 function preparation() {
   return phase === "unprepared" ? null : { operation_id: operation, cid: selectedCid, state: phase,
@@ -76,7 +77,7 @@ const server = createServer(async (req, res) => {
       assert.equal(method.resource, "elastos://capsules/*");
       assert.equal(method.approval, "runtime_policy");
       assert.equal(method.operation, input.method.split(".")[1]);
-      assert.ok(["use", "status", "cancel", "retention"].includes(method.operation));
+      assert.ok(["use", "status", "cancel", "retention", "reclaim"].includes(method.operation));
       assert.equal(method.risk, method.operation === "status" ? "read" : "write");
       if (failure) { json({ error: "private runtime provider path /secret" }, 503); return; }
       if (method.operation === "use") { assert.deepEqual(input.input, { cid }); phase = "preparing"; }
@@ -84,6 +85,18 @@ const server = createServer(async (req, res) => {
       if (["status", "cancel"].includes(method.operation)) assert.deepEqual(input.input, { operation_id: operation });
       if (method.operation === "cancel") { phase = "cancelled"; kept = false; }
       if (method.operation === "retention") { assert.deepEqual(input.input, { cid, keep: !kept }); kept = input.input.keep; }
+      if (method.operation === "reclaim") {
+        assert.deepEqual(input.input, { cid });
+        if (protectReclaim) {
+          json({
+            schema: "elastos.capsules.invoke-result/v1", status: "error", code: "preparation_unavailable",
+            message: "Model preparation is unavailable.", capsule: input.capsule, interface: input.interface,
+            method: input.method, request_id: input.request_id,
+          }, 409);
+          return;
+        }
+        phase = "reclaimed"; kept = false;
+      }
       const readiness = runtime();
       const facts = { admitted: readiness.admitted, kept: readiness.kept, dispatch_ready: readiness.dispatch_ready, offer_id: readiness.offer_id };
       const output = method.operation === "retention" ? { cid, ...facts } : { ...preparation(), ...facts };
@@ -122,7 +135,7 @@ try {
       ? { absent: "Not on this device yet", reclaimed: "Removed from this device" }
       : { absent: "Ready to prepare", reclaimed: "Model removed from local cache." };
     phase = "unprepared"; kept = false; failure = false; calls.length = 0;
-    selectedCid = cid; executable = true; trust = "verified";
+    selectedCid = cid; executable = true; trust = "verified"; protectReclaim = false;
     const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
     activePage = page;
     const pageErrors = [];
@@ -218,6 +231,33 @@ try {
     await frame.locator('[data-model-management] input:enabled:checked').waitFor();
     await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
     await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
+    const reclaimCopy = app === "marketplace"
+      ? "This removes prepared model files from this device. Conversations stay."
+      : "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.";
+    const reclaimBeforeDecline = calls.filter(c => c.method === "content.reclaim").length;
+    await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
+    await frame.getByText(reclaimCopy, { exact: true }).waitFor();
+    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline, "first Remove asks before reclaim");
+    assert.doesNotMatch(reclaimCopy, /only copy|will stop/i);
+    await frame.locator('[data-model-control="reclaim-decline"]').click();
+    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 1);
+    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline, "decline leaves the admission");
+    protectReclaim = true;
+    await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
+    await frame.getByRole("button", { name: "Remove now", exact: true }).click();
+    await frame.getByText("Stop the current reply in Assistant, then try Remove again.", { exact: true }).waitFor();
+    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 1, "busy reclaim keeps Remove");
+    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 1, "busy Remove now still invokes reclaim");
+    protectReclaim = false;
+    await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
+    await frame.getByRole("button", { name: "Remove now", exact: true }).click();
+    await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
+    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 2, "Remove now dispatches reclaim once after the busy reject");
+    phase = "admitted";
+    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
     phase = "preparing";
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();

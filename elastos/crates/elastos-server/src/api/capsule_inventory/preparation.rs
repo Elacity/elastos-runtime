@@ -391,16 +391,19 @@ impl PreparationInventory {
         }
         ensure!(active <= 1, "multiple active preparations");
         if let Some(retirement) = &self.retirement {
+            let owner = self.records.iter().any(|record| {
+                record.operation_id == retirement.admission_id
+                    && record.admission_id == record.operation_id
+                    && record.state == PreparationState::Admitted
+                    && record.activation.is_some()
+            });
+            let capacity = self.records.iter().any(|record| {
+                record.operation_id == retirement.operation_id
+                    && record.state == PreparationState::CapacityPending
+            });
+            let owner_reclaim = retirement.operation_id == retirement.admission_id;
             ensure!(
-                self.records
-                    .iter()
-                    .any(|record| record.operation_id == retirement.operation_id
-                        && record.state == PreparationState::CapacityPending)
-                    && self.records.iter().any(|record| record.operation_id
-                        == retirement.admission_id
-                        && record.admission_id == record.operation_id
-                        && record.state == PreparationState::Admitted
-                        && record.activation.is_some()),
+                owner && (owner_reclaim || capacity),
                 "invalid model retirement ownership"
             );
         }
@@ -908,6 +911,13 @@ impl PreparationOwner {
                     .context("preparation backend unavailable")?;
                 reserve(data_dir, &caller, request_id, &input.cid)?
             }
+            Some("reclaim") => {
+                let input: Use = serde_json::from_value(input.clone())?;
+                let registry = registry
+                    .as_ref()
+                    .context("preparation backend unavailable")?;
+                return await_owner_reclaim(data_dir, registry, &caller, &input.cid, &revalidate);
+            }
             _ => anyhow::bail!("preparation method unavailable"),
         };
         let kept = Inventory::open(data_dir, false)?
@@ -1391,6 +1401,126 @@ fn finish_model_retirement(data_dir: &Path) -> anyhow::Result<()> {
     inventory.save(&state)
 }
 
+fn reclaim_is_busy(error: &impl std::fmt::Display) -> bool {
+    let text = error.to_string();
+    text.contains("selection_unavailable") || text.contains("model retirement pending")
+}
+
+fn abort_owner_reclaim_pending(data_dir: &Path, admission_id: Option<&str>) -> anyhow::Result<()> {
+    let inventory = Inventory::open(data_dir, false)?;
+    let mut state = inventory.load()?;
+    let Some(retirement) = state.retirement.clone() else {
+        return Ok(());
+    };
+    if retirement.phase != RetirementPhase::WithdrawalPending
+        || retirement.operation_id != retirement.admission_id
+        || admission_id.is_some_and(|id| retirement.admission_id != id)
+    {
+        return Ok(());
+    }
+    state.retirement = None;
+    inventory.save(&state)
+}
+
+fn await_owner_reclaim(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    caller: &PreparationCaller<'_>,
+    cid: &str,
+    revalidate: &Revalidate,
+) -> anyhow::Result<serde_json::Value> {
+    let work = start_owner_reclaim(data_dir, registry, caller, cid, revalidate);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(work)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("reclaim runtime unavailable")?
+            .block_on(work),
+    }
+}
+
+async fn start_owner_reclaim(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    caller: &PreparationCaller<'_>,
+    cid: &str,
+    revalidate: &Revalidate,
+) -> anyhow::Result<serde_json::Value> {
+    authorize(caller, "reclaim")?;
+    revalidate()?;
+    ensure!(canonical_cid(cid, 0x70), "invalid reclaim input");
+    let inventory = Inventory::open(data_dir, false)?;
+    let _worker = inventory.worker_lock()?;
+    let mut state = inventory.load()?;
+    let owner = state
+        .records
+        .iter()
+        .find(|record| {
+            record.package_cid == cid
+                && record.operation_id == record.admission_id
+                && record.state == PreparationState::Admitted
+        })
+        .cloned()
+        .context("reclaim requires admission")?;
+    let activation = owner.activation.clone().context("activation unavailable")?;
+    activation.check_root(data_dir, &owner)?;
+    if let Some(existing) = &state.retirement {
+        ensure!(
+            existing.admission_id == owner.operation_id
+                && existing.operation_id == owner.operation_id,
+            "another retirement owns worker"
+        );
+        ensure!(
+            existing.phase == RetirementPhase::WithdrawalPending,
+            "invalid retirement phase"
+        );
+    } else {
+        state.retirement = Some(ModelRetirement {
+            operation_id: owner.operation_id.clone(),
+            admission_id: owner.operation_id.clone(),
+            phase: RetirementPhase::WithdrawalPending,
+        });
+        inventory.save(&state)?;
+    }
+    let retirement = state.retirement.clone().unwrap();
+    drop(inventory);
+    let live = registry.local_model_offers().await?;
+    ensure!(
+        live.iter()
+            .filter(|offer| **offer == activation.summary())
+            .count()
+            == 1,
+        "retirement requires exact active provider evidence"
+    );
+    let mut config = {
+        let inventory = Inventory::open(data_dir, false)?;
+        let state = inventory.load()?;
+        ensure!(
+            state.retirement.as_ref() == Some(&retirement),
+            "retirement changed"
+        );
+        withdrawal_config(data_dir, &state, &retirement, &live)?
+    };
+    if let Some(offers) = config.extra["offers"].as_array_mut() {
+        offers.retain(|offer| offer["id"] != activation.offer["id"]);
+    }
+    config.extra["owner_reclaim"] = serde_json::json!(true);
+    revalidate()?;
+    match registry.refresh_local_model_configuration(&config).await {
+        Ok(()) => {
+            mark_model_withdrawn(data_dir, &retirement)?;
+            finish_model_retirement(data_dir)?;
+            Ok(load_operation(data_dir, &owner.operation_id)?.projection())
+        }
+        Err(error) if reclaim_is_busy(&error) => {
+            abort_owner_reclaim_pending(data_dir, Some(&owner.operation_id))?;
+            anyhow::bail!("model retirement pending");
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn mark_model_withdrawn(data_dir: &Path, expected: &ModelRetirement) -> anyhow::Result<()> {
     let inventory = Inventory::open(data_dir, false)?;
     let mut state = inventory.load()?;
@@ -1639,6 +1769,26 @@ async fn require_capacity(
     Ok(observed.volume_id)
 }
 
+async fn require_recovery_capacity(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    record: &PreparationRecord,
+) -> anyhow::Result<u64> {
+    // Recovery hashes and renames bytes that already occupy the stage.
+    // The unwritten second-payload backend charge is a live-transfer budget.
+    let (outstanding_stage, _) = remaining_capacity_charges(
+        record.total_bytes,
+        record.completed_bytes,
+        record.index_bytes,
+    )?;
+    let observed = registry
+        .check_local_ipfs_capacity(outstanding_stage.max(1))
+        .await?;
+    require_cache_budget(data_dir, &Inventory::open(data_dir, false)?.load()?)?;
+    Inventory::open(data_dir, false)?.require_space(outstanding_stage)?;
+    Ok(observed.volume_id)
+}
+
 fn runtime_capacity_charge(record: &PreparationRecord, shared_volume: bool) -> anyhow::Result<u64> {
     let (outstanding_stage, backend) = remaining_capacity_charges(
         record.total_bytes,
@@ -1684,7 +1834,16 @@ async fn prepare(
         &serde_json::to_vec(&entry.object_manifest)?,
     )?;
     if record.index_bytes > 0 && record.completed_bytes == record.total_bytes {
-        return finish_admission(data_dir, registry, id, &closure, stop, revalidate, false).await;
+        return finish_admission(
+            data_dir,
+            registry,
+            id,
+            &closure,
+            stop,
+            revalidate,
+            AdmissionGate::LiveTransfer,
+        )
+        .await;
     }
     if record.index_bytes > 0 || record.completed_bytes > 0 {
         anyhow::bail!("interrupted partial preparation requires settled cleanup");
@@ -1792,7 +1951,16 @@ async fn prepare(
     update_operation(data_dir, id, |record| {
         record.state = PreparationState::Verifying
     })?;
-    finish_admission(data_dir, registry, id, &closure, stop, revalidate, false).await
+    finish_admission(
+        data_dir,
+        registry,
+        id,
+        &closure,
+        stop,
+        revalidate,
+        AdmissionGate::LiveTransfer,
+    )
+    .await
 }
 
 async fn reconcile(
@@ -1802,8 +1970,9 @@ async fn reconcile(
     stop: &AtomicBool,
     revalidate: &Revalidate,
 ) -> anyhow::Result<()> {
-    // A restarted owner first drains the same local provider before observing
-    // the rename or removing staging. Status/cancel never restart a transfer.
+    // Status/cancel never restart a transfer. Expiry bounds the network
+    // attempt. A complete unrenamed stage is hashed in place after current
+    // caller, catalog, and capacity checks, without rewriting the deadline.
     registry.prepare_local_ipfs_backend().await?;
     let record = load_operation(data_dir, id)?;
     let renamed = record.admission_id == id
@@ -1818,10 +1987,76 @@ async fn reconcile(
             &entry.cid,
             &serde_json::to_vec(&entry.object_manifest)?,
         )?;
-        finish_admission(data_dir, registry, id, &closure, stop, revalidate, true).await
+        finish_admission(
+            data_dir,
+            registry,
+            id,
+            &closure,
+            stop,
+            revalidate,
+            AdmissionGate::RecoverRenamed,
+        )
+        .await
+    } else if record.cancel_requested {
+        settle_failure(data_dir, id, true)
+    } else if let Some(closure) = complete_unrenamed_stage(data_dir, &record)? {
+        finish_admission(
+            data_dir,
+            registry,
+            id,
+            &closure,
+            stop,
+            revalidate,
+            AdmissionGate::RecoverComplete,
+        )
+        .await
     } else {
         settle_failure(data_dir, id, true)
     }
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionGate {
+    LiveTransfer,
+    RecoverRenamed,
+    RecoverComplete,
+}
+
+fn complete_unrenamed_stage(
+    data_dir: &Path,
+    record: &PreparationRecord,
+) -> anyhow::Result<Option<crate::content::ContentObjectManifest>> {
+    if record.admission_id != record.operation_id
+        || record.index_bytes == 0
+        || record.completed_bytes != record.total_bytes
+    {
+        return Ok(None);
+    }
+    let inventory = Inventory::open(data_dir, false)?;
+    let stage = match inventory.stage(false) {
+        Ok(stage) => stage,
+        Err(err) if storage::missing(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let index = match stage.read_index() {
+        Ok(bytes) if bytes.len() as u64 == record.index_bytes => bytes,
+        _ => return Ok(None),
+    };
+    let closure = match crate::content::parse_content_object_manifest(&record.package_cid, &index) {
+        Ok(closure) => closure,
+        Err(_) => return Ok(None),
+    };
+    for expected in &closure.files {
+        let meta = match std::fs::metadata(stage.path.join(&expected.path)) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(None),
+        };
+        if meta.len() != expected.size {
+            return Ok(None);
+        }
+    }
+    current_entry(data_dir, record)?;
+    Ok(Some(closure))
 }
 
 fn require_admission(
@@ -1829,9 +2064,9 @@ fn require_admission(
     id: &str,
     stop: &AtomicBool,
     revalidate: &Revalidate,
-    reconcile_existing: bool,
+    gate: AdmissionGate,
 ) -> anyhow::Result<PreparationRecord> {
-    if !reconcile_existing {
+    if matches!(gate, AdmissionGate::LiveTransfer) {
         return require_active(data_dir, id, stop, revalidate);
     }
     revalidate()?;
@@ -1840,9 +2075,10 @@ fn require_admission(
         record.active() && record.admission_id == id && !stop.load(Ordering::Acquire),
         "admission reconciliation stopped"
     );
+    if matches!(gate, AdmissionGate::RecoverComplete) {
+        ensure!(!record.cancel_requested, "admission reconciliation stopped");
+    }
     current_entry(data_dir, &record)?;
-    // Expiry/cancel forbid a new rename, not a receipt for an exact artifact
-    // already renamed by this operation. Current caller and catalog still bind it.
     Ok(record)
 }
 
@@ -1853,9 +2089,9 @@ async fn finish_admission(
     closure: &crate::content::ContentObjectManifest,
     stop: &AtomicBool,
     revalidate: &Revalidate,
-    reconcile_existing: bool,
+    gate: AdmissionGate,
 ) -> anyhow::Result<()> {
-    let record = require_admission(data_dir, id, stop, revalidate, reconcile_existing)?;
+    let record = require_admission(data_dir, id, stop, revalidate, gate)?;
     let (stage, renamed) = {
         let inventory = Inventory::open(data_dir, false)?;
         match inventory.admitted(&record.admission_id) {
@@ -1867,14 +2103,20 @@ async fn finish_admission(
         }
     };
     ensure!(
-        !reconcile_existing || renamed,
+        !matches!(gate, AdmissionGate::RecoverRenamed) || renamed,
         "admission rename is not present"
     );
     let entry = current_entry(data_dir, &record)?;
-    require_capacity(data_dir, registry, &record).await?;
-    require_admission(data_dir, id, stop, revalidate, reconcile_existing)?;
+    match gate {
+        AdmissionGate::LiveTransfer => require_capacity(data_dir, registry, &record).await,
+        AdmissionGate::RecoverComplete | AdmissionGate::RecoverRenamed => {
+            require_recovery_capacity(data_dir, registry, &record).await
+        }
+    }
+    .context(PreparationFailurePhase::Capacity)?;
+    require_admission(data_dir, id, stop, revalidate, gate)?;
     verify_package_identity(registry, &stage, &record, &entry, closure).await?;
-    require_admission(data_dir, id, stop, revalidate, reconcile_existing)?;
+    require_admission(data_dir, id, stop, revalidate, gate)?;
     stage.check()?;
     let inventory = Inventory::open(data_dir, false)?;
     let mut snapshot = inventory.load()?;
@@ -1884,7 +2126,7 @@ async fn finish_admission(
         .find(|r| r.operation_id == id)
         .context("preparation unavailable")?;
     ensure!(
-        reconcile_existing || !current.cancel_requested,
+        matches!(gate, AdmissionGate::RecoverRenamed) || !current.cancel_requested,
         "preparation cancelled before admission"
     );
     current.state = PreparationState::AdmissionPending;
@@ -2259,6 +2501,10 @@ pub async fn append_admitted_model_startup_offers(
         .is_some_and(|r| r.phase == RetirementPhase::Withdrawn)
     {
         finish_model_retirement(data_dir)?;
+    } else if retirement.as_ref().is_some_and(|r| {
+        r.phase == RetirementPhase::WithdrawalPending && r.operation_id == r.admission_id
+    }) {
+        abort_owner_reclaim_pending(data_dir, None)?;
     }
     append_admitted_model_offers_locked(data_dir, registry, config, &worker).await?;
     let snapshot = Inventory::open(data_dir, false)?.load()?;
@@ -2801,8 +3047,11 @@ mod tests {
                     {
                         Some((cid, _)) => cid.clone(),
                         None => {
-                            assert_eq!(staged, self.files);
-                            self.cid.lock().unwrap().clone()
+                            if staged == self.files {
+                                self.cid.lock().unwrap().clone()
+                            } else {
+                                "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm".into()
+                            }
                         }
                     };
                     Ok(serde_json::json!({"status":"ok","data":{"cid":cid}}))
@@ -4066,6 +4315,155 @@ mod tests {
             assert_eq!(retirement_candidate(f.root.path(), &state).unwrap(), None);
             assert_eq!(state.records[0].reserved_bytes, f.old.reserved_bytes);
             assert!(f.old.projection().get("activation").is_none());
+        }
+
+        fn admitted_weights(root: &Path, admission_id: &str) -> std::path::PathBuf {
+            root.join(format!(
+                "model-preparation/admitted-{admission_id}/weights.gguf"
+            ))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn model_owner_reclaim_busy_live_admission_returns_busy_without_retirement() {
+            let f = retirement_fixture().await;
+            f.model.busy.store(true, Ordering::Release);
+            let path = admitted_weights(f.root.path(), &f.old.operation_id);
+            let original = std::fs::read(&path).unwrap();
+            let err = PreparationOwner::default()
+                .invoke(
+                    f.root.path(),
+                    Some(Arc::clone(&f.registry)),
+                    caller(&context(), &method("reclaim")),
+                    "busy-reclaim",
+                    &serde_json::json!({"cid": f.old.package_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .expect_err("busy reclaim must fail closed");
+            let text = err.to_string();
+            assert!(
+                text.contains("selection_unavailable") || text.contains("model retirement pending"),
+                "busy reclaim must preserve the provider Init contract, got {text}"
+            );
+            let state = Inventory::open(f.root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(state.retirement, None);
+            assert_eq!(
+                load_operation(f.root.path(), &f.old.operation_id)
+                    .unwrap()
+                    .state,
+                PreparationState::Admitted
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn model_owner_reclaim_busy_resume_clears_stale_withdrawal_pending() {
+            let f = retirement_fixture().await;
+            f.model.busy.store(true, Ordering::Release);
+            let inventory = Inventory::open(f.root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            state.retirement = Some(ModelRetirement {
+                operation_id: f.old.operation_id.clone(),
+                admission_id: f.old.operation_id.clone(),
+                phase: RetirementPhase::WithdrawalPending,
+            });
+            inventory.save(&state).unwrap();
+            drop(inventory);
+            let path = admitted_weights(f.root.path(), &f.old.operation_id);
+            let original = std::fs::read(&path).unwrap();
+            let err = PreparationOwner::default()
+                .invoke(
+                    f.root.path(),
+                    Some(Arc::clone(&f.registry)),
+                    caller(&context(), &method("reclaim")),
+                    "busy-reclaim-resume",
+                    &serde_json::json!({"cid": f.old.package_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .expect_err("busy reclaim resume must fail closed");
+            let text = err.to_string();
+            assert!(
+                text.contains("selection_unavailable") || text.contains("model retirement pending"),
+                "busy reclaim resume must preserve the provider Init contract, got {text}"
+            );
+            let state = Inventory::open(f.root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(state.retirement, None);
+            assert_eq!(
+                load_operation(f.root.path(), &f.old.operation_id)
+                    .unwrap()
+                    .state,
+                PreparationState::Admitted
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        #[tokio::test]
+        async fn model_owner_reclaim_startup_aborts_unconfirmed_pending_and_keeps_bytes() {
+            let f = retirement_fixture().await;
+            let inventory = Inventory::open(f.root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            state.retirement = Some(ModelRetirement {
+                operation_id: f.old.operation_id.clone(),
+                admission_id: f.old.operation_id.clone(),
+                phase: RetirementPhase::WithdrawalPending,
+            });
+            inventory.save(&state).unwrap();
+            drop(inventory);
+            let path = admitted_weights(f.root.path(), &f.old.operation_id);
+            let original = std::fs::read(&path).unwrap();
+            let registry = elastos_runtime::provider::ProviderRegistry::new();
+            let mut config = crate::api::model_provider_bridge_config(f.root.path()).unwrap();
+            let _worker =
+                append_admitted_model_startup_offers(f.root.path(), &registry, &mut config)
+                    .await
+                    .unwrap();
+            let state = Inventory::open(f.root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(state.retirement, None);
+            assert_eq!(
+                load_operation(f.root.path(), &f.old.operation_id)
+                    .unwrap()
+                    .state,
+                PreparationState::Admitted
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn model_owner_reclaim_idle_admission_withdraws_and_removes_bytes() {
+            let f = retirement_fixture().await;
+            let path = admitted_weights(f.root.path(), &f.old.operation_id);
+            assert!(path.is_file());
+            let result = PreparationOwner::default()
+                .invoke(
+                    f.root.path(),
+                    Some(Arc::clone(&f.registry)),
+                    caller(&context(), &method("reclaim")),
+                    "idle-reclaim",
+                    &serde_json::json!({"cid": f.old.package_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            assert_eq!(result["state"], "reclaimed");
+            let state = Inventory::open(f.root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(state.retirement, None);
+            assert_eq!(
+                load_operation(f.root.path(), &f.old.operation_id)
+                    .unwrap()
+                    .state,
+                PreparationState::Reclaimed
+            );
+            assert!(!path.exists());
         }
 
         #[tokio::test]
@@ -7721,26 +8119,229 @@ server.serve_forever()
         );
     }
 
+    async fn restart_status(
+        root: &Path,
+        registry: Arc<elastos_runtime::provider::ProviderRegistry>,
+        operation_id: &str,
+        revalidate: Revalidate,
+    ) {
+        let owner = PreparationOwner::default();
+        owner
+            .invoke(
+                root,
+                Some(registry),
+                caller(&context(), &method("status")),
+                "status",
+                &serde_json::json!({"operation_id":operation_id}),
+                revalidate,
+            )
+            .unwrap();
+        join_worker(&owner).await;
+    }
+
+    fn stage_weights(root: &Path) -> std::path::PathBuf {
+        root.join("model-preparation/stage/weights.gguf")
+    }
+
+    fn assert_deadline_unchanged(before: &PreparationRecord, after: &PreparationRecord) {
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.expires_at, before.expires_at);
+        assert_eq!(after.expires_at, before.created_at + RESERVATION_SECONDS);
+    }
+
     #[tokio::test]
-    async fn model_preparation_restart_status_does_not_admit_expired_staging() {
+    async fn model_preparation_restart_status_admits_expired_complete_stage_without_fetch() {
+        let (root, record, backend, registry) = staged_fixture(1, false).await;
+        restart_status(
+            root.path(),
+            registry,
+            &record.operation_id,
+            Arc::new(|| Ok(())),
+        )
+        .await;
+        let admitted = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_eq!(admitted.state, PreparationState::Admitted);
+        assert_eq!(admitted.reserved_bytes, record.reserved_bytes);
+        assert_deadline_unchanged(&record, &admitted);
+        assert!(!root.path().join("model-preparation/stage").exists());
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_ok());
+        let (outstanding, backend_growth) = remaining_capacity_charges(
+            record.total_bytes,
+            record.completed_bytes,
+            record.index_bytes,
+        )
+        .unwrap();
+        assert!(outstanding < backend_growth);
+        assert_eq!(
+            *backend.capacity_requests.lock().unwrap(),
+            vec![outstanding.max(1)]
+        );
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"runtime_prepare_backend".into()));
+        assert!(calls.contains(&"runtime_hash_staged_directory".into()));
+        assert!(!calls.iter().any(|op| op == "cat"));
+    }
+
+    #[tokio::test]
+    async fn model_preparation_restart_status_rejects_expired_incomplete_stage() {
+        let (root, record, backend, registry) = staged_fixture(1, false).await;
+        let path = stage_weights(root.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.pop();
+        std::fs::write(&path, bytes).unwrap();
+        restart_status(
+            root.path(),
+            registry,
+            &record.operation_id,
+            Arc::new(|| Ok(())),
+        )
+        .await;
+        let terminal = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_eq!(terminal.state, PreparationState::Expired);
+        assert_eq!(terminal.reserved_bytes, 0);
+        assert_deadline_unchanged(&record, &terminal);
+        assert!(!root.path().join("model-preparation/stage").exists());
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_err());
+        assert_eq!(*backend.calls.lock().unwrap(), ["runtime_prepare_backend"]);
+    }
+
+    #[tokio::test]
+    async fn model_preparation_restart_status_rejects_expired_corrupt_stage() {
+        let (root, record, backend, registry) = staged_fixture(1, false).await;
+        let path = stage_weights(root.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        restart_status(
+            root.path(),
+            registry,
+            &record.operation_id,
+            Arc::new(|| Ok(())),
+        )
+        .await;
+        let terminal = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_eq!(terminal.state, PreparationState::Expired);
+        assert_eq!(terminal.reserved_bytes, 0);
+        assert_deadline_unchanged(&record, &terminal);
+        assert!(!root.path().join("model-preparation/stage").exists());
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_err());
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"runtime_hash_staged_directory".into()));
+        assert!(!calls.iter().any(|op| op == "cat"));
+    }
+
+    #[tokio::test]
+    async fn model_preparation_restart_status_denies_expired_complete_stage_after_authority_change()
+    {
+        let (root, record, backend, registry) = staged_fixture(1, false).await;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let revalidate = {
+            let seen = seen.clone();
+            Arc::new(move || {
+                if seen.fetch_add(1, Ordering::AcqRel) >= 1 {
+                    anyhow::bail!("fixture authority revoked");
+                }
+                Ok(())
+            })
+        };
+        restart_status(root.path(), registry, &record.operation_id, revalidate).await;
+        let terminal = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_ne!(terminal.state, PreparationState::Admitted);
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_err());
+        assert_deadline_unchanged(&record, &terminal);
+        assert!(!backend.calls.lock().unwrap().iter().any(|op| op == "cat"));
+    }
+
+    #[tokio::test]
+    async fn model_preparation_restart_status_denies_expired_complete_stage_after_catalogue_change()
+    {
+        let (root, record, backend, registry) = staged_fixture(1, false).await;
+        change_config(root.path(), |config| {
+            config["model_catalog"]
+                .as_object_mut()
+                .unwrap()
+                .remove("local_use");
+        });
+        restart_status(
+            root.path(),
+            registry,
+            &record.operation_id,
+            Arc::new(|| Ok(())),
+        )
+        .await;
+        let terminal = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_ne!(terminal.state, PreparationState::Admitted);
+        assert_deadline_unchanged(&record, &terminal);
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_err());
+        assert!(!backend.calls.lock().unwrap().iter().any(|op| op == "cat"));
+    }
+
+    #[tokio::test]
+    async fn model_preparation_restart_status_denies_expired_complete_stage_after_capacity_change()
+    {
+        let (root, record, backend, registry) = staged_fixture(1, false).await;
+        change_config(root.path(), |config| {
+            config["model_catalog"]["local_use"]["max_cache_bytes"] = serde_json::json!(1);
+        });
+        restart_status(
+            root.path(),
+            registry,
+            &record.operation_id,
+            Arc::new(|| Ok(())),
+        )
+        .await;
+        let terminal = load_operation(root.path(), &record.operation_id).unwrap();
+        assert_ne!(terminal.state, PreparationState::Admitted);
+        assert_deadline_unchanged(&record, &terminal);
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_err());
+        assert!(!backend.calls.lock().unwrap().iter().any(|op| op == "cat"));
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancel_expired_complete_stage_does_not_admit() {
         let (root, record, backend, registry) = staged_fixture(1, false).await;
         let owner = PreparationOwner::default();
         owner
             .invoke(
                 root.path(),
                 Some(registry),
-                caller(&context(), &method("status")),
-                "status",
+                caller(&context(), &method("cancel")),
+                "cancel",
                 &serde_json::json!({"operation_id":record.operation_id}),
                 Arc::new(|| Ok(())),
             )
             .unwrap();
         join_worker(&owner).await;
         let terminal = load_operation(root.path(), &record.operation_id).unwrap();
-        assert_eq!(terminal.state, PreparationState::Expired);
+        assert_eq!(terminal.state, PreparationState::Cancelled);
         assert_eq!(terminal.reserved_bytes, 0);
+        assert_deadline_unchanged(&record, &terminal);
         assert!(!root.path().join("model-preparation/stage").exists());
-        assert_eq!(*backend.calls.lock().unwrap(), ["runtime_prepare_backend"]);
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .admitted(&record.operation_id)
+            .is_err());
+        let calls = backend.calls.lock().unwrap().clone();
+        assert_eq!(calls, ["runtime_prepare_backend"]);
+        assert!(!calls.iter().any(|op| op == "cat"));
     }
 
     #[tokio::test]

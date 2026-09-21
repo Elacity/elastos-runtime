@@ -36,6 +36,11 @@
     ...PHASE_TEXT, absent: "Not on this device yet", preparing: "Getting the model…",
     reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time",
   });
+  const RECLAIM_CONFIRM_TEXT = Object.freeze({
+    compact: "This removes prepared model files from this device. Conversations stay.",
+    full: "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.",
+  });
+  const RECLAIM_BUSY_TEXT = "Stop the current reply in Assistant, then try Remove again.";
   const text = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f]/.test(v);
   function check(ok) { if (!ok) throw new Error("Invalid model response"); }
   function parseRuntime(r, cid) {
@@ -103,6 +108,7 @@
       let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false, polls = 0;
       let unresolvedUse = null, reconcileRequired = false;
       let pendingFocus = null;
+      let reclaimStep = "idle";
       root.classList.add("model-management");
       root.tabIndex = -1;
       const show = () => visible && !closed && !document.hidden;
@@ -143,7 +149,7 @@
         for (const entry of registry.interfaces.filter(e => e.capsule === capsule)) {
           check(text(entry.interface?.id, 160) && /^[A-Za-z0-9_.:-]+$/.test(entry.interface.id));
           for (const method of entry.interface?.methods || []) {
-            if (method.resource !== "elastos://capsules/*" || !["use", "status", "cancel", "retention"].includes(method.operation)) continue;
+            if (method.resource !== "elastos://capsules/*" || !["use", "status", "cancel", "retention", "reclaim"].includes(method.operation)) continue;
             check(!found.has(method.operation));
             const bindings = entry.bindings?.filter(b => b.method === method.id);
             check(method.id === `content.${method.operation}` && bindings?.length === 1
@@ -152,7 +158,7 @@
             found.set(method.operation, { id: method.id, interface: entry.interface.id });
           }
         }
-        check(found.size === 4);
+        check(found.size === 5);
         methods = found;
       }
       async function load() {
@@ -166,6 +172,7 @@
           if (epoch !== generation || !show()) return;
           bindMethods(interfaces); model = parseCatalog(catalog); polls = 0;
           reconcileRequired = false;
+          reclaimStep = "idle";
           if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation) unresolvedUse = null;
         } catch {
           if (epoch !== generation || !show()) return;
@@ -213,13 +220,18 @@
           check(result.cid === cid);
           if (operation === "retention") {
             check(result.kept === keep && typeof result.admitted === "boolean");
-            // Admission can finish while Keep is in flight. Read a fresh catalog
-            // instead of combining new readiness with an older preparation.
             const catalog = await request("/api/capsules/catalog", null, io.signal);
             if (epoch !== generation || !show() || model?.cid !== cid) return;
             const candidate = parseCatalog(catalog);
             check(candidate?.cid === cid);
             model = candidate;
+          } else if (operation === "reclaim") {
+            check(typeof result.admitted === "boolean");
+            const catalog = await request("/api/capsules/catalog", null, io.signal);
+            if (epoch !== generation || !show() || model?.cid !== cid) return;
+            const candidate = parseCatalog(catalog);
+            check(candidate?.cid === cid);
+            model = candidate; polls = 0;
           } else {
             const r = operationRuntime(result, cid);
             check(r.preparation?.operation_id === result.operation_id && (operation !== "cancel" || result.operation_id === id));
@@ -228,6 +240,19 @@
           }
         } catch {
           if (epoch === generation && show()) {
+            if (operation === "reclaim") {
+              try {
+                const catalog = await request("/api/capsules/catalog", null, io.signal);
+                if (epoch === generation && show() && model?.cid === cid) {
+                  const candidate = parseCatalog(catalog);
+                  if (candidate?.cid === cid && candidate.model_runtime.admitted) {
+                    model = candidate;
+                    reclaimStep = "busy";
+                    return;
+                  }
+                }
+              } catch {}
+            }
             reconcileRequired = true;
             message = "Model action could not be confirmed. Refresh to check its status.";
           }
@@ -302,11 +327,28 @@
           open.dataset.modelControl = "open-assistant";
           controls.append(open);
         }
+        if (r.admitted && !active(p) && reclaimStep === "busy") {
+          row.append(element("p", RECLAIM_BUSY_TEXT, "model-reclaim-busy"));
+        }
+        if (r.admitted && !active(p) && reclaimStep === "confirm") {
+          row.append(element("p", compact ? RECLAIM_CONFIRM_TEXT.compact : RECLAIM_CONFIRM_TEXT.full, "model-reclaim-confirm"));
+          const decline = button("Keep this model", () => { reclaimStep = "idle"; render(); }, reconcileRequired);
+          decline.dataset.modelControl = "reclaim-decline";
+          const confirm = button("Remove now", () => { reclaimStep = "idle"; void act("reclaim"); }, reconcileRequired);
+          confirm.dataset.modelControl = "reclaim-confirm";
+          controls.append(decline, confirm);
+        } else if (r.admitted && !active(p)) {
+          const reclaim = button("Remove from this device", () => { reclaimStep = "confirm"; render(); }, reconcileRequired);
+          reclaim.dataset.modelControl = "reclaim";
+          controls.append(reclaim);
+        }
         if (active(p)) { const cancel = button("Cancel preparation", () => void act("cancel"), p.cancel_requested || reconcileRequired); cancel.dataset.modelControl = "cancel"; controls.append(cancel); }
-        const labelNode = element("label", "", "model-keep"), toggle = element("input");
-        toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
-        toggle.addEventListener("change", () => void act("retention", toggle.checked));
-        labelNode.append(toggle, document.createTextNode("Keep on this device")); controls.append(labelNode);
+        if (reclaimStep !== "confirm") {
+          const labelNode = element("label", "", "model-keep"), toggle = element("input");
+          toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
+          toggle.addEventListener("change", () => void act("retention", toggle.checked));
+          labelNode.append(toggle, document.createTextNode("Keep on this device")); controls.append(labelNode);
+        }
         row.append(controls);
         if (!compact) {
           row.append(element("p", r.kept
