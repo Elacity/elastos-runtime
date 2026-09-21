@@ -41,6 +41,20 @@ struct EnsureRequest {
     object_did: Option<String>,
     #[serde(default)]
     publisher_did: Option<String>,
+    // Runtime-owned fields. They are accepted here so a well-formed Runtime
+    // request decodes, and they stop at this boundary: `skip_serializing`
+    // keeps the payload sent to a configured external target exactly what it
+    // was before Runtime carried this metadata.
+    #[serde(default, rename = "_runtime_invocation", skip_serializing)]
+    runtime_invocation: Value,
+    // Accepted so the request decodes, and deliberately unread: admission and
+    // quota are the publishing Runtime's decision, not this provider's.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    accounting: Value,
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    estimated_content_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +152,9 @@ impl AvailabilityProvider {
     }
 
     fn ensure(&self, request: EnsureRequest) -> Response {
+        if let Err(err) = validate_runtime_invocation(&request.runtime_invocation) {
+            return Response::error("invalid_request", err);
+        }
         if request.cid.trim().is_empty() {
             return Response::error("invalid_request", "ensure requires cid");
         }
@@ -787,6 +804,29 @@ fn default_timeout_secs() -> u64 {
     30
 }
 
+/// Runtime attaches `_runtime_invocation` to every provider request it routes.
+/// An absent envelope stays valid, because a direct request is still a legal
+/// caller here. A present one must name this provider's own operation, so a
+/// request routed for some other target cannot be answered as an ensure.
+fn validate_runtime_invocation(value: &Value) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let envelope = value
+        .as_object()
+        .ok_or_else(|| "_runtime_invocation must be an object".to_string())?;
+    for (field, expected) in [
+        ("schema", "elastos.provider.invocation/v1"),
+        ("target", "availability"),
+        ("op", "ensure"),
+    ] {
+        if envelope.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(format!("_runtime_invocation {field} must be {expected}"));
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     eprintln!(
         "availability-provider: starting v{} (configured targets only)",
@@ -853,6 +893,9 @@ mod tests {
             }),
             object_did: None,
             publisher_did: None,
+            runtime_invocation: Value::Null,
+            accounting: Value::Null,
+            estimated_content_bytes: None,
         }
     }
 
@@ -1221,5 +1264,74 @@ mod tests {
         .to_string();
 
         assert!(err.contains("unknown field"));
+    }
+
+    /// The Runtime content adapter sends `accounting` and an optional
+    /// `estimated_content_bytes`, and `ProviderRegistry::invoke_provider` then
+    /// attaches `_runtime_invocation`. All three were unknown here, so every
+    /// ensure failed to decode and a remote pin that had already succeeded was
+    /// recorded as `repair_needed`. The envelope is Runtime metadata: this
+    /// provider reads it and keeps it out of the payload it sends upstream.
+    #[test]
+    fn ensure_accepts_the_runtime_envelope_and_forwards_only_the_target_payload() {
+        let wire = json!({
+            "op": "ensure",
+            "cid": "QmWcE4pFS8k6XijFoR8j81A1CoKKm6iD88fVgXKkSbP7yi",
+            "uri": "elastos://QmWcE4pFS8k6XijFoR8j81A1CoKKm6iD88fVgXKkSbP7yi",
+            "policy": "network_default",
+            "local": {"status": "local_pinned", "replicas": 1},
+            "requirements": {
+                "min_replicas": 1,
+                "max_replicas": 1,
+                "require_live_multi_peer_proof": false,
+            },
+            "accounting": {
+                "schema": "elastos.content.accounting/v1",
+                "reason": "availability_admission_estimate",
+                "replicas": 1,
+            },
+            "estimated_content_bytes": 5_428,
+            "_runtime_invocation": {
+                "schema": "elastos.provider.invocation/v1",
+                "source": "content",
+                "target": "availability",
+                "op": "ensure",
+                "capability": "provider:content->availability:ensure",
+                "transport": "local",
+                "carrier": null,
+                "transfer": "json",
+                "range": null,
+                "progress": null,
+                "abi": {"kind": "json"},
+            },
+        });
+
+        let request = match serde_json::from_value::<Request>(wire)
+            .expect("runtime-enveloped ensure must decode")
+        {
+            Request::Ensure(request) => request,
+            other => panic!("expected an ensure request, got {other:?}"),
+        };
+        assert_eq!(
+            request.cid,
+            "QmWcE4pFS8k6XijFoR8j81A1CoKKm6iD88fVgXKkSbP7yi"
+        );
+
+        // Runtime metadata stops at this boundary. The configured external
+        // target sees the same payload it saw before the envelope existed.
+        let forwarded = serde_json::to_value(&request).unwrap();
+        let forwarded = forwarded.as_object().unwrap();
+        for runtime_only in [
+            "_runtime_invocation",
+            "accounting",
+            "estimated_content_bytes",
+        ] {
+            assert!(
+                !forwarded.contains_key(runtime_only),
+                "{runtime_only} must not be forwarded upstream"
+            );
+        }
+        assert!(forwarded.contains_key("cid"));
+        assert!(forwarded.contains_key("requirements"));
     }
 }

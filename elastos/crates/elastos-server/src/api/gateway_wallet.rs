@@ -11,7 +11,7 @@ mod gateway_wallet_connectors;
 #[path = "gateway_wallet_prices.rs"]
 mod gateway_wallet_prices;
 #[path = "gateway_wallet_send.rs"]
-mod gateway_wallet_send;
+pub(crate) mod gateway_wallet_send;
 
 pub(in crate::api::gateway) use gateway_wallet_accounts::*;
 pub(in crate::api::gateway) use gateway_wallet_app::*;

@@ -62,6 +62,30 @@ const PART_UNAVAILABLE = "Part of this file is unavailable.";
 const SESSION_UNAVAILABLE = "This file could not be closed.";
 const WRONG_KIND = "This file plays in Elacity Player.";
 const TOO_LARGE = "This file is too large for this reader to open.";
+const NOTHING_CHOSEN = "Open a file from your Library to read it here.";
+const RETRY_LABEL = "Try again";
+
+/** Wire identity of the state Runtime answers an unfinished open with. */
+export const OPEN_PROGRESS_SCHEMA = "elastos.protected-content.open-progress/v1";
+
+/**
+ * The stages an open can report, and how this reader waits through each.
+ *
+ * Opening a protected file is a ceremony, not a request: the wallet holds a
+ * rights-signature request that the person approves, and only then does the
+ * release run. Every first open of every protected item reaches this state, so
+ * a reader that treated it as a failure -- which this one did -- turned the
+ * ordinary case into a dead end.
+ *
+ * `intervalMs` is how long to wait before asking again, and `maxAttempts`
+ * bounds the asking. A rights approval is bounded by the window Runtime sends
+ * in `expires_at` as well, so the reader stops when the wallet request does
+ * rather than at a number of its own choosing.
+ */
+const RESUME_POLICY = new Map([
+  ["rights_approval", { intervalMs: 2000, maxAttempts: 180 }],
+  ["unavailable", { intervalMs: 3000, maxAttempts: 3 }],
+]);
 
 /**
  * Refuses any reply that carries key material.
@@ -91,6 +115,50 @@ export function assertNoKeyMaterial(value) {
     }
   }
   return value;
+}
+
+/**
+ * Reads the typed state Runtime attaches to an unfinished open.
+ *
+ * Returns `null` for anything this reader does not recognise, so an answer of
+ * an unexpected shape is treated as a plain failure rather than guessed at. In
+ * particular, a stage with no resume policy is not resumable here whatever the
+ * `resumable` flag says: the reader has no rule for how to wait through it.
+ */
+export function readOpenProgress(payload) {
+  const source = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null;
+  const value = source?.open_progress;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.schema !== OPEN_PROGRESS_SCHEMA) return null;
+  const stage = String(value.stage || "");
+  if (!stage) return null;
+  const connectorId = typeof value.connector_id === "string" ? value.connector_id.trim() : "";
+  return {
+    stage,
+    resumable: value.resumable === true && RESUME_POLICY.has(stage),
+    awaitsPerson: value.awaits_person === true,
+    connectorId,
+    expiresAt: Number.isInteger(value.expires_at) && value.expires_at > 0 ? value.expires_at : 0,
+  };
+}
+
+/**
+ * What to tell the person while an open waits.
+ *
+ * Composed here from the typed state rather than taken from the answer's own
+ * sentence: that sentence is Runtime's stable wording for its operators, and it
+ * names internal machinery a reader should never put on screen.
+ */
+export function waitingMessage(progress) {
+  if (progress?.stage !== "rights_approval") {
+    return "This file is not ready yet. Trying again...";
+  }
+  if (!progress.awaitsPerson) {
+    return "Your wallet is approving this file. It opens on its own.";
+  }
+  return progress.connectorId
+    ? `Approve opening this file in ${progress.connectorId}. It opens on its own once you do.`
+    : "Approve opening this file in your wallet. It opens on its own once you do.";
 }
 
 function hasExactKeys(value, keys) {
@@ -126,6 +194,19 @@ function parseJsonObject(text) {
   return value;
 }
 
+/**
+ * A refusal, carrying the typed state that came with it.
+ *
+ * The state rides the error rather than a return value because every caller
+ * already handles a refusal; what changes is that some refusals are a stage of
+ * a ceremony the reader waits through rather than the end of one.
+ */
+function providerError(message, progress) {
+  const error = new Error(message);
+  if (progress) error.openProgress = progress;
+  return error;
+}
+
 async function readProviderEnvelope(response, fallback) {
   const text = typeof response?.text === "function" ? await response.text() : "";
   let payload = null;
@@ -137,14 +218,16 @@ async function readProviderEnvelope(response, fallback) {
     }
   }
   if (payload) assertNoKeyMaterial(payload);
+  const progress = readOpenProgress(payload);
   if (!response?.ok) {
     const message =
       typeof payload?.message === "string" && payload.message.trim() ? payload.message : fallback;
-    throw new Error(message);
+    throw providerError(message, progress);
   }
   if (payload?.status === "error") {
-    throw new Error(
+    throw providerError(
       typeof payload?.message === "string" && payload.message.trim() ? payload.message : fallback,
+      progress,
     );
   }
   if (payload?.status !== "ok" || !payload.data || typeof payload.data !== "object") {
@@ -327,6 +410,11 @@ export function createReaderController({
   fetchImpl = fetch,
   urlObject = URL,
   render = rendererFor,
+  // The clock and the timer are taken as inputs so the waiting can be driven
+  // in a test without waiting through it.
+  nowSeconds = () => Math.floor(Date.now() / 1000),
+  setTimeoutImpl = (handler, delay) => setTimeout(handler, delay),
+  clearTimeoutImpl = (handle) => clearTimeout(handle),
 } = {}) {
   const stage = documentObject.getElementById("reader-stage");
   const status = documentObject.getElementById("reader-status");
@@ -345,6 +433,14 @@ export function createReaderController({
   let closed = false;
   let closePromise = null;
   let failed = false;
+  // The ceremony's own state. `attempts` counts asks of one waiting stage, so
+  // moving from one stage to another starts its bound afresh rather than
+  // inheriting a count from the stage before it.
+  let resumeTimer = null;
+  let resumeStage = "";
+  let attempts = 0;
+  let disposed = false;
+  let retryButton = null;
 
   function setStatus(message, state = "info") {
     status.textContent = message;
@@ -361,15 +457,38 @@ export function createReaderController({
     controls.hidden = true;
   }
 
-  function showEmpty(message) {
+  /** Stops the waiting. Called wherever the reader stops caring about it. */
+  function cancelResume() {
+    if (resumeTimer !== null) {
+      clearTimeoutImpl(resumeTimer);
+      resumeTimer = null;
+    }
+  }
+
+  function showEmpty(message, action = null) {
     releaseView();
+    retryButton = null;
     while (stage.firstChild) stage.removeChild(stage.firstChild);
     const panel = documentObject.createElement("div");
     panel.className = "view view-empty";
     const line = documentObject.createElement("p");
     line.textContent = message;
     panel.appendChild(line);
+    if (action) {
+      const button = documentObject.createElement("button");
+      button.type = "button";
+      button.className = "reader-action";
+      button.textContent = action.label;
+      button.addEventListener("click", action.run);
+      panel.appendChild(button);
+      retryButton = button;
+    }
     stage.appendChild(panel);
+    // Focus follows the state that changed, so a person reading by keyboard
+    // reaches the one control this panel offers without hunting for it.
+    try {
+      retryButton?.focus?.();
+    } catch {}
   }
 
   function paintPosition() {
@@ -432,12 +551,66 @@ export function createReaderController({
     return closePromise;
   }
 
-  async function fail(message) {
+  /**
+   * The end of this attempt.
+   *
+   * `retry` is offered only where asking again could answer differently. A
+   * refusal Runtime called final gets no button, because a button that cannot
+   * work is worse than none: it invites the person to keep trying something
+   * that has already been decided.
+   */
+  async function fail(message, { retry = false } = {}) {
     if (failed) return;
     failed = true;
-    showEmpty(message);
+    cancelResume();
+    showEmpty(message, retry ? { label: RETRY_LABEL, run: () => void restart() } : null);
     setStatus(message, "error");
     await closeViewer({ quiet: true });
+  }
+
+  /** An explicit retry after a terminal failure, asked for by the person. */
+  async function restart() {
+    if (disposed) return;
+    failed = false;
+    closed = false;
+    closePromise = null;
+    opened = null;
+    session = null;
+    attempts = 0;
+    resumeStage = "";
+    retryButton = null;
+    await attemptOpen();
+  }
+
+  /**
+   * Waits, then asks again with the identical open.
+   *
+   * The same request is re-issued rather than a new one built: Runtime resumes
+   * the attempt it already has, against the recipient the decrypt provider
+   * still holds, so asking again is how the person's approval is collected --
+   * not a second release.
+   */
+  function scheduleResume(progress) {
+    if (disposed) return false;
+    if (progress.stage !== resumeStage) {
+      resumeStage = progress.stage;
+      attempts = 0;
+    }
+    const policy = RESUME_POLICY.get(progress.stage);
+    if (!policy) return false;
+    attempts += 1;
+    if (attempts > policy.maxAttempts) return false;
+    // Runtime says when the wallet request lapses. Stopping with it means the
+    // reader stops asking at the moment there is nothing left to answer.
+    if (progress.expiresAt && nowSeconds() >= progress.expiresAt) return false;
+    setStatus(waitingMessage(progress));
+    showEmpty(waitingMessage(progress));
+    cancelResume();
+    resumeTimer = setTimeoutImpl(() => {
+      resumeTimer = null;
+      void attemptOpen();
+    }, policy.intervalMs);
+    return true;
   }
 
   async function readAllBytes() {
@@ -466,17 +639,40 @@ export function createReaderController({
   }
 
   async function open() {
+    // A launch with nothing chosen is not a failure, so it is said once and
+    // plainly: it names where files come from instead of reporting that one is
+    // unavailable, which would describe a file that was never named.
+    if (!mintId) {
+      showEmpty(NOTHING_CHOSEN);
+      setStatus(NOTHING_CHOSEN);
+      return;
+    }
     if (!MINT_ID_HEX_RE.test(mintId)) {
       showEmpty(FILE_UNAVAILABLE);
       setStatus(FILE_UNAVAILABLE, "error");
       return;
     }
+    await attemptOpen();
+  }
+
+  async function attemptOpen() {
+    if (disposed) return;
     setStatus("Opening the file...");
     try {
       const reply = await postProvider("open_viewer", { mint_id: mintId });
       // Noted before the reply is judged: a refusal below still closes the
       // session the reply opened.
       opened = closableSession(reply, mintId);
+      // A page that went away while this open was in flight still opened a
+      // session, so it is handed back rather than left to expire on its own.
+      if (disposed) {
+        await closeViewer({ keepalive: true, quiet: true });
+        return;
+      }
+      // The ceremony finished, so nothing is waiting on it any more.
+      cancelResume();
+      resumeStage = "";
+      attempts = 0;
       session = parseViewerOpenData(reply, mintId);
       const kind = kindFor(session.contentType);
       kindLabel.textContent = describeKind(kind);
@@ -501,8 +697,30 @@ export function createReaderController({
       }
       setStatus("");
     } catch (error) {
-      await fail(messageOf(error, FILE_UNAVAILABLE));
+      const progress = error?.openProgress ?? null;
+      // A stage the reader knows how to wait through is waited through. Only
+      // when the waiting itself is over does this become a failure, and only
+      // then is the person offered the choice to ask again.
+      if (progress?.resumable && scheduleResume(progress)) return;
+      await fail(messageOf(error, FILE_UNAVAILABLE), {
+        retry: Boolean(progress?.resumable),
+      });
     }
+  }
+
+  /**
+   * Gives back everything this page is holding.
+   *
+   * Reached from the page going away and from nothing else, so it is the one
+   * place the timer, the renderer's resources and the session are released
+   * together.
+   */
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    cancelResume();
+    releaseView();
+    void closeViewer({ keepalive: true, quiet: true });
   }
 
   previousButton.addEventListener("click", () => {
@@ -518,23 +736,28 @@ export function createReaderController({
     if (event.key === back) void goTo(index - 1);
     else if (event.key === on) void goTo(index + 1);
   });
-  windowObject.addEventListener(
-    "pagehide",
-    () => {
-      releaseView();
-      void closeViewer({ keepalive: true, quiet: true });
-    },
-    { once: true },
-  );
+  windowObject.addEventListener("pagehide", dispose, { once: true });
 
   return {
     open,
     closeViewer,
+    dispose,
     getSession() {
       return session;
     },
     getState() {
-      return { closed, failed, index, mintId, pageCount: pager?.count ?? 0 };
+      return {
+        closed,
+        failed,
+        index,
+        mintId,
+        pageCount: pager?.count ?? 0,
+        waiting: resumeTimer !== null,
+        waitingStage: resumeStage,
+        attempts,
+        disposed,
+        retryOffered: retryButton !== null,
+      };
     },
   };
 }
