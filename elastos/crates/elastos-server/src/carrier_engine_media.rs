@@ -438,19 +438,30 @@ async fn commit_prepared_media<T>(
     true
 }
 
+struct StreamWarmSource {
+    endpoint: iroh::Endpoint,
+    grant: Value,
+    authority: Value,
+}
+
 async fn install_stream_warm(
     root: &Path,
     page: &str,
     generation: &str,
     prepared: Option<tokio::task::JoinHandle<Result<super::CarrierClient>>>,
-    endpoint: iroh::Endpoint,
-    grant: Value,
-    authority: Value,
+    source: StreamWarmSource,
     attach_armed: bool,
     admit: bool,
 ) {
     let (tx, rx) = oneshot::channel();
-    let worker = spawn_stream_warm(tx, prepared, endpoint, grant, authority, admit);
+    let worker = spawn_stream_warm(
+        tx,
+        prepared,
+        source.endpoint,
+        source.grant,
+        source.authority,
+        admit,
+    );
     replace_media_warm(
         (root.to_owned(), page.into()),
         MediaWarm {
@@ -597,9 +608,11 @@ pub(crate) async fn rearm_media_stream(
         page,
         generation,
         None,
-        endpoint.clone(),
-        grant.clone(),
-        authority.clone(),
+        StreamWarmSource {
+            endpoint: endpoint.clone(),
+            grant: grant.clone(),
+            authority: authority.clone(),
+        },
         true,
         false,
     )
@@ -786,9 +799,11 @@ pub(crate) async fn start_ingress(
         page,
         generation,
         prepared,
-        endpoint.clone(),
-        grant.clone(),
-        authority.clone(),
+        StreamWarmSource {
+            endpoint: endpoint.clone(),
+            grant: grant.clone(),
+            authority: authority.clone(),
+        },
         true,
         true,
     )
@@ -1166,7 +1181,7 @@ mod tests {
         barrier.0.prepared.wait().await;
         close_ingress(root.path(), page, "gen").await.unwrap();
         let _ = barrier.0.release.send(true);
-        assert_eq!(pending.await.unwrap(), false);
+        assert!(!pending.await.unwrap());
         assert!(released.load(Ordering::SeqCst));
         assert!(MEDIA_WARMS
             .get_or_init(Default::default)

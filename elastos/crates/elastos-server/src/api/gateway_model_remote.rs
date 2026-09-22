@@ -537,10 +537,10 @@ pub(crate) async fn route_run_operation(
     grants: &[ConsumerModelGrant],
     context: &HomeLaunchTokenContext,
     capsule_id: &str,
-    op: &str,
-    normalized: &Value,
+    request: (&str, &Value),
     now: u64,
 ) -> Result<Option<Value>, RemoteRouteError> {
+    let (op, normalized) = request;
     match op {
         "runs_create" => {
             let offer_id = normalized["offer_id"].as_str().unwrap_or_default();
@@ -869,8 +869,7 @@ mod tests {
             &[],
             &context,
             "assistant",
-            "runs_create",
-            &local_create,
+            ("runs_create", &local_create),
             1
         )
         .await
@@ -884,8 +883,7 @@ mod tests {
             &[],
             &context,
             "assistant",
-            "runs_get",
-            &local_get,
+            ("runs_get", &local_get),
             1
         )
         .await
@@ -898,8 +896,7 @@ mod tests {
             &[],
             &context,
             "assistant",
-            "runs_create",
-            &remote_without_grant,
+            ("runs_create", &remote_without_grant),
             1,
         )
         .await

@@ -4540,8 +4540,7 @@ mod tests {
         let install_path = format!("libexec/llama.cpp/fixture-v1/{platform}");
         let dest = data.join(&install_path);
         let error = protect_local_model_engine_install_parents(&dest, &install_path)
-            .err()
-            .expect("protect must reject an aliased install parent")
+            .expect_err("protect must reject an aliased install parent")
             .to_string();
         let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
         let sentinel_bytes = fs::read(&sentinel).unwrap();

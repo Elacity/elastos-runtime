@@ -27,15 +27,15 @@ pub(super) fn grant_inspection(
     })
 }
 
-fn owner_headers(token: &str, host: &str) -> Result<HeaderMap, Response> {
+fn owner_headers(token: &str, host: &str) -> Result<HeaderMap, Box<Response>> {
     let mut headers = HeaderMap::new();
     let value = axum::http::HeaderValue::from_str(token)
-        .map_err(|_| failure(StatusCode::CONFLICT, "operator_owner_changed"))?;
+        .map_err(|_| Box::new(failure(StatusCode::CONFLICT, "operator_owner_changed")))?;
     headers.insert("x-elastos-home-token", value);
     headers.insert(
         axum::http::header::HOST,
         axum::http::HeaderValue::from_str(host)
-            .map_err(|_| failure(StatusCode::CONFLICT, "operator_owner_changed"))?,
+            .map_err(|_| Box::new(failure(StatusCode::CONFLICT, "operator_owner_changed")))?,
     );
     headers.insert("origin", axum::http::HeaderValue::from_static("null"));
     Ok(headers)
@@ -52,7 +52,7 @@ pub(in crate::api::gateway) async fn operator_inspect(
     }
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let session = match operator_session(&service, &headers).await {
         Ok(s) => s,
@@ -114,7 +114,7 @@ pub(in crate::api::gateway) async fn operator_inspect(
     }
     let owner_headers = match owner_headers(&owner_token, &owner_host) {
         Ok(h) => h,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let response = super::super::browser_page_inspection(
         state.clone(),
@@ -182,7 +182,7 @@ pub(in crate::api::gateway) async fn detach_operator(
 ) -> Response {
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let session = match operator_session(&service, &headers).await {
         Ok(s) => s,
@@ -217,7 +217,7 @@ pub(in crate::api::gateway) async fn detach_operator(
     };
     let headers = match owner_headers(&token, &host) {
         Ok(h) => h,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     // Reuse owner revocation, including pending native effects and release retry.
     // The operator was authenticated against the exact record above.

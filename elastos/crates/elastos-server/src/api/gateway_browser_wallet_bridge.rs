@@ -133,9 +133,7 @@ pub(super) fn browser_account_access_account(
     summary: &SystemWalletAccountsSummary,
     chain_namespace: &str,
 ) -> Option<SystemWalletAccountSummary> {
-    if browser_chain_namespace_network(chain_namespace).is_none() {
-        return None;
-    }
+    browser_chain_namespace_network(chain_namespace)?;
     let default_account_id = browser_default_account_id(summary);
     let projected = browser_projected_evm_accounts(summary);
     if let Some(default_id) = default_account_id.as_deref() {

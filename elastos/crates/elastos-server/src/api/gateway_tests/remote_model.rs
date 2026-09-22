@@ -1031,8 +1031,7 @@ mod consumer_path {
                 grants,
                 &seed_context(),
                 capsule_id,
-                op,
-                &normalized,
+                (op, &normalized),
                 now_ts(),
             )
             .await

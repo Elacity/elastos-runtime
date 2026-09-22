@@ -312,7 +312,7 @@ fn verify_payload_paths_with_cancel(
     let receipt_path = &paths[0];
     ensure!(
         fs::metadata(receipt_path)?.file_type().is_file()
-            && fs::metadata(&receipt_path)?.len() <= 1024 * 1024,
+            && fs::metadata(receipt_path)?.len() <= 1024 * 1024,
         "Browser image receipt must be a regular file of at most 1 MiB"
     );
     let receipt: Value = serde_json::from_slice(&fs::read(receipt_path)?)?;
@@ -710,10 +710,14 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
                 .context("Browser image free-space check failed");
         }
         let stats = unsafe { stats.assume_init() };
+        #[cfg(target_pointer_width = "64")]
+        let block_size = stats.f_frsize;
+        #[cfg(target_pointer_width = "32")]
+        let block_size = u64::from(stats.f_frsize);
         disk_budget(
             needed,
-            (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64),
-            (stats.f_blocks as u64).saturating_mul(stats.f_frsize as u64),
+            (stats.f_bavail as u64).saturating_mul(block_size),
+            (stats.f_blocks as u64).saturating_mul(block_size),
         )
     }
     #[cfg(not(unix))]

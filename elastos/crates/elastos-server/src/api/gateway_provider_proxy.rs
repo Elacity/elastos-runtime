@@ -1778,8 +1778,7 @@ pub(super) async fn gateway_provider_proxy(
                 &remote_model_grants,
                 &context,
                 &launch_capsule_id,
-                &op,
-                &request,
+                (&op, &request),
                 crate::auth::now_ts(),
             )
             .await

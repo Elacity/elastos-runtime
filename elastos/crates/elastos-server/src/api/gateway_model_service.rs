@@ -221,7 +221,7 @@ enum RunSlot {
     /// and, while the run is still open, a live journal read.
     Existing {
         run_id: String,
-        record: RemoteModelRunRecord,
+        record: Box<RemoteModelRunRecord>,
     },
     /// A slot is held under the reservation key until commit or release.
     Reserved,
@@ -322,7 +322,7 @@ fn reserve_run_slot(
         }) {
             return Ok(RunSlot::Existing {
                 run_id: run_id.clone(),
-                record: record.clone(),
+                record: Box::new(record.clone()),
             });
         }
         if index.pending.contains_key(key) {
@@ -501,16 +501,26 @@ fn index_settlement_reply(
     json!({ "ok": true, "result": reply })
 }
 
+struct RetainedRunQuery<'a> {
+    operation: &'a str,
+    run_id: &'a str,
+    record: &'a RemoteModelRunRecord,
+    after_sequence: u64,
+}
+
 fn recover_missing_run_or_deny(
     data_dir: &Path,
     now: u64,
-    operation: &str,
-    run_id: &str,
-    record: &RemoteModelRunRecord,
+    query: RetainedRunQuery<'_>,
     result: &Value,
     message: &str,
-    after_sequence: u64,
 ) -> Value {
+    let RetainedRunQuery {
+        operation,
+        run_id,
+        record,
+        after_sequence,
+    } = query;
     if provider_error_code(result) == "run_not_found" {
         tracing::info!(
             "remote model run {run_id} settled from the Runtime record after the provider forgot it"
@@ -568,10 +578,13 @@ async fn answer_retained_create(
     context: &HomeLaunchTokenContext,
     capsule_id: &str,
     normalized: &Value,
-    request_id: &str,
-    run_id: String,
-    record: RemoteModelRunRecord,
+    retained: (String, RemoteModelRunRecord),
 ) -> Value {
+    let (run_id, record) = retained;
+    let request_id = normalized
+        .pointer("/runtime_binding/request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if let Some(refusal) = refuse_unbound_or_conflicting_create(&record, normalized) {
         return refusal;
     }
@@ -600,7 +613,16 @@ async fn answer_retained_create(
     };
     if let Some(message) = provider_status_error(&result) {
         return recover_missing_run_or_deny(
-            data_dir, now, "runs_get", &run_id, &record, &result, &message, 0,
+            data_dir,
+            now,
+            RetainedRunQuery {
+                operation: "runs_get",
+                run_id: &run_id,
+                record: &record,
+                after_sequence: 0,
+            },
+            &result,
+            &message,
         );
     }
     if let Some(status) =
@@ -804,11 +826,11 @@ struct CreateRaceBarrier {
 }
 
 #[cfg(test)]
-static CREATE_RACE_BARRIERS: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::BTreeMap<(PathBuf, CreateRacePoint), Arc<CreateRaceBarrier>>,
-    >,
-> = std::sync::OnceLock::new();
+type CreateRaceBarriers =
+    std::collections::BTreeMap<(PathBuf, CreateRacePoint), Arc<CreateRaceBarrier>>;
+#[cfg(test)]
+static CREATE_RACE_BARRIERS: std::sync::OnceLock<std::sync::Mutex<CreateRaceBarriers>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct CreateRaceBarrierGuard {
@@ -975,49 +997,21 @@ const REMOTE_RUN_ID_POINTERS: [&str; 4] = ["/data/run/id", "/data/run_id", "/run
 async fn reject_dispatched_create(
     registry: &ProviderRegistry,
     data_dir: &Path,
-    now: u64,
     reservation_key: &str,
     held_slot: bool,
     context: &HomeLaunchTokenContext,
-    capsule_id: &str,
-    grant_id: &str,
-    source_did: &str,
-    requester_principal_id: &str,
-    request_id: &str,
-    normalized: &Value,
+    record: RemoteModelRunRecord,
     result: &Value,
 ) -> Value {
+    let now = record.created_at;
+    let capsule_id = record.capsule_id.clone();
     let trustworthy_run_id = unique_string_pointers(result, &REMOTE_RUN_ID_POINTERS)
         .ok()
         .flatten();
     if let Some(run_id) = trustworthy_run_id {
-        let record = RemoteModelRunRecord {
-            grant_id: grant_id.to_string(),
-            source_endpoint_did: source_did.to_string(),
-            requester_principal_id: requester_principal_id.to_string(),
-            remote_principal_id: context.principal_id.clone(),
-            capsule_id: capsule_id.to_string(),
-            offer_id: normalized["offer_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            operation: normalized["operation"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            request_id: request_id.to_string(),
-            input_hash: normalized
-                .pointer("/runtime_binding/input_hash")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            created_at: now,
-            terminal_status: None,
-            terminal_at: None,
-        };
         match commit_run_slot(data_dir, now, reservation_key, &run_id, record) {
             Ok(()) => {
-                let status = if cancel_unrecorded_run(registry, context, capsule_id, &run_id).await
+                let status = if cancel_unrecorded_run(registry, context, &capsule_id, &run_id).await
                 {
                     "cancelled"
                 } else {
@@ -1027,7 +1021,7 @@ async fn reject_dispatched_create(
             }
             Err(err) => {
                 tracing::warn!("remote model run index write failed: {err}");
-                let _ = cancel_unrecorded_run(registry, context, capsule_id, &run_id).await;
+                let _ = cancel_unrecorded_run(registry, context, &capsule_id, &run_id).await;
                 if held_slot {
                     release_run_slot(data_dir, now, reservation_key);
                 }
@@ -1243,9 +1237,7 @@ pub(crate) async fn invoke(
                     &context,
                     capsule_id,
                     &normalized,
-                    &request_id,
-                    run_id,
-                    record,
+                    (run_id, *record),
                 )
                 .await;
             }
@@ -1295,12 +1287,14 @@ pub(crate) async fn invoke(
             return recover_missing_run_or_deny(
                 data_dir,
                 now,
-                operation,
-                run_id,
-                record,
+                RetainedRunQuery {
+                    operation,
+                    run_id,
+                    record,
+                    after_sequence: normalized["after_sequence"].as_u64().unwrap_or(0),
+                },
                 &result,
                 &message,
-                normalized["after_sequence"].as_u64().unwrap_or(0),
             );
         }
         let class = redact_provider_error(&message);
@@ -1313,6 +1307,30 @@ pub(crate) async fn invoke(
         await_create_race_barrier(data_dir, CreateRacePoint::BeforeCommit).await;
     }
 
+    let create_record = || RemoteModelRunRecord {
+        grant_id: grant_id.to_string(),
+        source_endpoint_did: source_did.clone(),
+        requester_principal_id: requester_principal_id.to_string(),
+        remote_principal_id: context.principal_id.clone(),
+        capsule_id: capsule_id.to_string(),
+        offer_id: normalized["offer_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        operation: normalized["operation"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        request_id: request_id.clone(),
+        input_hash: normalized
+            .pointer("/runtime_binding/input_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        created_at: now,
+        terminal_status: None,
+        terminal_at: None,
+    };
     let reply = normalize_remote_model_reply(&result);
     if operation == "runs_create" {
         let expected_offer = normalized["offer_id"].as_str().unwrap_or_default();
@@ -1326,16 +1344,10 @@ pub(crate) async fn invoke(
             return reject_dispatched_create(
                 &registry,
                 data_dir,
-                now,
                 &reservation_key,
                 held_slot,
                 &context,
-                capsule_id,
-                grant_id,
-                &source_did,
-                requester_principal_id,
-                &request_id,
-                &normalized,
+                create_record(),
                 &result,
             )
             .await;
@@ -1355,30 +1367,9 @@ pub(crate) async fn invoke(
         ),
         "runs_create" => {
             if let Some(run_id) = reply.run_id.clone() {
-                let record = RemoteModelRunRecord {
-                    grant_id: grant_id.to_string(),
-                    source_endpoint_did: source_did.clone(),
-                    requester_principal_id: requester_principal_id.to_string(),
-                    remote_principal_id: context.principal_id.clone(),
-                    capsule_id: capsule_id.to_string(),
-                    offer_id: normalized["offer_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    operation: normalized["operation"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    request_id: request_id.clone(),
-                    input_hash: normalized
-                        .pointer("/runtime_binding/input_hash")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    created_at: now,
-                    terminal_status: reply.terminal_status.clone(),
-                    terminal_at: reply.terminal_status.is_some().then_some(now),
-                };
+                let mut record = create_record();
+                record.terminal_status = reply.terminal_status.clone();
+                record.terminal_at = reply.terminal_status.is_some().then_some(now);
                 if let Err(err) = commit_run_slot(data_dir, now, &reservation_key, &run_id, record)
                 {
                     // The run exists on this Runtime but has no owner record;
@@ -1591,6 +1582,7 @@ mod tests {
             { "id": "qwen", "hosted": null },
             {
                 "id": "model:openrouter",
+                "operation": "text.generate",
                 "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" },
                 "share": { "enabled": true, "terms_ack": "openrouter-5.1-5.2+model", "processor": "OpenRouter", "payer": "this Home", "model": "fixture/model" },
                 "key_present": true

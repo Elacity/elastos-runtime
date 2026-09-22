@@ -4028,7 +4028,7 @@ enum ShutdownWaitReason {
 }
 
 fn transport_remaining_ms(expires_at_unix_ms: u64, now_unix_ms: u64) -> u64 {
-    expires_at_unix_ms.checked_sub(now_unix_ms).unwrap_or(0)
+    expires_at_unix_ms.saturating_sub(now_unix_ms)
 }
 
 fn format_shutdown_wait_reason(reason: &ShutdownWaitReason) -> String {
