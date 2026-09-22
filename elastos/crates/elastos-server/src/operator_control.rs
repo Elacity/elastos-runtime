@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures_lite::future::Boxed;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, SecretKey, Watcher};
+use iroh::{Endpoint, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1596,14 +1596,7 @@ struct OperatorClient {
 
 impl OperatorClient {
     async fn connect_endpoint_addr(addr: iroh::EndpointAddr, timeout_secs: u64) -> Result<Self> {
-        let mut rng_bytes = [0u8; 32];
-        getrandom::getrandom(&mut rng_bytes).map_err(|err| anyhow::anyhow!("rng: {}", err))?;
-        let secret_key = SecretKey::from_bytes(&rng_bytes);
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await
-            .context("failed to bind operator client endpoint")?;
+        let (endpoint, addr) = crate::carrier::bind_short_lived_carrier_dial(addr).await?;
 
         let conn = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
@@ -1712,6 +1705,21 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (api_url, task)
+    }
+
+    #[tokio::test]
+    async fn operator_client_rejects_peers_without_direct_routes() {
+        let secret = iroh::SecretKey::from_bytes(&[91u8; 32]);
+        for addr in [
+            iroh::EndpointAddr::from(secret.public()),
+            iroh::EndpointAddr::from(secret.public()).with_addrs([iroh::TransportAddr::Relay(
+                "https://relay.example.invalid./".parse().unwrap(),
+            )]),
+        ] {
+            let result = OperatorClient::connect_endpoint_addr(addr, 1).await;
+            let error = result.err().expect("direct route is required");
+            assert!(error.to_string().contains("no IP route"), "{error:#}");
+        }
     }
 
     #[tokio::test]

@@ -1815,6 +1815,33 @@ fn require_runtime_capacity(
     inventory.require_space(required)
 }
 
+// A bounded model read is not an effect. While it is in flight, cancel ends
+// the local wait within one poll. The worker then uses the existing backend
+// drain and settle_failure path. A provider subprocess still completes its own
+// bounded answer before that drain takes the bridge.
+async fn fetch_model_part_unless_cancelled(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    id: &str,
+    cid: &str,
+    path: &str,
+    range: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<u8>> {
+    let fetch = crate::content::fetch_model_part(registry, cid, path, range);
+    tokio::pin!(fetch);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut fetch => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                if load_operation(data_dir, id)?.cancel_requested {
+                    anyhow::bail!("preparation stopped");
+                }
+            }
+        }
+    }
+}
+
 async fn prepare(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
@@ -1852,10 +1879,16 @@ async fn prepare(
         .await
         .context(PreparationFailurePhase::Capacity)?;
     require_active(data_dir, id, stop, revalidate)?;
-    let index =
-        crate::content::fetch_model_part(registry, &entry.cid, "_elastos_object.json", None)
-            .await
-            .context(PreparationFailurePhase::MetadataRead)?;
+    let index = fetch_model_part_unless_cancelled(
+        data_dir,
+        registry,
+        id,
+        &entry.cid,
+        "_elastos_object.json",
+        None,
+    )
+    .await
+    .context(PreparationFailurePhase::MetadataRead)?;
     require_active(data_dir, id, stop, revalidate)?;
     let object: serde_json::Value =
         serde_json::from_slice(&index).context(PreparationFailurePhase::MetadataIntegrity)?;
@@ -1903,8 +1936,10 @@ async fn prepare(
                     .context(PreparationFailurePhase::Capacity)?;
             }
             require_active(data_dir, id, stop, revalidate)?;
-            let bytes = crate::content::fetch_model_part(
+            let bytes = fetch_model_part_unless_cancelled(
+                data_dir,
                 registry,
+                id,
                 &entry.cid,
                 &expected.path,
                 Some((offset, length)),
@@ -5763,8 +5798,7 @@ mod tests {
             let before = serde_json::to_vec(&rejected).unwrap();
             let error = append_admitted_model_startup_offers(root.path(), &registry, &mut rejected)
                 .await
-                .err()
-                .expect("a changed owner descriptor is rejected");
+                .expect_err("a changed owner descriptor is rejected");
             assert!(
                 error
                     .to_string()
@@ -6984,32 +7018,104 @@ server.serve_forever()
         .unwrap();
         let id = result["operation_id"].as_str().unwrap();
         let before = load_operation(root.path(), id).unwrap();
-        owner
+        let started = std::time::Instant::now();
+        let cancelled = owner
             .invoke(
                 root.path(),
-                Some(registry),
+                Some(registry.clone()),
                 caller(&context(), &method("cancel")),
                 "cancel",
                 &serde_json::json!({"operation_id":id}),
                 Arc::new(|| Ok(())),
             )
             .unwrap();
-        assert_eq!(
-            load_operation(root.path(), id).unwrap().reserved_bytes,
-            before.reserved_bytes
-        );
-        assert!(root.path().join("model-preparation/stage").exists());
+        assert_eq!(cancelled["cancel_requested"], true);
+        assert_eq!(cancelled["state"], "preparing");
+        // The read is still held. Settlement must not wait for the holder.
         assert!(!owner.worker.lock().unwrap().as_ref().unwrap().is_finished());
-        backend.release.notify_one();
         join_worker(&owner).await;
+        let settled = started.elapsed();
+        assert!(
+            settled < std::time::Duration::from_secs(5),
+            "cancellation settles within 5s while the read stays held: {settled:?}"
+        );
         let record = load_operation(root.path(), id).unwrap();
         assert_eq!(record.state, PreparationState::Cancelled);
+        assert_eq!(
+            record.failure_phase,
+            Some(PreparationFailurePhase::WeightsRead)
+        );
         assert_eq!(record.completed_bytes, before.completed_bytes);
         assert_eq!(record.reserved_bytes, 0);
         assert!(!root.path().join("model-preparation/stage").exists());
+        assert!(storage::missing(
+            &Inventory::open(root.path(), false)
+                .unwrap()
+                .admitted(id)
+                .err()
+                .unwrap()
+        ));
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls.last().unwrap(), "runtime_prepare_backend");
         assert!(!calls.iter().any(|op| op == "runtime_hash_staged_directory"));
+        let calls_after_drain = calls.len();
+        drop(calls);
+        let input = serde_json::json!({"operation_id":id});
+        let mut previous_status = None;
+        for request_id in ["status-1", "status-2"] {
+            let status = owner
+                .invoke(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    request_id,
+                    &input,
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            assert_eq!(status["state"], "cancelled");
+            assert_eq!(status["admitted"], false);
+            assert_eq!(status["cancel_requested"], true);
+            if let Some(previous) = &previous_status {
+                assert_eq!(&status, previous);
+            }
+            previous_status = Some(status);
+            let persisted = load_operation(root.path(), id).unwrap();
+            assert_eq!(persisted.state, PreparationState::Cancelled);
+            assert_eq!(persisted.reserved_bytes, 0);
+        }
+        let restarted = PreparationOwner::default();
+        let status = restarted
+            .invoke(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("status")),
+                "status-restart",
+                &input,
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(status["state"], "cancelled");
+        assert_eq!(status["admitted"], false);
+        assert_eq!(status["cancel_requested"], true);
+        assert_eq!(Some(&status), previous_status.as_ref());
+        assert!(restarted.worker.lock().unwrap().is_none());
+        let again = restarted
+            .invoke(
+                root.path(),
+                Some(registry),
+                caller(&context(), &method("status")),
+                "status-restart-2",
+                &input,
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(again, status);
+        let persisted = load_operation(root.path(), id).unwrap();
+        assert_eq!(persisted.state, PreparationState::Cancelled);
+        assert_eq!(persisted.reserved_bytes, 0);
+        assert!(!root.path().join("model-preparation/stage").exists());
+        assert_eq!(backend.calls.lock().unwrap().len(), calls_after_drain);
     }
 
     async fn join_worker(owner: &PreparationOwner) {
