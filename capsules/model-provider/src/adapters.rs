@@ -41,17 +41,37 @@ const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
 
 fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, AdapterFault> {
-    reqwest::Client::builder()
+    backend_client_with_socket(timeout_ms, None)
+}
+
+fn backend_client_with_socket(
+    timeout_ms: u64,
+    unix_socket: Option<&str>,
+) -> std::result::Result<reqwest::Client, AdapterFault> {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(BACKEND_CONNECT_TIMEOUT_MS))
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-        .map_err(|err| {
-            AdapterFault::transport(
+        .timeout(Duration::from_millis(timeout_ms));
+    if let Some(path) = unix_socket {
+        #[cfg(unix)]
+        {
+            builder = builder.unix_socket(path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(AdapterFault::transport(
                 "model backend transport was interrupted",
-                format!("failed to build backend client: {err}"),
-            )
-        })
+                "Unix socket transport is unavailable on this platform".into(),
+            ));
+        }
+    }
+    builder.build().map_err(|err| {
+        AdapterFault::transport(
+            "model backend transport was interrupted",
+            format!("failed to build backend client: {err}"),
+        )
+    })
 }
 
 // The native provider has no network sandbox. Until Runtime owns a confined
@@ -545,20 +565,20 @@ impl LiveAdapterExecutor {
 
     #[cfg(test)]
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
-        Self::new_with_local_ports(runtime, updates, BTreeMap::new())
+        Self::new_with_local_sockets(runtime, updates, BTreeMap::new())
     }
 
-    pub(crate) fn new_with_local_ports(
+    pub(crate) fn new_with_local_sockets(
         runtime: Handle,
         updates: mpsc::Sender<WorkerUpdate>,
-        ports: BTreeMap<String, u16>,
+        sockets: BTreeMap<String, String>,
     ) -> Self {
         Self {
             runtime,
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
-            local_llama: LocalLlamaEngines::with_runtime_ports(ports),
+            local_llama: LocalLlamaEngines::with_runtime_sockets(sockets),
         }
     }
 
@@ -1549,6 +1569,7 @@ async fn run_local_text_worker_inner(
         LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
     )
     .then(HostedBackendReport::default);
+    let mut local_socket = None;
     let (api_url, api_key, body, private_endpoint) = match &task.backend {
         LocalTextBackend::OpenRouterDecisions {
             api_url,
@@ -1610,14 +1631,16 @@ async fn run_local_text_worker_inner(
                 &task.prompt,
                 Some(endpoint.enable_thinking),
             );
+            local_socket = endpoint.unix_socket;
             (endpoint.api_url, None, body, true)
         }
     };
-    let client = backend_client(
+    let client = backend_client_with_socket(
         remaining_run_timeout(task.deadline_ms)?
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX),
+        local_socket.as_deref(),
     )?;
     let request = {
         let mut builder = client

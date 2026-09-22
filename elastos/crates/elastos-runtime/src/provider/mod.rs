@@ -7,6 +7,8 @@
 //! Providers are registered at startup and can be dynamically added/removed.
 
 pub mod bridge;
+#[cfg(target_os = "macos")]
+mod local_model_broker;
 mod registry;
 
 pub use bridge::{CapsuleProvider, ProviderBridge, ProviderConfig as BridgeProviderConfig};

@@ -1231,7 +1231,7 @@ async fn refresh_registered_model_provider(
     };
     let (mut config, _guard) = model_provider_config(data_dir, registry).await?;
     #[cfg(target_os = "macos")]
-    registry.apply_local_model_ports(&mut config).await?;
+    registry.apply_local_model_sockets(&mut config).await?;
     registry
         .refresh_local_model_configuration(&config)
         .await

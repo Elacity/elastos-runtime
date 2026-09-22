@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read as _;
 use std::net::TcpListener;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,12 +33,13 @@ pub(crate) enum LocalLlamaFault {
 #[derive(Clone, Default)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
-    runtime_ports: Arc<BTreeMap<String, u16>>,
+    runtime_sockets: Arc<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalLlamaEndpoint {
     pub api_url: String,
+    pub unix_socket: Option<String>,
     pub model: String,
     pub enable_thinking: bool,
 }
@@ -56,16 +59,23 @@ struct RunningEngine {
 struct GuardConfig {
     engine_path: String,
     model_path: String,
-    port: u16,
+    target: EngineTarget,
     alias: String,
     settings: LocalLlamaSettings,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum EngineTarget {
+    Tcp(u16),
+    Unix(String),
+}
+
 impl LocalLlamaEngines {
-    pub(crate) fn with_runtime_ports(ports: BTreeMap<String, u16>) -> Self {
+    pub(crate) fn with_runtime_sockets(sockets: BTreeMap<String, String>) -> Self {
         Self {
             engines: Arc::new(Mutex::new(BTreeMap::new())),
-            runtime_ports: Arc::new(ports),
+            runtime_sockets: Arc::new(sockets),
         }
     }
 
@@ -116,23 +126,38 @@ impl LocalLlamaEngines {
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
-        let port = if self.runtime_ports.is_empty() {
-            reserve_loopback_port()?
+        let (target, broker_socket) = if self.runtime_sockets.is_empty() {
+            (EngineTarget::Tcp(reserve_loopback_port()?), None)
         } else {
-            *self
-                .runtime_ports
+            let broker = self
+                .runtime_sockets
                 .get(offer_id)
-                .ok_or(LocalLlamaFault::Failed)?
+                .ok_or(LocalLlamaFault::Failed)?;
+            let prefix = broker
+                .strip_suffix(".sock")
+                .ok_or(LocalLlamaFault::Failed)?;
+            (
+                EngineTarget::Unix(format!("{prefix}.engine.sock")),
+                Some(broker.clone()),
+            )
         };
+        if let EngineTarget::Unix(path) = &target {
+            remove_stale_engine_socket(path)?;
+        }
         let alias = random_alias()?;
+        let (base_url, unix_socket) = match &target {
+            EngineTarget::Tcp(port) => (format!("http://127.0.0.1:{port}"), None),
+            EngineTarget::Unix(_) => ("http://localhost".to_string(), broker_socket),
+        };
         let endpoint = LocalLlamaEndpoint {
-            api_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            api_url: format!("{base_url}/v1/chat/completions"),
+            unix_socket,
             model: alias.clone(),
             enable_thinking: settings.enable_thinking,
         };
-        let models_url = format!("http://127.0.0.1:{port}/v1/models");
+        let models_url = format!("{base_url}/v1/models");
         let (child, liveness, guard_group) =
-            spawn_managed_engine(engine, model, settings, port, &alias).await?;
+            spawn_managed_engine(engine, model, settings, &target, &alias).await?;
         let health_timeout = Duration::from_millis(settings.health_timeout_ms)
             .min(deadline.saturating_duration_since(Instant::now()));
         let shutdown_timeout = Duration::from_millis(settings.shutdown_timeout_ms);
@@ -152,7 +177,7 @@ impl LocalLlamaEngines {
             Some(running) => {
                 #[cfg(not(test))]
                 let initialized =
-                    initialize_guard(running, engine, model, settings, port, &alias, deadline)
+                    initialize_guard(running, engine, model, settings, &target, &alias, deadline)
                         .await;
                 #[cfg(test)]
                 let initialized = Ok(());
@@ -162,7 +187,7 @@ impl LocalLlamaEngines {
                         wait_until_healthy(
                             &mut running.child,
                             running.guard_group,
-                            port,
+                            &running.endpoint,
                             &alias,
                             health_timeout.min(deadline.saturating_duration_since(Instant::now())),
                         )
@@ -223,20 +248,20 @@ async fn spawn_managed_engine(
     engine: &LocalArtifactConfig,
     model: &LocalArtifactConfig,
     settings: &LocalLlamaSettings,
-    port: u16,
+    target: &EngineTarget,
     alias: &str,
 ) -> Result<(Child, Option<ChildStdin>, Option<libc::pid_t>), LocalLlamaFault> {
     #[cfg(test)]
     {
         let mut command = Command::new(&engine.path);
-        configure_tokio_engine_command(&mut command, &model.path, settings, port, alias);
+        configure_tokio_engine_command(&mut command, &model.path, settings, target, alias);
         let child = command.spawn().map_err(|_| LocalLlamaFault::Failed)?;
         Ok((child, None, None))
     }
 
     #[cfg(not(test))]
     {
-        let _ = (engine, model, settings, port, alias);
+        let _ = (engine, model, settings, target, alias);
         spawn_guarded_engine()
     }
 }
@@ -247,14 +272,14 @@ async fn initialize_guard(
     engine: &LocalArtifactConfig,
     model: &LocalArtifactConfig,
     settings: &LocalLlamaSettings,
-    port: u16,
+    target: &EngineTarget,
     alias: &str,
     deadline: Instant,
 ) -> Result<(), LocalLlamaFault> {
     let config = GuardConfig {
         engine_path: engine.path.clone(),
         model_path: model.path.clone(),
-        port,
+        target: target.clone(),
         alias: alias.to_string(),
         settings: settings.clone(),
     };
@@ -305,12 +330,12 @@ fn configure_tokio_engine_command(
     command: &mut Command,
     model_path: &str,
     settings: &LocalLlamaSettings,
-    port: u16,
+    target: &EngineTarget,
     alias: &str,
 ) {
     command
         .env_clear()
-        .args(engine_arguments(model_path, settings, port, alias))
+        .args(engine_arguments(model_path, settings, target, alias))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -320,16 +345,23 @@ fn configure_tokio_engine_command(
 fn engine_arguments(
     model_path: &str,
     settings: &LocalLlamaSettings,
-    port: u16,
+    target: &EngineTarget,
     alias: &str,
 ) -> Vec<OsString> {
-    [
+    let mut args: Vec<OsString> = [
         "-m".into(),
         model_path.into(),
         "--host".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
-        port.to_string().into(),
+        match target {
+            EngineTarget::Tcp(_) => "127.0.0.1".into(),
+            EngineTarget::Unix(path) => path.into(),
+        },
+    ]
+    .into();
+    if let EngineTarget::Tcp(port) = target {
+        args.extend([OsString::from("--port"), port.to_string().into()]);
+    }
+    args.extend([
         "--ctx-size".into(),
         settings.context_size.to_string().into(),
         "--parallel".into(),
@@ -342,8 +374,8 @@ fn engine_arguments(
         settings.gpu_layers.to_string().into(),
         "--alias".into(),
         alias.into(),
-    ]
-    .into()
+    ]);
+    args
 }
 
 async fn running_engine_is_ready(
@@ -353,7 +385,7 @@ async fn running_engine_is_ready(
     if !managed_child_is_running(&mut running.child, running.guard_group) {
         return Ok(false);
     }
-    let Ok(client) = health_client() else {
+    let Ok(client) = health_client(running.endpoint.unix_socket.as_deref()) else {
         return Ok(false);
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -402,6 +434,24 @@ fn reserve_loopback_port() -> Result<u16, LocalLlamaFault> {
 }
 
 #[cfg(unix)]
+fn remove_stale_engine_socket(path: &str) -> Result<(), LocalLlamaFault> {
+    use std::os::unix::fs::FileTypeExt as _;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            std::fs::remove_file(path).map_err(|_| LocalLlamaFault::Failed)
+        }
+        Ok(_) => Err(LocalLlamaFault::Failed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(LocalLlamaFault::Failed),
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_stale_engine_socket(_path: &str) -> Result<(), LocalLlamaFault> {
+    Err(LocalLlamaFault::Failed)
+}
+
+#[cfg(unix)]
 fn random_alias() -> Result<String, LocalLlamaFault> {
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")
@@ -418,13 +468,16 @@ fn random_alias() -> Result<String, LocalLlamaFault> {
 async fn wait_until_healthy(
     child: &mut Child,
     guard_group: Option<libc::pid_t>,
-    port: u16,
+    endpoint: &LocalLlamaEndpoint,
     alias: &str,
     timeout: Duration,
 ) -> Result<(), LocalLlamaFault> {
-    let client = health_client()?;
+    let client = health_client(endpoint.unix_socket.as_deref())?;
     let deadline = Instant::now() + timeout;
-    let models_url = format!("http://127.0.0.1:{port}/v1/models");
+    let models_url = match endpoint.api_url.strip_suffix("/v1/chat/completions") {
+        Some(base) => format!("{base}/v1/models"),
+        None => return Err(LocalLlamaFault::Failed),
+    };
     loop {
         if !managed_child_is_running(child, guard_group) {
             return Err(LocalLlamaFault::Failed);
@@ -454,13 +507,23 @@ async fn wait_until_healthy(
     }
 }
 
-fn health_client() -> Result<reqwest::Client, LocalLlamaFault> {
-    reqwest::Client::builder()
+fn health_client(unix_socket: Option<&str>) -> Result<reqwest::Client, LocalLlamaFault> {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(HEALTH_REQUEST_TIMEOUT)
-        .read_timeout(HEALTH_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|_| LocalLlamaFault::Failed)
+        .read_timeout(HEALTH_REQUEST_TIMEOUT);
+    if let Some(path) = unix_socket {
+        #[cfg(unix)]
+        {
+            builder = builder.unix_socket(PathBuf::from(path));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(LocalLlamaFault::Failed);
+        }
+    }
+    builder.build().map_err(|_| LocalLlamaFault::Failed)
 }
 
 async fn endpoint_reports_alias(
@@ -666,7 +729,7 @@ fn run_internal_guard() -> Result<(), ()> {
         .args(engine_arguments(
             &config.model_path,
             &config.settings,
-            config.port,
+            &config.target,
             &config.alias,
         ))
         .stdin(Stdio::null())
@@ -902,9 +965,22 @@ mod tests {
         .collect();
 
         assert_eq!(
-            engine_arguments("/models/model.gguf", &settings, 11434, "private-alias"),
+            engine_arguments(
+                "/models/model.gguf",
+                &settings,
+                &EngineTarget::Tcp(11434),
+                "private-alias"
+            ),
             expected
         );
+        let unix_args = engine_arguments(
+            "/models/model.gguf",
+            &settings,
+            &EngineTarget::Unix("/tmp/private-model.sock".into()),
+            "private-alias",
+        );
+        assert_eq!(unix_args[3], OsString::from("/tmp/private-model.sock"));
+        assert!(!unix_args.contains(&OsString::from("--port")));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1317,7 +1393,12 @@ mod tests {
             wait_until_healthy(
                 &mut child,
                 None,
-                port,
+                &LocalLlamaEndpoint {
+                    api_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+                    unix_socket: None,
+                    model: "unpredictable-expected-alias".into(),
+                    enable_thinking: false,
+                },
                 "unpredictable-expected-alias",
                 Duration::from_millis(100),
             )

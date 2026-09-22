@@ -3,10 +3,12 @@
 //! Manages stdin/stdout communication with a provider capsule process.
 //! The runtime sends ProviderRequests and receives ProviderResponses
 //! over line-delimited JSON.
-use std::path::Path;
-use std::sync::Arc;
 #[cfg(target_os = "macos")]
-use std::{collections::BTreeMap, net::TcpListener};
+use std::collections::BTreeMap;
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -191,6 +193,27 @@ pub struct ProviderBridge {
     /// Timeout applied to each shutdown settle stage (protocol request,
     /// child wait, force reap). Tests inject a short value.
     shutdown_timeout: std::time::Duration,
+    #[cfg(target_os = "macos")]
+    _local_brokers: Mutex<BrokerTasks>,
+    #[cfg(target_os = "macos")]
+    _local_ipc_dir: Mutex<Option<tempfile::TempDir>>,
+    #[cfg(target_os = "macos")]
+    _local_provider_pid: Arc<AtomicU32>,
+    #[cfg(target_os = "macos")]
+    _local_provider_birth: Arc<AtomicU64>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct BrokerTasks(Vec<tokio::task::JoinHandle<()>>);
+
+#[cfg(target_os = "macos")]
+impl Drop for BrokerTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 impl ProviderBridge {
@@ -231,19 +254,27 @@ impl ProviderBridge {
         Self::spawn_with_timeouts(binary_path, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
     }
 
-    /// Admit only Runtime-selected local engine ports for the native model provider.
+    /// Admit only Runtime-selected private engine sockets for the native model provider.
     #[cfg(target_os = "macos")]
     pub async fn spawn_confined_model(
         binary_path: &Path,
         mut config: ProviderConfig,
-    ) -> Result<(Self, BTreeMap<String, u16>, ProviderConfig), BridgeError> {
+    ) -> Result<(Self, BTreeMap<String, String>, ProviderConfig), BridgeError> {
         let offers = config
             .extra
             .get("offers")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| BridgeError::InitFailed("model offers unavailable".into()))?;
-        let mut ports = BTreeMap::new();
-        let mut reservations = Vec::new();
+        let mut sockets = BTreeMap::new();
+        let mut brokers = BrokerTasks::default();
+        let provider_pid = Arc::new(AtomicU32::new(0));
+        let provider_birth = Arc::new(AtomicU64::new(0));
+        let ipc_dir = tempfile::Builder::new()
+            .prefix("em-")
+            .tempdir()
+            .map_err(BridgeError::Spawn)?;
+        // Seatbelt resolves /var to /private/var before comparing literal paths.
+        let ipc_path = std::fs::canonicalize(ipc_dir.path()).map_err(BridgeError::Spawn)?;
         let mut policy = String::from("(version 1)\n(allow default)\n(deny network-outbound)\n");
         for offer in offers {
             if offer
@@ -257,25 +288,70 @@ impl ProviderBridge {
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))?;
-            let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(BridgeError::Spawn)?;
-            let port = listener.local_addr().map_err(BridgeError::Spawn)?.port();
-            if ports.insert(id.to_string(), port).is_some() {
+            let index = sockets.len();
+            let socket = ipc_path.join(format!("{index}.sock"));
+            let engine_socket = ipc_path.join(format!("{index}.engine.sock"));
+            let socket = socket
+                .to_str()
+                .ok_or_else(|| BridgeError::InitFailed("invalid local socket path".into()))?
+                .to_string();
+            if !socket.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+            }) {
+                return Err(BridgeError::InitFailed("unsafe local socket path".into()));
+            }
+            if socket.len() >= 104 {
+                return Err(BridgeError::InitFailed("local socket path too long".into()));
+            }
+            if engine_socket.as_os_str().len() >= 104 {
+                return Err(BridgeError::InitFailed(
+                    "engine socket path too long".into(),
+                ));
+            }
+            if sockets.insert(id.to_string(), socket.clone()).is_some() {
                 return Err(BridgeError::InitFailed("duplicate local offer id".into()));
             }
             policy.push_str(&format!(
-                "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+                "(allow network-outbound (literal \"{socket}\"))\n"
             ));
-            reservations.push(listener);
+            brokers.0.push(
+                super::local_model_broker::start(
+                    &socket,
+                    engine_socket,
+                    provider_pid.clone(),
+                    provider_birth.clone(),
+                )
+                .map_err(BridgeError::Spawn)?,
+            );
         }
-        // Seatbelt's localhost selector includes ::1 at the same port.
-        policy.push_str("(deny network-outbound (socket-domain AF_INET6))\n");
-        config.extra["runtime_local_ports"] = serde_json::json!(ports);
+        config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(policy).arg(binary_path);
-        drop(reservations);
-        let bridge =
+        let mut bridge =
             Self::spawn_command(command, config.clone(), INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await?;
-        Ok((bridge, ports, config))
+        let pid = bridge
+            .child
+            .lock()
+            .await
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .ok_or_else(|| BridgeError::InitFailed("model provider pid unavailable".into()))?;
+        let birth = match super::local_model_broker::process_birth(pid) {
+            Some(birth) => birth,
+            None => {
+                let _ = bridge.shutdown().await;
+                return Err(BridgeError::InitFailed(
+                    "model provider identity unavailable".into(),
+                ));
+            }
+        };
+        provider_birth.store(birth, Ordering::Release);
+        provider_pid.store(pid, Ordering::Release);
+        *bridge._local_ipc_dir.lock().await = Some(ipc_dir);
+        *bridge._local_brokers.lock().await = brokers;
+        bridge._local_provider_pid = provider_pid;
+        bridge._local_provider_birth = provider_birth;
+        Ok((bridge, sockets, config))
     }
 
     async fn spawn_with_timeouts(
@@ -336,6 +412,14 @@ impl ProviderBridge {
             child: Mutex::new(Some(child)),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_timeout,
+            #[cfg(target_os = "macos")]
+            _local_ipc_dir: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            _local_brokers: Mutex::new(BrokerTasks::default()),
+            #[cfg(target_os = "macos")]
+            _local_provider_pid: Arc::new(AtomicU32::new(0)),
+            #[cfg(target_os = "macos")]
+            _local_provider_birth: Arc::new(AtomicU64::new(0)),
         };
 
         // Send Init request
@@ -395,6 +479,14 @@ impl ProviderBridge {
             child: Mutex::new(None),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_timeout: SHUTDOWN_TIMEOUT,
+            #[cfg(target_os = "macos")]
+            _local_ipc_dir: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            _local_brokers: Mutex::new(BrokerTasks::default()),
+            #[cfg(target_os = "macos")]
+            _local_provider_pid: Arc::new(AtomicU32::new(0)),
+            #[cfg(target_os = "macos")]
+            _local_provider_birth: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -553,7 +645,7 @@ impl ProviderBridge {
         });
 
         let protocol_error = shutdown_result.err();
-        match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
+        let result = match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
             Ok(Ok(status)) => {
                 child_guard.take();
                 self.shutdown_completed
@@ -584,7 +676,24 @@ impl ProviderBridge {
                 }
                 Err(reap_error) => Err(reap_error),
             },
+        };
+        #[cfg(target_os = "macos")]
+        if child_guard.is_none() {
+            self.stop_local_brokers().await;
         }
+        result
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn stop_local_brokers(&self) {
+        self._local_provider_pid.store(0, Ordering::Release);
+        self._local_provider_birth.store(0, Ordering::Release);
+        let mut brokers = self._local_brokers.lock().await;
+        for task in brokers.0.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        self._local_ipc_dir.lock().await.take();
     }
 }
 
@@ -1379,40 +1488,37 @@ def local_errno(port):
         connection.settimeout(1)
         return connection.connect_ex(('127.0.0.1', port))
 
-def ipv6_errno(port):
-    with socket.socket(socket.AF_INET6) as connection:
+def unix_errno(path):
+    with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(1)
-        return connection.connect_ex(('::1', port))
+        return connection.connect_ex(path)
 
 for line in sys.stdin:
     request = json.loads(line)
     if request['op'] == 'init':
         extra = request['config']['extra']
-        allowed_port = extra['runtime_local_ports']['fixture-local']
+        allowed_socket = extra['runtime_local_sockets']['fixture-local']
+        other_socket = allowed_socket + '.other'
         unrelated_port = extra['probe_unrelated_port']
         print('{"status":"ok"}', flush=True)
     elif request['op'] == 'exists':
-        direct = external_errno()
-        unrelated = local_errno(unrelated_port)
-        descendant = list(map(int, subprocess.check_output([
-            '/usr/bin/python3', '-c',
-            'import socket,sys; out=[];\nfor family,host,port in [(socket.AF_INET,"203.0.113.1",443),(socket.AF_INET,"127.0.0.1",int(sys.argv[1])),(socket.AF_INET6,"::1",int(sys.argv[2]))]:\n s=socket.socket(family);s.settimeout(1);out.append(s.connect_ex((host,port)));s.close()\nprint(*out)',
-            str(unrelated_port), str(allowed_port)
-        ]).split()))
-        with socket.socket() as listener:
-            listener.bind(('127.0.0.1', allowed_port))
-            listener.listen(1)
-            loopback = local_errno(allowed_port)
-        with socket.socket(socket.AF_INET6) as listener6:
-            listener6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            listener6.bind(('::1', allowed_port))
-            listener6.listen(1)
-            ipv6 = ipv6_errno(allowed_port)
+        with socket.socket(socket.AF_UNIX) as other_listener:
+            other_listener.bind(other_socket)
+            other_listener.listen(8)
+            direct = external_errno()
+            unrelated = local_errno(unrelated_port)
+            other = unix_errno(other_socket)
+            selected = unix_errno(allowed_socket)
+            descendant = list(map(int, subprocess.check_output([
+                '/usr/bin/python3', '-c',
+                'import socket,sys; out=[];\nfor family,address in [(socket.AF_INET,("203.0.113.1",443)),(socket.AF_INET,("127.0.0.1",int(sys.argv[1]))),(socket.AF_UNIX,sys.argv[2]),(socket.AF_UNIX,sys.argv[3])]:\n s=socket.socket(family);s.settimeout(1);out.append(s.connect_ex(address));s.close()\nprint(*out)',
+                str(unrelated_port), other_socket, allowed_socket
+            ]).split()))
         print(json.dumps({'status':'ok','data':{
             'direct_errno': direct, 'descendant_errno': descendant[0],
             'unrelated_errno': unrelated, 'descendant_unrelated_errno': descendant[1],
-            'loopback_errno': loopback, 'ipv6_errno': ipv6,
-            'descendant_ipv6_errno': descendant[2]}}), flush=True)
+            'other_socket_errno': other, 'descendant_other_socket_errno': descendant[2],
+            'selected_socket_errno': selected, 'descendant_selected_socket_errno': descendant[3]}}), flush=True)
     elif request['op'] == 'shutdown':
         print('{"status":"ok"}', flush=True)
         break
@@ -1425,14 +1531,13 @@ for line in sys.stdin:
             }),
             ..Default::default()
         };
-        let (bridge, ports, confined_config) =
+        let (bridge, sockets, confined_config) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
                 .unwrap();
-        assert_ne!(ports["fixture-local"], unrelated_port);
         assert_eq!(
-            confined_config.extra["runtime_local_ports"]["fixture-local"],
-            ports["fixture-local"]
+            confined_config.extra["runtime_local_sockets"]["fixture-local"],
+            sockets["fixture-local"]
         );
         let response = bridge
             .request(ProviderRequest::Exists {
@@ -1448,10 +1553,89 @@ for line in sys.stdin:
         assert_eq!(data["descendant_errno"], libc::EPERM);
         assert_eq!(data["unrelated_errno"], libc::EPERM);
         assert_eq!(data["descendant_unrelated_errno"], libc::EPERM);
-        assert_eq!(data["ipv6_errno"], libc::EPERM);
-        assert_eq!(data["descendant_ipv6_errno"], libc::EPERM);
-        assert_eq!(data["loopback_errno"], 0);
+        assert_eq!(data["other_socket_errno"], libc::EPERM);
+        assert_eq!(data["descendant_other_socket_errno"], libc::EPERM);
+        assert_eq!(data["selected_socket_errno"], 0);
+        assert_eq!(data["descendant_selected_socket_errno"], 0);
         bridge.shutdown().await.unwrap();
+        assert!(!Path::new(&sockets["fixture-local"]).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires ELASTOS_MODEL_BROKER_PROOF_CONFIG with installed provider and admitted local Smol artifacts"]
+    async fn installed_model_provider_completes_smollm2_through_runtime_broker() {
+        use sha2::{Digest as _, Sha256};
+
+        let input_path = std::env::var("ELASTOS_MODEL_BROKER_PROOF_CONFIG").unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(input_path).unwrap()).unwrap();
+        let binary = Path::new(fixture["binary_path"].as_str().unwrap());
+        let config: ProviderConfig =
+            serde_json::from_value(fixture["provider_config"].clone()).unwrap();
+        let offer_id = fixture["offer_id"].as_str().unwrap();
+        let (bridge, sockets, _) = ProviderBridge::spawn_confined_model(binary, config)
+            .await
+            .unwrap();
+        let socket = sockets[offer_id].clone();
+        let input = serde_json::json!({
+            "schema": "elastos.model.input.text/v1",
+            "prompt": "Reply with one word: local."
+        });
+        let input_hash = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(serde_json::to_vec(&input).unwrap()))
+        );
+        let binding = serde_json::json!({
+            "schema": "elastos.model.runtime-binding/v1",
+            "principal_id": "person:local:test",
+            "session_id": "session:test",
+            "capsule_id": "assistant",
+            "grant_id": "grant:test",
+            "request_id": format!("request:broker-smol-{}", uuid::Uuid::new_v4()),
+            "offer_id": offer_id,
+            "operation": "text.generate",
+            "input_hash": input_hash,
+        });
+        let created = bridge
+            .send_raw(&serde_json::json!({
+                "op": "runs_create", "offer_id": offer_id,
+                "operation": "text.generate", "input": input,
+                "runtime_binding": binding,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(created["status"], "ok", "{created}");
+        let run_id = created["data"]["run_id"].as_str().unwrap();
+        let access = serde_json::json!({
+            "schema": "elastos.model.runtime-access-binding/v1",
+            "principal_id": binding["principal_id"],
+            "session_id": binding["session_id"],
+            "capsule_id": binding["capsule_id"],
+            "grant_id": binding["grant_id"],
+            "request_id": binding["request_id"],
+            "run_id": run_id,
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "Smol run timed out");
+            let result = bridge
+                .send_raw(&serde_json::json!({
+                    "op": "runs_get", "run_id": run_id, "runtime_binding": access,
+                }))
+                .await
+                .unwrap();
+            if result["data"]["status"] == "completed" {
+                assert!(result["data"]["terminal"]["output"]["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()));
+                break;
+            }
+            assert_ne!(result["data"]["status"], "failed", "{result}");
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        bridge.shutdown().await.unwrap();
+        assert!(!Path::new(&socket).exists());
     }
 
     #[test]

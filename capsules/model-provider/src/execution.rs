@@ -158,15 +158,16 @@ impl ProviderCoordinator {
                     provider.apply_refresh(refresh);
                     return self.status_response();
                 }
-                let ports = serde_json::from_value::<ProviderInitExtra>(init.config.extra.clone())
-                    .map_err(|_| {
-                        ProviderFault::invalid_request("invalid model provider init config")
-                    })?
-                    .runtime_local_ports;
-                let adapter = LiveAdapterExecutor::new_with_local_ports(
+                let sockets =
+                    serde_json::from_value::<ProviderInitExtra>(init.config.extra.clone())
+                        .map_err(|_| {
+                            ProviderFault::invalid_request("invalid model provider init config")
+                        })?
+                        .runtime_local_sockets;
+                let adapter = LiveAdapterExecutor::new_with_local_sockets(
                     self.handle.clone(),
                     self.update_tx.clone(),
-                    ports,
+                    sockets,
                 );
                 let mut provider = ModelProviderState::from_init(init.config, adapter)?;
                 provider.settle_active_local_text_runs_unknown()?;
