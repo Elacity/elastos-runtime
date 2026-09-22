@@ -46,6 +46,28 @@ fn is_home_owned_hosted_offer(offer: &ConfiguredOffer) -> bool {
     HOME_OWNED_HOSTED_CHAT_URLS.contains(&api_url.as_str())
 }
 
+// Held workers retain their cloned credentials; new dispatches use the refreshed
+// key. Every execution and disclosure field must keep its exact value.
+fn hosted_key_only_replace(old: &ConfiguredOffer, proposed: &ConfiguredOffer) -> bool {
+    let mut proposed = proposed.clone();
+    match (&old.adapter, &mut proposed.adapter) {
+        (
+            AdapterConfig::OpenAiCompatibleText { api_key, .. },
+            AdapterConfig::OpenAiCompatibleText {
+                api_key: next_key, ..
+            },
+        )
+        | (
+            AdapterConfig::OpenRouterDecisions { api_key, .. },
+            AdapterConfig::OpenRouterDecisions {
+                api_key: next_key, ..
+            },
+        ) => *next_key = api_key.clone(),
+        _ => return false,
+    }
+    &proposed == old
+}
+
 fn home_owned_hosted_key_model_replace(old: &ConfiguredOffer, proposed: &ConfiguredOffer) -> bool {
     if !is_home_owned_hosted_offer(old)
         || !is_home_owned_hosted_offer(proposed)
@@ -233,8 +255,9 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         let mut retired = Vec::new();
         for old in &previous.offers {
             if let Some(proposed) = offers.get(&old.id) {
+                let key_only_replace = hosted_key_only_replace(old, proposed);
                 let hosted_replace = home_owned_hosted_key_model_replace(old, proposed);
-                if (proposed != old && !hosted_replace)
+                if (proposed != old && !hosted_replace && !key_only_replace)
                     || admissions.get(old.id.as_str()) != old_admissions.get(old.id.as_str())
                 {
                     return Err(ProviderFault::invalid_request(
@@ -242,6 +265,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                     ));
                 }
                 if hosted_replace
+                    && !key_only_replace
                     && offer_has_unresolved_activity(self, &old.id, &extra, retained_workers)?
                 {
                     return Err(ProviderFault::selection_unavailable(
@@ -1579,19 +1603,24 @@ mod tests {
         cancel_results: Arc<Mutex<Vec<std::result::Result<CancelResult, AdapterFault>>>>,
         cancel_allow_send: Arc<Mutex<Vec<bool>>>,
         dispatch_calls: Arc<Mutex<u32>>,
+        dispatched_adapters: Arc<Mutex<Vec<AdapterConfig>>>,
         reconcile_calls: Arc<Mutex<u32>>,
     }
 
     impl AdapterExecutor for FakeAdapters {
         fn dispatch(
             &self,
-            _adapter: &AdapterConfig,
+            adapter: &AdapterConfig,
             _offer: &ConfiguredOffer,
             _binding: &RuntimeCreateBinding,
             _input: &Value,
             _deadline_ms: u64,
         ) -> std::result::Result<DispatchResult, AdapterFault> {
             *self.dispatch_calls.lock().unwrap() += 1;
+            self.dispatched_adapters
+                .lock()
+                .unwrap()
+                .push(adapter.clone());
             self.dispatch_results.lock().unwrap().remove(0)
         }
 
@@ -1873,6 +1902,113 @@ mod tests {
             hosted: crate::config::test_hosted_disclosure(),
         };
         hosted
+    }
+
+    #[test]
+    fn hosted_key_refresh_preserves_held_run_and_updates_next_dispatch() {
+        let chat = home_owned_hosted_offer(
+            "model:chat",
+            "http://127.0.0.1:61974/v1/chat/completions",
+            "fixture-key-a",
+        );
+        let mut decision = offer("model:decision");
+        decision.operation = "decision.evaluate".into();
+        decision.input_modalities = vec!["application/json".into()];
+        decision.output_modalities = vec!["application/json".into()];
+        decision.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: "https://openrouter.ai/api/alpha/decisions".into(),
+            api_key: Some("fixture-key-a".into()),
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        for mut original in [chat, decision] {
+            original.policy.concurrency_limit = 2;
+            let root = temp_root("hosted-held-key-refresh");
+            let adapters = FakeAdapters {
+                dispatch_results: Arc::new(Mutex::new(
+                    (0..2)
+                        .map(|_| {
+                            Ok(DispatchResult::Running {
+                                events: vec![],
+                                backend_state: running_backend_state(),
+                            })
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            };
+            let mut state = init_state(&root, vec![original.clone()], adapters.clone());
+            let request = |request_id: &str| {
+                let input = json!({"prompt":"held key refresh"});
+                let mut binding = create_binding(request_id, &original.id, &input);
+                binding.operation = original.operation.clone();
+                RunsCreateRequest {
+                    op: "runs_create".into(),
+                    offer_id: original.id.clone(),
+                    operation: original.operation.clone(),
+                    input,
+                    runtime_binding: binding,
+                }
+            };
+            let held = state
+                .handle_runs_create(request("request:held-key-a"))
+                .unwrap();
+            assert_eq!(held["data"]["status"], "running");
+            let held_id = held["data"]["run_id"].as_str().unwrap().to_string();
+            let held_bytes = std::fs::read(run_path(&root, &held_id)).unwrap();
+            let workers = vec![held_id.clone()];
+            let mut refreshed = state.config.clone();
+            refreshed.extra["offers"][0]["adapter"]["api_key"] = json!("fixture-key-b");
+            for (pointer, value) in [
+                ("/adapter/api_url", json!("https://example.invalid/changed")),
+                ("/adapter/model", json!("changed-model")),
+                ("/adapter/hosted/model_privacy", json!("private")),
+                ("/policy/concurrency_limit", json!(3)),
+                ("/title", json!("Changed title")),
+            ] {
+                let mut changed = refreshed.clone();
+                let (parent, field) = pointer.rsplit_once('/').unwrap();
+                changed.extra["offers"][0].pointer_mut(parent).unwrap()[field] = value;
+                let extra: ProviderInitExtra =
+                    serde_json::from_value(changed.extra.clone()).unwrap();
+                extra.validate(&changed).unwrap();
+                assert!(
+                    state.plan_refresh(changed, true, &workers).is_err(),
+                    "held key refresh allowed a change at {pointer}"
+                );
+            }
+            let mut removed = refreshed.clone();
+            removed.extra["offers"] = json!([]);
+            assert!(state.plan_refresh(removed, true, &workers).is_err());
+            let refresh = state.plan_refresh(refreshed, true, &workers).unwrap();
+            state.apply_refresh(refresh);
+            assert_eq!(
+                state.config.extra["offers"][0]["adapter"]["api_key"],
+                "fixture-key-b"
+            );
+            assert_eq!(
+                std::fs::read(run_path(&root, &held_id)).unwrap(),
+                held_bytes
+            );
+            let next = state
+                .handle_runs_create(request("request:next-key-b"))
+                .unwrap();
+            assert_eq!(next["data"]["status"], "running");
+            let dispatched = adapters.dispatched_adapters.lock().unwrap();
+            assert_eq!(dispatched.len(), 2);
+            assert_eq!(dispatched[0], original.adapter);
+            assert_eq!(dispatched[1], state.offers[&original.id].adapter);
+            assert_ne!(dispatched[0], dispatched[1]);
+            assert_eq!(
+                state.offers[&original.id].execution_binding_hash().unwrap(),
+                original.execution_binding_hash().unwrap()
+            );
+            assert_eq!(
+                std::fs::read(run_path(&root, &held_id)).unwrap(),
+                held_bytes
+            );
+        }
     }
 
     #[test]

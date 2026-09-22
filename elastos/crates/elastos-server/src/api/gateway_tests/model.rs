@@ -1870,3 +1870,47 @@ async fn named_jev_retries_eval_after_unsigned_record_cleared() {
     assert_eq!(eval_ids.len(), 2, "{requests:?}");
     assert_ne!(eval_ids[0], eval_ids[1], "{eval_ids:?}");
 }
+
+#[tokio::test]
+async fn hosted_configuration_rejection_is_reported_after_save_and_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RecordingModelProvider::default();
+    *provider.response.lock().await = json!({
+        "status": "error", "code": "invalid_request", "message": "private provider detail"
+    });
+    let state = model_test_state(dir.path(), provider.clone()).await;
+    let id = "model:hosted-0123456789abcdef0123456789abcdef";
+    let error = crate::api::model_provider_config::save_hosted_offer(
+        dir.path(),
+        state.provider_registry.as_deref(),
+        crate::api::model_provider_config::HostedOfferSave {
+            provider: crate::api::model_provider_config::HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Fixture",
+            instance_id: Some(id),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "model activation pending");
+    assert_eq!(
+        crate::api::ai_provider_status(dir.path())
+            .unwrap()
+            .connections[0]
+            .id,
+        id
+    );
+    let error = crate::api::remove_hosted_offer(dir.path(), state.provider_registry.as_deref(), id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "model retirement pending");
+    assert!(crate::api::ai_provider_status(dir.path())
+        .unwrap()
+        .connections
+        .is_empty());
+    let calls = provider.requests.lock().await;
+    assert_eq!(calls.iter().filter(|call| call["op"] == "init").count(), 2);
+}

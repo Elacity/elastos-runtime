@@ -1235,15 +1235,9 @@ pub(crate) async fn save_hosted_offer(
         }
         persist_model_provider_operator_offers(data_dir, offers)?;
     }
-    if let Err(error) = refresh_registered_model_provider(data_dir, registry).await {
-        let text = error.to_string();
-        if text.contains("model retirement pending")
-            || text.contains("model activation pending")
-            || text.contains("selection_unavailable")
-        {
-            return Err(error);
-        }
-    }
+    refresh_registered_model_provider(data_dir, registry)
+        .await
+        .map_err(|_| anyhow::anyhow!("model activation pending"))?;
     ai_provider_status(data_dir)
 }
 
@@ -1265,15 +1259,9 @@ pub(crate) async fn remove_hosted_offer(
         persist_model_provider_operator_offers(data_dir, offers)?;
         delete_hosted_secret(data_dir, offer_id)?;
     }
-    if let Err(error) = refresh_registered_model_provider(data_dir, registry).await {
-        let text = error.to_string();
-        if text.contains("model retirement pending")
-            || text.contains("model activation pending")
-            || text.contains("selection_unavailable")
-        {
-            return Err(error);
-        }
-    }
+    refresh_registered_model_provider(data_dir, registry)
+        .await
+        .map_err(|_| anyhow::anyhow!("model retirement pending"))?;
     ai_provider_status(data_dir)
 }
 
