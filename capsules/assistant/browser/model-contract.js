@@ -150,6 +150,9 @@ function promptDestination(kind, facts) {
 }
 
 function privacyLabel(kind, facts) {
+  if (kind === "remote_hosted" && !facts.privacy) {
+    return `The provider Home and ${facts.processor || "the hosted processor"} receive prompts. Retention policy not reported.`;
+  }
   if (kind === "hosted" || kind === "remote_hosted") {
     return facts.privacy || "Not reported";
   }
@@ -206,13 +209,16 @@ export function offerSelectionFacts(offer, backendReport = null) {
     || (typeof hosted?.intermediary === "string" && hosted.intermediary.trim() !== ""
       ? hosted.intermediary.trim()
       : "");
-  const payer = typeof hosted?.payer === "string" && hosted.payer.trim() !== ""
+  const reportedPayer = typeof hosted?.payer === "string" && hosted.payer.trim() !== ""
     ? hosted.payer.trim()
     : kind === "remote_hosted"
       ? "this Home"
       : kind === "hosted"
         ? "this Home"
         : "";
+  const payer = kind === "remote_hosted" && reportedPayer === "this Home"
+    ? remoteName ? `Provider Home (${remoteName})` : "Provider Home"
+    : reportedPayer;
   const provider = kind === "remote_hosted"
     ? processor || "hosted provider"
     : kind === "hosted"

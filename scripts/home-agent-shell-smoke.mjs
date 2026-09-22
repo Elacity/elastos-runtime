@@ -464,8 +464,14 @@ const remoteHostedFacts = contract.offerSelectionFacts(remoteHostedOffer);
 assert.equal(contract.offerRouteKind(remoteHostedOffer), "remote_hosted");
 assert.equal(remoteHostedFacts.intermediary, "Owner Home");
 assert.equal(remoteHostedFacts.processor, "OpenRouter");
-assert.equal(remoteHostedFacts.payer, "this Home");
-assert.equal(remoteHostedFacts.execution, "via Owner Home; OpenRouter; payer this Home");
+assert.equal(remoteHostedFacts.payer, "Provider Home (Owner Home)");
+assert.equal(remoteHostedFacts.execution, "via Owner Home; OpenRouter; payer Provider Home (Owner Home)");
+assert.equal(remoteHostedFacts.detailRows.find(row => row.term === "Privacy").value,
+  "The provider Home and OpenRouter receive prompts. Retention policy not reported.");
+assert.equal(contract.offerSelectionFacts({ ...remoteHostedOffer, remote_service: {} }).payer,
+  "Provider Home");
+assert.equal(contract.offerSelectionFacts({ ...remoteHostedOffer,
+  hosted: { ...remoteHostedOffer.hosted, payer: "External sponsor" } }).payer, "External sponsor");
 assert.equal(contract.textOfferRows([remoteHostedOffer])[0].detail, "via Owner Home");
 const remoteRows = contract.textOfferRows([remoteOffer, hostedOffer], {
   "offer-hosted": {
