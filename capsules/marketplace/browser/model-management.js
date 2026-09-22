@@ -105,7 +105,7 @@
   window.ElastosModelManagement = {
     create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: requiredCid = null, compact = false, onReadyOpen = null }) {
       let visible = false, closed = false, generation = 0, busy = false, timer, reader;
-      let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false, polls = 0;
+      let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false;
       let unresolvedUse = null, reconcileRequired = false;
       let pendingFocus = null;
       let reclaimStep = "idle";
@@ -170,7 +170,7 @@
             request("/api/capsules/catalog", null, io.signal), request("/api/capsules/interfaces", null, io.signal),
           ]);
           if (epoch !== generation || !show()) return;
-          bindMethods(interfaces); model = parseCatalog(catalog); polls = 0;
+          bindMethods(interfaces); model = parseCatalog(catalog);
           reconcileRequired = false;
           reclaimStep = "idle";
           if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation) unresolvedUse = null;
@@ -187,13 +187,12 @@
         const runtime = model?.model_runtime, preparation = runtime?.preparation;
         const pending = active(preparation) || (preparation && runtime.admitted && !runtime.dispatch_ready);
         if (!show() || busy || message || !pending) return;
-        if (polls >= 120) { message = "Preparation is still pending. Refresh to check its status."; render(); return; }
         timer = setTimeout(poll, 1500);
       }
       async function poll() {
         if (!show() || busy || !model) return;
         const epoch = generation, cid = model.cid, id = model.model_runtime.preparation.operation_id;
-        const io = controller(); reader = io; polls++;
+        const io = controller(); reader = io;
         try {
           const result = await invoke("status", { operation_id: id }, io.signal);
           if (epoch !== generation || !show() || model?.cid !== cid) return;
@@ -231,11 +230,11 @@
             if (epoch !== generation || !show() || model?.cid !== cid) return;
             const candidate = parseCatalog(catalog);
             check(candidate?.cid === cid);
-            model = candidate; polls = 0;
+            model = candidate;
           } else {
             const r = operationRuntime(result, cid);
             check(r.preparation?.operation_id === result.operation_id && (operation !== "cancel" || result.operation_id === id));
-            model.model_runtime = r; polls = 0;
+            model.model_runtime = r;
             if (operation === "use") unresolvedUse = null;
           }
         } catch {
