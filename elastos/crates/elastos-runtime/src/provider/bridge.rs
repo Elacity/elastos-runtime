@@ -229,13 +229,40 @@ impl ProviderBridge {
         Self::spawn_with_timeouts(binary_path, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
     }
 
+    /// Keep the native model provider and its local engine off the external network.
+    #[cfg(target_os = "macos")]
+    pub async fn spawn_confined_model(
+        binary_path: &Path,
+        config: ProviderConfig,
+    ) -> Result<Self, BridgeError> {
+        const POLICY: &str = "(version 1)\n(allow default)\n(deny network-outbound)\n(allow network-outbound (remote ip \"localhost:*\"))\n";
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.arg("-p").arg(POLICY).arg(binary_path);
+        Self::spawn_command(command, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
+    }
+
     async fn spawn_with_timeouts(
         binary_path: &Path,
         config: ProviderConfig,
         init_timeout: std::time::Duration,
         shutdown_timeout: std::time::Duration,
     ) -> Result<Self, BridgeError> {
-        let mut child = Command::new(binary_path)
+        Self::spawn_command(
+            Command::new(binary_path),
+            config,
+            init_timeout,
+            shutdown_timeout,
+        )
+        .await
+    }
+
+    async fn spawn_command(
+        mut command: Command,
+        config: ProviderConfig,
+        init_timeout: std::time::Duration,
+        shutdown_timeout: std::time::Duration,
+    ) -> Result<Self, BridgeError> {
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -1288,6 +1315,67 @@ mod tests {
 
         let pid = std::fs::read_to_string(&pid_path).unwrap();
         assert_process_absent(pid.trim());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_confined_model_child_and_descendant_cannot_open_external_socket() {
+        let temp = TempDir::new().unwrap();
+        let script = write_provider_script(
+            &temp,
+            "network-probe.py",
+            r#"#!/usr/bin/python3
+import json
+import socket
+import subprocess
+import sys
+
+def external_errno():
+    with socket.socket() as connection:
+        connection.settimeout(1)
+        return connection.connect_ex(('203.0.113.1', 443))
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['op'] == 'init':
+        print('{"status":"ok"}', flush=True)
+    elif request['op'] == 'exists':
+        direct = external_errno()
+        descendant = int(subprocess.check_output([
+            '/usr/bin/python3', '-c',
+            'import socket; s=socket.socket(); s.settimeout(1); print(s.connect_ex(("203.0.113.1", 443)))'
+        ]))
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(1)
+            with socket.socket() as local:
+                local.settimeout(1)
+                loopback = local.connect_ex(listener.getsockname())
+        print(json.dumps({'status':'ok','data':{
+            'direct_errno': direct, 'descendant_errno': descendant,
+            'loopback_errno': loopback}}), flush=True)
+    elif request['op'] == 'shutdown':
+        print('{"status":"ok"}', flush=True)
+        break
+"#,
+        );
+        let bridge = ProviderBridge::spawn_confined_model(&script, ProviderConfig::default())
+            .await
+            .unwrap();
+        let response = bridge
+            .request(ProviderRequest::Exists {
+                path: "network-probe".into(),
+                token: String::new(),
+            })
+            .await
+            .unwrap();
+        let ProviderResponse::Ok { data: Some(data) } = response else {
+            panic!("expected network probe response");
+        };
+        assert_eq!(data["direct_errno"], libc::EPERM);
+        assert_eq!(data["descendant_errno"], libc::EPERM);
+        assert_eq!(data["loopback_errno"], 0);
+        bridge.shutdown().await.unwrap();
     }
 
     #[test]

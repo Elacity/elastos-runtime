@@ -1029,7 +1029,14 @@ async fn setup_server_infrastructure_impl(
         Ok(Some(path)) => {
             match model_provider_startup_config(&data_dir, &provider_registry).await {
                 Ok((model_config, worker)) => {
-                    match provider::ProviderBridge::spawn(&path, model_config.clone()).await {
+                    #[cfg(target_os = "macos")]
+                    let bridge_result =
+                        provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
+                            .await;
+                    #[cfg(not(target_os = "macos"))]
+                    let bridge_result =
+                        provider::ProviderBridge::spawn(&path, model_config.clone()).await;
+                    match bridge_result {
                         Ok(bridge) => {
                             let bridge = Arc::new(bridge);
                             let startup = async {
