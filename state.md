@@ -9,6 +9,18 @@ saved journal without another provider request. Marketplace projects the
 existing grant's offer facts and hands the exact offer to Services or Assistant.
 The fresh request and Inbox approval path awaits the current human decision.
 
+Local commit `6a7004c2` adds the real hosted Assistant approval flow. Consumer
+Home retained a short pending Venice prompt across restart; its direct Review
+in Inbox action opened a card naming the requester, recipient, payer and
+continuing scope, with Jev defer advice. Both signed-in Homes serve matching
+Home, Assistant and System scripts from the source checkout, and the six
+focused Jev tests and responsive Assistant replay smoke pass. The person has
+not yet approved this Consumer connection, so explicit continuation, terminal
+Venice output, ending access and a later refusal remain to verify. The older
+Consumer grant for the owner's shared model has expired. Consumer sent one
+fresh service request, which now waits in the owner Inbox for a person's
+approval. The hosted Assistant request and service grant are separate actions.
+
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each
 returned a bound pre-dispatch refusal with zero provider calls. Earlier runs

@@ -217,6 +217,35 @@ terminal cancellation with zero reservation, a separate small read and restart
 without replay. Combined installation and final source gates pass. Trusted
 publisher successor evidence and global sole-copy evidence remain open clauses.
 
+New bounded local-model result, 22 September 2026: the specialized
+`aac6fef/laya-typed-decisions-mlx` checkpoint at revision
+`f9e501c2080cc57c13d6887820329758f5351125` ran offline through the
+pinned MLX engine at `0a859518634112655cb97c745dbf04f5191aaf13`.
+Its weight hash matched `804ef8802b4cac7a67913b0cfb8448659e934a50284aaa867b98d7d9a6e7d1e0`.
+In eight prelabelled Approval Lens cases it matched five recommendation and
+three risk labels, with two unsafe `approve` recommendations, one using the
+current production state shape. This small test does not estimate a general
+error rate. The checkpoint stays outside Runtime. A later proof needs reviewed
+labels from actual six-field states, exact Decisions v1 mapping, and offline
+isolation before any product integration. Receipt:
+`.audit/laya-feasibility/result.json`; read-only review accepted this boundary.
+
+Current product correction in progress: System Models has one compact
+evaluator selection and no fictional sample. A real Assistant hosted request
+now keeps its prompt at the pre-dispatch Inbox gate and offers direct review
+and an explicit Continue request action. Inbox names the connection, prompt
+recipient, payer and continuing approval scope; System Models lets the owner
+end that approval. Six focused Jev tests and the Assistant 390/768/1280 replay
+smoke pass. Both signed-in Homes serve bytes that match the edited Home,
+Assistant and System source. On Consumer, a genuinely new Venice request stayed
+held across a Home restart and Review in Inbox opened the pending card. The
+person's Inbox approval is still pending. Next proof is the exact Inbox
+decision, one explicit continuation to a terminal result, and a later request
+held again after ending approval. The separate existing Consumer service grant
+has expired. Consumer sent one fresh request through Services, and the owner
+Inbox now holds it for a person's approval. Keep existing human state and the
+original acceptance blockers below.
+
 Accepted regression evidence for the original five outcomes:
 
 1. **CR1/CR2 prerequisite closeout — verified:** source lineage and installed
