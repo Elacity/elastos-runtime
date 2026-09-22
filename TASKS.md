@@ -267,6 +267,17 @@ replay of an already-active HTTP job remains unproved for that adapter path.
 Inbox approval history and revocation remain product acceptance work. Keep the
 saved prompt, owner request, and original acceptance blockers below.
 
+Mac socket-isolation milestone: commit `364d0254` makes Runtime start the
+verified model-provider through Seatbelt. Its fixture got `EPERM` for direct
+external TCP from both the child and a descendant; local TCP succeeded. The
+installed provider binary completed a new SmolLM2 run under the same policy.
+Independent review found that the localhost exception permits a local relay
+and that forced descendant cleanup lacks proof. The new Runtime binary is
+built but has not replaced either signed-in Home installation. Keep hosted
+calls paused. Next, prove installed Runtime startup, design the Runtime broker
+with a narrow llama endpoint, obtain exact owner HTTPS consent, and prove the
+Linux boundary. Receipt: `.audit/hosted-egress-design-scratch/seatbelt-milestone.md`.
+
 Accepted regression evidence for the original five outcomes:
 
 1. **CR1/CR2 prerequisite closeout — verified:** source lineage and installed

@@ -43,6 +43,20 @@ already-active HTTP jobs and Inbox history and revocation are separate open
 clauses. The owner service request waits in Inbox; approving it would grant
 service access, not provider HTTPS. No new paid call was made.
 
+Local commit `364d0254` adds a macOS Seatbelt launch for the verified native
+model provider. A fixture started through that Runtime bridge saw `EPERM` when
+the child and its descendant tried a direct external TCP connection; loopback
+worked. The already-installed model-provider binary completed a fresh SmolLM2
+run under the same policy. The new optimized Runtime binary was built with SHA-256
+`a8dc182a932a1c1f9cfd3c9f33eaf487fa6ece8906428aa7644107fe53e3c02a`.
+It has not replaced the Runtime in either signed-in Home. Those Homes keep the
+previous hosted pause. The policy permits every localhost port so llama.cpp
+can run; a local relay could still send traffic outward. Hosted HTTPS remains
+paused until Runtime brokers exact owner-approved requests and closes that
+localhost path. Installed Runtime startup, forced descendant cleanup, Linux
+confinement, and owner HTTPS consent still need proof. Local proof notes:
+`.audit/hosted-egress-design-scratch/seatbelt-milestone.md`.
+
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each
 returned a bound pre-dispatch refusal with zero provider calls. Earlier runs
