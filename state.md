@@ -76,10 +76,30 @@ first local run and remains allowed after its offer is removed until Runtime
 restarts. A second small Seatbelt test allowed one named Unix socket while
 refusing an unrelated socket and external TCP for a child and descendant.
 The installed llama-server accepts a `.sock` host and pinned reqwest supports
-Unix sockets. This is the next private transport to implement and test; full
-provider egress authority, owner HTTPS consent, Linux confinement, and active
+Unix sockets. That proof selected the private transport for the next checkpoint;
+full provider egress authority, owner HTTPS consent, Linux confinement, and active
 HTTP-job replay remain open. Receipt:
 `.audit/hosted-egress-design-scratch/narrow-seatbelt-installed.json`.
+
+Commit `f05bd171` replaces the selected TCP port with a Runtime-owned private
+Unix socket broker for each initial local offer. The confined provider and its
+engine have outbound permission only to that socket. The broker checks the
+provider process, engine ancestry, exact local model routes, request bounds
+and lifetime. A source-linked Runtime bridge test completed a fresh SmolLM2 run with the
+diagnostic Home's installed model-provider binary, then removed its socket.
+The diagnostic gateway has no admitted local offer, so a Home-launched SmolLM2
+run on this transport remains open. The gateway restarted; its built and
+installed Runtime match SHA-256 `54d2654e4e38d778ed2f8115fcaca504cf4f47fb7d0d16e930b06e8fa9768546`
+and model-provider SHA-256 `63f8157bdc21fb5023a2de131c49bb4e7ca2b3f1ee6456494a78d6962c41c144`;
+its provider manifest check and Home HTTP 200 passed. `just verify` with four
+Rust test threads passed 4,566 tests with 28 ignored. The default run hit two
+timing failures in model-provider tests, which passed alone and in the serial capsule
+suite; a one-thread full run stalled in a custody child barrier. Both failed
+logs are retained. Independent review found no new high or medium broker issue
+and confirmed the proof scope. All 18 checked protected files kept their hashes
+and inodes; both signed-in human Homes still serve HTTP 200. Hosted HTTPS
+remains paused pending Runtime-owned egress grants and owner consent. Receipt:
+`.audit/hosted-egress-design-scratch/unix-broker-diagnostic-installed.json`.
 
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each

@@ -283,10 +283,30 @@ the installed provider binary completed SmolLM2 under the policy and removed
 its guard and engine after a forced kill. The human Homes and protected state
 remain unchanged. Review found an unowned port interval before first inference
 and stale port permission after offer removal. An exact Unix socket rule passed
-child and descendant tests and is the next viable private transport. Keep
-hosted calls paused. Finish that transport and installed Runtime-to-Smol proof
-before Runtime HTTPS broker grants, owner consent, and Linux confinement.
+child and descendant tests and selected the next private transport. Hosted
+calls stay paused. The following checkpoint implements that transport;
+Home-launched Runtime-to-Smol proof, HTTPS broker grants, owner consent, and
+Linux confinement remain open.
 Receipt: `.audit/hosted-egress-design-scratch/narrow-seatbelt-installed.json`.
+
+Commit `f05bd171` now makes Runtime own a private Unix broker socket for each
+initial local offer. The macOS Seatbelt policy lets the model provider reach
+only its selected socket. The broker checks provider identity, engine ancestry,
+exact llama routes, request bounds and lifetime. A source-linked Runtime test
+completed a new SmolLM2 run through the diagnostic Home's installed provider
+binary and closed the broker socket. The diagnostic gateway has no admitted
+SmolLM2 offer, so an installed Home-launched inference on this transport still
+needs proof. Its installed Runtime and provider match their built SHA-256 values;
+the provider manifest check and Home startup passed. The human Homes remain
+signed in, all 18 checked protected files retain hash and inode, and disk free
+space is above 20%. `RUST_TEST_THREADS=4 just verify` passed 4,566 tests with
+28 ignored. Default and one-thread failed runs and their classified test
+interference remain in the receipt. Independent review found no new high or
+medium broker issue. Next: Runtime-owned hosted HTTPS egress grants with exact
+owner consent and controlled redirect, DNS, revocation and active-job proof;
+then Linux kernel confinement. Hosted calls remain paused until that authority
+is installed. Receipt:
+`.audit/hosted-egress-design-scratch/unix-broker-diagnostic-installed.json`.
 
 Accepted regression evidence for the original five outcomes:
 
