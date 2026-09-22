@@ -6576,6 +6576,19 @@ impl CarrierProviderInvoker {
     }
 }
 
+/// One line of a peer's own explanation, for repeating in a caller-visible
+/// error. Bounded because the text is remote, and flattened to one line
+/// because it is joined into a message.
+fn carrier_peer_reported_reason(err: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 300;
+    let reason = format!("{err}");
+    let reason = reason.trim().replace(['\n', '\r'], " ");
+    if reason.chars().count() > MAX_CHARS {
+        return reason.chars().take(MAX_CHARS).collect();
+    }
+    reason
+}
+
 fn carrier_provider_public_connect_error(index: usize, err: &anyhow::Error) -> String {
     tracing::debug!(
         ticket_index = index,
@@ -6716,9 +6729,16 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             error = %err,
                             "Carrier peer invocation failed"
                         );
-                        ProviderError::Provider(
-                            "Carrier provider invocation peer_did route failed".to_string(),
-                        )
+                        // A peer that refuses says why, and that sentence is
+                        // the whole diagnosis for a caller who can otherwise
+                        // only report that something went wrong. It is remote
+                        // text, so it is repeated as the peer's own words and
+                        // bounded -- never parsed, and never allowed to decide
+                        // anything here.
+                        ProviderError::Provider(format!(
+                            "Carrier provider invocation peer_did route failed: {}",
+                            carrier_peer_reported_reason(&err)
+                        ))
                     })
             }
         }
@@ -8864,10 +8884,6 @@ mod tests {
 
     fn carrier_test_object_file_bytes() -> Vec<u8> {
         b"# Carrier Object\n".to_vec()
-    }
-
-    fn carrier_test_object_manifest_bytes() -> Vec<u8> {
-        carrier_test_object_manifest_bytes_with_identity(true)
     }
 
     /// `with_identity = false` is the shape the measured metadata directory

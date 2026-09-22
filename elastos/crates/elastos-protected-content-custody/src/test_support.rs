@@ -5,7 +5,6 @@ use rand10::{rngs::StdRng as ShamirStdRng, SeedableRng as _};
 use sha2::Digest as _;
 use sha3::Keccak256;
 
-use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     AtomicReplayClaimer, AuthenticatedRuntimeReleaseOperationV1, CanonicalContract,
     ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
@@ -376,9 +375,7 @@ fn signed_rights_request_with_suite_for_envelope(
     .unwrap();
     let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
     let (signature, recovery_id) = key
-        .sign_prehash_recoverable(&ethereum_signed_message_hash(
-            &request.canonical_bytes().unwrap(),
-        ))
+        .sign_prehash_recoverable(&request.signing_hash().unwrap())
         .unwrap();
     let mut signature_bytes = signature.to_bytes().to_vec();
     signature_bytes.push(recovery_id.to_byte());

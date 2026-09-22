@@ -1439,6 +1439,7 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
             "content_kind",
             "display_name",
             "listing_uri",
+            "metadata_cid",
             "mime_type",
             "mint_id",
             "pay_token",
@@ -1494,11 +1495,21 @@ async fn runtime_custody_listings_project_public_summary_and_access_state() {
         other_view["listings"][0]["availability"],
         expected_availability
     );
+    // `metadata_cid` used to be on this list and is deliberately off it now.
+    //
+    // It is not private: the mint writes `ipfs://<metadata_cid>/metadata.json`
+    // as the media token's URI, so it is on chain for anyone to read, and the
+    // document it names is published for marketplaces to fetch. Withholding it
+    // from this Home's own shelf bought nothing and cost the shelf its titles
+    // and covers, which live in that document.
+    //
+    // `token_uri` stays hidden even so: the bare CID is what a surface needs
+    // to ask this Home's `/ipfs/` route for, and a URI is a second spelling of
+    // the same fact that a consumer would have to parse to use.
     for hidden in [
         "publisher_principal_id",
         "content_id",
         "cid",
-        "metadata_cid",
         "token_uri",
         "chain_namespace",
         "network",
@@ -2721,9 +2732,7 @@ fn release_operation_assembly_input(
         .unwrap();
         let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());
@@ -3015,9 +3024,7 @@ fn make_signed_runtime_release_operation_for_envelope_and_epoch_and_recipient_at
         .unwrap();
         let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());
@@ -3501,6 +3508,7 @@ fn provisioned_process_custody_node_for_issuer(
         adapter: RuntimeCustodyRegistryAdapter::new(
             registry.clone(),
             elastos_runtime::provider::ProviderInvocationTransport::Local,
+            super::RuntimeCustodyCallDiagnostics::default(),
         ),
         registry,
         provisioned,
@@ -3555,6 +3563,7 @@ fn provisioned_process_custody_node(
         adapter: RuntimeCustodyRegistryAdapter::new(
             registry.clone(),
             elastos_runtime::provider::ProviderInvocationTransport::Local,
+            super::RuntimeCustodyCallDiagnostics::default(),
         ),
         registry,
         provisioned,
@@ -6514,6 +6523,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     let adapter = RuntimeCustodyRegistryAdapter::new(
         registry.clone(),
         elastos_runtime::provider::ProviderInvocationTransport::Local,
+        super::RuntimeCustodyCallDiagnostics::default(),
     );
     let request = RightsProviderRequestV1::new_evaluate(node_public_key(1), &operation).unwrap();
 
@@ -6579,6 +6589,7 @@ async fn runtime_custody_registry_adapter_invokes_selected_custody_endpoint_for_
     let adapter = RuntimeCustodyRegistryAdapter::new(
         registry.clone(),
         elastos_runtime::provider::ProviderInvocationTransport::Local,
+        super::RuntimeCustodyCallDiagnostics::default(),
     );
     let request =
         CustodyProviderRequestV1::new_release_contribution(&operation, &decision).unwrap();
@@ -6639,6 +6650,7 @@ async fn runtime_custody_registry_adapter_process_happy_path_uses_public_provisi
     let adapter = RuntimeCustodyRegistryAdapter::new(
         registry.clone(),
         elastos_runtime::provider::ProviderInvocationTransport::Local,
+        super::RuntimeCustodyCallDiagnostics::default(),
     );
 
     let provision_request =
@@ -8504,7 +8516,9 @@ fn media_preparation_source_input(
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
         creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
-        price: "0x5".to_string(),
+        price: "5".to_string(),
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         source_storage: "protected_principal_root".to_string(),
     }
 }
@@ -8783,7 +8797,9 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
             wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
             creator_mint_source_digest: digest(0x71),
             copies: "0x1".to_string(),
-            price: "0x5".to_string(),
+            price: "5".to_string(),
+            channel: "0x0000000000000000000000000000000000000022".to_string(),
+            pay_token: String::new(),
             clear_init_segment,
             clear_segments,
             source_storage: "plain_localhost_root".to_string(),
@@ -8838,7 +8854,9 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
             wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
             creator_mint_source_digest: digest(0x71),
             copies: "0x1".to_string(),
-            price: "0x5".to_string(),
+            price: "5".to_string(),
+            channel: "0x0000000000000000000000000000000000000022".to_string(),
+            pay_token: String::new(),
             clear_init_segment,
             clear_segments,
             source_storage: "plain_localhost_root".to_string(),
@@ -8886,7 +8904,9 @@ fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublis
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
         creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
-        price: "0x5".to_string(),
+        price: "5".to_string(),
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         clear_init_segment,
         clear_segments,
         source_storage: "plain_localhost_root".to_string(),
@@ -9419,7 +9439,9 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
         wallet_account_address: "0x1111111111111111111111111111111111111111".to_string(),
         creator_mint_source_digest: digest(0x71),
         copies: "0x1".to_string(),
-        price: "0x5".to_string(),
+        price: "5".to_string(),
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         source_storage: "plain_localhost_root".to_string(),
     };
     let preparation = RuntimeMediaPreparationRecord::new(
@@ -10505,7 +10527,11 @@ impl Provider for LibraryReleaseWalletProvider {
         let key = WalletSigningKey::from_slice(&[7; 32])
             .map_err(|error| ProviderError::Provider(error.to_string()))?;
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(&rights_bytes))
+            .sign_prehash_recoverable(
+                &rights_request
+                    .signing_hash()
+                    .map_err(|error| ProviderError::Provider(format!("{error:?}")))?,
+            )
             .map_err(|error| ProviderError::Provider(error.to_string()))?;
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());
@@ -10537,6 +10563,12 @@ impl Provider for LibraryReleaseWalletProvider {
 /// real wallet-provider answers with).
 struct ManagedReleaseWalletProvider {
     approved: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Requests the person has confirmed but whose signature has not come back
+    /// yet. This is the real `approved` state an external wallet sits in
+    /// between the person pressing Confirm and the connector posting the
+    /// signature, and it answers `requires_approval: false` with no signed
+    /// result -- the shape that once read as a hard failure.
+    confirmed_awaiting_signature: std::sync::Mutex<std::collections::HashSet<String>>,
     seen: std::sync::Mutex<Vec<String>>,
 }
 
@@ -10544,12 +10576,21 @@ impl ManagedReleaseWalletProvider {
     fn new() -> Self {
         Self {
             approved: std::sync::Mutex::new(std::collections::HashSet::new()),
+            confirmed_awaiting_signature: std::sync::Mutex::new(std::collections::HashSet::new()),
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn approve(&self, request_id: &str) {
         self.approved.lock().unwrap().insert(request_id.to_string());
+    }
+
+    /// The person has confirmed; the connector has not answered yet.
+    fn confirm_awaiting_signature(&self, request_id: &str) {
+        self.confirmed_awaiting_signature
+            .lock()
+            .unwrap()
+            .insert(request_id.to_string());
     }
 
     fn seen_request_ids(&self) -> Vec<String> {
@@ -10586,6 +10627,11 @@ impl Provider for ManagedReleaseWalletProvider {
             .lock()
             .unwrap()
             .push(wallet_request.request_id.clone());
+        let awaiting_signature = self
+            .confirmed_awaiting_signature
+            .lock()
+            .unwrap()
+            .contains(&wallet_request.request_id);
         let approved = self
             .approved
             .lock()
@@ -10595,7 +10641,13 @@ impl Provider for ManagedReleaseWalletProvider {
             "schema": "elastos.wallet.approval_request/v1",
             "request_id": wallet_request.request_id,
             "intent": "protected_content_rights_signature",
-            "status": if approved { "completed" } else { "pending" },
+            "status": if approved {
+                "completed"
+            } else if awaiting_signature {
+                "approved"
+            } else {
+                "pending"
+            },
             // The Wallet names the account the approval belongs to. A managed
             // account completes in place, so the open reports that nobody has
             // to go anywhere; an external one would carry its connector here.
@@ -10623,9 +10675,11 @@ impl Provider for ManagedReleaseWalletProvider {
             let key = WalletSigningKey::from_slice(&[7; 32])
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
             let (signature, recovery_id) = key
-                .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                    &rights_bytes,
-                ))
+                .sign_prehash_recoverable(
+                    &rights_request
+                        .signing_hash()
+                        .map_err(|error| ProviderError::Provider(format!("{error:?}")))?,
+                )
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
             let mut signature_bytes = signature.to_bytes().to_vec();
             signature_bytes.push(recovery_id.to_byte());
@@ -10648,7 +10702,10 @@ impl Provider for ManagedReleaseWalletProvider {
         } else {
             json!({
                 "approval_request": approval_request,
-                "requires_approval": true,
+                // False once the person has confirmed, exactly as the real
+                // wallet answers: `requires_approval` is `status == Pending`
+                // alone, so the approved gap reports false with no signature.
+                "requires_approval": !awaiting_signature,
                 "signature": Value::Null,
             })
         };
@@ -10787,6 +10844,41 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
         super::RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE
     );
 
+    // Confirmed, but the signature has not come back yet. This is the state an
+    // external wallet sits in between the person pressing Confirm and the
+    // connector posting the signature, and the Wallet answers it with
+    // `requires_approval: false` and no signed result, because that flag is
+    // `status == Pending` alone. Reading the flag by itself made the release
+    // treat a state that was about to succeed as a finished approval carrying
+    // no signature, and fail closed. A viewer polling every two seconds lands
+    // in this gap reliably, so a person saw their own approval become an error.
+    wallet.confirm_awaiting_signature(&approval_request_id);
+    match super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient,
+        invocation(),
+        Some(&request_bytes),
+        now,
+    )
+    .await
+    .unwrap()
+    {
+        super::RuntimeReleaseWalletOutcome::PendingApproval {
+            request_bytes: replayed,
+            approval_request_id: replayed_id,
+            ..
+        } => {
+            // Still the same approval and the same request: the release waits
+            // rather than raising a second one.
+            assert_eq!(replayed, request_bytes);
+            assert_eq!(replayed_id, approval_request_id);
+        }
+        super::RuntimeReleaseWalletOutcome::Signed { .. } => {
+            panic!("a confirmed approval whose signature has not arrived is not signed")
+        }
+    }
+
     // Approved: the exact replay yields the signed rights for the SAME
     // request, decoded out of the Wallet's approval envelope.
     wallet.approve(&approval_request_id);
@@ -10811,7 +10903,10 @@ async fn runtime_custody_release_wallet_pends_on_managed_approval_and_resumes_ex
     super::wallet_signed_rights_from_bytes(&signed_request_bytes, &response_bytes).unwrap();
     assert_eq!(
         wallet.seen_request_ids(),
-        vec![approval_request_id.clone(); 3],
+        // Four shots now: pending, pending replay, the confirmed-but-unsigned
+        // gap, and the signed replay. All four carry the same request id,
+        // which is the point -- a wait never raises a second approval.
+        vec![approval_request_id.clone(); 4],
         "every shot replayed the identical wallet request"
     );
 }
@@ -13857,6 +13952,37 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     assert_eq!(
         record.lifecycle_status,
         super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+
+    // An open that never reaches a signature must not fetch the same content
+    // twice.
+    //
+    // `open_runtime_custody_viewer` runs top to bottom on every call, and a
+    // viewer re-issues the identical open every couple of seconds while a
+    // person reads their wallet prompt. The viewer session's own fetch used to
+    // sit before the wallet was asked, on top of the fetch the freshness check
+    // already performs, so the content was pulled and re-hashed twice before
+    // the prompt appeared and twice again on every poll of the wait.
+    //
+    // The session's fetch now sits after the signature. This test fails at the
+    // wallet, which is the step it moved behind, so a repeated path here means
+    // the ordering has regressed. The freshness check's own fetches remain and
+    // are the dominant pre-prompt cost; they are not what this pins.
+    let fetched: Vec<String> = harness
+        .content_provider
+        .requests()
+        .await
+        .iter()
+        .filter(|request| request["op"] == "fetch")
+        .map(|request| request["path"].as_str().unwrap_or("?").to_string())
+        .collect();
+    let mut unique = fetched.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        fetched.len(),
+        unique.len(),
+        "an open that fails at the wallet fetched the same content twice: {fetched:?}"
     );
 }
 

@@ -1,5 +1,78 @@
 use super::*;
 
+/// The most calls one JSON-RPC batch may carry.
+///
+/// Measured against the configured sources rather than chosen:
+///
+/// ```text
+/// mainnet.base.org   40 calls -> {"error":{"code":-32014,
+///                                "message":"maximum 10 calls in 1 batch"}}
+/// base.drpc.org      40 calls -> 40 elements, each an error:
+///                                "Batch of more than 3 requests are not
+///                                 allowed on free plan"
+/// ```
+///
+/// Three, because the strictest source decides. The two refusals are not even
+/// the same shape -- one is a single object where an array was expected, the
+/// other a perfectly well-formed array in which every answer is an error --
+/// and the second is the dangerous one: it looks exactly like a source that
+/// answered and knew nothing.
+pub(super) const EVM_RPC_BATCH_MAX: usize = 3;
+
+/// Reads a batch answer, and decides whether it is an answer at all.
+///
+/// Two refusals to tell apart, both seen from configured sources:
+///
+/// - a single object where an array was expected, which is plainly not a batch
+///   answer;
+/// - a well-formed array in which EVERY element carries an error, which is
+///   what dRPC returns when a batch exceeds its plan. That shape is
+///   indistinguishable from a source that answered and knew nothing, and read
+///   as the latter it made a source contribute silence while looking healthy.
+///   A whole batch failing is treated as a refusal so the caller can ask again
+///   one call at a time.
+///
+/// An individual element carrying an error is `None` -- one reverting call
+/// among several is an answer about that call, not a failure of the batch.
+///
+/// Answers arrive in whatever order the node chooses, so each is placed by its
+/// own id and never by position.
+pub(super) fn interpret_evm_rpc_batch(
+    body: &Value,
+    expected: usize,
+) -> Result<Vec<Option<Value>>, Response> {
+    let entries = body.as_array().ok_or_else(|| {
+        Response::error(
+            "upstream_batch_unsupported",
+            "EVM RPC source did not answer a batch with a batch",
+        )
+    })?;
+    let mut results = vec![None; expected];
+    let mut errored = 0usize;
+    for entry in entries {
+        if entry.get("error").is_some() {
+            errored += 1;
+        }
+        let Some(index) = entry.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(slot) = results.get_mut(index as usize) else {
+            continue;
+        };
+        if entry.get("error").is_some() {
+            continue;
+        }
+        *slot = entry.get("result").cloned();
+    }
+    if !entries.is_empty() && errored == entries.len() {
+        return Err(Response::error(
+            "upstream_batch_refused",
+            "EVM RPC source answered every call in the batch with an error",
+        ));
+    }
+    Ok(results)
+}
+
 pub(super) struct MainchainTip {
     pub(super) height: u64,
     pub(super) hash: String,
@@ -207,6 +280,66 @@ impl ChainProvider {
         body.get("result")
             .cloned()
             .ok_or_else(|| Response::error("upstream_missing_result", "RPC result missing"))
+    }
+
+    /// Several `eth_call`s to one source in a single JSON-RPC batch.
+    ///
+    /// The Shops surface asks two questions of every channel across every
+    /// configured source. Sent one at a time that is eighty-odd round trips
+    /// for a directory of fourteen channels, which measured 46 seconds on an
+    /// installed Home while every card sat at "checking".
+    ///
+    /// Answers come back in whatever order the node chooses, so each is
+    /// matched by its own id and never by position. An element that carries an
+    /// `error`, or that no answer arrives for, is `None` -- the caller decides
+    /// what a missing answer means, and for an access check it means "unknown"
+    /// rather than "no".
+    ///
+    /// A node that refuses batches is reported as one failure rather than
+    /// silently as a set of them; the caller falls back to asking singly.
+    pub(super) fn evm_rpc_batch(
+        &self,
+        network: &ChainNetwork,
+        calls: &[(String, Value)],
+    ) -> Result<Vec<Option<Value>>, Response> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        if calls.len() > EVM_RPC_BATCH_MAX {
+            return Err(Response::error(
+                "invalid_batch_request",
+                "too many calls in one EVM RPC batch",
+            ));
+        }
+        let payload: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (method, params))| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": method,
+                    "params": params,
+                })
+            })
+            .collect();
+        let response = self
+            .client
+            .post(&network.rpc_url)
+            .json(&payload)
+            .send()
+            .map_err(|_| Response::error("upstream_unreachable", "EVM RPC batch request failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Response::error(
+                "upstream_http_error",
+                &format!("upstream returned HTTP {}", status.as_u16()),
+            ));
+        }
+        let body = response
+            .json::<Value>()
+            .map_err(|_| Response::error("upstream_invalid_json", "EVM RPC batch malformed"))?;
+        interpret_evm_rpc_batch(&body, calls.len())
     }
 
     pub(super) fn bitcoin_rpc(

@@ -21,8 +21,37 @@ const walletPreferencesJs = readFileSync(resolve(walletRoot, "wallet-preferences
 const walletSendFlowJs = readFileSync(resolve(walletRoot, "wallet-send-flow.js"), "utf8");
 const walletReceiveFlowJs = readFileSync(resolve(walletRoot, "wallet-receive-flow.js"), "utf8");
 const walletAccountActionsJs = readFileSync(resolve(walletRoot, "wallet-account-actions.js"), "utf8");
+const walletRequestsJs = readFileSync(resolve(walletRoot, "wallet-requests.js"), "utf8");
 const walletFormatJs = readFileSync(resolve(walletRoot, "wallet-format.js"), "utf8");
 const vendorScript = readFileSync(resolve(repoRoot, "scripts/vendor-ui-tokens.sh"), "utf8");
+
+// One click on an approval's open button must launch one connector window.
+//
+// Two listeners see that click: `onRequestClick` on the pending-requests node,
+// and `onDocumentClick` on the document, which serves the signers section's own
+// open buttons. Both recognise `data-wallet-open-method`, so a click inside the
+// requests node reached both as it bubbled and opened the connector twice. A
+// person then met two windows offering Review for one approval, which also let
+// the same request be answered twice.
+//
+// Both handlers stay -- they serve different buttons -- so the invariant is
+// that the inner one claims the click it owns.
+{
+  const openMethodBranch = walletRequestsJs.slice(
+    walletRequestsJs.indexOf('closest("[data-wallet-open-method]")'),
+  );
+  assert(
+    walletRequestsJs.includes('closest("[data-wallet-open-method]")')
+      && walletAccountActionsJs.includes('closest("[data-wallet-open-method]")'),
+    "Both wallet click handlers must keep serving their own open buttons.",
+  );
+  assert(
+    openMethodBranch.indexOf("event.stopPropagation()") >= 0
+      && openMethodBranch.indexOf("event.stopPropagation()")
+        < openMethodBranch.indexOf("openApprovalMethod("),
+    "The requests handler must stop an open-method click before the document handler repeats it.",
+  );
+}
 
 const letterSpacingValues = [...styleCss.matchAll(/letter-spacing:\s*([^;]+);/g)].map((match) => match[1].trim());
 

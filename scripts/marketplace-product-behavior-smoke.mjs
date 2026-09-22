@@ -138,7 +138,12 @@ assert(
     && js.includes("async function downloadOwnedCopy(mintId) {")
     && js.includes('data-action="download-copy"')
     && js.includes("const pendingDownloads = new Set();")
-    && js.includes('if (listing.accessState === "available") {'),
+    // The gate is that an item still on sale to this person offers no
+    // rebuild. The sentence carrying it has changed twice -- an early return,
+    // then a branch, now the card's own state -- so the rule is asserted
+    // rather than the spelling.
+    && /const secondary = state === "mine" \|\| state === "owned"/.test(js)
+    && /data-action="download-copy"/.test(js),
   "Marketplace must let a person rebuild a copy they own, and offer it only on copies they own.",
 );
 assert(
@@ -223,7 +228,16 @@ assert(
     && js.includes("uint256Decimal(listing.quantity)")
     && js.includes("uint256Decimal(listing.price)")
     && js.includes("`quantity ${uint256Decimal(listing.quantity)}`")
-    && js.includes("`price ${uint256Decimal(listing.price)} base units`")
+    // A price is searched as it is shown as well as in full. Both come from
+    // `formatMoney`, which reads the uint256 through `uint256Decimal` and
+    // scales it by moving digits -- no step of a price is a JavaScript
+    // number, which is the rule this line exists to hold.
+    && js.includes("const money = formatMoney(listing);")
+    && js.includes("`price ${money.value} ${money.title}`")
+    && js.includes("const full = uint256Decimal(listing.price);")
+    && js.includes("function shiftDecimal(digits, decimals) {")
+    && !js.includes("Number(listing.price)")
+    && !js.includes("parseFloat")
     && js.includes('postObjectProvider("buy", { mint_id: mintId })')
     && js.includes("state.mediaRejected")
     && !js.includes("function parseRuntimeCustodyListing(")

@@ -37,6 +37,9 @@ function objectFixture(overrides = {}) {
     display_name: "1409899-uhd_3840_2160_25fps.png",
     content_kind: "object",
     listing_uri: "elastos://QmcHh9eQuLiisfxZo4m4TxaVTSYzs4AF4LaVcmkd2o2Y76",
+    // The published metadata directory, which carries the title the creator
+    // typed and the cover they chose. Taken from a real record on this Home.
+    metadata_cid: "QmX1KSGkt3fLX5GsuN7wVWrCj55PSnfbk4JJ2BTY2QRJ7F",
     mime_type: "image/png",
     // An object carries no codecs. Runtime sends the empty string for it.
     codecs: "",
@@ -136,6 +139,7 @@ test("a field Runtime always sends may not go missing", () => {
     "codecs",
     "content_kind",
     "listing_uri",
+    "metadata_cid",
     "quantity",
     "price",
     "pay_token",

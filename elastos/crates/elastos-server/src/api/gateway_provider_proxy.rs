@@ -331,49 +331,29 @@ macro_rules! creator_mint_unavailable_missing {
         }
     };
 }
-const RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE: u16 = 1;
 /// The zero address, which is how a listing says it is priced in the chain's
 /// own coin rather than in an ERC-20.
-const RUNTIME_CUSTODY_NATIVE_PAY_TOKEN: &str = "0x0000000000000000000000000000000000000000";
+pub(in crate::api::gateway) const RUNTIME_CUSTODY_NATIVE_PAY_TOKEN: &str =
+    "0x0000000000000000000000000000000000000000";
 /// The schema a chain-provider verified listing must carry, whether it was read
 /// back from chain state or taken from the `ItemListed` the mint itself emitted.
 const RUNTIME_CUSTODY_VERIFIED_LISTING_SCHEMA: &str =
     "elastos.chain.protected-content-verified-listing/v1";
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentCreatorMint {
-    schema: String,
-    network: String,
-    chain_namespace: String,
-    function: String,
-    ledger: String,
-    pay_token: String,
-    to: String,
-    data: String,
-    value: String,
-    content_access_id: String,
-    signed: bool,
-}
+// The creator-mint wire, defined once in the contracts crate and used by both
+// sides of it. These aliases keep the names this file already reads by.
+//
+// Declaring these shapes here as well is what let four field mismatches reach
+// a person: `deny_unknown_fields` on one side and a JSON literal on the other,
+// reconciled only by a hand-written mock that the tests answered with instead
+// of the capsule.
+pub(crate) use elastos_protected_content_contracts::{
+    ProtectedContentCreatorMintSourceV1 as ResolvedProtectedContentCreatorMintSource,
+    ProtectedContentCreatorMintV1 as ResolvedProtectedContentCreatorMint,
+    ProtectedContentMintReceiptV1 as ResolvedProtectedContentMintReceipt,
+};
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ResolvedProtectedContentMintReceipt {
-    pub(crate) schema: String,
-    pub(crate) network: String,
-    pub(crate) chain_id: u64,
-    pub(crate) token_id: String,
-    pub(crate) operative: String,
-    /// The listing the mint created, carried on the receipt because the mint
-    /// emits `ItemListed` in the same transaction. Reading it back from chain
-    /// state was a second round trip for facts this receipt already proves --
-    /// and, because that read was pinned to a finalized block, the reason a
-    /// settled mint could sit unrecorded for the length of an L1 finality
-    /// delay.
-    pub(crate) quantity: String,
-    pub(crate) price: String,
-    pub(crate) pay_token: String,
-}
+/// One pay token the deployment offers, as the capsule describes it.
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -482,35 +462,23 @@ struct RuntimeCustodyCreatorChainPlan {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentCreatorMintSource {
-    schema: String,
-    network: String,
-    chain_namespace: String,
-    ledger: String,
-    pay_token: String,
-    abi: String,
-    function: String,
-    /// The authority gateway the network's market is configured with. Absent
-    /// when the network has no market configured, and absent from every
-    /// response a chain provider built before it was reported -- so a mint
-    /// states the authority when it can and says nothing when it cannot.
-    #[serde(default)]
-    authority_gateway_contract: Option<String>,
-}
-
+/// The deployment a mint is bound to.
+///
+/// The channel and the pay token used to be in here, back when a Home had
+/// exactly one of each and a change to either meant the ground had moved. They
+/// are the creator's choice now and legitimately differ from one mint to the
+/// next, so pinning them here would refuse ordinary work. They are pinned
+/// where they belong instead -- in the mint's own recorded terms, which a
+/// retry re-encodes from and which cannot change once a mint is under way.
 fn runtime_custody_creator_mint_source_digest(
     network: &str,
     chain_namespace: &str,
-    ledger: &str,
-    pay_token: &str,
     abi: &str,
     function: &str,
 ) -> Digest32 {
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"elastos.runtime-custody.creator-mint-source/v1");
-    for field in [network, chain_namespace, ledger, pay_token, abi, function] {
+    hasher.update(b"elastos.runtime-custody.creator-mint-source/v2");
+    for field in [network, chain_namespace, abi, function] {
         hasher.update((field.len() as u32).to_be_bytes());
         hasher.update(field.as_bytes());
     }
@@ -523,8 +491,6 @@ fn runtime_custody_creator_mint_source_digest_for_source(
     runtime_custody_creator_mint_source_digest(
         &source.network,
         &source.chain_namespace,
-        &source.ledger,
-        &source.pay_token,
         &source.abi,
         &source.function,
     )
@@ -2446,10 +2412,14 @@ async fn resolve_runtime_custody_creator_mint_source(
     {
         return Err(creator_mint_unavailable_missing!()());
     }
-    validate_wallet_evm_address(&source.ledger, "creator ledger")
-        .map_err(creator_mint_unavailable!())?;
-    validate_wallet_evm_address(&source.pay_token, "creator pay token")
-        .map_err(creator_mint_unavailable!())?;
+    // No channel to validate: the source describes a deployment, and a mint
+    // settles on the channel its creator chose. What it does offer is the set
+    // of tokens a sale may be priced in, and every one of those has to be an
+    // address this Runtime can encode.
+    for pay_token in &source.pay_tokens {
+        validate_wallet_evm_address(&pay_token.address, "creator pay token")
+            .map_err(creator_mint_unavailable!())?;
+    }
     Ok(source)
 }
 
@@ -2478,6 +2448,139 @@ async fn resolve_runtime_custody_bound_creator_account(
         return Err(creator_mint_unavailable_missing!()());
     }
     Ok(account)
+}
+
+/// What a price is denominated in: every token a sale may be priced in, with
+/// the decimals that make its number readable and the name a person knows it
+/// by.
+///
+/// Local configuration, read through the chain provider's description of the
+/// mint source -- the same list a mint is priced against, so a shelf and a
+/// creator's form cannot disagree about what a token is.
+pub(in crate::api::gateway) async fn runtime_custody_pay_token_table(
+    state: &GatewayState,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let source = resolve_runtime_custody_creator_mint_source(state).await?;
+    Ok(source
+        .pay_tokens
+        .iter()
+        .map(|token| {
+            serde_json::json!({
+                "symbol": token.symbol,
+                "address": token.address,
+                "decimals": token.decimals,
+            })
+        })
+        .collect())
+}
+
+/// What this Home's account already holds on a set of channels.
+///
+/// The account is resolved here, from the launch context's wallet authority,
+/// and is never returned to the caller -- a page that needs to know which
+/// cards to offer a subscription for does not need to learn the address those
+/// cards would be paid from.
+///
+/// Answers per channel, and answers `unknown` rather than `none` when the
+/// chain could not be read: `none` is what puts a Subscribe button in front of
+/// someone, and that must rest on an answer rather than on a silence.
+pub(in crate::api::gateway) async fn runtime_custody_channel_access(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    channels: &[String],
+) -> anyhow::Result<Vec<(String, String)>> {
+    if channels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let source = resolve_runtime_custody_creator_mint_source(state).await?;
+    let account = resolve_runtime_custody_wallet_default_account(
+        state,
+        authority,
+        &source.chain_namespace,
+        RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE,
+    )
+    .await?;
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_channel_access",
+            "network": source.network,
+            "account": account.address.to_ascii_lowercase(),
+            "channels": channels,
+        }),
+    )
+    .await
+    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    let entries = response
+        .get("channels")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("channel access answer carried no channels"))?;
+    let mut states = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(channel) = entry.get("channel").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let value = entry
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        // Only the four words this Runtime knows reach a surface. A provider
+        // that learns a fifth does not get to have it rendered untranslated.
+        let value = match value {
+            "administrator" | "subscribed" | "none" => value,
+            _ => "unknown",
+        };
+        states.push((channel.to_ascii_lowercase(), value.to_string()));
+    }
+    Ok(states)
+}
+
+/// What a creator may choose from: the account a mint would be signed by, and
+/// the tokens a sale may be priced in.
+///
+/// Both come from one description of the mint source, because they are one
+/// question -- what can this Home mint, and as whom. Asking twice was two
+/// identical round trips per page load.
+///
+/// The account is resolved here rather than taken from the page, because the
+/// page choosing the account is the page choosing the answer: a directory
+/// asked about a different account lists channels the mint could not use, and
+/// the creator would pick one and be refused.
+///
+/// The address is `None` when this Home has no usable transaction default yet.
+/// That is not a failure of this call -- there is simply nobody to ask a
+/// directory about -- and the tokens are still worth returning.
+pub(in crate::api::gateway) async fn runtime_custody_creator_choices(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+) -> anyhow::Result<(Option<String>, Vec<serde_json::Value>)> {
+    let source = resolve_runtime_custody_creator_mint_source(state).await?;
+    let pay_tokens = source
+        .pay_tokens
+        .iter()
+        .map(|token| {
+            serde_json::json!({
+                "symbol": token.symbol,
+                "address": token.address,
+                "decimals": token.decimals,
+            })
+        })
+        .collect();
+    let address = match resolve_runtime_custody_wallet_default_account(
+        state,
+        authority,
+        &source.chain_namespace,
+        RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE,
+    )
+    .await
+    {
+        Ok(account) => Some(account.address.to_ascii_lowercase()),
+        Err(error) => {
+            tracing::debug!(error = %error, "creator choices: no default creator account yet");
+            None
+        }
+    };
+    Ok((address, pay_tokens))
 }
 
 pub(crate) async fn resolve_runtime_custody_creator_publish_binding(
@@ -3101,6 +3204,9 @@ fn confirmed_stage(
               creator's account and their listing terms; bundling them into a \
               struct would only move the same list one call further out"
 )]
+/// `ledger` is the channel this mint publishes into, which the document
+/// states. It comes from the creator's choice rather than from the source,
+/// which no longer names one.
 async fn publish_runtime_custody_creator_metadata(
     registry: &ProviderRegistry,
     data_dir: &std::path::Path,
@@ -3114,6 +3220,7 @@ async fn publish_runtime_custody_creator_metadata(
     source: &ResolvedProtectedContentCreatorMintSource,
     copies_hex: &str,
     price_hex: &str,
+    ledger: &str,
 ) -> anyhow::Result<(String, String)> {
     let draft = mint.draft();
     let (media_identity_base64, content_identity_base64) =
@@ -3169,6 +3276,15 @@ async fn publish_runtime_custody_creator_metadata(
     };
 
     let threshold = draft.threshold();
+    // Exactly one of the two is present, as in the listing package: a media
+    // listing carries the media identity and an object the chunked one.
+    let (media_identity, content_identity) =
+        crate::protected_content_runtime::runtime_portable_identity_fields(
+            draft.content_identity(),
+        )?;
+    // The helper answers with exactly one of the two, so whichever is present
+    // is the identity this listing publishes.
+    let published_content_identity = media_identity.or(content_identity).unwrap_or_default();
     let inputs = crate::protected_content_elacity_metadata::ElacityMetadataInputs {
         encrypted_content_cid: &facts.content_cid,
         content_type: draft.content_identity().content_type(),
@@ -3177,7 +3293,7 @@ async fn publish_runtime_custody_creator_metadata(
         publisher_address: creator_address,
         chain_id: runtime_custody_creator_chain_id(&source.chain_namespace)
             .map_err(creator_mint_unavailable!())?,
-        ledger: &source.ledger,
+        ledger,
         authority: source
             .authority_gateway_contract
             .as_deref()
@@ -3188,9 +3304,30 @@ async fn publish_runtime_custody_creator_metadata(
         protection: crate::protected_content_elacity_metadata::runtime_custody_protection(
             u32::from(threshold.required()),
             u32::from(threshold.total()),
-            &base64::engine::general_purpose::STANDARD.encode(draft.policy().canonical_bytes()?),
+            // The same four values the listing package carries, from the same
+            // draft, so a buyer who finds this asset in an index can open what
+            // they bought without needing the creator's link.
+            crate::protected_content_elacity_metadata::ProtectedContentIdentities {
+                rights_policy: &base64::engine::general_purpose::STANDARD
+                    .encode(draft.policy().canonical_bytes()?),
+                key_envelope: &base64::engine::general_purpose::STANDARD
+                    .encode(draft.key_envelope().canonical_bytes()?),
+                content_key_commitment: &base64::engine::general_purpose::STANDARD
+                    .encode(draft.content_key_commitment().as_bytes()),
+                content_identity: &published_content_identity,
+            },
         ),
         fallback_name: runtime_custody_metadata_name(object_uri),
+        created_at: &crate::protected_content_elacity_metadata::rfc3339_utc(crate::auth::now_ts()),
+        // From the mint's RECORDED terms, not the request: the document must
+        // describe the mint that is actually being encoded, and a retry
+        // re-encodes from these.
+        access_method: mint.creator_state().map_or_else(Default::default, |state| {
+            state.desired_terms().access_method()
+        }),
+        reseller_cut: mint
+            .creator_state()
+            .and_then(|state| state.desired_terms().reseller_cut()),
     };
     for (name, file_bytes) in
         crate::protected_content_elacity_metadata::elacity_metadata_files(listing, &inputs)?
@@ -3238,6 +3375,62 @@ fn runtime_custody_hex_quantity_to_u64(value: &str) -> anyhow::Result<u64> {
 /// Decimal string from a canonical `0x` quantity. A price is `uint256` on
 /// chain, so it is widened to `u128` and rendered as text rather than parsed
 /// into anything narrower.
+/// The creator's price in the base units of the token they chose.
+///
+/// The decimals come from the deployment's own list of offered tokens, which
+/// is the only place they are stated, so the number that reaches the chain and
+/// the number the creator typed cannot disagree about scale. A token this
+/// deployment does not offer has unknown decimals and is refused rather than
+/// guessed at.
+///
+/// `native_amount_to_hex_quantity` does the arithmetic: exact integer work
+/// that rejects an amount more precise than its token, and the same conversion
+/// the Wallet's own send path uses. One implementation, not two.
+fn runtime_custody_creator_price_base_units(
+    source: &ResolvedProtectedContentCreatorMintSource,
+    chosen_pay_token: &str,
+    price: &str,
+) -> anyhow::Result<String> {
+    let chosen = chosen_pay_token.trim();
+    let token = if chosen.is_empty() {
+        source.pay_tokens.first()
+    } else {
+        source
+            .pay_tokens
+            .iter()
+            .find(|token| token.address.eq_ignore_ascii_case(chosen))
+    };
+    let decimals = match token {
+        Some(token) => u32::from(token.decimals),
+        // A deployment that offers no list priced in its chain's own coin,
+        // which every EVM states at eighteen.
+        None if chosen.is_empty() => RUNTIME_CUSTODY_NATIVE_PAY_TOKEN_DECIMALS,
+        None => {
+            tracing::warn!(
+                line = line!(),
+                pay_token = %chosen,
+                "runtime custody creator mint: pay token is not offered by this deployment"
+            );
+            return Err(creator_mint_unavailable_missing!()());
+        }
+    };
+    native_amount_to_hex_quantity(price, decimals).map_err(|(_, message)| {
+        tracing::warn!(
+            line = line!(),
+            decimals,
+            reason = %message,
+            "runtime custody creator mint: price is not an amount of the chosen token"
+        );
+        // The creator's own words about their own number, kept beneath the
+        // stable sentence: "supports at most 6 decimal places" is actionable
+        // where "unavailable" is not.
+        anyhow::anyhow!(message).context(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE)
+    })
+}
+
+/// Every EVM prices its own coin at eighteen decimals.
+pub(in crate::api::gateway) const RUNTIME_CUSTODY_NATIVE_PAY_TOKEN_DECIMALS: u32 = 18;
+
 fn runtime_custody_hex_quantity_to_decimal(value: &str) -> anyhow::Result<String> {
     u128::from_str_radix(value.trim().trim_start_matches("0x"), 16)
         .map(|parsed| parsed.to_string())
@@ -3327,6 +3520,10 @@ fn runtime_custody_creator_chain_id(chain_namespace: &str) -> anyhow::Result<u64
         .map_err(creator_mint_unavailable!())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "creator mint assembly binds the exact on-chain mint terms without an intermediate authority struct"
+)]
 async fn resolve_runtime_custody_creator_chain_plan(
     state: &GatewayState,
     expected_source_digest: Digest32,
@@ -3345,6 +3542,13 @@ async fn resolve_runtime_custody_creator_chain_plan(
             "content_access_id": format!("0x{}", hex::encode(content_access_id.as_bytes())),
             "copies": creator_state.desired_terms().copies(),
             "price": creator_state.desired_terms().price(),
+            "op_type_code": creator_state.desired_terms().access_method().op_type_code(),
+            "reseller_cut": creator_state.desired_terms().reseller_cut(),
+            // The channel and the token, from the RECORDED terms for the same
+            // reason as the payees below: a retry must publish into the same
+            // channel, priced in the same token, as the attempt before it.
+            "ledger": creator_state.desired_terms().ledger(),
+            "pay_token": creator_state.desired_terms().pay_token(),
             // From the RECORDED terms, not the request: a retry re-encodes the
             // chain call here, and the payees have to be the ones the mint was
             // bound to rather than whatever the latest attempt happened to
@@ -3367,11 +3571,40 @@ async fn resolve_runtime_custody_creator_chain_plan(
     let resolved_source_digest = runtime_custody_creator_mint_source_digest(
         &resolved.network,
         &resolved.chain_namespace,
-        &resolved.ledger,
-        &resolved.pay_token,
         "elacity_mint_v1",
         &resolved.function,
     );
+    // The capsule must hold the same decimals for this token as the source
+    // that priced it. A disagreement here is a price wrong by a power of ten,
+    // so it is refused rather than reconciled.
+    let expected_decimals = source
+        .pay_tokens
+        .iter()
+        .find(|token| token.address.eq_ignore_ascii_case(&resolved.pay_token))
+        .map(|token| token.decimals);
+    if expected_decimals.is_some_and(|decimals| decimals != resolved.pay_token_decimals) {
+        tracing::warn!(
+            line = line!(),
+            pay_token = %resolved.pay_token,
+            capsule_decimals = resolved.pay_token_decimals,
+            source_decimals = ?expected_decimals,
+            "runtime custody creator mint: pay token decimals disagree"
+        );
+        return Err(creator_mint_unavailable_missing!()());
+    }
+    if resolved.op_type_code != creator_state.desired_terms().access_method().op_type_code()
+        || resolved.reseller_cut != creator_state.desired_terms().reseller_cut()
+        || !resolved
+            .ledger
+            .eq_ignore_ascii_case(creator_state.desired_terms().ledger())
+    {
+        // The capsule encoded a different access method than the creator
+        // recorded. Everything downstream -- the operative that is created,
+        // whether a listing exists, what the receipt may be expected to prove
+        // -- follows from this, so it is checked here rather than discovered
+        // after the transaction settles.
+        return Err(creator_mint_unavailable_missing!()());
+    }
     if resolved.schema != "elastos.chain.protected-content-creator-mint/v1"
         || resolved.signed
         || resolved.function != "mint(string,uint16,bytes,bytes)"
@@ -3381,8 +3614,13 @@ async fn resolve_runtime_custody_creator_chain_plan(
         || !resolved
             .content_access_id
             .eq_ignore_ascii_case(&format!("0x{}", hex::encode(content_access_id.as_bytes())))
-        || !resolved.ledger.eq_ignore_ascii_case(&source.ledger)
-        || !resolved.pay_token.eq_ignore_ascii_case(&source.pay_token)
+        // The token the capsule priced in must be the one the terms recorded.
+        // Empty terms are a record from before a token could be chosen, and
+        // the capsule's own default answers for those.
+        || (!creator_state.desired_terms().pay_token().is_empty()
+            && !resolved
+                .pay_token
+                .eq_ignore_ascii_case(creator_state.desired_terms().pay_token()))
     {
         return Err(creator_mint_unavailable_missing!()());
     }
@@ -3489,7 +3727,7 @@ async fn resolve_runtime_custody_creator_mint_receipt(
             "creator": creator_address,
             "ledger": chain_plan.ledger,
             "token_uri": creator_state.token_uri(),
-            "op_type_code": RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE,
+            "op_type_code": creator_state.desired_terms().access_method().op_type_code(),
         }),
     )
     .await;
@@ -3539,12 +3777,29 @@ fn runtime_custody_listing_from_mint_receipt(
         ledger: chain_plan.ledger.clone(),
         token_id: receipt.token_id.clone(),
         operative: receipt.operative.clone(),
-        quantity: receipt.quantity.clone(),
-        price: receipt.price.clone(),
-        pay_token: receipt.pay_token.clone(),
+        // A free mint lists nothing, so its receipt proves no sale terms. They
+        // are recorded as a sale of nothing at no price in the chain's own
+        // coin, which is what a free mint IS -- and is the shape every reader
+        // of this record already understands.
+        quantity: receipt
+            .quantity
+            .clone()
+            .unwrap_or_else(|| RUNTIME_CUSTODY_UNSOLD_QUANTITY.to_string()),
+        price: receipt
+            .price
+            .clone()
+            .unwrap_or_else(|| RUNTIME_CUSTODY_UNSOLD_PRICE.to_string()),
+        pay_token: receipt
+            .pay_token
+            .clone()
+            .unwrap_or_else(|| RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string()),
         payment_processor: None,
     }
 }
+
+/// What a mint that sells nothing records in place of sale terms.
+const RUNTIME_CUSTODY_UNSOLD_QUANTITY: &str = "0x0";
+const RUNTIME_CUSTODY_UNSOLD_PRICE: &str = "0x0";
 
 async fn finalize_runtime_custody_creator_listing(
     state: &GatewayState,
@@ -3559,24 +3814,46 @@ async fn finalize_runtime_custody_creator_listing(
     // the evidence this tail has in hand. Only a non-native pay token needs
     // anything further, and only because its payment processor lives in chain
     // state rather than in the event.
-    let listing = if receipt.pay_token == RUNTIME_CUSTODY_NATIVE_PAY_TOKEN {
-        runtime_custody_listing_from_mint_receipt(creator_address, chain_plan, receipt)
-    } else {
-        let listing_response = wallet_chain_provider_data(
+    // A free mint has no listing to read back, and a native-priced one already
+    // proved its terms in its own receipt. Only a non-native sale needs a
+    // second read, and only because its payment processor lives in chain state
+    // rather than in the event.
+    let settles_in_native = receipt
+        .pay_token
+        .as_deref()
+        .is_none_or(|pay_token| pay_token == RUNTIME_CUSTODY_NATIVE_PAY_TOKEN);
+    let mut listing =
+        runtime_custody_listing_from_mint_receipt(creator_address, chain_plan, receipt);
+    if !settles_in_native {
+        // The one fact the receipt cannot carry: where an ERC-20 sale pays
+        // through. It lives on the operative rather than in the event.
+        //
+        // This used to re-read the WHOLE listing at a finalized block, which
+        // re-proved terms the receipt had already proved and made every
+        // non-native mint wait out L1 finality -- sixteen minutes on Base --
+        // before its listing could be assembled. It did not wait: the two
+        // evidence sources simply disagreed about a block that had not
+        // finalized yet, and the mint failed with the listing unassembled
+        // while the asset sat minted on chain.
+        let response = wallet_chain_provider_data(
             state,
             serde_json::json!({
-                "op": "resolve_protected_content_verified_listing",
+                "op": "resolve_protected_content_payment_processor",
                 "network": chain_plan.network,
-                "seller": creator_address,
-                "ledger": chain_plan.ledger,
-                "token_id": receipt.token_id,
+                "operative": receipt.operative,
             }),
         )
         .await
         .map_err(|error| creator_mint_chain_error(error, line!()))?;
-        serde_json::from_value::<ResolvedProtectedContentVerifiedListing>(listing_response)
-            .map_err(creator_mint_unavailable!())?
-    };
+        let payment_processor = response
+            .get("payment_processor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(creator_mint_unavailable_missing!())?;
+        validate_wallet_evm_address(&payment_processor, "payment processor")
+            .map_err(|(_, message)| anyhow::anyhow!(message))?;
+        listing.payment_processor = Some(payment_processor);
+    }
     validate_runtime_custody_creator_terminal_bindings(
         creator_state,
         creator_address,
@@ -4222,11 +4499,35 @@ async fn runtime_custody_publish_creator_tail_from_facts(
         .transpose()
         .map_err(creator_mint_unavailable!())?
         .unwrap_or_default();
+    // The access method travels with the royalty split for the same reason:
+    // it is a term the chain call is re-encoded from on a retry, not a
+    // description of the asset. A mint with no listing keeps the pre-listing
+    // behaviour, which was buy once.
+    let (access_method, reseller_cut) = input
+        .listing
+        .as_ref()
+        .map(|listing| (listing.access_method, listing.reseller_cut))
+        .unwrap_or_default();
+    // The channel and token the creator chose. Mint terms, so they arrive
+    // beside copies and price rather than inside the optional listing: a mint
+    // with no marketplace listing still has to settle somewhere.
+    let (ledger, chosen_pay_token) = (input.channel.clone(), input.pay_token.clone());
+    // The creator's price arrives as an amount of the token they chose, and is
+    // scaled here because this is where that token's decimals are known. The
+    // page used to scale it and then declare which decimals it had used, which
+    // made the declaration something to verify rather than something true --
+    // and a page that got it wrong priced a sale a million-fold under.
+    let price_hex =
+        runtime_custody_creator_price_base_units(&source, &chosen_pay_token, &input.price)?;
     let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
         creator_account.account_id.clone(),
         input.copies.clone(),
-        input.price.clone(),
+        price_hex.clone(),
         royalties,
+        access_method,
+        reseller_cut,
+        ledger.clone(),
+        chosen_pay_token,
     )
     .map_err(creator_mint_unavailable!())?;
     if let Some(existing) = mint.creator_state() {
@@ -4344,7 +4645,11 @@ async fn runtime_custody_publish_creator_tail_from_facts(
                 &creator_account.address,
                 &source,
                 &input.copies,
-                &input.price,
+                // The scaled price, not the amount the creator typed: this
+                // document states a price in the pay token's base units, which
+                // is what the chain call carries and what a marketplace reads.
+                &price_hex,
+                &ledger,
             )
             .await?;
             let creator_state = elastos_protected_content_runtime::RuntimeMintCreatorState::new(
@@ -5472,6 +5777,10 @@ mod tests {
             "0x2".to_string(),
             "0x5".to_string(),
             Vec::new(),
+            elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
         )
         .unwrap();
         elastos_protected_content_runtime::RuntimeMintCreatorState::new(
@@ -5501,9 +5810,9 @@ mod tests {
             chain_id,
             token_id: "0x77".to_string(),
             operative: "0x00000000000000000000000000000000000000dd".to_string(),
-            quantity: "0x7".to_string(),
-            price: "0xf4240".to_string(),
-            pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+            quantity: Some("0x7".to_string()),
+            price: Some("0xf4240".to_string()),
+            pay_token: Some(RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string()),
         }
     }
 
@@ -5683,9 +5992,9 @@ mod tests {
             ..test_chain_plan()
         };
         let receipt = ResolvedProtectedContentMintReceipt {
-            quantity: creator_state.desired_terms().copies().to_string(),
-            price: creator_state.desired_terms().price().to_string(),
-            pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+            quantity: Some(creator_state.desired_terms().copies().to_string()),
+            price: Some(creator_state.desired_terms().price().to_string()),
+            pay_token: Some(RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string()),
             ..test_receipt(8453)
         };
         let creator_address = "0x00000000000000000000000000000000000000ee";
@@ -5720,9 +6029,9 @@ mod tests {
             (creator_state.desired_terms().copies(), "0x6".to_string()),
         ] {
             let receipt = ResolvedProtectedContentMintReceipt {
-                quantity: quantity.to_string(),
-                price,
-                pay_token: RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string(),
+                quantity: Some(quantity.to_string()),
+                price: Some(price),
+                pay_token: Some(RUNTIME_CUSTODY_NATIVE_PAY_TOKEN.to_string()),
                 ..test_receipt(8453)
             };
             let listing =
@@ -5747,6 +6056,10 @@ mod tests {
                 "0x02",
                 "0x05",
                 Vec::new(),
+                elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+                None,
+                String::new(),
+                String::new(),
             )
             .unwrap(),
             "bafycreatorcid",

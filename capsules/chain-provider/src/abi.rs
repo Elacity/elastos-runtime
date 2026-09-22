@@ -5,6 +5,16 @@ pub(super) const PROTECTED_CONTENT_LISTINGS_SELECTOR: &str = "0x6bd3a64b";
 pub(super) const PROTECTED_CONTENT_PAYMENT_PROCESSOR_SELECTOR: &str = "0xf1c6bdf8";
 pub(super) const PROTECTED_CONTENT_BUY_ACCESS_NATIVE_SELECTOR: &str = "0xf7580ad9";
 pub(super) const PROTECTED_CONTENT_BUY_ACCESS_ERC20_SELECTOR: &str = "0x0ede2294";
+/// `ISubscribable.hasActiveSubscription(address)` on the channel itself, which
+/// is what grants access to a Free item: one minted with opType 0 creates no
+/// operative and no listing, so a subscription is the only way anyone but its
+/// creator reaches it.
+pub(super) const CHANNEL_HAS_ACTIVE_SUBSCRIPTION_SELECTOR: &str = "0xbebe4a57";
+/// `IAccessControl.hasRole(bytes32,address)`. A channel's administrator holds
+/// `DEFAULT_ADMIN_ROLE`, which is the zero word -- `ChannelRegistry` decides
+/// the same way, so this Home and the chain agree on who runs a channel.
+pub(super) const CHANNEL_HAS_ROLE_SELECTOR: &str = "0x91d14854";
+pub(super) const CHANNEL_DEFAULT_ADMIN_ROLE_WORD: [u8; 32] = [0u8; 32];
 pub(super) const ACCESS_TOKEN_ID_HEX: &str = "0x1";
 pub(super) const PROTECTED_CONTENT_PURCHASE_QUANTITY_HEX: &str = "0x1";
 
@@ -62,6 +72,25 @@ pub(super) fn encode_protected_content_creator_mint_call(
     bytes.extend_from_slice(&enc_op);
     bytes.extend_from_slice(&enc_sell);
     Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// FREE-case `opRawData = abi.encode(bytes16 contentId)`.
+///
+/// A free mint creates no operative: `AssetFactory.registerNewAsset` skips the
+/// whole operative branch for op type 0. What it still does, unconditionally,
+/// is `cstore.bindIP(contentId, ledger, tokenId)` -- and it reads that content
+/// id straight off the head of `opRawData`. So the bytes16 is not optional
+/// padding here; without it the mint reverts, and with it the content id is
+/// bound so `hasAccessByContentId` can answer instead of reverting on an
+/// unbound id.
+///
+/// Nothing else belongs in it. There is no operative to hold a metadata base
+/// URI, no access token to mint and no royalty share to split, so anything
+/// further would be bytes the contracts never read.
+pub(super) fn encode_protected_content_mint_op_raw_free(
+    content_access_id: &[u8; 16],
+) -> Result<Vec<u8>, String> {
+    Ok(abi_word_bytes16(content_access_id))
 }
 
 pub(super) fn encode_protected_content_mint_op_raw_paid(
@@ -177,6 +206,27 @@ pub(super) fn encode_operatives_payment_processor_call() -> Result<String, Strin
         Some(4),
         "paymentProcessor selector",
     )?;
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// Does this account hold an active subscription to this channel?
+pub(super) fn encode_channel_has_active_subscription_call(account: &str) -> Result<String, String> {
+    let mut bytes = decode_hex(
+        CHANNEL_HAS_ACTIVE_SUBSCRIPTION_SELECTOR,
+        Some(4),
+        "hasActiveSubscription selector",
+    )?;
+    bytes.extend_from_slice(&abi_word_address(account)?);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// Does this account administer this channel? Asked of the chain rather than
+/// taken from a directory: an index saying who created a channel is a label,
+/// and a label must not decide what a person is offered.
+pub(super) fn encode_channel_has_admin_role_call(account: &str) -> Result<String, String> {
+    let mut bytes = decode_hex(CHANNEL_HAS_ROLE_SELECTOR, Some(4), "hasRole selector")?;
+    bytes.extend_from_slice(&CHANNEL_DEFAULT_ADMIN_ROLE_WORD);
+    bytes.extend_from_slice(&abi_word_address(account)?);
     Ok(format!("0x{}", encode_hex(&bytes)))
 }
 

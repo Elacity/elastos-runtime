@@ -1215,9 +1215,7 @@ mod tests {
         .unwrap();
         let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(recovery_id.to_byte());

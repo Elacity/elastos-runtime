@@ -406,6 +406,62 @@ async fn dispatch_inbox_action(
         )?;
         return Ok("Approved Wallet market-price source.".to_string());
     }
+    if action_id == CREATOR_CHANNELS_HTTP_APPROVE_ACTION_ID {
+        ensure_admin_context(data_dir, context)?;
+        let approved_at = now_ts();
+        store_creator_channels_http_policy(data_dir, &context.principal_id, approved_at)?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        append_creator_channels_policy_audit(
+            data_dir,
+            &context.principal_id,
+            &context.session_id,
+            "approved",
+            "Approved Creator channel directory HTTP source through Inbox",
+        )?;
+        return Ok("Approved Creator channel directory.".to_string());
+    }
+    if action_id == MARKETPLACE_DIRECTORY_HTTP_APPROVE_ACTION_ID {
+        ensure_admin_context(data_dir, context)?;
+        let approved_at = now_ts();
+        MARKET_DIRECTORY.store_policy(data_dir, &context.principal_id, approved_at)?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        MARKET_DIRECTORY.append_policy_audit(
+            data_dir,
+            &context.principal_id,
+            &context.session_id,
+            "approved",
+            "Approved Marketplace directory HTTP source through Inbox",
+        )?;
+        return Ok("Approved Marketplace directory.".to_string());
+    }
+    if MARKET_DIRECTORY.is_deny_action(action_id) {
+        let _ = crate::notifications::dismiss_external_http_request(
+            data_dir,
+            MARKETPLACE_DIRECTORY_HTTP_REQUEST_ID,
+        );
+        MARKET_DIRECTORY.append_policy_audit(
+            data_dir,
+            &context.principal_id,
+            &context.session_id,
+            "rejected",
+            "Rejected Marketplace directory HTTP source through Inbox",
+        )?;
+        return Ok("Rejected Marketplace directory.".to_string());
+    }
+    if CREATOR_CHANNEL_DIRECTORY.is_deny_action(action_id) {
+        let _ = crate::notifications::dismiss_external_http_request(
+            data_dir,
+            CREATOR_CHANNELS_HTTP_REQUEST_ID,
+        );
+        append_creator_channels_policy_audit(
+            data_dir,
+            &context.principal_id,
+            &context.session_id,
+            "rejected",
+            "Rejected Creator channel directory HTTP source through Inbox",
+        )?;
+        return Ok("Rejected Creator channel directory.".to_string());
+    }
     if action_id.strip_prefix(WALLET_PRICE_HTTP_DENY_ACTION_PREFIX) == Some("coingecko") {
         let _ = crate::notifications::dismiss_external_http_request(
             data_dir,

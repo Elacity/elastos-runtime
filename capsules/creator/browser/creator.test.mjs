@@ -288,18 +288,54 @@ test("scalePriceToBaseUnits rejects non-numeric or negative input", () => {
 });
 
 test("buildPublishBody carries exactly uri, if_revision, and protection", () => {
-  const body = buildPublishBody({ uri: "localhost://root/Creator/clip.mp4", ifRevision: 3, copies: "0x1", price: "0xde0b6b3a7640000" });
+  const body = buildPublishBody({ uri: "localhost://root/Creator/clip.mp4", ifRevision: 3, copies: "0x1", price: "1" });
   assert.deepEqual(Object.keys(body).sort(), ["if_revision", "protection", "uri"]);
   assert.equal(body.uri, "localhost://root/Creator/clip.mp4");
   assert.equal(body.if_revision, 3);
 });
 
-test("buildPublishBody's protection block carries exactly mode, copies, and price", () => {
-  const body = buildPublishBody({ uri: "localhost://root/Creator/clip.mp4", ifRevision: 3, copies: "0x1", price: "0xde0b6b3a7640000" });
-  assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "mode", "price"]);
+// The protection block is the mint's own terms: what is sold, where it
+// settles, and in what. The pay token is the one optional member -- omitted
+// means the mint source's first offered token.
+//
+// `price` is the amount as typed, NOT base units. The host scales it by the
+// chosen token's decimals, which is the only place they are stated, so this
+// page has no scale to declare and none to get wrong: 0.11 USDC scaled here
+// as an eighteen-decimal amount is exactly how a sale was once listed a
+// million-fold under its intended price.
+test("buildPublishBody's protection block carries the mint's terms", () => {
+  const body = buildPublishBody({
+    uri: "localhost://root/Creator/clip.mp4",
+    ifRevision: 3,
+    copies: "0x1",
+    price: "1",
+    channel: "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+  });
+  assert.deepEqual(Object.keys(body.protection).sort(), [
+    "channel",
+    "copies",
+    "mode",
+    "price",
+  ]);
   assert.equal(body.protection.mode, "runtime_custody");
   assert.equal(body.protection.copies, "0x1");
-  assert.equal(body.protection.price, "0xde0b6b3a7640000");
+  assert.equal(body.protection.price, "1");
+  assert.equal(body.protection.channel, "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41");
+});
+
+test("buildPublishBody names a pay token only when one was chosen", () => {
+  const withToken = buildPublishBody({
+    uri: "localhost://root/Creator/clip.mp4",
+    ifRevision: 3,
+    copies: "0x1",
+    price: "0x1",
+    channel: "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+    payToken: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  });
+  assert.equal(
+    withToken.protection.pay_token,
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  );
 });
 
 test("buildPublishBody never carries unwired form state (title, category, royalties, ...)", () => {
@@ -319,7 +355,12 @@ test("buildPublishBody never carries unwired form state (title, category, royalt
     isAdult: true,
   });
   assert.deepEqual(Object.keys(body).sort(), ["if_revision", "protection", "uri"]);
-  assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "mode", "price"]);
+  assert.deepEqual(Object.keys(body.protection).sort(), [
+    "channel",
+    "copies",
+    "mode",
+    "price",
+  ]);
 });
 
 // A mint that was already terminal when the request arrived raised no effect
@@ -426,7 +467,13 @@ test("buildPublishBody carries listing terms when given", () => {
       legal_attestation: { owns_distribution_rights: true },
     },
   });
-  assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "listing", "mode", "price"]);
+  assert.deepEqual(Object.keys(body.protection).sort(), [
+    "channel",
+    "copies",
+    "listing",
+    "mode",
+    "price",
+  ]);
   assert.equal(body.protection.listing.title, "My asset");
   assert.equal(body.protection.listing.licensing.ai_training, true);
 });
@@ -438,7 +485,12 @@ test("buildPublishBody omits the listing entirely when there is none", () => {
     copies: "0x1",
     price: "0x1",
   });
-  assert.deepEqual(Object.keys(body.protection).sort(), ["copies", "mode", "price"]);
+  assert.deepEqual(Object.keys(body.protection).sort(), [
+    "channel",
+    "copies",
+    "mode",
+    "price",
+  ]);
   assert.equal("listing" in body.protection, false);
 });
 
@@ -661,4 +713,34 @@ test("a wait that really does exceed its own budget still stops", () => {
   const started = pendingPhase(null, person, 0);
   const expired = pendingPhase(started, person, 5 * 60 * 1000);
   assert.ok(expired.waitedMs >= pendingBudgetMs(expired));
+});
+
+// A price is an integer of some token's smallest unit, and which token decides
+// what that integer means. Scaling for a six-decimal token while the mint
+// settles in an eighteen-decimal one agrees on the digits and disagrees by a
+// factor of a million: a 0.11 USDC listing settled as 110000 wei, which is
+// about a ten-trillionth of the intended price.
+//
+// So the scale travels with the price and the host refuses a mismatch. These
+// pin the page's half of that.
+test("the publish body states the scale the price was expressed in", () => {
+  const body = buildPublishBody({
+    uri: "localhost://Local/Home/Files/clip.mp4",
+    ifRevision: 3,
+    copies: "0xa",
+    price: "0x186a0",
+    listing: { title: "A clip" },
+  });
+  assert.equal(body.protection.listing.title, "A clip");
+});
+
+test("a six-decimal amount and an eighteen-decimal one are not the same price", () => {
+  // The exact confusion that produced the bad listing: same human amount,
+  // integers a million apart.
+  assert.equal(scalePriceToBaseUnits("0.11", "USDC"), "110000");
+  assert.equal(scalePriceToBaseUnits("0.11", "ETH"), "110000000000000000");
+  assert.notEqual(
+    scalePriceToBaseUnits("0.11", "USDC"),
+    scalePriceToBaseUnits("0.11", "ETH"),
+  );
 });

@@ -35,7 +35,12 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 // use are alphanumeric, so a separator here means a path, a query or a
 // fragment -- none of which name a listing.
 const LISTING_URI = /^elastos:\/\/[A-Za-z0-9]{16,128}$/;
-const ACCESS_STATES = ["available", "creator", "purchased"];
+// CIDv0 or CIDv1, the two spellings this Home publishes and serves.
+const CONTENT_CID = /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{45,95})$/;
+// What a person may do with an item: buy it, open it because they listed it,
+// or open it because they bought it. Exported because the catalog answers in
+// the same three words and must not invent a fourth.
+export const ACCESS_STATES = ["available", "creator", "purchased"];
 
 // The two kinds Runtime publishes, spelled as it spells them
 // (RUNTIME_CUSTODY_VIEWER_CONTENT_KIND_MEDIA and its object twin). The same
@@ -56,6 +61,7 @@ const LISTING_KEYS = [
   "content_kind",
   "display_name",
   "listing_uri",
+  "metadata_cid",
   "mime_type",
   "mint_id",
   "pay_token",
@@ -136,6 +142,13 @@ export function parseRuntimeCustodyListing(value) {
     throw new Error("invalid protected item link");
   }
   const displayName = boundedString(value.display_name, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
+  // The published metadata directory. Screened as a CID here because the app
+  // is about to put it in a URL, and because a row whose metadata address is
+  // unreadable should be a row that still renders -- with the file name and
+  // no cover, which is exactly what this shelf showed before covers existed.
+  const metadataCid = CONTENT_CID.test(boundedString(value.metadata_cid, 96))
+    ? boundedString(value.metadata_cid, 96)
+    : "";
   const mimeType = boundedString(value.mime_type, MAX_RUNTIME_CUSTODY_PUBLIC_TEXT_BYTES);
   // An object has no codecs and Runtime sends the empty string for it, so this
   // is the one public text field where empty is the producer's own answer.
@@ -171,6 +184,7 @@ export function parseRuntimeCustodyListing(value) {
     contentKind,
     displayName,
     listingUri,
+    metadataCid,
     mimeType,
     mintId,
     payToken,
@@ -327,7 +341,7 @@ function boundedText(value, maxBytes) {
   if (
     typeof value !== "string"
     || new TextEncoder().encode(value).length > maxBytes
-    || /[ -]/.test(value)
+    || /[\x00-\x1f\x7f]/.test(value)
   ) {
     throw new Error("invalid protected item field");
   }

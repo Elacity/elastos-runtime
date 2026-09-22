@@ -419,18 +419,28 @@ fn protected_content_rights_managed_and_external_sign_identical_canonical_result
     ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["handoff"]["signature_type"], "personal_sign");
+            // The readable message, not the canonical bytes hex-encoded. A
+            // wallet decodes 0x-prefixed input before showing it, which is how
+            // a nested identity graph used to reach the screen as two
+            // kilobytes of replacement characters. Pinned against the contract
+            // rather than a literal, so producer and verifier move together.
             assert_eq!(
                 data["handoff"]["message"],
-                format!(
-                    "0x{}",
-                    hex::encode(rights_request.canonical_bytes().unwrap())
-                )
+                rights_request.signing_message().unwrap()
             );
+            let shown = data["handoff"]["message"].as_str().unwrap();
+            assert!(shown.starts_with("ElastOS\n"), "{shown}");
+            assert!(shown.contains("Action:  View"), "{shown}");
+            assert!(!shown.contains("0x656c6173746f73"), "{shown}");
         }
         other => panic!("expected external protected-content handoff, got {other:?}"),
     }
-    let external_signature =
-        sign_message_bytes(&managed_key, &rights_request.canonical_bytes().unwrap());
+    // Signs what the wallet is shown, which is the readable message, not the
+    // canonical bytes the payload still carries for transport.
+    let external_signature = sign_message_bytes(
+        &managed_key,
+        rights_request.signing_message().unwrap().as_bytes(),
+    );
     let external_result = match invoke_wallet(
         &mut external_provider,
         principal_id,
@@ -782,7 +792,7 @@ fn protected_content_rights_external_rejects_wrong_signer_type_and_stored_shape(
                 payload_hash: payload_hash.clone(),
                 signature: Some(sign_message_bytes(
                     &signing_key,
-                    &request.canonical_bytes().unwrap(),
+                    request.signing_message().unwrap().as_bytes(),
                 )),
                 signature_type: Some("eth_sign".to_string()),
                 public_key: None,
@@ -803,7 +813,7 @@ fn protected_content_rights_external_rejects_wrong_signer_type_and_stored_shape(
                 payload_hash: payload_hash.clone(),
                 signature: Some(make_high_s_evm_signature(&sign_message_bytes(
                     &signing_key,
-                    &request.canonical_bytes().unwrap(),
+                    request.signing_message().unwrap().as_bytes(),
                 ))),
                 signature_type: Some("personal_sign".to_string()),
                 public_key: None,
@@ -824,7 +834,7 @@ fn protected_content_rights_external_rejects_wrong_signer_type_and_stored_shape(
                 payload_hash,
                 signature: Some(sign_message_bytes(
                     &wrong_key,
-                    &request.canonical_bytes().unwrap(),
+                    request.signing_message().unwrap().as_bytes(),
                 )),
                 signature_type: Some("personal_sign".to_string()),
                 public_key: None,

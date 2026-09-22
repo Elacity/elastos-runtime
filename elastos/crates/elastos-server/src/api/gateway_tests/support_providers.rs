@@ -6,7 +6,18 @@ const MOCK_PROTECTED_CONTENT_OPERATIVE: &str = "0x000000000000000000000000000000
 const MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR: &str = "0x00000000000000000000000000000000000000ff";
 const MOCK_PROTECTED_CONTENT_TOKEN_ID: &str = "0x77";
 const MOCK_PROTECTED_CONTENT_LISTING_QUANTITY: &str = "0x2";
-const MOCK_PROTECTED_CONTENT_LISTING_PRICE: &str = "0x5";
+/// 5.5 of the pay token, in its base units at eighteen decimals.
+///
+/// The listing price the chain reports is base units; what a creator types is
+/// an amount. They were the same constant while the page did the scaling, and
+/// they are not the same number: 5.5 tokens is 5.5e18.
+const MOCK_PROTECTED_CONTENT_LISTING_PRICE: &str = "0x4c53ecdc18a60000";
+/// The amount a creator types to reach the price above.
+///
+/// FRACTIONAL on purpose. A whole number like "5" is also valid hex, so a
+/// price that was never scaled still parsed as base units and every test
+/// passed while a real amount -- "0.001" -- failed in front of a creator.
+const MOCK_PROTECTED_CONTENT_LISTING_AMOUNT: &str = "5.5";
 const MOCK_PROTECTED_CONTENT_CHAIN_ID: u64 = 8453;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -711,29 +722,74 @@ impl Provider for MockChainProvider {
                     }
                 }))
             }
-            Some("resolve_protected_content_creator_mint") => Ok(json!({
+            Some("resolve_protected_content_payment_processor") => {
+                // The same fixture that once made the whole listing read fail.
+                // A mint priced in an ERC-20 still needs one fact from chain
+                // state, and a test that pins what happens when that read
+                // fails has to fail the read the tail actually makes.
+                if *mock_protected_content_chain_mode().lock().unwrap()
+                    == MockProtectedContentChainMode::ListingError
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "unavailable",
+                        "message": "mock protected-content payment processor unavailable"
+                    }));
+                }
+                Ok(json!({
                 "status": "ok",
                 "data": {
-                    "schema": "elastos.chain.protected-content-creator-mint/v1",
+                    "schema": "elastos.chain.protected-content-payment-processor/v1",
                     "network": "base-mainnet",
-                    "chain_namespace": "eip155:8453",
-                    "function": "mint(string,uint16,bytes,bytes)",
-                    "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-                    "pay_token": if *mock_protected_content_chain_mode().lock().unwrap()
-                        == MockProtectedContentChainMode::CreatorMintResolveDrift
-                    {
-                        "0x00000000000000000000000000000000000000cc"
-                    } else if mock_protected_content_purchase_fixture()
-                        .lock()
-                        .unwrap()
-                        .native_purchase
-                    {
-                        "0x0000000000000000000000000000000000000000"
-                    } else {
-                        MOCK_PROTECTED_CONTENT_PAY_TOKEN
-                    },
-                    "to": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-                    "data": format!(
+                    "operative": request
+                        .get("operative")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    "payment_processor": MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR,
+                }
+                }))
+            }
+            Some("resolve_protected_content_creator_mint") => {
+                // Built from the shared wire type, not from a JSON literal.
+                // A literal here is what let four field mismatches reach a
+                // person: the gateway refuses unknown fields, this mock is
+                // what the tests answer with, and the two drifted every time
+                // the real capsule gained a field. Constructed this way, a
+                // field the capsule adds stops compiling here.
+                let pay_token = if *mock_protected_content_chain_mode().lock().unwrap()
+                    == MockProtectedContentChainMode::CreatorMintResolveDrift
+                {
+                    "0x00000000000000000000000000000000000000cc"
+                } else if mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .native_purchase
+                {
+                    "0x0000000000000000000000000000000000000000"
+                } else {
+                    MOCK_PROTECTED_CONTENT_PAY_TOKEN
+                };
+                // A capsule mints into the channel it was asked to, and echoes
+                // it so the caller can check that it did. A fixed one would
+                // make this mock agree with a gateway that ignored the
+                // creator's choice.
+                let ledger = request
+                    .get("ledger")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY)
+                    .to_string();
+                let answer = elastos_protected_content_contracts::ProtectedContentCreatorMintV1 {
+                    schema:
+                        elastos_protected_content_contracts::PROTECTED_CONTENT_CREATOR_MINT_SCHEMA_V1
+                            .to_string(),
+                    network: "base-mainnet".to_string(),
+                    chain_namespace: "eip155:8453".to_string(),
+                    function: "mint(string,uint16,bytes,bytes)".to_string(),
+                    to: ledger.clone(),
+                    ledger,
+                    pay_token: pay_token.to_string(),
+                    pay_token_decimals: 18,
+                    data: format!(
                         "0x{}",
                         hex::encode(Keccak256::digest(
                             serde_json::to_vec(&json!({
@@ -746,12 +802,25 @@ impl Provider for MockChainProvider {
                             .map_err(|err| ProviderError::Provider(err.to_string()))?
                         ))
                     ),
-                    "value": "0x0",
-                    "content_access_id": required_test_str(request, "content_access_id")?
+                    value: "0x0".to_string(),
+                    content_access_id: required_test_str(request, "content_access_id")?
                         .to_ascii_lowercase(),
-                    "signed": false
-                }
-            })),
+                    op_type_code: request
+                        .get("op_type_code")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1) as u16,
+                    reseller_cut: request
+                        .get("reseller_cut")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|cut| cut as u16),
+                    signed: false,
+                };
+                Ok(json!({
+                    "status": "ok",
+                    "data": serde_json::to_value(&answer)
+                        .map_err(|err| ProviderError::Provider(err.to_string()))?,
+                }))
+            }
             Some("describe_protected_content_market_source") => Ok(json!({
                 "status": "ok",
                 "data": {
@@ -767,16 +836,21 @@ impl Provider for MockChainProvider {
                     "schema": "elastos.chain.protected-content-creator-mint-source/v1",
                     "network": "base-mainnet",
                     "chain_namespace": "eip155:8453",
-                    "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-                    "pay_token": if mock_protected_content_purchase_fixture()
-                        .lock()
-                        .unwrap()
-                        .native_purchase
-                    {
-                        "0x0000000000000000000000000000000000000000"
-                    } else {
-                        MOCK_PROTECTED_CONTENT_PAY_TOKEN
-                    },
+                    // No channel: the source describes a deployment, and a
+                    // mint settles on the channel its creator chose.
+                    "pay_tokens": [{
+                        "symbol": "native",
+                        "address": if mock_protected_content_purchase_fixture()
+                            .lock()
+                            .unwrap()
+                            .native_purchase
+                        {
+                            "0x0000000000000000000000000000000000000000"
+                        } else {
+                            MOCK_PROTECTED_CONTENT_PAY_TOKEN
+                        },
+                        "decimals": 18,
+                    }],
                     "abi": "elacity_mint_v1",
                     "function": "mint(string,uint16,bytes,bytes)"
                 }
@@ -6138,9 +6212,11 @@ impl MockWalletProvider {
                 let signer = required_test_str(&account, "address")?;
                 let signing_key = mock_managed_evm_key_for_address(signer)?;
                 let (signature, recovery_id) = signing_key
-                    .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-                        &rights_bytes,
-                    ))
+                    .sign_prehash_recoverable(
+                        &rights_request
+                            .signing_hash()
+                            .map_err(|err| ProviderError::Provider(format!("{err:?}")))?,
+                    )
                     .map_err(|err| ProviderError::Provider(err.to_string()))?;
                 let mut signature_bytes = signature.to_bytes().to_vec();
                 signature_bytes.push(recovery_id.to_byte());

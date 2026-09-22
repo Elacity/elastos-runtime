@@ -5826,8 +5826,13 @@ assert(
     inbox.includes("inspect-approve-request:") &&
     inbox.includes("inspect-deny-request:") &&
     inbox.includes('entry.kind !== "inspect_action_request"') &&
-    inbox.includes("wallet-price-http-approve:") &&
-    inbox.includes("wallet-price-http-deny:") &&
+    // Matched by SHAPE rather than by naming each request: every
+    // "<what>-http-approve:<source>" pairs with "<what>-http-deny:<source>",
+    // and the Inbox derives one from the other. Naming them one at a time is
+    // why the creator's channel-list request first arrived with nothing to
+    // press but "Open".
+    inbox.includes('actionId.includes("-http-approve:")') &&
+    inbox.includes('actionId.replace("-http-approve:", "-http-deny:")') &&
     gatewayApi.includes("append_runtime_capability_notifications") &&
     gatewayApi.includes("/api/capability/pending") &&
     gatewayTests.includes(

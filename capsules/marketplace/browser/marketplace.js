@@ -2,6 +2,7 @@
 // Home to launch what a person chooses. The listing contract it reads lives in
 // `src/listing.js`, beside the tests that pin it against Runtime's producer.
 import {
+  ACCESS_STATES,
   MAX_RUNTIME_CUSTODY_LISTINGS,
   RUNTIME_CUSTODY_MINT_ID,
   buyOutcomeFromAnswer,
@@ -20,6 +21,10 @@ import {
     apps: [],
     mediaListings: [],
     destination: "discover",
+    // Which of Media's three surfaces is showing. Held here and nowhere else:
+    // this capsule keeps no browser storage, so a reload returns to Explore,
+    // which is the surface that works without anything external.
+    mediaTab: "explore",
     search: "",
     appLoading: true,
     mediaLoading: true,
@@ -27,7 +32,57 @@ import {
     mediaLoadError: null,
     mediaTruncated: false,
     mediaRejected: 0,
+    // Shops reads an outside index, so it carries the three answers that are
+    // not "here are the channels": nobody has approved the read, the index
+    // could not be reached, or it answered with nothing.
+    shops: [],
+    shopsLoading: false,
+    shopsLoaded: false,
+    shopsLoadError: null,
+    shopsNeedsApproval: false,
+    shopsUnavailable: false,
+    shopsAwaitingApproval: false,
+    // What this Home already holds on each channel, keyed by address:
+    // "administrator", "subscribed", "none", or "unknown" when the chain
+    // could not be read. Absent means not asked yet.
+    shopAccess: new Map(),
+    // The group a person opened from a "See all" link, or "" for the shelf.
+    exploreGroup: "",
+    // What anyone has minted, as the index reports it, merged by Runtime with
+    // what this Home holds. Explore shows these; My listings never does.
+    catalog: [],
+    catalogLoading: false,
+    catalogLoaded: false,
+    catalogUnavailable: false,
+    catalogNeedsApproval: false,
+    catalogAwaitingApproval: false,
+    catalogNote: "",
+    mediaRefreshing: false,
+    // Which kind the chips are filtering to, and the order items arrive in.
+    exploreFilter: "all",
+    exploreSort: "newest",
   };
+
+  // What each item's published metadata says about itself: the title its
+  // creator typed and the cover they chose. Read once per item, from this
+  // Home's own `/ipfs/` route, and kept only for as long as this page lives.
+  //
+  // Presentation only. Price, quantity, availability and who may open it are
+  // answered by Runtime in the listing itself and are never taken from here.
+  const listingMetadata = new Map();
+  // What identifies one item on this shelf.
+  //
+  // A listing this Home holds answers to its mint. An item known only to the
+  // index has no mint here at all, and is named by the asset instead --
+  // channel and token, which is how the chain names it. Keying both on the
+  // mint alone gave every catalogue item the same empty key, so one item's
+  // title and cover appeared on all of them.
+  const itemKey = (item) => item.mintId || item.catalogId || "";
+  // What a price is denominated in, keyed by the token's address: its decimals
+  // and the name a person knows it by. Read once from this Home, which holds
+  // the same allow-list a mint is priced against.
+  const payTokens = new Map();
+  const listingMetadataAsked = new Set();
 
   // What each purchase in flight is waiting for, keyed by mint. A purchase
   // lives in Runtime, not here: this only remembers what to show while this
@@ -46,12 +101,18 @@ import {
     categoryList: document.querySelector("#category-list"),
     loadingState: document.querySelector("#loading-state"),
     loadError: document.querySelector("#load-error"),
+    storeMain: document.querySelector("#store-main"),
     storeSections: document.querySelector("#store-sections"),
     storeTitle: document.querySelector("#store-title"),
     installedBadge: document.querySelector("#installed-badge"),
     detailModal: document.querySelector("#detail-modal"),
     detailContent: document.querySelector("#detail-content"),
     searchInput: document.querySelector("#search-input"),
+    mediaHead: document.querySelector("#media-head"),
+    mediaTabs: document.querySelector("#media-tabs"),
+    mediaToolbar: document.querySelector("#media-toolbar"),
+    mediaChips: document.querySelector("#media-chips"),
+    mediaSort: document.querySelector("#media-sort"),
     importForm: document.querySelector("#import-listing"),
     importInput: document.querySelector("#import-listing-uri"),
     importSubmit: document.querySelector("#import-listing-submit"),
@@ -75,10 +136,65 @@ import {
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>',
     close: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>',
     check: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>',
+    share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"></path><path d="m8 7 4-4 4 4"></path><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"></path></svg>',
+    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"></path><path d="m8 11 4 4 4-4"></path><path d="M5 19h14"></path></svg>',
+    mediaOutline: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2.5" y="5.5" width="19" height="13" rx="3"></rect><path d="m10.5 9.8 4.6 2.7-4.6 2.7V9.8Z"></path></svg>',
+    playFill: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="7 4 20 12 7 20 7 4"></polygon></svg>',
     media: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m10 9 5 3-5 3V9Z" fill="currentColor" stroke="none"></path></svg>',
   };
 
   const CAPSULE_ICON_ROUTE = /^\/apps\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.png$/;
+  const MEDIA_TABS = ["explore", "shops", "mine"];
+  const SHOP_ACCESS_STATES = ["administrator", "subscribed", "none", "unknown"];
+  // The shelf's sections, in the order a person sees them, each matched by the
+  // MIME Runtime published. The kind comes from Runtime rather than from the
+  // creator's chosen category: a category is a label on a document this app
+  // fetches separately and may not have yet, and a shelf that regroups itself
+  // once a fetch lands is a shelf that moved under someone's hand.
+  // `shape` is how a card holds its cover, and it follows what the thing is
+  // rather than which kind Runtime calls it: an image and a video both fill a
+  // frame, and only a document stands a page at the foot of the card.
+  const EXPLORE_GROUPS = [
+    { id: "videos", title: "Videos", shape: "wide", limit: 3, matches: (mime) => mime.startsWith("video/") },
+    { id: "musics", title: "Audio", shape: "wide", limit: 3, matches: (mime) => mime.startsWith("audio/") },
+    {
+      id: "documents",
+      title: "Documents",
+      shape: "page",
+      // A page is narrower than a frame, so one more fits the same row.
+      limit: 5,
+      matches: (mime) => mime === "application/pdf"
+        || mime.startsWith("text/")
+        || mime === "application/epub+zip"
+        || mime === "application/msword"
+        || mime.startsWith("application/vnd.openxmlformats-officedocument")
+        || mime.startsWith("application/vnd.oasis.opendocument"),
+    },
+    { id: "images", title: "Images", shape: "wide", limit: 3, matches: (mime) => mime.startsWith("image/") },
+    // Everything Runtime published that none of the above claims. It is named
+    // rather than dropped: an item on this Home that no section wanted would
+    // otherwise be invisible to the person who owns it.
+    { id: "other", title: "Other", shape: "wide", limit: 3, matches: () => true },
+  ];
+  // How many items a section shows before it offers the rest, when its own
+  // kind does not say. A shelf is meant to fit on screen.
+  const EXPLORE_ROW_LIMIT = 3;
+  // The app that makes a listing. Named once: this app launches it, and never
+  // pretends to do its work.
+  const CREATOR_CAPSULE_ID = "creator";
+  // Currencies written as a mark rather than a name, which is both shorter on
+  // a card and what a person already reads as money. Only the marks in common
+  // use: a token nobody writes as a symbol keeps its name.
+  const CURRENCY_MARKS = {
+    USDC: "$",
+    USDT: "$",
+    USD: "$",
+    ETH: "Ξ",
+    WETH: "Ξ",
+  };
+  // A title longer than this is not a title. Bounded because it comes from a
+  // document published by whoever minted the item.
+  const MAX_LISTING_TITLE_CHARS = 120;
 
   boot();
 
@@ -144,12 +260,27 @@ import {
       }
       node.addEventListener("click", () => selectDestination(node.dataset.destination));
     });
+    els.mediaTabs.querySelectorAll("[data-media-tab]").forEach((node) => {
+      node.addEventListener("click", () => selectMediaTab(node.dataset.mediaTab));
+    });
+    // The toolbar is in the page rather than rendered, so its controls are
+    // bound here. `bindAppActions` only reaches markup this app drew.
+    bindAppActions(els.mediaToolbar);
+    els.mediaSort.addEventListener("change", (event) => {
+      state.exploreSort = String(event.target.value || "newest");
+      renderSections();
+    });
     els.detailModal.addEventListener("click", (event) => {
       if (event.target === els.detailModal) {
         closeDetail();
       }
     });
     document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && document.querySelector(".menu-list:not([hidden])")) {
+        event.preventDefault();
+        closeCardMenus();
+        return;
+      }
       if (event.key === "Escape" && els.detailModal.classList.contains("active")) {
         event.preventDefault();
         closeDetail();
@@ -189,6 +320,11 @@ import {
       item.focus();
       selectDestination(item.dataset.destination);
     });
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest(".menu")) {
+        closeCardMenus();
+      }
+    }, true);
     window.addEventListener("message", handleTrustedHomeMessage);
   }
 
@@ -238,6 +374,7 @@ import {
     await Promise.all([
       loadCatalogData().then(render),
       loadMediaData().then(render),
+      loadPayTokens().then(render),
     ]);
   }
 
@@ -299,6 +436,207 @@ import {
     } finally {
       state.mediaLoading = false;
     }
+  }
+
+  // The channels publishing protected items. Discovery, never authority: what
+  // it lists is what exists, and what a Home may do with any of it is decided
+  // on chain when it tries.
+  // The market: everything anyone has minted, not only what this Home holds.
+  //
+  // Runtime has already converted the index's dialect into the values this
+  // app speaks, and joined each item against this Home's own listings. What
+  // arrives is therefore the same kind of thing the shelf already renders,
+  // with one difference that matters: an item with no `mintId` is one this
+  // Home holds nothing for, so it can be bought and cannot be opened.
+  async function loadCatalogItems() {
+    state.catalogLoading = true;
+    renderSurfaceState();
+    try {
+      const response = await fetch("/api/apps/marketplace/items", {
+        headers: { accept: "application/json", "x-elastos-home-token": homeToken },
+      });
+      const answer = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(catalogErrorMessage(response, answer));
+      }
+      state.catalog = (Array.isArray(answer.items) ? answer.items : [])
+        .map(catalogItemFromAnswer)
+        .filter(Boolean);
+      state.catalogUnavailable = answer.unavailable === true;
+      state.catalogNeedsApproval = answer.needsApproval === true;
+      state.catalogLoaded = true;
+    } catch (error) {
+      // An index that cannot be read leaves Explore with this Home's own
+      // items: a thinner shelf, not a broken one.
+      state.catalog = [];
+      state.catalogUnavailable = true;
+      state.catalogNote = publicError(error.message, "Couldn’t reach the market.");
+    } finally {
+      // Attempted either way. Without this a failure is retried on every
+      // paint, and a paint follows every retry -- which is a loop that asks
+      // an outside service as fast as the page can draw.
+      state.catalogLoaded = true;
+      state.catalogLoading = false;
+    }
+  }
+
+  // One catalog item, in the shape the card already reads.
+  //
+  // Runtime screened and converted these; this keeps the page's own shape so
+  // that a field it has never seen cannot reach a card, and so a catalog item
+  // and a listing render through one function rather than two.
+  function catalogItemFromAnswer(entry) {
+    const ledger = String(entry && entry.ledger || "");
+    const tokenId = String(entry && entry.tokenId || "");
+    if (!/^0x[0-9a-f]{40}$/.test(ledger) || !/^0x[0-9a-f]{1,64}$/.test(tokenId)) {
+      return null;
+    }
+    const accessState = String(entry && entry.accessState || "available");
+    return {
+      // A catalog item is identified by its asset until this Home holds a
+      // listing for it; then it answers to that listing's mint like any other.
+      mintId: String(entry && entry.mintId || ""),
+      catalogId: `${ledger}:${tokenId}`,
+      displayName: String(entry && entry.displayName || "").slice(0, 256),
+      mimeType: catalogMimeType(String(entry && entry.contentCategory || "")),
+      codecs: "",
+      contentKind: "",
+      quantity: `0x${Math.max(0, Number(entry && entry.quantity) || 0).toString(16)}`,
+      price: `0x${(BigInt(String(entry && entry.price || "0"))).toString(16)}`,
+      payToken: String(entry && entry.payToken || ""),
+      sellerAddress: String(entry && entry.sellerAddress || ""),
+      publishedAt: Number(entry && entry.publishedAt) || 0,
+      views: Number(entry && entry.views) || 0,
+      metadataCid: cidOrEmpty(entry && entry.metadataCid),
+      accessState: ACCESS_STATES.includes(accessState) ? accessState : "available",
+      purchaseInFlight: false,
+      availability: null,
+      // What this Home can do about it. An item it holds no listing for can be
+      // bought; opening one needs the listing, which a purchase creates.
+      catalogOnly: !entry || !entry.mintId,
+    };
+  }
+
+  // The index reports a category where a listing reports a MIME. The shelf
+  // groups on MIME, so the category is spelled as one -- `video` becomes
+  // `video/*` -- rather than teaching the grouping a second vocabulary.
+  function catalogMimeType(category) {
+    const known = {
+      video: "video/*",
+      audio: "audio/*",
+      image: "image/*",
+      document: "application/pdf",
+      ebook: "application/epub+zip",
+      comic: "application/pdf",
+      article: "text/plain",
+    }[category];
+    return known || "application/octet-stream";
+  }
+
+  // Asked once, early: a price is unreadable without it, and it is local
+  // configuration rather than anything this Home has to reach out for.
+  async function loadPayTokens() {
+    try {
+      const response = await fetch("/api/apps/marketplace/pay-tokens", {
+        headers: { accept: "application/json", "x-elastos-home-token": homeToken },
+      });
+      if (!response.ok) {
+        return;
+      }
+      const answer = await response.json().catch(() => ({}));
+      for (const token of Array.isArray(answer.payTokens) ? answer.payTokens : []) {
+        const address = String(token && token.address || "").toLowerCase();
+        const decimals = Number(token && token.decimals);
+        const symbol = String(token && token.symbol || "").slice(0, 12);
+        if (/^0x[0-9a-f]{40}$/.test(address) && Number.isInteger(decimals) && decimals >= 0 && decimals <= 36) {
+          payTokens.set(address, { decimals, symbol });
+        }
+      }
+    } catch {
+      // A shelf without this shows base units.
+    }
+  }
+
+  async function loadShopsData() {
+    state.shopsLoading = true;
+    state.shopsLoadError = null;
+    renderSurfaceState();
+    try {
+      const response = await fetch("/api/apps/marketplace/channels", {
+        headers: { accept: "application/json", "x-elastos-home-token": homeToken },
+      });
+      const answer = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(catalogErrorMessage(response, answer));
+      }
+      state.shops = Array.isArray(answer.channels) ? answer.channels.map(shopFromAnswer) : [];
+      state.shopsNeedsApproval = answer.needsApproval === true;
+      state.shopsUnavailable = answer.unavailable === true;
+      state.shopsLoaded = true;
+      // Which cards to offer a subscription for is a separate question with a
+      // separate answer, asked once the channels are known and never allowed
+      // to hold the list up.
+      loadShopAccess(state.shops.map((shop) => shop.address)).then(render);
+    } catch (error) {
+      state.shops = [];
+      state.shopsNeedsApproval = false;
+      state.shopsUnavailable = false;
+      state.shopsLoadError = publicError(error.message, "Couldn’t load channels.");
+    } finally {
+      state.shopsLoading = false;
+    }
+  }
+
+  // What this Home already holds on each of these channels. Its failure is not
+  // the surface's failure: every card simply stays at "checking", which is a
+  // state it draws, and no card claims access it could not confirm.
+  async function loadShopAccess(addresses) {
+    if (!addresses.length) {
+      return;
+    }
+    try {
+      const response = await fetch("/api/apps/marketplace/channel-access", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          "x-elastos-home-token": homeToken,
+        },
+        body: JSON.stringify({ channels: addresses }),
+      });
+      if (!response.ok) {
+        return;
+      }
+      const answer = await response.json().catch(() => ({}));
+      for (const entry of Array.isArray(answer.channels) ? answer.channels : []) {
+        const channel = String(entry && entry.channel || "");
+        const access = String(entry && entry.state || "");
+        if (channel && SHOP_ACCESS_STATES.includes(access)) {
+          state.shopAccess.set(channel, access);
+        }
+      }
+    } catch {
+      // Nothing to say and nothing to stop: the cards keep checking.
+    }
+  }
+
+  // Runtime has already bounded and screened these; this keeps the page's own
+  // shape rather than rendering whatever arrived.
+  function shopFromAnswer(entry) {
+    return {
+      address: String(entry && entry.address || ""),
+      name: String(entry && entry.name || ""),
+      description: String(entry && entry.description || ""),
+      categories: (Array.isArray(entry && entry.categories) ? entry.categories : [])
+        .map((value) => String(value || ""))
+        .filter(Boolean),
+      // A CID and nothing else. The page never takes a URL from the directory:
+      // this Home serves the picture from its own node.
+      imageCid: cidOrEmpty(entry && entry.imageCid),
+      itemsCount: Number.isSafeInteger(entry && entry.itemsCount) && entry.itemsCount >= 0
+        ? entry.itemsCount
+        : 0,
+    };
   }
 
   function skeletonRows(count) {
@@ -496,15 +834,147 @@ import {
       else node.removeAttribute("aria-current");
     });
     els.storeTitle.textContent = destinationTitle(state.destination);
-    // Adding a listing belongs to the shelf it adds to, so the control appears
-    // with that surface and nowhere else.
-    els.importForm.classList.toggle("hidden", state.destination !== "media");
+    const onMedia = state.destination === "media";
+    // `media-studio.css` is the design's own stylesheet, scoped to this class
+    // so it governs the Media surface and leaves the catalog alone. The scope
+    // is switched on with the surface rather than wrapped around part of the
+    // page, because both surfaces render into the same sections element.
+    els.storeMain.classList.toggle("media-studio", onMedia);
+    els.mediaHead.classList.toggle("hidden", !onMedia);
+    syncMediaTabSelection();
+    syncMediaChrome(onMedia);
     if (!options.silent) {
       const surfaceBlocked = renderSurfaceState();
       if (!surfaceBlocked) {
         renderSections();
       }
     }
+  }
+
+  function normalizeMediaTab(id) {
+    return MEDIA_TABS.includes(id) ? id : "explore";
+  }
+
+  function selectMediaTab(id) {
+    const next = normalizeMediaTab(id);
+    if (next === state.mediaTab) {
+      // The tab a person is already on still takes them back to the whole of
+      // it. Pressing Explore while inside one of its sections is how anyone
+      // would expect to leave that section.
+      if (state.exploreGroup) {
+        state.exploreGroup = "";
+        renderSections();
+      }
+      return;
+    }
+    state.mediaTab = next;
+    state.exploreGroup = "";
+    state.exploreFilter = "all";
+    syncMediaTabSelection();
+    syncMediaChrome(true);
+    // The surface a person left must not still be in the page while the one
+    // they chose is loading. It is hidden rather than gone otherwise, which
+    // leaves a shelf of items sitting underneath the word "Shops".
+    els.storeSections.innerHTML = "";
+    // Asked for the first time the person looks, and not before: asking is
+    // what raises the approval request, and a Home whose owner never opened
+    // Shops should never be asked about it.
+    ensureMediaTabData();
+    const surfaceBlocked = renderSurfaceState();
+    if (!surfaceBlocked) {
+      renderSections();
+    }
+  }
+
+  // The chrome each surface needs. Adding a listing belongs to the shelves it
+  // adds to, and filtering by kind belongs where there are kinds to filter.
+  function syncMediaChrome(onMedia) {
+    const shelf = onMedia && state.mediaTab !== "shops";
+    els.importForm.classList.toggle("hidden", !shelf);
+    els.mediaToolbar.classList.toggle("hidden", !shelf);
+    ensureMediaTabData();
+  }
+
+  // Read this surface again, because a person asked.
+  //
+  // The market is an outside service and this Home's own records are on disk;
+  // either can have moved since the page was drawn, and until now the only
+  // way to find out was to reopen the app. A failure to reach the market used
+  // to leave Explore quietly showing this Home's own items -- so this also
+  // says what it found, which is how anyone would notice it found nothing.
+  async function refreshMediaSurface(control) {
+    if (state.mediaRefreshing) {
+      return;
+    }
+    state.mediaRefreshing = true;
+    if (control) {
+      control.disabled = true;
+      control.setAttribute("aria-busy", "true");
+    }
+    try {
+      state.catalogLoaded = false;
+      state.shopsLoaded = false;
+      const reads = state.mediaTab === "shops"
+        ? [loadShopsData()]
+        : [loadMediaData(), loadCatalogItems(), loadPayTokens()];
+      await Promise.all(reads);
+      render();
+      showToast(refreshSummary());
+    } finally {
+      state.mediaRefreshing = false;
+      if (control) {
+        control.disabled = false;
+        control.removeAttribute("aria-busy");
+      }
+    }
+  }
+
+  // What the refresh found, in the terms a person would check it against.
+  function refreshSummary() {
+    if (state.mediaTab === "shops") {
+      if (state.shopsNeedsApproval) {
+        return "Channels need your approval.";
+      }
+      return state.shopsUnavailable
+        ? "Channel list unavailable."
+        : `${state.shops.length} ${state.shops.length === 1 ? "channel" : "channels"}.`;
+    }
+    const mine = state.mediaListings.filter((listing) => listing.accessState === "creator").length;
+    const total = exploreSourceItems().length;
+    if (state.catalogUnavailable && state.mediaTab === "explore") {
+      // The important half: the market was not read, and what is on screen is
+      // this Home's own shelf rather than the market being empty.
+      return `Market unavailable — showing ${total} of your own.`;
+    }
+    return `${total} ${total === 1 ? "item" : "items"} · ${mine} yours.`;
+  }
+
+  // What the surface a person is looking at needs, asked for once.
+  //
+  // Called when Media is opened as well as when a tab is chosen, because
+  // Explore is where a person lands: a load that only happened on a switch
+  // would never happen for the tab they never switch to.
+  //
+  // Asking is what raises an approval, so a surface nobody opens asks for
+  // nothing.
+  function ensureMediaTabData() {
+    if (state.destination !== "media") {
+      return;
+    }
+    if (state.mediaTab === "shops" && !state.shopsLoaded && !state.shopsLoading) {
+      loadShopsData().then(render);
+    }
+    if (state.mediaTab === "explore" && !state.catalogLoaded && !state.catalogLoading) {
+      loadCatalogItems().then(render);
+    }
+  }
+
+  function syncMediaTabSelection() {
+    els.mediaTabs.querySelectorAll("[data-media-tab]").forEach((node) => {
+      const selected = node.dataset.mediaTab === state.mediaTab;
+      node.classList.toggle("selected", selected);
+      node.setAttribute("aria-selected", selected ? "true" : "false");
+    });
   }
 
   function matchesSearch(app) {
@@ -555,6 +1025,17 @@ import {
 
   function surfaceState() {
     if (state.destination === "media") {
+      // Each Media tab reports its own loading and failure, so a channel
+      // directory that cannot be reached leaves the shelf exactly as it was.
+      if (state.mediaTab === "shops") {
+        return {
+          destination: "shops",
+          loading: state.shopsLoading,
+          error: state.shopsLoadError,
+          retryAction: "retry-shops",
+          title: "Couldn’t load channels",
+        };
+      }
       return {
         destination: "media",
         loading: state.mediaLoading,
@@ -650,6 +1131,203 @@ import {
   }
 
   function renderMediaSections() {
+    if (state.mediaTab === "shops") {
+      renderShopsSections();
+      return;
+    }
+    // "My listings" is the same shelf asked a narrower question, so it is the
+    // same rendering rather than a second one that could disagree with it.
+    renderExploreSections();
+  }
+
+  // Four answers, and each one says which it is. An unapproved read, an index
+  // that could not be reached and a market with nothing in it look identical
+  // on screen unless the page insists on telling them apart.
+  function renderShopsSections() {
+    if (state.shopsNeedsApproval) {
+      els.storeSections.innerHTML = `
+        ${emptyState(
+          "Channels need your approval",
+          state.shopsAwaitingApproval
+            ? "Approve “Marketplace requests the channel and sales index” in your Inbox, then choose Check again."
+            : "Marketplace can list the channels publishing protected items by reading an on-chain index. Buying and opening work without it.",
+          icons.package,
+        )}
+        <div class="store-empty-actions">
+          <button type="button" class="store-pill" data-action="approve-shops">${
+            state.shopsAwaitingApproval ? "Check again" : "Allow channel list"
+          }</button>
+        </div>
+      `;
+      bindAppActions(els.storeSections);
+      return;
+    }
+    if (state.shopsUnavailable) {
+      els.storeSections.innerHTML = `
+        ${emptyState(
+          "Channel list unavailable",
+          "The on-chain index could not be reached. Nothing else is affected.",
+          icons.package,
+        )}
+        <div class="store-empty-actions">
+          <button type="button" class="store-pill" data-action="retry-shops">Try again</button>
+        </div>
+      `;
+      bindAppActions(els.storeSections);
+      return;
+    }
+    const shops = filteredShops();
+    if (!shops.length) {
+      els.storeSections.innerHTML = emptyState(
+        state.search ? "No results" : "No channels listed",
+        state.search ? "Try a different search." : "The index answered with no channels.",
+        icons.package,
+      );
+      return;
+    }
+    els.storeSections.innerHTML = `
+      <section class="store-section">
+        <div class="store-section-head">
+          <h2 class="store-section-title">Channels</h2>
+        </div>
+        <div class="store-row-grid">
+          ${shops.map(renderShopRow).join("")}
+        </div>
+      </section>
+    `;
+    bindAppActions(els.storeSections);
+  }
+
+  function filteredShops() {
+    return state.shops.filter((shop) => {
+      if (!state.search) {
+        return true;
+      }
+      return [shop.name, shop.description, shop.categories.join(" "), shop.address]
+        .join(" ")
+        .toLowerCase()
+        .includes(state.search);
+    });
+  }
+
+  // A shop card names the channel and says how much is in it. The address is
+  // shown abbreviated because a channel with no name is still a channel a
+  // person may recognise, and it is the only durable thing on the card.
+  function renderShopRow(shop) {
+    const itemLabel = shop.itemsCount === 1 ? "1 item" : `${shop.itemsCount} items`;
+    const categories = shop.categories
+      .map((category) => `<span class="store-row-fact">${escapeHtml(titleCase(category))}</span>`)
+      .join("");
+    return `
+      <article class="store-row store-row-static store-row-shop" data-shop="${escapeAttr(shop.address)}">
+        ${shopIconHtml(shop)}
+        <div class="store-row-text">
+          <div class="store-row-title">${escapeHtml(shop.name || abbreviateAddress(shop.address))}</div>
+          <div class="store-row-sub">${escapeHtml(shop.description || abbreviateAddress(shop.address))}</div>
+          <div class="store-row-facts">
+            <span class="store-row-fact">${escapeHtml(itemLabel)}</span>
+            ${categories}
+          </div>
+        </div>
+        ${shopActionButton(shop)}
+      </article>
+    `;
+  }
+
+  // CIDv0 or CIDv1, and nothing else. Runtime has already screened this; the
+  // page screens it again because it is about to put it in a URL, and the one
+  // thing that must never end up there is something the directory chose.
+  function cidOrEmpty(value) {
+    const cid = String(value || "").trim();
+    return /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{45,95})$/.test(cid) ? cid : "";
+  }
+
+  // A channel's own picture, served by this Home from its own node through
+  // `/ipfs/:cid` -- the route that already fetches and caches CID content for
+  // every other surface, rather than a second content path built for this one.
+  //
+  // The glyph stays underneath for a picture that does not arrive: a CID no
+  // node has yet is the ordinary case, not an error.
+  function shopIconHtml(shop) {
+    if (!shop.imageCid) {
+      return `<span class="app-icon gradient-blue store-row-icon" aria-hidden="true">${icons.package}</span>`;
+    }
+    const route = `/ipfs/${encodeURIComponent(shop.imageCid)}`;
+    // The gradient rides along so that a picture which never arrives falls
+    // back to the same tile a channel without one gets, rather than to a bare
+    // glyph on nothing.
+    return `<span class="app-icon app-icon-raster gradient-blue store-row-icon"><img class="app-icon-img" src="${escapeAttr(route)}" alt="" draggable="false"><span class="app-icon-glyph" hidden>${icons.package}</span></span>`;
+  }
+
+  // A subscription is offered to whoever could use one, and to nobody else: a
+  // channel this Home administers and one it is already subscribed to have
+  // nothing to sell this person.
+  //
+  // An unconfirmed state offers nothing either. "Not subscribed" is the answer
+  // that draws the button, so a chain that could not be read must not be
+  // reported as one.
+  function shopActionButton(shop) {
+    const access = state.shopAccess.get(shop.address);
+    if (access === "administrator") {
+      return `<span class="store-row-state">Yours</span>`;
+    }
+    if (access === "subscribed") {
+      return `<span class="store-row-state">Subscribed</span>`;
+    }
+    if (access === "none") {
+      // Subscribing is a payment, and the path that makes one is not built
+      // yet. The control says so rather than doing nothing when pressed.
+      return `<button class="store-pill" type="button" data-action="subscribe-channel" data-shop="${escapeAttr(shop.address)}" disabled title="Subscribing isn't available on this Home yet.">Subscribe</button>`;
+    }
+    return `<span class="store-row-state">${access === "unknown" ? "Access unknown" : "Checking…"}</span>`;
+  }
+
+
+  // The chips: every kind, with how many of it this shelf holds. A kind with
+  // nothing in it is shown and disabled rather than hidden, so the set a
+  // person can filter by does not change shape under them.
+  function renderExploreChips(counts, total) {
+    const chips = [{ id: "all", title: "All", count: total }]
+      .concat(EXPLORE_GROUPS.map((group) => ({
+        id: group.id,
+        title: group.title,
+        count: counts.get(group.id) || 0,
+      })))
+      .filter((chip) => chip.id !== "other" || chip.count > 0);
+    els.mediaChips.innerHTML = chips.map((chip) => `
+      <button class="chip" type="button" data-action="explore-filter" data-filter="${escapeAttr(chip.id)}"
+              aria-pressed="${chip.id === state.exploreFilter ? "true" : "false"}"
+              ${chip.count === 0 && chip.id !== "all" ? "disabled" : ""}>
+        ${escapeHtml(chip.title)}${chip.count > 0 ? `<span class="n">${chip.count}</span>` : ""}
+      </button>
+    `).join("");
+    bindAppActions(els.mediaChips);
+  }
+
+  // Newest first by default, and the other orders a shelf is usually asked
+  // for. A price is a uint256, so it is compared as one -- never as a number
+  // this app rounded on the way.
+  function sortExploreListings(listings) {
+    const sorted = [...listings];
+    if (state.exploreSort === "title") {
+      return sorted.sort((left, right) => cardTitle(left).localeCompare(cardTitle(right)));
+    }
+    if (state.exploreSort === "price-asc" || state.exploreSort === "price-desc") {
+      const direction = state.exploreSort === "price-asc" ? 1n : -1n;
+      return sorted.sort((left, right) => {
+        const difference = (BigInt(left.price) - BigInt(right.price)) * direction;
+        return difference === 0n ? 0 : difference < 0n ? -1 : 1;
+      });
+    }
+    return sorted.sort((left, right) => right.publishedAt - left.publishedAt);
+  }
+
+  function cardTitle(listing) {
+    const meta = listingMetadata.get(itemKey(listing));
+    return (meta && meta.title) || listing.displayName;
+  }
+
+  function renderExploreSections() {
     const listings = filteredMediaListings();
     const notice = shelfNotice();
     if (!listings.length) {
@@ -663,18 +1341,558 @@ import {
       );
       return;
     }
-    els.storeSections.innerHTML = `
-      ${notice}
-      <section class="store-section">
-        <div class="store-section-head">
-          <h2 class="store-section-title">Protected media</h2>
+    const sorted = sortExploreListings(listings);
+    const counts = new Map();
+    for (const listing of sorted) {
+      const id = exploreGroupId(listing);
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+    renderExploreChips(counts, sorted.length);
+    const groups = groupExploreListings(sorted)
+      .filter((group) => state.exploreFilter === "all" || group.id === state.exploreFilter);
+    if (!groups.length) {
+      els.storeSections.innerHTML = notice + emptyState(
+        "Nothing of that kind",
+        "This shelf holds nothing in the kind you picked.",
+        icons.media,
+      );
+      return;
+    }
+    // A group opened from its own "More" link shows everything it has.
+    const opened = groups.find((group) => group.id === state.exploreGroup);
+    if (opened) {
+      els.storeSections.innerHTML = `
+        ${notice}
+        <section class="section">
+          <div class="section-head">
+            <h2>${escapeHtml(opened.title)} <span class="n">${opened.listings.length}</span></h2>
+            <button type="button" class="store-see-all" data-action="explore-all">&larr; All items</button>
+          </div>
+          <div class="grid ${escapeAttr(opened.shape === "page" ? "docs" : "videos")}">
+            ${opened.listings.map(renderMediaCard).join("")}
+            ${state.mediaTab === "mine" ? addCardTile(opened.id) : ""}
+          </div>
+        </section>
+      `;
+      bindAppActions(els.storeSections);
+      requestListingMetadata(opened.listings);
+      return;
+    }
+    const arriving = state.mediaTab === "explore" && state.catalogLoading;
+    els.storeSections.innerHTML = notice + marketNotice() + groups.map((group) => `
+      <section class="section">
+        <div class="section-head">
+          <h2>${escapeHtml(group.title)} <span class="n">${group.listings.length}</span></h2>
+          ${group.listings.length > group.limit
+            ? `<button type="button" class="store-see-all" data-action="explore-more" data-group="${escapeAttr(group.id)}">See all</button>`
+            : ""}
         </div>
-        <div class="store-row-grid">
-          ${listings.map(renderMediaRow).join("")}
+        <div class="grid ${escapeAttr(group.shape === "page" ? "docs" : "videos")}">
+          ${group.listings.slice(0, group.limit).map(renderMediaCard).join("")}
+          ${arriving && group.listings.length < group.limit
+            ? skeletonCards(group.shape, group.limit - group.listings.length)
+            : ""}
+          ${state.mediaTab === "mine" && group.listings.length <= group.limit ? addCardTile(group.id) : ""}
         </div>
       </section>
-    `;
+    `).join("");
     bindAppActions(els.storeSections);
+    requestListingMetadata(sorted.slice(0, 4 * EXPLORE_GROUPS.length));
+  }
+
+  // The end of a section in My listings: where a new item of that kind comes
+  // from. Explore is other people's shelf and offers no such thing -- adding
+  // to it means buying, not minting.
+  //
+  // Making one is Creator's job, not this app's, so the tile launches Creator
+  // through Home exactly as any other launch does. It is offered only when
+  // Creator is actually installed and launchable -- a tile that opens nothing
+  // is worse than a tile that is not there, so when it cannot launch it says
+  // what is missing instead.
+  function addCardTile(groupId) {
+    const noun = {
+      videos: "a video",
+      musics: "audio",
+      documents: "a document",
+      images: "an image",
+      other: "an item",
+    }[groupId] || "an item";
+    const creator = state.apps.find((app) => app.id === CREATOR_CAPSULE_ID);
+    if (!creator || !creator.launchable || !creator.launchTarget) {
+      return `
+        <div class="add-tile">
+          <span class="plus">${spriteIcon("i-plus", "", "width:20px;height:20px;stroke-width:2")}</span>
+          <strong>Add ${escapeHtml(noun)}</strong><span>Creator isn’t installed on this Home.</span>
+        </div>
+      `;
+    }
+    return `
+      <button class="add-tile" type="button" data-action="open-creator">
+        <span class="plus">${spriteIcon("i-plus", "", "width:20px;height:20px;stroke-width:2")}</span>
+        <strong>Add ${escapeHtml(noun)}</strong><span>Protect and list a new one in Creator</span>
+      </button>
+    `;
+  }
+
+  // When the market could not be read, Explore is this Home's own shelf --
+  // which looks exactly like a market with nothing in it unless it says so.
+  // It is a note above the items rather than an error in place of them,
+  // because the items are real and this is about what is missing beside them.
+  function marketNotice() {
+    if (state.mediaTab !== "explore" || !state.catalogLoaded) {
+      return "";
+    }
+    if (state.catalogNeedsApproval) {
+      return `
+        <p class="store-inline-note">
+          Other people’s items need your approval. Approve “Marketplace requests the channel list” in your Inbox, then refresh.
+        </p>
+      `;
+    }
+    if (state.catalogUnavailable) {
+      return `<p class="store-inline-note">Couldn’t reach the market. Showing your own items.</p>`;
+    }
+    return "";
+  }
+
+  // A card that is on its way, in the shape the real one will take.
+  //
+  // The design's own skeleton: the shelf keeps its layout while it fills, so
+  // nothing jumps once the items arrive.
+  function skeletonCards(shape, count) {
+    const frame = shape === "page" ? "height:236px" : "aspect-ratio:16/9";
+    return Array.from({ length: count }, () => `
+      <div class="card skeleton ${shape === "page" ? "doc" : "video"}" aria-hidden="true">
+        <div class="thumb" style="${frame}"></div>
+        <div class="card-body" style="gap:8px">
+          <div class="bar" style="width:80%"></div>
+          <div class="bar" style="width:55%"></div>
+        </div>
+        <div style="padding:8px 16px 16px"><div class="bar" style="width:40%"></div></div>
+      </div>
+    `).join("");
+  }
+
+  // One section per kind, and a section only when it has something in it. An
+  // empty "Musics" heading tells a person nothing except that this app knows
+  // the word.
+  function groupExploreListings(listings) {
+    return EXPLORE_GROUPS
+      .map((group) => ({
+        id: group.id,
+        title: group.title,
+        shape: group.shape,
+        limit: group.limit || EXPLORE_ROW_LIMIT,
+        listings: listings.filter((listing) => exploreGroupId(listing) === group.id),
+      }))
+      .filter((group) => group.listings.length > 0);
+  }
+
+  // The first section that claims this item's MIME. Order decides: "Other"
+  // matches everything and is last, so it only ever gets what nothing else
+  // wanted.
+  function exploreGroupFor(listing) {
+    const mime = String(listing.mimeType || "").toLowerCase();
+    return EXPLORE_GROUPS.find((group) => group.matches(mime)) || EXPLORE_GROUPS[EXPLORE_GROUPS.length - 1];
+  }
+
+  function exploreGroupId(listing) {
+    return exploreGroupFor(listing).id;
+  }
+
+  // The format badge: what this item IS, in the shortest true word.
+  //
+  // Taken from the MIME's subtype rather than from a table of names, so an
+  // item of a kind nobody anticipated still gets a badge instead of nothing.
+  // Deliberately no resolution beside it: the design shows "MP4 · 720p", and
+  // this Home is told the codec but never the frame size, so it says the part
+  // it knows rather than a number it guessed.
+  function formatBadge(listing) {
+    const mime = String(listing.mimeType || "").toLowerCase();
+    const subtype = mime.slice(mime.indexOf("/") + 1);
+    const named = {
+      "quicktime": "MOV",
+      "x-matroska": "MKV",
+      "mpeg": mime.startsWith("audio/") ? "MP3" : "MPEG",
+      "svg+xml": "SVG",
+      "epub+zip": "EPUB",
+      "vnd.openxmlformats-officedocument.wordprocessingml.document": "DOCX",
+      "plain": "TXT",
+      "jpeg": "JPG",
+    }[subtype];
+    const badge = named || subtype.replace(/^x-/, "").toUpperCase();
+    return badge.length > 0 && badge.length <= 6 ? badge : "FILE";
+  }
+
+  // The state badge, top right, and only when there is something to say. An
+  // item someone else listed and can still sell wears nothing.
+  function stateBadge(listing) {
+    if (listing.accessState === "creator") {
+      return { label: "Listed by you", tone: "own" };
+    }
+    if (listing.accessState === "purchased") {
+      return { label: "In your library", tone: "owned" };
+    }
+    if (isSoldOut(listing)) {
+      return { label: "Sold out", tone: "gone" };
+    }
+    return null;
+  }
+
+  // Nothing left to sell. Read from the quantity Runtime published, as a
+  // string, because a uint256 is not a number this app may hold.
+  function isSoldOut(listing) {
+    return uint256Decimal(listing.quantity) === "0";
+  }
+
+  // A price, short enough for a card and still exactly itself.
+  //
+  // The design shows "100K units" and "10¹⁷ units", so long values are
+  // shortened -- but only when the short form is EXACT. 100000 is exactly
+  // 100K; 123456 is not 123.5K, so it stays 123456. A price a person reads is
+  // either the price or it is a lie, and the full value is on the element for
+  // anything that needs it.
+  function compactUnits(decimal) {
+    const digits = String(decimal || "0");
+    // A clean power of ten says itself best as one, once it is long enough
+    // that a suffix would still leave a wall of zeros.
+    if (digits.length > 9 && /^10*$/.test(digits)) {
+      return `10${superscript(digits.length - 1)}`;
+    }
+    for (const [suffix, zeros] of [["T", 12], ["B", 9], ["M", 6], ["K", 3]]) {
+      if (digits.length > zeros && /^0+$/.test(digits.slice(-zeros))) {
+        const head = digits.slice(0, -zeros);
+        // A head longer than this is not shorter than the number it replaced.
+        if (head.length <= 4) {
+          return `${head}${suffix}`;
+        }
+      }
+    }
+    return digits;
+  }
+
+  function superscript(value) {
+    const glyphs = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+    return String(value)
+      .replace("-", "⁻")
+      .replace(/[0-9]/g, (digit) => glyphs[Number(digit)]);
+  }
+
+  // One item, as a card.
+  //
+  // Six states, and each one says which it is rather than leaving a person to
+  // work it out from what is missing: someone else's listing to buy, one this
+  // Home listed, one it already holds, one with nothing left to sell, a
+  // purchase still running, and a card whose metadata has not arrived yet.
+  // One item, as a card.
+  //
+  // This is `media-studio.html`'s `videoCard` and `docCard`, kept in its own
+  // class names and structure so the next change can be diffed against the
+  // design instead of translated out of it. What differs is data and actions:
+  // the values come from Runtime's listing, and every control carries the
+  // `data-action` this app already answers.
+  function renderMediaCard(listing) {
+    const kind = exploreGroupFor(listing).shape === "page" ? "doc" : "video";
+    const mint = escapeAttr(listing.mintId);
+    const state = cardStateName(listing);
+    const meta = listingMetadata.get(itemKey(listing));
+    const title = (meta && meta.title) || listing.displayName;
+    const cover = meta && meta.coverCid ? `/ipfs/${escapeAttr(meta.coverCid)}` : "";
+    const stock = `${escapeHtml(uint256Decimal(listing.quantity))} available`;
+    const seller = listing.accessState === "creator" ? " · by you" : "";
+    if (kind === "doc") {
+      const thumb = cover
+        ? `<img class="page app-icon-img" src="${cover}" alt="" loading="lazy" data-cover="pending">`
+        : "";
+      return `
+      <article class="card doc store-row-media" data-mint="${mint}" data-id="${escapeAttr(itemKey(listing))}" data-state="${escapeAttr(state)}">
+        <div class="thumb app-icon-raster${cover ? " thumb-pending" : ""}">
+          ${thumb}
+          <div class="page-fallback app-icon-glyph"${cover ? " hidden" : ""}><b>${escapeHtml(title)}</b><i></i><i></i><i></i><i></i></div>
+          <span class="tag left">${escapeHtml(formatBadge(listing))}</span>
+          ${statusTag(state)}
+        </div>
+        <div class="card-body">
+          <h3 class="card-title" title="${escapeAttr(title)}">${escapeHtml(title)}</h3>
+          <div class="card-meta">${state === "owned" ? "In your library" : `${stock}${seller}`}</div>
+          <div class="card-progress">${buyStateNoteMarkup(listing)}</div>
+        </div>
+        <div class="card-foot">
+          ${priceBlock(listing, state)}
+          <div class="card-actions">${cardActions(listing, state, "btn-sm", true)}</div>
+        </div>
+      </article>`;
+    }
+    const thumb = cover
+      ? `<img class="app-icon-img" src="${cover}" alt="" loading="lazy" data-cover="pending">`
+      : "";
+    // An image is looked at, not played, so the control over it says so.
+    const previewIcon = exploreGroupId(listing) === "images" ? "i-eye" : "i-play";
+    const play = state !== "soldout" && listing.accessState !== "available"
+      ? `<button class="play" type="button" data-action="open-media" data-mint="${mint}" aria-label="Open ${escapeAttr(title)}">${spriteIcon(previewIcon, "fill", "width:22px;height:22px")}</button>`
+      : "";
+    return `
+    <article class="card video store-row-media" data-mint="${mint}" data-id="${escapeAttr(itemKey(listing))}" data-state="${escapeAttr(state)}">
+      <div class="thumb app-icon-raster${cover ? " thumb-pending" : ""}">
+        ${thumb}
+        <div class="video-fallback app-icon-glyph"${cover ? " hidden" : ""}>${spriteIcon("i-media")}</div>
+        <span class="tag left">${escapeHtml(formatBadge(listing))}</span>
+        ${statusTag(state)}
+        ${play}
+      </div>
+      <div class="card-body">
+        <h3 class="card-title" title="${escapeAttr(title)}">${escapeHtml(title)}</h3>
+        <div class="card-meta mono" title="${escapeAttr(listing.displayName)}">${escapeHtml(mediaCardSubtitle(listing, title))}</div>
+        <div class="card-progress">${buyStateNoteMarkup(listing)}</div>
+      </div>
+      <div class="card-foot">
+        <div>${priceBlock(listing, state)}<div class="stock">${state === "owned" ? "Purchased" : stock}</div></div>
+        <div class="card-actions">${cardActions(listing, state)}</div>
+      </div>
+    </article>`;
+  }
+
+  // The line under the title, which must never repeat it.
+  //
+  // For an item this Home holds, that line is the file name in mono: it says
+  // WHICH copy you are looking at, since two mints of one title are one title
+  // and two files, and it differs from the title because the title comes from
+  // the published document.
+  //
+  // An item known only to the index has no file name -- its `name` IS the
+  // title -- so the line would echo the title and say nothing. It says who is
+  // selling it and how many are left instead, which is what a card about
+  // someone else's item is otherwise missing.
+  function mediaCardSubtitle(listing, title) {
+    const fileName = listing.displayName;
+    if (fileName && fileName !== title) {
+      return listing.codecs ? `${fileName} · ${listing.codecs}` : fileName;
+    }
+    const seller = listing.accessState === "creator"
+      ? "by you"
+      : listing.sellerAddress
+        ? `by ${abbreviateAddress(listing.sellerAddress)}`
+        : "";
+    const stock = `${uint256Decimal(listing.quantity)} available`;
+    return seller ? `${stock} · ${seller}` : stock;
+  }
+
+  // The design's four card states, named from what Runtime says.
+  function cardStateName(listing) {
+    if (listing.accessState === "purchased") {
+      return "owned";
+    }
+    if (listing.accessState === "creator") {
+      return "mine";
+    }
+    return isSoldOut(listing) ? "soldout" : "default";
+  }
+
+  function statusTag(state) {
+    if (state === "mine") {
+      return `<span class="tag right mine">Listed by you</span>`;
+    }
+    if (state === "owned") {
+      return `<span class="tag right owned">In your library</span>`;
+    }
+    if (state === "soldout") {
+      return `<span class="tag right sold">Sold out</span>`;
+    }
+    return "";
+  }
+
+  function priceBlock(listing, state) {
+    if (state === "owned") {
+      return `<div class="price owned">✓ In your library</div>`;
+    }
+    const money = formatMoney(listing);
+    return `<div class="price${state === "soldout" ? " sold" : ""}" title="${escapeAttr(money.title)}">${escapeHtml(money.value)}${money.unit ? ` <small>${escapeHtml(money.unit)}</small>` : ""}</div>`;
+  }
+
+  // A price a person can read.
+  //
+  // The listing carries a uint256 and the address it is priced in; this Home
+  // says how many decimals that address has and what it is called. The
+  // scaling is integer arithmetic on the digits -- a price is never put
+  // through a float, which is why this shifts a decimal point by hand rather
+  // than dividing.
+  //
+  // A token this Home does not know is shown in base units. That is useless
+  // to read and honest, which is the right way round: inventing decimals
+  // would turn an unknown price into a confident wrong one.
+  function formatMoney(listing) {
+    const full = uint256Decimal(listing.price);
+    const token = payTokens.get(String(listing.payToken || "").toLowerCase());
+    if (!token) {
+      return { value: compactUnits(full), unit: "units", title: `${full} base units` };
+    }
+    const exact = trimZeros(shiftDecimal(full, token.decimals));
+    const shown = readableAmount(exact);
+    const mark = CURRENCY_MARKS[token.symbol.toUpperCase()];
+    // A token with a mark of its own wears it, which is both shorter and what
+    // a person recognises. One without keeps its name beside the number.
+    return mark
+      ? { value: `${mark}${shown}`, unit: "", title: `${exact} ${token.symbol}` }
+      : { value: shown, unit: token.symbol, title: `${exact} ${token.symbol}` };
+  }
+
+  // `digits` divided by 10^decimals, exactly, as a decimal string. No
+  // division and no Number: the point is moved through the digit string.
+  function shiftDecimal(digits, decimals) {
+    const value = String(digits || "0");
+    if (decimals <= 0) {
+      return value;
+    }
+    if (value.length <= decimals) {
+      return `0.${value.padStart(decimals, "0")}`;
+    }
+    return `${value.slice(0, value.length - decimals)}.${value.slice(value.length - decimals)}`;
+  }
+
+  // An amount a card can hold, written the way token prices are written.
+  //
+  // A token with eighteen decimals makes very small prices very long:
+  // 0.0000000000001 ETH is thirteen leading zeros, unreadable and wider than
+  // the card. The run of zeros is counted instead of printed -- 0.0₁₃1 --
+  // which is what Uniswap, DexScreener and CoinGecko all do, so a person who
+  // has seen a token price before already reads it.
+  //
+  // Nothing is rounded and nothing is dropped: the subscript is a count, not
+  // an approximation, and the exact amount stays on the element as well.
+  function readableAmount(exact) {
+    const value = String(exact || "0");
+    if (!value.startsWith("0.")) {
+      return value;
+    }
+    const fraction = value.slice(2);
+    const leadingZeros = fraction.length - fraction.replace(/^0+/, "").length;
+    // Two zeros are shorter written out than counted.
+    if (leadingZeros < 3) {
+      return value;
+    }
+    return `0.0${subscript(leadingZeros)}${fraction.replace(/^0+/, "")}`;
+  }
+
+  function subscript(value) {
+    const glyphs = "₀₁₂₃₄₅₆₇₈₉";
+    return String(value).replace(/[0-9]/g, (digit) => glyphs[Number(digit)]);
+  }
+
+  // Trailing zeros after a decimal point say nothing. A whole number keeps no
+  // point at all.
+  function trimZeros(value) {
+    if (!value.includes(".")) {
+      return value;
+    }
+    return value.replace(/0+$/, "").replace(/\.$/, "");
+  }
+
+  // The design's secondary icons and primary button, carrying this app's
+  // actions. A sold-out item keeps the design's disabled control rather than
+  // its "Notify me": this Home cannot tell anyone when a copy frees up.
+  function cardActions(listing, state, size = "", overflow = false) {
+    const mint = escapeAttr(listing.mintId);
+    if (state === "soldout") {
+      return `<button class="btn btn-ghost ${size}" type="button" disabled>Sold out</button>`;
+    }
+    const secondary = state === "mine" || state === "owned"
+      ? cardSecondaryActions(listing, state, size, overflow)
+      : "";
+    return `${secondary}${mediaActionButton(listing, size)}`;
+  }
+
+  // The same two things either way: the link a creator passes on, and the
+  // rebuild anyone holding a copy may ask for.
+  //
+  // A document card has less room beside a taller page, so the design folds
+  // them behind one control there and shows them plainly on a video. The
+  // actions are identical; only how many buttons they occupy differs.
+  function cardSecondaryActions(listing, state, size, overflow) {
+    const mint = escapeAttr(listing.mintId);
+    const downloading = pendingDownloads.has(listing.mintId);
+    const share = state === "mine";
+    if (!overflow) {
+      return `${share
+        ? `<button class="btn btn-icon ${size}" type="button" data-action="share-listing" data-mint="${mint}" aria-label="Share listing">${spriteIcon("i-share", "", "width:17px;height:17px")}</button>`
+        : ""}
+        <button class="btn btn-icon ${size}" type="button" data-action="download-copy" data-mint="${mint}" aria-label="Download"${downloading ? " disabled aria-busy=\"true\"" : ""}>${spriteIcon("i-download", "", "width:17px;height:17px")}</button>`;
+    }
+    return `
+      <div class="menu">
+        <button class="btn btn-icon ${size}" type="button" data-action="card-menu" data-mint="${mint}"
+                aria-label="More actions" aria-haspopup="menu" aria-expanded="false">${spriteIcon("i-more", "fill", "width:16px;height:16px")}</button>
+        <ul class="menu-list" role="menu" hidden>
+          ${share
+            ? `<li><button role="menuitem" type="button" data-action="share-listing" data-mint="${mint}">${spriteIcon("i-share", "", "width:15px;height:15px")}Share</button></li>`
+            : ""}
+          <li><button role="menuitem" type="button" data-action="download-copy" data-mint="${mint}"${downloading ? " disabled aria-busy=\"true\"" : ""}>${spriteIcon("i-download", "", "width:15px;height:15px")}Download</button></li>
+        </ul>
+      </div>`;
+  }
+
+  // An icon from the design's own sprite, drawn the way the design draws it.
+  function spriteIcon(id, extraClass = "", style = "") {
+    return `<svg class="icon ${extraClass}"${style ? ` style="${escapeAttr(style)}"` : ""} aria-hidden="true"><use href="#${escapeAttr(id)}"/></svg>`;
+  }
+
+  // Reads each item's published metadata document from this Home's own node,
+  // once, and redraws when they arrive.
+  //
+  // Asked for after the shelf has rendered rather than before: a person should
+  // see their items immediately with the file names Runtime already sent, and
+  // gain the titles and covers a moment later. A document that never arrives
+  // costs a cover, never a row.
+  async function requestListingMetadata(listings) {
+    const pending = listings.filter((listing) =>
+      listing.metadataCid && itemKey(listing) && !listingMetadataAsked.has(itemKey(listing)));
+    if (!pending.length) {
+      return;
+    }
+    for (const listing of pending) {
+      listingMetadataAsked.add(itemKey(listing));
+    }
+    const found = await Promise.all(pending.map(async (listing) => {
+      try {
+        const response = await fetch(`/ipfs/${encodeURIComponent(listing.metadataCid)}/metadata.json`, {
+          headers: { accept: "application/json" },
+        });
+        if (!response.ok) {
+          return null;
+        }
+        const document = await response.json();
+        return { key: itemKey(listing), ...metadataFacts(document) };
+      } catch {
+        // A cover this Home cannot fetch is a cover it does not show.
+        return null;
+      }
+    }));
+    let learned = false;
+    for (const entry of found) {
+      if (entry && entry.key && (entry.title || entry.coverCid)) {
+        listingMetadata.set(entry.key, entry);
+        learned = true;
+      }
+    }
+    if (learned) {
+      render();
+    }
+  }
+
+  // The two things this shelf takes from a published metadata document, each
+  // bounded and screened. Everything else in that document is ignored here:
+  // what an item costs and who may open it are Runtime's answers.
+  function metadataFacts(document) {
+    const source = document && typeof document === "object" ? document : {};
+    const name = typeof source.name === "string" ? source.name.trim() : "";
+    // `ipfs://<cid>` is what this Home writes for a cover it published. A
+    // document naming anything else -- an http URL, a path, a data URI -- gets
+    // no cover rather than a fetch this app was told to make.
+    const image = typeof source.image === "string" ? source.image.trim() : "";
+    const coverCid = image.startsWith("ipfs://") ? cidOrEmpty(image.slice("ipfs://".length)) : "";
+    return {
+      title: name.slice(0, MAX_LISTING_TITLE_CHARS),
+      coverCid,
+    };
   }
 
   // Two facts belong above the shelf, and only when they are true: Runtime
@@ -694,17 +1912,40 @@ import {
     return notes.length ? `<p class="store-inline-note">${escapeHtml(notes.join(" "))}</p>` : "";
   }
 
+  // Explore is the market: everything the index knows, with this Home's own
+  // items among them rather than instead of them. My listings is this Home's
+  // own, from its own records, and never asks the index anything.
+  function exploreSourceItems() {
+    if (state.mediaTab === "mine") {
+      return state.mediaListings.filter((listing) => listing.accessState === "creator");
+    }
+    if (!state.catalog.length) {
+      return state.mediaListings;
+    }
+    // An asset this Home holds a listing for is shown from that listing: it
+    // knows the availability, the purchase in flight and the viewer its kind
+    // names, none of which an index can answer.
+    const held = new Set(state.mediaListings.map((listing) => listing.mintId));
+    return state.mediaListings.concat(
+      state.catalog.filter((item) => !item.mintId || !held.has(item.mintId)),
+    );
+  }
+
   function filteredMediaListings() {
-    return state.mediaListings.filter((listing) => {
+    return exploreSourceItems().filter((listing) => {
       if (!state.search) {
         return true;
       }
+      // What a person can see is what they can search for. The price is
+      // matched as it is shown as well as in full, so typing what is on the
+      // card finds the card.
+      const money = formatMoney(listing);
       const haystack = [
         listing.displayName,
         listing.mimeType,
-        listing.codecs,
+        listing.codecs || "",
         `quantity ${uint256Decimal(listing.quantity)}`,
-        `price ${uint256Decimal(listing.price)} base units`,
+        `price ${money.value} ${money.title}`,
         listing.payToken,
         listing.accessState,
       ].join(" ").toLowerCase();
@@ -813,7 +2054,7 @@ import {
       : listing.mimeType;
   }
 
-  function mediaActionButton(listing) {
+  function mediaActionButton(listing, size = "") {
     const mint = escapeAttr(listing.mintId);
     const buyState = listing.accessState === "available" ? pendingMediaBuys.get(listing.mintId) : null;
     // A purchase Runtime is still holding, from a visit this page does not
@@ -821,38 +2062,29 @@ import {
     // second one, and the terms it was started on are already fixed by the
     // record, so it does not ask for them again.
     if (!buyState && listing.accessState === "available" && listing.purchaseInFlight) {
-      return `<button class="store-pill" type="button" data-action="resume-buy" data-mint="${mint}">Continue</button>`;
+      return `<button class="btn btn-primary ${size}" type="button" data-action="resume-buy" data-mint="${mint}">Continue</button>`;
     }
     if (buyState) {
       // Whose turn it is decides what the control does. When it is the
       // person's, the control takes them to the wallet holding the request;
       // when it is the network's, there is nothing to press.
       if (buyState.kind === "declined") {
-        return `<button class="store-pill" type="button" data-action="buy-media" data-mint="${mint}">Buy again</button>`;
+        return `<button class="btn btn-primary ${size}" type="button" data-action="buy-media" data-mint="${mint}">Buy again</button>`;
       }
       if (buyState.awaitsPerson) {
-        return `<button class="store-pill" type="button" data-action="open-wallet" data-mint="${mint}">Approve in wallet</button>`;
+        return `<button class="btn btn-primary ${size}" type="button" data-action="open-wallet" data-mint="${mint}">Approve in wallet</button>`;
       }
-      return `<button class="store-pill" type="button" data-action="buy-media" data-mint="${mint}" disabled aria-busy="true">${escapeHtml(buyStateLabel(buyState))}</button>`;
+      return `<button class="btn btn-ghost ${size}" type="button" data-action="buy-media" data-mint="${mint}" disabled aria-busy="true">${escapeHtml(buyStateLabel(buyState))}</button>`;
     }
+    // The one control that acts on the item itself. What surrounds it -- the
+    // creator's link, the rebuild of a copy already owned -- is added by
+    // `cardActions`, so this stays the answer to one question: what does
+    // pressing the main button do for whoever is looking?
+    // What the button does, said plainly. The design calls it "Get"; this
+    // says "Buy", because it spends money and the word should say so.
     const action = listing.accessState === "available" ? "buy-media" : "open-media";
     const label = listing.accessState === "available" ? "Buy" : "Open";
-    const open = `<button class="store-pill" type="button" data-action="${escapeAttr(action)}" data-mint="${mint}">${label}</button>`;
-    if (listing.accessState === "available") {
-      return open;
-    }
-    // An owned copy can always be built again: the chain says it is theirs and
-    // the file is made of material anyone can fetch. So the person who holds it
-    // is offered that, whether the copy never arrived or they deleted it.
-    const download = pendingDownloads.has(listing.mintId)
-      ? `<button class="store-pill" type="button" data-action="download-copy" data-mint="${mint}" disabled aria-busy="true">Downloading...</button>`
-      : `<button class="store-pill" type="button" data-action="download-copy" data-mint="${mint}">Download</button>`;
-    // Only the person who listed it has anything to pass on. A bought copy is
-    // theirs to open, and the link belongs to whoever is selling.
-    const share = listing.accessState === "creator"
-      ? `<button class="store-pill" type="button" data-action="share-listing" data-mint="${mint}">Share</button>`
-      : "";
-    return `${share}${download}${open}`;
+    return `<button class="btn btn-primary ${size}" type="button" data-action="${escapeAttr(action)}" data-mint="${mint}">${label}</button>`;
   }
 
   // What the row says while a purchase settles. Each stage is a different fact
@@ -1397,6 +2629,56 @@ import {
               showToast(publicError(error.message, "Couldn’t load your items."), true);
             });
         }
+        if (action === "refresh-media") {
+          refreshMediaSurface(target);
+        }
+        if (action === "card-menu") {
+          // One menu open at a time, and the control says which state it is
+          // in so a screen reader is told the same thing the arrow shows.
+          const menu = target.parentElement?.querySelector(".menu-list");
+          const open = target.getAttribute("aria-expanded") === "true";
+          closeCardMenus();
+          if (menu && !open) {
+            menu.hidden = false;
+            target.setAttribute("aria-expanded", "true");
+          }
+        }
+        if (action === "open-creator") {
+          openApp(CREATOR_CAPSULE_ID);
+        }
+        if (action === "explore-filter") {
+          state.exploreFilter = String(target.dataset.filter || "all");
+          state.exploreGroup = "";
+          renderSections();
+        }
+        if (action === "explore-more") {
+          state.exploreGroup = String(target.dataset.group || "");
+          renderSections();
+        }
+        if (action === "explore-all") {
+          state.exploreGroup = "";
+          renderSections();
+        }
+        if (action === "retry-shops") {
+          loadShopsData().then(render).catch((error) => {
+            showToast(publicError(error.message, "Couldn’t load channels."), true);
+          });
+        }
+        if (action === "approve-shops") {
+          // Approving is the Inbox's job, not this page's: it is an operator
+          // decision about letting this Home talk to an outside service, and
+          // it is recorded there with who allowed it. Asking for the list
+          // already raised the request, so this says where it is waiting and
+          // then becomes the way back.
+          if (state.shopsAwaitingApproval) {
+            loadShopsData().then(render).catch((error) => {
+              showToast(publicError(error.message, "Couldn’t load channels."), true);
+            });
+            return;
+          }
+          state.shopsAwaitingApproval = true;
+          renderSections();
+        }
         if (action === "see-all") {
           selectDestination(target.dataset.destination);
         }
@@ -1436,6 +2718,18 @@ import {
     });
   }
 
+  // A menu stays open only while it is being used. Anywhere else, Escape and
+  // the next click close it -- including a click on the control that opened
+  // it, which is what makes it a toggle.
+  function closeCardMenus() {
+    document.querySelectorAll(".menu-list:not([hidden])").forEach((menu) => {
+      menu.hidden = true;
+    });
+    document.querySelectorAll('[data-action="card-menu"][aria-expanded="true"]').forEach((control) => {
+      control.setAttribute("aria-expanded", "false");
+    });
+  }
+
   function bindRasterIconFallbacks(root) {
     root.querySelectorAll(".app-icon-raster").forEach((container) => {
       if (container.dataset.iconFallbackBound === "true") {
@@ -1447,8 +2741,27 @@ import {
       if (!image || !glyph) {
         return;
       }
+      // A cover in flight leaves the frame shimmering rather than blank: the
+      // fetch goes to this Home's node and then, for anything it does not
+      // already hold, out to the network, which is not instant.
+      const settle = () => {
+        image.removeAttribute("data-cover");
+        container.classList.remove("thumb-pending");
+      };
+      if (image.complete) {
+        settle();
+      } else {
+        image.addEventListener("load", settle, { once: true });
+      }
       image.addEventListener("error", () => {
+        settle();
+        // An inline style rather than the `hidden` attribute alone. A
+        // stylesheet that gives the image its own `display` outranks the
+        // browser's `[hidden]` rule, which is how a dead image once stayed on
+        // screen beside the glyph that replaced it -- and the design's own
+        // stylesheet does exactly that, for both shapes.
         image.hidden = true;
+        image.style.display = "none";
         glyph.hidden = false;
         container.classList.remove("app-icon-raster");
       });

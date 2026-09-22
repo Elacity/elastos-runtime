@@ -79,6 +79,38 @@ cargo_target_root_for_manifest() {
     fi
 }
 
+# Which cargo profile every build below uses.
+#
+# `release` is what an installed Home is meant to be: the custody ceremony and
+# the crypto paths are the slowest things this Home does, and unoptimised they
+# are painful rather than merely slower.
+#
+# `dev` exists for the iteration loop, where the cost is the build rather than
+# the run. `scripts/setup-dev-home.sh` is the way to ask for it; it also passes
+# the debug-info overrides the VS Code launch uses, so the gateway artifact is
+# shared between the two rather than built twice.
+#
+# Cargo writes the dev profile to `debug/`, which is why the directory is
+# mapped rather than assumed to match the profile's name.
+SOURCE_HOME_CARGO_PROFILE="${SOURCE_HOME_CARGO_PROFILE:-release}"
+case "${SOURCE_HOME_CARGO_PROFILE}" in
+    release)
+        SOURCE_HOME_CARGO_PROFILE_ARGS=(--release)
+        SOURCE_HOME_CARGO_PROFILE_DIR="release"
+        ;;
+    dev)
+        SOURCE_HOME_CARGO_PROFILE_ARGS=()
+        SOURCE_HOME_CARGO_PROFILE_DIR="debug"
+        ;;
+    *)
+        echo "SOURCE_HOME_CARGO_PROFILE must be release or dev, got: ${SOURCE_HOME_CARGO_PROFILE}" >&2
+        exit 1
+        ;;
+esac
+# Extra `cargo build` arguments, used to carry the VS Code launch's debug-info
+# overrides so both produce the same artifact. Word-split on purpose.
+read -r -a SOURCE_HOME_CARGO_EXTRA_ARGS <<< "${SOURCE_HOME_CARGO_EXTRA_ARGS:-}"
+
 cargo_built_binary_path() {
     local manifest_path="$1"
     local profile="$2"
@@ -330,14 +362,14 @@ build_browser_vm_guest_helper() {
         env "$linker_env=$linker" "$CARGO_BIN" build --quiet \
             --manifest-path "$manifest" \
             --target "$rust_target" \
-            --release
+            "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
         return
     fi
 
     "$CARGO_BIN" build --quiet \
         --manifest-path "$manifest" \
         --target "$rust_target" \
-        --release
+        "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
 }
 
 build_browser_vm_guest_helpers() {
@@ -385,7 +417,7 @@ resolve_browser_vm_guest_helper_source() {
         return 1
     fi
     manifest="${ROOT}/elastos/tools/${crate_name}/Cargo.toml"
-    candidate="$(cargo_target_root_for_manifest "$manifest")/${rust_target}/release/${binary_name}"
+    candidate="$(cargo_target_root_for_manifest "$manifest")/${rust_target}/${SOURCE_HOME_CARGO_PROFILE_DIR}/${binary_name}"
     if [[ ! -x "$candidate" ]]; then
         echo "$label source build is missing: $candidate" >&2
         return 1
@@ -511,7 +543,17 @@ require_minimum_free_space() {
     # root; 16 GiB leaves headroom for architecture variance, staging, and
     # the VM backup set. The gate is absolute because a percentage scales
     # with volume size and demands space setup never uses on large disks.
-    local minimum_gib=16
+    #
+    # `SOURCE_HOME_MIN_FREE_GIB` lowers it for a build that is not a full cold
+    # one. The dev installer sets it, because it reuses the artifacts the
+    # editor's own build already produced and so needs a fraction of this --
+    # and because a gate that stops an iteration loop over headroom it will
+    # not use is a gate that gets bypassed rather than heeded.
+    local minimum_gib="${SOURCE_HOME_MIN_FREE_GIB:-16}"
+    if [[ ! "${minimum_gib}" =~ ^[0-9]+$ ]]; then
+        echo "SOURCE_HOME_MIN_FREE_GIB must be a whole number of GiB, got: ${minimum_gib}" >&2
+        exit 1
+    fi
     local minimum_kib=$((minimum_gib * 1024 * 1024))
     local available
     local available_gib
@@ -698,7 +740,7 @@ verify_collaboration_startup_config_input() {
         exit 1
     fi
     local elastos_bin
-    elastos_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+    elastos_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" elastos)"
     "$elastos_bin" collaboration-config verify --input "$input_path" >/dev/null
 }
 
@@ -1432,7 +1474,7 @@ EOF
         local vz_supervisor="${DATA_DIR}/bin/browser-vz-engine-supervisor"
         local vz_release_bin
         local vz_debug_bin
-        vz_release_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release browser-vz-engine-supervisor)"
+        vz_release_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" browser-vz-engine-supervisor)"
         vz_debug_bin="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" debug browser-vz-engine-supervisor)"
         if [[ -x "${vz_release_bin}" ]]; then
             install -m 755 "${vz_release_bin}" \
@@ -1713,7 +1755,7 @@ prepare_media_provider_prerequisite() {
     echo "[setup-source-home] prepare media-provider prerequisite"
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${ROOT}/components.json" \
-        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" \
+        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" elastos)" \
         setup --with media-provider --prerequisites-only
 }
 
@@ -1731,7 +1773,7 @@ install_content_publish_backend() {
     echo "[setup-source-home] install Kubo for Library/Documents publish"
     HOME="${HOME}" \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)" setup --with kubo
+        "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" elastos)" setup --with kubo
     if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
         echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
         exit 1
@@ -1773,11 +1815,11 @@ if ! grep -Eq '^[[:space:]]*trusted_keys[[:space:]]*=' "${CONFIG_TOML}"; then
 fi
 
 echo "[setup-source-home] build runtime server"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}" "${SOURCE_HOME_CARGO_EXTRA_ARGS[@]}" -p elastos-server
 verify_collaboration_startup_config_input
 if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
-    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
+    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}" -p elastos-vz --bin browser-vz-engine-supervisor
 fi
 build_browser_vm_guest_helpers
 
@@ -1799,13 +1841,13 @@ source_home_binary_manifest_path() {
 }
 
 echo "[setup-source-home] build native provider binaries"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
 source_home_binary_names | while IFS= read -r provider; do
-    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
+    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
 done
 
 echo "[setup-source-home] build Home CLI native renderer"
-"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
+"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}" --bin home-cli
 
 echo "[setup-source-home] build app WASM capsules"
 for capsule in "${APP_CAPSULES[@]}"; do
@@ -1833,10 +1875,10 @@ prepare_media_provider_prerequisite
 
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
-install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
-install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${DATA_DIR}/bin/home-cli"
+install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" shell)" "${DATA_DIR}/bin/shell"
+install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" home-cli)" "${DATA_DIR}/bin/home-cli"
 source_home_binary_names | while IFS= read -r provider; do
-    install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}")" "${DATA_DIR}/bin/${provider}"
+    install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" "${SOURCE_HOME_CARGO_PROFILE_DIR}" "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
 
@@ -1866,7 +1908,7 @@ install_collaboration_startup_config
 # installer's artifact gate rejects any multi-link source (hardlink-swap
 # defense, st_nlink must be 1). Hand it a private single-link copy staged
 # next to the built binary instead of relaxing the gate.
-built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release elastos)"
+built_runtime="$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_DIR}" elastos)"
 (
     runtime_stage_dir="$(mktemp -d "$(dirname "${built_runtime}")/install-stage.XXXXXX")"
     trap 'rm -rf "${runtime_stage_dir}"' EXIT

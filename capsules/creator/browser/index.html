@@ -63,12 +63,23 @@
       </div>
 
       <div class="field">
+        <label for="channel">Channel</label>
+        <select id="channel">
+          <option value="">Choose a channel…</option>
+        </select>
+        <div id="channel-manual" class="hidden">
+          <input id="channel-manual-input" type="text" placeholder="0x…" autocomplete="off" spellcheck="false" aria-label="Channel address">
+        </div>
+        <p id="channel-hint" class="hint">Where this publishes. Loading the channels you can publish into…</p>
+        <button id="channel-approve" class="btn hidden" type="button">Allow channel list</button>
+      </div>
+
+      <div class="field">
         <label>Access method</label>
         <div id="method-grid" class="method-grid">
           <div class="method" data-method="free" role="button" tabindex="0" aria-pressed="false">
             <strong>Free</strong>
-            <span class="method-desc">Open access</span>
-            <span class="badge badge-muted">Not connected</span>
+            <span class="method-desc">No sale</span>
           </div>
           <div class="method sel" data-method="buy_once" role="button" tabindex="0" aria-pressed="true">
             <strong>Buy now</strong>
@@ -77,10 +88,9 @@
           <div class="method" data-method="buy_and_resell" role="button" tabindex="0" aria-pressed="false">
             <strong>Buy &amp; resell</strong>
             <span class="method-desc">Tradable + royalty</span>
-            <span class="badge badge-muted">Not connected</span>
           </div>
         </div>
-        <p id="method-hint" class="hint">Buy now is the only method connected in this build.</p>
+        <p id="method-hint" class="hint">One sale per copy. Resale is not offered.</p>
       </div>
 
       <div id="price-row" class="row">
@@ -93,17 +103,15 @@
           <label for="currency">Currency</label>
           <select id="currency">
             <option value="ELA">ELA</option>
-            <option value="USDC">USDC</option>
-            <option value="ETH">ETH</option>
           </select>
-          <p class="hint">Not sent — used only to convert your amount into base units.</p>
+          <p class="hint">What a buyer pays in. Offered by this Home's configuration.</p>
         </div>
       </div>
 
       <div class="row">
         <div class="field">
           <label for="copies-input">Copies</label>
-          <input id="copies-input" type="text" inputmode="numeric" placeholder="1" autocomplete="off" spellcheck="false">
+          <input id="copies-input" type="text" inputmode="numeric" placeholder="10" autocomplete="off" spellcheck="false">
           <p class="hint">How many copies of this listing can be sold.</p>
         </div>
         <div class="field">
@@ -127,7 +135,7 @@
       <div id="resell-field" class="field hidden">
         <label for="reseller-cut">Resale royalty (RRL %)</label>
         <input id="reseller-cut" type="number" min="0" max="100" step="0.1" value="90">
-        <p class="hint">Not sent — resale terms aren't supported yet.</p>
+        <p class="hint">What you earn each time an owner resells their copy. Defaults to 90%.</p>
       </div>
 
       <div id="royalty-field" class="field">

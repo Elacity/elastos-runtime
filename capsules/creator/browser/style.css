@@ -153,15 +153,6 @@ textarea {
   vertical-align: middle;
 }
 
-/* A muted variant of .badge for structure that is present but not wired to
-   any backend yet — deliberately unlike the accent badge above, which marks
-   a real, active property (a chosen file's kind). */
-.badge-muted {
-  margin: 6px 0 0;
-  background: var(--panel-soft);
-  color: var(--muted);
-}
-
 .row {
   display: flex;
   gap: 12px;
@@ -240,10 +231,9 @@ textarea {
   border: 1px solid var(--line);
 }
 
-/* Access-method selector cards (free / buy_once / buy_and_resell). Only
-   buy_once is connected to the publish request this runtime accepts; the
-   other two carry a "Not connected" marker (.badge-muted) rather than being
-   removed, so the page shows the real shape of the product. */
+/* Access-method selector cards (free / buy_once / buy_and_resell). All three
+   publish: the choice becomes the channel's `opType`, which decides whether an
+   operative and a listing are created at all. */
 .method-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

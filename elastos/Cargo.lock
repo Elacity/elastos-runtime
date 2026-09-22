@@ -1683,6 +1683,7 @@ dependencies = [
  "k256",
  "rand 0.10.2",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "thiserror 1.0.69",

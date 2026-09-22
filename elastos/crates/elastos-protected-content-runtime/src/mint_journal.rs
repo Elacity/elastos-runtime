@@ -1647,6 +1647,51 @@ impl RuntimeMintRoyaltyShare {
 /// The creator's whole share of a primary sale, in `ROYALTY_SHARE` units.
 pub const RUNTIME_MINT_CREATOR_ROYALTY_UNITS: u32 = 950;
 
+/// How a creator lets people reach an asset.
+///
+/// Recorded rather than derived, for the same reason the royalty split is: a
+/// retry compares desired terms and re-encodes the chain call from them, and a
+/// method held only in the request could differ between attempts and silently
+/// change what the mint creates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMintAccessMethod {
+    /// No operative, no listing, no access token: `AssetFactory` skips that
+    /// whole branch for op type 0 and only binds the content id. Access is
+    /// then whatever the channel itself grants.
+    Free,
+    /// One sale per access token, no resale. The default, because it is the
+    /// only method this Runtime could mint before creators could choose, so
+    /// every record written before this field existed means exactly this.
+    #[default]
+    BuyOnce,
+    /// Sale plus resale. The one method whose `opRawData` carries a trailing
+    /// `uint16 resellerCut`.
+    BuyAndResell,
+}
+
+impl RuntimeMintAccessMethod {
+    /// The `opType` the channel's `mint` takes.
+    pub const fn op_type_code(self) -> u16 {
+        match self {
+            Self::Free => 0,
+            Self::BuyOnce => 1,
+            Self::BuyAndResell => 2,
+        }
+    }
+
+    /// Whether this method sells anything -- which is also whether it creates
+    /// an operative, a listing and a royalty split, since the contracts tie
+    /// all four to the same `opType > 0` branch.
+    pub const fn is_paid(self) -> bool {
+        !matches!(self, Self::Free)
+    }
+}
+
+/// A resale cut is carried in deci-percent, so 900 is 90%. The whole sale is
+/// the ceiling; anything above it is not a share.
+pub const RUNTIME_MINT_RESELLER_CUT_MAX: u16 = 1000;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeMintCreatorDesiredTerms {
@@ -1666,23 +1711,66 @@ pub struct RuntimeMintCreatorDesiredTerms {
     /// missing key needs no format change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     royalties: Vec<RuntimeMintRoyaltyShare>,
+    /// How people reach the asset. Defaulted for the same reason as the
+    /// royalties above: a record written before creators could choose meant
+    /// buy once, and still does.
+    #[serde(default)]
+    access_method: RuntimeMintAccessMethod,
+    /// The resale cut in deci-percent, present only for buy and resell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reseller_cut: Option<u16>,
+    /// The channel this mint settles on.
+    ///
+    /// Recorded because it is the creator's choice and a retry re-encodes the
+    /// chain call from these terms: a channel held only in the request could
+    /// differ between attempts and publish the same work twice, in two places.
+    ///
+    /// Defaulted to empty for records written before a channel could be
+    /// chosen, which all settled on the one configured channel.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    ledger: String,
+    /// The token the sale is priced in, for the same reason. Empty means the
+    /// mint source's own default, which is what every earlier record meant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pay_token: String,
 }
 
 impl RuntimeMintCreatorDesiredTerms {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one term per argument: a struct literal here would let a caller omit one silently"
+    )]
     pub fn new(
         wallet_account_id: impl Into<String>,
         copies: impl Into<String>,
         price: impl Into<String>,
         royalties: Vec<RuntimeMintRoyaltyShare>,
+        access_method: RuntimeMintAccessMethod,
+        reseller_cut: Option<u16>,
+        ledger: impl Into<String>,
+        pay_token: impl Into<String>,
     ) -> Result<Self, RuntimeMintJournalError> {
         let wallet_account_id = wallet_account_id.into();
-        let copies = normalize_intent_hex_quantity(&copies.into())?;
-        let price = normalize_intent_hex_quantity(&price.into())?;
+        // A free mint sells nothing, so zero is the honest value for both of
+        // these rather than a term that failed to be set.
+        let normalize = if access_method.is_paid() {
+            normalize_intent_hex_quantity
+        } else {
+            normalize_intent_hex_quantity_allowing_zero
+        };
+        let copies = normalize(&copies.into())?;
+        let price = normalize(&price.into())?;
         let value = Self {
             wallet_account_id,
             copies,
             price,
             royalties,
+            access_method,
+            reseller_cut,
+            // Lower-cased on the way in, like every other address this journal
+            // holds, so two spellings of one channel are one channel.
+            ledger: ledger.into().to_ascii_lowercase(),
+            pay_token: pay_token.into().to_ascii_lowercase(),
         };
         value.validate()?;
         Ok(value)
@@ -1690,8 +1778,41 @@ impl RuntimeMintCreatorDesiredTerms {
 
     fn validate(&self) -> Result<(), RuntimeMintJournalError> {
         validate_intent_text(&self.wallet_account_id)?;
-        validate_canonical_intent_hex_quantity(&self.copies)?;
-        validate_canonical_intent_hex_quantity(&self.price)?;
+        let validate_quantity = if self.access_method.is_paid() {
+            validate_canonical_intent_hex_quantity
+        } else {
+            validate_canonical_intent_hex_quantity_allowing_zero
+        };
+        validate_quantity(&self.copies)?;
+        validate_quantity(&self.price)?;
+        // The cut belongs to exactly one method: elsewhere it would be
+        // recorded and never encoded, and on resale its absence shifts the
+        // ABI layout the operative factory decodes positionally.
+        match (self.access_method, self.reseller_cut) {
+            (RuntimeMintAccessMethod::BuyAndResell, Some(cut)) => {
+                if cut > RUNTIME_MINT_RESELLER_CUT_MAX {
+                    return Err(RuntimeMintJournalError::InvalidSelection);
+                }
+            }
+            (RuntimeMintAccessMethod::BuyAndResell, None) | (_, Some(_)) => {
+                return Err(RuntimeMintJournalError::InvalidSelection)
+            }
+            (_, None) => {}
+        }
+        // Empty is a record from before a channel could be chosen; anything
+        // present must be a real address, since it is what the mint targets.
+        if !self.ledger.is_empty() {
+            validate_intent_evm_address(&self.ledger)?;
+        }
+        if !self.pay_token.is_empty() {
+            validate_intent_evm_address(&self.pay_token)?;
+        }
+        // A free mint sells nothing, so terms that describe a sale are terms
+        // the chain call will not carry. Recording them would describe a
+        // payout that cannot happen.
+        if !self.access_method.is_paid() && (self.price != "0x0" || !self.royalties.is_empty()) {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
         // Absent is the chain default and always allowed. Present must be
         // exactly the creator share: a split that does not total it is not one
         // the chain can honour, so recording it would describe a payout that
@@ -1725,6 +1846,22 @@ impl RuntimeMintCreatorDesiredTerms {
 
     pub fn royalties(&self) -> &[RuntimeMintRoyaltyShare] {
         &self.royalties
+    }
+
+    pub const fn access_method(&self) -> RuntimeMintAccessMethod {
+        self.access_method
+    }
+
+    pub const fn reseller_cut(&self) -> Option<u16> {
+        self.reseller_cut
+    }
+
+    pub fn ledger(&self) -> &str {
+        &self.ledger
+    }
+
+    pub fn pay_token(&self) -> &str {
+        &self.pay_token
     }
 }
 
@@ -3936,7 +4073,34 @@ fn validate_canonical_intent_hex_quantity(value: &str) -> Result<(), RuntimeMint
     Ok(())
 }
 
+/// The same canonical form, for the quantities of a mint that sells nothing.
+///
+/// Every quantity in this journal was a sale's until creators could choose a
+/// free mint, so zero was always a mistake and is still refused everywhere a
+/// sale is described. A free mint has no sale: its price is zero because
+/// there is nothing to pay, and neither it nor its supply is encoded into the
+/// chain call at all.
+fn validate_canonical_intent_hex_quantity_allowing_zero(
+    value: &str,
+) -> Result<(), RuntimeMintJournalError> {
+    if normalize_intent_hex_quantity_allowing_zero(value)? != value {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    Ok(())
+}
+
 fn normalize_intent_hex_quantity(value: &str) -> Result<String, RuntimeMintJournalError> {
+    let normalized = normalize_intent_hex_quantity_allowing_zero(value)?;
+    // A sale of nothing, or at no price, is a mistake rather than a term.
+    if normalized == "0x0" {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    Ok(normalized)
+}
+
+fn normalize_intent_hex_quantity_allowing_zero(
+    value: &str,
+) -> Result<String, RuntimeMintJournalError> {
     validate_intent_text(value)?;
     let raw = value
         .strip_prefix("0x")
@@ -3958,11 +4122,7 @@ fn normalize_intent_hex_quantity(value: &str) -> Result<String, RuntimeMintJourn
     if decoded.len() > 32 {
         return Err(RuntimeMintJournalError::InvalidSelection);
     }
-    let normalized = normalize_intent_hex_quantity_bytes(&decoded);
-    if normalized == "0x0" {
-        return Err(RuntimeMintJournalError::InvalidSelection);
-    }
-    Ok(normalized)
+    Ok(normalize_intent_hex_quantity_bytes(&decoded))
 }
 
 fn normalize_intent_hex_quantity_bytes(bytes: &[u8]) -> String {
@@ -4414,7 +4574,17 @@ mod tests {
     }
 
     fn creator_desired_terms() -> RuntimeMintCreatorDesiredTerms {
-        RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x3", "0x5", Vec::new()).unwrap()
+        RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x3",
+            "0x5",
+            Vec::new(),
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
+        )
+        .unwrap()
     }
 
     fn creator_effect_binding() -> RuntimeMintCreatorEffectBinding {
@@ -5336,8 +5506,17 @@ mod tests {
 
         // Re-terming after a discard is what start over means.
         let restarted = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x64", "0x186a0", Vec::new())
-                .unwrap(),
+            RuntimeMintCreatorDesiredTerms::new(
+                "wallet-account-1",
+                "0x64",
+                "0x186a0",
+                Vec::new(),
+                RuntimeMintAccessMethod::BuyOnce,
+                None,
+                String::new(),
+                String::new(),
+            )
+            .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )
@@ -5395,9 +5574,17 @@ mod tests {
 
     #[test]
     fn creator_desired_terms_normalize_hex_quantities() {
-        let terms =
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x05", "0x000A", Vec::new())
-                .unwrap();
+        let terms = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x05",
+            "0x000A",
+            Vec::new(),
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
         assert_eq!(terms.wallet_account_id(), "wallet-account-1");
         assert_eq!(terms.copies(), "0x5");
         assert_eq!(terms.price(), "0xa");
@@ -5422,7 +5609,16 @@ mod tests {
             ("0x1", oversized.as_str()),
         ] {
             assert!(matches!(
-                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", copies, price, Vec::new()),
+                RuntimeMintCreatorDesiredTerms::new(
+                    "wallet-account-1",
+                    copies,
+                    price,
+                    Vec::new(),
+                    RuntimeMintAccessMethod::BuyOnce,
+                    None,
+                    String::new(),
+                    String::new(),
+                ),
                 Err(RuntimeMintJournalError::InvalidSelection)
             ));
         }
@@ -5463,6 +5659,10 @@ mod tests {
             "0x2",
             "0x5",
             vec![payee(0xab, 900), payee(0x7b, 50)],
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
         )
         .unwrap();
         let decoded: RuntimeMintCreatorDesiredTerms =
@@ -5484,7 +5684,16 @@ mod tests {
             vec![payee(0xab, 1000)],
         ] {
             assert!(matches!(
-                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", royalties),
+                RuntimeMintCreatorDesiredTerms::new(
+                    "wallet-account-1",
+                    "0x2",
+                    "0x5",
+                    royalties,
+                    RuntimeMintAccessMethod::BuyOnce,
+                    None,
+                    String::new(),
+                    String::new(),
+                ),
                 Err(RuntimeMintJournalError::InvalidSelection)
             ));
         }
@@ -5494,6 +5703,10 @@ mod tests {
             "0x2",
             "0x5",
             vec![payee(0xab, 950)],
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
         )
         .unwrap();
     }
@@ -5513,6 +5726,83 @@ mod tests {
         assert!(RuntimeMintRoyaltyShare::new(format!("0x{}", hex::encode([0xab; 20])), 0).is_err());
     }
 
+    /// The recorded terms are what a retry re-encodes the chain call from, so
+    /// a combination the chain cannot carry must be refused when it is
+    /// recorded rather than when it is encoded.
+    #[test]
+    fn creator_terms_reject_an_access_method_the_chain_cannot_carry() {
+        let terms = |method, cut, price, royalties| {
+            RuntimeMintCreatorDesiredTerms::new(
+                "wallet-account-1",
+                "0x2",
+                price,
+                royalties,
+                method,
+                cut,
+                String::new(),
+                String::new(),
+            )
+        };
+        // The cut belongs to buy and resell, and only there: it is the
+        // trailing `uint16` of that method's `opRawData`.
+        assert!(terms(
+            RuntimeMintAccessMethod::BuyAndResell,
+            Some(900),
+            "0x5",
+            Vec::new()
+        )
+        .is_ok());
+        assert!(terms(
+            RuntimeMintAccessMethod::BuyAndResell,
+            None,
+            "0x5",
+            Vec::new()
+        )
+        .is_err());
+        assert!(terms(
+            RuntimeMintAccessMethod::BuyOnce,
+            Some(900),
+            "0x5",
+            Vec::new()
+        )
+        .is_err());
+        // A cut larger than the whole sale is not a share.
+        assert!(terms(
+            RuntimeMintAccessMethod::BuyAndResell,
+            Some(RUNTIME_MINT_RESELLER_CUT_MAX + 1),
+            "0x5",
+            Vec::new()
+        )
+        .is_err());
+        // A free mint creates no operative, so it has no sale to price and no
+        // royalty share to split. Recording either would describe a payout
+        // that cannot happen.
+        assert!(terms(RuntimeMintAccessMethod::Free, None, "0x0", Vec::new()).is_ok());
+        assert!(terms(RuntimeMintAccessMethod::Free, None, "0x5", Vec::new()).is_err());
+        assert!(terms(
+            RuntimeMintAccessMethod::Free,
+            None,
+            "0x0",
+            vec![payee(0xab, 950)]
+        )
+        .is_err());
+    }
+
+    /// A record written before creators could choose meant buy once, and must
+    /// still decode as exactly that.
+    #[test]
+    fn creator_terms_without_an_access_method_decode_as_buy_once() {
+        let recorded = serde_json::json!({
+            "wallet_account_id": "wallet-account-1",
+            "copies": "0x2",
+            "price": "0x5",
+        });
+        let terms: RuntimeMintCreatorDesiredTerms = serde_json::from_value(recorded).unwrap();
+        assert_eq!(terms.access_method(), RuntimeMintAccessMethod::BuyOnce);
+        assert_eq!(terms.access_method().op_type_code(), 1);
+        assert_eq!(terms.reseller_cut(), None);
+    }
+
     /// A retry re-encodes the chain call from the recorded terms, so terms that
     /// differ only in payees must not compare equal.
     #[test]
@@ -5522,6 +5812,10 @@ mod tests {
             "0x2",
             "0x5",
             vec![payee(0xab, 950)],
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
         )
         .unwrap();
         let other = RuntimeMintCreatorDesiredTerms::new(
@@ -5529,11 +5823,23 @@ mod tests {
             "0x2",
             "0x5",
             vec![payee(0x7b, 950)],
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
         )
         .unwrap();
-        let default =
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", Vec::new())
-                .unwrap();
+        let default = RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1",
+            "0x2",
+            "0x5",
+            Vec::new(),
+            RuntimeMintAccessMethod::BuyOnce,
+            None,
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
         assert!(one != other);
         assert!(one != default);
     }
@@ -5552,15 +5858,33 @@ mod tests {
             .unwrap();
 
         let initial_state = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x02", "0x05", Vec::new())
-                .unwrap(),
+            RuntimeMintCreatorDesiredTerms::new(
+                "wallet-account-1",
+                "0x02",
+                "0x05",
+                Vec::new(),
+                RuntimeMintAccessMethod::BuyOnce,
+                None,
+                String::new(),
+                String::new(),
+            )
+            .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )
         .unwrap();
         let replay_state = RuntimeMintCreatorState::new(
-            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5", Vec::new())
-                .unwrap(),
+            RuntimeMintCreatorDesiredTerms::new(
+                "wallet-account-1",
+                "0x2",
+                "0x5",
+                Vec::new(),
+                RuntimeMintAccessMethod::BuyOnce,
+                None,
+                String::new(),
+                String::new(),
+            )
+            .unwrap(),
             "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
             "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
         )

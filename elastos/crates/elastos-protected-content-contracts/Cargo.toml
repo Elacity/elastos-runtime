@@ -19,5 +19,6 @@ x-wing = "=0.1.0"
 
 [dev-dependencies]
 hex = "0.4"
+serde_json = "1.0"
 rand = "0.10"
 x-wing = { version = "=0.1.0", features = ["hazmat"] }

@@ -5,6 +5,20 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Unreleased]
 
 ### Added
+- Approving an open shows a message a person can read. The wallet used to be
+  handed the rights request's canonical bytes hex-encoded, and a wallet decodes
+  a `0x` prefix before displaying it, so a nested identity graph arrived on
+  screen as roughly two kilobytes of replacement characters. The signature over
+  those bytes was sound, so this was a consent defect rather than a correctness
+  one. The wallet now signs four readable lines -- the action, the account, the
+  expiry and one hash that commits to the whole request -- so the three facts a
+  person can check cannot be altered without changing the fourth. Every field
+  is an enum, a number or a hash, so no caller-supplied text reaches the
+  message and there is nothing to escape. `RightsRequestV1::signing_message`
+  and `::signing_hash` are the single definition, reached by the handoff, the
+  managed signing path, the wallet's completion check and `verify_unclaimed`,
+  which the Runtime coordinator and every custody node use. The committed
+  golden vectors moved with the format and carry their reason in place.
 - A `creator` app capsule: upload a file through the Library transport,
   protect it, and list it in one flow.
 - Non-media objects protect and read end to end. A chunked-payload object

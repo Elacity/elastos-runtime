@@ -156,6 +156,27 @@ Open:
   playback. None has ever been run. The deferred proofs from the object,
   reader and audio work all collapse into this one item; `state.md` records
   what to run and what to look for.
+- [ ] Cosmetic follow-ups on that prompt, none of them blocking. The expiry is
+  a labelled epoch rather than a date, because formatting one means a date
+  dependency in the crate every custody node links. And the prompt names no
+  item: a person sees what they are authorising and on which account, but not
+  which file. The title was deliberately left out, since putting caller text in
+  a plain-text signed message is what invites a forged line, so restoring it
+  means binding it in the request and refusing control characters at that
+  point. Reconsider both together rather than piecemeal. The prompt today shows two kilobytes of
+  decoded canonical bytes; the signature over them is sound and an open
+  completed through it on 2026-09-22, so this is a consent defect rather than a
+  correctness one. Design, the rule that whatever is displayed must also be
+  signed, and the reviewer's checklist are in
+  [readable signature design](docs/audits/2026-09-22-rights-request-readable-signature-design.md).
+  The shape is a readable signed message -- EIP-191 over plain text, as SIWE
+  does -- with four fields a person can check and the mandatory digests
+  rendered as hex rather than mojibake; EIP-712 is recorded as the alternative.
+  The
+  verification follows by construction: one `signing_hash` in the contracts
+  crate replaces byte-hashing at the producer and at both verifiers, one of
+  which is every custody node. Needs a custody image rebuild and a coordinated
+  cutover, and a security review before implementation.
 - [ ] Build the locked renderer for the object path, pictures first. Elacity
   Reader receives plaintext today, which the containment claim allows and
   states. Two decisions are settled and recorded in

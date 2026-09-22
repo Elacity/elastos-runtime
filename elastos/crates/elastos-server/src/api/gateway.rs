@@ -50,6 +50,8 @@ mod gateway_browser;
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
 mod gateway_collaboration_presence;
+#[path = "gateway_creator_channels.rs"]
+mod gateway_creator_channels;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
 #[path = "gateway_home_agent.rs"]
@@ -70,6 +72,10 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_marketplace_directory.rs"]
+mod gateway_marketplace_directory;
+#[path = "gateway_onchain_directory.rs"]
+mod gateway_onchain_directory;
 #[path = "gateway_origin.rs"]
 mod gateway_origin;
 #[path = "gateway_passkey_step_up.rs"]
@@ -92,9 +98,11 @@ mod gateway_wallet_adapter;
 use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
 use gateway_collaboration_presence::*;
+use gateway_creator_channels::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
+use gateway_onchain_directory::*;
 
 pub(crate) fn principal_root_protected_object_inventory(
     localhost_root: &str,
@@ -121,12 +129,13 @@ pub(crate) use gateway_home_token::RuntimeWalletAuthority;
 pub(super) use gateway_home_token::{
     home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
-    issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
-    require_home_launch_token, require_home_launch_token_binding,
-    require_home_launch_token_context, require_home_launch_token_for_any_app_context,
-    require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
-    require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
-    require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
+    issue_home_projection_launch_token_with_context, require_app_runtime_wallet_authority,
+    require_carried_home_launch_token, require_home_launch_token,
+    require_home_launch_token_binding, require_home_launch_token_context,
+    require_home_launch_token_for_any_app_context, require_home_launch_token_for_any_context,
+    require_home_projection_launch_token_context, require_home_runtime_wallet_authority,
+    require_home_token, require_home_token_context, require_home_viewer_launch_token_context,
+    require_internal_shell_launch_grant_for_any_context,
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
@@ -141,6 +150,7 @@ use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+use gateway_marketplace_directory::*;
 use gateway_origin::*;
 use gateway_passkey_step_up::*;
 pub(super) use gateway_passkey_step_up::{
@@ -196,6 +206,52 @@ const WALLET_PRICE_POLICY_FILE: &str = "price-policy.json";
 const WALLET_PRICE_HTTP_REQUEST_ID: &str = "wallet-prices";
 const WALLET_PRICE_HTTP_APPROVE_ACTION_ID: &str = "wallet-price-http-approve:coingecko";
 const WALLET_PRICE_HTTP_DENY_ACTION_PREFIX: &str = "wallet-price-http-deny:";
+
+// Channel discovery for the creator page. The directory is an INDEX, never an
+// authority: it says which channels a creator is likely to want offered, and
+// the chain decides whether a mint on the chosen one is permitted. It is
+// therefore allowed to be absent, stale or wrong without blocking a mint --
+// the picker keeps the configured channel and a typed address either way.
+//
+// Deliberately its own policy, request and actions rather than the wallet's:
+// approving market prices must not silently approve a second external service.
+const CREATOR_CHANNELS_CACHE_TTL_SECS: u64 = 5 * 60;
+const CREATOR_CHANNELS_SOURCE_ENV: &str = "ELASTOS_CREATOR_CHANNELS_SOURCE";
+/// The GraphQL index of on-chain state this Home reads.
+///
+/// Named for what it is rather than for the first question asked of it or for
+/// whoever runs it today: the channel list is one query at this endpoint, and
+/// anything else this Runtime later reads about chain state is the same
+/// address. Each such use keeps its OWN approval -- one endpoint is not one
+/// consent.
+///
+/// It indexes ONE chain, so a Home minting somewhere else must point this at
+/// that chain's index; the default is the one this deployment settles on.
+const ONCHAIN_GRAPHQL_URL_ENV: &str = "ELASTOS_ONCHAIN_GRAPHQL_URL";
+const ONCHAIN_GRAPHQL_DEFAULT_URL: &str = "https://base.ela.city/api/2.0/graphql";
+const CREATOR_CHANNELS_HTTP_APPROVED_ENV: &str = "ELASTOS_CREATOR_CHANNELS_HTTP_APPROVED";
+const CREATOR_CHANNELS_POLICY_SCHEMA: &str = "elastos.creator.channel-directory-policy/v1";
+const CREATOR_CHANNELS_POLICY_ROOT: &str = "localhost://Local/Shared/System/Creator";
+const CREATOR_CHANNELS_POLICY_FILE: &str = "channel-directory-policy.json";
+const CREATOR_CHANNELS_HTTP_REQUEST_ID: &str = "creator-channels";
+const CREATOR_CHANNELS_HTTP_APPROVE_ACTION_ID: &str =
+    "creator-channels-http-approve:onchain-graphql";
+const CREATOR_CHANNELS_HTTP_DENY_ACTION_PREFIX: &str = "creator-channels-http-deny:";
+
+// The Marketplace reads the same index the Creator's picker reads, to list
+// the channels that publish protected items. Its approval is separate from the
+// Creator's, for the reason that comment states: one endpoint is not one
+// consent, and approving a picker in one app must not quietly enable another.
+const MARKETPLACE_DIRECTORY_CACHE_TTL_SECS: u64 = 5 * 60;
+const MARKETPLACE_DIRECTORY_SOURCE_ENV: &str = "ELASTOS_MARKETPLACE_DIRECTORY_SOURCE";
+const MARKETPLACE_DIRECTORY_HTTP_APPROVED_ENV: &str = "ELASTOS_MARKETPLACE_DIRECTORY_HTTP_APPROVED";
+const MARKETPLACE_DIRECTORY_POLICY_SCHEMA: &str = "elastos.marketplace.directory-policy/v1";
+const MARKETPLACE_DIRECTORY_POLICY_ROOT: &str = "localhost://Local/Shared/System/Marketplace";
+const MARKETPLACE_DIRECTORY_POLICY_FILE: &str = "market-directory-policy.json";
+const MARKETPLACE_DIRECTORY_HTTP_REQUEST_ID: &str = "marketplace-directory";
+const MARKETPLACE_DIRECTORY_HTTP_APPROVE_ACTION_ID: &str =
+    "marketplace-directory-http-approve:onchain-graphql";
+const MARKETPLACE_DIRECTORY_HTTP_DENY_ACTION_PREFIX: &str = "marketplace-directory-http-deny:";
 pub(crate) const HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV: &str =
     "ELASTOS_HOME_LAUNCH_TRUSTED_SIGNER_DID";
 pub(crate) const HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV: &str =
@@ -441,6 +497,38 @@ struct WalletPricesResponse {
     stale: bool,
     unavailable: bool,
     prices: BTreeMap<String, WalletPriceQuote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// One channel a creator may mint on, as the directory reports it.
+///
+/// Everything here is display: a reader decides what to show, never what is
+/// permitted. `address` is the only field the mint itself uses, and it is
+/// checked on chain before anything is signed.
+#[derive(Debug, Clone, Serialize)]
+struct CreatorChannelEntry {
+    address: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    name: String,
+    /// True for the channel this Runtime is configured to mint on, which is
+    /// offered whether or not the directory knows about it.
+    configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatorChannelsResponse {
+    #[serde(rename = "asOf")]
+    as_of: u64,
+    stale: bool,
+    /// The directory could not be read. The picker still works: it keeps the
+    /// configured channel and a typed address.
+    unavailable: bool,
+    /// The directory has not been approved for external HTTP yet, so the page
+    /// can offer the approval rather than reporting a failure.
+    #[serde(rename = "needsApproval")]
+    needs_approval: bool,
+    channels: Vec<CreatorChannelEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -754,6 +842,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route("/api/apps/wallet/wallet/summary", get(wallet_app_summary))
         .route("/api/wallet/prices", get(wallet_prices))
+        .route("/api/creator/channels", get(creator_channels))
         .route("/api/wallet/qr", post(wallet_receive_qr))
         .route(
             "/api/apps/wallet/wallet/managed",
@@ -977,6 +1066,19 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(capsule_interface_invoke),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
+        .route("/api/apps/marketplace/channels", get(marketplace_channels))
+        .route(
+            "/api/apps/marketplace/items",
+            get(marketplace_catalog_items),
+        )
+        .route(
+            "/api/apps/marketplace/pay-tokens",
+            get(marketplace_pay_tokens),
+        )
+        .route(
+            "/api/apps/marketplace/channel-access",
+            post(marketplace_channel_access),
+        )
         .route("/api/apps/services/summary", get(services_summary))
         .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/apps/inbox/summary", get(inbox_summary))
