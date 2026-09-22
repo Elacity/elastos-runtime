@@ -704,6 +704,16 @@
       return text;
     }
 
+    function inboxEntryText(entry, field, fallback) {
+      const text = String(entry[field] || "").trim();
+      // Contact and service copy contains names chosen by people, which can
+      // include words used in technical messages. Render those names as text.
+      const namedRequest = entry.kind === "contact_request"
+        || entry.kind === "service_access_request"
+        || entry.kind === "service_access_grant";
+      return namedRequest ? text || fallback : publicInboxText(text, fallback);
+    }
+
     function notifyHome() {
       if (homeParentOrigin && window.top && window.top !== window) {
         window.top.postMessage({
@@ -997,7 +1007,7 @@
       top.className = "entry-row-top";
       const title = document.createElement("span");
       title.className = "entry-row-title";
-      title.textContent = publicInboxText(entry.title, "Request");
+      title.textContent = inboxEntryText(entry, "title", "Request");
       const time = document.createElement("span");
       time.className = "entry-row-time";
       time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
@@ -1005,7 +1015,7 @@
 
       const snippet = document.createElement("span");
       snippet.className = "entry-row-snippet";
-      snippet.textContent = publicInboxText(entry.body, "This request needs your review.");
+      snippet.textContent = inboxEntryText(entry, "body", "This request needs your review.");
 
       row.append(top, snippet);
       row.addEventListener("click", () => {
@@ -1027,7 +1037,7 @@
       top.className = "entry-row-top";
       const title = document.createElement("span");
       title.className = "entry-row-title";
-      title.textContent = publicInboxText(entry.title, "Request");
+      title.textContent = inboxEntryText(entry, "title", "Request");
       const time = document.createElement("span");
       time.className = "entry-row-time";
       time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
@@ -1035,7 +1045,7 @@
 
       const snippet = document.createElement("span");
       snippet.className = "entry-row-snippet";
-      snippet.textContent = publicInboxText(entry.body, "This request needs your review.");
+      snippet.textContent = inboxEntryText(entry, "body", "This request needs your review.");
 
       const actions = document.createElement("div");
       actions.className = "entry-actions";
@@ -1108,7 +1118,7 @@
       titleRow.className = "entry-title-row";
       const title = document.createElement("div");
       title.className = "entry-title";
-      title.textContent = publicInboxText(entry.title, "Request");
+      title.textContent = inboxEntryText(entry, "title", "Request");
       titleRow.appendChild(title);
       if (entry.severity === "attention") {
         const badge = document.createElement("span");
@@ -1132,7 +1142,7 @@
 
       const body = document.createElement("p");
       body.className = "entry-body";
-      body.textContent = publicInboxText(entry.body, "This request needs your review.");
+      body.textContent = inboxEntryText(entry, "body", "This request needs your review.");
 
       const actions = document.createElement("div");
       actions.className = "entry-actions";

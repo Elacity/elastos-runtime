@@ -268,6 +268,24 @@ async function runInboxHomeChromeSmoke() {
   });
   await settle();
 
+  // Contact and service names remain visible even when they contain technical words.
+  for (const kind of ["contact_request", "service_access_request", "service_access_grant"]) {
+    for (const name of ["Model Capsule", "<b>Provider</b>"]) {
+      const entry = { ...inboxSummary().notifications.entries[0], kind, title: `${name} requests access`, body: `${name} needs your review.` };
+      context.renderDetail(entry);
+      for (const view of [context.createRow(entry), context.createRailCard(entry), nodes.get("entry-detail")]) {
+        const texts = descendants(view).map(node => node.textContent);
+        assert(texts.includes(entry.title), "Named identity missing from Inbox view");
+        assert(texts.includes(entry.body), "Named details missing from Inbox view");
+        assert(!descendants(view).some(node => node.tagName === "B"), "Named identity became markup");
+      }
+    }
+  }
+  assert.equal(context.inboxEntryText({ kind: "contact_request", title: "" }, "title", "Request"), "Request");
+  assert.equal(context.inboxEntryText({ kind: "external_http_request", body: "provider boundary failed" }, "body", "Review"), "Review");
+  context.setStatus("unauthorized provider");
+  assert.equal(nodes.get("status-text").textContent, "Inbox action could not be completed.");
+
   const menuManifest = topMessages.find((entry) => entry.message.type === "home:menu-manifest");
   assert.deepEqual(
     plainJson(topMessages.find((entry) => entry.message.type === "home:app-ready")),
