@@ -786,8 +786,8 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(gateway_home_system_ai_provider::system_approval_lens_select),
         )
         .route(
-            "/api/apps/system/approval-lens/sample",
-            post(gateway_home_system_ai_provider::system_approval_lens_sample),
+            "/api/apps/system/approval-lens/revoke",
+            post(gateway_home_system_ai_provider::system_approval_lens_revoke),
         )
         .route(
             "/api/apps/system/ai-provider/share",

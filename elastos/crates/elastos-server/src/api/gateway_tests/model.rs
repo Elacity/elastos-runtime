@@ -1558,13 +1558,14 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
         .find(|entry| entry["kind"] == "external_http_request")
         .unwrap();
     let body_text = entry["body"].as_str().unwrap();
-    assert!(body_text.contains("Action: send a prompt through a hosted model connection"));
-    assert!(body_text.contains("Affected resource: Venice"));
-    assert!(body_text.contains("Jev recommendation: approve"));
-    assert!(body_text.contains("Reason: Runtime rubric:"));
-    assert!(body_text.contains("Risk: low"));
-    assert!(body_text.contains("Confidence: 80"));
-    assert!(body_text.contains("You remain the authority."));
+    assert!(body_text.contains("Requested by: Assistant"));
+    assert!(body_text.contains("Connection: Venice"));
+    assert!(body_text.contains("Prompt recipient: Venice"));
+    assert!(body_text.contains("Payer: this Home"));
+    assert!(body_text.contains("until you end approval in System > Models"));
+    assert!(body_text.contains("This pending prompt stays in Assistant"));
+    assert!(body_text.contains("Jev advice: approve · risk: low · reported confidence: 80%"));
+    assert!(body_text.contains("Advice reason: Runtime rubric:"));
     assert!(!body_text.contains("sk-or-fixture-secret"));
     assert!(!body_text.contains("sk-vnz-fixture-secret"));
     let action_id = entry["action_ref"]["action_id"].as_str().unwrap();
@@ -1593,7 +1594,7 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let (status, retry) = status_json(
         app.clone()
             .oneshot(post_model(
-                assistant_token,
+                assistant_token.clone(),
                 "runs_create",
                 json!({
                     "offer_id": "model:venice",
@@ -1617,6 +1618,108 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let encoded = serde_json::to_string(&record).unwrap();
     assert!(!encoded.contains("sk-or-fixture-secret"));
     assert!(!encoded.contains("sk-vnz-fixture-secret"));
+
+    let (status, connection_status) = status_json(
+        app.clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("GET")
+                    .uri("/api/apps/system/ai-provider")
+                    .header("x-elastos-home-token", authority.system_token.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{connection_status}");
+    let approved = connection_status["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|connection| connection["id"] == "model:venice")
+        .unwrap();
+    assert_eq!(approved["approval_state"], "approved");
+
+    let revoke = |token: String| {
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/system/approval-lens/revoke")
+            .header("x-elastos-home-token", token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "id": "model:venice" })).unwrap(),
+            ))
+            .unwrap()
+    };
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let response = app
+        .clone()
+        .oneshot(revoke(guest.system_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let (status, ended) = status_json(
+        app.clone()
+            .oneshot(revoke(authority.system_token.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ended}");
+    assert_eq!(ended["approval"], "ended");
+    assert!(!crate::jev_approval_lens::approved_connection(
+        dir.path(),
+        "model:venice"
+    ));
+    let record = crate::jev_approval_lens::load_record(dir.path(), &request_id).unwrap();
+    assert_eq!(record.human_decision.as_deref(), Some("defer"));
+
+    let (status, after_revoke) = status_json(
+        app.clone()
+            .oneshot(post_model(
+                assistant_token,
+                "runs_create",
+                json!({
+                    "offer_id": "model:venice", "operation": "text.generate",
+                    "request_id": "request-venice-3",
+                    "input": { "messages": [{ "role": "user", "content": "after revoke" }] }
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after_revoke}");
+    assert_eq!(after_revoke["code"], "approval_required");
+    assert_eq!(provider.requests.lock().await.len(), 2);
+    let (status, summary) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let pending = summary["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["kind"] == "external_http_request"
+                && entry["action_ref"]["action_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("hosted-http-approve:"))
+        })
+        .expect("ending approval creates a new Inbox decision");
+    assert!(pending["body"]
+        .as_str()
+        .unwrap()
+        .contains("This pending prompt stays in Assistant"));
 }
 
 #[tokio::test]
@@ -1706,7 +1809,7 @@ async fn named_jev_waits_for_run_terminal_before_inbox_advice() {
         .find(|entry| entry["kind"] == "external_http_request")
         .unwrap();
     let body_text = entry["body"].as_str().unwrap();
-    assert!(body_text.contains("Jev recommendation: approve"));
+    assert!(body_text.contains("Jev advice: approve"));
     assert!(body_text.contains("Runtime rubric:"));
 }
 
@@ -1773,9 +1876,9 @@ async fn named_jev_malformed_or_failed_reply_still_opens_inbox() {
     let body_text = summary["notifications"]["entries"][0]["body"]
         .as_str()
         .unwrap();
-    assert!(body_text.contains("Jev recommendation: unavailable"));
-    assert!(body_text.contains("Risk: unknown"));
-    assert!(body_text.contains("Confidence: Not reported"));
+    assert!(body_text.contains("Jev advice: unavailable"));
+    assert!(body_text.contains("risk: unknown"));
+    assert!(body_text.contains("reported confidence: not reported"));
     let request_id = crate::jev_approval_lens::hosted_http_request_id("model:venice").unwrap();
     let record = crate::jev_approval_lens::load_record(dir.path(), &request_id).unwrap();
     assert_eq!(record.recommendation.recommendation, "unavailable");
@@ -1845,8 +1948,8 @@ async fn named_jev_provider_failure_still_opens_inbox() {
     let body_text = summary["notifications"]["entries"][0]["body"]
         .as_str()
         .unwrap();
-    assert!(body_text.contains("Jev recommendation: unavailable"));
-    assert!(body_text.contains("You remain the authority."));
+    assert!(body_text.contains("Jev advice: unavailable"));
+    assert!(body_text.contains("You decide."));
 }
 
 #[tokio::test]
@@ -1923,113 +2026,6 @@ async fn named_jev_retries_eval_after_unsigned_record_cleared() {
         .collect();
     assert_eq!(eval_ids.len(), 2, "{requests:?}");
     assert_ne!(eval_ids[0], eval_ids[1], "{eval_ids:?}");
-}
-
-#[tokio::test]
-async fn approval_lens_sample_advises_without_permission_or_downstream_effect() {
-    let dir = tempfile::tempdir().unwrap();
-    crate::api::seed_model_provider_operator_offers_for_test(
-        dir.path(),
-        vec![
-            hosted_test_offer(
-                "model:jev",
-                "Jev",
-                "OpenRouter",
-                "https://openrouter.ai/api/alpha/decisions",
-                "fixture-secret",
-            ),
-            hosted_test_offer(
-                "model:text",
-                "Text",
-                "OpenRouter",
-                "https://openrouter.ai/api/v1/chat/completions",
-                "fixture-secret",
-            ),
-        ],
-    )
-    .unwrap();
-    let provider = ScriptedModelProvider::default();
-    provider.replies.lock().await.insert(
-        "model:jev".into(),
-        json!({"status": "error", "message": "fixture lost create reply"}),
-    );
-    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
-    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
-    let guest = passkey_authority_with_name_role(
-        dir.path(),
-        Some("guest"),
-        crate::auth::RuntimePrincipalRole::Guest,
-    );
-    let send = |token: String, id: &str| {
-        test_browser_request("localhost:61180", "null")
-            .method("POST")
-            .uri("/api/apps/system/approval-lens/sample")
-            .header("x-elastos-home-token", token)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&json!({"id": id})).unwrap()))
-            .unwrap()
-    };
-    let response = app
-        .clone()
-        .oneshot(send(guest.system_token, "model:jev"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    for invalid in ["model:text", "model:foreign"] {
-        let response = app
-            .clone()
-            .oneshot(send(authority.system_token.clone(), invalid))
-            .await
-            .unwrap();
-        assert_ne!(response.status(), StatusCode::OK);
-    }
-    assert!(provider.requests.lock().await.is_empty());
-    for attempt in 0..2 {
-        let (status, result) = status_json(
-            app.clone()
-                .oneshot(send(authority.system_token.clone(), "model:jev"))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{result}");
-        assert_eq!(result["advisory_only"], true);
-        assert_eq!(result["sample_reused"], attempt > 0);
-        assert_eq!(
-            result["recommendation"]["recommendation"],
-            if attempt == 0 {
-                "unavailable"
-            } else {
-                "approve"
-            }
-        );
-        let request = provider.requests.lock().await[0].clone();
-        let binding: RuntimeCreateBinding =
-            serde_json::from_value(request["runtime_binding"].clone()).unwrap();
-        provider.get_replies.lock().await.insert(
-            elastos_model_contract::model_run_id(&binding),
-            decision_reply("approve", "low", 0.8),
-        );
-    }
-    let requests = provider.requests.lock().await;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["op"], "runs_create");
-    assert_eq!(requests[1]["op"], "runs_get");
-    assert_eq!(requests[0]["runtime_binding"]["capsule_id"], "system");
-    assert_eq!(requests[0]["operation"], "decision.evaluate");
-    assert!(!requests[0].to_string().contains("fixture-secret"));
-    assert!(!dir.path().join("jev-approval-lens").exists());
-    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
-    let (_, inbox) = status_json(
-        app.oneshot(inbox_summary_request(inbox_token))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert!(inbox["notifications"]["entries"]
-        .as_array()
-        .unwrap()
-        .is_empty());
 }
 
 #[tokio::test]

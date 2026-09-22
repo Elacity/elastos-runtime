@@ -504,10 +504,10 @@ code {
 .ai-provider-details p { overflow-wrap: anywhere; margin: 12px 0; }
 .ai-provider-form { max-width: 520px; padding: 12px 0; }
 .ai-provider-form .pc2-input { width: 100%; min-width: 0; box-sizing: border-box; font-size: 14px; padding: 10px 12px; }
-.approval-lens-controls { display: grid; gap: 12px; font-size: 14px; line-height: 1.5; }
+.approval-lens-controls { display: grid; gap: 8px; font-size: 14px; line-height: 1.5; }
 .approval-lens-controls .pc2-input { width: 100%; min-width: 0; box-sizing: border-box; }
 .approval-lens-controls p { margin: 0; }
-#approval-lens-sample > p, #approval-lens-run { margin-top: 12px; }
+#approval-lens-manage .system-inline-row { margin-top: 8px; }
 @media (max-width: 600px) { .models-heading { flex-direction: column; } .ai-provider-instance { grid-template-columns: minmax(0, 1fr); } .ai-provider-instance > .system-inline-row { grid-column: 1; grid-row: auto; } }
 
 .pc2-input,

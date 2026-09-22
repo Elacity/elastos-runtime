@@ -433,6 +433,7 @@ export async function modelRunCall(op, body = {}) {
     const error = new Error(data?.message || data?.code || `model ${op} failed (${res.status})`);
     error.code = data?.code || "model_error";
     error.status = res.status;
+    if (data?.code === "approval_required") error.approvalOfferId = body.offer_id;
     error.preDispatchRefusal =
       data?.code === "approval_required" || data?.code === "approval_denied"
       || (op === "runs_create" && res.status === 409
@@ -543,7 +544,8 @@ export async function streamChatViaContract(
     if (!resuming) {
       const refused = error.preDispatchRefusal === true;
       patch({ state: refused ? TurnState.FAILED : TurnState.SETTLEMENT_UNKNOWN,
-        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null });
+        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null,
+        ...(error.approvalOfferId ? { approvalOfferId: error.approvalOfferId } : {}) });
       if (!refused) throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
     }
     throw error;

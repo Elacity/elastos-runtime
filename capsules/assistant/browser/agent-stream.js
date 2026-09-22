@@ -22,7 +22,7 @@ import {
 import { stampMessageNode, contentHash, newTurnId, createTurnManifest, turnStorePut, turnStorePatch, turnStoreGet, TurnState, cheapTurnSnapshot, resolveReasoningPolicy } from "./agent-context.js";
 import { setAgentComposerProcessing } from "./agent-shelf.js";
 import { renderHarnessPage } from "./agent-configure.js";
-import { postToHome } from "./harness-host.js";
+import { postToHome, openInboxFromAgent } from "./harness-host.js";
 import {
   createProgressController,
   snapshotProgress,
@@ -510,6 +510,12 @@ function renderMarkdownBlocks(raw) {
 
 export function formatStreamError(err) {
   const code = err?.code || "";
+  if (code === "approval_required") {
+    return "Approval pending. Your prompt is saved here. Review this connection in Inbox, then choose Continue request.";
+  }
+  if (code === "approval_denied") {
+    return "This hosted connection was denied in Inbox. Your prompt is saved here; choose another model to send it.";
+  }
   if (code === "aborted") {
     return "Run status unavailable.";
   }
@@ -598,7 +604,50 @@ function showRunSettlement(turn, detail = turn?.error === "run_not_found"
   el.append(" ", button);
 }
 
+function approvalPromptHash(message) {
+  return contentHash(JSON.stringify([
+    String(message?.text || ""),
+    String(message?.modelText || ""),
+    Array.isArray(message?.parts) ? message.parts : null,
+  ]));
+}
+
+function showApprovalReview(turn) {
+  setStreamStatus(formatStreamError({ code: "approval_required" }), { tone: "review" });
+  const el = document.querySelector("[data-agent-stream-status]");
+  if (!el) return;
+  const sessionId = ctx.activeSessionId;
+  const review = document.createElement("button");
+  review.type = "button";
+  review.textContent = "Review in Inbox";
+  review.addEventListener("click", () => {
+    if (sessionId === ctx.activeSessionId) openInboxFromAgent();
+  });
+  const resume = document.createElement("button");
+  resume.type = "button";
+  resume.textContent = "Continue request";
+  const note = document.createElement("span");
+  resume.addEventListener("click", () => {
+    if (sessionId !== ctx.activeSessionId || ctx.turnBusy) return;
+    const session = ctx.sessions.find((item) => item.id === sessionId);
+    const lastUser = [...(session?.messages || [])].reverse().find((message) => message.role === "user");
+    if (!turn?.approvalOfferId || session?.lastTurn?.turnId !== turn.turnId
+        || selectedLiveOffer()?.offerId !== turn.approvalOfferId
+        || !lastUser || approvalPromptHash(lastUser) !== turn.approvalPromptHash) {
+      note.textContent = "Select the original connection and saved prompt to continue.";
+      return;
+    }
+    resume.disabled = true;
+    startTurnForPrompt("");
+  });
+  el.append(" ", review, " ", resume, " ", note);
+}
+
 function showRunFailure(turn, detail) {
+  if (turn?.error === "approval_required") {
+    showApprovalReview(turn);
+    return;
+  }
   setStreamStatus(detail || formatStreamError({
     code: String(turn?.error || "run_failed"),
   }), { tone: "error" });
@@ -791,7 +840,8 @@ export function enqueueFollowUp(text, opts = {}) {
 }
 
 export function drainFollowUpQueue() {
-  if (!ctx.followUpQueue.length || !ctx.active) {
+  const session = ctx.sessions.find((item) => item.id === ctx.activeSessionId);
+  if (!ctx.followUpQueue.length || !ctx.active || session?.lastTurn?.error === "approval_required") {
     return;
   }
   const next = ctx.followUpQueue.shift();
@@ -799,9 +849,9 @@ export function drainFollowUpQueue() {
   if (!next?.text) {
     return;
   }
-  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId) || host.ensureSessionForPrompt(next.text);
+  const target = session || host.ensureSessionForPrompt(next.text);
   const displayText = String(next.displayText || "").trim();
-  session.messages.push({
+  target.messages.push({
     role: "user",
     text: displayText || (Array.isArray(next.parts) && next.parts.length ? "" : next.text),
     modelText: next.text,
@@ -2735,6 +2785,22 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       }
     }
     progress.dispatch({ type: "GENERATION_ERROR", text: honest });
+    if (err?.code === "approval_required") {
+      const lastUser = [...(session?.messages || [])].reverse().find((message) => message.role === "user");
+      if (liveTurn?.turnId && lastUser) {
+        const pending = turnStorePatch(liveTurn.turnId, {
+          approvalPromptHash: approvalPromptHash(lastUser),
+        });
+        if (session) {
+          session.lastTurn = cheapTurnSnapshot(pending || liveTurn);
+          host.persistAgentWorkspaceSoon?.();
+        }
+      }
+      progressEl?.remove();
+      answerRow?.remove();
+      showApprovalReview(session?.lastTurn || liveTurn);
+      return;
+    }
     if (partialAnswer) {
       persistPartialAgentReply(partialAnswer, partialThinking);
       answerRow?.classList.remove("is-streaming");
@@ -2814,7 +2880,8 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       if (status === "Generating…" || status === "Thinking…" || status === "Connecting…") {
         setStreamStatus("");
       }
-      if (state.phase !== "finalizing" && !unresolvedModelTurn(session?.lastTurn)) {
+      if (state.phase !== "finalizing" && session?.lastTurn?.error !== "approval_required"
+          && !unresolvedModelTurn(session?.lastTurn)) {
         window.requestAnimationFrame(() => drainFollowUpQueue());
       }
     }

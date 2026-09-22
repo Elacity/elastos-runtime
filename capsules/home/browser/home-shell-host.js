@@ -70,8 +70,8 @@ const WALLET_CONNECTOR_TARGETS = new Set(
   Object.keys(WALLET_CONNECTOR_TARGET_TITLES),
 );
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
-  assistant: new Set(["marketplace", "system"]),
-  "home-agent": new Set(["marketplace", "system"]),
+  assistant: new Set(["marketplace", "system", "inbox"]),
+  "home-agent": new Set(["marketplace", "system", "inbox"]),
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
@@ -1824,7 +1824,9 @@ window.addEventListener("message", (event) => {
     if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])) return;
     const marketplace = data.target === "marketplace" && assistantModelsMarketplaceQuery(data.query);
     const settings = data.target === "system" && assistantAiProviderSettingsQuery(data.query);
-    if (!marketplace && !settings) return;
+    const inbox = data.target === "inbox" && data.query && typeof data.query === "object"
+      && !Array.isArray(data.query) && Object.keys(data.query).length === 0;
+    if (!marketplace && !settings && !inbox) return;
   }
   if (context.targetId === "marketplace" && target === "assistant" &&
       (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||

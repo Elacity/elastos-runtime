@@ -946,6 +946,8 @@ export function cheapTurnSnapshot(turn) {
     startedAt: Number(turn.startedAt) || undefined,
     completedAt: Number(turn.completedAt) || undefined,
     error: turn.error ? String(turn.error).slice(0, 120) : undefined,
+    approvalOfferId: turn.approvalOfferId ? String(turn.approvalOfferId).slice(0, 160) : undefined,
+    approvalPromptHash: turn.approvalPromptHash ? String(turn.approvalPromptHash).slice(0, 16) : undefined,
     ...(turn.outputRetained === false ? { outputRetained: false } : {}),
   };
 }

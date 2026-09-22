@@ -262,6 +262,10 @@ export function openAiProviderSettingsFromAgent() {
   return postHomeOpenTarget("system", { settings: "models" });
 }
 
+export function openInboxFromAgent() {
+  return postHomeOpenTarget("inbox", {});
+}
+
 /* The Home GUI frame is opaque-sandboxed, so the only honest target is "*";
    the parent reference pins the recipient and Home checks event.source. */
 export function postToHome(message) {

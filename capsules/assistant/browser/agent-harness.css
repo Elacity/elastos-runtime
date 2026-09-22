@@ -2506,6 +2506,23 @@ html[data-agent-reasoning="off"] .agent-thinking {
   color: color-mix(in srgb, var(--accent, #6ea8fe) 70%, var(--text));
 }
 
+.agent-stream-status[data-tone="review"] { color: var(--text); }
+.agent-stream-status[data-tone="review"] button {
+  min-height: 32px;
+  margin: 8px 8px 0 0;
+  padding: 5px 10px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.agent-stream-status[data-tone="review"] button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .agent-stream-status[data-tone="error"] {
   color: color-mix(in srgb, #e8a05d 75%, var(--text));
 }

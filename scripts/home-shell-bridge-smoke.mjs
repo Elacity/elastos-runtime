@@ -1214,6 +1214,16 @@ for (const actor of ["assistant", "home-agent"]) {
   assert(count() === settingsBefore + 1, "registered composer opens AI provider Settings", shellMessages);
   const settingsOpened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
   assert(settingsOpened.target === "system" && JSON.stringify(settingsOpened.query) === JSON.stringify({ settings: "models" }), "exact Settings destination", settingsOpened);
+  const inboxIntent = { type: "home:open-target", homeToken: token, target: "inbox", query: {} };
+  const inboxBefore = count();
+  sendChildMessage("null", source, { ...inboxIntent, query: { item: "other" } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert(count() === inboxBefore, "Assistant Inbox handoff rejects extra query keys", shellMessages);
+  sendChildMessage("null", source, inboxIntent);
+  for (let i = 0; i < 50 && count() === inboxBefore; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert(count() === inboxBefore + 1, "registered composer opens Inbox", shellMessages);
+  const inboxOpened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
+  assert(inboxOpened.target === "inbox" && JSON.stringify(inboxOpened.query) === "{}", "exact Inbox destination", inboxOpened);
 }
 
 {

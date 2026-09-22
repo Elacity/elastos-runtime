@@ -184,6 +184,7 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
@@ -210,6 +211,7 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
@@ -444,6 +446,7 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
@@ -2626,12 +2629,12 @@ assert(
   "Home must allow Library picker results to return only to Archive, Browser and Chat Room",
 );
 assert(
-  shellJs.includes('assistant: new Set(["marketplace", "system"])') &&
-    shellJs.includes('"home-agent": new Set(["marketplace", "system"])') &&
+  shellJs.includes('assistant: new Set(["marketplace", "system", "inbox"])') &&
+    shellJs.includes('"home-agent": new Set(["marketplace", "system", "inbox"])') &&
     shellJs.includes("assistantModelsMarketplaceQuery") &&
     shellJs.includes("assistantAiProviderSettingsQuery") &&
     shellJs.includes("marketplaceAssistantHandoffQuery"),
-  "Open Models must hand off through Marketplace, and AI provider Settings through System, with bounded queries",
+  "Assistant Models, Settings, and Inbox handoffs must use bounded destinations and queries",
 );
 assert(
   shellJs.includes('marketplace: "runtime-target"') &&

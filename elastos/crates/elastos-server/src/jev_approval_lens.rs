@@ -172,6 +172,28 @@ pub fn load_record(data_dir: &Path, request_id: &str) -> anyhow::Result<JevShado
     serde_json::from_slice(&bytes).context("Jev shadow record is not valid JSON")
 }
 
+pub fn approved_connection(data_dir: &Path, offer_id: &str) -> bool {
+    hosted_http_request_id(offer_id)
+        .ok()
+        .and_then(|id| load_record(data_dir, &id).ok())
+        .is_some_and(|record| {
+            record.human_decision.as_deref() == Some("approve")
+                && relationship_object(&record, "offer") == Some(offer_id)
+        })
+}
+
+pub fn end_connection_approval(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
+    let request_id = hosted_http_request_id(offer_id)?;
+    let record = load_record(data_dir, &request_id)?;
+    anyhow::ensure!(
+        relationship_object(&record, "offer") == Some(offer_id)
+            && record.human_decision.as_deref() == Some("approve"),
+        "hosted connection has no active approval"
+    );
+    record_human_decision(data_dir, &request_id, "defer")?;
+    Ok(())
+}
+
 pub fn hosted_http_request_id(offer_id: &str) -> anyhow::Result<String> {
     let offer_id = bounded_request_id(offer_id)?;
     let request_id = format!("hosted-http:{}", offer_id.replace(':', "_"));
@@ -190,7 +212,7 @@ pub fn outcome_request_id(data_dir: &Path, offer_id: &str, fallback: &str) -> St
 
 pub fn inbox_card_copy(record: &JevShadowRecord) -> (String, String) {
     let title = format!(
-        "Assistant requests {}",
+        "Assistant requests access to {}",
         if record.consequence.title.trim().is_empty() {
             "hosted HTTP"
         } else {
@@ -205,25 +227,24 @@ pub fn inbox_card_copy(record: &JevShadowRecord) -> (String, String) {
         record.recommendation.reason.trim()
     };
     let body = format!(
-        "Action: send a prompt through a hosted model connection\n\
-Affected resource: {}\n\
-Processor: {}\n\
-Relationships: Assistant uses this hosted connection. The owner remains the authority.\n\
-Jev recommendation: {}\n\
-Reason: {}\n\
-Risk: {}\n\
-Confidence: {}\n\
-You remain the authority.",
+        "Requested by: Assistant\n\
+Connection: {}\n\
+Prompt recipient: {}\n\
+Payer: this Home\n\
+Approve gives Assistant access to this connection for later prompts until you end approval in System > Models. This pending prompt stays in Assistant. Return there and choose Continue request after your decision.\n\
+Jev advice: {} · risk: {} · reported confidence: {}\n\
+Advice reason: {}\n\
+You decide. End access later in System > Models.",
         record.consequence.title,
         processor,
         recommendation,
-        reason,
         record.recommendation.risk,
         record
             .recommendation
             .confidence
             .map(|value| format!("{value}%"))
-            .unwrap_or_else(|| "Not reported".into())
+            .unwrap_or_else(|| "not reported".into()),
+        reason,
     );
     (title, body)
 }
@@ -241,6 +262,9 @@ pub async fn prepare_assistant_hosted_http(
                 Err(_) => return HostedHttpGate::NeedsReview,
             };
             if let Ok(existing) = load_record(data_dir, &request_id) {
+                if relationship_object(&existing, "offer") != Some(context.offer_id) {
+                    return HostedHttpGate::Denied;
+                }
                 return match existing.human_decision.as_deref() {
                     Some("approve") => HostedHttpGate::Proceed,
                     Some("deny") => HostedHttpGate::Denied,
@@ -279,6 +303,9 @@ pub async fn prepare_assistant_hosted_http(
         return HostedHttpGate::Proceed;
     };
     if let Ok(existing) = load_record(data_dir, &request_id) {
+        if relationship_object(&existing, "offer") != Some(context.offer_id) {
+            return HostedHttpGate::Denied;
+        }
         match existing.human_decision.as_deref() {
             Some("approve") => return HostedHttpGate::Proceed,
             Some("deny") => return HostedHttpGate::Denied,
@@ -344,7 +371,6 @@ async fn evaluate_named_jev(
         &eval_request_id,
     )
     .await
-    .0
 }
 
 async fn evaluate_advice(
@@ -354,21 +380,13 @@ async fn evaluate_advice(
     model: &str,
     context: &AssistantHostedHttpContext<'_>,
     eval_request_id: &str,
-) -> (JevRecommendation, Option<String>, Option<bool>) {
+) -> JevRecommendation {
     let input = evaluator_input(context);
     if secret_in_text(data_dir, &input.to_string()).is_some() {
-        return (
-            unavailable_recommendation("Jev request omitted a secret"),
-            None,
-            None,
-        );
+        return unavailable_recommendation("Jev request omitted a secret");
     }
     let Ok(input_hash) = model_input_hash(&input) else {
-        return (
-            unavailable_recommendation("Jev request could not be bound"),
-            None,
-            None,
-        );
+        return unavailable_recommendation("Jev request could not be bound");
     };
     let binding = RuntimeCreateBinding {
         schema: RUNTIME_CREATE_BINDING_SCHEMA.to_string(),
@@ -385,45 +403,15 @@ async fn evaluate_advice(
         .validate(jev_offer_id, decisions::OPERATION, &input)
         .is_err()
     {
-        return (
-            unavailable_recommendation("Jev request could not be bound"),
-            None,
-            None,
-        );
+        return unavailable_recommendation("Jev request could not be bound");
     }
-    let sample_run_id = elastos_model_contract::model_run_id(&binding);
-    let create_sample = if context.capsule_id == "system" {
-        match claim_sample(data_dir, &sample_run_id) {
-            Ok(first) => first,
-            Err(_) => {
-                return (
-                    unavailable_recommendation("Sample status could not be saved. Try again."),
-                    None,
-                    None,
-                )
-            }
-        }
-    } else {
-        true
-    };
-    let request = if create_sample {
-        serde_json::json!({
-            "op": "runs_create",
-            "offer_id": jev_offer_id,
-            "operation": decisions::OPERATION,
-            "input": input,
-            "runtime_binding": binding,
-        })
-    } else {
-        serde_json::json!({
-            "op": "runs_get", "run_id": sample_run_id,
-            "runtime_binding": RuntimeAccessBinding {
-                schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(), principal_id: context.principal_id.to_string(),
-                session_id: context.session_id.to_string(), capsule_id: context.capsule_id.to_string(),
-                grant_id: context.grant_id.to_string(), request_id: "sample-check".to_string(), run_id: sample_run_id.clone(),
-            }
-        })
-    };
+    let request = serde_json::json!({
+        "op": "runs_create",
+        "offer_id": jev_offer_id,
+        "operation": decisions::OPERATION,
+        "input": input,
+        "runtime_binding": binding,
+    });
     let result = tokio::time::timeout(EVALUATOR_TIMEOUT, async {
         let created = registry.send_raw("model", &request).await;
         match created {
@@ -433,81 +421,13 @@ async fn evaluate_advice(
     })
     .await;
     match result {
-        Err(_) => (
-            unavailable_recommendation(
-                "Evaluation acceptance is unknown. Check this sample again.",
-            ),
-            None,
-            Some(!create_sample),
+        Err(_) | Ok(Err(_)) => unavailable_recommendation(
+            "Evaluation acceptance is unknown. Review this connection yourself.",
         ),
-        Ok(Err(_)) => (
-            unavailable_recommendation(
-                "Evaluation acceptance is unknown. Check this sample again.",
-            ),
-            None,
-            Some(!create_sample),
-        ),
-        Ok(Ok(response)) => (
-            recommendation_from_provider_response(data_dir, &response, &input, model),
-            response
-                .pointer("/data/run_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            Some(!create_sample),
-        ),
-    }
-}
-
-// Persist the first-dispatch claim before sending. Later checks only read the
-// exact run, even after reload, a lost create reply or journal expiry.
-fn claim_sample(data_dir: &Path, run_id: &str) -> anyhow::Result<bool> {
-    let root = data_dir.join("providers/model-provider/approval-samples");
-    let path = root.join(format!(
-        "{}.json",
-        run_id
-            .strip_prefix("run:sha256:")
-            .context("invalid sample run")?
-    ));
-    crate::auth::ensure_protected_principal_root_object_parent(data_dir, &path)?;
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    match options.open(&path) {
-        Ok(mut file) => {
-            file.write_all(
-                serde_json::to_string(&serde_json::json!({ "run_id": run_id }))?.as_bytes(),
-            )?;
-            file.sync_all()?;
-            fs::File::open(&root)?.sync_all()?;
-            Ok(true)
+        Ok(Ok(response)) => {
+            recommendation_from_provider_response(data_dir, &response, &input, model)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error.into()),
     }
-}
-
-/// A fixed fictional scenario uses Decisions only. It creates no approval record,
-/// Inbox action, grant or downstream text request. Rechecking reuses the run identity.
-pub async fn evaluate_sample(
-    data_dir: &Path,
-    registry: &ProviderRegistry,
-    jev_offer_id: &str,
-    model: &str,
-    context: &AssistantHostedHttpContext<'_>,
-) -> (JevRecommendation, Option<String>, Option<bool>) {
-    evaluate_advice(
-        data_dir,
-        registry,
-        jev_offer_id,
-        model,
-        context,
-        context.request_id,
-    )
-    .await
 }
 
 fn jev_output_ready(response: &serde_json::Value) -> bool {
@@ -864,16 +784,6 @@ fn write_record(data_dir: &Path, record: &JevShadowRecord) -> anyhow::Result<()>
 mod tests {
     use super::*;
 
-    #[test]
-    #[cfg(unix)]
-    fn sample_claim_rejects_symlink_parent_before_dispatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("providers")).unwrap();
-        assert!(claim_sample(dir.path(), &format!("run:sha256:{}", "a".repeat(64))).is_err());
-        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-    }
-
     fn hint() -> HostedModelOfferHint {
         HostedModelOfferHint {
             offer_title: "Venice".to_string(),
@@ -1027,10 +937,10 @@ mod tests {
         let recorded = record_assistant_hosted_http_shadow(tmp.path(), &context).unwrap();
         let (title, body) = inbox_card_copy(&recorded);
         assert!(title.contains("Venice"));
-        assert!(body.contains("Action: send a prompt through a hosted model connection"));
-        assert!(body.contains("Affected resource: Venice"));
-        assert!(body.contains("Jev recommendation: unavailable"));
-        assert!(body.contains("You remain the authority."));
+        assert!(body.contains("Requested by: Assistant"));
+        assert!(body.contains("Connection: Venice"));
+        assert!(body.contains("Jev advice: unavailable"));
+        assert!(body.contains("You decide."));
         assert!(!body.contains("https://"));
         assert!(!body.contains("api_key"));
     }

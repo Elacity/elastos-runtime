@@ -790,6 +790,7 @@ function configureAiProvider() {
     instancesNode.replaceChildren();
     for (const connection of connections) {
       if (!connection || connection.connected !== true) continue;
+      if (connection.operation === "decision.evaluate") continue;
       const card = document.createElement("div");
       card.className = "ai-provider-instance";
       const title = document.createElement("p");
@@ -803,9 +804,8 @@ function configureAiProvider() {
       const useButton = document.createElement("button");
       useButton.className = "pc2-btn";
       useButton.type = "button";
-      const decisionModel = connection.operation === "decision.evaluate";
-      useButton.textContent = decisionModel ? "Review in Inbox" : "Use in Assistant";
-      useButton.addEventListener("click", () => openCapsuleTarget(decisionModel ? "inbox" : "assistant", decisionModel ? {} : { offer_id: connection.id }));
+      useButton.textContent = "Use in Assistant";
+      useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
       const shareButton = document.createElement("button");
       shareButton.className = "pc2-btn pc2-btn-secondary";
       shareButton.type = "button";
@@ -844,7 +844,7 @@ function configureAiProvider() {
       });
       const state = document.createElement("span");
       state.className = "ai-provider-state";
-      state.textContent = decisionModel ? "Approval advice" : connection.share_enabled ? "Shared" : "Private";
+      state.textContent = connection.approval_state === "approved" ? "Assistant access approved" : connection.share_enabled ? "Shared" : "Private";
       title.append(state);
       const more = document.createElement("details");
       more.className = "ai-provider-details";
@@ -855,7 +855,29 @@ function configureAiProvider() {
       identity.textContent = `Instance: ${connection.id}`;
       const secondary = document.createElement("div");
       secondary.className = "system-inline-row";
-      if (!decisionModel) secondary.append(shareButton);
+      secondary.append(shareButton);
+      if (connection.approval_state === "approved") {
+        const endApproval = document.createElement("button");
+        endApproval.className = "pc2-btn pc2-btn-secondary";
+        endApproval.type = "button";
+        endApproval.textContent = "End Assistant approval";
+        endApproval.addEventListener("click", async () => {
+          if (!hasShellAccess()) return;
+          endApproval.disabled = true;
+          try {
+            await fetchJson("/api/apps/system/approval-lens/revoke", {
+              method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+              body: JSON.stringify({ id: connection.id }),
+            });
+            await refreshStatus();
+            showState("Assistant approval ended. A later request needs Inbox review again.", "");
+          } catch (error) {
+            showState(publicSystemError(error, "Approval could not be ended."), "error");
+            endApproval.disabled = false;
+          }
+        });
+        secondary.append(endApproval);
+      }
       secondary.append(disconnectButton);
       more.append(summary, identity, secondary);
       actions.append(useButton, replaceButton);
@@ -866,8 +888,8 @@ function configureAiProvider() {
   const lensModel = document.querySelector("#approval-lens-model");
   const lensStatus = document.querySelector("#approval-lens-status");
   const lensSelect = document.querySelector("#approval-lens-select");
-  const lensRun = document.querySelector("#approval-lens-run");
-  const lensResult = document.querySelector("#approval-lens-result");
+  const lensEdit = document.querySelector("#approval-lens-edit");
+  const lensDisconnect = document.querySelector("#approval-lens-disconnect");
   const renderLens = (status) => {
     const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
     const current = decisions.find(c => c.id === status.approval_lens_offer_id);
@@ -878,13 +900,34 @@ function configureAiProvider() {
       lensModel.append(option);
     }
     if (current) lensModel.value = current.id;
-    lensStatus.textContent = current ? `Current evaluator: ${current.name} · ${current.processor_label}`
+    lensStatus.textContent = current ? `Using ${current.name} · ${current.processor_label}`
       : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
       : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
-    lensSelect.disabled = lensRun.disabled = !decisions.length;
+    lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
   };
-  lensModel.addEventListener("change", () => { lensResult.textContent = ""; lensRun.textContent = "Evaluate or view sample"; });
-  document.querySelector("#approval-lens-inbox").addEventListener("click", () => openCapsuleTarget("inbox"));
+  lensEdit.addEventListener("click", () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection) return;
+    showForm(connection);
+    showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
+  });
+  lensDisconnect.addEventListener("click", async () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection || !hasShellAccess()) return;
+    lensDisconnect.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/ai-provider", {
+        method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: connection.id }),
+      });
+      hideForm();
+      await refreshStatus();
+      showState(`${readText(connection.name)} is disconnected.`, "");
+    } catch (error) {
+      showState(publicSystemError(error, "This Home could not disconnect that evaluator."), "error");
+      lensDisconnect.disabled = false;
+    }
+  });
   lensSelect.addEventListener("click", async () => {
     lensSelect.disabled = true;
     try {
@@ -892,17 +935,6 @@ function configureAiProvider() {
       await refreshStatus();
     } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
     finally { lensSelect.disabled = false; }
-  });
-  lensRun.addEventListener("click", async () => {
-    lensRun.disabled = lensModel.disabled = true;
-    lensResult.textContent = "Evaluating this fictional sample…";
-    try {
-      const result = await fetchJson("/api/apps/system/approval-lens/sample", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
-      const advice = result.recommendation;
-      if (result.advisory_only !== true || result.offer_id !== lensModel.value || !advice) throw new Error("invalid sample response");
-      lensResult.textContent = advice.recommendation === "unavailable" ? advice.reason : `${result.sample_reused === true ? "Saved sample evaluation." : "New sample evaluation."} Advice: ${advice.recommendation}. Risk: ${advice.risk}. Confidence: ${advice.confidence == null ? "not reported" : `${advice.confidence}%`}. ${advice.reason} This sample changed no permissions.`;
-    } catch { lensResult.textContent = "Evaluation acceptance is unknown. Check this sample again before starting another."; }
-    finally { lensRun.disabled = lensModel.disabled = false; lensRun.textContent = "Check this sample again"; }
   });
   const refreshStatus = async () => {
     latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });

@@ -143,6 +143,9 @@ export function inertSystemApiResponse(pathname) {
   if (pathname === "/api/provider/chain/networks") {
     return { status: "ok", data: { networks: [] } };
   }
+  if (pathname === "/api/apps/system/ai-provider") {
+    return { connections: [], approval_lens_offer_id: null };
+  }
   return null;
 }
 
