@@ -259,6 +259,13 @@ pub(crate) fn test_hosted_disclosure() -> HostedDisclosureConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdapterConfig {
+    OpenRouterDecisions {
+        api_url: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        model: String,
+        hosted: HostedDisclosureConfig,
+    },
     OpenAiCompatibleText {
         api_url: String,
         #[serde(default)]
@@ -292,7 +299,13 @@ pub enum AdapterConfig {
 impl AdapterConfig {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::OpenAiCompatibleText {
+            Self::OpenRouterDecisions {
+                api_url,
+                api_key,
+                model,
+                hosted,
+            }
+            | Self::OpenAiCompatibleText {
                 api_url,
                 api_key,
                 model,
@@ -488,12 +501,19 @@ impl ConfiguredOffer {
         self.validate_canonical_modalities()?;
         self.policy.validate()?;
         self.adapter.validate()?;
+        if let AdapterConfig::OpenRouterDecisions { model, .. } = &self.adapter {
+            anyhow::ensure!(
+                !model.starts_with('~'),
+                "decision models require a pinned selector"
+            );
+        }
         Ok(())
     }
 
     pub fn summary(&self) -> OfferSummary {
         let hosted = match &self.adapter {
-            AdapterConfig::OpenAiCompatibleText { model, hosted, .. }
+            AdapterConfig::OpenRouterDecisions { model, hosted, .. }
+            | AdapterConfig::OpenAiCompatibleText { model, hosted, .. }
             | AdapterConfig::OpenAiResponsesText { model, hosted, .. } => {
                 Some(hosted.summary(model))
             }
@@ -513,6 +533,9 @@ impl ConfiguredOffer {
 
     pub fn execution_binding_hash(&self) -> Result<String> {
         let adapter = match &self.adapter {
+            AdapterConfig::OpenRouterDecisions { api_url, model, .. } => json!({
+                "kind": "open_router_decisions", "api_url": api_url, "model": model,
+            }),
             AdapterConfig::OpenAiCompatibleText { api_url, model, .. } => json!({
                 "kind": "open_ai_compatible_text",
                 "api_url": api_url,
@@ -555,6 +578,22 @@ impl ConfiguredOffer {
 
     fn validate_canonical_modalities(&self) -> Result<()> {
         match &self.adapter {
+            AdapterConfig::OpenRouterDecisions { .. } => {
+                anyhow::ensure!(
+                    self.operation == elastos_model_contract::decisions::OPERATION,
+                    "decision offers require operation decision.evaluate"
+                );
+                validate_exact_modalities(
+                    &self.input_modalities,
+                    &["application/json"],
+                    "decision input_modalities",
+                )?;
+                validate_exact_modalities(
+                    &self.output_modalities,
+                    &["application/json"],
+                    "decision output_modalities",
+                )?;
+            }
             AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {

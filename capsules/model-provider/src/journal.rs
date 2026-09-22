@@ -919,12 +919,41 @@ fn validate_stored_output(
         })?;
     if !matches!(
         schema,
-        RUN_OUTPUT_TEXT_SCHEMA | RUN_OUTPUT_OBJECT_SCHEMA | RUN_OUTPUT_CONTENT_SCHEMA
+        RUN_OUTPUT_TEXT_SCHEMA
+            | RUN_OUTPUT_OBJECT_SCHEMA
+            | RUN_OUTPUT_CONTENT_SCHEMA
+            | elastos_model_contract::decisions::OUTPUT_SCHEMA
     ) {
         return Err(ProviderFault::corrupt_journal(format!(
             "model run journal output schema is invalid at {}",
             path.display()
         )));
+    }
+    if (schema == elastos_model_contract::decisions::OUTPUT_SCHEMA)
+        != (run.offer.operation == elastos_model_contract::decisions::OPERATION)
+    {
+        return Err(ProviderFault::corrupt_journal(
+            "decision operation/output schema mismatch",
+        ));
+    }
+    if schema == elastos_model_contract::decisions::OUTPUT_SCHEMA {
+        let decision: elastos_model_contract::decisions::Output =
+            serde_json::from_value(output.clone())
+                .map_err(|_| ProviderFault::corrupt_journal("invalid stored decision output"))?;
+        decision
+            .validate()
+            .map_err(|_| ProviderFault::corrupt_journal("invalid stored decision answers"))?;
+        if run
+            .offer
+            .hosted
+            .as_ref()
+            .map(|hosted| hosted.requested_selector.as_str())
+            != Some(decision.model.as_str())
+        {
+            return Err(ProviderFault::corrupt_journal(
+                "stored decision model differs from selected model",
+            ));
+        }
     }
     Ok(())
 }
@@ -1316,6 +1345,27 @@ mod tests {
             terminal: true,
         }];
         run
+    }
+
+    #[test]
+    fn stored_decision_output_retains_operation_and_pinned_model() {
+        let mut run = prepared_run("decision");
+        run.offer.operation = elastos_model_contract::decisions::OPERATION.into();
+        run.offer.hosted.as_mut().unwrap().requested_selector = "typesafe/jev-1.13".into();
+        let mut output = serde_json::json!({"schema": elastos_model_contract::decisions::OUTPUT_SCHEMA,
+            "model":"typesafe/jev-1.13", "answers":{"review":{"type":"choice","choice":"defer"}}});
+        let path = Path::new("fixture-run.json");
+        validate_stored_output(path, &run, &output).unwrap();
+        output["model"] = serde_json::json!("different-model");
+        assert!(validate_stored_output(path, &run, &output).is_err());
+        assert!(validate_stored_output(
+            path,
+            &run,
+            &serde_json::json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"approve"})
+        )
+        .is_err());
+        run.offer.operation = "text.generate".into();
+        assert!(validate_stored_output(path, &run, &output).is_err());
     }
 
     fn failed_run(

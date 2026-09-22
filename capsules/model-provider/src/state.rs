@@ -34,10 +34,13 @@ pub(crate) struct ConfigRefresh {
 const HOME_OWNED_HOSTED_CHAT_URLS: &[&str] = &[
     "https://openrouter.ai/api/v1/chat/completions",
     "https://api.venice.ai/api/v1/chat/completions",
+    "https://openrouter.ai/api/alpha/decisions",
 ];
 
 fn is_home_owned_hosted_offer(offer: &ConfiguredOffer) -> bool {
-    let AdapterConfig::OpenAiCompatibleText { api_url, .. } = &offer.adapter else {
+    let (AdapterConfig::OpenAiCompatibleText { api_url, .. }
+    | AdapterConfig::OpenRouterDecisions { api_url, .. }) = &offer.adapter
+    else {
         return false;
     };
     HOME_OWNED_HOSTED_CHAT_URLS.contains(&api_url.as_str())
@@ -60,6 +63,20 @@ fn home_owned_hosted_key_model_replace(old: &ConfiguredOffer, proposed: &Configu
                 ..
             },
             AdapterConfig::OpenAiCompatibleText {
+                api_key: next_key,
+                model: next_model,
+                hosted: next_hosted,
+                ..
+            },
+        )
+        | (
+            AdapterConfig::OpenRouterDecisions {
+                api_key,
+                model,
+                hosted,
+                ..
+            },
+            AdapterConfig::OpenRouterDecisions {
                 api_key: next_key,
                 model: next_model,
                 hosted: next_hosted,

@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decisions;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

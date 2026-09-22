@@ -1353,18 +1353,19 @@ fn hosted_test_offer(
     api_url: &str,
     api_key: &str,
 ) -> Value {
+    let decision = title == "Jev";
     json!({
         "id": id,
         "title": title,
-        "operation": "text.generate",
-        "input_modalities": ["text/plain"],
-        "output_modalities": ["text/plain"],
+        "operation": if decision { "decision.evaluate" } else { "text.generate" },
+        "input_modalities": [if decision { "application/json" } else { "text/plain" }],
+        "output_modalities": [if decision { "application/json" } else { "text/plain" }],
         "enabled": true,
         "adapter": {
-            "kind": "open_ai_compatible_text",
-            "api_url": api_url,
+            "kind": if decision { "open_router_decisions" } else { "open_ai_compatible_text" },
+            "api_url": if decision { "https://openrouter.ai/api/alpha/decisions" } else { api_url },
             "api_key": api_key,
-            "model": "fixture/model",
+            "model": if decision { "typesafe/jev-1.13" } else { "fixture/model" },
             "hosted": {
                 "backend_provider_label": processor,
                 "selection_mode": "pinned",
@@ -1376,15 +1377,14 @@ fn hosted_test_offer(
     })
 }
 
-fn typed_jev_reply(body: &str) -> Value {
-    json!({
-        "status": "ok",
-        "data": {
-            "terminal": {
-                "output": { "text": body }
-            }
+fn decision_reply(choice: &str, risk: &str, confidence: f64) -> Value {
+    json!({"status": "ok", "data": {"status": "completed", "terminal": {"output": {
+        "schema": "elastos.model.output.decisions/v1", "model": "typesafe/jev-1.13",
+        "answers": {
+            "recommendation": {"type": "choice", "choice": choice, "confidence": confidence},
+            "risk": {"type": "choice", "choice": risk}
         }
-    })
+    }}}})
 }
 
 async fn status_json(response: Response) -> (StatusCode, Value) {
@@ -1438,9 +1438,7 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),
-        typed_jev_reply(
-            "{\"recommendation\":\"approve\",\"reason\":\"Matches the named connection.\",\"risk\":\"low\",\"confidence\":80}",
-        ),
+        decision_reply("approve", "low", 0.8),
     );
     let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
@@ -1478,10 +1476,11 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
         eval_request_id.starts_with("jev-eval:hosted-http:model_venice:"),
         "{eval_request_id}"
     );
-    let eval_prompt = requests[0]["input"]["prompt"].as_str().unwrap();
+    let eval_prompt = requests[0]["input"].to_string();
+    assert_eq!(requests[0]["operation"], "decision.evaluate");
     assert_eq!(
         requests[0]["input"]["schema"],
-        "elastos.model.input.text/v1"
+        "elastos.model.input.decisions/v1"
     );
     assert!(eval_prompt.contains("Venice"));
     assert!(!eval_prompt.contains("sk-or-fixture-secret"));
@@ -1508,7 +1507,7 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     assert!(body_text.contains("Action: send a prompt through a hosted model connection"));
     assert!(body_text.contains("Affected resource: Venice"));
     assert!(body_text.contains("Jev recommendation: approve"));
-    assert!(body_text.contains("Reason: Matches the named connection."));
+    assert!(body_text.contains("Reason: Runtime rubric:"));
     assert!(body_text.contains("Risk: low"));
     assert!(body_text.contains("Confidence: 80"));
     assert!(body_text.contains("You remain the authority."));
@@ -1595,12 +1594,11 @@ async fn named_jev_waits_for_run_terminal_before_inbox_advice() {
         "model:openrouter".to_string(),
         json!({ "status": "ok", "data": { "run_id": run_id } }),
     );
-    provider.get_replies.lock().await.insert(
-        run_id.clone(),
-        typed_jev_reply(
-            "{\"recommendation\":\"approve\",\"reason\":\"Accepted after the run settled.\",\"risk\":\"low\",\"confidence\":70}",
-        ),
-    );
+    provider
+        .get_replies
+        .lock()
+        .await
+        .insert(run_id.clone(), decision_reply("approve", "low", 0.7));
     let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let grant = assistant_auth_grant(dir.path(), &authority);
@@ -1655,7 +1653,7 @@ async fn named_jev_waits_for_run_terminal_before_inbox_advice() {
         .unwrap();
     let body_text = entry["body"].as_str().unwrap();
     assert!(body_text.contains("Jev recommendation: approve"));
-    assert!(body_text.contains("Accepted after the run settled."));
+    assert!(body_text.contains("Runtime rubric:"));
 }
 
 #[tokio::test]
@@ -1684,9 +1682,7 @@ async fn named_jev_malformed_or_failed_reply_still_opens_inbox() {
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),
-        typed_jev_reply(
-            "{\"recommendation\":\"approve\",\"reason\":\"x\",\"risk\":\"low\",\"confidence\":9,\"auto_approve\":true}",
-        ),
+        decision_reply("auto_approve", "low", 0.8),
     );
     let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
@@ -1725,7 +1721,7 @@ async fn named_jev_malformed_or_failed_reply_still_opens_inbox() {
         .unwrap();
     assert!(body_text.contains("Jev recommendation: unavailable"));
     assert!(body_text.contains("Risk: unknown"));
-    assert!(body_text.contains("Confidence: 0"));
+    assert!(body_text.contains("Confidence: Not reported"));
     let request_id = crate::jev_approval_lens::hosted_http_request_id("model:venice").unwrap();
     let record = crate::jev_approval_lens::load_record(dir.path(), &request_id).unwrap();
     assert_eq!(record.recommendation.recommendation, "unavailable");
@@ -1825,9 +1821,7 @@ async fn named_jev_retries_eval_after_unsigned_record_cleared() {
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),
-        typed_jev_reply(
-            "{\"recommendation\":\"approve\",\"reason\":\"Matches the named connection.\",\"risk\":\"low\",\"confidence\":80}",
-        ),
+        decision_reply("approve", "low", 0.8),
     );
     let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));

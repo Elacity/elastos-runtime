@@ -792,8 +792,9 @@ function configureAiProvider() {
       const useButton = document.createElement("button");
       useButton.className = "pc2-btn";
       useButton.type = "button";
-      useButton.textContent = "Use in Assistant";
-      useButton.addEventListener("click", () => openCapsuleTarget("assistant"));
+      const decisionModel = connection.operation === "decision.evaluate";
+      useButton.textContent = decisionModel ? "Open Inbox" : "Use in Assistant";
+      useButton.addEventListener("click", () => openCapsuleTarget(decisionModel ? "inbox" : "assistant"));
       const shareButton = document.createElement("button");
       shareButton.className = "pc2-btn pc2-btn-secondary";
       shareButton.type = "button";
@@ -830,7 +831,9 @@ function configureAiProvider() {
           setBusy(false);
         }
       });
-      actions.append(useButton, shareButton, replaceButton, disconnectButton);
+      actions.append(useButton);
+      if (!decisionModel) actions.append(shareButton);
+      actions.append(replaceButton, disconnectButton);
       card.append(title, detail, actions);
       instancesNode.append(card);
     }

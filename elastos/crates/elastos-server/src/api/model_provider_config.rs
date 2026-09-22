@@ -15,6 +15,7 @@ const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const MODEL_PROVIDER_VALIDATE_FIXTURES_FILE_NAME: &str = "validate-fixtures.json";
 const MODEL_PROVIDER_VALIDATE_FIXTURES_MAX_BYTES: usize = 8 * 1024;
+const OPENROUTER_DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
 const HOSTED_ADAPTER_KIND: &str = "open_ai_compatible_text";
 const MODEL_PROVIDER_SECRETS_DIR_NAME: &str = "secrets";
 const HOSTED_DISPLAY_NAME_MAX_BYTES: usize = 80;
@@ -118,6 +119,9 @@ impl HostedAiProvider {
     }
 
     pub(crate) fn from_api_url(value: &str) -> Option<Self> {
+        if value.trim() == OPENROUTER_DECISIONS_URL {
+            return Some(Self::OpenRouter);
+        }
         Self::ALL
             .into_iter()
             .find(|provider| provider.chat_url() == value.trim())
@@ -451,6 +455,7 @@ fn hosted_hint_from_offers(
         && kind != "openai_compatible_text"
         && kind != "open_ai_responses_text"
         && kind != "openai_responses_text"
+        && kind != "open_router_decisions"
     {
         return None;
     }
@@ -496,7 +501,7 @@ fn hosted_hint_from_offers(
 }
 
 /// Named Jev instance used as the Approval Lens evaluator.
-/// Runtime matches the owner-chosen title `Jev`.
+/// Runtime requires the owner-chosen title and a pinned Jev decision model.
 pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedModelOfferHint)> {
     let offers = load_model_provider_operator_offers(data_dir).ok()?;
     for offer in &offers {
@@ -505,7 +510,18 @@ pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedM
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .trim();
-        if !title.eq_ignore_ascii_case("jev") {
+        if !title.eq_ignore_ascii_case("jev")
+            || offer.get("operation").and_then(serde_json::Value::as_str)
+                != Some(elastos_model_contract::decisions::OPERATION)
+            || offer
+                .pointer("/adapter/kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("open_router_decisions")
+            || !offer
+                .pointer("/adapter/model")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|model| model.starts_with("typesafe/jev-"))
+        {
             continue;
         }
         let offer_id = offer.get("id").and_then(serde_json::Value::as_str)?;
@@ -517,6 +533,7 @@ pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedM
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AiProviderConnection {
+    pub operation: String,
     pub id: String,
     pub name: String,
     pub provider: String,
@@ -547,6 +564,7 @@ fn hosted_offer(
     model: &str,
     privacy: Option<&str>,
 ) -> serde_json::Value {
+    let decision = provider == HostedAiProvider::OpenRouter && model.starts_with("typesafe/jev-");
     let mut hosted = serde_json::json!({
         "backend_provider_label": provider.label(),
         "selection_mode": "pinned",
@@ -560,22 +578,22 @@ fn hosted_offer(
     serde_json::json!({
         "id": offer_id,
         "title": name,
-        "operation": "text.generate",
-        "input_modalities": ["text/plain"],
-        "output_modalities": ["text/plain"],
+        "operation": if decision { elastos_model_contract::decisions::OPERATION } else { "text.generate" },
+        "input_modalities": [if decision { "application/json" } else { "text/plain" }],
+        "output_modalities": [if decision { "application/json" } else { "text/plain" }],
         "enabled": true,
         "policy": {
             "concurrency_limit": 1,
             "input_bytes_limit": 32768,
             "inline_output_bytes_limit": 65536,
             "event_bytes_limit": 66560,
-            "runtime_ms_limit": 120000,
+            "runtime_ms_limit": if decision { 7000 } else { 120000 },
             "retention_secs": 3600,
             "cancel_settlement_timeout_ms": 15000
         },
         "adapter": {
-            "kind": HOSTED_ADAPTER_KIND,
-            "api_url": provider.chat_url(),
+            "kind": if decision { "open_router_decisions" } else { HOSTED_ADAPTER_KIND },
+            "api_url": if decision { OPENROUTER_DECISIONS_URL } else { provider.chat_url() },
             "model": model,
             "secret_ref": hosted_secret_ref(offer_id),
             "hosted": hosted
@@ -611,6 +629,11 @@ fn connection_from_offer(offer: &serde_json::Value) -> Option<AiProviderConnecti
     let connected =
         offer.get("enabled").and_then(serde_json::Value::as_bool) != Some(false) && key_present;
     Some(AiProviderConnection {
+        operation: offer
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("text.generate")
+            .to_string(),
         id,
         name,
         provider: provider.as_str().to_string(),
@@ -713,7 +736,8 @@ pub(crate) fn offer_is_shareable(offer: &serde_json::Value) -> bool {
     if !listed_or_operator_is_hosted(offer) {
         return true;
     }
-    hosted_share_enabled(offer)
+    offer.get("operation").and_then(serde_json::Value::as_str) == Some("text.generate")
+        && hosted_share_enabled(offer)
         && operator_offer_enabled(offer)
         && (operator_offer_has_key(offer)
             || offer
@@ -740,6 +764,9 @@ fn preserve_hosted_share(
     model: &str,
     share: Option<serde_json::Value>,
 ) -> serde_json::Value {
+    if offer.get("operation").and_then(serde_json::Value::as_str) != Some("text.generate") {
+        return offer;
+    }
     let Some(mut share) = share else {
         return offer;
     };
@@ -967,7 +994,7 @@ pub(crate) fn hosted_model_share_cards(
         .iter()
         .filter_map(|offer| {
             let connection = connection_from_offer(offer)?;
-            if !connection.connected {
+            if !connection.connected || connection.operation != "text.generate" {
                 return None;
             }
             let provider = hosted_provider_from_offer(offer)?;
@@ -1028,6 +1055,10 @@ pub(crate) fn set_hosted_offer_share(
         anyhow::bail!("hosted connection is required");
     }
     if enabled {
+        anyhow::ensure!(
+            connection.operation == "text.generate",
+            "only text model connections can be shared as Assistant services"
+        );
         let ack = terms_ack.map(str::trim).unwrap_or_default();
         if ack.is_empty() {
             anyhow::bail!("share terms acknowledgment is required");
@@ -1106,16 +1137,28 @@ pub(crate) fn ai_provider_status(data_dir: &Path) -> anyhow::Result<AiProviderSt
     )?))
 }
 
+pub(crate) struct HostedOfferSave<'a> {
+    pub provider: HostedAiProvider,
+    pub api_key: &'a str,
+    pub model: &'a str,
+    pub privacy: Option<&'a str>,
+    pub name: &'a str,
+    pub instance_id: Option<&'a str>,
+}
+
 pub(crate) async fn save_hosted_offer(
     data_dir: &Path,
     registry: Option<&provider::ProviderRegistry>,
-    provider: HostedAiProvider,
-    api_key: &str,
-    model: &str,
-    privacy: Option<&str>,
-    name: &str,
-    instance_id: Option<&str>,
+    request: HostedOfferSave<'_>,
 ) -> anyhow::Result<AiProviderStatus> {
+    let HostedOfferSave {
+        provider,
+        api_key,
+        model,
+        privacy,
+        name,
+        instance_id,
+    } = request;
     {
         let _guard = MODEL_PROVIDER_CONFIG_MUTEX
             .get_or_init(|| Mutex::new(()))
@@ -1278,7 +1321,11 @@ fn read_model_provider_private_file(
 
 #[cfg(test)]
 mod hosted_hint_tests {
-    use super::{hosted_hint_from_offers, hosted_offer, status_from_offers, HostedAiProvider};
+    use super::{
+        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer, named_jev_hosted_offer,
+        seed_model_provider_operator_offers_for_test, set_hosted_offer_share, status_from_offers,
+        HostedAiProvider,
+    };
     use serde_json::json;
 
     #[test]
@@ -1344,15 +1391,15 @@ mod hosted_hint_tests {
         assert_eq!(status.connections[0].id, "model:openrouter");
         assert_eq!(status.connections[0].name, "OpenRouter");
         assert_eq!(status.connections[0].provider, "openrouter");
-        assert_eq!(status.connections[0].connected, true);
+        assert!(status.connections[0].connected);
         assert_eq!(
             status.connections[0].selected_model.as_deref(),
             Some("fixture/model")
         );
-        assert_eq!(status.connections[0].key_present, true);
+        assert!(status.connections[0].key_present);
         assert_eq!(status.connections[0].privacy, None);
         assert_eq!(status.connections[1].provider, "venice");
-        assert_eq!(status.connections[1].connected, true);
+        assert!(status.connections[1].connected);
         assert_eq!(status.connections[1].privacy.as_deref(), Some("private"));
         let status_json = serde_json::to_string(&status).unwrap();
         let status_debug = format!("{status:?}");
@@ -1364,6 +1411,32 @@ mod hosted_hint_tests {
         assert!(!status_json.contains("api_url"));
         assert!(!status_debug.contains("sk-or-fixture-valid"));
         assert!(!status_debug.contains("openrouter.ai"));
+    }
+
+    #[test]
+    fn named_jev_requires_a_decision_model_and_stays_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut offer = hosted_offer(
+            HostedAiProvider::OpenRouter,
+            "model:openrouter",
+            "Jev",
+            "typesafe/jev-1.13",
+            None,
+        );
+        offer["adapter"]["api_key"] = serde_json::json!("fixture-secret");
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer.clone()]).unwrap();
+        assert!(named_jev_hosted_offer(dir.path()).is_some());
+        assert!(hosted_model_share_cards(dir.path()).unwrap().is_empty());
+        assert!(set_hosted_offer_share(
+            dir.path(),
+            "model:openrouter",
+            true,
+            Some(HostedAiProvider::OpenRouter.share_terms_ack())
+        )
+        .is_err());
+        offer["adapter"]["model"] = serde_json::json!("other/model");
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
+        assert!(named_jev_hosted_offer(dir.path()).is_none());
     }
 
     #[test]
@@ -1388,24 +1461,28 @@ mod hosted_hint_tests {
         assert!(super::offer_is_shareable(&json!({
             "id": "model:openrouter",
             "hosted": { "placement": "hosted" },
+            "operation": "text.generate",
             "share": { "enabled": true },
             "key_present": true
         })));
         assert!(super::offer_is_shareable(&json!({
             "id": "model:hosted-0123456789abcdef0123456789abcdef",
             "hosted": { "placement": "hosted" },
+            "operation": "text.generate",
             "share": { "enabled": true },
             "key_present": true
         })));
         assert!(!super::offer_is_shareable(&json!({
             "id": "model:venice",
             "hosted": { "placement": "hosted" },
+            "operation": "text.generate",
             "share": { "enabled": false },
             "key_present": true
         })));
         assert!(!super::offer_is_shareable(&json!({
             "id": "model:openrouter",
             "hosted": { "placement": "hosted" },
+            "operation": "text.generate",
             "share": { "enabled": true },
             "enabled": false,
             "key_present": true
@@ -1415,7 +1492,7 @@ mod hosted_hint_tests {
     #[test]
     fn preserve_hosted_share_keeps_enabled_and_updates_model() {
         let preserved = super::preserve_hosted_share(
-            json!({ "id": "model:openrouter" }),
+            json!({ "id": "model:openrouter", "operation": "text.generate" }),
             HostedAiProvider::OpenRouter,
             "fixture/replaced",
             Some(json!({
@@ -1431,6 +1508,47 @@ mod hosted_hint_tests {
         assert_eq!(preserved["share"]["model"], "fixture/replaced");
         assert_eq!(preserved["share"]["processor"], "OpenRouter");
         assert_eq!(preserved["share"]["payer"], "this Home");
+    }
+    #[tokio::test]
+    async fn replacing_shared_text_with_jev_clears_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "model:hosted-0123456789abcdef0123456789abcdef";
+        super::save_hosted_offer(
+            dir.path(),
+            None,
+            crate::api::model_provider_config::HostedOfferSave {
+                provider: HostedAiProvider::OpenRouter,
+                api_key: "fixture-key",
+                model: "fixture/text",
+                privacy: None,
+                name: "Chat",
+                instance_id: Some(id),
+            },
+        )
+        .await
+        .unwrap();
+        let mut offers = super::load_model_provider_operator_offers(dir.path()).unwrap();
+        offers[0]["share"] = json!({"enabled": true});
+        super::persist_model_provider_operator_offers(dir.path(), offers).unwrap();
+        super::save_hosted_offer(
+            dir.path(),
+            None,
+            crate::api::model_provider_config::HostedOfferSave {
+                provider: HostedAiProvider::OpenRouter,
+                api_key: "fixture-key",
+                model: "typesafe/jev-1.13",
+                privacy: None,
+                name: "Jev",
+                instance_id: Some(id),
+            },
+        )
+        .await
+        .unwrap();
+        let mut offers = super::load_model_provider_operator_offers(dir.path()).unwrap();
+        assert!(!super::hosted_share_enabled(&offers[0]));
+        // Even a stale stored share cannot expose a decision offer.
+        offers[0]["share"] = json!({"enabled": true});
+        assert!(!super::offer_is_shareable(&offers[0]));
     }
 }
 

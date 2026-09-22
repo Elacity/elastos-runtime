@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::*;
 
 #[cfg_attr(test, allow(dead_code))]
-const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models?output_modalities=all";
 #[cfg_attr(test, allow(dead_code))]
 const VENICE_RATE_LIMITS_URL: &str = "https://api.venice.ai/api/v1/api_keys/rate_limits";
 #[cfg_attr(test, allow(dead_code))]
@@ -206,7 +206,19 @@ fn parse_openrouter_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredMo
             continue;
         };
         let id = id.trim();
-        if !id.is_empty() {
+        // Discovery admits only the operations implemented by this provider.
+        let outputs = entry
+            .pointer("/architecture/output_modalities")
+            .and_then(serde_json::Value::as_array);
+        let decision = outputs
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("decisions")));
+        let text =
+            outputs.is_some_and(|items| items.iter().any(|item| item.as_str() == Some("text")));
+        let pinned_jev = id.starts_with("typesafe/jev-");
+        if !id.is_empty()
+            && !id.starts_with('~')
+            && ((decision && pinned_jev) || (text && !decision && !pinned_jev))
+        {
             models.push(DiscoveredModel {
                 id: id.to_string(),
                 privacy: None,
@@ -495,12 +507,14 @@ pub(super) async fn system_ai_provider_save(
     match crate::api::save_hosted_offer(
         &state.data_dir,
         state.provider_registry.as_deref(),
-        provider,
-        &api_key,
-        &model,
-        selected.privacy.as_deref(),
-        &name,
-        req.id.as_deref(),
+        crate::api::model_provider_config::HostedOfferSave {
+            provider,
+            api_key: &api_key,
+            model: &model,
+            privacy: selected.privacy.as_deref(),
+            name: &name,
+            instance_id: req.id.as_deref(),
+        },
     )
     .await
     {
@@ -592,13 +606,23 @@ mod parse_tests {
     fn parse_openrouter_models_body_reads_ids() {
         assert_eq!(
             super::parse_openrouter_models_body(
-                br#"{"data":[{"id":"fixture/model"},{"id":"  "}]}"#
+                br#"{"data":[
+                    {"id":"fixture/model","architecture":{"output_modalities":["text"]}},
+                    {"id":"typesafe/jev-1.13","architecture":{"output_modalities":["decisions"]}},
+                    {"id":"~typesafe/jev-latest","architecture":{"output_modalities":["decisions"]}},
+                    {"id":"other/decision","architecture":{"output_modalities":["decisions"]}},
+                    {"id":"image/only","architecture":{"output_modalities":["image"]}},
+                    {"id":"audio/only","architecture":{"output_modalities":["audio"]}},
+                    {"id":"embedding/only","architecture":{"output_modalities":["embeddings"]}},
+                    {"id":"unknown/modalities"},
+                    {"id":"  ","architecture":{"output_modalities":["text"]}}
+                ]}"#
             )
             .unwrap()
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>(),
-            vec!["fixture/model".to_string()]
+            vec!["fixture/model".to_string(), "typesafe/jev-1.13".to_string()]
         );
     }
 

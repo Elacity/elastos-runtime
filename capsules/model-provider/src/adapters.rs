@@ -9,6 +9,7 @@ use crate::contract::{
 };
 use crate::journal::{deterministic_run_id, now_ms};
 use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
+use elastos_model_contract::decisions;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -378,6 +379,13 @@ struct LocalTextWorkerTask {
 }
 
 enum LocalTextBackend {
+    // Decisions share the cancellable HTTP worker lifecycle; output is inline JSON.
+    OpenRouterDecisions {
+        api_url: String,
+        api_key: Option<String>,
+        model: String,
+        input: decisions::Input,
+    },
     OpenAiCompatible {
         api_url: String,
         api_key: Option<String>,
@@ -950,6 +958,40 @@ impl AdapterExecutor for LiveAdapterExecutor {
         deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault> {
         match adapter {
+            AdapterConfig::OpenRouterDecisions {
+                api_url,
+                api_key,
+                model,
+                ..
+            } => {
+                let decision: decisions::Input =
+                    serde_json::from_value(input.clone()).map_err(|_| {
+                        AdapterFault::context("model input is invalid", "invalid decision input")
+                    })?;
+                decision.validate().map_err(|_| {
+                    AdapterFault::context("model input is invalid", "invalid decision questions")
+                })?;
+                let backend_state = self.spawn_local_text_worker(
+                    LocalTextBackend::OpenRouterDecisions {
+                        api_url: api_url.clone(),
+                        api_key: api_key.clone(),
+                        model: model.clone(),
+                        input: decision,
+                    },
+                    offer,
+                    binding,
+                    "",
+                    deadline_ms,
+                )?;
+                Ok(DispatchResult::Running {
+                    events: vec![EventSeed {
+                        kind: "dispatched",
+                        data: json!({"offer_id": offer.id}),
+                    }],
+                    backend_state,
+                })
+            }
+
             AdapterConfig::OpenAiCompatibleText {
                 api_url,
                 api_key,
@@ -1037,7 +1079,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<ReconcileResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. }
+            AdapterConfig::OpenRouterDecisions { .. }
+            | AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 reconcile_local_text(self, binding, backend_state)
@@ -1069,7 +1112,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         allow_send: bool,
     ) -> std::result::Result<CancelResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. }
+            AdapterConfig::OpenRouterDecisions { .. }
+            | AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 cancel_local_text(self, binding, backend_state)
@@ -1100,7 +1144,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<CancelReservation, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. }
+            AdapterConfig::OpenRouterDecisions { .. }
+            | AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => reserve_local_text_cancel(backend_state),
             AdapterConfig::HttpJobArtifact { cancel_url, .. } => {
@@ -1468,6 +1513,23 @@ async fn run_local_text_worker_inner(
     )
     .then(HostedBackendReport::default);
     let (api_url, api_key, body, private_endpoint) = match &task.backend {
+        LocalTextBackend::OpenRouterDecisions {
+            api_url,
+            api_key,
+            model,
+            input,
+        } => {
+            return run_decision_worker(
+                api_url,
+                api_key.as_deref(),
+                model,
+                input,
+                &task.offer,
+                task.deadline_ms,
+                &mut task.cancel_rx,
+            )
+            .await;
+        }
         LocalTextBackend::OpenAiCompatible {
             api_url,
             api_key,
@@ -1677,6 +1739,79 @@ async fn run_local_text_worker_inner(
         backend_report: backend_report
             .map(HostedBackendReport::finish)
             .map(Box::new),
+    })
+}
+
+async fn run_decision_worker(
+    api_url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    input: &decisions::Input,
+    offer: &ConfiguredOffer,
+    deadline_ms: u64,
+    cancel: &mut watch::Receiver<bool>,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    let client = backend_client(
+        remaining_run_timeout(deadline_ms)?
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )?;
+    let body = json!({"model": model, "state": input.state, "questions": input.questions,
+        "provider": {"allow_fallbacks": false}});
+    let mut request = client.post(api_url).json(&body);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = tokio::select! {
+        _ = cancel.changed() => return Ok(worker_settlement_unknown_result()),
+        response = request.send() => response.map_err(map_reqwest_failure)?,
+    };
+    if !response.status().is_success() {
+        return Err(map_backend_http_status(response.status()));
+    }
+    let value = tokio::select! {
+        _ = cancel.changed() => return Ok(worker_settlement_unknown_result()),
+        value = read_bounded_json_response_async(response) => value?,
+    };
+    let mut report = HostedBackendReport::default();
+    if let Some(object) = value.as_object() {
+        report.observe_responses_completed(object);
+    }
+    if let Some(usage) = value.get("usage").and_then(Value::as_object) {
+        if usage.contains_key("cost") {
+            report.cost.observe(parse_backend_cost(usage));
+        }
+    }
+    let output = (|| {
+        let output: decisions::Output = serde_json::from_value(json!({
+            "schema": decisions::OUTPUT_SCHEMA, "model": value.get("model"), "answers": value.get("answers")
+        })).map_err(|_| AdapterFault::malformed("model backend returned invalid data", "invalid decision response"))?;
+        output.validate_for(input, model).map_err(|_| {
+            AdapterFault::malformed(
+                "model backend returned invalid data",
+                "decision response does not match request",
+            )
+        })?;
+        let output = serde_json::to_value(output).map_err(|_| {
+            AdapterFault::malformed(
+                "model backend returned invalid data",
+                "invalid decision output",
+            )
+        })?;
+        sanitize_output(&output, offer)?;
+        Ok::<_, AdapterFault>(output)
+    })();
+    let (status, output, error) = match output {
+        Ok(output) => (RunStatus::Completed, Some(output), None),
+        Err(fault) => (RunStatus::Failed, None, Some(fault.error)),
+    };
+    Ok(ReconcileResult::Terminal {
+        events: Vec::new(),
+        status,
+        output,
+        error,
+        backend_report: Some(Box::new(report.finish())),
     })
 }
 
@@ -3058,6 +3193,183 @@ mod tests {
             },
             enabled: true,
         }
+    }
+
+    fn decision_input() -> decisions::Input {
+        serde_json::from_value(
+            json!({"schema": decisions::INPUT_SCHEMA, "state": "Bounded test action",
+            "questions": {"review": {"type": "choice", "instructions": "Choose a review outcome",
+                "criteria": {"allow": "Authorized", "defer": "Needs human review"}}}}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn decision_http_request_and_failed_reply_preserve_reported_accounting() {
+        for (actual_model, choice, expected_status) in [
+            ("typesafe/jev-1.13", "defer", RunStatus::Completed),
+            ("different-model", "defer", RunStatus::Failed),
+            ("typesafe/jev-1.13", "invented", RunStatus::Failed),
+        ] {
+            let server = start_server(vec![HttpResponseSpec {
+                status_line: "200 OK",
+                headers: vec![],
+                body: serde_json::to_vec(&json!({"model": actual_model,
+                    "answers": {"review": {"type": "choice", "choice": choice, "confidence": 0.8}},
+                    "usage": {"input_tokens": 25, "output_tokens": 0, "cost": 0.00000105}}))
+                .unwrap(),
+            }]);
+            let url = format!("{}/api/alpha/decisions", server.base_url);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (_cancel_tx, mut cancel) = watch::channel(false);
+            let input = decision_input();
+            let result = runtime
+                .block_on(run_decision_worker(
+                    &url,
+                    Some("fixture-secret"),
+                    "typesafe/jev-1.13",
+                    &input,
+                    &openai_offer(&url),
+                    now_ms() + 5000,
+                    &mut cancel,
+                ))
+                .unwrap();
+            let ReconcileResult::Terminal {
+                status,
+                output,
+                backend_report: Some(report),
+                ..
+            } = result
+            else {
+                panic!("missing terminal report")
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(output.is_some(), expected_status == RunStatus::Completed);
+            let report = serde_json::to_value(report).unwrap();
+            assert_eq!(report["resolved_model"]["value"], actual_model);
+            assert_eq!(report["usage"]["status"], "reported");
+            assert_eq!(report["cost"]["value"]["value"], "1.05e-6");
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert!(request.starts_with("POST /api/alpha/decisions "));
+            assert!(request
+                .to_lowercase()
+                .contains("authorization: bearer fixture-secret"));
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(
+                body,
+                json!({"model":"typesafe/jev-1.13", "state":input.state, "questions":input.questions, "provider":{"allow_fallbacks":false}})
+            );
+            assert!(!output
+                .unwrap_or(Value::Null)
+                .to_string()
+                .contains("fixture-secret"));
+        }
+    }
+
+    #[test]
+    fn decision_cancellation_during_headers_or_body_keeps_unknown_settlement() {
+        for send_headers in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://{}/api/alpha/decisions",
+                listener.local_addr().unwrap()
+            );
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std_mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").unwrap();
+                    stream.flush().unwrap();
+                }
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (cancel_tx, mut cancel) = watch::channel(false);
+            let input = decision_input();
+            let offer = openai_offer(&url);
+            let result = runtime.block_on(async {
+                let worker = run_decision_worker(
+                    &url,
+                    None,
+                    "typesafe/jev-1.13",
+                    &input,
+                    &offer,
+                    now_ms() + 2000,
+                    &mut cancel,
+                );
+                let interrupt = async {
+                    ready_rx.await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    cancel_tx.send(true).unwrap();
+                };
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::join!(worker, interrupt).0
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            });
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::SettlementUnknown,
+                    output: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn decision_restart_reconciles_unknown_without_another_post() {
+        let server = start_server(Vec::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (updates, _receiver) = mpsc::channel(1);
+        let executor = LiveAdapterExecutor::new(runtime.handle().clone(), updates);
+        let mut offer = openai_offer(&server.base_url);
+        offer.operation = decisions::OPERATION.into();
+        offer.input_modalities = vec!["application/json".into()];
+        offer.output_modalities = vec!["application/json".into()];
+        offer.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: server.base_url.clone(),
+            api_key: None,
+            model: "typesafe/jev-1.13".into(),
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        offer.validate().unwrap();
+        let state = serialize_local_text_backend_state(false).unwrap();
+        let result = executor
+            .reconcile(&offer.adapter, &offer, &openai_binding(), &state)
+            .unwrap();
+        assert!(matches!(
+            result,
+            ReconcileResult::Terminal {
+                status: RunStatus::SettlementUnknown,
+                ..
+            }
+        ));
+        assert!(server.requests.lock().unwrap().is_empty());
+        if let AdapterConfig::OpenRouterDecisions { model, .. } = &mut offer.adapter {
+            *model = "~typesafe/jev-latest".into();
+        }
+        assert!(offer.validate().is_err());
     }
 
     fn text_input(prompt: &str) -> Value {
