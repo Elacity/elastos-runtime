@@ -213,34 +213,40 @@ The next outcomes use the existing acceptance IDs in this order:
    prompt. DS4 completed with a matching input hash, named instance, request,
    run and terminal reply. The receipt keeps the connection decision separate
    from create acceptance and terminal inference. Human authority remains intact.
-4. **MA4 remote hosted use:** share one named instance through existing Services,
-   complete a second-Home reply and verify destination-enforced revoke, expiry,
-   pause, replacement/disconnect and bounded settlement. Use fresh request IDs
-   for new-dispatch denials; credentials remain on the owner Home.
-   Two source-built Mac Homes now have separate identities, matching signed
-   network configuration and stable local Carrier listeners. Both Homes are
-   signed in; the owner shared one Venice instance, and the consumer accepted
-   the owner contact. Installed Inbox now preserves the signed contact name.
-   A model-only sharing mailbox guard omitted incoming requests. The repair
-   passed three focused tests and source review; the installed consumer now
-   sends the request and the owner Inbox receives it. Human service approval
-   is pending before the unpaid offer check and shared inference. The shared
-   offer route now recognizes Runtime secret references as well as legacy inline
-   keys. All 29 remote-model tests passed, including exact fresh-request denials,
-   regrant recovery and old-run settlement. One private/remote concurrency test
-   passed. Both Homes now run the matching reviewed Runtime and provider
-   artifacts after normal restart; saved provider settings remain unchanged.
-   The shared reply still needs installed proof. This setup is a local two-Home path. Marketplace projection of
-   service offers and access remains a separate product flow to complete.
-5. **MA5.2 combined candidate — final reconciliation:** the earlier combined
+4. **MA4 remote hosted use — bounded handoff verified:** two signed-in Mac Homes
+   completed ordinary contact, service request and human approval through Home.
+   The consumer listed the authorized offer before paid inference, selected the
+   named Venice instance, and received a completed reply. Its request, grant,
+   remote offer and input hash match the owner run and provider journal.
+   Assistant now names the provider Home as payer and identifies both prompt
+   recipients; upstream retention, usage and billed cost remain unreported.
+   The completed conversation and remote selection survived reload. The consumer
+   holds zero provider keys; all nine owner connections and key hashes remain.
+   Three mailbox tests and 29 remote-model tests passed, including exact fresh
+   authority denials, pause/disconnect withdrawal, regrant and old-run access.
+   One private/remote concurrency test passed. Replacement, cancellation and
+   loss settlement reuse their named passing source fixtures. These checks keep
+   their source-test scope. An authorized installed pause and fresh request
+   produced no new owner run or provider journal. The completed run remained
+   intact; restoring the exact share preserved all keys and the existing grant.
+   A new chat and explicit model refresh recovered the remote offer without
+   another paid request. The consumer conservatively retained unknown acceptance;
+   precise refusal copy needs an explicit destination pre-dispatch assertion.
+   The full installed negative matrix remains unclaimed.
+   This is a local two-Home path. Marketplace projection of service offers and
+   access remains a separate product flow to complete.
+5. **MA5.2 combined candidate — local handoff verified:** the earlier combined
    candidate passed the basic AGENTS gate and `just verify`, including workspace lint/tests, all separate capsule
    workspaces and the Browser local-exit helper. The server suite passed 2,186
    tests with 16 opt-in skips; the model provider passed 215 unit tests and five
    process tests with two opt-in skips. Other live IPFS and documentation skips
    retain their recorded reasons. Independent review accepted the source,
    artifact evidence and local commit boundaries. Focused checks cover the later
-   repairs; freeze their installed artifacts and local commit set after the
-   sharing journey above.
+   repairs. Runtime, provider and changed capsule hashes match both installed
+   Homes; served Assistant disclosure bytes match the reviewed source. The
+   reviewed local commits preserve the original dirty work and parent history.
+   The bounded handoff is complete; publication and wider qualification remain
+   separate gates.
    The initial combined run exposed stale authorization, key-permission,
    direct-discovery and reconciliation fixtures. All 25 affected cases now pass
    after independent review. Optional

@@ -49,19 +49,32 @@ Repeated installed saves preserved all nine connection identities, stored-key
 hashes and list order. Warm local engine retention permits idle hosted additions
 while active and unresolved ownership guards remain in force. The two signed-in
 Homes discovered each other and accepted a contact through ordinary Home; the
-owner has shared one named Venice connection. This proves contact setup, with
-remote model access and inference still awaiting their separate checks.
-The model-only request mailbox repair is installed on both Homes, and the
-owner Inbox received the consumer's service request. A later source test found
-that the sharing route recognized inline keys but omitted saved secret references.
-The correction uses the existing key-presence check. All 29 remote-model tests
-passed, including fresh-request authority denials, pause/disconnect withdrawal,
-regrant recovery and continued access to old runs. These are source fixtures;
-the installed shared reply remains pending. Both owned Homes now run Runtime
+owner shared one named Venice connection and approved the consumer request in
+Inbox. The consumer listed its authorized remote offer before a paid request,
+then received “The mountain stream rushed over cool stones.” Its grant, named
+instance, request, canonical input hash and run match the owner records and
+provider journal. The provider reported `qwen-3-8-flash`; usage and cost remain
+unknown. One journaled dispatch does not establish an independent billing count.
+The conversation and selected remote offer survived consumer reload with the
+completed provider journal unchanged. The consumer holds zero provider keys.
+
+The model-only request mailbox and secret-reference sharing repairs are installed
+on both Homes. All 29 remote-model tests passed, including fresh-request authority
+denials, pause/disconnect withdrawal, regrant recovery and continued access to old
+runs. A private/remote same-instance concurrency test passed. These are source
+fixtures. An authorized installed pause and fresh consumer prompt produced no
+new owner run or provider journal; the prior completed run stayed intact. The
+exact share, configuration and existing grant were restored. A new chat and
+explicit unpaid model refresh recovered the same remote offer. The consumer
+conservatively retained unknown acceptance because the current error classes
+can also arise after dispatch. More precise refusal copy needs a destination
+pre-dispatch assertion. A complete installed negative matrix is not claimed. Both owned Homes run Runtime
 `acb5011232841a3cde788494b47172bf8d0503ab2665c7f1715e56ac3d54dc81`
 with matching built and installed provider/capsule hashes. Normal restart,
-served Inbox parity and installed provider verification passed. The owner's
-nine stored keys and provider configuration remained unchanged.
+served Inbox parity and installed provider verification passed. Assistant's
+reviewed disclosure patch also matches installed and served bytes; it names the
+provider Home as payer and both prompt recipients while leaving retention
+unreported. The owner's nine keys and provider configuration remain unchanged.
 
 The installed UI now keeps model preparation polling active until a terminal
 result or view closure. A regression check passed 131 polls and verified timer
@@ -71,10 +84,11 @@ startup. The basic AGENTS gate and full `just verify` passed on the combined
 source, including separate capsule workspaces and the Browser local-exit helper.
 The server suite passed 2,186 tests with 16 opt-in skips; the model provider
 passed 215 unit tests and five process tests with two opt-in skips. Live IPFS
-and documentation examples retain their opt-in skips. Two-Home hosted sharing
-remains open for the pending Home actions. Focused provider, gateway and UI checks cover the later Save and
-canonical identity repairs; the full-suite counts above describe the earlier
-combined candidate.
+and documentation examples retain their opt-in skips. Focused provider, gateway
+and UI checks cover the later Save, canonical identity, sharing and disclosure
+repairs; the full-suite counts above describe the earlier combined candidate. The five bounded handoff outcomes are verified with these
+explicit source and installed evidence scopes. The local candidate remains
+unpublished; Marketplace service entry/access projection retains its own work.
 Public installer, reverse Mac dial, approved relay, indefinite
 provider-hang cancellation and full Qwen delivery retain their separate gates.
 The following dated inventory preserves earlier evidence and public state; it
