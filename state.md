@@ -1,6 +1,56 @@
 # State
 
-## Current model delivery checkpoint, 19 September 2026 UTC
+## Current model delivery checkpoint, 22 September 2026 UTC
+
+The unpublished closeout source preserves the security parent and original
+Carrier/preparation work. A fresh source-built Mac Home completed the signed
+SmolLM2 Marketplace-to-Assistant journey through direct Carrier from a distinct
+seed Home. The 144,835,448-byte closure and all five file hashes match the signed
+catalog. Runtime activation completed; two separate Assistant runs returned
+terminal output from the admitted model.
+
+Conversation, model selection and an unsent draft survived reload and an owned
+Runtime restart. Warm reopen with the consumer's seed route withdrawn used the
+same weights hash, inode and modification time, with zero Carrier UDP traffic.
+Admission retained one 443,091,560-byte quota charge and the owner's Keep claim.
+The source-built Runtime for this accepted journey is SHA-256
+`b24f3c7cf68b9ecd7e52034e081d45c7482cd539f85cd8927c826a59d2772afd`.
+Independent review accepted the artifact and UI receipts. The human passkey
+session stayed signed in. Marketplace polling stopped before the longer transfer
+finished; Refresh restored progress while the backend operation continued.
+
+Runtime `b20622552145c906bc409cea9aa59b417b62970886e71a181095be63f055ae24`
+completed a real private Venice Assistant request through ordinary Home on
+`qwen-3-8-flash`. The receipt binds the visible turn, canonical
+input hash, named offer, request, run and terminal response. Provider usage and
+billed cost remain unknown. The named model configuration and stored key hashes
+survived the subsequent install and restart of Runtime
+`fe44fe8aae0212fc31414ce03b33c9dc8fc341414703b1ccedbba141d0e5d188`.
+That Runtime also completed a fresh lighthouse prompt through ordinary Assistant,
+with a new request/run and reported `qwen-3-8-flash` terminal output. Built and
+installed Runtime, model-provider and changed capsule files match; installed
+provider verification passed on both test Homes. A new ordinary Assistant run
+also completed on the admitted local SmolLM2 model, with an independently checked
+input hash, request, run and terminal reply. Real Jev advice still waits for its
+named instance setup through Home; source fixtures cover the typed Decisions
+contract, failure handling and human decision boundary.
+
+The installed UI now keeps model preparation polling active until a terminal
+result or view closure. A regression check passed 131 polls and verified timer
+cleanup. The optional `carrier_bind_addr` setting gives a configured direct
+bootstrap a stable listener; an invalid or occupied explicit address stops
+startup. The basic AGENTS gate and full `just verify` passed on the combined
+source, including separate capsule workspaces and the Browser local-exit helper.
+The server suite passed 2,186 tests with 16 opt-in skips; the model provider
+passed 215 unit tests and five process tests with two opt-in skips. Live IPFS
+and documentation examples retain their opt-in skips. Two-Home hosted sharing
+and real Jev evaluation remain open for the pending Home actions.
+Public installer, reverse Mac dial, approved relay, indefinite
+provider-hang cancellation and full Qwen delivery retain their separate gates.
+The following dated inventory preserves earlier evidence and public state; it
+does not describe this new local candidate as published.
+
+## Earlier model delivery checkpoint, 19 September 2026 UTC
 
 The model-delivery source line is `feat/remote-services`
 `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` on `origin`. Working closeout
@@ -197,11 +247,16 @@ Stop is accepted: 61953 is honest `settlement_unknown`, and 61942 is
 confirmed completed. Coexistence removal, byte reuse, and Chosen model
 unavailable are accepted. Active-run Remove consent and local retention
 consent are accepted on disposable 61956. Global sole copy stays Waiting.
-MA2 is Partial/Waiting on DirectOnly Ask 61942 to 61680. Live prepare is
+MA2 is Partial/Waiting on DirectOnly Ask 61942 to 61680. Mac services
+runtime node `8d03e7b1` connected outbound to DirectOnly 61942 node
+`ede679a3` in 0.236 s. The dialed ticket had two public addresses and zero
+relay addresses. `list_peers` then showed that one peer. The Mac ticket relay
+was left unused. This proof sends no Ask. Live prepare is
 `created_at+3600`. Recovery does not extend or close that budget.
 The completed MA4 fixture Home 61958 was removed after census. The 61956
 Ping after Cancel/Retry admit timed out and stays outside the accepted
-Smol execution clause. MA2 waits on DirectOnly Ask delivery.
+Smol execution clause. MA2 Ask delivery stays open after the Mac outbound
+route to 61942.
 Release test `model_preparation_restart_reconciles_expired_rename_after_exact_hash`
 passed. Restart status admits an expired complete unrenamed stage after
 authority, catalogue, capacity, index, and CID/hash checks. Receipt
@@ -232,11 +287,107 @@ gossip with 0 bootstrap peers. The local offline read of
 `cancel_requested` false. `content.cancel` stayed declared. The attempt sent
 18 public UDP datagrams and 0 datagrams to seed holder 61954. The gateway
 repository stayed 128 KiB. Assistant execution remains unproven for this
-Linux consumer.
+Linux consumer. The owned transfer is operation
+`2feb233d8dea49d7e67873a8a850335693c03b47e6438b1e772747ab2d293c9a` on
+disposable gateway `127.0.0.1:61962`, managed Home `127.0.0.1:44117`,
+marketplace `content.use`, same Qwen CID. It is not operation
+`bf2ff7d0…`. `content.cancel` returned HTTP 200 and set `cancel_requested`
+true. The journal stayed `preparing` with `reserved_bytes` 18516684377 and
+`completed_bytes` 24403. The worker stayed in `cat_to_path`. The last
+gateway warning was 2026-09-21T22:38:27Z at elapsed 900 s. One SIGTERM to
+the disposable gateway stopped that consumer within 15 s. Seed holder
+61954, the Mac holder, its Kubo, and the human Homes stayed. The journal
+is now `uncertain`, `failure_phase` `weights_read`, `cancel_requested`
+true, and `reserved_bytes` 18516684377. The reservation is still held.
+This stop is operational containment. The running worker did not settle
+inside that process. One normal restart of the same installed gateway,
+pid 955407, binary SHA-256 prefix `cc77e40279d5e595`, then one
+`content.status` for this operation wrote `cancelled`, `reserved_bytes`
+0, and `completed_bytes` 24403. No admission directory exists. The worker
+lock was free. Recovery removed the stage weights file. The ipfs-repo
+grew 1,759,775 bytes and logged no `cat_to_path`. The Mac Qwen pin stayed.
+Seed holder 61954 stayed. Managed Home `127.0.0.1:44117` did not listen.
+SmolLM2 stays unstarted. Mac free space was
+67,666,980 KiB of 482,746,452 KiB. Seed free space was 44,790,288 KiB of
+314,748,412 KiB. Installed elastos SHA-256
+`cc77e40279d5e595b8690f982c86517a0f0b8297e9c78390d6d0542fe853a4c1`
+matches preparation.rs at `20ac3f628`, where the stop message is line 1075.
+That revision and current source read model bytes with `fetch_model_part`
+in 64 KiB bounds. The installed binary contains
+`ipfs-provider cat_to_path left no dest file` and `carrier-content-fetch`.
+Both strings are absent from `20ac3f628` and from HEAD. The live
+`cat_to_path` read was that overlay. Current preparation ends a held
+bounded read when `cancel_requested` is set. The existing drain and
+`settle_failure` path then releases the reservation.
+`model_preparation_actual_fetch_cancel_waits_for_held_read` used a 16-byte
+GGUF fixture, cancelled while the weights read stayed held, and reached
+`cancelled` with `reserved_bytes` 0, no stage, and no admission within 5 s.
+Two status calls and one fresh owner status left that record in place and
+started no worker. The same run passed the silent-holder cancel test and
+the restart drain test. Disk before that run was 67,613,820 KiB free of
+482,746,452 KiB. The source test passed. The disposable seed lane then ran a debug elastos
+from HEAD `e387c9ad` plus the uncommitted fetch helper. Built, installed,
+and the running process share SHA-256
+`6cc2ab44ecc46b28571c669510b8e39394d223fa0219ba18d52305de1d0187c3`.
+The file size is 454001624 bytes. Proof gateway `127.0.0.1:61963` used a
+763-byte fixture. The harness returns the ipfs-provider child when Kubo is still absent.
+One `content.use` then observed `op=cat` on that bridge. `kubo_pid` was
+null at that identification. The proof stopped the provider after
+`op=cat` was sent. `content.cancel` ran while the read stayed open.
+During the hold the journal stayed `preparing` with `reserved_bytes`
+8587505. Time from the cancel request to `cancelled` and `reserved_bytes`
+0 was 1.29 s. That interval includes the deliberate SIGSTOP hold of
+1.389 s. After SIGCONT the terminal state arrived in 0.201 s. The cat
+settled before `runtime_prepare_backend`. This result is a controlled
+drain-order proof. The provider resumed after the bounded hold. The
+stage directory is absent. The admission directory is absent. Two
+status calls and one restart status matched. Those calls sent no new
+`op=cat`. The loaded linux ipfs-provider matched its manifest checksum.
+The gateway log shows carrier online with 1 relay. Canonical `carrier.rs`
+at that binary starts `CarrierNodeNetwork::Public`. `ELASTOS_CARRIER_NETWORK`
+is absent from that binary. Parent accepts this local cancellation result.
+The acceptance covers the controlled drain, the zero reservation, and the
+idle restart. An indefinite provider hang stays a separate gate. WAN Carrier
+stays a separate gate. Seed holder 191661 stayed alive. The Mac protected
+processes stayed alive.
+The 22 September Codex review traced 306 seed build inputs to this source.
+The recovered dirty files and manifests matched the recorded installed build.
+Review then found two additional constructor gaps: operator calls selected N0,
+and the direct listener ignored explicit binds. Both now use the shared Carrier
+policy. Eleven narrow tests passed, followed by six affected tests after keeping
+isolated fixtures on ephemeral ports. The repaired Mac Runtime built successfully;
+its fresh source-home installation is in progress. This new installed journey
+remains pending. The retained admission charge is defined quota:
+`3 * 144835448 + 8388608 + 196608 = 443091560`; reuse aliases charge zero.
+Private evidence: `.audit/codex-goal1-lineage.json`.
+
+The reviewed CR1 selector is back in canonical `carrier.rs`. Unset and
+`direct` start Isolated. `public` is an error. `ELASTOS_RELAY_URL` on that
+path is an error until CR3 names an approved ElastOS relay. Isolated strips
+foreign relay hints before MemoryLookup and connect, and the connect hook
+rejects a relay address. Eight policy tests passed on the seed. The
+installed proof Home `127.0.0.1:61964` runs SHA-256
+`16fb94adb6aba4d9e03445c35a8835c9e399416f9221e46a4ba89f6591a64556`.
+Built, installed, and the running process match. The log says isolated.
+The ticket has 6 IP addresses and 0 relay addresses. The loaded linux
+ipfs-provider matches its manifest. The configured Mac holder ticket
+already had 0 relays and 2 IP addresses. That connect timed out at
+`metadata_read`. Operation `059969c3ba8f` stays failed with 0 bytes.
+The seed holder already pins SmolLM2. One later `content.use`, operation
+`8f885ed89d08`, read the 726-byte signed index and admitted 144,835,448
+bytes. Weights are 144,811,072 bytes and match SHA-256
+`c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a`.
+The admitted journal still records `reserved_bytes` 443091560. Holder
+191661 and lane 1004338 stayed alive. Proof gateway pid 1040783 stays up.
+Qwen stayed deferred. Mac free space is 121731864 KiB of 482746452 KiB.
+Seed free space is 40507532 KiB of 314748412 KiB. Full Qwen distribution
+acceptance stays open.
 Receipts `.audit/ma3-2-mac-holder-range-proof-receipt.json`,
 `.audit/ma3-2-mac-holder-64kib-range-receipt.json`,
-`.audit/ma3-2-seed-to-mac-route-receipt.json`, and
-`.audit/ma3-2-cold-consumer-receipt.json`. The local split through
+`.audit/ma3-2-seed-to-mac-route-receipt.json`,
+`.audit/ma3-2-cold-consumer-receipt.json`, and
+`.audit/ma3-2-qwen-cancel-closeout-receipt.json`, and
+`.audit/ma3-2-carrier-policy-receipt.json`. The local split through
 the MA1 record is `f6242b51`. The branch has no upstream. Live MA4
 hosted credential is absent on 61680 and public live. The one-form System
 Models OpenRouter/Venice Settings surface is a shortcut, not the MA4 product
