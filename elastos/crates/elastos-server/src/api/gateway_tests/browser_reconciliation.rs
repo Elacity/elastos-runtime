@@ -107,6 +107,22 @@ async fn finish_current_reconciliation_sweep() {
     }
 }
 
+// Keep this paused clock under the test's explicit control while other test
+// runtimes hold the shared Browser registry lock. An idle runtime would otherwise
+// advance lifecycle deadlines during those unrelated lock waits.
+async fn with_manual_test_clock(test: impl std::future::Future<Output = ()>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    tokio::select! {
+        biased;
+        () = test => {}
+        () = async {
+            while std::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+        } => panic!("manual-clock Browser test exceeded its 30-second real-time bound"),
+    }
+}
+
 async fn settle_sweep_without_virtual_time_autoadvance(
     reconciler: &BrowserLifecycleReconciler,
     expected_completed_sweeps: usize,
@@ -137,7 +153,10 @@ async fn advance_until_reconciliation_call_count(
         tokio::time::advance(step).await;
         finish_current_reconciliation_sweep().await;
     }
-    calls.wait_for_count(expected).await;
+    assert!(
+        calls.count() >= expected,
+        "reconciliation call count did not reach {expected}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -375,113 +394,116 @@ async fn periodic_stale_cleanup_retries_exact_binding_and_blocks_replacement_fai
 
 #[tokio::test(start_paused = true)]
 async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    let exit_close_calls = BrowserCloseCallRecorder::new();
-    let exit_close_started = Arc::new(tokio::sync::Notify::new());
-    let state = browser_engine_retrying_close_test_state(
-        dir.path(),
-        engine_close_calls,
-        MockBrowserEngineCloseFailure::Adapter,
-        0,
-        Some(MockExitClosePlan {
-            close_calls: exit_close_calls.clone(),
-            close_failures: 0,
-            close_hangs: 1,
-            close_started: Some(exit_close_started.clone()),
-        }),
-        None,
-    )
-    .await;
-    let principal_id = "person:local:stale-stream-timeout";
-    record_active_page(
-        &state,
-        principal_id,
-        "launch:stale-stream-timeout",
-        "page:stale-stream-timeout",
-        Some(BrowserStreamCleanup {
-            stream_id: "stream:launch:stale-stream-timeout".to_string(),
-            principal_id: principal_id.to_string(),
-        }),
-    )
-    .await;
-    let reconciler = start_controlled_browser_lifecycle_reconciler(state.clone())
-        .expect("controlled Runtime reconciler");
-
-    reconciler.wait_for_completed_sweeps(1).await;
-    tokio::time::advance(ACTIVE_HEARTBEAT_STALE_TTL + Duration::from_millis(1)).await;
-    notify_browser_lifecycle_reconciler(&state.data_dir);
-    reconciler.resume_sweeps();
-    exit_close_started.notified().await;
-    let blocked = reserve_browser_launch(
-        &state.data_dir,
-        principal_id,
-        retrying_browser_lifecycle("launch:blocked-during-stale-stream-timeout"),
-    )
-    .await
-    .expect_err("stale cleanup must retain capacity while its stream call is hanging");
-    assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
-
-    tokio::time::advance(BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT + Duration::from_millis(1))
+    with_manual_test_clock(async {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+        let exit_close_calls = BrowserCloseCallRecorder::new();
+        let exit_close_started = Arc::new(tokio::sync::Notify::new());
+        let state = browser_engine_retrying_close_test_state(
+            dir.path(),
+            engine_close_calls,
+            MockBrowserEngineCloseFailure::Adapter,
+            0,
+            Some(MockExitClosePlan {
+                close_calls: exit_close_calls.clone(),
+                close_failures: 0,
+                close_hangs: 1,
+                close_started: Some(exit_close_started.clone()),
+            }),
+            None,
+        )
         .await;
-    reconciler.wait_for_completed_sweeps(2).await;
-    assert_eq!(
-        browser_engine_cleanup_obligation_count(&state.data_dir).await,
-        1
-    );
-    assert_eq!(
-        browser_stream_cleanup_obligation_count(&state.data_dir).await,
-        1
-    );
+        let principal_id = "person:local:stale-stream-timeout";
+        record_active_page(
+            &state,
+            principal_id,
+            "launch:stale-stream-timeout",
+            "page:stale-stream-timeout",
+            Some(BrowserStreamCleanup {
+                stream_id: "stream:launch:stale-stream-timeout".to_string(),
+                principal_id: principal_id.to_string(),
+            }),
+        )
+        .await;
+        let reconciler = start_controlled_browser_lifecycle_reconciler(state.clone())
+            .expect("controlled Runtime reconciler");
 
-    let mut completed_sweeps = 2;
-    for _ in 0..64 {
-        if browser_engine_cleanup_obligation_count(&state.data_dir).await == 0
-            && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
-        {
-            break;
-        }
+        reconciler.wait_for_completed_sweeps(1).await;
+        tokio::time::advance(ACTIVE_HEARTBEAT_STALE_TTL + Duration::from_millis(1)).await;
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
-        completed_sweeps += 1;
-        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
-    }
-    assert_eq!(
-        browser_engine_cleanup_obligation_count(&state.data_dir).await,
-        0,
-        "exact engine cleanup obligations must drain to 0 via retry sweeps"
-    );
-    assert_eq!(
-        browser_stream_cleanup_obligation_count(&state.data_dir).await,
-        0,
-        "exact stream cleanup obligations must drain to 0 via retry sweeps"
-    );
-    exit_close_calls.wait_for_count(2).await;
-    let calls = exit_close_calls.snapshot().await;
-    assert!(calls.len() >= 2);
-    assert!(calls.iter().all(|call| {
-        call["stream_id"] == "stream:launch:stale-stream-timeout"
-            && call["principal_id"] == principal_id
-    }));
-    drop(calls);
-    assert_eq!(
-        browser_engine_cleanup_obligation_count(&state.data_dir).await,
-        0
-    );
-    assert_eq!(
-        browser_stream_cleanup_obligation_count(&state.data_dir).await,
-        0
-    );
-    let replacement = reserve_browser_launch(
-        &state.data_dir,
-        principal_id,
-        retrying_browser_lifecycle("launch:replacement-after-stale-stream-terminal"),
-    )
-    .await
-    .expect("replacement only after stale engine and stream cleanup are terminal");
-    release_browser_launch(&replacement).await;
-    reconciler.cancel();
-    reconciler.join().await.expect("Runtime shutdown");
+        exit_close_started.notified().await;
+        let blocked = reserve_browser_launch(
+            &state.data_dir,
+            principal_id,
+            retrying_browser_lifecycle("launch:blocked-during-stale-stream-timeout"),
+        )
+        .await
+        .expect_err("stale cleanup must retain capacity while its stream call is hanging");
+        assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        tokio::time::advance(BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT + Duration::from_millis(1))
+            .await;
+        reconciler.wait_for_completed_sweeps(2).await;
+        assert_eq!(
+            browser_engine_cleanup_obligation_count(&state.data_dir).await,
+            1
+        );
+        assert_eq!(
+            browser_stream_cleanup_obligation_count(&state.data_dir).await,
+            1
+        );
+
+        let mut completed_sweeps = 2;
+        for _ in 0..64 {
+            if browser_engine_cleanup_obligation_count(&state.data_dir).await == 0
+                && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
+            {
+                break;
+            }
+            notify_browser_lifecycle_reconciler(&state.data_dir);
+            reconciler.resume_sweeps();
+            completed_sweeps += 1;
+            settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
+        }
+        assert_eq!(
+            browser_engine_cleanup_obligation_count(&state.data_dir).await,
+            0,
+            "exact engine cleanup obligations must drain to 0 via retry sweeps"
+        );
+        assert_eq!(
+            browser_stream_cleanup_obligation_count(&state.data_dir).await,
+            0,
+            "exact stream cleanup obligations must drain to 0 via retry sweeps"
+        );
+        exit_close_calls.wait_for_count(2).await;
+        let calls = exit_close_calls.snapshot().await;
+        assert!(calls.len() >= 2);
+        assert!(calls.iter().all(|call| {
+            call["stream_id"] == "stream:launch:stale-stream-timeout"
+                && call["principal_id"] == principal_id
+        }));
+        drop(calls);
+        assert_eq!(
+            browser_engine_cleanup_obligation_count(&state.data_dir).await,
+            0
+        );
+        assert_eq!(
+            browser_stream_cleanup_obligation_count(&state.data_dir).await,
+            0
+        );
+        let replacement = reserve_browser_launch(
+            &state.data_dir,
+            principal_id,
+            retrying_browser_lifecycle("launch:replacement-after-stale-stream-terminal"),
+        )
+        .await
+        .expect("replacement only after stale engine and stream cleanup are terminal");
+        release_browser_launch(&replacement).await;
+        reconciler.cancel();
+        reconciler.join().await.expect("Runtime shutdown");
+    })
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -888,43 +910,57 @@ async fn expired_remote_engine_grant_forgets_launch_reconciliation_without_engin
 }
 
 #[tokio::test(start_paused = true)]
-async fn current_remote_engine_grant_still_asks_engine_for_launch_reconciliation() {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
-        dir.path(),
-        MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess,
-    )
-    .await;
-    let principal_id = "person:local:current-grant-reconciliation";
-    let reservation = record_pending_launch(
-        &state,
-        principal_id,
-        "launch:current-grant-reconciliation",
-        "stream:current-grant-reconciliation",
-    )
-    .await;
-    gateway_browser_remote::write_consumer_binding_for_test(
-        &state.data_dir,
-        &reservation,
-        principal_id,
-        "stream:current-grant-reconciliation",
-        crate::auth::now_ts().saturating_add(3600),
-    )
-    .expect("current remote Engine grant record");
-    let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
-    reconciliation_calls.wait_for_count(1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        1
-    );
-    finish_current_reconciliation_sweep().await;
-    advance_until_reconciliation_call_count(&reconciliation_calls, 2, Duration::from_millis(100))
+async fn current_unserviceable_remote_engine_grant_retains_reconciliation() {
+    with_manual_test_clock(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+            dir.path(),
+            MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess,
+        )
         .await;
-    close_calls.wait_for_count(1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        0
-    );
-    reconciler.cancel();
-    reconciler.join().await.expect("Runtime shutdown");
+        let principal_id = "person:local:current-grant-reconciliation";
+        let reservation = record_pending_launch(
+            &state,
+            principal_id,
+            "launch:current-grant-reconciliation",
+            "stream:current-grant-reconciliation",
+        )
+        .await;
+        gateway_browser_remote::write_consumer_binding_for_test(
+            &state.data_dir,
+            &reservation,
+            principal_id,
+            "stream:current-grant-reconciliation",
+            crate::auth::now_ts().saturating_add(3600),
+        )
+        .expect("current remote Engine grant record");
+        let reconciler = start_controlled_browser_lifecycle_reconciler(state.clone())
+            .expect("controlled Runtime reconciler");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reconciler.wait_for_completed_sweeps(1),
+        )
+        .await
+        .expect("remote rejection must settle a bounded sweep");
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+            1
+        );
+        assert_eq!(reconciliation_calls.count(), 0);
+        assert_eq!(close_calls.count(), 0);
+        let blocked = reserve_browser_launch(
+            &state.data_dir,
+            principal_id,
+            browser_lifecycle("launch:blocked-by-unserviceable-remote-grant"),
+        )
+        .await
+        .expect_err("remote cleanup must remain pending until terminal evidence");
+        assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
+        reconciler.cancel();
+        tokio::time::timeout(Duration::from_secs(5), reconciler.join())
+            .await
+            .expect("bounded Runtime shutdown")
+            .expect("Runtime shutdown");
+    })
+    .await;
 }

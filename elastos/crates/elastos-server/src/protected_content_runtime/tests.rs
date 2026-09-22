@@ -2562,8 +2562,7 @@ fn install_profile_authority_for_release_test(
     principal_id: &str,
 ) -> (String, String, ProfileIdentityV1) {
     owner_only_dir(data_dir);
-    fs::create_dir_all(data_dir.join("identity")).unwrap();
-    fs::write(data_dir.join("identity/device.key"), [0x42; 32]).unwrap();
+    write_device_key(data_dir, 0x42);
     let proof_binding_id =
         store_profile_signing_passkey(data_dir, principal_id, "credential-protected-content");
     crate::auth::store_test_principal_root_protection(data_dir, principal_id);
@@ -2770,8 +2769,7 @@ fn profile_authorized_runtime_release_assembly_fails_without_required_authority(
     let unprotected = tempfile::tempdir().unwrap();
     let unprotected_principal = "person:local:unprotected-profile-release";
     owner_only_dir(unprotected.path());
-    fs::create_dir_all(unprotected.path().join("identity")).unwrap();
-    fs::write(unprotected.path().join("identity/device.key"), [0x42; 32]).unwrap();
+    write_device_key(unprotected.path(), 0x42);
     let unprotected_proof = store_profile_signing_passkey(
         unprotected.path(),
         unprotected_principal,
@@ -2799,12 +2797,7 @@ fn profile_authorized_runtime_release_assembly_fails_without_required_authority(
     let missing_profile = tempfile::tempdir().unwrap();
     let missing_profile_principal = "person:local:missing-profile-release";
     owner_only_dir(missing_profile.path());
-    fs::create_dir_all(missing_profile.path().join("identity")).unwrap();
-    fs::write(
-        missing_profile.path().join("identity/device.key"),
-        [0x42; 32],
-    )
-    .unwrap();
+    write_device_key(missing_profile.path(), 0x42);
     let missing_profile_proof = store_profile_signing_passkey(
         missing_profile.path(),
         missing_profile_principal,

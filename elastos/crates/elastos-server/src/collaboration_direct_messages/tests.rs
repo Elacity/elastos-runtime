@@ -1,4 +1,5 @@
 use super::*;
+use iroh::Watcher as _;
 
 #[derive(Clone)]
 struct RecordedDirectCarrierCall {
@@ -979,6 +980,12 @@ async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
     )
     .await
     .unwrap();
+    pair._node_a
+        .memory_lookup
+        .add_endpoint_info(restarted_b.endpoint.watch_addr().get());
+    restarted_b
+        .memory_lookup
+        .add_endpoint_info(pair._node_a.endpoint.watch_addr().get());
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     restarted

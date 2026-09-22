@@ -3684,13 +3684,16 @@ assertProtectedPrincipalRootAccessor(
 assert(
   gatewayApi.includes("is_unencrypted_principal_root_state") &&
     gatewayTests.includes(
-      "test_home_browser_state_resets_plaintext_for_protected_principal_root",
+      "test_home_browser_state_defaults_preserve_protected_plaintext_and_refuse_overwrite",
+    ) &&
+    gatewayTests.includes(
+      "test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite",
     ) &&
     gatewayTests.includes(
       "test_home_summary_ignores_services_state_left_unencrypted_before_root_protection",
     ) &&
     gatewayTests.includes("test_home_summary_ignores_invalid_protected_services_state"),
-  "Home must reset untrusted or invalid principal-root UI state without accepting it",
+  "Home must return defaults for unreadable principal-root UI state, preserve its bytes and refuse overwrite",
 );
 assertProtectedPrincipalRootAccessor(
   gatewayApi,

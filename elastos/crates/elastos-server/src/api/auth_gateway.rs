@@ -7684,7 +7684,8 @@ mod tests {
     async fn passkey_management_rejects_missing_grant() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
-        let headers = HeaderMap::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "localhost:61965".parse().unwrap());
 
         let list_err = passkey_list_inner(&state, &headers)
             .await
@@ -8485,9 +8486,7 @@ mod tests {
             let before = std::fs::read(&auth_path).unwrap();
             crate::auth::inject_recovery_reassignment_test_fault(temp.path(), fault);
             let result = refresh_session_inner(&state, &home_token_headers(&grant.home_token));
-            let error = result
-                .err()
-                .expect("failed refresh must return no token response");
+            let error = result.expect_err("failed refresh must return no token response");
             assert!(error.to_string().contains(&format!("{fault:?}")));
             assert_eq!(std::fs::read(&auth_path).unwrap(), before);
             super::super::gateway::require_home_token_context(

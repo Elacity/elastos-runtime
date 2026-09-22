@@ -4487,7 +4487,7 @@ async fn test_home_events_stream_requires_home_authority_and_serves_sse() {
     let unauthorized = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/events/stream")
                 .body(Body::empty())
                 .unwrap(),
@@ -7599,7 +7599,7 @@ async fn test_home_browser_state_drops_unknown_targets() {
 }
 
 #[tokio::test]
-async fn test_home_browser_state_recovers_from_malformed_saved_state() {
+async fn test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
@@ -7686,17 +7686,12 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
         )
         .await
         .unwrap();
-    assert_eq!(updated.status(), StatusCode::OK);
-    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap())
-        .expect("Home should rewrite malformed browser state as valid JSON");
-    assert_eq!(
-        stored["layout"]["desktopIconsVisible"],
-        serde_json::Value::Bool(true)
-    );
+    assert_eq!(updated.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&state_path).unwrap(), malformed_before);
 }
 
 #[tokio::test]
-async fn test_home_browser_state_resets_plaintext_for_protected_principal_root() {
+async fn test_home_browser_state_defaults_preserve_protected_plaintext_and_refuse_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let protection =
@@ -7783,10 +7778,8 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
         )
         .await
         .unwrap();
-    assert_eq!(updated.status(), StatusCode::OK);
-    let stored = std::fs::read_to_string(&state_path).unwrap();
-    assert!(!stored.contains("desktopIconsVisible"));
-    assert!(stored.contains("elastos.principal-root.object/v1"));
+    assert_eq!(updated.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&state_path).unwrap(), plaintext_before);
 }
 
 #[tokio::test]
@@ -9215,7 +9208,6 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_execution_gr
     super::remote_engine::exercise_consumer_http_remote_engine(
         &browser_app,
         &browser_token,
-        left.path(),
         &remote_offer["selectable_adapters"][0]["id"],
         &alice.authority.principal_id,
         &consumer_exit,
@@ -9431,7 +9423,7 @@ fn services_direct_route_ticket(peer_id: &str) -> String {
 }
 
 #[tokio::test]
-async fn test_configured_services_runtime_request_remembers_matching_direct_ticket() {
+async fn test_configured_services_runtime_request_ignores_legacy_direct_ticket_file() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
@@ -9479,14 +9471,12 @@ async fn test_configured_services_runtime_request_remembers_matching_direct_tick
         [
             "get_ticket",
             "gossip_join",
-            "remember_peer",
-            "connect",
             "gossip_join_peers",
             "gossip_send"
         ]
     );
-    assert_eq!(calls[2]["body"]["ticket"], ticket);
-    assert_eq!(calls[3]["body"]["ticket"], ticket);
+    assert_eq!(calls[2]["body"]["peers"], json!([bob.peer_id]));
+    assert!(!serde_json::to_string(&calls).unwrap().contains(&ticket));
     let messages = bus
         .lock()
         .await
@@ -9500,14 +9490,13 @@ async fn test_configured_services_runtime_request_remembers_matching_direct_tick
         crate::carrier::verify_service_message(&messages[0], "requester_peer_id").unwrap();
     assert_eq!(request["kind"], "service_access_request");
     assert_eq!(request["target_peer_id"], bob.peer_id);
-    assert_eq!(
-        request["requester_connect_ticket"].as_str().unwrap(),
-        format!("fake-ticket-{}", alice.peer_id)
-    );
+
+    assert_eq!(request["requester_peer_id"], alice.peer_id);
+    assert!(request.get("requester_connect_ticket").is_none());
 }
 
 #[tokio::test]
-async fn test_configured_services_runtime_request_uses_contact_bound_current_ticket() {
+async fn test_configured_services_runtime_request_rejects_legacy_contact_route_override() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     let live = tempfile::tempdir().unwrap();
@@ -9561,15 +9550,12 @@ async fn test_configured_services_runtime_request_uses_contact_bound_current_tic
         [
             "get_ticket",
             "gossip_join",
-            "remember_peer",
-            "connect",
             "gossip_join_peers",
             "gossip_send"
         ]
     );
-    assert_eq!(calls[2]["body"]["ticket"], ticket);
-    assert_eq!(calls[3]["body"]["ticket"], ticket);
-    assert_eq!(calls[4]["body"]["peers"], json!([live_peer_id]));
+    assert_eq!(calls[2]["body"]["peers"], json!([bob.peer_id]));
+    assert!(!serde_json::to_string(&calls).unwrap().contains(&ticket));
     let messages = bus
         .lock()
         .await
@@ -9582,8 +9568,10 @@ async fn test_configured_services_runtime_request_uses_contact_bound_current_tic
     let request =
         crate::carrier::verify_service_message(&messages[0], "requester_peer_id").unwrap();
     assert_eq!(request["kind"], "service_access_request");
-    assert_eq!(request["target_peer_id"], live_peer_id);
-    assert_ne!(request["target_peer_id"], bob.peer_id);
+    assert_eq!(request["target_peer_id"], bob.peer_id);
+    assert_ne!(request["target_peer_id"], live_peer_id);
+    assert_eq!(request["requester_peer_id"], alice.peer_id);
+    assert!(request.get("requester_connect_ticket").is_none());
 }
 
 #[tokio::test]
