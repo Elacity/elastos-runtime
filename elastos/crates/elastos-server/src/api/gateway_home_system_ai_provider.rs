@@ -41,6 +41,8 @@ pub(super) fn ai_provider_request_message(err: &anyhow::Error) -> Option<&'stati
 pub(super) struct AiProviderValidateRequest {
     provider: String,
     api_key: String,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +81,8 @@ pub(super) struct AiProviderDeleteRequest {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct DiscoveredModel {
     id: String,
+    #[serde(skip_serializing)]
+    expected_response_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     privacy: Option<String>,
 }
@@ -126,7 +130,11 @@ pub(crate) fn install_venice_validate_double(
         *slot.borrow_mut() = models.map(|models| {
             models
                 .into_iter()
-                .map(|(id, privacy)| DiscoveredModel { id, privacy })
+                .map(|(id, privacy)| DiscoveredModel {
+                    id,
+                    privacy,
+                    expected_response_model: None,
+                })
                 .collect()
         });
     });
@@ -215,12 +223,27 @@ fn parse_openrouter_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredMo
         let text =
             outputs.is_some_and(|items| items.iter().any(|item| item.as_str() == Some("text")));
         let pinned_jev = id.starts_with("typesafe/jev-");
+        let canonical = entry
+            .get("canonical_slug")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.trim() == *value
+                    && value.len() <= 256
+                    && !value.starts_with('~')
+            });
         if !id.is_empty()
             && !id.starts_with('~')
-            && ((decision && pinned_jev) || (text && !decision && !pinned_jev))
+            && ((decision && pinned_jev && canonical.is_some())
+                || (text && !decision && !pinned_jev))
         {
             models.push(DiscoveredModel {
                 id: id.to_string(),
+                expected_response_model: if decision {
+                    canonical.map(ToOwned::to_owned)
+                } else {
+                    None
+                },
                 privacy: None,
             });
         }
@@ -263,6 +286,7 @@ fn parse_venice_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredModel>
         models.push(DiscoveredModel {
             id: id.to_string(),
             privacy,
+            expected_response_model: None,
         });
     }
     Ok(models)
@@ -300,6 +324,7 @@ async fn fetch_openrouter_models(
                 .iter()
                 .map(|id| DiscoveredModel {
                     id: id.clone(),
+                    expected_response_model: id.starts_with("typesafe/jev-").then(|| id.clone()),
                     privacy: None,
                 })
                 .collect()),
@@ -466,7 +491,16 @@ pub(super) async fn system_ai_provider_validate(
         Ok(provider) => provider,
         Err(err) => return system_error_response(err),
     };
-    match validate_hosted_key(&state.data_dir, provider, &req.api_key).await {
+    let api_key = match crate::api::model_provider_config::hosted_key_for_save(
+        &state.data_dir,
+        provider,
+        req.id.as_deref(),
+        &req.api_key,
+    ) {
+        Ok(key) => key,
+        Err(err) => return system_error_response(err),
+    };
+    match validate_hosted_key(&state.data_dir, provider, &api_key).await {
         Ok(models) => Json(AiProviderValidateResponse {
             valid: true,
             models,
@@ -488,7 +522,16 @@ pub(super) async fn system_ai_provider_save(
         Ok(provider) => provider,
         Err(err) => return system_error_response(err),
     };
-    let api_key = match normalize_secret(provider, &req.api_key) {
+    let api_key = match if req.api_key.trim().is_empty() {
+        crate::api::model_provider_config::hosted_key_for_save(
+            &state.data_dir,
+            provider,
+            req.id.as_deref(),
+            &req.api_key,
+        )
+    } else {
+        normalize_secret(provider, &req.api_key)
+    } {
         Ok(api_key) => api_key,
         Err(err) => return system_error_response(err),
     };
@@ -511,6 +554,7 @@ pub(super) async fn system_ai_provider_save(
             provider,
             api_key: &api_key,
             model: &model,
+            expected_response_model: selected.expected_response_model.as_deref(),
             privacy: selected.privacy.as_deref(),
             name: &name,
             instance_id: req.id.as_deref(),
@@ -603,12 +647,27 @@ pub(super) async fn system_ai_provider_share(
 #[cfg(test)]
 mod parse_tests {
     #[test]
+    fn decision_catalog_binds_exact_canonical_identity_and_requires_metadata() {
+        let models = super::parse_openrouter_models_body(br#"{"data":[
+            {"id":"typesafe/jev-1.13","canonical_slug":"typesafe/jev-1.13-20260917","architecture":{"output_modalities":["decisions"]}},
+            {"id":"typesafe/jev-1.12","architecture":{"output_modalities":["decisions"]}},
+            {"id":"typesafe/jev-1.14","canonical_slug":"~typesafe/jev-latest","architecture":{"output_modalities":["decisions"]}}
+        ]}"#).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "typesafe/jev-1.13");
+        assert_eq!(
+            models[0].expected_response_model.as_deref(),
+            Some("typesafe/jev-1.13-20260917")
+        );
+    }
+
+    #[test]
     fn parse_openrouter_models_body_reads_ids() {
         assert_eq!(
             super::parse_openrouter_models_body(
                 br#"{"data":[
                     {"id":"fixture/model","architecture":{"output_modalities":["text"]}},
-                    {"id":"typesafe/jev-1.13","architecture":{"output_modalities":["decisions"]}},
+                    {"id":"typesafe/jev-1.13","canonical_slug":"typesafe/jev-1.13-20260917","architecture":{"output_modalities":["decisions"]}},
                     {"id":"~typesafe/jev-latest","architecture":{"output_modalities":["decisions"]}},
                     {"id":"other/decision","architecture":{"output_modalities":["decisions"]}},
                     {"id":"image/only","architecture":{"output_modalities":["image"]}},

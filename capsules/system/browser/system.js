@@ -762,6 +762,7 @@ function configureAiProvider() {
     providerSelect.value = "openrouter";
     fillModels([], "");
     applyProviderChrome();
+    setBusy(false);
   };
   const showForm = (instance) => {
     formNode.hidden = false;
@@ -773,6 +774,7 @@ function configureAiProvider() {
     fillModels([], instance && instance.selected_model ? instance.selected_model : "");
     applyProviderChrome();
     saveButton.textContent = editingId ? "Save" : "Save";
+    setBusy(false);
   };
   const renderInstances = (status) => {
     const connections = status && Array.isArray(status.connections) ? status.connections : [];
@@ -803,10 +805,10 @@ function configureAiProvider() {
       const replaceButton = document.createElement("button");
       replaceButton.className = "pc2-btn pc2-btn-secondary";
       replaceButton.type = "button";
-      replaceButton.textContent = "Replace key";
+      replaceButton.textContent = "Edit";
       replaceButton.addEventListener("click", () => {
         showForm(connection);
-        showState(`Replace the key for ${readText(connection.name)}.`, "");
+        showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
       });
       const disconnectButton = document.createElement("button");
       disconnectButton.className = "pc2-btn pc2-btn-secondary";
@@ -864,7 +866,7 @@ function configureAiProvider() {
       const result = await fetchJson("/api/apps/system/ai-provider/validate", {
         method: "POST",
         headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value }),
+        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value, ...(editingId ? { id: editingId } : {}) }),
       });
       fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
       showState("This key is valid.", "success");
@@ -879,13 +881,16 @@ function configureAiProvider() {
     setBusy(true);
     showState("", "");
     try {
+      // Keep this instance identity when activation fails after persistence.
+      // Retrying Save updates the same connection instead of creating another.
+      if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
       const body = {
+        id: editingId,
         provider: selectedProvider(),
         name: nameInput.value,
         api_key: keyInput.value,
         model: modelSelect.value,
       };
-      if (editingId) body.id = editingId;
       latestStatus = await fetchJson("/api/apps/system/ai-provider", {
         method: "POST",
         headers: shellHeaders({ "content-type": "application/json" }),
@@ -895,7 +900,10 @@ function configureAiProvider() {
       renderInstances(latestStatus);
       showState("This hosted model is saved on this Home.", "success");
     } catch (error) {
-      showState(publicSystemError(error, "This Home could not save that hosted model."), "error");
+      const activationPending = /selection_unavailable|model activation pending|model retirement pending/.test(String(error.message || error));
+      showState(activationPending
+        ? "This model is saved. Activation is waiting for current model work to finish. Select Save to try again."
+        : publicSystemError(error, "This Home could not save that hosted model."), "error");
     } finally {
       setBusy(false);
     }

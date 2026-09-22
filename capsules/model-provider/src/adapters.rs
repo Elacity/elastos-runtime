@@ -1784,15 +1784,26 @@ async fn run_decision_worker(
         }
     }
     let output = (|| {
-        let output: decisions::Output = serde_json::from_value(json!({
+        let mut output: decisions::Output = serde_json::from_value(json!({
             "schema": decisions::OUTPUT_SCHEMA, "model": value.get("model"), "answers": value.get("answers")
         })).map_err(|_| AdapterFault::malformed("model backend returned invalid data", "invalid decision response"))?;
-        output.validate_for(input, model).map_err(|_| {
+        // Runtime binds catalog canonical identity to this exact offer revision.
+        // The backend report keeps the reported identity; the typed output binds
+        // to the requested selector after the exact canonical check succeeds.
+        let expected = match &offer.adapter {
+            AdapterConfig::OpenRouterDecisions {
+                expected_response_model: Some(expected),
+                ..
+            } => expected.as_str(),
+            _ => model,
+        };
+        output.validate_for(input, expected).map_err(|_| {
             AdapterFault::malformed(
                 "model backend returned invalid data",
                 "decision response does not match request",
             )
         })?;
+        output.model = model.to_string();
         let output = serde_json::to_value(output).map_err(|_| {
             AdapterFault::malformed(
                 "model backend returned invalid data",
@@ -3206,10 +3217,40 @@ mod tests {
 
     #[test]
     fn decision_http_request_and_failed_reply_preserve_reported_accounting() {
-        for (actual_model, choice, expected_status) in [
-            ("typesafe/jev-1.13", "defer", RunStatus::Completed),
-            ("different-model", "defer", RunStatus::Failed),
-            ("typesafe/jev-1.13", "invented", RunStatus::Failed),
+        for (canonical, actual_model, choice, expected_status) in [
+            (None, "typesafe/jev-1.13", "defer", RunStatus::Completed),
+            (None, "different-model", "defer", RunStatus::Failed),
+            (None, "typesafe/jev-1.13", "invented", RunStatus::Failed),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.13-20260917",
+                "defer",
+                RunStatus::Completed,
+            ),
+            (
+                None,
+                "typesafe/jev-1.13-20260917",
+                "defer",
+                RunStatus::Failed,
+            ),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.13-20260918",
+                "defer",
+                RunStatus::Failed,
+            ),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.14",
+                "defer",
+                RunStatus::Failed,
+            ),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.13-20260917",
+                "invented",
+                RunStatus::Failed,
+            ),
         ] {
             let server = start_server(vec![HttpResponseSpec {
                 status_line: "200 OK",
@@ -3226,13 +3267,31 @@ mod tests {
                 .unwrap();
             let (_cancel_tx, mut cancel) = watch::channel(false);
             let input = decision_input();
+            let mut offer = openai_offer(&url);
+            offer.adapter = AdapterConfig::OpenRouterDecisions {
+                api_url: url.clone(),
+                api_key: Some("fixture-secret".into()),
+                model: "typesafe/jev-1.13".into(),
+                expected_response_model: canonical.map(String::from),
+                hosted: crate::config::test_hosted_disclosure(),
+            };
+            let binding_hash = offer.execution_binding_hash().unwrap();
+            let mut changed = offer.clone();
+            if let AdapterConfig::OpenRouterDecisions {
+                expected_response_model,
+                ..
+            } = &mut changed.adapter
+            {
+                *expected_response_model = Some("different-catalog-revision".into());
+            }
+            assert_ne!(binding_hash, changed.execution_binding_hash().unwrap());
             let result = runtime
                 .block_on(run_decision_worker(
                     &url,
                     Some("fixture-secret"),
                     "typesafe/jev-1.13",
                     &input,
-                    &openai_offer(&url),
+                    &offer,
                     now_ms() + 5000,
                     &mut cancel,
                 ))
@@ -3248,6 +3307,16 @@ mod tests {
             };
             assert_eq!(status, expected_status);
             assert_eq!(output.is_some(), expected_status == RunStatus::Completed);
+            if let Some(output) = &output {
+                assert_eq!(
+                    output["model"], "typesafe/jev-1.13",
+                    "typed output identifies the selected model"
+                );
+                serde_json::from_value::<decisions::Output>(output.clone())
+                    .unwrap()
+                    .validate_for(&input, "typesafe/jev-1.13")
+                    .unwrap();
+            }
             let report = serde_json::to_value(report).unwrap();
             assert_eq!(report["resolved_model"]["value"], actual_model);
             assert_eq!(report["usage"]["status"], "reported");
@@ -3351,6 +3420,7 @@ mod tests {
             api_url: server.base_url.clone(),
             api_key: None,
             model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
             hosted: crate::config::test_hosted_disclosure(),
         };
         offer.validate().unwrap();

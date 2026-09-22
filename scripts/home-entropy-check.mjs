@@ -7557,7 +7557,8 @@ assert(
     systemJs.includes("provider: selectedProvider()") &&
     systemJs.includes("Use in Assistant") &&
     systemJs.includes("Share as service") &&
-    systemJs.includes("Replace key") &&
+    systemJs.includes('replaceButton.textContent = "Edit"') &&
+    systemJs.includes("Leave the API key blank to keep the stored key.") &&
     systemJs.includes("Disconnect") &&
     systemJs.includes("ElastosModelManagement.create"),
   "System Models tab must host named hosted-model instances with a masked key",

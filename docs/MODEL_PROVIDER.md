@@ -253,8 +253,18 @@ storage beside that provider root. That file is the provider boundary, not a
 user-facing editor. Terminal, JSON, and key-file workarounds are not the
 product path. System supplies generic installed-capsule and secret
 management. The capsule UI is Add hosted model, Name, Provider, API key,
-Model, Test, and Save, then Use in Assistant, Share as service, Replace key,
-and Disconnect.
+Model, Test, and Save, then Use in Assistant, Share as service, Edit, and
+Disconnect. An authenticated edit with a blank key retains the stored key of
+that same provider instance. A new instance requires a key. Save retries keep
+one instance identity, including while activation is pending.
+
+For Decisions, Save binds the exact validated catalog entry's canonical model
+ID to the offer revision. This binding is part of the execution hash. The
+adapter checks the response against that ID before projecting `output.model`
+as the selected contract model. The terminal backend report retains the actual
+provider-reported canonical ID and accounting. These are provider reports,
+not attestations of upstream computation. Missing or changed identity fails
+validation; model prefixes and date suffixes do not establish equivalence.
 
 Canonical architecture documents do not freeze a commercial model name or
 claim that a catalog entry will remain available.

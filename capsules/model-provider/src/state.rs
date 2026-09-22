@@ -89,6 +89,19 @@ fn home_owned_hosted_key_model_replace(old: &ConfiguredOffer, proposed: &Configu
         }
         _ => return false,
     }
+    if let (
+        AdapterConfig::OpenRouterDecisions {
+            expected_response_model,
+            ..
+        },
+        AdapterConfig::OpenRouterDecisions {
+            expected_response_model: next,
+            ..
+        },
+    ) = (&old.adapter, &mut proposed.adapter)
+    {
+        *next = expected_response_model.clone();
+    }
     proposed.title = old.title.clone();
     &proposed == old
 }
@@ -257,6 +270,17 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             }
         }
         let addition = offers.keys().any(|id| !self.offers.contains_key(id));
+        // A warm local engine owns its artifacts, but an independent hosted
+        // connection does not replace or consume them. Active workers and
+        // unresolved runs still keep every addition behind the activation gate.
+        let hosted_additions_only = offers
+            .values()
+            .filter(|offer| !self.offers.contains_key(&offer.id))
+            .all(is_home_owned_hosted_offer)
+            && previous
+                .offers
+                .iter()
+                .all(|old| offers.get(&old.id) == Some(old));
         if retired.len() > 1 || (!retired.is_empty() && addition) {
             return Err(ProviderFault::invalid_request(
                 "retire one model offer per Init",
@@ -279,7 +303,8 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 ));
             }
         } else if addition
-            && (execution_owned
+            && ((execution_owned && !hosted_additions_only)
+                || !retained_workers.is_empty()
                 || self.journal.scan_runs()?.iter().any(|(_, r)| {
                     !r.status.is_terminal()
                         || (r.status == RunStatus::SettlementUnknown
@@ -1953,6 +1978,72 @@ mod tests {
             .expect("idle hosted instance disconnect");
     }
 
+    #[test]
+    fn canonical_decision_identity_replacement_preserves_unresolved_ownership() {
+        let root = temp_root("decision-canonical-refresh");
+        let mut jev = offer("model:jev");
+        jev.operation = "decision.evaluate".into();
+        jev.input_modalities = vec!["application/json".into()];
+        jev.output_modalities = vec!["application/json".into()];
+        jev.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: "https://openrouter.ai/api/alpha/decisions".into(),
+            api_key: Some("fixture-key".into()),
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        let state = init_state(&root, vec![jev.clone()], FakeAdapters::default());
+        let mut proposed = state.config.clone();
+        proposed.extra["offers"][0]["adapter"]["expected_response_model"] =
+            json!("typesafe/jev-1.13-20260917");
+        let mut binding = create_binding(
+            "request:canonical-refresh",
+            &jev.id,
+            &json!({"state":"fixture"}),
+        );
+        binding.operation = jev.operation.clone();
+        let prepared = prepared_run_for_offer(binding, &jev, now_ms());
+        let mut active = prepared.clone();
+        active.status = RunStatus::Running;
+        active.backend_state = Some(running_backend_state());
+        state.journal.store_run(&active).unwrap();
+        assert!(state.plan_refresh(proposed.clone(), false, &[]).is_err());
+        let mut unknown = prepared.clone();
+        transition_terminal(
+            &jev,
+            &mut unknown,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "model settlement is unknown".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&unknown).unwrap();
+        assert!(state.plan_refresh(proposed.clone(), false, &[]).is_err());
+        let mut completed = prepared;
+        transition_terminal(
+            &jev,
+            &mut completed,
+            RunStatus::Completed,
+            Some(
+                json!({"schema":"elastos.model.output.decisions/v1", "model":"typesafe/jev-1.13",
+                "answers":{"review":{"type":"choice", "choice":"allow"}}}),
+            ),
+            None,
+        )
+        .unwrap();
+        state.journal.store_run(&completed).unwrap();
+        for worker in [completed.run_id.clone(), "missing-worker-record".into()] {
+            assert!(state
+                .plan_refresh(proposed.clone(), false, &[worker])
+                .is_err());
+        }
+        assert!(state.plan_refresh(proposed, false, &[]).is_ok());
+    }
+
     #[cfg(unix)]
     fn retirement_state() -> ModelProviderState<FakeAdapters> {
         use crate::config::{LocalArtifactConfig, LocalLlamaSettings};
@@ -1994,6 +2085,112 @@ mod tests {
         config.extra["offers"] = json!([state.offers["operator"].clone()]);
         config.extra["runtime_admitted_offers"] = json!([]);
         config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_local_engine_allows_only_idle_hosted_additions() {
+        let mut state = retirement_state();
+        let local = state.offers["admitted"].clone();
+        let binding = create_binding("request:warm-hosted", &local.id, &json!({"prompt":"x"}));
+        let mut run = prepared_run_for_offer(binding, &local, now_ms());
+        let prepared = run.clone();
+        transition_terminal(
+            &local,
+            &mut run,
+            RunStatus::Completed,
+            Some(json!({"schema":"elastos.model.output.text/v1", "text":"fixture"})),
+            None,
+        )
+        .unwrap();
+        state.journal.store_run(&run).unwrap();
+        let original_binding = local.execution_binding_hash().unwrap();
+        let mut jev = home_owned_hosted_offer(
+            "model:jev",
+            "https://openrouter.ai/api/alpha/decisions",
+            "fixture-key",
+        );
+        jev.operation = "decision.evaluate".into();
+        jev.input_modalities = vec!["application/json".into()];
+        jev.output_modalities = vec!["application/json".into()];
+        jev.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: "https://openrouter.ai/api/alpha/decisions".into(),
+            api_key: Some("fixture-key".into()),
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        let venice = home_owned_hosted_offer(
+            "model:venice",
+            "https://api.venice.ai/api/v1/chat/completions",
+            "fixture-key",
+        );
+        let mut proposed = state.config.clone();
+        proposed.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .extend([json!(jev), json!(venice)]);
+        state
+            .plan_refresh(proposed.clone(), true, &[])
+            .expect("warm idle engine permits hosted additions");
+        for worker in [run.run_id.clone(), "missing-worker-record".into()] {
+            assert!(state
+                .plan_refresh(proposed.clone(), true, &[worker])
+                .is_err());
+        }
+        for status in [RunStatus::Running, RunStatus::SettlementUnknown] {
+            let mut unresolved = prepared.clone();
+            if status == RunStatus::SettlementUnknown {
+                transition_terminal(
+                    &local,
+                    &mut unresolved,
+                    status,
+                    None,
+                    Some(RunError {
+                        class: ErrorClass::SettlementUnknown,
+                        code: "settlement_unknown".into(),
+                        message: "model settlement is unknown".into(),
+                    }),
+                )
+                .unwrap();
+            } else {
+                unresolved.status = status;
+                unresolved.backend_state = Some(running_backend_state());
+            }
+            state.journal.store_run(&unresolved).unwrap();
+            assert!(state.plan_refresh(proposed.clone(), true, &[]).is_err());
+        }
+        state.journal.store_run(&run).unwrap();
+        let mut new_local = local.clone();
+        new_local.id = "admitted-next".into();
+        let mut mixed = proposed.clone();
+        mixed.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(new_local.clone()));
+        mixed.extra["runtime_admitted_offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"offer_id":new_local.id}));
+        assert!(state.plan_refresh(mixed, true, &[]).is_err());
+        let mut local_only = state.config.clone();
+        local_only.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(new_local.clone()));
+        local_only.extra["runtime_admitted_offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"offer_id":new_local.id}));
+        assert!(state.plan_refresh(local_only, true, &[]).is_err());
+        let refresh = state.plan_refresh(proposed, true, &[]).unwrap();
+        assert!(refresh.retire_offer.is_none());
+        state.apply_refresh(refresh);
+        assert_eq!(
+            state.offers["admitted"].execution_binding_hash().unwrap(),
+            original_binding
+        );
+        assert_eq!(state.offers.len(), 4);
     }
 
     #[cfg(unix)]
@@ -3618,6 +3815,68 @@ mod tests {
         assert_eq!(terminal["data"]["code"], "model_busy");
         assert_eq!(terminal["data"]["message"], "Model is busy.");
         assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn private_and_remote_principals_share_one_hosted_concurrency_limit() {
+        let root = temp_root("hosted-private-remote-concurrency");
+        let id = "model:openrouter";
+        let hosted = home_owned_hosted_offer(
+            id,
+            "https://openrouter.ai/api/v1/chat/completions",
+            "fixture-key",
+        );
+        let running = || {
+            Ok(DispatchResult::Running {
+                events: Vec::new(),
+                backend_state: serde_json::json!({"job_id":"fixture-job"}),
+            })
+        };
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![running(), running()])),
+            reconcile_results: Arc::new(Mutex::new(vec![Ok(ReconcileResult::Terminal {
+                events: Vec::new(),
+                status: RunStatus::Completed,
+                output: Some(
+                    serde_json::json!({"schema":"elastos.model.output.text/v1","text":"settled"}),
+                ),
+                error: None,
+                backend_report: None,
+            })])),
+            ..Default::default()
+        };
+        let mut state = init_state(&root, vec![hosted], adapters.clone());
+        let input =
+            serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"small fixture"});
+        let private = create_binding("request:private", id, &input);
+        let mut remote = create_binding("request:remote-busy", id, &input);
+        remote.principal_id = "remote:consumer".to_string();
+        remote.grant_id = "grant:shared-model".to_string();
+        assert_ne!(private.principal_id, remote.principal_id);
+        let request = |binding| RunsCreateRequest {
+            op: "runs_create".to_string(),
+            offer_id: id.to_string(),
+            operation: "text.generate".to_string(),
+            input: input.clone(),
+            runtime_binding: binding,
+        };
+        let first = state.handle_runs_create(request(private.clone())).unwrap();
+        assert_eq!(first["data"]["status"], "running");
+        let denied = state.handle_runs_create(request(remote.clone())).unwrap();
+        assert_eq!(denied["data"]["terminal"]["error"]["code"], "model_busy");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        let settled = state
+            .handle_runs_get(RunsGetRequest {
+                op: "runs_get".to_string(),
+                run_id: first["data"]["run_id"].as_str().unwrap().to_string(),
+                runtime_binding: access_binding(&private),
+            })
+            .unwrap();
+        assert_eq!(settled["data"]["status"], "completed");
+        remote.request_id = "request:remote-after-settlement".to_string();
+        let resumed = state.handle_runs_create(request(remote)).unwrap();
+        assert_eq!(resumed["data"]["status"], "running");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 2);
     }
 
     #[test]

@@ -699,7 +699,7 @@ fn strip_runtime_share_fields(mut offer: serde_json::Value) -> serde_json::Value
     offer
 }
 
-fn operator_offer_has_key(offer: &serde_json::Value) -> bool {
+pub(super) fn operator_offer_has_key(offer: &serde_json::Value) -> bool {
     let inline = offer
         .pointer("/adapter/api_key")
         .and_then(serde_json::Value::as_str)
@@ -829,6 +829,32 @@ fn read_hosted_secret(data_dir: &Path, offer_id: &str) -> anyhow::Result<Option<
         return Ok(None);
     }
     Ok(Some(secret.to_string()))
+}
+
+/// Called only after System admin authorization. Blank edits retain the key of
+/// this existing provider instance; this helper never returns a key to Home.
+pub(crate) fn hosted_key_for_save(
+    data_dir: &Path,
+    provider: HostedAiProvider,
+    instance_id: Option<&str>,
+    supplied: &str,
+) -> anyhow::Result<String> {
+    if !supplied.trim().is_empty() {
+        return Ok(supplied.trim().to_string());
+    }
+    let id = instance_id.ok_or_else(|| anyhow::anyhow!("hosted connection is required"))?;
+    validate_hosted_instance_id(id)?;
+    let offers = load_model_provider_operator_offers(data_dir)?;
+    let existing = offers
+        .iter()
+        .find(|offer| is_same_hosted_instance(offer, id))
+        .ok_or_else(|| anyhow::anyhow!("hosted connection is required"))?;
+    anyhow::ensure!(
+        hosted_provider_from_offer(existing) == Some(provider),
+        "hosted instance provider does not match"
+    );
+    read_hosted_secret(data_dir, id)?
+        .ok_or_else(|| anyhow::anyhow!("hosted connection is required"))
 }
 
 fn delete_hosted_secret(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
@@ -1141,6 +1167,7 @@ pub(crate) struct HostedOfferSave<'a> {
     pub provider: HostedAiProvider,
     pub api_key: &'a str,
     pub model: &'a str,
+    pub expected_response_model: Option<&'a str>,
     pub privacy: Option<&'a str>,
     pub name: &'a str,
     pub instance_id: Option<&'a str>,
@@ -1155,6 +1182,7 @@ pub(crate) async fn save_hosted_offer(
         provider,
         api_key,
         model,
+        expected_response_model,
         privacy,
         name,
         instance_id,
@@ -1185,17 +1213,26 @@ pub(crate) async fn save_hosted_offer(
         };
         write_hosted_secret(data_dir, &offer_id, api_key)?;
         let share = existing_hosted_share(&current, &offer_id);
-        let replacement = preserve_hosted_share(
+        let mut replacement = preserve_hosted_share(
             hosted_offer(provider, &offer_id, &name, model, privacy),
             provider,
             model,
             share,
         );
-        let mut offers = current
-            .into_iter()
-            .filter(|offer| !is_same_hosted_instance(offer, &offer_id))
-            .collect::<Vec<_>>();
-        offers.push(replacement);
+        if replacement["operation"] == elastos_model_contract::decisions::OPERATION {
+            if let Some(expected) = expected_response_model {
+                replacement["adapter"]["expected_response_model"] = serde_json::json!(expected);
+            }
+        }
+        let mut offers = current;
+        if let Some(index) = offers
+            .iter()
+            .position(|offer| is_same_hosted_instance(offer, &offer_id))
+        {
+            offers[index] = replacement;
+        } else {
+            offers.push(replacement);
+        }
         persist_model_provider_operator_offers(data_dir, offers)?;
     }
     if let Err(error) = refresh_registered_model_provider(data_dir, registry).await {
@@ -1510,6 +1547,46 @@ mod hosted_hint_tests {
         assert_eq!(preserved["share"]["payer"], "this Home");
     }
     #[tokio::test]
+    async fn editing_jev_preserves_evaluator_selection_and_other_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "model:hosted-0123456789abcdef0123456789abcdef";
+        let second = "model:hosted-1123456789abcdef0123456789abcdef";
+        for (id, canonical) in [
+            (first, None),
+            (second, None),
+            (first, Some("typesafe/jev-1.13-20260917")),
+        ] {
+            super::save_hosted_offer(
+                dir.path(),
+                None,
+                super::HostedOfferSave {
+                    provider: HostedAiProvider::OpenRouter,
+                    api_key: "fixture-key",
+                    model: "typesafe/jev-1.13",
+                    expected_response_model: canonical,
+                    privacy: None,
+                    name: "Jev",
+                    instance_id: Some(id),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let offers = super::load_model_provider_operator_offers(dir.path()).unwrap();
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[0]["id"], first);
+        assert_eq!(offers[1]["id"], second);
+        assert!(offers[1]["adapter"]
+            .get("expected_response_model")
+            .is_none());
+        assert_eq!(super::named_jev_hosted_offer(dir.path()).unwrap().0, first);
+        assert_eq!(
+            offers[0]["adapter"]["expected_response_model"],
+            "typesafe/jev-1.13-20260917"
+        );
+    }
+
+    #[tokio::test]
     async fn replacing_shared_text_with_jev_clears_share() {
         let dir = tempfile::tempdir().unwrap();
         let id = "model:hosted-0123456789abcdef0123456789abcdef";
@@ -1520,6 +1597,7 @@ mod hosted_hint_tests {
                 provider: HostedAiProvider::OpenRouter,
                 api_key: "fixture-key",
                 model: "fixture/text",
+                expected_response_model: None,
                 privacy: None,
                 name: "Chat",
                 instance_id: Some(id),
@@ -1537,6 +1615,7 @@ mod hosted_hint_tests {
                 provider: HostedAiProvider::OpenRouter,
                 api_key: "fixture-key",
                 model: "typesafe/jev-1.13",
+                expected_response_model: Some("typesafe/jev-1.13-20260917"),
                 privacy: None,
                 name: "Jev",
                 instance_id: Some(id),
@@ -1546,6 +1625,21 @@ mod hosted_hint_tests {
         .unwrap();
         let mut offers = super::load_model_provider_operator_offers(dir.path()).unwrap();
         assert!(!super::hosted_share_enabled(&offers[0]));
+        assert_eq!(
+            offers[0]["adapter"]["expected_response_model"],
+            "typesafe/jev-1.13-20260917"
+        );
+        assert_eq!(
+            super::hosted_key_for_save(dir.path(), HostedAiProvider::OpenRouter, Some(id), "")
+                .unwrap(),
+            "fixture-key"
+        );
+        assert!(
+            super::hosted_key_for_save(dir.path(), HostedAiProvider::Venice, Some(id), "").is_err()
+        );
+        assert!(
+            super::hosted_key_for_save(dir.path(), HostedAiProvider::OpenRouter, None, "").is_err()
+        );
         // Even a stale stored share cannot expose a decision offer.
         offers[0]["share"] = json!({"enabled": true});
         assert!(!super::offer_is_shareable(&offers[0]));

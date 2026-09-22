@@ -264,6 +264,8 @@ pub enum AdapterConfig {
         #[serde(default)]
         api_key: Option<String>,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_response_model: Option<String>,
         hosted: HostedDisclosureConfig,
     },
     OpenAiCompatibleText {
@@ -304,6 +306,7 @@ impl AdapterConfig {
                 api_key,
                 model,
                 hosted,
+                ..
             }
             | Self::OpenAiCompatibleText {
                 api_url,
@@ -501,11 +504,23 @@ impl ConfiguredOffer {
         self.validate_canonical_modalities()?;
         self.policy.validate()?;
         self.adapter.validate()?;
-        if let AdapterConfig::OpenRouterDecisions { model, .. } = &self.adapter {
+        if let AdapterConfig::OpenRouterDecisions {
+            model,
+            expected_response_model,
+            ..
+        } = &self.adapter
+        {
             anyhow::ensure!(
                 !model.starts_with('~'),
                 "decision models require a pinned selector"
             );
+            if let Some(expected) = expected_response_model {
+                validate_bounded_trimmed(expected, "decision expected_response_model", 256)?;
+                anyhow::ensure!(
+                    !expected.starts_with('~'),
+                    "decision response model requires a pinned identity"
+                );
+            }
         }
         Ok(())
     }
@@ -533,9 +548,19 @@ impl ConfiguredOffer {
 
     pub fn execution_binding_hash(&self) -> Result<String> {
         let adapter = match &self.adapter {
-            AdapterConfig::OpenRouterDecisions { api_url, model, .. } => json!({
-                "kind": "open_router_decisions", "api_url": api_url, "model": model,
-            }),
+            AdapterConfig::OpenRouterDecisions {
+                api_url,
+                model,
+                expected_response_model,
+                ..
+            } => {
+                let mut binding =
+                    json!({"kind": "open_router_decisions", "api_url": api_url, "model": model});
+                if let Some(expected) = expected_response_model {
+                    binding["expected_response_model"] = json!(expected);
+                }
+                binding
+            }
             AdapterConfig::OpenAiCompatibleText { api_url, model, .. } => json!({
                 "kind": "open_ai_compatible_text",
                 "api_url": api_url,
