@@ -132,6 +132,13 @@ export function createWalletRequests({
     }
     const openMethod = event.target && event.target.closest("[data-wallet-open-method]");
     if (openMethod) {
+      // This handler sits on the pending-requests node, and an identical block
+      // sits on the document for the signers section's own open buttons. A
+      // click in here reaches both as it bubbles, so without this the
+      // connector was launched twice and a person met two windows offering
+      // Review for one approval -- which also let the same request be answered
+      // twice, the second answer landing on something already resolved.
+      event.stopPropagation();
       openApprovalMethod(readText(openMethod.dataset.walletOpenMethod));
     }
   }

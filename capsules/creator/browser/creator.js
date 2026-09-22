@@ -22,14 +22,26 @@
 //
 // The publish request carries `protection.listing` with the title,
 // description, cover, category and the adult/licensing/legal flags, which
-// become the Elacity metadata folder the mint's token URI resolves to. Four
-// fields are still rendered without being sent — currency (the price is
-// scaled locally; the chain mints against the native token), and resale
-// royalty and free-preview, neither supported yet. Each keeps a hint saying
-// so, and no field claims more than it does. The royalty split IS sent, but
-// only the creator's own rows and only when they name real addresses: see
-// collectRoyaltyUnits. The one dkms surface omitted outright is the
-// wallet/channel picker: those routes do not exist here.
+// become the Elacity metadata folder the mint's token URI resolves to. It
+// also carries the terms the chain call is built from: the access method, the
+// resale cut when that method offers resale, the royalty split, and the
+// decimal scale the price was expressed in.
+//
+// The royalty split is sent only as the creator's own rows and only when they
+// name real addresses: see collectRoyaltyUnits. Free-preview is rendered
+// without being sent and keeps a hint saying so.
+//
+// The channel and the currency are both chosen, and both come from the host:
+// the channels this creator may publish into, and the tokens a sale may be
+// priced in. Neither is invented here, because a form offering a channel the
+// mint cannot use, or a six-decimal token to an eighteen-decimal mint, makes a
+// promise the chain then breaks -- the second of those listed an asset a
+// million times under its intended price. The price is sent as the amount
+// typed, and the host scales it by the chosen token's own decimals, so there
+// is no scale for this page to declare and none to get wrong.
+//
+// The one dkms surface omitted outright is the wallet picker: that route does
+// not exist here, and the host resolves the publishing account itself.
 
 // How a pending publish is resumed. The person budget is the generous one:
 // approving in a connector means leaving this page, finding the wallet and
@@ -80,15 +92,32 @@ const ROYALTY_TOTAL_TARGET_PERCENT = 100;
 const CREATOR_ROYALTY_UNITS = 950;
 const EVM_ADDRESS_RE = /^0x[0-9a-f]{40}$/;
 
-// Decimal places each listed currency uses for its smallest base unit. Only
-// used client-side to scale the human-entered price into the integer this
-// runtime's publish request carries — the currency itself is never sent (see
-// #currency's hint).
+// Decimal places for the currencies this page can name on its own, used by the
+// symbol-taking scaler and its tests. The form does not choose from this: the
+// host offers the tokens a mint may settle in, each stating its own decimals,
+// and those are what a price is scaled by.
 const CURRENCY_DECIMALS = {
   ELA: 18,
   ETH: 18,
   USDC: 6,
 };
+
+// The pay token every mint from this Runtime settles in: the chain's own coin,
+// which is eighteen decimals. The price crosses to the host as an integer of
+// that token's smallest unit, so this is also the scale the host is told the
+// price was expressed in -- and it refuses a mint whose scale does not match
+// the token it will actually settle in.
+//
+// Offering a six-decimal token here while the mint settles in an
+// eighteen-decimal one produced a listing a million times under its intended
+// price, so the choice is not offered until the pay token itself is.
+const NATIVE_PRICE_DECIMALS = 18;
+
+
+// The channel option that reveals a typed address. A directory can only offer
+// what it knows, and the chain is what decides: a creator who knows a channel
+// the list has not surfaced should not be stopped by the list.
+const MANUAL_CHANNEL_VALUE = "__manual__";
 
 // ---------------------------------------------------------------------------
 // Pure helpers — exported and covered by creator.test.mjs with `node --test`.
@@ -227,6 +256,23 @@ export function scalePriceToBaseUnits(amount, currency) {
   if (decimals === undefined) {
     throw new Error(`Unknown currency: ${currency}`);
   }
+  return scaleAmountToBaseUnits(amount, decimals, currency);
+}
+
+/**
+ * The same scaling, told the decimals rather than asked to look them up.
+ *
+ * The host states each offered token's decimals, because that is what gives a
+ * price its meaning and what the mint is checked against. Taking the number
+ * directly means a token this page has never heard of still prices correctly,
+ * where a symbol lookup would refuse it or -- worse -- fall back to a
+ * different scale.
+ */
+export function scaleAmountToBaseUnits(amount, decimals, label = "This token") {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new Error("Unknown price scale.");
+  }
+  const currency = label;
   const text = String(amount ?? "").trim();
   if (!/^[0-9]+(\.[0-9]+)?$/.test(text)) {
     throw new Error("Enter a positive amount, e.g. 0.001.");
@@ -253,12 +299,34 @@ export function scalePriceToBaseUnits(amount, currency) {
  * category/reseller-cut/royalties/checkbox state into this object, publishing
  * breaks immediately and loudly instead of silently leaking form state.
  */
-export function buildPublishBody({ uri, ifRevision, copies, price, listing }) {
+export function buildPublishBody({
+  uri,
+  ifRevision,
+  copies,
+  price,
+  channel,
+  payToken,
+  listing,
+}) {
   const protection = {
     mode: "runtime_custody",
     copies,
+    // The amount a buyer pays for one copy, as the creator typed it. The host
+    // scales it into the pay token's base units, because that is where the
+    // token's decimals are known -- a page that scaled it first could only
+    // declare which decimals it had used, and a wrong declaration priced a
+    // sale a million-fold under.
     price,
+    // The chain terms of the mint, beside copies and price rather than inside
+    // the optional listing: a mint with no marketplace listing still has to
+    // settle somewhere, in something.
+    channel,
   };
+  // Omitted when the creator did not choose one, which means the mint source's
+  // own first offered token.
+  if (payToken) {
+    protection.pay_token = payToken;
+  }
   // Omitted rather than sent empty: absent means "no Elacity listing folder",
   // which is a different thing from a listing whose every field is blank.
   if (listing) {
@@ -517,6 +585,11 @@ function bootCreatorApp() {
     copiesInput: document.querySelector("#copies-input"),
     category: document.querySelector("#category"),
 
+    channel: document.querySelector("#channel"),
+    channelManual: document.querySelector("#channel-manual"),
+    channelManualInput: document.querySelector("#channel-manual-input"),
+    channelHint: document.querySelector("#channel-hint"),
+    channelApprove: document.querySelector("#channel-approve"),
     resellField: document.querySelector("#resell-field"),
     resellerCut: document.querySelector("#reseller-cut"),
 
@@ -551,10 +624,15 @@ function bootCreatorApp() {
   };
 
   let selectedFile = null;
+  // What the host says this creator may publish into, and price in. Both start
+  // empty and the form stays usable while they are: the channel can be typed,
+  // and the price scale comes from whichever token is chosen.
+  let offeredChannels = [];
+  let offeredPayTokens = [];
   let customThumbnail = null;
-  // Only "buy_once" (Buy now) is connected to a real publish request; "free"
-  // and "buy_and_resell" are rendered (dkms parity) but block submission —
-  // see refreshSubmitEnabled and syncMethodUI's #method-hint copy.
+  // All three are connected. The method travels with the listing terms and
+  // decides the channel's `opType`: free creates no operative at all, buy once
+  // creates one, and buy and resell creates one that also carries a resale cut.
   let accessMethod = "buy_once";
   let submitting = false;
   // Interval id while a publish is in flight, so the side-channel progress
@@ -661,9 +739,44 @@ function bootCreatorApp() {
 
     els.copiesInput.addEventListener("input", refreshSubmitEnabled);
     els.priceInput.addEventListener("input", refreshSubmitEnabled);
+    els.resellerCut.addEventListener("input", refreshSubmitEnabled);
     // A currency change alone can invalidate an already-typed amount (e.g.
     // more fractional digits than USDC's 6 decimals allow), so re-check.
     els.currency.addEventListener("change", refreshSubmitEnabled);
+    els.channel.addEventListener("change", () => {
+      els.channelManual.classList.toggle(
+        "hidden",
+        els.channel.value !== MANUAL_CHANNEL_VALUE,
+      );
+      refreshSubmitEnabled();
+    });
+    els.channelManualInput.addEventListener("input", refreshSubmitEnabled);
+    els.channelApprove.addEventListener("click", () => {
+      // Approving is the Inbox's job, not this page's: it is an operator
+      // decision about letting this Home talk to an outside service, and it
+      // is recorded there with who allowed it. Asking for the list already
+      // raised the request, so this says where it is waiting and then becomes
+      // the way back -- rather than making a creator reload the page to find
+      // out whether it worked.
+      if (els.channelApprove.dataset.recheck === "true") {
+        loadChannels().catch(() => {
+          renderChannels(
+            "Channel list unavailable — type the address instead.",
+            "Unavailable",
+          );
+        });
+        return;
+      }
+      els.channelHint.textContent =
+        "Approve “Creator requests your channel list” in your Inbox, then choose Check again.";
+      els.channelApprove.textContent = "Check again";
+      els.channelApprove.dataset.recheck = "true";
+    });
+    loadChannels().catch(() => {
+      // Never fatal: a directory that cannot be read costs the list, not the
+      // ability to publish.
+      renderChannels("Channel list unavailable — type the address instead.");
+    });
     els.submitButton.addEventListener("click", () => {
       protectAndList().catch((error) => {
         if (error?.pending) {
@@ -732,7 +845,15 @@ function bootCreatorApp() {
         bytes_base64: await fileToBase64(customThumbnail),
       };
     }
-    const royalties = collectRoyaltyUnits();
+    listing.access_method = accessMethod;
+    // The price scale is NOT here: it is a mint term and travels in
+    // `protection`, beside the price it gives meaning to. It sat here while
+    // the channel did, and the host rightly refuses a listing that carries it.
+    if (accessMethod === "buy_and_resell") {
+      listing.reseller_cut = resellerCutDeciPercent();
+    }
+    // A free mint creates no operative, so there is no royalty share to split.
+    const royalties = isPaidMethod() ? collectRoyaltyUnits() : null;
     if (royalties) {
       listing.royalties = royalties;
     }
@@ -800,7 +921,7 @@ function bootCreatorApp() {
     els.thumbDrop.classList.remove("hidden");
   }
 
-  // -- Access method (only "buy_once" is wired) -----------------------------
+  // -- Access method ---------------------------------------------------------
 
   function isPaidMethod() {
     return accessMethod === "buy_once" || accessMethod === "buy_and_resell";
@@ -815,9 +936,14 @@ function bootCreatorApp() {
     els.priceRow.classList.toggle("hidden", !isPaidMethod());
     els.resellField.classList.toggle("hidden", accessMethod !== "buy_and_resell");
     els.royaltyField.classList.toggle("hidden", !isPaidMethod());
-    els.methodHint.textContent = accessMethod === "buy_once"
-      ? "Buy now is the only method connected in this build."
-      : "Select Buy now to continue — this method isn't connected yet.";
+    // What each method actually does on chain, since the difference is not
+    // cosmetic: a free asset has no operative, so nobody buys it and access
+    // comes from the channel instead.
+    els.methodHint.textContent = {
+      free: "Free mints no sale and no access token — the channel decides who can open it.",
+      buy_once: "One sale per copy. Resale is not offered.",
+      buy_and_resell: "Sold, then resellable, with the resale royalty below.",
+    }[accessMethod] || "";
     refreshSubmitEnabled();
   }
 
@@ -944,20 +1070,204 @@ function bootCreatorApp() {
 
   // -- Submission gate -------------------------------------------------------
 
+  // The resale royalty in deci-percent, the unit the operative factory decodes
+  // (90% is 900), so nothing converts between the number shown and the number
+  // encoded. An empty field means the default rather than nothing: a creator
+  // who cleared it has not thereby chosen to earn zero on every resale.
+  const RESELLER_CUT_DEFAULT = 900;
+  const RESELLER_CUT_MAX = 1000;
+
+  // Asks the host which channels this creator may publish into, and what a
+  // sale may be priced in.
+  //
+  // The host resolves the account itself, so this page never names one -- it
+  // could only name the wrong one, and a list for the wrong account is a list
+  // of channels the mint would refuse.
+  async function loadChannels() {
+    const response = await fetch("/api/creator/channels", {
+      // The same launch token every other call from this page carries: the
+      // capability comes from the token, never from the route.
+      headers: { accept: "application/json", "x-elastos-home-token": homeToken },
+    });
+    if (!response.ok) {
+      renderChannels("Channel list unavailable — type the address instead.");
+      return;
+    }
+    const answer = await response.json();
+    offeredChannels = Array.isArray(answer.channels) ? answer.channels : [];
+    offeredPayTokens = Array.isArray(answer.payTokens) ? answer.payTokens : [];
+    renderPayTokens();
+    if (answer.needsApproval) {
+      els.channelApprove.classList.remove("hidden");
+      renderChannels(
+        "Allow the channel list to see the channels you can publish into, or type an address.",
+        "Not available yet",
+      );
+      return;
+    }
+    if (answer.unavailable) {
+      renderChannels(
+        "Channel list unavailable — type the address instead.",
+        "Unavailable",
+      );
+      return;
+    }
+    els.channelApprove.classList.add("hidden");
+    renderChannels(
+      answer.stale
+        ? "Showing the last channel list this Home saw."
+        : "Where this publishes.",
+    );
+  }
+
+  // `emptyLabel` is what the closed select reads when there is nothing to
+  // offer. It matters: "No channels found" is a different statement from "the
+  // list is not switched on", and only one of them is the creator's problem.
+  function renderChannels(hint, emptyLabel = "No channels found") {
+    const chosen = els.channel.value;
+    els.channel.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = offeredChannels.length
+      ? "Choose a channel…"
+      : emptyLabel;
+    els.channel.append(placeholder);
+    for (const channel of offeredChannels) {
+      const option = document.createElement("option");
+      option.value = channel.address;
+      // The name is the directory's, the address is what is published into.
+      // Both are shown so a creator can tell two similarly named channels
+      // apart.
+      option.textContent = channel.name
+        ? `${channel.name} — ${shortAddress(channel.address)}`
+        : channel.address;
+      els.channel.append(option);
+    }
+    const manual = document.createElement("option");
+    manual.value = MANUAL_CHANNEL_VALUE;
+    manual.textContent = "Type an address…";
+    els.channel.append(manual);
+    // Keep a selection the creator already made across a refresh.
+    if (chosen) {
+      els.channel.value = chosen;
+    }
+    els.channelManual.classList.toggle(
+      "hidden",
+      els.channel.value !== MANUAL_CHANNEL_VALUE,
+    );
+    els.channelHint.textContent = hint;
+    refreshSubmitEnabled();
+  }
+
+  // The currencies the host offers, in its order: the first is the default,
+  // which is a product decision the host makes rather than this page.
+  function renderPayTokens() {
+    if (!offeredPayTokens.length) {
+      // Nothing to price in, and nothing this page may invent: say so where
+      // the creator is looking rather than refusing at the end.
+      els.currency.replaceChildren();
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "Unavailable";
+      els.currency.append(none);
+      refreshSubmitEnabled();
+      return;
+    }
+    els.currency.replaceChildren();
+    for (const token of offeredPayTokens) {
+      const option = document.createElement("option");
+      option.value = token.symbol;
+      option.textContent = token.symbol;
+      els.currency.append(option);
+    }
+    els.currency.value = offeredPayTokens[0].symbol;
+    refreshSubmitEnabled();
+  }
+
+  function shortAddress(address) {
+    return `${address.slice(0, 6)}…${address.slice(-4)}`;
+  }
+
+  // The channel this publishes into. The sentinel reveals a typed address,
+  // which is the fallback for a channel the directory has not surfaced -- the
+  // server verifies whatever is chosen either way.
+  function selectedChannel() {
+    const value = els.channel ? els.channel.value : "";
+    if (value === MANUAL_CHANNEL_VALUE) {
+      const typed = (els.channelManualInput.value || "").trim().toLowerCase();
+      return EVM_ADDRESS_RE.test(typed) ? typed : "";
+    }
+    return EVM_ADDRESS_RE.test(value) ? value : "";
+  }
+
+  // The token a sale is priced in, and what its price means. Offered by the
+  // host from configuration, so the form never invents a token the mint would
+  // not settle in -- which is how a six-decimal price once reached an
+  // eighteen-decimal mint.
+  function selectedPayToken() {
+    const selected = els.currency ? els.currency.value : "";
+    const found = offeredPayTokens.find((token) => token.symbol === selected);
+    return found || offeredPayTokens[0] || null;
+  }
+
+  function resellerCutDeciPercent() {
+    const entered = parseFloat(els.resellerCut && els.resellerCut.value);
+    if (!Number.isFinite(entered)) {
+      return RESELLER_CUT_DEFAULT;
+    }
+    return Math.round(entered * 10);
+  }
+
+  // A cut larger than the whole sale is not a share, and the server refuses
+  // it. Caught here so the creator sees the field rather than a failed mint.
+  function validResellerCut() {
+    if (accessMethod !== "buy_and_resell") {
+      return true;
+    }
+    const cut = resellerCutDeciPercent();
+    return cut >= 0 && cut <= RESELLER_CUT_MAX;
+  }
+
   function validCopiesAndPrice() {
+    // Nowhere to publish is not a mint. The server refuses one too, so this is
+    // the form saying so first rather than the only thing saying so.
+    const channel = selectedChannel();
+    if (!channel) {
+      return null;
+    }
+    // Until the host says what a sale may be priced in, there is no scale to
+    // price in. Guessing one is how a six-decimal amount reached an
+    // eighteen-decimal mint, so the form waits instead.
+    const token = selectedPayToken();
+    if (!token) {
+      return null;
+    }
+    const chainTerms = { channel, payToken: token.address };
+    // A free mint sells nothing, so there is no supply to set and no price to
+    // read: both are zero, and the chain call encodes neither.
+    if (!isPaidMethod()) {
+      return { copies: "0x0", price: "0", ...chainTerms };
+    }
     try {
       const copies = decimalIntegerToHexQuantity(els.copiesInput.value);
-      const baseUnits = scalePriceToBaseUnits(els.priceInput.value, els.currency.value);
-      const price = decimalIntegerToHexQuantity(baseUnits);
-      return { copies, price };
+      // Scaled only to CHECK it: an amount more precise than its token is
+      // refused here so a creator sees it while typing rather than after
+      // pressing Protect. The result is discarded -- what is sent is the
+      // amount itself, and the host does the conversion that counts.
+      scaleAmountToBaseUnits(els.priceInput.value, token.decimals, token.symbol);
+      return { copies, price: els.priceInput.value.trim(), ...chainTerms };
     } catch {
       return null;
     }
   }
 
   function refreshSubmitEnabled() {
-    const methodWired = accessMethod === "buy_once";
-    els.submitButton.disabled = submitting || !selectedFile || listed || !methodWired || !validCopiesAndPrice();
+    els.submitButton.disabled =
+      submitting ||
+      !selectedFile ||
+      listed ||
+      !validResellerCut() ||
+      !validCopiesAndPrice();
   }
 
   // -- Progress tracker -------------------------------------------------------
@@ -1174,6 +1484,8 @@ function bootCreatorApp() {
         ifRevision: revision,
         copies: terms.copies,
         price: terms.price,
+        channel: terms.channel,
+        payToken: terms.payToken,
         listing: terms.listing,
       }),
     );

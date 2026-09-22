@@ -528,9 +528,6 @@
         approveButton.dataset.actionId = actionId;
         actions.appendChild(approveButton);
         actions.appendChild(createButton("Deny", () => denyInspectRequest(requestId), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("model-egress-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "model-egress-deny:" + actionId.slice("model-egress-approve:".length), "danger"));
@@ -540,6 +537,15 @@
       } else if (typeof actionId === "string" && actionId.startsWith("hosted-http-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "hosted-http-deny:" + actionId.slice("hosted-http-approve:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.includes("-http-approve:")) {
+        // Every request to let this Home talk to an outside service is the
+        // same decision, so it is matched by shape rather than by naming each
+        // one: "<what>-http-approve:<source>" always pairs with
+        // "<what>-http-deny:<source>". Naming them individually is why the
+        // creator's channel-list request arrived with nothing to press.
+        const denyId = actionId.replace("-http-approve:", "-http-deny:");
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Reject", denyId, "danger"));
       }
 
       if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "hosted_route_decision" && entry.kind !== "hosted_route_history" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant") {

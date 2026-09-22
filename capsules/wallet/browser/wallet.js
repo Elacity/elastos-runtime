@@ -5,7 +5,7 @@ import {
   readLaunchToken,
   readQueryParam,
 } from "./wallet-api.js?v=wallet-20260715a";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260523a";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260922a";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -30,7 +30,7 @@ import {
 import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260819c";
 import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260711b";
 import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260523a";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260731a";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260922a";
 import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260711b";
 import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260819f";
 import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260819d";

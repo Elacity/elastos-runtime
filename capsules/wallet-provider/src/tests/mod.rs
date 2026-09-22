@@ -1,7 +1,6 @@
 use super::*;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::{hashes::Hash, sighash::SighashCache, Amount, EcdsaSighashType, Network, Witness};
-use elastos_auth::ethereum_signed_message_hash;
 use elastos_auth::normalize_evm_address;
 use elastos_wallet_contract::{PublicNetwork, VerifiedWalletInvocationContext};
 use k256::ecdsa::SigningKey;

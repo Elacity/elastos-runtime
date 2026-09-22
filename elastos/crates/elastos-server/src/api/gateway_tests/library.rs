@@ -230,6 +230,9 @@ fn runtime_custody_creator_test_input(
         .unwrap_or("0x1111111111111111111111111111111111111111")
         .to_string();
     crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
+        // Every mint names the channel it publishes into.
+        channel: "0x0000000000000000000000000000000000000022".to_string(),
+        pay_token: String::new(),
         listing: None,
         object_uri: object_uri.to_string(),
         principal_id: principal_id.to_string(),
@@ -239,7 +242,7 @@ fn runtime_custody_creator_test_input(
         wallet_account_address,
         creator_mint_source_digest: runtime_custody_creator_source_digest(),
         copies: "0x2".to_string(),
-        price: MOCK_PROTECTED_CONTENT_LISTING_PRICE.to_string(),
+        price: MOCK_PROTECTED_CONTENT_LISTING_AMOUNT.to_string(),
         clear_init_segment,
         clear_segments,
         source_storage: "protected_principal_root".to_string(),
@@ -248,12 +251,14 @@ fn runtime_custody_creator_test_input(
 
 fn runtime_custody_creator_source_digest() -> elastos_protected_content_contracts::Digest32 {
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"elastos.runtime-custody.creator-mint-source/v1");
+    // The deployment, and only the deployment. The channel and the pay token
+    // used to be hashed in here, back when a Home had exactly one of each;
+    // they are the creator's choice now and are pinned in the mint's own
+    // recorded terms instead.
+    hasher.update(b"elastos.runtime-custody.creator-mint-source/v2");
     for field in [
         "base-mainnet",
         "eip155:8453",
-        MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-        MOCK_PROTECTED_CONTENT_PAY_TOKEN,
         "elacity_mint_v1",
         "mint(string,uint16,bytes,bytes)",
     ] {
@@ -539,6 +544,8 @@ fn seed_completed_runtime_custody_mint(
         }),
         content_security: json!({
             "mode": "runtime_custody",
+            // Every mint names the channel it publishes into.
+            "channel": "0x0000000000000000000000000000000000000022",
             "access": "buyer_purchase_required"
         }),
         listing_uri: None,
@@ -691,8 +698,10 @@ async fn publish_runtime_custody(
             "uri": uri,
             "protection": {
                 "mode": "runtime_custody",
+                // Every mint names the channel it publishes into.
+                "channel": "0x0000000000000000000000000000000000000022",
                 "copies": "0x1",
-                "price": "0xde0b6b3a7640000"
+                "price": "1"
             }
         }),
     )
@@ -6152,8 +6161,10 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
                 "uri": uri,
                 "protection": {
                     "mode": "runtime_custody",
+                    // Every mint names the channel it publishes into.
+                    "channel": "0x0000000000000000000000000000000000000022",
                     "copies": "0x1",
-                    "price": "0xde0b6b3a7640000",
+                    "price": "1",
                     "extra": true
                 }
             }),
@@ -6674,9 +6685,11 @@ async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutab
     );
     assert_eq!(listing.package.chain_namespace, "eip155:8453");
     assert_eq!(listing.package.network, "base-mainnet");
+    // The channel the creator chose, which is what the mint settled on -- not
+    // whatever channel the deployment happens to name.
     assert_eq!(
         listing.package.ledger,
-        MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase()
+        "0x0000000000000000000000000000000000000022"
     );
     assert_eq!(listing.package.token_id, MOCK_PROTECTED_CONTENT_TOKEN_ID);
     assert_eq!(
@@ -6824,8 +6837,12 @@ async fn test_runtime_custody_creator_progress_is_read_from_the_mint_journal() {
                 elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
                     wallet_account_id.clone(),
                     input.copies.clone(),
-                    input.price.clone(),
+                    MOCK_PROTECTED_CONTENT_LISTING_PRICE.to_string(),
                     Vec::new(),
+                    elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+                    None,
+                    "0x0000000000000000000000000000000000000022".to_string(),
+                    String::new(),
                 )
                 .unwrap(),
                 "bafyprogresscid",
@@ -7034,8 +7051,12 @@ async fn test_runtime_custody_creator_tail_refuses_recorded_terms_when_the_defau
                 elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
                     bound_account_id.clone(),
                     input.copies.clone(),
-                    input.price.clone(),
+                    MOCK_PROTECTED_CONTENT_LISTING_PRICE.to_string(),
                     Vec::new(),
+                    elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+                    None,
+                    "0x0000000000000000000000000000000000000022".to_string(),
+                    String::new(),
                 )
                 .unwrap(),
                 "bafydriftedcreatorcid",
@@ -7137,9 +7158,10 @@ async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_s
     );
     let mut input =
         runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x8b, &wallet_account_id);
-    // 10 copies at 1000000, exactly as first entered.
+    // 10 copies at 1, exactly as first entered. The price is the amount a
+    // creator types; the terms below record what it scales to.
     input.copies = "0xa".to_string();
-    input.price = "0xf4240".to_string();
+    input.price = "1".to_string();
     let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
     let mint_id = facts.mint_id;
     let journal = crate::protected_content_runtime::runtime_mint_journal(dir.path());
@@ -7150,8 +7172,13 @@ async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_s
                 elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
                     wallet_account_id.clone(),
                     input.copies.clone(),
-                    input.price.clone(),
+                    // One token, in the base units the terms hold.
+                    "0xde0b6b3a7640000",
                     Vec::new(),
+                    elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+                    None,
+                    "0x0000000000000000000000000000000000000022".to_string(),
+                    String::new(),
                 )
                 .unwrap(),
                 "bafystalledcreatorcid",
@@ -7161,10 +7188,10 @@ async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_s
         )
         .unwrap();
 
-    // The retry: 100 copies at 100000.
+    // The retry: 100 copies at 2.
     let mut retry_input = input.clone();
     retry_input.copies = "0x64".to_string();
-    retry_input.price = "0x186a0".to_string();
+    retry_input.price = "2".to_string();
     let retry_facts = || crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
         content_cid: facts.content_cid.clone(),
         mint_id,
@@ -7191,7 +7218,7 @@ async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_s
     let reported = blocked.as_json();
     assert_eq!(reported["state"], "recorded_only");
     assert_eq!(reported["recorded_copies"], "0xa");
-    assert_eq!(reported["recorded_price"], "0xf4240");
+    assert_eq!(reported["recorded_price"], "0xde0b6b3a7640000");
     assert_eq!(reported["can_discard"], true);
     assert_eq!(reported["mint_id"], hex::encode(mint_id.as_bytes()));
     // The old opaque sentence must no longer be what this case says.
@@ -7236,7 +7263,8 @@ async fn test_runtime_custody_creator_tail_names_the_recorded_terms_and_allows_s
         .desired_terms()
         .clone();
     assert_eq!(restarted_terms.copies(), "0x64");
-    assert_eq!(restarted_terms.price(), "0x186a0");
+    // The retry's amount of 2, in the base units the terms record.
+    assert_eq!(restarted_terms.price(), "0x1bc16d674ec80000");
 
     // With a transaction now raised behind a wallet approval that may still
     // settle, dropping the record is refused — server-side, not by the app.
@@ -9580,8 +9608,12 @@ async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
         "uri": uri,
         "protection": {
             "mode": "runtime_custody",
+            // Every mint names the channel it publishes into.
+            "channel": "0x0000000000000000000000000000000000000022",
             "copies": "0x2",
-            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+            // The amount a creator types; the host scales it into the
+            // token's base units, which is what the listing then reports.
+            "price": MOCK_PROTECTED_CONTENT_LISTING_AMOUNT,
         },
     });
     let (publish_pending_status, publish_pending) =
@@ -10052,8 +10084,12 @@ async fn test_runtime_custody_audio_publish_lists_the_aac_rendition() {
         "uri": uri,
         "protection": {
             "mode": "runtime_custody",
+            // Every mint names the channel it publishes into.
+            "channel": "0x0000000000000000000000000000000000000022",
             "copies": "0x2",
-            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+            // The amount a creator types; the host scales it into the
+            // token's base units, which is what the listing then reports.
+            "price": MOCK_PROTECTED_CONTENT_LISTING_AMOUNT,
         },
     });
     let (publish_pending_status, publish_pending) =
@@ -10204,8 +10240,12 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
         "uri": uri,
         "protection": {
             "mode": "runtime_custody",
+            // Every mint names the channel it publishes into.
+            "channel": "0x0000000000000000000000000000000000000022",
             "copies": "0x2",
-            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+            // The amount a creator types; the host scales it into the
+            // token's base units, which is what the listing then reports.
+            "price": MOCK_PROTECTED_CONTENT_LISTING_AMOUNT,
         },
     });
     let (publish_pending_status, publish_pending) =
@@ -10499,6 +10539,18 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     .await;
     assert_eq!(open_replay, open_payload);
 
+    // The open staged the verified object, so every chunk read seeks into it
+    // rather than fetching and re-hashing the whole file again. Without this
+    // the cleanup assertion at the end of the test would pass on a file that
+    // was never written.
+    let staged_during_session =
+        runtime_custody_viewer_record_path_for_test(dir.path(), &buyer.principal_id, mint_id)
+            .with_extension("framed");
+    assert!(
+        staged_during_session.exists(),
+        "an open object session must stage its verified object at {staged_during_session:?}"
+    );
+
     // Media's selector on an object session is refused, not ignored.
     let (_, wrong_selector) = post_library(
         app.clone(),
@@ -10631,6 +10683,17 @@ async fn test_runtime_custody_object_publish_buy_open_read_chunk_and_close() {
     .unwrap();
     assert_eq!(viewer_record["lifecycle_status"], "closed");
     assert_eq!(std::fs::read(&listing_path).unwrap(), listing_before_buy);
+
+    // The object this session staged is gone with it. Staged ciphertext is
+    // already published and secret from nobody, but it is session state, and
+    // session state that outlives its session is a leak whatever it contains.
+    let staged =
+        runtime_custody_viewer_record_path_for_test(dir.path(), &buyer.principal_id, mint_id)
+            .with_extension("framed");
+    assert!(
+        !staged.exists(),
+        "a closed session must leave no staged object at {staged:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -10701,8 +10764,12 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
         "uri": creator_uri,
         "protection": {
             "mode": "runtime_custody",
+            // Every mint names the channel it publishes into.
+            "channel": "0x0000000000000000000000000000000000000022",
             "copies": "0x1",
-            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+            // The amount a creator types; the host scales it into the
+            // token's base units, which is what the listing then reports.
+            "price": MOCK_PROTECTED_CONTENT_LISTING_AMOUNT,
         },
     });
     let (_, publish_pending) = post_library(
@@ -11973,8 +12040,12 @@ async fn test_creator_token_can_upload_and_publish_runtime_custody() {
         "uri": uri,
         "protection": {
             "mode": "runtime_custody",
+            // Every mint names the channel it publishes into.
+            "channel": "0x0000000000000000000000000000000000000022",
             "copies": "0x2",
-            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+            // The amount a creator types; the host scales it into the
+            // token's base units, which is what the listing then reports.
+            "price": MOCK_PROTECTED_CONTENT_LISTING_AMOUNT,
         },
     });
     let (publish_pending_status, publish_pending) =

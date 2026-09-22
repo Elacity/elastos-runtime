@@ -98,6 +98,17 @@ pub(crate) struct ElacityMetadataInputs<'a> {
     pub protection: Value,
     /// Fallback display name when the creator supplied no listing at all.
     pub fallback_name: &'a str,
+    /// RFC 3339 timestamp for `createdAt`. Passed in rather than read from a
+    /// clock here so the same inputs always produce the same folder, which is
+    /// what lets a test compare one byte for byte.
+    pub created_at: &'a str,
+    /// How the creator chose to let people reach the asset. It decides the
+    /// `opType` the mint encodes, so the document states it rather than
+    /// assuming one: a folder that claims resale for an asset minted without
+    /// it describes a market that does not exist.
+    pub access_method: elastos_protected_content_runtime::RuntimeMintAccessMethod,
+    /// The resale cut in deci-percent, present only for buy and resell.
+    pub reseller_cut: Option<u16>,
 }
 
 /// The public custody descriptor carried in `asset.protections[0]`.
@@ -124,7 +135,7 @@ pub(crate) struct ElacityMetadataInputs<'a> {
 pub(crate) fn runtime_custody_protection(
     threshold: u32,
     node_count: u32,
-    rights_policy_identity_base64: &str,
+    identities: ProtectedContentIdentities<'_>,
 ) -> Value {
     json!({
         "protectionType": ELASTOS_PQ_PROTECTION_SCHEME_V1,
@@ -135,8 +146,41 @@ pub(crate) fn runtime_custody_protection(
         // identities would say more, but they live on the mint intent rather
         // than the draft this is built from; naming the policy states what
         // governs release without inventing a fact this site cannot see.
-        "rights_policy_identity_base64": rights_policy_identity_base64,
+        "rights_policy_identity_base64": identities.rights_policy,
+        // What a buyer needs in order to OPEN what they bought.
+        //
+        // These three are already public: the listing package carries them and
+        // sits on IPFS, fetched by CID with no authentication. What they were
+        // not, until now, is REACHABLE -- findable only from a link a creator
+        // hands out, rather than from the document the token URI names, which
+        // anyone can resolve from chain.
+        //
+        // That difference is the whole of it. Someone who finds this asset in
+        // an index can buy it from what the chain says, and could then hold
+        // something they cannot open. With these, they can ask custody for the
+        // key (the envelope), check that the key belongs to this content (the
+        // commitment), and verify the bytes they fetched are the bytes that
+        // were sold (the content identity).
+        //
+        // None of them is key material, and none of them grants anything: the
+        // chain still decides whether this account may open it.
+        "key_envelope_identity_base64": identities.key_envelope,
+        "content_key_commitment_base64": identities.content_key_commitment,
+        "content_identity_base64": identities.content_identity,
     })
+}
+
+/// The identities a buyer needs to open what they bought, gathered so that
+/// adding one is a field here rather than another positional argument.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProtectedContentIdentities<'a> {
+    pub rights_policy: &'a str,
+    pub key_envelope: &'a str,
+    pub content_key_commitment: &'a str,
+    /// The chunked payload identity for an object, or the media identity for
+    /// a media listing: one of the two, in the same encoding the listing
+    /// package carries.
+    pub content_identity: &'a str,
 }
 
 /// Build every file in the metadata directory, as (filename, bytes) pairs.
@@ -196,6 +240,74 @@ pub(crate) fn elacity_metadata_files(
         .collect()
 }
 
+/// Formats unix seconds as an RFC 3339 UTC timestamp.
+///
+/// Written here rather than taken from a date crate: the workspace has none,
+/// and `createdAt` is the only place this Runtime needs one. The civil-date
+/// conversion is the standard days-to-y/m/d algorithm, shifted so the era
+/// starts in March and leap days fall at the end of a year.
+pub(crate) fn rfc3339_utc(unix_seconds: u64) -> String {
+    let days = (unix_seconds / 86_400) as i64;
+    let seconds_of_day = unix_seconds % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u64;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u64;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds_of_day / 3600,
+        (seconds_of_day % 3600) / 60,
+        seconds_of_day % 60,
+    )
+}
+
+/// The category word a marketplace indexes on, derived from the MIME.
+///
+/// `media.contentType` in the Elacity asset schema is a category -- "Video",
+/// "Audio", "Image", "Text" and "Other" -- not a MIME, and that enum is
+/// exactly five words, so a 3D model and a PDF are both Other however much a
+/// richer word would suit them. This folder used to
+/// publish the MIME there, so an indexer reading it got `video/mp4` where it
+/// expected `Video` and could not classify the asset at all. The MIME is still
+/// stated, beside it, as `mimeType`.
+fn elacity_content_category(content_type: &str) -> &'static str {
+    let mime = content_type.split(';').next().unwrap_or("").trim();
+    let (top, _) = mime.split_once('/').unwrap_or((mime, ""));
+    match top {
+        "video" => "Video",
+        "audio" => "Audio",
+        "image" => "Image",
+        "text" => "Text",
+        _ => "Other",
+    }
+}
+
+/// The sample cipher this asset's bytes are actually protected with.
+///
+/// Media and objects differ, and the difference is load-bearing rather than
+/// cosmetic: CENC sample encryption is AES-128-CTR and carries no per-sample
+/// authentication tag, so tamper-evidence on that path comes from the staged
+/// segment's SHA-256 and length check. An object's chunks are AES-256-GCM and
+/// the integrity is in the cipher. Stating each truthfully is the point; the
+/// PC2 generator names different strings here and this follows the bytes
+/// rather than that text.
+fn elacity_content_algorithm(content_type: &str) -> &'static str {
+    match elacity_content_category(content_type) {
+        "Video" | "Audio" => "AES-128-CTR",
+        _ => "AES-256-GCM",
+    }
+}
+
 fn metadata_json(
     inputs: &ElacityMetadataInputs<'_>,
     title: &str,
@@ -204,7 +316,7 @@ fn metadata_json(
     tags: &[String],
     listing: Option<&RuntimeCustodyListingTerms>,
 ) -> Value {
-    json!({
+    let mut document = json!({
         "schema": ELACITY_ASSET_SCHEMA,
         "version": "1.1",
         "name": title,
@@ -213,11 +325,19 @@ fn metadata_json(
         // showing a broken image.
         "image": inputs.image,
         "category": category,
+        // The schema's own top-level field, whose enum is the five words the
+        // category helper returns. `media.contentType` is a free string and
+        // carries the same answer, which is where the PC2 generator puts it.
+        "contentType": elacity_content_category(inputs.content_type),
         "media": {
             "uri": format!("ipfs://{}", inputs.encrypted_content_cid),
-            "contentType": inputs.content_type,
+            // The category word the schema calls for, with the MIME beside it.
+            "contentType": elacity_content_category(inputs.content_type),
             "mimeType": inputs.content_type,
             "object": "self://content.json",
+            // An array with at least one entry, which is what the schema
+            // declares. The PC2 generator emits a bare string here; the schema
+            // is the authority and it says `array of strings, minItems 1`.
             "protectionType": [ELASTOS_PQ_PROTECTION_SCHEME_V1],
             "size": inputs.plaintext_bytes,
         },
@@ -235,24 +355,48 @@ fn metadata_json(
             "authority": inputs.authority,
             "publisher": inputs.publisher_address,
             "contract": "self://contract.json",
-            "labelType": "Creator",
+            "labelType": "Independent Creator",
+            // How the asset may be acquired, in the schema's own vocabulary
+            // and in the terms this mint actually carries.
+            "distribution": elacity_distribution(inputs.access_method),
             "tags": tags,
             "categories": if category.is_empty() { Vec::new() } else { vec![category.to_string()] },
             "adult": listing.is_some_and(|listing| listing.adult),
-            "licensing": listing.and_then(|listing| listing.licensing.clone()),
-            "legal": listing.and_then(|listing| listing.legal_attestation.clone()),
             "kid": inputs.kid_0x,
         },
         "attributes": [
-            { "trait_type": "Content-Type", "value": inputs.content_type },
+            { "trait_type": "Content-Type", "value": elacity_content_category(inputs.content_type) },
             { "trait_type": "Size", "value": inputs.plaintext_bytes },
             { "trait_type": "Encrypted", "value": true },
+            // The operation type the mint encodes, matching the distribution
+            // stated above. Stated as a string because that is the shape the
+            // indexer reads these traits in.
+            { "trait_type": "OpType", "value": inputs.access_method.op_type_code().to_string() },
+            { "trait_type": "Resell-Allowed", "value": elacity_resell_allowed(inputs.access_method).to_string() },
+            { "trait_type": "Algorithm", "value": elacity_content_algorithm(inputs.content_type) },
             { "trait_type": "Supply", "value": inputs.copies },
         ],
         // The indexer keys on `metadata.kid || metadata.properties.kid`, so it
         // is stated at both levels deliberately rather than by duplication.
         "kid": inputs.kid_0x,
-    })
+        // When the folder was produced. The schema carries it and a consumer
+        // ordering by recency has nothing else in the document to order by.
+        "createdAt": inputs.created_at,
+    });
+    // Absent facts are left out rather than stated as `null`. A consumer
+    // syncing this into a database reads a missing key as "not supplied" and a
+    // null as "supplied as nothing", and only the first is true here. The
+    // category is carried in `properties.categories`, so an empty top-level
+    // copy of it said nothing twice.
+    if let Some(listing) = listing {
+        if let Some(licensing) = listing.licensing.clone() {
+            document["properties"]["licensing"] = licensing;
+        }
+        if let Some(legal) = listing.legal_attestation.clone() {
+            document["properties"]["legal"] = legal;
+        }
+    }
+    document
 }
 
 fn content_json(inputs: &ElacityMetadataInputs<'_>, title: &str) -> Value {
@@ -301,14 +445,54 @@ fn contract_json(inputs: &ElacityMetadataInputs<'_>, title: &str) -> Value {
         },
         "attributes": [
             { "trait_type": "Content-Type", "value": inputs.content_type },
-            { "trait_type": "OpType", "value": "buy_once" },
+            { "trait_type": "OpType", "value": elacity_op_type_label(inputs.access_method) },
             { "trait_type": "Supply", "value": inputs.copies },
-            // Resale is not offered by this Runtime yet, so it is stated as
-            // false rather than omitted: an absent flag reads as unknown.
-            { "trait_type": "Resell-Allowed", "value": false },
-            { "trait_type": "RRL-Percent", "value": 0 },
+            // Stated either way rather than omitted when false: an absent flag
+            // reads as unknown.
+            { "trait_type": "Resell-Allowed", "value": elacity_resell_allowed(inputs.access_method) },
+            // The creator's resale royalty as a percentage, from the
+            // deci-percent the chain call carries. Zero when resale is not
+            // offered at all.
+            { "trait_type": "RRL-Percent", "value": f64::from(inputs.reseller_cut.unwrap_or(0)) / 10.0 },
         ],
     })
+}
+
+/// The schema's acquisition phrase for an access method.
+fn elacity_distribution(
+    method: elastos_protected_content_runtime::RuntimeMintAccessMethod,
+) -> &'static str {
+    use elastos_protected_content_runtime::RuntimeMintAccessMethod as Method;
+    match method {
+        // No operative and no listing, so nothing is sold. Whoever the channel
+        // admits may play it.
+        Method::Free => "Free, play always",
+        Method::BuyOnce => "Buy once, play always",
+        Method::BuyAndResell => "Buy once, play always, resell",
+    }
+}
+
+/// The word form of the op type, for the document that states it that way.
+fn elacity_op_type_label(
+    method: elastos_protected_content_runtime::RuntimeMintAccessMethod,
+) -> &'static str {
+    use elastos_protected_content_runtime::RuntimeMintAccessMethod as Method;
+    match method {
+        Method::Free => "free",
+        Method::BuyOnce => "buy_once",
+        Method::BuyAndResell => "buy_and_resell",
+    }
+}
+
+/// Whether an owner may resell their access. Only one method creates an
+/// operative that permits it.
+const fn elacity_resell_allowed(
+    method: elastos_protected_content_runtime::RuntimeMintAccessMethod,
+) -> bool {
+    matches!(
+        method,
+        elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyAndResell
+    )
 }
 
 fn token_type_json(
@@ -341,6 +525,8 @@ mod tests {
 
     fn inputs() -> ElacityMetadataInputs<'static> {
         ElacityMetadataInputs {
+            access_method: elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyAndResell,
+            reseller_cut: Some(900),
             encrypted_content_cid: "bafycidofciphertext",
             content_type: "image/png",
             plaintext_bytes: 4096,
@@ -352,9 +538,88 @@ mod tests {
             copies: 1000,
             price: "100000",
             image: "ipfs://bafycidofcover",
-            protection: runtime_custody_protection(2, 3, "cG9saWN5"),
+            protection: runtime_custody_protection(
+                2,
+                3,
+                ProtectedContentIdentities {
+                    rights_policy: "cG9saWN5",
+                    key_envelope: "ZW52ZWxvcGU=",
+                    content_key_commitment: "Y29tbWl0bWVudA==",
+                    content_identity: "aWRlbnRpdHk=",
+                },
+            ),
             fallback_name: "protected-runtime-proof.png",
+            created_at: "2026-09-22T13:45:00Z",
         }
+    }
+
+    /// `media.contentType` is the category word a marketplace indexes on, not
+    /// the MIME.
+    ///
+    /// The schema's vocabulary is Video, Audio, Image, 3D Model, Document. This
+    /// folder published the MIME there, so an indexer reading it got
+    /// `video/mp4` where it expected `Video` and could not classify the asset.
+    /// The MIME is still stated, as `mimeType`, because it is the fact a viewer
+    /// needs and the category is the fact a shelf needs.
+    #[test]
+    fn media_states_the_category_a_marketplace_reads_and_the_mime_beside_it() {
+        // The schema's enum is exactly these five words.
+        for (mime, category, algorithm) in [
+            ("video/mp4", "Video", "AES-128-CTR"),
+            ("audio/mp4", "Audio", "AES-128-CTR"),
+            ("image/png", "Image", "AES-256-GCM"),
+            ("text/plain; charset=utf-8", "Text", "AES-256-GCM"),
+            ("model/gltf-binary", "Other", "AES-256-GCM"),
+            ("application/pdf", "Other", "AES-256-GCM"),
+        ] {
+            assert_eq!(elacity_content_category(mime), category, "{mime}");
+            assert_eq!(elacity_content_algorithm(mime), algorithm, "{mime}");
+        }
+
+        let mut inputs = inputs();
+        inputs.content_type = "video/mp4";
+        let files = elacity_metadata_files(None, &inputs).unwrap();
+        let metadata = parse(&files, "metadata.json");
+        assert_eq!(metadata["media"]["contentType"], "Video");
+        assert_eq!(metadata["media"]["mimeType"], "video/mp4");
+        // The schema declares an array with at least one entry.
+        let protection_types = metadata["media"]["protectionType"].as_array().unwrap();
+        assert_eq!(protection_types.len(), 1, "{protection_types:?}");
+        // And the top-level field the schema names, with its enum value.
+        assert_eq!(metadata["contentType"], "Video");
+        assert_eq!(metadata["createdAt"], "2026-09-22T13:45:00Z");
+        assert_eq!(
+            metadata["properties"]["distribution"],
+            "Buy once, play always, resell"
+        );
+        let traits: Vec<&str> = metadata["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|attribute| attribute["trait_type"].as_str().unwrap_or_default())
+            .collect();
+        for expected in [
+            "Content-Type",
+            "Encrypted",
+            "OpType",
+            "Resell-Allowed",
+            "Algorithm",
+            "Supply",
+        ] {
+            assert!(
+                traits.contains(&expected),
+                "{expected} missing from {traits:?}"
+            );
+        }
+    }
+
+    /// The timestamp is produced here, so it is pinned here.
+    #[test]
+    fn rfc3339_utc_formats_known_instants() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        // A leap day, which the civil-date shift exists to get right.
+        assert_eq!(rfc3339_utc(1_709_208_000), "2024-02-29T12:00:00Z");
     }
 
     fn parse(files: &[(String, Vec<u8>)], name: &str) -> Value {
@@ -383,9 +648,15 @@ mod tests {
         );
     }
 
-    /// The two interop facts that break a listing silently when wrong: the kid
-    /// must equal the on-chain contentId at both levels the indexer reads, and
-    /// `media.contentType` must be a MIME rather than a category word.
+    /// The interop facts that break a listing silently when wrong: the kid must
+    /// equal the on-chain contentId at both levels the indexer reads, and the
+    /// media block must state both the category a shelf indexes on and the MIME
+    /// a viewer needs.
+    ///
+    /// This assertion used to require a MIME in `media.contentType`, which is
+    /// the opposite of the asset schema and of the generator every other
+    /// Elacity listing is produced by. The MIME did not stop being stated; it
+    /// moved to `mimeType`, where the rest of the system now reads it.
     #[test]
     fn metadata_states_the_contract_kid_and_a_real_mime() {
         let files = elacity_metadata_files(None, &inputs()).unwrap();
@@ -393,7 +664,9 @@ mod tests {
         assert_eq!(metadata["kid"], "0x51515151515151515151515151515151");
         assert_eq!(metadata["properties"]["kid"], metadata["kid"]);
         assert_eq!(metadata["asset"]["kid"], metadata["kid"]);
-        assert_eq!(metadata["media"]["contentType"], "image/png");
+        assert_eq!(metadata["media"]["contentType"], "Image");
+        assert_eq!(metadata["contentType"], "Image");
+        assert_eq!(metadata["media"]["mimeType"], "image/png");
         assert_eq!(metadata["media"]["uri"], "ipfs://bafycidofciphertext");
         assert_eq!(
             metadata["properties"]["publisher"],
@@ -434,17 +707,49 @@ mod tests {
         assert_eq!(protection["threshold"], 2);
         assert_eq!(protection["node_count"], 3);
         assert_eq!(protection["rights_policy_identity_base64"], "cG9saWN5");
-        // Four fields, not five: there is no second name for the scheme. The
-        // threshold is data here, so a string spelling "2of3" could contradict
-        // the numbers beside it, and the suites already have one home in the
-        // `pssh` payload.
+        // The three that make a purchase openable by someone who found this
+        // asset in an index rather than through the creator's link: which
+        // envelope holds the key, that the key belongs to this content, and
+        // what the content is.
+        //
+        // They were deliberately absent, and are deliberately here now. What
+        // changed is not the judgement about key material -- none of these is
+        // any -- but the reachability of facts that were already public: the
+        // listing package carries all three and sits on IPFS, fetched by CID
+        // with no authentication. Withholding them from the document the
+        // token URI names meant a buyer could pay for something on chain and
+        // then hold what they could not open.
+        //
+        // Each is an IDENTITY: schema names and digests naming the custody
+        // pool, epoch and committee authorization. The key shares themselves
+        // are held by the custody nodes and released against a rights check,
+        // which is unchanged by any of this.
+        assert_eq!(protection["key_envelope_identity_base64"], "ZW52ZWxvcGU=");
+        assert_eq!(
+            protection["content_key_commitment_base64"],
+            "Y29tbWl0bWVudA=="
+        );
+        assert_eq!(protection["content_identity_base64"], "aWRlbnRpdHk=");
+        // Seven fields, and no second name for the scheme. The threshold is
+        // data here, so a string spelling "2of3" could contradict the numbers
+        // beside it, and the suites already have one home in the `pssh`
+        // payload.
         let fields: Vec<&String> = protection.as_object().unwrap().keys().collect();
-        assert_eq!(fields.len(), 4, "{protection}");
+        assert_eq!(fields.len(), 7, "{protection}");
         assert!(
             !protection.as_object().unwrap().contains_key("scheme"),
             "{protection}"
         );
-        for forbidden in ["shares", "key_envelope", "commitment", "cek", "secret"] {
+        // Still no material, which is the guarantee that has not moved: an
+        // identity names a thing, and none of these carries the thing itself.
+        for forbidden in [
+            "shares",
+            "key_envelope",
+            "commitment",
+            "cek",
+            "secret",
+            "key",
+        ] {
             assert!(
                 protection.get(forbidden).is_none(),
                 "{forbidden} must not travel"
@@ -461,6 +766,8 @@ mod tests {
             tags: vec!["one".to_string(), "two".to_string()],
             thumbnail: None,
             royalties: Vec::new(),
+            access_method: elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+            reseller_cut: None,
             adult: true,
             licensing: Some(json!({ "ai_training": true })),
             legal_attestation: Some(json!({ "owns_rights": true })),

@@ -321,7 +321,11 @@ enum ObjectProviderRequest {
         #[serde(default)]
         if_revision: Option<String>,
         #[serde(default)]
-        protection: Option<LibraryPublishProtectionRequest>,
+        /// Boxed because this one variant carries every term of a mint --
+        /// channel, token, price scale, access method, royalty split, the
+        /// whole listing -- and an enum is as large as its largest variant.
+        /// Every other request here would otherwise pay for it.
+        protection: Option<Box<LibraryPublishProtectionRequest>>,
     },
     /// Read-only: how far this object's publish has got. Takes no revision
     /// and no protection terms, because it changes nothing.
@@ -457,7 +461,33 @@ enum ObjectProviderRequest {
 enum LibraryPublishProtectionRequest {
     RuntimeCustody {
         copies: String,
+        /// What a buyer pays for one copy, as a decimal amount of the pay
+        /// token below -- "0.001", not its base units.
+        ///
+        /// The amount rather than the integer, because an integer of some
+        /// token's smallest unit says nothing about which token, and a caller
+        /// that scaled for six decimals while the mint settles in eighteen
+        /// agrees on the digits and disagrees by a factor of a million. The
+        /// decimals live with the pay token in this Runtime's configuration,
+        /// so the scaling happens where they are known and no caller has to
+        /// declare what its number meant.
         price: String,
+        /// The channel this mint publishes into.
+        ///
+        /// A mint term, beside copies and price, rather than part of the
+        /// listing below: the listing is optional metadata a marketplace
+        /// displays, while a mint without a channel has nowhere to settle.
+        ///
+        /// Defaulted so the field's absence is a clear refusal rather than a
+        /// decode error, and required in `runtime_custody_listing_terms`.
+        #[serde(default)]
+        channel: String,
+        /// The token the sale is priced in. Absent takes the mint source's
+        /// first offered token, which is what a caller that does not choose
+        /// means.
+        #[serde(default)]
+        pay_token: Option<String>,
+
         /// The listing a marketplace actually displays. Optional: absent means
         /// the pre-listing behaviour, a mint with no Elacity metadata folder,
         /// so an existing caller keeps working unchanged.
@@ -488,6 +518,24 @@ struct LibraryPublishListingRequest {
     /// set, so they never appear here.
     #[serde(default)]
     royalties: Vec<LibraryPublishRoyaltyRequest>,
+    /// How people reach the asset: `free`, `buy_once` or `buy_and_resell`.
+    /// Absent means buy once, which is what every caller written before
+    /// creators could choose meant.
+    #[serde(default)]
+    access_method: Option<String>,
+    /// The resale cut in deci-percent (900 is 90%), for `buy_and_resell` only.
+    #[serde(default)]
+    reseller_cut: Option<u16>,
+    /// How many decimal places the caller scaled `price` by.
+    ///
+    /// The price crosses this boundary as an integer of the pay token's
+    /// smallest unit, which says nothing about which token that is. A caller
+    /// that scaled for a six-decimal token and a mint that settles in an
+    /// eighteen-decimal one agree on the digits and disagree by a factor of a
+    /// million, so the meaning has to travel with the number and be checked
+    /// against the token the mint will actually use.
+    ///
+
     #[serde(default)]
     adult: bool,
     #[serde(default)]
@@ -533,6 +581,13 @@ pub(crate) struct RuntimeCustodyListingTerms {
     pub(crate) tags: Vec<String>,
     pub(crate) thumbnail: Option<RuntimeCustodyListingThumbnail>,
     pub(crate) royalties: Vec<RuntimeCustodyListingRoyalty>,
+    /// The access method this mint creates, alongside the royalty split it
+    /// sits with: both are terms the chain call is re-encoded from on a
+    /// retry, not descriptions of the asset.
+    pub(crate) access_method: elastos_protected_content_runtime::RuntimeMintAccessMethod,
+    pub(crate) reseller_cut: Option<u16>,
+    /// The decimal scale the creator's price was expressed in, checked against
+    /// the pay token the mint settles in before anything is signed.
     pub(crate) adult: bool,
     pub(crate) licensing: Option<Value>,
     pub(crate) legal_attestation: Option<Value>,
@@ -565,6 +620,12 @@ pub(crate) struct RuntimeCustodyListingRoyalty {
 struct LoadedRuntimeCustodyPublishInput {
     copies: String,
     price: String,
+    /// The channel this mint publishes into, lower-cased. Never empty: a
+    /// publish that named none was refused before this was built.
+    channel: String,
+    /// The token the sale is priced in, lower-cased. Empty means the mint
+    /// source's first offered token.
+    pay_token: String,
     listing: Option<RuntimeCustodyListingTerms>,
 }
 
@@ -621,7 +682,7 @@ impl Provider for ObjectProvider {
                     &principal_id,
                     &uri,
                     if_revision.as_deref(),
-                    protection,
+                    protection.map(|protection| *protection),
                     None,
                 )
                 .await
@@ -924,7 +985,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
                 &principal_id,
                 &uri,
                 if_revision.as_deref(),
-                protection,
+                protection.map(|protection| *protection),
                 gateway_authority,
             )
             .await
@@ -2063,6 +2124,8 @@ async fn library_publish(
                     creator_mint_source_digest: creator_binding.source_digest,
                     copies: loaded.copies,
                     price: loaded.price,
+                    channel: loaded.channel,
+                    pay_token: loaded.pay_token,
                     listing: loaded.listing,
                     source_storage,
                 };
@@ -2090,6 +2153,8 @@ async fn library_publish(
                     creator_mint_source_digest: creator_binding.source_digest,
                     copies: loaded.copies,
                     price: loaded.price,
+                    channel: loaded.channel,
+                    pay_token: loaded.pay_token,
                     listing: loaded.listing,
                     clear_plaintext,
                     source_storage,
@@ -6210,8 +6275,28 @@ fn validate_runtime_custody_publish_input(
     let LibraryPublishProtectionRequest::RuntimeCustody {
         copies,
         price,
+        channel,
+        pay_token,
         listing,
     } = protection;
+    // The channel is the creator's choice and there is no default to fall back
+    // on. Publishing into whichever channel a deployment happens to name is
+    // the behaviour this replaces, so a mint that names none is refused here
+    // rather than quietly settling somewhere.
+    let channel = channel.trim().to_ascii_lowercase();
+    if !is_evm_address(&channel) {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    let pay_token = match pay_token.as_deref().map(str::trim) {
+        None | Some("") => String::new(),
+        Some(pay_token) => {
+            let pay_token = pay_token.to_ascii_lowercase();
+            if !is_evm_address(&pay_token) {
+                bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+            }
+            pay_token
+        }
+    };
     let target_metadata = fs::symlink_metadata(&target.path)
         .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
     if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
@@ -6222,6 +6307,8 @@ fn validate_runtime_custody_publish_input(
     Ok(LoadedRuntimeCustodyPublishInput {
         copies,
         price,
+        channel,
+        pay_token,
         listing,
     })
 }
@@ -6295,6 +6382,32 @@ fn validate_runtime_custody_listing(
         }
     }
 
+    let access_method = match listing.access_method.as_deref().map(str::trim) {
+        None | Some("") | Some("buy_once") => {
+            elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce
+        }
+        Some("free") => elastos_protected_content_runtime::RuntimeMintAccessMethod::Free,
+        Some("buy_and_resell") => {
+            elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyAndResell
+        }
+        Some(_) => bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE),
+    };
+    // The cut belongs to exactly one method. Anywhere else it would be
+    // accepted and then never encoded; on resale its absence shifts the ABI
+    // layout the operative factory decodes positionally.
+    match (access_method, listing.reseller_cut) {
+        (elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyAndResell, Some(cut))
+            if cut <= elastos_protected_content_runtime::RUNTIME_MINT_RESELLER_CUT_MAX => {}
+        (_, None)
+            if access_method
+                != elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyAndResell => {}
+        _ => bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE),
+    }
+    // A free mint creates no operative, so it has no royalty share to split.
+    if !access_method.is_paid() && !royalties.is_empty() {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+
     Ok(RuntimeCustodyListingTerms {
         title,
         description: listing.description.trim().to_string(),
@@ -6307,6 +6420,9 @@ fn validate_runtime_custody_listing(
             .collect(),
         thumbnail,
         royalties,
+        access_method,
+        reseller_cut: listing.reseller_cut,
+
         adult: listing.adult,
         licensing: listing.licensing,
         legal_attestation: listing.legal_attestation,
@@ -7508,6 +7624,10 @@ mod tests {
                 "0xa",
                 "0xf4240",
                 Vec::new(),
+                elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+                None,
+                String::new(),
+                String::new(),
             )
             .unwrap(),
             "bafycreatorcid",

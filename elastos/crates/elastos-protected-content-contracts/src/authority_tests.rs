@@ -1,8 +1,6 @@
 use ed25519_dalek::{Signer as _, SigningKey};
 use k256::ecdsa::SigningKey as WalletSigningKey;
 
-use elastos_auth::ethereum_signed_message_hash;
-
 use crate::test_support::{
     binding_for_wallet, custody_epoch_identity, digest, node_key, node_public_key, node_set,
     wallet, TestReplayClaims, NOW,
@@ -22,9 +20,7 @@ fn signed_rights(seed: u8) -> WalletSignedRightsRequestV1 {
     .unwrap();
     let key = WalletSigningKey::from_slice(&[seed; 32]).unwrap();
     let (signature, recovery_id) = key
-        .sign_prehash_recoverable(&ethereum_signed_message_hash(
-            &request.canonical_bytes().unwrap(),
-        ))
+        .sign_prehash_recoverable(&request.signing_hash().unwrap())
         .unwrap();
     let mut signature_bytes = signature.to_bytes().to_vec();
     signature_bytes.push(recovery_id.to_byte());
@@ -759,9 +755,17 @@ fn canonical_signature_golden_vectors() {
         hex::encode(node_set().canonical_bytes().unwrap()),
         "656c6173746f732e70726f7465637465642d636f6e74656e742e6e6f64652d7365742f7631000203038139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ced4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
     );
+    // Regenerated 2026-09-22 with the readable signing format. The wallet no
+    // longer signs the request's canonical bytes; it signs the text
+    // `RightsRequestV1::signing_message` produces, which states the action,
+    // account and expiry a person can read and commits to everything else
+    // through the request hash. Only the signature bytes move: every identity
+    // vector above is unchanged, because what is bound did not change, only
+    // how it is presented for signing. A reviewer of #48 should treat this
+    // value as new evidence rather than a corrected one.
     assert_eq!(
         hex::encode(rights.wallet_signature()),
-        "f8d15c5a9b765f40686169e93ec196ff7e4c2fbe93132ecd1804e492687a029414f3c9b21e239cce63a31a1958b2d069ba7b89613a8fb807738f4eb6128ea86a01"
+        "4023649c53f7724724ab93c043560f6f1d6803298552f7d511b162a2baddd0d410cd485e97fbe67ff738e6f77c60df8118f901de349413970d1a4451085fcb7f01"
     );
     assert_eq!(
         hex::encode(decision.node_signature()),
@@ -784,11 +788,52 @@ fn canonical_signature_golden_vectors() {
             hex::encode(terminal.canonical_hash().unwrap().as_bytes()),
         ],
         [
-            "7913817772c400273f2177da95a44219cec102ee24451c17f04a4a7c0f0c46a1",
+            // The signed rights request, whose signature bytes moved with the
+            // readable format. The three below it are unchanged, which is the
+            // evidence that only the rights signature moved.
+            "af8e00ded7bd1e361a0f6375419cdc940a44613344b9909687fd0a616d110262",
             "8f279ff1e622a435a90f9774e2c84ecbbdd52d290fba68432b1b20bf129020e1",
             "ea9e345a4c7cee3f29e203990a8457fad79ea9f82036d2e686388af2b947f7c0",
             "ee09e1fe43f4d5b42c3be036472a8089b9d348527031663116d6d64a4ce307fc",
         ]
         .map(str::to_string)
     );
+}
+
+/// What a person is actually shown when they approve an open.
+///
+/// Pinned because the message IS the signature: changing a word here changes
+/// every signature the product produces, so it must never move by accident.
+#[test]
+fn the_signing_prompt_is_readable_and_commits_to_the_whole_request() {
+    let rights = signed_rights(7);
+    let message = rights.request().signing_message().unwrap();
+
+    // Readable, and no replacement characters: every byte is printable ASCII.
+    assert!(
+        message.is_ascii() && !message.contains('\u{fffd}'),
+        "{message}"
+    );
+    assert!(message.contains("Open protected content."), "{message}");
+    assert!(message.contains("Action:  View"), "{message}");
+    assert!(message.contains("Account: 0x"), "{message}");
+    assert!(message.contains("(unix seconds)"), "{message}");
+
+    // The nested identity graph that used to fill the screen is now one line,
+    // and it is the canonical hash of the whole request -- so the three
+    // readable facts above cannot be altered without changing it.
+    assert!(
+        message.contains(&format!(
+            "Request: 0x{}",
+            hex::encode(rights.request().request_hash().unwrap().as_bytes())
+        )),
+        "{message}"
+    );
+    assert!(
+        !message.contains("elastos.protected-content.binding/v1"),
+        "the raw identity graph must not reach the prompt: {message}"
+    );
+
+    // Short enough to read in one screen rather than scrolled past.
+    assert!(message.len() < 256, "{} bytes: {message}", message.len());
 }

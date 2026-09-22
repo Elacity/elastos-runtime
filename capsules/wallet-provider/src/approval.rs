@@ -766,7 +766,7 @@ impl WalletProvider {
             }) else {
                 return Response::error("not_found", "active linked account not found");
             };
-            let (rights_request, canonical_bytes) =
+            let (rights_request, _canonical_bytes) =
                 match protected_content_rights_request_from_payload(&request_snapshot.payload) {
                     Ok(value) => value,
                     Err(err) => return Response::error("invalid_request", err),
@@ -776,7 +776,18 @@ impl WalletProvider {
             {
                 return Response::error("invalid_request", err);
             }
-            let hash = ethereum_signed_message_hash(&canonical_bytes);
+            // Recovered against the same message the wallet was shown, taken
+            // from the one definition in the contracts crate rather than
+            // hashed here, so producer and verifier cannot drift apart.
+            let hash = match rights_request.signing_hash() {
+                Ok(hash) => hash,
+                Err(err) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("rights request has no signing hash: {err:?}"),
+                    )
+                }
+            };
             let recovered = match recover_evm_address_from_hash(&hash, signature) {
                 Ok(recovered) => recovered,
                 Err(err) => return Response::error("invalid_signature", err),

@@ -1362,7 +1362,6 @@ mod tests {
     use super::*;
 
     use ed25519_dalek::{Signer as _, SigningKey};
-    use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
         ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
         CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1,
@@ -1541,9 +1540,7 @@ mod tests {
             .unwrap();
             let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
             let (signature, recovery_id) = key
-                .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                    &request.canonical_bytes().unwrap(),
-                ))
+                .sign_prehash_recoverable(&request.signing_hash().unwrap())
                 .unwrap();
             let mut signature_bytes = signature.to_bytes().to_vec();
             signature_bytes.push(recovery_id.to_byte());

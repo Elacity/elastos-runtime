@@ -46,7 +46,34 @@ pub enum RightsActionV1 {
     Execute = 4,
 }
 
+/// Lowercase hex, written here rather than taken from a crate.
+///
+/// `hex` is a dev-dependency of this crate, and this is the shared contract
+/// every custody node links, so four lines of encoding are cheaper than
+/// widening its shipped dependency surface.
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
 impl RightsActionV1 {
+    /// The word a person reads in the signature prompt. Stable wire text, not
+    /// a display string: it is inside what the wallet signs, so changing it
+    /// changes the signature.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::View => "View",
+            Self::Stream => "Stream",
+            Self::Download => "Download",
+            Self::Execute => "Execute",
+        }
+    }
+
     pub(crate) fn decode(value: u8) -> Result<Self, ContractError> {
         match value {
             1 => Ok(Self::View),
@@ -179,6 +206,48 @@ impl RightsRequestV1 {
         self.canonical_hash()
     }
 
+    /// The exact text a wallet is asked to sign for this request.
+    ///
+    /// The request used to be signed as its own canonical bytes. Those bytes
+    /// are a nested identity graph -- roughly a dozen SHA-256 digests with
+    /// their schema names and length prefixes -- and a wallet shown them
+    /// renders them as two kilobytes of replacement characters. The signature
+    /// was sound; the prompt was not something a person could read, so
+    /// approving it was an act of trust rather than a decision.
+    ///
+    /// This message states the three facts a person can actually check and
+    /// commits to everything else through `Request`, which is the canonical
+    /// hash of the whole request. The three readable facts are themselves
+    /// inside that hash, so none of them can be altered without changing the
+    /// line below them.
+    ///
+    /// Every field here is an enum, a number or a hash. No caller-supplied
+    /// text reaches this message, so no value can carry a newline and forge a
+    /// line -- the injection risk that plain-text signing otherwise invites
+    /// does not exist while that stays true. Adding a free-form field later
+    /// means refusing control characters at the point the field enters the
+    /// request, not escaping them here.
+    pub fn signing_message(&self) -> Result<String, ContractError> {
+        Ok(format!(
+            "ElastOS\n\nOpen protected content.\n\nAction:  {action}\nAccount: 0x{account}\nExpires: {expires} (unix seconds)\nRequest: 0x{request}\n",
+            action = self.action.label(),
+            account = hex_lower(self.binding.wallet().as_bytes()),
+            expires = self.expires_at,
+            request = hex_lower(self.request_hash()?.as_bytes()),
+        ))
+    }
+
+    /// The digest a wallet produces for this request, and the one every
+    /// verifier recovers against.
+    ///
+    /// Producer and verifiers all reach the signature through here, so there
+    /// is no second definition of what is signed for them to drift apart on.
+    pub fn signing_hash(&self) -> Result<[u8; 32], ContractError> {
+        Ok(ethereum_signed_message_hash(
+            self.signing_message()?.as_bytes(),
+        ))
+    }
+
     pub fn replay_claim_key(&self) -> Result<ReplayClaimKeyV1, ContractError> {
         let scope = RightsAuthorityScopeV1 {
             binding: self.binding.clone(),
@@ -285,7 +354,7 @@ impl WalletSignedRightsRequestV1 {
         }
         validate_active(request.issued_at, request.expires_at, context.now)?;
 
-        let recovered = recover_wallet(&request.canonical_bytes()?, &self.wallet_signature)?;
+        let recovered = recover_wallet(&request.signing_hash()?, &self.wallet_signature)?;
         if recovered != request.binding.wallet() {
             return Err(RightsError::WalletMismatch);
         }
@@ -413,8 +482,13 @@ pub(crate) fn validate_active(
     Ok(())
 }
 
+/// Recovers the wallet that produced `signature_bytes` over `signing_hash`.
+///
+/// Takes the prehash rather than a message, so the one definition of what is
+/// signed lives in `RightsRequestV1::signing_message` and this function cannot
+/// hash something else by accident.
 fn recover_wallet(
-    canonical_request: &[u8],
+    signing_hash: &[u8; 32],
     signature_bytes: &[u8],
 ) -> Result<WalletAddress, RightsError> {
     if signature_bytes.len() != WALLET_SIGNATURE_BYTES {
@@ -427,12 +501,8 @@ fn recover_wallet(
     }
     let recovery_id =
         RecoveryId::from_byte(signature_bytes[64]).ok_or(RightsError::InvalidWalletSignature)?;
-    let verifying_key = VerifyingKey::recover_from_prehash(
-        &ethereum_signed_message_hash(canonical_request),
-        &signature,
-        recovery_id,
-    )
-    .map_err(|_| RightsError::InvalidWalletSignature)?;
+    let verifying_key = VerifyingKey::recover_from_prehash(signing_hash, &signature, recovery_id)
+        .map_err(|_| RightsError::InvalidWalletSignature)?;
     let encoded = verifying_key.to_encoded_point(false);
     let public_key = encoded.as_bytes();
     if public_key.len() != 65 || public_key[0] != 4 {
@@ -450,8 +520,6 @@ fn recover_wallet(
 mod tests {
     use ed25519_dalek::{Signer as _, SigningKey as ReceiptSigningKey};
     use k256::ecdsa::SigningKey;
-
-    use elastos_auth::ethereum_signed_message_hash;
 
     use super::*;
     use crate::test_support::{binding_for_wallet, digest, wallet, TestReplayClaims, NOW};
@@ -476,9 +544,7 @@ mod tests {
 
     fn signature(request: &RightsRequestV1, seed: u8) -> Vec<u8> {
         let (signature, recovery_id) = wallet_key(seed)
-            .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&request.signing_hash().unwrap())
             .unwrap();
         let mut bytes = signature.to_bytes().to_vec();
         bytes.push(recovery_id.to_byte());

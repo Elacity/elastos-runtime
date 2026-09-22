@@ -22,6 +22,12 @@ const mediaCreatorMint = "a".repeat(64);
 const mediaPurchasedMint = "b".repeat(64);
 const mediaAvailableMint = "c".repeat(64);
 const mediaImportedMint = "d".repeat(64);
+const mediaSongMint = "e".repeat(64);
+const mediaPaperMint = "f".repeat(64);
+const mediaSoldOutMint = "1".repeat(64);
+const mediaCoverCid = "QmYtisnG1wCaUCAGp3hi2xKKeaTzMFhvxyFf1crWaTyoRH";
+const mediaMetadataCid = "QmX1KSGkt3fLX5GsuN7wVWrCj55PSnfbk4JJ2BTY2QRJ7F";
+const mediaBareMetadataCid = "QmUwdnvSofKYGnBSWwqtgnEJLWMPD9fDv9ZdvSrbFSg7ov";
 // What a creator hands out: `elastos://` and the listing package's CID.
 const importedListingUri = "elastos://QmcHh9eQuLiisfxZo4m4TxaVTSYzs4AF4LaVcmkd2o2Y76";
 const mediaPayToken = "0x1111111111111111111111111111111111111111";
@@ -48,6 +54,9 @@ function mediaListing({ mintId, displayName, accessState, quantity, price, codec
     mint_id: mintId,
     display_name: displayName,
     listing_uri: importedListingUri,
+    // The published metadata directory, which the shelf reads a title and a
+    // cover from. A real CID from this Home's own records.
+    metadata_cid: mediaMetadataCid,
     // Runtime names the kind; the shelf and the viewer session read the same
     // two words rather than each deciding from the MIME.
     content_kind: "media",
@@ -109,6 +118,20 @@ const catalogCapsules = [
     accepted_content: [{ name: "markdown", title: "Markdown" }],
     requires: [{ name: "people" }],
     viewer_title: "Documents",
+  },
+  {
+    name: "creator",
+    title: "Creator",
+    author: "Elastos",
+    description: "Protect a file and list it for sale.",
+    category: "apps",
+    role: "app",
+    installed: true,
+    launchable: true,
+    launch_target: "creator",
+    type: "wasm",
+    trust_state: "local-manifest-signature",
+    signature_state: "manifest-signature-declared",
   },
   {
     name: "object-provider",
@@ -328,6 +351,72 @@ function startServer() {
       initialCatalogHeld: false,
       initialInterfacesHeld: false,
       initialMediaHeld: false,
+      channelsNeedApproval: true,
+      // Two assets nobody on this Home holds a listing for: the market has
+      // them, and this Home can buy them and cannot open them.
+      catalogItems: [
+        {
+          ledger: "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+          tokenId: "0x1f",
+          operative: "0x1aa4dd2cb9c9b784eaccedf5c679fd267cab1033",
+          sellerAddress: "0x34daf3000000000000000000000000000000beef",
+          contentAccessId: "0x27df70c564295e2fbc1967719ffdb12e",
+          contentCid: "Qma6zsq5rQXK1dwtF6xvFSGNvVY8q5yGGUugH3bVTst5m8",
+          metadataCid: mediaBareMetadataCid,
+          displayName: "Someone Else's Film",
+          contentCategory: "video",
+          price: "250000",
+          payToken: mediaPayToken,
+          quantity: 12,
+          opType: 1,
+          views: 41,
+          publishedAt: 1_789_500_000,
+          accessState: "available",
+        },
+        {
+          ledger: "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+          tokenId: "0x20",
+          sellerAddress: "0x34daf3000000000000000000000000000000beef",
+          contentAccessId: "0x27df70c564295e2fbc1967719ffdb12f",
+          metadataCid: mediaBareMetadataCid,
+          displayName: "Someone Else's Paper",
+          contentCategory: "document",
+          price: "500000",
+          payToken: mediaPayToken,
+          quantity: 3,
+          opType: 1,
+          views: 2,
+          publishedAt: 1_789_400_000,
+          accessState: "available",
+        },
+      ],
+      channelAccess: {
+        "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41": "none",
+        "0x56d2d76a8e3a1c9551efe1201e15b517f77cb9b0": "administrator",
+        "0x1234567890abcdef1234567890abcdef12345678": "unknown",
+      },
+      channels: [
+        {
+          address: "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+          name: "Test CH-3.0-rc7",
+          description: "Protected items",
+          categories: ["music"],
+          itemsCount: 40,
+          imageCid: "QmYtisnG1wCaUCAGp3hi2xKKeaTzMFhvxyFf1crWaTyoRH",
+        },
+        {
+          address: "0x56d2d76a8e3a1c9551efe1201e15b517f77cb9b0",
+          itemsCount: 0,
+        },
+        // A channel the chain could not be read for. It exists in this fixture
+        // so that "unknown must not draw a Subscribe button" is a claim the
+        // run can actually falsify.
+        {
+          address: "0x1234567890abcdef1234567890abcdef12345678",
+          name: "Unreadable Channel",
+          itemsCount: 3,
+        },
+      ],
       mediaListings: [
         mediaListing({
           mintId: mediaCreatorMint,
@@ -348,8 +437,59 @@ function startServer() {
           displayName: "Store Video",
           accessState: "available",
           quantity: "0x4",
-          price: "0x8",
+          // 123 base units at six decimals: a mantissa with more than one
+          // digit, so that dropping digits to shorten it would be visible.
+          price: "0x7b",
         }),
+        // A shelf worth grouping. The song is the newest of all, so it also
+        // proves the order inside a section is the item's own age and not the
+        // order Runtime happened to list them in.
+        {
+          ...mediaListing({
+            mintId: mediaSongMint,
+            displayName: "A Song.mp3",
+            accessState: "available",
+            quantity: "0x1",
+            price: "0x9",
+            codecs: "mp4a.40.2",
+          }),
+          metadata_cid: mediaBareMetadataCid,
+          // Priced in the chain's own coin, so the card wears its mark.
+          pay_token: "0x0000000000000000000000000000000000000000",
+          mime_type: "audio/mpeg",
+          published_at: 1_789_000_000,
+        },
+        {
+          ...mediaListing({
+            mintId: mediaSoldOutMint,
+            displayName: "Nothing Left.mp4",
+            accessState: "available",
+            quantity: "0x0",
+            price: "0x186a0",
+          }),
+          // The oldest video, so the three a shelf shows are the ones the
+          // purchase flows below drive. Its own state is checked with the
+          // section opened.
+          published_at: 1_600_000_000,
+        },
+        {
+          ...mediaListing({
+            mintId: mediaPaperMint,
+            displayName: "A Paper.pdf",
+            // Listed by this Home, so it carries the secondary actions a
+            // document folds behind one control.
+            accessState: "creator",
+            quantity: "0x2",
+            // 12345000. Shortening it would mean "12345K", which is longer
+            // than it is short, so the card must show it in full.
+            price: "0xbc5ea8",
+            codecs: "",
+          }),
+          metadata_cid: mediaBareMetadataCid,
+          content_kind: "object",
+          mime_type: "application/pdf",
+          published_at: 1_700_000_000,
+        },
       ],
     },
     [mediaErrorToken]: { catalogFailuresRemaining: 0 },
@@ -477,6 +617,127 @@ function startServer() {
         json(response, { capsules: catalogCapsules });
         return;
       }
+      // The market, as Runtime hands it over: the index's dialect already
+      // converted, and each item joined against what this Home holds.
+      if (url.pathname === "/api/apps/marketplace/items") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        requestLog.push({ path: url.pathname, token });
+        const scenario = state[token] || {};
+        if (scenario.catalogUnavailable) {
+          json(response, {
+            asOf: 1_790_000_000,
+            unavailable: true,
+            needsApproval: false,
+            items: [],
+            note: "market directory returned 502: bad gateway",
+          });
+          return;
+        }
+        if (scenario.catalogNeedsApproval) {
+          json(response, { asOf: 1_790_000_000, unavailable: true, needsApproval: true, items: [] });
+          return;
+        }
+        json(response, {
+          asOf: 1_790_000_000,
+          unavailable: false,
+          needsApproval: false,
+          items: scenario.catalogItems || [],
+        });
+        return;
+      }
+      if (url.pathname === "/api/apps/marketplace/pay-tokens") {
+        requestLog.push({ path: url.pathname });
+        json(response, {
+          payTokens: [
+            { symbol: "USDC", address: mediaPayToken, decimals: 6 },
+            { symbol: "ETH", address: "0x0000000000000000000000000000000000000000", decimals: 18 },
+          ],
+        });
+        return;
+      }
+      if (url.pathname === "/api/apps/marketplace/channels") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        requestLog.push({ path: url.pathname, token });
+        const scenario = state[token] || {};
+        // The answer this surface must tell apart: an unapproved read, an
+        // index that could not be reached, and a market with channels in it.
+        if (scenario.channelsNeedApproval) {
+          json(response, {
+            asOf: 1_790_000_000,
+            stale: false,
+            unavailable: true,
+            needsApproval: true,
+            channels: [],
+            note: "external market directory HTTP source is not approved",
+          });
+          return;
+        }
+        json(response, {
+          asOf: 1_790_000_000,
+          stale: false,
+          unavailable: false,
+          needsApproval: false,
+          channels: scenario.channels || [],
+        });
+        return;
+      }
+      if (url.pathname === "/api/apps/marketplace/channel-access") {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        const body = await readJsonBody(request);
+        requestLog.push({ path: url.pathname, token, method: request.method, body });
+        const scenario = state[token] || {};
+        json(response, {
+          unavailable: false,
+          channels: (body?.channels || []).map((channel) => ({
+            channel,
+            state: (scenario.channelAccess || {})[channel] || "unknown",
+          })),
+        });
+        return;
+      }
+      // The published metadata document, which the shelf reads a title and a
+      // cover from. Served from this Home's own CID route, exactly as the
+      // gateway serves it.
+      if (url.pathname.endsWith("/metadata.json")) {
+        requestLog.push({ path: url.pathname });
+        // Only one item has a published document here. The others fall back
+        // to the file name Runtime already sent, which is what a shelf shows
+        // for anything minted before covers existed.
+        if (!url.pathname.startsWith(`/ipfs/${mediaMetadataCid}/`)) {
+          response.writeHead(404, {
+            "access-control-allow-origin": "null",
+            "cache-control": "no-store",
+            "content-length": 0,
+          });
+          response.end();
+          return;
+        }
+        json(response, {
+          schema: "elacity.asset/v1",
+          name: "Big Buck Bunny",
+          description: "A rabbit, at some length.",
+          image: `ipfs://${mediaCoverCid}`,
+        });
+        return;
+      }
+      if (url.pathname.startsWith("/ipfs/")) {
+        const token = String(request.headers["x-elastos-home-token"] || "");
+        requestLog.push({ path: url.pathname, token });
+        // A 1x1 PNG, served the way this Home serves any CID.
+        const png = Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+          "base64",
+        );
+        response.writeHead(200, {
+          "access-control-allow-origin": "null",
+          "cache-control": "private, max-age=300",
+          "content-length": png.length,
+          "content-type": "image/png",
+          "x-content-type-options": "nosniff",
+        });
+        response.end(png);
+        return;
+      }
       if (url.pathname === "/api/capsules/interfaces") {
         const token = String(request.headers["x-elastos-home-token"] || "");
         requestLog.push({ path: url.pathname, token });
@@ -546,13 +807,18 @@ function startServer() {
         if (token === normalToken && body?.listing_uri === importedListingUri) {
           state[normalToken].mediaListings = [
             ...state[normalToken].mediaListings,
-            mediaListing({
-              mintId: mediaImportedMint,
-              displayName: "Imported Video",
-              accessState: "available",
-              quantity: "0x9",
-              price: "0xa",
-            }),
+            {
+              ...mediaListing({
+                mintId: mediaImportedMint,
+                displayName: "Imported Video",
+                accessState: "available",
+                quantity: "0x9",
+                price: "0xa",
+              }),
+              // An item that just arrived is the newest thing on the shelf,
+              // which is also where a person looks for it.
+              published_at: 1_800_000_000,
+            },
           ];
           json(response, {
             status: "ok",
@@ -771,7 +1037,7 @@ async function run() {
     );
 
     const installedBadge = await frame.locator("#installed-badge").textContent();
-    assert(installedBadge?.trim() === "3", "Marketplace installed count must come from catalog installed fields", { installedBadge });
+    assert(installedBadge?.trim() === "4", "Marketplace installed count must come from catalog installed fields", { installedBadge });
 
     const discoverTitles = await frame.locator(".store-section-title").evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() || ""));
     assert(discoverTitles.includes("Installed"), "Marketplace Discover must include the Installed section", discoverTitles);
@@ -806,21 +1072,576 @@ async function run() {
       nodes.map((node) => node.textContent?.trim() || ""),
     );
     assert(
-      mediaRows.some((row) => /Creator Video/.test(row) && /Quantity 2/.test(row) && /Price 5 base units/.test(row))
-        && mediaRows.every((row) => !/Quantity 0x|Price 0x/.test(row)),
-      "Marketplace media rows must present canonical uint256 listing values in decimal",
+      mediaRows.some((row) => /Creator Video/.test(row) && /2 available/.test(row) && /0\.0₅5/.test(row))
+        // A uint256 is a hex string all the way to the moment it is shown.
+        // Whatever the card's wording, none of it may be a raw one.
+        && mediaRows.every((row) => !/0x[0-9a-f]+\s*(units|available)/.test(row)),
+      "Marketplace media cards must present canonical uint256 listing values in decimal",
       mediaRows,
     );
-    await frame.locator("#search-input").fill("price 5");
+    // A person searches for what the card shows them, so the price is matched
+    // in the form they read as well as in full.
+    await frame.locator("#search-input").fill("0.0₅5");
     const decimalSearchRows = await frame.locator(".store-row-media").evaluateAll((nodes) =>
       nodes.map((node) => node.textContent?.trim() || ""),
     );
     assert(
       decimalSearchRows.length === 1 && /Creator Video/.test(decimalSearchRows[0]),
-      "Marketplace media search must include the visible decimal price",
+      "Marketplace media search must match the price a person can see",
       decimalSearchRows,
     );
     await frame.locator("#search-input").fill("");
+
+    // The shelf is grouped by what each item IS, newest first, and a section
+    // exists only when it has something in it.
+    const sectionTitles = await frame.locator("#store-sections .section-head h2").evaluateAll(
+      (nodes) => nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      // Each section says how many it holds, which is the design's own way of
+      // telling a shelf of three from a shelf of thirty.
+      // Five videos and two documents: this Home's own, plus the market's.
+      sectionTitles.join("|") === "Videos 5|Audio 1|Documents 2",
+      "Explore must group items by kind, in order, with counts and no empty section",
+      sectionTitles,
+    );
+    const videoTitles = await frame
+      .locator("#store-sections .section:has(.section-head h2:has-text('Videos')) .card-title")
+      .evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() || ""));
+    // A section shows three and offers the rest, so a shelf fits on screen.
+    assert(
+      videoTitles.length === 3
+        && (await frame.locator('.section:has(.section-head h2:has-text("Videos")) [data-action="explore-more"]').count()) === 1,
+      "A section shows three items and offers the rest behind See all",
+      videoTitles,
+    );
+    assert(
+      (await frame.locator('.section:has(.section-head h2:has-text("Audio")) [data-action="explore-more"]').count()) === 0,
+      "A section with nothing held back offers no See all",
+    );
+    const musicTitles = await frame
+      .locator("#store-sections .section:has(.section-head h2:has-text('Audio')) .card-title")
+      .evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() || ""));
+    assert(
+      musicTitles.length === 1 && musicTitles[0] === "A Song.mp3",
+      "A song belongs to Audio and to nothing else",
+      musicTitles,
+    );
+    // Explore is the market, not this Home's shelf: an item nobody here holds
+    // a listing for still has a card, and it offers to buy.
+    // The market arrives after this Home's own items are already on screen,
+    // which is the point: a shelf shows what it has and gains the rest.
+    await frame.locator('.card-title:text-is("Someone Else\'s Film")').waitFor();
+    const foreignTitles = await frame.locator(".card-title").evaluateAll(
+      (nodes) => nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      foreignTitles.includes("Someone Else's Film"),
+      "Explore must show what other people minted",
+      foreignTitles,
+    );
+    // An item known only to the index has no file name, so the line under its
+    // title says what the card is otherwise missing rather than repeating it.
+    const foreignMeta = await frame
+      .locator('.card:has(.card-title:text-is("Someone Else\'s Film")) .card-meta')
+      .textContent();
+    assert(
+      !/Someone Else's Film/.test(foreignMeta || "")
+        && /12 available/.test(foreignMeta || "")
+        && /by 0x34daf3/.test(foreignMeta || ""),
+      "A card must not repeat its own title in the line beneath it",
+      { foreignMeta },
+    );
+    // ...and My listings is this Home's own, which never includes them.
+    await frame.locator('[data-media-tab="mine"]').click();
+    await frame.locator(".card").first().waitFor();
+    const mineTitles = await frame.locator(".card-title").evaluateAll(
+      (nodes) => nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      !mineTitles.includes("Someone Else's Film") && mineTitles.length > 0,
+      "My listings must hold only what this Home listed",
+      mineTitles,
+    );
+    await frame.locator('[data-media-tab="explore"]').click();
+    await frame.locator(".card").first().waitFor();
+
+    // A cover that has landed leaves no shimmer behind it, and one that never
+    // arrives leaves the placeholder rather than a frame that shimmers for
+    // ever.
+    const covers = await frame.locator(".card .thumb").evaluateAll((nodes) => nodes.map((node) => ({
+      pending: node.classList.contains("thumb-pending"),
+      img: node.querySelector("img")?.getAttribute("data-cover") || "",
+    })));
+    assert(
+      covers.length > 0 && covers.every((cover) => !cover.pending && cover.img !== "pending"),
+      "A settled shelf must leave no cover still loading",
+      covers,
+    );
+
+    // A market that cannot be read is not an empty market, and the shelf says
+    // which it is rather than leaving a person to guess from what is missing.
+    state[normalToken].catalogUnavailable = true;
+    await frame.locator('[data-action="refresh-media"]').click();
+    await frame.locator("#store-sections", { hasText: "Couldn’t reach the market" }).waitFor();
+    const downNotice = await frame.locator("#store-sections .store-inline-note").first().textContent();
+    assert(
+      /Couldn’t reach the market/.test(downNotice || "")
+        && (await frame.locator(".card").count()) > 0,
+      "An unreachable market must say so, above the items this Home does have",
+      { downNotice },
+    );
+    state[normalToken].catalogUnavailable = false;
+
+    // Asking again is a control, and it says what it found rather than just
+    // spinning: a market that cannot be read must not look like an empty one.
+    await frame.locator('[data-action="refresh-media"]').click();
+    await frame.locator("#toast", { hasText: "yours." }).waitFor();
+    const refreshToast = await frame.locator("#toast").textContent();
+    assert(
+      /\d+ items? · \d+ yours\./.test(refreshToast || ""),
+      "Refresh must say what it found",
+      { refreshToast },
+    );
+
+    // A published document gives an item the title its creator typed and the
+    // cover they chose; an item without one keeps the file name Runtime sent.
+    const titled = await frame.locator(`.card[data-mint="${mediaCreatorMint}"]`).evaluate((node) => ({
+      title: node.querySelector(".card-title")?.textContent?.trim() || "",
+      meta: node.querySelector(".card-meta")?.textContent?.trim() || "",
+      cover: node.querySelector(".app-icon-img")?.getAttribute("src") || "",
+    }));
+    // The line under the title names the file, because that differs from the
+    // title and says which copy this is.
+    assert(
+      titled.title === "Big Buck Bunny"
+        && /Creator Video/.test(titled.meta)
+        && titled.cover === `/ipfs/${mediaCoverCid}`,
+      "A published document gives a card its title and cover, with the file still named beneath",
+      titled,
+    );
+    const untitled = await frame.locator(`.card[data-mint="${mediaSongMint}"]`).evaluate((node) => ({
+      title: node.querySelector(".card-title")?.textContent?.trim() || "",
+      cover: node.querySelector(".app-icon-img")?.getAttribute("src") || "",
+    }));
+    assert(
+      untitled.title === "A Song.mp3" && untitled.cover === "",
+      "An item with no published document keeps its file name and its placeholder",
+      untitled,
+    );
+
+    // Open Videos in full, so every state below is on screen: a shelf shows
+    // three, and these assertions are about the cards rather than the shelf.
+    await frame.locator('.section:has(.section-head h2:has-text("Videos")) [data-action="explore-more"]').click();
+    await frame.locator(`.card[data-mint="${mediaAvailableMint}"]`).waitFor();
+
+    // From here the checks are about cards rather than about the shelf, so
+    // Videos is opened in full: a shelf shows three of a kind on purpose.
+    const openVideosInFull = async () => {
+      await frame.locator('[data-media-tab="explore"]').click();
+      await frame.locator(".card").first().waitFor();
+      const more = frame.locator('.section:has(.section-head h2:has-text("Videos")) [data-action="explore-more"]');
+      if (await more.count()) {
+        await more.click();
+      }
+      await frame.locator(`.card[data-mint="${mediaAvailableMint}"]`).waitFor();
+    };
+    await openVideosInFull();
+
+    // Each state names itself on the card, rather than leaving a person to
+    // work it out from what is missing.
+    // Pressing the tab a person is already on takes them back to the whole
+    // shelf, which is what the helper below relies on.
+    //
+    // A shelf shows three of a kind and holds the rest behind See all, so a
+    // check about one card brings that card into view first. Which section it
+    // lives in is the shelf's business, not the test's.
+    const ensureCard = async (mint) => {
+      const card = frame.locator(`.card[data-mint="${mint}"]`);
+      if (await card.count()) {
+        return;
+      }
+      await frame.locator('[data-media-tab="explore"]').click();
+      await frame.locator(".card").first().waitFor();
+      if (await card.count()) {
+        return;
+      }
+      const sections = await frame.locator('[data-action="explore-more"]').count();
+      for (let index = 0; index < sections; index += 1) {
+        await frame.locator('[data-media-tab="explore"]').click();
+        await frame.locator(".card").first().waitFor();
+        await frame.locator('[data-action="explore-more"]').nth(index).click();
+        if (await card.count()) {
+          return;
+        }
+      }
+    };
+    const cardState = async (mint) => {
+      await ensureCard(mint);
+      return frame.locator(`.card[data-mint="${mint}"]`).evaluate((node) => ({
+      format: node.querySelector(".tag.left")?.textContent?.trim() || "",
+      badge: node.querySelector(".tag.right")?.textContent?.trim() || "",
+      units: node.querySelector(".price:not(.owned)")?.textContent?.replace(/\s+/g, " ").trim() || "",
+      unitsTitle: node.querySelector(".price")?.getAttribute("title") || "",
+      play: node.querySelectorAll(".play").length,
+      stock: node.querySelector(".stock")?.textContent?.trim() || "",
+      owned: node.querySelector(".price.owned")?.textContent?.trim() || "",
+      note: node.querySelector(".btn-ghost[disabled]")?.textContent?.trim() || "",
+      actions: [...node.querySelectorAll(".card-actions [data-action]")].map((c) => c.dataset.action),
+      }));
+    };
+
+    const creatorState = await cardState(mediaCreatorMint);
+    assert(
+      creatorState.badge === "Listed by you"
+        && creatorState.actions.join("|") === "share-listing|download-copy|open-media",
+      "A listing this Home made says so, and offers its link, a rebuild and the item",
+      creatorState,
+    );
+    const ownedState = await cardState(mediaPurchasedMint);
+    assert(
+      ownedState.badge === "In your library"
+        && ownedState.owned === "✓ In your library"
+        && ownedState.units === ""
+        && ownedState.actions.join("|") === "download-copy|open-media",
+      "A copy this Home holds says it is owned instead of naming a price again",
+      ownedState,
+    );
+    const soldOutState = await cardState(mediaSoldOutMint);
+    assert(
+      soldOutState.badge === "Sold out"
+        && soldOutState.stock === "0 available"
+        // No control at all, rather than one that cannot work: this Home
+        // cannot tell anyone when a copy frees up.
+        && soldOutState.actions.length === 0
+        && soldOutState.note === "Sold out",
+      "An item with nothing left to sell offers nothing, and says why",
+      soldOutState,
+    );
+    // A play control is offered on what this person can open, and on nothing
+    // else: on an item still for sale it would promise what the next click
+    // cannot do.
+    assert(
+      creatorState.play === 1 && ownedState.play === 1,
+      "An item this Home can open offers to play it from the card",
+      { creator: creatorState.play, owned: ownedState.play },
+    );
+    assert(
+      (await cardState(mediaAvailableMint)).play === 0 && soldOutState.play === 0,
+      "An item this Home cannot open offers no play control",
+    );
+    await frame.locator('[data-action="explore-all"]').click();
+    await frame.locator(".card").first().waitFor();
+
+    // A document folds its two secondary actions behind one control, because
+    // a page leaves less room beside it. The actions are the same either way.
+    const paperCard = frame.locator(`.card[data-mint="${mediaPaperMint}"]`);
+    assert(
+      (await paperCard.locator('[data-action="card-menu"]').count()) === 1
+        && (await paperCard.locator('.card-actions > [data-action="download-copy"]').count()) === 0,
+      "A document card offers its secondary actions behind one control",
+    );
+    assert(
+      !(await paperCard.locator('[data-action="download-copy"]').isVisible()),
+      "A folded menu stays shut until it is asked for",
+    );
+    await paperCard.locator('[data-action="card-menu"]').click();
+    assert(
+      (await paperCard.locator('[data-action="download-copy"]').isVisible())
+        && (await paperCard.locator('[data-action="card-menu"]').getAttribute("aria-expanded")) === "true",
+      "Opening the menu reveals the same actions a video shows plainly",
+    );
+    await frame.locator("#store-title").click();
+    assert(
+      !(await paperCard.locator('[data-action="download-copy"]').isVisible())
+        && (await paperCard.locator('[data-action="card-menu"]').getAttribute("aria-expanded")) === "false",
+      "A click elsewhere closes the menu",
+    );
+    // A video shows them plainly, in the room it has.
+    const videoCard = frame.locator(`.card[data-mint="${mediaCreatorMint}"]`);
+    assert(
+      (await videoCard.locator('.card-actions > [data-action="download-copy"]').count()) === 1
+        && (await videoCard.locator('[data-action="card-menu"]').count()) === 0,
+      "A video card shows its secondary actions without folding them",
+    );
+
+    const paperState = await cardState(mediaPaperMint);
+    assert(
+      paperState.format === "PDF" && (await cardState(mediaSongMint)).format === "MP3",
+      "A card names what kind of file it is",
+      paperState,
+    );
+    // A document stands a page at the foot of the card; a video fills the
+    // frame. A document with no cover still shows a page, with its title on
+    // it, rather than a glyph that says only "file".
+    // A cover that fails to load leaves the same placeholder as a cover that
+    // was never there. Proved by pointing a card at a CID this fake Home does
+    // not serve and watching the image stand down.
+    const brokenCover = await frame.locator(`.card[data-mint="${mediaCreatorMint}"]`).evaluate(async (node) => {
+      const image = node.querySelector(".app-icon-img");
+      if (!image) {
+        return { had: false };
+      }
+      const glyph = node.querySelector(".app-icon-glyph");
+      image.dispatchEvent(new Event("error"));
+      // The computed style, not the attribute. An author `display: block`
+      // beats the browser's own `[hidden]` rule, which is how a dead image
+      // once stayed on screen beside the glyph that replaced it.
+      return {
+        had: true,
+        imageShown: getComputedStyle(image).display !== "none",
+        glyphShown: glyph ? getComputedStyle(glyph).display !== "none" : false,
+      };
+    });
+    assert(
+      brokenCover.had && !brokenCover.imageShown && brokenCover.glyphShown,
+      "A cover that fails to load must stand down and leave the placeholder",
+      brokenCover,
+    );
+
+    const paperShape = await frame.locator(`.card[data-mint="${mediaPaperMint}"]`).evaluate((node) => ({
+      doc: node.classList.contains("doc"),
+      page: node.querySelector(".page-fallback")?.textContent?.trim() || "",
+    }));
+    assert(
+      paperShape.doc && /A Paper\.pdf/.test(paperShape.page),
+      "A document card is page-shaped and carries its own title",
+      paperShape,
+    );
+    assert(
+      await frame.locator(`.card[data-mint="${mediaCreatorMint}"]`).evaluate(
+        (node) => node.classList.contains("video"),
+      ),
+      "A video card fills its frame",
+    );
+    // A price is shortened only when the short form is exactly the price, and
+    // the exact value travels with it either way.
+    assert(
+      soldOutState.units === "$0.1" && soldOutState.unitsTitle === "0.1 USDC",
+      "A price is shown as money, with the token amount kept exactly",
+      soldOutState,
+    );
+    // A price too small to read in full is written with its significant
+    // digits and an exponent -- the same number, short enough for a card --
+    // and the exact amount stays on the element.
+    const tiny = await cardState(mediaCreatorMint);
+    assert(
+      tiny.units === "$0.0₅5" && tiny.unitsTitle === "0.000005 USDC",
+      "A very small price counts its zeros instead of printing them",
+      tiny,
+    );
+
+    // Every significant digit survives being shortened.
+    const smallMulti = await cardState(mediaAvailableMint);
+    assert(
+      smallMulti.units === "$0.0₃123" && smallMulti.unitsTitle === "0.000123 USDC",
+      "Counting a price's zeros must keep every digit that follows them",
+      smallMulti,
+    );
+
+    // A currency with a mark wears it instead of its name.
+    const ether = await cardState(mediaSongMint);
+    assert(
+      ether.units === "Ξ0.0₁₇9" && ether.unitsTitle === "0.000000000000000009 ETH",
+      "A price in ether is marked, not named",
+      ether,
+    );
+
+    // ...and a price no shorter for being shortened stays as it is.
+    const longPrice = await cardState(mediaPaperMint);
+    assert(
+      longPrice.units === "$12.345" && longPrice.unitsTitle === "12.345 USDC",
+      "A price keeps every digit it has: no rounding on the way to the card",
+      longPrice,
+    );
+
+    // Every card offers the one control that fits whoever is looking.
+    await ensureCard(mediaAvailableMint);
+    const available = frame.locator(`.card[data-mint="${mediaAvailableMint}"]`);
+    const owned = frame.locator(`.card[data-mint="${mediaPurchasedMint}"]`);
+    assert(
+      (await available.locator('[data-action="buy-media"]').count()) === 1
+        && (await available.locator('[data-action="download-copy"]').count()) === 0,
+      "An item this Home does not hold offers Buy, and nothing to download",
+    );
+    assert(
+      (await ensureCard(mediaPurchasedMint), await owned.locator('[data-action="download-copy"]').count()) === 1
+        && (await owned.locator('[data-action="buy-media"]').count()) === 0,
+      "An item this Home holds offers Download, and nothing to buy",
+    );
+
+    // Media is two surfaces behind one title. Switching away from Explore
+    // must take the shelf and its Add-a-listing control with it, and coming
+    // back must restore both -- the tab is the only thing that changed.
+    const tabsVisible = await frame.locator("#media-tabs").isVisible();
+    const tabLabels = await frame.locator("#media-tabs [data-media-tab]").evaluateAll((nodes) =>
+      nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      tabsVisible && tabLabels.join("|") === "Explore|Shops|My listings",
+      "Media must offer Explore, Shops and My listings",
+      { tabsVisible, tabLabels },
+    );
+    assert(
+      await frame.locator("#import-listing").isVisible(),
+      "Add a listing must be offered on Explore",
+    );
+    await frame.locator('[data-media-tab="shops"]').click();
+    assert(
+      !(await frame.locator("#import-listing").isVisible())
+        && !(await frame.locator("#media-toolbar").isVisible())
+        && (await frame.locator(".store-row-media").count()) === 0
+        && (await frame.locator('[data-media-tab="shops"]').getAttribute("aria-selected")) === "true",
+      "Shops must replace the shelf and withdraw the Add-a-listing control",
+    );
+
+    // An unapproved directory is not an empty market. The surface must say
+    // which it is, and offer the only thing that changes it.
+    await frame.locator('[data-action="approve-shops"]').waitFor();
+    const unapprovedText = await frame.locator("#store-sections").textContent();
+    assert(
+      /need your approval/i.test(unapprovedText || "")
+        && !/No channels listed/i.test(unapprovedText || ""),
+      "An unapproved channel directory must not read as an empty market",
+      { unapprovedText },
+    );
+    // Approving happens in the Inbox, so the control says where to go and
+    // then becomes the way back.
+    await frame.locator('[data-action="approve-shops"]').click();
+    const awaitingText = await frame.locator("#store-sections").textContent();
+    assert(
+      /Inbox/.test(awaitingText || "")
+        && (await frame.locator('[data-action="approve-shops"]').textContent())?.trim() === "Check again",
+      "The approval control must name the Inbox and then offer a re-check",
+      { awaitingText },
+    );
+    // Once approved, the same control fetches, and the channels render.
+    state[normalToken].channelsNeedApproval = false;
+    await frame.locator('[data-action="approve-shops"]').click();
+    await frame.locator(".store-row-shop").first().waitFor();
+    const shopRows = await frame.locator(".store-row-shop").evaluateAll((nodes) =>
+      nodes.map((node) => node.textContent?.trim() || ""),
+    );
+    assert(
+      shopRows.length === 3
+        && /Test CH-3\.0-rc7/.test(shopRows[0])
+        && /40 items/.test(shopRows[0])
+        && /Music/.test(shopRows[0]),
+      "Shops must name each channel and how much is in it",
+      shopRows,
+    );
+    assert(
+      /0x56d2…b9b0|0x56d2/.test(shopRows[1]) && /0 items/.test(shopRows[1]),
+      "A channel with no name must still be recognisable by its address",
+      shopRows,
+    );
+    // A channel with a picture shows it, named by the channel rather than by
+    // a CID the page was handed; a channel without one keeps its glyph.
+    const shopImages = await frame.locator(".store-row-shop .app-icon-img").evaluateAll(
+      (nodes) => nodes.map((node) => node.getAttribute("src") || ""),
+    );
+    assert(
+      shopImages.length === 1
+        && shopImages[0] === "/ipfs/QmYtisnG1wCaUCAGp3hi2xKKeaTzMFhvxyFf1crWaTyoRH",
+      "A channel picture must come from this Home's own CID route",
+      shopImages,
+    );
+    // The CID is fine -- it is what the route takes. A directory URL is not.
+    const shopMarkup = await frame.locator("#store-sections").innerHTML();
+    assert(
+      !/10\.132\.0\.5/.test(shopMarkup)
+        && !/thumbnail:/.test(shopMarkup)
+        && !/initials:/.test(shopMarkup),
+      "No directory URL or sentinel may reach the page",
+    );
+
+    // A subscription is offered only to someone who could use one. A channel
+    // this Home administers has nothing to sell it, and an unconfirmed state
+    // must not draw the button either.
+    await frame.locator('.store-row-shop [data-action="subscribe-channel"]').first().waitFor();
+    const subscribeButtons = await frame.locator('[data-action="subscribe-channel"]').evaluateAll(
+      (nodes) => nodes.map((node) => ({
+        shop: node.dataset.shop,
+        disabled: node.disabled,
+        label: node.textContent?.trim() || "",
+      })),
+    );
+    assert(
+      subscribeButtons.length === 1
+        && subscribeButtons[0].shop === "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41"
+        && subscribeButtons[0].label === "Subscribe",
+      "Subscribe must be offered on a channel this Home neither runs nor subscribes to",
+      subscribeButtons,
+    );
+    assert(
+      subscribeButtons[0].disabled,
+      "Subscribe must not look available while the payment path does not exist",
+      subscribeButtons,
+    );
+    const unknownRowText = await frame
+      .locator('.store-row-shop[data-shop="0x1234567890abcdef1234567890abcdef12345678"]')
+      .textContent();
+    assert(
+      /Access unknown/.test(unknownRowText || ""),
+      "A channel whose access could not be read must say so, not offer a subscription",
+      { unknownRowText },
+    );
+    const adminRowText = await frame
+      .locator('.store-row-shop[data-shop="0x56d2d76a8e3a1c9551efe1201e15b517f77cb9b0"]')
+      .textContent();
+    assert(
+      /Yours/.test(adminRowText || ""),
+      "A channel this Home administers must say so instead of offering a subscription",
+      { adminRowText },
+    );
+
+
+    // Making a listing is Creator's job. The tile that launches it belongs to
+    // My listings: Explore is other people's shelf, and adding to that means
+    // buying rather than minting.
+    await frame.locator('[data-media-tab="explore"]').click();
+    await frame.locator(".card").first().waitFor();
+    assert(
+      (await frame.locator('[data-action="open-creator"]').count()) === 0,
+      "Explore must not offer to mint",
+    );
+    await frame.locator('[data-media-tab="mine"]').click();
+    await frame.locator(".card").first().waitFor();
+    const launchesBefore = (await readHomeMessages(page))
+      .filter((entry) => entry.type === "home:open-target").length;
+    await frame.locator('[data-action="open-creator"]').first().click();
+    const afterLaunch = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target");
+    assert(
+      afterLaunch.length === launchesBefore + 1 && afterLaunch.at(-1)?.target === "creator",
+      "Add a video must open Creator through Home, exactly once",
+      afterLaunch.at(-1),
+    );
+    await frame.locator('[data-media-tab="explore"]').click();
+    await frame.locator('[data-media-tab="shops"]').click();
+
+    // Search reaches Shops too, and reaches it by name.
+    await frame.locator("#search-input").fill("rc7");
+    assert(
+      (await frame.locator(".store-row-shop").count()) === 1,
+      "Search must filter the channel list",
+    );
+    await frame.locator("#search-input").fill("");
+    await frame.locator('[data-media-tab="explore"]').click();
+    await frame.locator(".store-row-media").first().waitFor();
+    assert(
+      await frame.locator("#import-listing").isVisible(),
+      "Returning to Explore must restore the shelf and its Add-a-listing control",
+    );
+    // A tab lives in Media. Leaving for Apps and coming back must not leave a
+    // tab strip stranded over a catalog that has no tabs.
+    await frame.locator('[data-destination="discover"]').click();
+    assert(
+      !(await frame.locator("#media-tabs").isVisible()),
+      "The Media tabs must not follow the person to the catalog",
+    );
+    await frame.locator('[data-destination="media"]').click();
+    await frame.locator(".store-row-media").first().waitFor();
+
     const mediaPageText = await frame.locator("#store-main").textContent();
     assert(
       !mediaPageText?.includes(mediaCreatorMint)
@@ -831,7 +1652,8 @@ async function run() {
     );
 
     const mediaOpenCountBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
-    await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"] [data-action="open-media"]`).click();
+    await ensureCard(mediaCreatorMint);
+    await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"] .card-actions [data-action="open-media"]`).click();
     const mediaOpenMessagesAfterCreator = await readHomeMessages(page);
     const creatorOpen = mediaOpenMessagesAfterCreator.filter((entry) => entry.type === "home:open-target").at(-1);
     assert(
@@ -852,6 +1674,7 @@ async function run() {
     // Buy asks first. Cancelling leaves nothing behind: no request, and the
     // row exactly as it was.
     const buyRequestsBeforeCancel = requestLog.filter((entry) => entry.path === "/api/provider/object/buy").length;
+    await ensureCard(mediaAvailableMint);
     await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).click();
     await frame.locator('[data-action="confirm-buy"]').waitFor();
     const buyTermsText = await frame.locator("#detail-content").textContent();
@@ -868,6 +1691,8 @@ async function run() {
       requestLog.filter((entry) => entry.path === "/api/provider/object/buy").length === buyRequestsBeforeCancel,
       "Cancelling the terms must leave the purchase unstarted",
     );
+
+    await ensureCard(mediaAvailableMint);
 
     await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="buy-media"]`).click();
     await frame.locator('[data-action="confirm-buy"]').waitFor();
@@ -896,9 +1721,14 @@ async function run() {
       "Marketplace rapid media Buy activation must submit one exact typed request",
       buyRequests,
     );
-    await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] [data-action="open-media"]`).waitFor();
+    await ensureCard(mediaAvailableMint);
+    await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"] .card-actions [data-action="open-media"]`).waitFor();
     const boughtRowText = await frame.locator(`.store-row-media[data-mint="${mediaAvailableMint}"]`).textContent();
-    assert(/Owned/.test(boughtRowText || ""), "Marketplace must reload the media list after buy", { boughtRowText });
+    assert(
+      /In your library/.test(boughtRowText || "") && /Purchased/.test(boughtRowText || ""),
+      "Marketplace must reload the media list after buy",
+      { boughtRowText },
+    );
 
     // A listing published on another Home arrives by its link. The control
     // belongs to this shelf and appears with it, the link's shape is checked
@@ -938,11 +1768,14 @@ async function run() {
       "Marketplace must send the listing link as the one typed request Runtime verifies",
       importRequest,
     );
+    await ensureCard(mediaImportedMint);
     await frame.locator(`.store-row-media[data-mint="${mediaImportedMint}"]`).waitFor();
     const importedRowText = await frame.locator(`.store-row-media[data-mint="${mediaImportedMint}"]`).textContent();
     assert(
+      // The control says what it does: an item this Home does not hold is
+      // bought, and one it holds is opened.
       /Imported Video/.test(importedRowText || "") && /Buy/.test(importedRowText || ""),
-      "An imported listing must reach the shelf with a Buy control",
+      "An imported listing must reach the shelf with a control that buys it",
       { importedRowText },
     );
     assert(
@@ -951,7 +1784,8 @@ async function run() {
     );
 
     const purchasedOpenCountBefore = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
-    await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="open-media"]`).click();
+    await ensureCard(mediaPurchasedMint);
+    await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] .card-actions [data-action="open-media"]`).click();
     const mediaOpenMessagesAfterPurchased = await readHomeMessages(page);
     const purchasedOpen = mediaOpenMessagesAfterPurchased.filter((entry) => entry.type === "home:open-target").at(-1);
     assert(
@@ -1063,6 +1897,7 @@ async function run() {
     const downloadsBefore = requestLog.filter(
       (entry) => entry.path === "/api/provider/object/download_owned_copy",
     ).length;
+    await ensureCard(mediaPurchasedMint);
     await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="download-copy"]`).click();
     await waitForRequestCount(requestLog, normalToken, "/api/provider/object/download_owned_copy", downloadsBefore + 1);
     const downloadRequest = requestLog.find(
@@ -1078,16 +1913,24 @@ async function run() {
     // The person who listed an item has a link to pass on. It is the other
     // half of Add a listing: without it, reaching an item on another Home
     // meant already knowing its address.
-    const creatorRowText = await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"]`).textContent();
+    // Share is an icon now, so the control is asserted rather than its label
+    // -- and the label it does carry is asserted too, because an icon with no
+    // accessible name is a control only some people have.
+    const creatorCard = frame.locator(`.card[data-mint="${mediaCreatorMint}"]`);
+    const creatorRowText = await creatorCard.textContent();
+    const shareLabel = await creatorCard
+      .locator('[data-action="share-listing"]')
+      .getAttribute("aria-label");
     assert(
-      /Share/.test(creatorRowText || "") && /You listed this/.test(creatorRowText || ""),
-      "A creator's own row must offer the link to their listing",
-      { creatorRowText },
+      shareLabel === "Share listing" && /Listed by you/.test(creatorRowText || ""),
+      "A creator's own card must offer the link to their listing, and name the control",
+      { creatorRowText, shareLabel },
     );
     assert(
       (await frame.locator(`.store-row-media[data-mint="${mediaPurchasedMint}"] [data-action="share-listing"]`).count()) === 0,
       "A bought copy is not a listing to share",
     );
+    await ensureCard(mediaCreatorMint);
     await frame.locator(`.store-row-media[data-mint="${mediaCreatorMint}"] [data-action="share-listing"]`).click();
     await frame.locator("#share-listing-uri").waitFor();
     assert(
@@ -1197,33 +2040,56 @@ async function run() {
     assert(errorMessagesAfterRetry === errorMessagesBeforeRetry, "Marketplace must deduplicate unchanged menu manifests across retry");
 
     assert(notFoundPaths.length === 0, "Marketplace layout smoke hit unexpected fixture paths", notFoundPaths);
+    // An item that published no metadata document answers 404, and the shelf
+    // renders its file name instead. That is an expected answer rather than a
+    // failure, so it is named here rather than counted.
+    const metadataMisses = nonOkResponses.filter((entry) =>
+      entry.url.endsWith(`/ipfs/${mediaBareMetadataCid}/metadata.json`) && entry.status === 404);
+    const unexpectedNonOk = nonOkResponses.filter((entry) => !metadataMisses.includes(entry));
     assert(
-      nonOkResponses.length === 2
-        && nonOkResponses.some((entry) =>
+      metadataMisses.length > 0,
+      "An item with no published document must be answered, not left hanging",
+    );
+    assert(
+      unexpectedNonOk.length === 2
+        && unexpectedNonOk.some((entry) =>
           entry.url === `http://127.0.0.1:${port}/api/capsules/catalog`
             && entry.status === 500
             && entry.token === errorToken
             && entry.method === "GET",
         )
-        && nonOkResponses.some((entry) =>
+        && unexpectedNonOk.some((entry) =>
           entry.url === `http://127.0.0.1:${port}/api/provider/object/list_runtime_custody`
             && entry.status === 500
             && entry.token === mediaErrorToken
             && entry.method === "POST",
         ),
       "Marketplace layout smoke must see only the deliberate catalog and media fixture failures",
-      nonOkResponses,
+      unexpectedNonOk,
     );
     assert(pageErrors.length === 0, "Marketplace layout smoke saw page errors", pageErrors);
     const expectedConsoleError = "Failed to load resource: the server responded with a status of 500 (Internal Server Error)";
-    const unexpectedConsoleErrors = consoleErrors.filter((entry) => entry !== expectedConsoleError);
+    const expectedMetadataMiss = "Failed to load resource: the server responded with a status of 404 (Not Found)";
+    const unexpectedConsoleErrors = consoleErrors.filter(
+      (entry) => entry !== expectedConsoleError && entry !== expectedMetadataMiss,
+    );
     assert(
-      consoleErrors.length === 2,
+      consoleErrors.filter((entry) => entry === expectedConsoleError).length === 2,
       "Marketplace layout smoke must see only the deliberate catalog and media fixture console errors",
       consoleErrors,
     );
     assert(unexpectedConsoleErrors.length === 0, "Marketplace layout smoke saw console errors", unexpectedConsoleErrors);
-    assert(requestFailures.length === 0, "Marketplace layout smoke saw failed browser requests", requestFailures);
+    // A person can leave the shelf while its documents are still arriving, and
+    // the browser abandons those reads. The shelf keeps the file names Runtime
+    // sent and says nothing, which is the whole point of asking for titles
+    // after the items are already on screen.
+    const abandonedReads = requestFailures.filter((entry) =>
+      entry.url.endsWith("/metadata.json") && entry.error === "net::ERR_ABORTED");
+    assert(
+      requestFailures.length === abandonedReads.length,
+      "Marketplace layout smoke saw failed browser requests",
+      requestFailures.filter((entry) => !abandonedReads.includes(entry)),
+    );
   } finally {
     server.closeAllConnections?.();
     await new Promise((resolveClose) => server.close(() => resolveClose()));

@@ -34,13 +34,14 @@ pub use mint::{
 pub use mint_journal::{
     ExclusiveFileLock, PersistedRuntimeMint, RuntimeContentAvailabilityRequirement,
     RuntimeContentIdentityV1, RuntimeCustodyTerminalKind, RuntimeMediaPreparationRecord,
-    RuntimeMediaPreparationState, RuntimeMintAbandonedRecordV1, RuntimeMintCreatorDesiredTerms,
-    RuntimeMintCreatorEffectBinding, RuntimeMintCreatorStage, RuntimeMintCreatorState,
-    RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft, RuntimeMintIntent,
-    RuntimeMintIntentContentV1, RuntimeMintIntentRecordScanV1, RuntimeMintJournal,
-    RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeEffectV1,
+    RuntimeMediaPreparationState, RuntimeMintAbandonedRecordV1, RuntimeMintAccessMethod,
+    RuntimeMintCreatorDesiredTerms, RuntimeMintCreatorEffectBinding, RuntimeMintCreatorStage,
+    RuntimeMintCreatorState, RuntimeMintCreatorTerminalEvidence, RuntimeMintDraft,
+    RuntimeMintIntent, RuntimeMintIntentContentV1, RuntimeMintIntentRecordScanV1,
+    RuntimeMintJournal, RuntimeMintJournalError, RuntimeMintNodeBinding, RuntimeMintNodeEffectV1,
     RuntimeMintNodeReceipt, RuntimeMintRoyaltyShare, RuntimeVerifiedContentAvailability,
     RuntimeVerifiedContentIdentityRootV1, RUNTIME_MINT_CREATOR_ROYALTY_UNITS,
+    RUNTIME_MINT_RESELLER_CUT_MAX,
 };
 pub use open::{
     bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,

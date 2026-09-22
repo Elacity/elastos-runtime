@@ -684,7 +684,13 @@ def test_receipt_bound_binaries_and_owner_only_media_tools(fixture):
     ):
         if marker not in setup:
             raise AssertionError(f"setup candidate/media gate missing {marker}")
-    if '"$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server' not in setup:
+    # The profile is a parameter (release by default; the dev installer passes
+    # dev), so the build line is matched with its profile arguments rather than
+    # a literal --release, and the release default is asserted on its own.
+    if not re.search(
+        r'"\$CARGO_BIN" build --locked --manifest-path "\$\{ROOT\}/elastos/Cargo\.toml" [^\n]*-p elastos-server',
+        setup,
+    ) or 'SOURCE_HOME_CARGO_PROFILE="${SOURCE_HOME_CARGO_PROFILE:-release}"' not in setup:
         raise AssertionError("setup still builds Runtime when no receipt-bound binary is supplied")
 
     header = setup.split("ROOT=", 1)[0]

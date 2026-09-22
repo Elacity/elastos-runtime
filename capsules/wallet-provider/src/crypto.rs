@@ -76,9 +76,15 @@ pub(super) fn sign_managed_approval(
     request: &WalletApprovalRequest,
 ) -> Result<ManagedSignatureOutput, String> {
     if request.intent == PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT {
-        let (rights_request, canonical_bytes) =
+        let (rights_request, _canonical_bytes) =
             protected_content_rights_request_from_payload(&request.payload)?;
-        let signature = sign_evm_message(signing_key, &canonical_bytes)?;
+        // A managed account signs the same message an external wallet is
+        // shown, from the one definition in the contracts crate. The two
+        // paths must produce identical signed results, and a test asserts it.
+        let message = rights_request
+            .signing_message()
+            .map_err(|err| format!("rights request has no signing message: {err:?}"))?;
+        let signature = sign_evm_message(signing_key, message.as_bytes())?;
         let signed_request = WalletSignedRightsRequestV1::new(
             rights_request,
             canonicalize_evm_signature(&signature)
@@ -186,14 +192,22 @@ pub(super) fn external_wallet_handoff(request: &WalletApprovalRequest) -> Result
         }));
     }
     if request.intent == PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT {
-        let (_, canonical_bytes) = protected_content_rights_request_from_payload(&request.payload)?;
+        let (rights_request, _) = protected_content_rights_request_from_payload(&request.payload)?;
+        // The readable message, not the canonical bytes hex-encoded. A wallet
+        // decodes `0x`-prefixed input before displaying it, which is how a
+        // nested identity graph reached the screen as two kilobytes of
+        // replacement characters. This text is rendered verbatim, and it is
+        // the same string every verifier recovers against.
+        let message = rights_request
+            .signing_message()
+            .map_err(|err| format!("rights request has no signing message: {err:?}"))?;
         return Ok(json!({
             "schema": "elastos.wallet.webconnect_handoff/v1",
             "request_id": request.request_id,
             "intent": request.intent,
             "payload_hash": request.payload_hash,
             "signer": request.address,
-            "message": format!("0x{}", hex::encode(canonical_bytes)),
+            "message": message,
             "signature_type": "personal_sign",
             "status": "awaiting_wallet_signature"
         }));
