@@ -7,7 +7,7 @@ use anyhow::Result;
 use elastos_model_contract::model_input_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -105,6 +105,9 @@ pub struct ProviderInitExtra {
     /// journal does not pin the exact admission.
     #[serde(default)]
     pub owner_reclaim: bool,
+    /// Loopback engine ports selected by the Runtime's macOS Seatbelt launch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime_local_ports: BTreeMap<String, u16>,
 }
 
 /// Private Init provenance projected by Runtime from its verified inventory.
@@ -138,6 +141,18 @@ impl ProviderInitExtra {
             offer.validate_local_artifacts(bridge)?;
             if !offer_ids.insert(offer.id.as_str()) {
                 anyhow::bail!("duplicate model offer id in provider config");
+            }
+        }
+        if !self.runtime_local_ports.is_empty() {
+            let unique_ports: BTreeSet<_> = self.runtime_local_ports.values().copied().collect();
+            if unique_ports.len() != self.runtime_local_ports.len()
+                || unique_ports.contains(&0)
+                || self.offers.iter().any(|offer| {
+                    matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+                        && !self.runtime_local_ports.contains_key(&offer.id)
+                })
+            {
+                anyhow::bail!("invalid Runtime local model ports");
             }
         }
         if self.runtime_admitted_offers.len() > MAX_OFFER_COUNT {
@@ -994,6 +1009,7 @@ mod tests {
         let extra = ProviderInitExtra {
             runtime_admitted_offers: Vec::new(),
             owner_reclaim: false,
+            runtime_local_ports: BTreeMap::new(),
             provider_id: Some("model-provider".to_string()),
             journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
             offers: vec![local_llama_offer(&engine, &model)],
@@ -1094,6 +1110,7 @@ mod tests {
         let config = ProviderInitExtra {
             runtime_admitted_offers: Vec::new(),
             owner_reclaim: false,
+            runtime_local_ports: BTreeMap::new(),
             provider_id: None,
             journal_dir: Some("/tmp/model-provider".to_string()),
             offers: vec![ConfiguredOffer {

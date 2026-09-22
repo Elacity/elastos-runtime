@@ -5,6 +5,8 @@
 //! over line-delimited JSON.
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::{collections::BTreeMap, net::TcpListener};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -229,16 +231,51 @@ impl ProviderBridge {
         Self::spawn_with_timeouts(binary_path, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
     }
 
-    /// Keep the native model provider and its local engine off the external network.
+    /// Admit only Runtime-selected local engine ports for the native model provider.
     #[cfg(target_os = "macos")]
     pub async fn spawn_confined_model(
         binary_path: &Path,
-        config: ProviderConfig,
-    ) -> Result<Self, BridgeError> {
-        const POLICY: &str = "(version 1)\n(allow default)\n(deny network-outbound)\n(allow network-outbound (remote ip \"localhost:*\"))\n";
+        mut config: ProviderConfig,
+    ) -> Result<(Self, BTreeMap<String, u16>, ProviderConfig), BridgeError> {
+        let offers = config
+            .extra
+            .get("offers")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| BridgeError::InitFailed("model offers unavailable".into()))?;
+        let mut ports = BTreeMap::new();
+        let mut reservations = Vec::new();
+        let mut policy = String::from("(version 1)\n(allow default)\n(deny network-outbound)\n");
+        for offer in offers {
+            if offer
+                .pointer("/adapter/kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("local_llama_cpp_text")
+            {
+                continue;
+            }
+            let id = offer
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))?;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(BridgeError::Spawn)?;
+            let port = listener.local_addr().map_err(BridgeError::Spawn)?.port();
+            if ports.insert(id.to_string(), port).is_some() {
+                return Err(BridgeError::InitFailed("duplicate local offer id".into()));
+            }
+            policy.push_str(&format!(
+                "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+            ));
+            reservations.push(listener);
+        }
+        // Seatbelt's localhost selector includes ::1 at the same port.
+        policy.push_str("(deny network-outbound (socket-domain AF_INET6))\n");
+        config.extra["runtime_local_ports"] = serde_json::json!(ports);
         let mut command = Command::new("/usr/bin/sandbox-exec");
-        command.arg("-p").arg(POLICY).arg(binary_path);
-        Self::spawn_command(command, config, INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await
+        command.arg("-p").arg(policy).arg(binary_path);
+        drop(reservations);
+        let bridge =
+            Self::spawn_command(command, config.clone(), INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await?;
+        Ok((bridge, ports, config))
     }
 
     async fn spawn_with_timeouts(
@@ -1321,6 +1358,8 @@ mod tests {
     #[tokio::test]
     async fn test_confined_model_child_and_descendant_cannot_open_external_socket() {
         let temp = TempDir::new().unwrap();
+        let unrelated = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unrelated_port = unrelated.local_addr().unwrap().port();
         let script = write_provider_script(
             &temp,
             "network-probe.py",
@@ -1335,33 +1374,66 @@ def external_errno():
         connection.settimeout(1)
         return connection.connect_ex(('203.0.113.1', 443))
 
+def local_errno(port):
+    with socket.socket() as connection:
+        connection.settimeout(1)
+        return connection.connect_ex(('127.0.0.1', port))
+
+def ipv6_errno(port):
+    with socket.socket(socket.AF_INET6) as connection:
+        connection.settimeout(1)
+        return connection.connect_ex(('::1', port))
+
 for line in sys.stdin:
     request = json.loads(line)
     if request['op'] == 'init':
+        extra = request['config']['extra']
+        allowed_port = extra['runtime_local_ports']['fixture-local']
+        unrelated_port = extra['probe_unrelated_port']
         print('{"status":"ok"}', flush=True)
     elif request['op'] == 'exists':
         direct = external_errno()
-        descendant = int(subprocess.check_output([
+        unrelated = local_errno(unrelated_port)
+        descendant = list(map(int, subprocess.check_output([
             '/usr/bin/python3', '-c',
-            'import socket; s=socket.socket(); s.settimeout(1); print(s.connect_ex(("203.0.113.1", 443)))'
-        ]))
+            'import socket,sys; out=[];\nfor family,host,port in [(socket.AF_INET,"203.0.113.1",443),(socket.AF_INET,"127.0.0.1",int(sys.argv[1])),(socket.AF_INET6,"::1",int(sys.argv[2]))]:\n s=socket.socket(family);s.settimeout(1);out.append(s.connect_ex((host,port)));s.close()\nprint(*out)',
+            str(unrelated_port), str(allowed_port)
+        ]).split()))
         with socket.socket() as listener:
-            listener.bind(('127.0.0.1', 0))
+            listener.bind(('127.0.0.1', allowed_port))
             listener.listen(1)
-            with socket.socket() as local:
-                local.settimeout(1)
-                loopback = local.connect_ex(listener.getsockname())
+            loopback = local_errno(allowed_port)
+        with socket.socket(socket.AF_INET6) as listener6:
+            listener6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            listener6.bind(('::1', allowed_port))
+            listener6.listen(1)
+            ipv6 = ipv6_errno(allowed_port)
         print(json.dumps({'status':'ok','data':{
-            'direct_errno': direct, 'descendant_errno': descendant,
-            'loopback_errno': loopback}}), flush=True)
+            'direct_errno': direct, 'descendant_errno': descendant[0],
+            'unrelated_errno': unrelated, 'descendant_unrelated_errno': descendant[1],
+            'loopback_errno': loopback, 'ipv6_errno': ipv6,
+            'descendant_ipv6_errno': descendant[2]}}), flush=True)
     elif request['op'] == 'shutdown':
         print('{"status":"ok"}', flush=True)
         break
 "#,
         );
-        let bridge = ProviderBridge::spawn_confined_model(&script, ProviderConfig::default())
-            .await
-            .unwrap();
+        let config = ProviderConfig {
+            extra: serde_json::json!({
+                "offers": [{"id":"fixture-local", "adapter":{"kind":"local_llama_cpp_text"}}],
+                "probe_unrelated_port": unrelated_port,
+            }),
+            ..Default::default()
+        };
+        let (bridge, ports, confined_config) =
+            ProviderBridge::spawn_confined_model(&script, config)
+                .await
+                .unwrap();
+        assert_ne!(ports["fixture-local"], unrelated_port);
+        assert_eq!(
+            confined_config.extra["runtime_local_ports"]["fixture-local"],
+            ports["fixture-local"]
+        );
         let response = bridge
             .request(ProviderRequest::Exists {
                 path: "network-probe".into(),
@@ -1374,6 +1446,10 @@ for line in sys.stdin:
         };
         assert_eq!(data["direct_errno"], libc::EPERM);
         assert_eq!(data["descendant_errno"], libc::EPERM);
+        assert_eq!(data["unrelated_errno"], libc::EPERM);
+        assert_eq!(data["descendant_unrelated_errno"], libc::EPERM);
+        assert_eq!(data["ipv6_errno"], libc::EPERM);
+        assert_eq!(data["descendant_ipv6_errno"], libc::EPERM);
         assert_eq!(data["loopback_errno"], 0);
         bridge.shutdown().await.unwrap();
     }

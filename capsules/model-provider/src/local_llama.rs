@@ -31,6 +31,7 @@ pub(crate) enum LocalLlamaFault {
 #[derive(Clone, Default)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
+    runtime_ports: Arc<BTreeMap<String, u16>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,13 @@ struct GuardConfig {
 }
 
 impl LocalLlamaEngines {
+    pub(crate) fn with_runtime_ports(ports: BTreeMap<String, u16>) -> Self {
+        Self {
+            engines: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_ports: Arc::new(ports),
+        }
+    }
+
     pub(crate) async fn retains_artifacts(&self) -> bool {
         // Idle engines can still map model bytes. Only the existing lifecycle
         // owner can prove closure; refresh does not attempt eviction.
@@ -108,7 +116,14 @@ impl LocalLlamaEngines {
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
-        let port = reserve_loopback_port()?;
+        let port = if self.runtime_ports.is_empty() {
+            reserve_loopback_port()?
+        } else {
+            *self
+                .runtime_ports
+                .get(offer_id)
+                .ok_or(LocalLlamaFault::Failed)?
+        };
         let alias = random_alias()?;
         let endpoint = LocalLlamaEndpoint {
             api_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),

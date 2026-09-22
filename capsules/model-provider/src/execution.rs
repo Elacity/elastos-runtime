@@ -1,4 +1,5 @@
 use crate::adapters::{LiveAdapterExecutor, WorkerApplyAck, WorkerUpdate};
+use crate::config::ProviderInitExtra;
 use crate::contract::{
     ok_response, InitRequest, OffersListRequest, ProviderEnvelope, ProviderFault,
     ProviderOperation, RunsCancelRequest, RunsCreateRequest, RunsEventsRequest, RunsGetRequest,
@@ -157,7 +158,16 @@ impl ProviderCoordinator {
                     provider.apply_refresh(refresh);
                     return self.status_response();
                 }
-                let adapter = LiveAdapterExecutor::new(self.handle.clone(), self.update_tx.clone());
+                let ports = serde_json::from_value::<ProviderInitExtra>(init.config.extra.clone())
+                    .map_err(|_| {
+                        ProviderFault::invalid_request("invalid model provider init config")
+                    })?
+                    .runtime_local_ports;
+                let adapter = LiveAdapterExecutor::new_with_local_ports(
+                    self.handle.clone(),
+                    self.update_tx.clone(),
+                    ports,
+                );
                 let mut provider = ModelProviderState::from_init(init.config, adapter)?;
                 provider.settle_active_local_text_runs_unknown()?;
                 provider.settle_active_http_job_creates_unknown()?;

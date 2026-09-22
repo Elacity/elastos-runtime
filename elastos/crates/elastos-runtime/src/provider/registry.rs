@@ -636,6 +636,8 @@ pub struct ProviderRegistry {
     sub_providers: RwLock<HashMap<String, SubProviderRegistration>>,
     /// Optional Carrier transport for Runtime-mediated provider invocation.
     carrier_invoker: RwLock<Option<Arc<dyn ProviderCarrierInvoker>>>,
+    #[cfg(target_os = "macos")]
+    local_model_ports: RwLock<Option<std::collections::BTreeMap<String, u16>>>,
 }
 
 enum SubProviderRegistration {
@@ -686,7 +688,42 @@ impl ProviderRegistry {
             providers: RwLock::new(HashMap::new()),
             sub_providers: RwLock::new(HashMap::new()),
             carrier_invoker: RwLock::new(None),
+            #[cfg(target_os = "macos")]
+            local_model_ports: RwLock::new(None),
         }
+    }
+
+    /// Keep the confined child's engine ports stable across Init refreshes.
+    #[cfg(target_os = "macos")]
+    pub async fn set_local_model_ports(&self, ports: std::collections::BTreeMap<String, u16>) {
+        *self.local_model_ports.write().await = Some(ports);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn apply_local_model_ports(
+        &self,
+        config: &mut super::BridgeProviderConfig,
+    ) -> Result<(), ProviderError> {
+        let ports = self.local_model_ports.read().await;
+        let Some(ports) = ports.as_ref() else {
+            return Ok(());
+        };
+        let offers = config.extra["offers"]
+            .as_array()
+            .ok_or_else(|| ProviderError::Provider("model offers unavailable".into()))?;
+        for offer in offers {
+            if offer["adapter"]["kind"] == "local_llama_cpp_text"
+                && offer["id"]
+                    .as_str()
+                    .is_none_or(|id| !ports.contains_key(id))
+            {
+                return Err(ProviderError::Provider(
+                    "new local model requires Runtime restart".into(),
+                ));
+            }
+        }
+        config.extra["runtime_local_ports"] = serde_json::json!(ports);
+        Ok(())
     }
 
     /// Register the Runtime-owned Carrier provider-plane invoker.
@@ -2396,6 +2433,32 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_model_refresh_keeps_ports_and_requires_restart_for_new_local_offer() {
+        let registry = ProviderRegistry::new();
+        registry
+            .set_local_model_ports(std::collections::BTreeMap::from([(
+                "local-a".to_string(),
+                54321,
+            )]))
+            .await;
+        let mut config = super::super::BridgeProviderConfig {
+            extra: serde_json::json!({"offers":[
+                {"id":"local-a","adapter":{"kind":"local_llama_cpp_text"}},
+                {"id":"hosted","adapter":{"kind":"open_ai_compatible_text"}}
+            ]}),
+            ..Default::default()
+        };
+        registry.apply_local_model_ports(&mut config).await.unwrap();
+        assert_eq!(config.extra["runtime_local_ports"]["local-a"], 54321);
+        config.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"local-b","adapter":{"kind":"local_llama_cpp_text"}}));
+        assert!(registry.apply_local_model_ports(&mut config).await.is_err());
+    }
     use std::time::Duration;
     use tokio::sync::{Mutex, Notify};
 

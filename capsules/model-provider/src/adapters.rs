@@ -543,13 +543,22 @@ impl LiveAdapterExecutor {
         self.local_llama.close_offer(offer_id).await
     }
 
+    #[cfg(test)]
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
+        Self::new_with_local_ports(runtime, updates, BTreeMap::new())
+    }
+
+    pub(crate) fn new_with_local_ports(
+        runtime: Handle,
+        updates: mpsc::Sender<WorkerUpdate>,
+        ports: BTreeMap<String, u16>,
+    ) -> Self {
         Self {
             runtime,
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
-            local_llama: LocalLlamaEngines::default(),
+            local_llama: LocalLlamaEngines::with_runtime_ports(ports),
         }
     }
 

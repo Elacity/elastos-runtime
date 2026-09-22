@@ -1028,16 +1028,26 @@ async fn setup_server_infrastructure_impl(
     match binaries::resolve_verified_native_provider_binary("model-provider") {
         Ok(Some(path)) => {
             match model_provider_startup_config(&data_dir, &provider_registry).await {
-                Ok((model_config, worker)) => {
+                Ok((mut model_config, worker)) => {
                     #[cfg(target_os = "macos")]
                     let bridge_result =
                         provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
-                            .await;
+                            .await
+                            .map(|(bridge, ports, config)| (bridge, Some(ports), config));
                     #[cfg(not(target_os = "macos"))]
                     let bridge_result =
-                        provider::ProviderBridge::spawn(&path, model_config.clone()).await;
+                        provider::ProviderBridge::spawn(&path, model_config.clone())
+                            .await
+                            .map(|bridge| (bridge, None, model_config.clone()));
                     match bridge_result {
-                        Ok(bridge) => {
+                        Ok((bridge, local_ports, confined_config)) => {
+                            model_config = confined_config;
+                            #[cfg(target_os = "macos")]
+                            if let Some(ports) = local_ports {
+                                provider_registry.set_local_model_ports(ports).await;
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = local_ports;
                             let bridge = Arc::new(bridge);
                             let startup = async {
                                 #[cfg(unix)]
