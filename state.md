@@ -7,19 +7,41 @@ Assistant keeps one model selector. Installed keyboard and responsive checks
 passed. A real Jev sample evaluation completed, and reopening it reused the
 saved journal without another provider request. Marketplace projects the
 existing grant's offer facts and hands the exact offer to Services or Assistant.
-The fresh request and Inbox approval path awaits the current human decision.
+A new Consumer-to-owner service grant request awaits the owner Inbox decision.
 
 Local commit `6a7004c2` adds the real hosted Assistant approval flow. Consumer
 Home retained a short pending Venice prompt across restart; its direct Review
 in Inbox action opened a card naming the requester, recipient, payer and
 continuing scope, with Jev defer advice. Both signed-in Homes serve matching
 Home, Assistant and System scripts from the source checkout, and the six
-focused Jev tests and responsive Assistant replay smoke pass. The person has
-not yet approved this Consumer connection, so explicit continuation, terminal
+focused Jev tests and responsive Assistant replay smoke pass. The person
+approved the Consumer connection in Inbox; its saved Jev record has
+`human_decision=approve` and no actual outcome. Explicit continuation, terminal
 Venice output, ending access and a later refusal remain to verify. The older
 Consumer grant for the owner's shared model has expired. Consumer sent one
 fresh service request, which now waits in the owner Inbox for a person's
 approval. The hosted Assistant request and service grant are separate actions.
+
+Hosted HTTP is paused on the installed local candidate while Runtime network
+authority is built. System Validate and Save return a pause error before key
+validation. The model provider refuses external adapter dispatch and queued
+hosted work before HTTP. Consumer System shows the saved Venice and Jev
+connections as paused and disables hosted Use in Assistant. Owner Assistant
+completed a new local SmolLM2 prompt after installation. The diagnostic Home
+returned four pause errors for OpenRouter/Venice Validate and Save with zero
+controlled-endpoint connections and unchanged provider config. Built and
+installed Runtime and provider hashes match on the three Homes; System source,
+installed, and served files match. The 18 recorded protected files kept their
+hashes and inodes. Runtime
+SHA-256 is `90edb7fa1474d23ded52abee44f87c31a4f45f24eb083a8bef658ac6ef84176c`;
+model-provider SHA-256 is `6dc1b33868761b9b3d8e92659d0f9f8911bfa4a6cd60ead700d4ced37842b11b`.
+Receipt: `.audit/codex-hosted-egress-containment-installed.json`.
+This is an application-level pause. The native provider is still unsandboxed.
+The saved Venice text request waits for Runtime-owned socket isolation, an
+egress broker, and explicit owner HTTPS consent. Production replay proof for
+already-active HTTP jobs and Inbox history and revocation are separate open
+clauses. The owner service request waits in Inbox; approving it would grant
+service access, not provider HTTPS. No new paid call was made.
 
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each

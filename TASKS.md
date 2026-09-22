@@ -239,12 +239,33 @@ end that approval. Six focused Jev tests and the Assistant 390/768/1280 replay
 smoke pass. Both signed-in Homes serve bytes that match the edited Home,
 Assistant and System source. On Consumer, a genuinely new Venice request stayed
 held across a Home restart and Review in Inbox opened the pending card. The
-person's Inbox approval is still pending. Next proof is the exact Inbox
-decision, one explicit continuation to a terminal result, and a later request
-held again after ending approval. The separate existing Consumer service grant
-has expired. Consumer sent one fresh request through Services, and the owner
-Inbox now holds it for a person's approval. Keep existing human state and the
-original acceptance blockers below.
+person approved that connection; its saved Jev record still has no actual
+outcome. The separate existing Consumer service grant has expired. Consumer
+sent one fresh request through Services, and the owner Inbox holds it for a
+person's approval. The short hosted prompt, both keys, and the existing share
+stay in place.
+
+The next ready correction is a fail-closed pause on hosted HTTP. A review found
+that System key validation and the native model provider could send HTTPS
+without a separate owner egress decision. The installed candidate now refuses
+System Validate and Save, all external model adapter dispatch, and queued
+hosted workers. A diagnostic Home sent four dummy-key Validate/Save requests to
+a controlled endpoint: all returned the pause error, with zero endpoint
+connections and unchanged provider config. Production provider process tests
+refused four adapter types on create, retry, and restart; worker tests covered
+queued create, status, cancel, text, and Decisions. Both signed-in human Homes
+run matching installed Runtime/provider binaries and serve matching System files.
+Consumer System shows
+Venice and Jev paused; owner Assistant completed a local SmolLM2 reply.
+Eighteen protected files kept their hashes and inodes, and disk free space
+remains 21%. Receipt: `.audit/codex-hosted-egress-containment-installed.json`.
+The native provider still lacks OS socket confinement. A new Venice text call
+waits for Runtime-owned network isolation, an egress broker, an exact owner
+HTTPS grant, and fresh consent. The owner service request is a separate Inbox
+decision; its approval grants service access, not provider HTTPS. Production
+replay of an already-active HTTP job remains unproved for that adapter path.
+Inbox approval history and revocation remain product acceptance work. Keep the
+saved prompt, owner request, and original acceptance blockers below.
 
 Accepted regression evidence for the original five outcomes:
 
