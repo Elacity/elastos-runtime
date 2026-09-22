@@ -47,12 +47,25 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
             }) =>
         {
             for entry in entries {
+                let model_title = entry.manifest.model_content.as_ref().and_then(|model| {
+                    model
+                        .provenance
+                        .base_repository
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .filter(|name| !name.is_empty())
+                        .map(|name| name.replace('-', " "))
+                });
                 let mut summary = catalog_capsule_summary(
                     entry.manifest,
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                 );
+                if let Some(title) = model_title {
+                    summary.title = title;
+                }
                 summary.state = "unprepared".into();
                 summary.installed = false;
                 summary.launchable = false;

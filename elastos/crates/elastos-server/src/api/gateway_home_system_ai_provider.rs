@@ -466,6 +466,79 @@ async fn validate_hosted_key(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ApprovalLensRequest {
+    id: String,
+}
+
+pub(super) async fn system_approval_lens_select(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<ApprovalLensRequest>,
+) -> Response {
+    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
+        return system_error_response(err);
+    }
+    match crate::api::model_provider_config::select_approval_lens(&state.data_dir, &req.id) {
+        Ok(()) => Json(serde_json::json!({ "offer_id": req.id })).into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+pub(super) async fn system_approval_lens_sample(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<ApprovalLensRequest>,
+) -> Response {
+    let context = match require_system_admin(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return system_error_response(err),
+    };
+    let id =
+        format!("lens-sample-{}", elastos_model_contract::model_input_hash(&serde_json::json!({
+        "scenario": "fictional-weather-v1", "principal": context.principal_id, "offer": req.id,
+    })).expect("serializable sample identity").trim_start_matches("sha256:"));
+    let Some(hint) =
+        crate::api::model_provider_config::decision_hosted_offer(&state.data_dir, &req.id)
+    else {
+        return system_error_response(ai_provider_request_error(
+            "configured decision model required",
+        ));
+    };
+    let Some(registry) = state.provider_registry.as_deref() else {
+        return system_error_response(ai_provider_request_error("model service unavailable"));
+    };
+    let sample = crate::jev_approval_lens::AssistantHostedHttpContext {
+        request_id: &id,
+        principal_id: &context.principal_id,
+        session_id: &context.session_id,
+        capsule_id: SYSTEM_CAPSULE_ID,
+        grant_id: &context.grant_id,
+        offer_id: "sample-fictional-connection",
+        hint: crate::api::HostedModelOfferHint {
+            offer_title: "Fictional weather helper".into(),
+            provider_label: "Fictional hosted processor".into(),
+            requested_selector: "A public weather question".into(),
+            privacy_policy_ref: String::new(),
+            fallback: String::new(),
+        },
+    };
+    let (recommendation, run_id, sample_reused) = crate::jev_approval_lens::evaluate_sample(
+        &state.data_dir,
+        registry,
+        &req.id,
+        &hint.requested_selector,
+        &sample,
+    )
+    .await;
+    Json(
+        serde_json::json!({ "request_id": id, "offer_id": req.id, "run_id": run_id,
+        "recommendation": recommendation, "sample_reused": sample_reused, "advisory_only": true }),
+    )
+    .into_response()
+}
+
 pub(super) async fn system_ai_provider_get(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -474,7 +547,18 @@ pub(super) async fn system_ai_provider_get(
         return system_error_response(err);
     }
     match crate::api::ai_provider_status(&state.data_dir) {
-        Ok(status) => Json(status).into_response(),
+        Ok(status) => {
+            let mut result = serde_json::to_value(status).expect("serializable provider status");
+            match crate::api::model_provider_config::approval_lens_offer_id(&state.data_dir) {
+                Ok(id) => {
+                    result["approval_lens_offer_id"] = serde_json::json!(id);
+                }
+                Err(_) => {
+                    result["approval_lens_error"] = serde_json::json!(true);
+                }
+            }
+            Json(result).into_response()
+        }
         Err(err) => system_error_response(err),
     }
 }

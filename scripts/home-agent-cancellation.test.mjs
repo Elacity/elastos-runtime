@@ -69,6 +69,131 @@ test("content intent survives missing catalog and overlapping refresh; hosted re
   live.selectLiveOffer("");
 });
 
+test("explicit local model selection awaits Keep while restore and nonlocal choices stay read-only", async t => {
+  t.after(() => { workspace.bindAgentWorkspaceStore(null); live.selectLiveOffer(""); });
+  const cid = `bafybei${"a".repeat(52)}`;
+  const offers = ["local", "hosted", "remote:grant:local", "operator"].map(id => ({
+    id, title: id, operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"],
+  }));
+  const catalog = { schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: [{
+    source: "signed-model-catalog", role: "content", installed: false, launchable: false, cid,
+    title: "Local", signature_state: "catalog-signature-verified",
+    model_runtime: { admitted: true, dispatch_ready: true, offer_id: "local" },
+  }] };
+  const calls = [];
+  let reply = defer();
+  globalThis.fetch = async (url, options) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/capsules/interfaces/invoke") {
+      const body = JSON.parse(options.body); calls.push(body);
+      assert.equal(options.headers["x-elastos-home-token"], "fixture");
+      return { ok: true, json: () => reply.promise };
+    }
+    return { ok: true, json: async () => path === "/api/capsules/catalog" ? catalog : { offers } };
+  };
+  const draft = { text: "Preserve my draft", parts: [] };
+  workspace.bindAgentWorkspaceStore({ getSessions: () => [], setSessions() {}, getActiveSessionId: () => null,
+    getReasoningVisible: () => false, setReasoningVisible() {}, setActiveSessionId() {},
+    getSessionMode: () => "chat", setSessionMode() {}, getComposerDraft: () => draft,
+    applyComposerDraft() { assert.fail("model selection changed the draft"); },
+    getWorkspaceHydrated: () => true, setWorkspaceHydrated() {} });
+  await live.probeLiveInference({ force: true });
+  live.selectLiveOffer("local", cid);
+  assert.equal(calls.length, 0, "restoring a local choice saves no retention");
+  live.selectLiveOffer("hosted");
+  const selecting = live.selectLiveOfferForUse("local", cid);
+  assert.equal(live.liveOfferChoice(), "hosted", "previous selection stays while Keep is pending");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].input, { cid, keep: true });
+  assert.equal(calls[0].capsule, "assistant");
+  assert.equal(calls[0].interface, "elastos.assistant.model");
+  assert.equal(calls[0].method, "content.retention");
+  const ack = body => ({ schema: "elastos.capsules.invoke-result/v1", status: "ok", ...body,
+    output: { cid, kept: true, admitted: true } });
+  reply.resolve(ack(calls[0]));
+  assert.equal(await selecting, true);
+  assert.equal(live.liveOfferChoice(), "local");
+  assert.equal(live.liveContentChoice(), cid);
+  for (const fault of ["rejected", "wrong-cid", "not-kept", "not-admitted", "wrong-request", "transport"]) {
+    live.selectLiveOffer("hosted"); reply = defer();
+    const failed = live.selectLiveOfferForUse("local", cid);
+    const result = ack(calls.at(-1));
+    if (fault === "rejected") result.status = "error";
+    if (fault === "wrong-cid") result.output.cid = `bafybei${"b".repeat(51)}a`;
+    if (fault === "not-kept") result.output.kept = false;
+    if (fault === "not-admitted") result.output.admitted = false;
+    if (fault === "wrong-request") result.request_id = "other";
+    if (fault === "transport") reply.reject(new Error("private failure"));
+    else reply.resolve(result);
+    await assert.rejects(failed, /Select it again to retry/);
+    assert.equal(live.liveOfferChoice(), "hosted");
+    assert.equal(workspace.getAgentWorkspaceSnapshot().composerDraft.text, draft.text);
+  }
+  reply = defer();
+  const stale = live.selectLiveOfferForUse("local", cid);
+  live.selectLiveOffer("operator");
+  reply.resolve(ack(calls.at(-1)));
+  assert.equal(await stale, false, "a late Keep acknowledgement preserves newer restored selection");
+  const count = calls.length;
+  for (const id of ["hosted", "remote:grant:local", "operator"]) {
+    assert.equal(await live.selectLiveOfferForUse(id), true);
+    assert.equal(live.liveOfferChoice(), id);
+  }
+  await assert.rejects(live.selectLiveOfferForUse("hosted", cid), /Select it again to retry/);
+  assert.equal(calls.length, count, "only a verified local CID/offer mapping writes retention");
+});
+
+test("explicit admitted model selection requires its catalog mapping after refresh failure", async t => {
+  t.after(() => live.selectLiveOffer(""));
+  const cid = `bafybei${"a".repeat(52)}`;
+  const localId = `model:${"b".repeat(64)}`;
+  const otherIds = ["hosted", `remote:grant:${localId}`, "operator"];
+  const offers = [localId, ...otherIds].map(id => ({
+    id, title: id, operation: "text", input_modalities: ["text/plain"], output_modalities: ["text/plain"],
+  }));
+  const catalog = { schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: [{
+    source: "signed-model-catalog", role: "content", installed: false, launchable: false, cid,
+    title: "Local", signature_state: "catalog-signature-verified",
+    model_runtime: { admitted: true, kept: false, dispatch_ready: true, offer_id: localId },
+  }] };
+  const calls = [];
+  let catalogFailure = false;
+  globalThis.fetch = async (url, options) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/capsules/catalog" && catalogFailure) throw new Error("catalog unavailable");
+    if (path === "/api/capsules/interfaces/invoke") {
+      const body = JSON.parse(options.body); calls.push(body);
+      return { ok: true, json: async () => ({ schema: "elastos.capsules.invoke-result/v1", status: "ok", ...body,
+        output: { cid, kept: true, admitted: true } }) };
+    }
+    return { ok: true, json: async () => path === "/api/capsules/catalog" ? catalog : { offers } };
+  };
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.liveContentModels()[0].offerId, localId);
+  live.selectLiveOffer(localId, cid);
+  catalogFailure = true;
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.liveContentModels().length, 0);
+  assert.ok(live.getLiveInferenceState().models.some(model => model.offerId === localId), "provider still advertises the local offer");
+  for (const previous of otherIds) {
+    assert.equal(await live.selectLiveOfferForUse(previous), true);
+    await assert.rejects(live.selectLiveOfferForUse(localId), /Select it again to retry/);
+    assert.equal(live.liveOfferChoice(), previous, "failed local selection preserves the previous choice");
+    assert.equal(live.liveContentChoice(), null);
+  }
+  assert.equal(calls.length, 0, "missing mapping supplies no CID for a retention write");
+  live.selectLiveOffer(localId, cid);
+  assert.equal(live.liveOfferChoice(), localId, "restore keeps the exact saved selection");
+  assert.equal(live.liveContentChoice(), cid);
+  assert.equal(live.selectedLiveOffer(), null, "restored local selection remains unavailable without mapping");
+  assert.equal(calls.length, 0, "restore stays read-only");
+  catalogFailure = false;
+  await live.probeLiveInference({ force: true });
+  assert.equal(await live.selectLiveOfferForUse(localId), true);
+  assert.deepEqual(calls.map(call => call.input), [{ cid, keep: true }]);
+  assert.equal(live.liveContentChoice(), cid);
+});
+
 test("an in-flight offers refresh keeps the current offer selectable", async t => {
   t.after(() => live.selectLiveOffer(""));
   const chosen = {

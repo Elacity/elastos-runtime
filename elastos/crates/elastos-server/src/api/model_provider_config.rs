@@ -500,35 +500,123 @@ fn hosted_hint_from_offers(
     })
 }
 
-/// Named Jev instance used as the Approval Lens evaluator.
-/// Runtime requires the owner-chosen title and a pinned Jev decision model.
-pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedModelOfferHint)> {
+/// Resolve one saved decision instance without using its display name as authority.
+pub(super) fn decision_hosted_offer(data_dir: &Path, id: &str) -> Option<HostedModelOfferHint> {
     let offers = load_model_provider_operator_offers(data_dir).ok()?;
-    for offer in &offers {
-        let title = offer
-            .get("title")
+    let offer = offers
+        .iter()
+        .find(|offer| offer.get("id").and_then(serde_json::Value::as_str) == Some(id))?;
+    if !operator_offer_enabled(offer)
+        || !operator_offer_has_key(offer)
+        || offer.get("operation").and_then(serde_json::Value::as_str)
+            != Some(elastos_model_contract::decisions::OPERATION)
+        || offer
+            .pointer("/adapter/kind")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if !title.eq_ignore_ascii_case("jev")
-            || offer.get("operation").and_then(serde_json::Value::as_str)
-                != Some(elastos_model_contract::decisions::OPERATION)
-            || offer
-                .pointer("/adapter/kind")
-                .and_then(serde_json::Value::as_str)
-                != Some("open_router_decisions")
-            || !offer
-                .pointer("/adapter/model")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|model| model.starts_with("typesafe/jev-"))
-        {
-            continue;
-        }
-        let offer_id = offer.get("id").and_then(serde_json::Value::as_str)?;
-        let hint = hosted_hint_from_offers(std::slice::from_ref(offer), offer_id)?;
-        return Some((offer_id.to_string(), hint));
+            != Some("open_router_decisions")
+        || !offer
+            .pointer("/adapter/model")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|model| model.starts_with("typesafe/jev-"))
+    {
+        return None;
     }
-    None
+    hosted_hint_from_offers(std::slice::from_ref(offer), id)
+}
+
+fn approval_lens_selection_path(data_dir: &Path) -> PathBuf {
+    model_provider_root_dir(data_dir).join("approval-lens.json")
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalLensSelection {
+    offer_id: String,
+}
+
+pub(crate) fn approval_lens_has_selection(data_dir: &Path) -> bool {
+    // A failed policy read or migration keeps human review required.
+    approval_lens_offer_id(data_dir)
+        .map(|id| id.is_some())
+        .unwrap_or(true)
+}
+
+fn store_approval_lens_selection(data_dir: &Path, id: &str) -> anyhow::Result<()> {
+    write_model_provider_config_atomic(
+        &approval_lens_selection_path(data_dir),
+        &serde_json::to_vec(&ApprovalLensSelection {
+            offer_id: id.to_string(),
+        })?,
+    )
+}
+
+pub(super) fn select_approval_lens(data_dir: &Path, id: &str) -> anyhow::Result<()> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(
+        decision_hosted_offer(data_dir, id).is_some(),
+        "configured decision model required"
+    );
+    store_approval_lens_selection(data_dir, id)
+}
+
+/// Read policy identity separately from availability. First legacy selection is
+/// migrated while holding the same lock as explicit selection and model edits.
+pub(super) fn approval_lens_offer_id(data_dir: &Path) -> anyhow::Result<Option<String>> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let path = approval_lens_selection_path(data_dir);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            validate_model_provider_private_directory(
+                &data_dir.join("providers"),
+                "model-provider config parent",
+            )?;
+            validate_model_provider_private_directory(
+                &model_provider_root_dir(data_dir),
+                "model-provider config root",
+            )?;
+            let bytes = read_model_provider_private_file(
+                &path,
+                &metadata,
+                4096,
+                "Approval Lens selection",
+            )?;
+            let selection: ApprovalLensSelection = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                !selection.offer_id.is_empty() && selection.offer_id.len() <= 256,
+                "invalid evaluator selection"
+            );
+            Ok(Some(selection.offer_id))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let offers = load_model_provider_operator_offers(data_dir)?;
+            let id = offers.iter().find_map(|offer| {
+                let id = offer.get("id")?.as_str()?;
+                (offer
+                    .get("title")?
+                    .as_str()?
+                    .trim()
+                    .eq_ignore_ascii_case("jev")
+                    && decision_hosted_offer(data_dir, id).is_some())
+                .then(|| id.to_string())
+            });
+            if let Some(id) = &id {
+                store_approval_lens_selection(data_dir, id)?;
+            }
+            Ok(id)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedModelOfferHint)> {
+    let id = approval_lens_offer_id(data_dir).ok()??;
+    Some((id.clone(), decision_hosted_offer(data_dir, &id)?))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1462,6 +1550,61 @@ mod hosted_hint_tests {
         offer["adapter"]["model"] = serde_json::json!("other/model");
         seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
         assert!(named_jev_hosted_offer(dir.path()).is_none());
+    }
+
+    #[test]
+    fn approval_lens_selection_survives_rename_and_never_substitutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = hosted_offer(
+            HostedAiProvider::OpenRouter,
+            "model:first",
+            "Jev",
+            "typesafe/jev-1.13",
+            None,
+        );
+        first["adapter"]["api_key"] = json!("fixture-secret");
+        let mut second = first.clone();
+        second["id"] = json!("model:second");
+        seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+        assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
+        first["title"] = json!("My reviewer");
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![first, second.clone()])
+            .unwrap();
+        assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![second.clone()]).unwrap();
+        assert!(named_jev_hosted_offer(dir.path()).is_none());
+        assert!(super::approval_lens_has_selection(dir.path()));
+        super::select_approval_lens(dir.path(), "model:second").unwrap();
+        assert_eq!(
+            named_jev_hosted_offer(dir.path()).unwrap().0,
+            "model:second"
+        );
+        second["enabled"] = json!(false);
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![second]).unwrap();
+        assert!(super::select_approval_lens(dir.path(), "model:second").is_err());
+        assert!(super::select_approval_lens(dir.path(), "model:foreign").is_err());
+    }
+
+    #[test]
+    fn approval_lens_policy_read_error_keeps_review_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut offer = hosted_offer(
+            HostedAiProvider::OpenRouter,
+            "model:first",
+            "Jev",
+            "typesafe/jev-1.13",
+            None,
+        );
+        offer["adapter"]["api_key"] = json!("fixture-secret");
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
+        std::fs::create_dir(super::approval_lens_selection_path(dir.path())).unwrap();
+        assert!(super::approval_lens_offer_id(dir.path()).is_err());
+        assert!(named_jev_hosted_offer(dir.path()).is_none());
+        assert!(super::approval_lens_has_selection(dir.path()));
     }
 
     #[test]

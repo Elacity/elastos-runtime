@@ -5111,11 +5111,11 @@ assert(
 );
 assert(
   marketplaceUi.includes('data-action="open-ai-provider-settings"') &&
-    marketplaceUi.includes("Open Settings") &&
+    marketplaceUi.includes("Manage models") &&
     !marketplaceUi.includes("OpenRouter") &&
-    read("capsules/assistant/browser/agent-harness.js").includes("Open Settings") &&
+    read("capsules/assistant/browser/agent-harness.js").includes('["open-ai-provider-settings", "Manage models"]') &&
     !read("capsules/assistant/browser/agent-harness.js").includes("OpenRouter"),
-  "Assistant and Marketplace AI-provider links must name Settings",
+  "Assistant and Marketplace must retain their System model-management links",
 );
 assert(
   assistantIndex.includes('placeholder="Message Assistant"') &&
@@ -5505,7 +5505,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260921a";
+const systemAssetVersion = "system-models-20260922a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -7534,7 +7534,7 @@ assert(
 assert(
   system.includes('data-settings="models"') &&
     system.includes('data-ai-provider') &&
-    system.includes("Hosted models") &&
+    system.includes('id="ai-provider-title" class="pc2-section-title">Hosted<') &&
     system.includes("Add hosted model") &&
     system.includes("This Home stores the key.") &&
     system.includes("The selected processor receives prompts outside this Home.") &&
@@ -7549,7 +7549,7 @@ assert(
     system.includes('autocomplete="off"') &&
     system.includes('id="ai-provider-validate"') &&
     system.includes('id="ai-provider-save"') &&
-    system.includes(">Test<") &&
+    system.includes(">Check key and load models<") &&
     system.includes(">Save<") &&
     !system.includes("Share OpenRouter") &&
     !system.includes("Share Venice") &&

@@ -202,6 +202,60 @@ async fn non_assistant_capsule_cannot_invoke_model_provider() {
 }
 
 #[tokio::test]
+async fn marketplace_reads_model_offers_and_services_without_run_or_grant_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RecordingModelProvider::default();
+    *provider.response.lock().await = json!({"status":"ok", "data":{"offers":[]}});
+    let app = gateway_router(model_test_state(dir.path(), provider.clone()).await);
+    let token = issue_home_launch_token(dir.path(), MARKETPLACE_CAPSULE_ID).unwrap();
+    let response = app
+        .clone()
+        .oneshot(post_model(token.clone(), "offers_list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for operation in ["runs_create", "runs_get", "runs_events", "runs_cancel"] {
+        let response = app
+            .clone()
+            .oneshot(post_model(token.clone(), operation, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{operation}");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/services/summary")
+                .header("x-elastos-home-token", &token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/services/offers")
+                .header("x-elastos-home-token", &token)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"offer_id":"local:provider:model","section":"mine","selected":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        *provider.requests.lock().await,
+        vec![json!({"op":"offers_list"})]
+    );
+}
+
+#[tokio::test]
 async fn assistant_cannot_invoke_unsupported_model_operation() {
     let dir = tempfile::tempdir().unwrap();
     let provider = RecordingModelProvider::default();
@@ -1869,6 +1923,113 @@ async fn named_jev_retries_eval_after_unsigned_record_cleared() {
         .collect();
     assert_eq!(eval_ids.len(), 2, "{requests:?}");
     assert_ne!(eval_ids[0], eval_ids[1], "{eval_ids:?}");
+}
+
+#[tokio::test]
+async fn approval_lens_sample_advises_without_permission_or_downstream_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:jev",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/alpha/decisions",
+                "fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:text",
+                "Text",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let provider = ScriptedModelProvider::default();
+    provider.replies.lock().await.insert(
+        "model:jev".into(),
+        json!({"status": "error", "message": "fixture lost create reply"}),
+    );
+    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let send = |token: String, id: &str| {
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/system/approval-lens/sample")
+            .header("x-elastos-home-token", token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({"id": id})).unwrap()))
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(send(guest.system_token, "model:jev"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    for invalid in ["model:text", "model:foreign"] {
+        let response = app
+            .clone()
+            .oneshot(send(authority.system_token.clone(), invalid))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+    }
+    assert!(provider.requests.lock().await.is_empty());
+    for attempt in 0..2 {
+        let (status, result) = status_json(
+            app.clone()
+                .oneshot(send(authority.system_token.clone(), "model:jev"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["advisory_only"], true);
+        assert_eq!(result["sample_reused"], attempt > 0);
+        assert_eq!(
+            result["recommendation"]["recommendation"],
+            if attempt == 0 {
+                "unavailable"
+            } else {
+                "approve"
+            }
+        );
+        let request = provider.requests.lock().await[0].clone();
+        let binding: RuntimeCreateBinding =
+            serde_json::from_value(request["runtime_binding"].clone()).unwrap();
+        provider.get_replies.lock().await.insert(
+            elastos_model_contract::model_run_id(&binding),
+            decision_reply("approve", "low", 0.8),
+        );
+    }
+    let requests = provider.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["op"], "runs_create");
+    assert_eq!(requests[1]["op"], "runs_get");
+    assert_eq!(requests[0]["runtime_binding"]["capsule_id"], "system");
+    assert_eq!(requests[0]["operation"], "decision.evaluate");
+    assert!(!requests[0].to_string().contains("fixture-secret"));
+    assert!(!dir.path().join("jev-approval-lens").exists());
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let (_, inbox) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

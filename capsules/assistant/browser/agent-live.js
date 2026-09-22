@@ -153,13 +153,52 @@ export function clearBackendReports() {
    initial first advertised offer; later absence never substitutes another. */
 let selectedLiveOfferId = "";
 let selectedContentCid = null;
+let selectionEpoch = 0;
 
 export function selectLiveOffer(offerId, modelCid = null) {
+  ++selectionEpoch;
   selectedLiveOfferId = typeof offerId === "string" ? offerId : "";
   selectedContentCid = modelCid;
   if (!liveState.checking) {
     liveState.live = Boolean(currentChoice(liveState.models, liveState.catalogModels));
   }
+}
+
+// Explicit user selection retains verified local content. Workspace restore and
+// launch hydration continue to use selectLiveOffer without changing retention.
+export async function selectLiveOfferForUse(offerId, modelCid = null) {
+  const local = liveContentModels().find(model => model.offerId === offerId && (modelCid == null || model.cid === modelCid));
+  // Runtime derives admitted local offer IDs from the verified content binding.
+  // A missing catalog mapping cannot turn that offer into an operator choice.
+  if (modelCid == null && !local && !/^model:[0-9a-f]{64}$/.test(offerId)) {
+    selectLiveOffer(offerId);
+    return true;
+  }
+  const failure = () => new Error("Could not keep this model on this device. Select it again to retry.");
+  if (!local) throw failure();
+  const epoch = selectionEpoch;
+  const token = getHomeGuiLaunchToken();
+  if (!token) throw failure();
+  const body = { capsule: "assistant", interface: "elastos.assistant.model", method: "content.retention",
+    request_id: newRequestId(), input: { cid: local.cid, keep: true } };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 35000);
+  try {
+    const response = await fetch(new URL("/api/capsules/interfaces/invoke", window.location.href).href, {
+      method: "POST", headers: { "content-type": "application/json", "x-elastos-home-token": token },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
+    const result = await response.json();
+    if (!response.ok || result.schema !== "elastos.capsules.invoke-result/v1" || result.status !== "ok"
+        || !["capsule", "interface", "method", "request_id"].every(key => result[key] === body[key])
+        || result.output?.cid !== local.cid || result.output.kept !== true || result.output.admitted !== true) throw failure();
+    if (epoch !== selectionEpoch) return false;
+    if (!liveContentModels().some(model => model.cid === local.cid && model.offerId === offerId)) throw failure();
+    selectLiveOffer(offerId, local.cid);
+    return true;
+  } catch {
+    throw failure();
+  } finally { clearTimeout(timeout); }
 }
 
 export function liveContentChoice() { return selectedContentCid; }

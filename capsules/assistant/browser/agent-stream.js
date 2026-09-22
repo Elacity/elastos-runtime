@@ -519,6 +519,9 @@ export function formatStreamError(err) {
   if (code === "run_acceptance_unknown") {
     return "Run acceptance is unknown. Start a new chat.";
   }
+  if (code === "remote_model_invocation_refused" && err?.preDispatchRefusal === true) {
+    return "Request refused. This attempt stopped before provider dispatch. Review service access before a new request.";
+  }
   if (code === "missing-home-launch-token") {
     return "Live unavailable — Home launch token missing (unlock Home and reopen Agent)";
   }

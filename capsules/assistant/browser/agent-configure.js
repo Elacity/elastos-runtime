@@ -184,14 +184,12 @@ function renderConfigureModels() {
   if (!page) {
     return;
   }
-  const installed = page.querySelector("[data-models-installed]");
-  if (installed) {
-    host.buildInstalledModelRows(installed, "No model offer on this Home yet.");
-  }
+  const label = page.querySelector("[data-current-model-label]");
+  if (label) label.textContent = selectedLiveOffer()?.label || "No model selected";
   renderModelSelectionFacts();
   void probeLiveInference({ force: true }).then(() => {
-    if (harnessPage === "configure" && configureSection === "models" && installed) {
-      host.buildInstalledModelRows(installed, "No model offer on this Home yet.");
+    if (harnessPage === "configure" && configureSection === "models") {
+      if (label) label.textContent = selectedLiveOffer()?.label || "No model selected";
       host.syncModelTrigger?.();
       renderModelSelectionFacts();
     }

@@ -47,6 +47,11 @@ function applyLaunchQuery(query = {}) {
     selectLiveOffer(typeof query.offer_id === "string" ? query.offer_id : "", query.model_cid);
     scheduleAgentWorkspacePersist();
   }
+  if (!query.model_cid && typeof query.offer_id === "string" && query.offer_id.trim()) {
+    // Preserve the exact requested identity even when it is currently unavailable.
+    selectLiveOffer(query.offer_id);
+    scheduleAgentWorkspacePersist();
+  }
   if (query.session_id) selectSession(query.session_id);
   if (["chat", "build", "studio"].includes(query.mode)) window.dispatchEvent(new CustomEvent("assistant:session-selected", {detail: {mode: query.mode}}));
 }

@@ -57,6 +57,7 @@ const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const frameHomeToken = readLaunchToken();
 const models = window.ElastosModelManagement.create({
   root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
+  onReadyOpen: ({ cid, offer_id }) => openCapsuleTarget("assistant", { model_cid: cid, offer_id }),
 });
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
@@ -756,6 +757,9 @@ function configureAiProvider() {
   const hideForm = () => {
     editingId = "";
     formNode.hidden = true;
+    instancesNode.hidden = false;
+    document.querySelector("#local-models").hidden = false;
+    document.querySelector("#approval-lens").hidden = false;
     addButton.hidden = false;
     nameInput.value = "";
     keyInput.value = "";
@@ -766,6 +770,9 @@ function configureAiProvider() {
   };
   const showForm = (instance) => {
     formNode.hidden = false;
+    instancesNode.hidden = true;
+    document.querySelector("#local-models").hidden = true;
+    document.querySelector("#approval-lens").hidden = true;
     addButton.hidden = true;
     editingId = instance && instance.id ? String(instance.id) : "";
     nameInput.value = instance && instance.name ? String(instance.name) : "";
@@ -773,7 +780,9 @@ function configureAiProvider() {
     keyInput.value = "";
     fillModels([], instance && instance.selected_model ? instance.selected_model : "");
     applyProviderChrome();
-    saveButton.textContent = editingId ? "Save" : "Save";
+    document.querySelector("#ai-provider-form-title").textContent = editingId ? "Edit hosted model" : "Add hosted model";
+    saveButton.textContent = "Save";
+    nameInput.focus();
     setBusy(false);
   };
   const renderInstances = (status) => {
@@ -795,8 +804,8 @@ function configureAiProvider() {
       useButton.className = "pc2-btn";
       useButton.type = "button";
       const decisionModel = connection.operation === "decision.evaluate";
-      useButton.textContent = decisionModel ? "Open Inbox" : "Use in Assistant";
-      useButton.addEventListener("click", () => openCapsuleTarget(decisionModel ? "inbox" : "assistant"));
+      useButton.textContent = decisionModel ? "Review in Inbox" : "Use in Assistant";
+      useButton.addEventListener("click", () => openCapsuleTarget(decisionModel ? "inbox" : "assistant", decisionModel ? {} : { offer_id: connection.id }));
       const shareButton = document.createElement("button");
       shareButton.className = "pc2-btn pc2-btn-secondary";
       shareButton.type = "button";
@@ -825,7 +834,7 @@ function configureAiProvider() {
             body: JSON.stringify({ id: connection.id }),
           });
           hideForm();
-          renderInstances(latestStatus);
+          await refreshStatus();
           showState(`${readText(connection.name)} is disconnected.`, "");
         } catch (error) {
           showState(publicSystemError(error, "This Home could not disconnect that hosted model."), "error");
@@ -833,24 +842,81 @@ function configureAiProvider() {
           setBusy(false);
         }
       });
-      actions.append(useButton);
-      if (!decisionModel) actions.append(shareButton);
-      actions.append(replaceButton, disconnectButton);
-      card.append(title, detail, actions);
+      const state = document.createElement("span");
+      state.className = "ai-provider-state";
+      state.textContent = decisionModel ? "Approval advice" : connection.share_enabled ? "Shared" : "Private";
+      title.append(state);
+      const more = document.createElement("details");
+      more.className = "ai-provider-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Details and access";
+      const identity = document.createElement("p");
+      identity.className = "pc2-card-sublabel";
+      identity.textContent = `Instance: ${connection.id}`;
+      const secondary = document.createElement("div");
+      secondary.className = "system-inline-row";
+      if (!decisionModel) secondary.append(shareButton);
+      secondary.append(disconnectButton);
+      more.append(summary, identity, secondary);
+      actions.append(useButton, replaceButton);
+      card.append(title, detail, actions, more);
       instancesNode.append(card);
     }
   };
+  const lensModel = document.querySelector("#approval-lens-model");
+  const lensStatus = document.querySelector("#approval-lens-status");
+  const lensSelect = document.querySelector("#approval-lens-select");
+  const lensRun = document.querySelector("#approval-lens-run");
+  const lensResult = document.querySelector("#approval-lens-result");
+  const renderLens = (status) => {
+    const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
+    const current = decisions.find(c => c.id === status.approval_lens_offer_id);
+    lensModel.replaceChildren();
+    for (const connection of decisions) {
+      const option = document.createElement("option"); option.value = connection.id;
+      option.textContent = `${connection.name} · ${connection.processor_label} · ${connection.selected_model}`;
+      lensModel.append(option);
+    }
+    if (current) lensModel.value = current.id;
+    lensStatus.textContent = current ? `Current evaluator: ${current.name} · ${current.processor_label}`
+      : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
+      : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
+    lensSelect.disabled = lensRun.disabled = !decisions.length;
+  };
+  lensModel.addEventListener("change", () => { lensResult.textContent = ""; lensRun.textContent = "Evaluate or view sample"; });
+  document.querySelector("#approval-lens-inbox").addEventListener("click", () => openCapsuleTarget("inbox"));
+  lensSelect.addEventListener("click", async () => {
+    lensSelect.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/approval-lens", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
+      await refreshStatus();
+    } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
+    finally { lensSelect.disabled = false; }
+  });
+  lensRun.addEventListener("click", async () => {
+    lensRun.disabled = lensModel.disabled = true;
+    lensResult.textContent = "Evaluating this fictional sample…";
+    try {
+      const result = await fetchJson("/api/apps/system/approval-lens/sample", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
+      const advice = result.recommendation;
+      if (result.advisory_only !== true || result.offer_id !== lensModel.value || !advice) throw new Error("invalid sample response");
+      lensResult.textContent = advice.recommendation === "unavailable" ? advice.reason : `${result.sample_reused === true ? "Saved sample evaluation." : "New sample evaluation."} Advice: ${advice.recommendation}. Risk: ${advice.risk}. Confidence: ${advice.confidence == null ? "not reported" : `${advice.confidence}%`}. ${advice.reason} This sample changed no permissions.`;
+    } catch { lensResult.textContent = "Evaluation acceptance is unknown. Check this sample again before starting another."; }
+    finally { lensRun.disabled = lensModel.disabled = false; lensRun.textContent = "Check this sample again"; }
+  });
   const refreshStatus = async () => {
     latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
     renderInstances(latestStatus);
+    renderLens(latestStatus);
     return latestStatus;
   };
   addButton.addEventListener("click", () => {
     showForm(null);
-    showState("Name this hosted model, then Test and Save.", "");
+    showState("Name this model, check its key, choose a model and Save.", "");
   });
   cancelButton.addEventListener("click", () => {
     hideForm();
+    addButton.focus();
     showState("", "");
   });
   providerSelect.addEventListener("change", applyProviderChrome);
@@ -897,7 +963,7 @@ function configureAiProvider() {
         body: JSON.stringify(body),
       });
       hideForm();
-      renderInstances(latestStatus);
+      await refreshStatus();
       showState("This hosted model is saved on this Home.", "success");
     } catch (error) {
       const activationPending = /selection_unavailable|model activation pending|model retirement pending/.test(String(error.message || error));
@@ -1453,7 +1519,7 @@ function pulseDeviceDidCopyButton() {
   }, 1200);
 }
 
-function openCapsuleTarget(target) {
+function openCapsuleTarget(target, query = {}) {
   const id = readText(target);
   if (!id || !homeParentOrigin || !window.top || window.top === window) {
     return;
@@ -1461,6 +1527,7 @@ function openCapsuleTarget(target) {
   window.top.postMessage({
     type: "home:open-target",
     target: id,
+    query,
     homeToken: apiHomeToken,
   }, homeParentOrigin);
 }

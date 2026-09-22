@@ -2005,11 +2005,14 @@ pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SERVICES_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
+    let context = match require_home_launch_token_binding(
+        &state.data_dir,
+        &headers,
+        &[SERVICES_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
+    ) {
+        Ok(binding) => binding.context,
+        Err(err) => return home_error_response(err),
+    };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
     let provider_registry = state.provider_registry.clone();

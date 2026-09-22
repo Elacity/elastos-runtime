@@ -173,14 +173,51 @@ verification separate from product acceptance and required human review.
 
 ### Model delivery R14 — 0.7.1 on public Home
 
-Current execution, 22 September 2026. Codex owns source edits, builds and the
-new consumer Home on this existing working branch. The retired worker has no
-active child or build. Existing human Homes and holders retain their state.
-One read-only reviewer checks each material milestone. Notion owns acceptance. The private Codex
-handoff in the common Git directory supplies exact artifacts, targets and proof
-procedures. Preserve the dirty Carrier and preparation fixes.
+Current execution, 22 September 2026: complete the remaining model product
+before the next human test. The reviewed five-outcome candidate below is the
+regression baseline. Codex owns source, builds, installed test Homes and evidence;
+one read-only reviewer checks material milestones. The coordinator owns Notion
+and monitoring. Preserve all human connections, keys, conversations and drafts.
 
-The next outcomes use the existing acceptance IDs in this order:
+The active sequence is: simplify Models and Approval Lens with installed keyboard
+and responsive proof; project existing shared service offers in Marketplace and
+complete its ordinary access handoff; complete the installed access and failure
+matrix with controlled test state; finish remaining catalogue, retention and AI
+acceptance clauses; then run combined checks, review and artifact reconciliation.
+A labelled Approval Lens sample uses real Decisions advice with human authority
+kept separate. Generic remote failures retain unknown acceptance until an explicit
+destination assertion proves refusal before dispatch. Full Qwen work and the
+previously deferred relay/performance gates retain their original scope.
+
+Current revision: installed System Models and Assistant use one editor and one
+selector. Approval Lens selection and the labelled sample work; reopening the
+sample reuses its saved evaluation. Marketplace shows the granted offer's Home,
+upstream, payer, limits and availability, and hands that exact offer to Services
+or Assistant. The existing-grant path passed. A fresh request and six-hour Inbox
+approval waits on the current human confirmation.
+
+The isolated installed hosted matrix passed destination authority, sharing
+pause/resume, combined private/shared capacity, key replacement, removal,
+retained-run access, transport loss, cancellation and owner restart checks.
+The key check exposed a swallowed refresh error; exact key-only refresh now
+preserves the running worker and gives subsequent requests the new key.
+Configuration refresh failures report a pending state. Disconnect withdraws the
+exact shared offer while retirement is pending and preserves other connections.
+Independent review accepted this diagnostic matrix. Source checks pass for Use
+retention and caller-bound Remove, including busy, foreign-claim and recovery
+cases. Installed Use creates the caller's Keep; human SmolLM2 Open/selection and
+reload pass with artifact and protected-state parity. Fresh access approval
+and the remaining acceptance decisions stay open. The tiny held-read test found that a frozen shared provider prevents
+terminal cancellation until its read drains. The reservation stays charged.
+Recovery after releasing the provider passed, including restart without replay;
+the frozen-provider criterion remains open. Request-exclusive read ownership is
+a larger mechanism decision, separate from the existing HTTP read deadline.
+The running-provider held-HTTP check passed actual socket drain at 5.002 seconds,
+terminal cancellation with zero reservation, a separate small read and restart
+without replay. Combined installation and final source gates pass. Trusted
+publisher successor evidence and global sole-copy evidence remain open clauses.
+
+Accepted regression evidence for the original five outcomes:
 
 1. **CR1/CR2 prerequisite closeout — verified:** source lineage and installed
    direct-only acquisition are bound. Shared endpoint construction enforces the
@@ -245,8 +282,8 @@ The next outcomes use the existing acceptance IDs in this order:
    repairs. Runtime, provider and changed capsule hashes match both installed
    Homes; served Assistant disclosure bytes match the reviewed source. The
    reviewed local commits preserve the original dirty work and parent history.
-   The bounded handoff is complete; publication and wider qualification remain
-   separate gates.
+   This candidate is the regression baseline for the active product revision;
+   publication and wider qualification retain separate gates.
    The initial combined run exposed stale authorization, key-permission,
    direct-discovery and reconciliation fixtures. All 25 affected cases now pass
    after independent review. Optional

@@ -1686,7 +1686,12 @@ pub(super) async fn gateway_provider_proxy(
             }
         },
         "model" => match op.as_str() {
-            "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
+            "offers_list" => &[
+                ASSISTANT_CAPSULE_ID,
+                HOME_AGENT_CAPSULE_ID,
+                MARKETPLACE_CAPSULE_ID,
+            ],
+            "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
                 &[ASSISTANT_CAPSULE_ID, HOME_AGENT_CAPSULE_ID]
             }
             _ => {

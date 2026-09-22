@@ -78,7 +78,7 @@ import {
 import {
   getLiveInferenceState,
   probeLiveInference,
-  selectLiveOffer,
+  selectLiveOfferForUse,
   selectedLiveOffer,
   liveContentChoice,
   liveContentModels,
@@ -235,7 +235,6 @@ bindAgentConfigure(
         /* optional during early boot */
       }
     },
-    buildInstalledModelRows: (hostEl, emptyText) => buildInstalledModelRows(hostEl, emptyText),
     syncModelTrigger: () => syncModelTrigger(),
   },
 );
@@ -693,10 +692,14 @@ function modelMenuOpen() {
 
 /** Menu can be summoned from the composer trigger or the sidebar Models row. */
 let modelMenuAnchor = null;
+let modelSelectionPending = false;
+let modelSelectionMessage = "";
 
 function closeModelMenu() {
   const menu = modelMenuEl();
   const btn = modelBtnEl();
+  const returnFocus = menu?.contains(document.activeElement);
+  const anchor = modelMenuAnchor || btn;
   if (menu) {
     menu.hidden = true;
     clearFloatingMenuStyle(menu);
@@ -705,6 +708,7 @@ function closeModelMenu() {
     btn.setAttribute("aria-expanded", "false");
   }
   modelMenuAnchor = null;
+  if (returnFocus) anchor?.focus({ preventScroll: true });
 }
 
 function syncModelTrigger() {
@@ -717,7 +721,8 @@ function syncModelTrigger() {
   const tier = btn.querySelector(".agent-model-tier");
   const liveInference = getLiveInferenceState();
   const offer = selectedLiveOffer();
-  const label = offer?.label || liveInference.model || "No model";
+  const content = liveContentModels().find(model => model.offerId === offer?.offerId);
+  const label = content?.title || offer?.label || liveInference.model || "No model";
   if (name) {
     name.textContent = label;
   }
@@ -751,6 +756,13 @@ function fillOptionFacts(host, facts, expanded) {
 
 function buildInstalledModelRows(host, emptyText) {
   host.replaceChildren();
+  if (modelSelectionPending || modelSelectionMessage) {
+    const status = document.createElement("p");
+    status.className = "agent-model-menu-empty";
+    status.setAttribute("role", modelSelectionMessage ? "alert" : "status");
+    status.textContent = modelSelectionMessage || "Keeping this model on this device…";
+    host.append(status);
+  }
   /* Rows are the advertised model offers — nothing else is inference. */
   const liveInference = getLiveInferenceState();
   const activeOffer = selectedLiveOffer();
@@ -758,6 +770,7 @@ function buildInstalledModelRows(host, emptyText) {
     if (liveContentModels().some(content => content.offerId === model.offerId)) continue;
     const row = document.createElement("button");
     row.type = "button";
+    row.disabled = modelSelectionPending;
     row.className = "agent-model-option";
     row.id = optionIdForOffer(host, model.offerId);
     row.setAttribute("role", "option");
@@ -784,6 +797,7 @@ function buildInstalledModelRows(host, emptyText) {
   for (const model of liveContentModels()) {
     const row = document.createElement("button");
     row.type = "button";
+    row.disabled = modelSelectionPending;
     row.className = "agent-model-option";
     row.id = optionIdForOffer(host, model.cid || model.offerId);
     row.dataset.liveOfferId = model.offerId;
@@ -801,7 +815,6 @@ function buildInstalledModelRows(host, emptyText) {
       `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
     row.querySelector(".agent-model-option-title").textContent = model.title;
     row.querySelector(".agent-model-option-desc").textContent = "This Home · local";
-    row.title = model.cid;
     host.append(row);
   }
   if (!host.children.length) {
@@ -812,8 +825,8 @@ function buildInstalledModelRows(host, emptyText) {
   }
   for (const [action, label] of [
     ["refresh-models", "Refresh models"],
-    ["open-models", "Open Models"],
-    ["open-ai-provider-settings", "Open Settings"],
+    ["open-models", "Find models in Marketplace"],
+    ["open-ai-provider-settings", "Manage models"],
   ]) {
     const button = document.createElement("button");
     button.type = "button"; button.className = "agent-model-option";
@@ -1622,10 +1635,10 @@ export function bindAgentHarness() {
       toggleModelMenu();
       return;
     }
-    if (event.target.closest?.("[data-model-add]")) {
+    const chooseModel = event.target.closest?.("[data-model-picker-open]");
+    if (chooseModel) {
       event.preventDefault();
-      closeModelMenu();
-      openHarnessPage("configure", { section: "models" });
+      openModelMenu(chooseModel);
       return;
     }
     const sidebarNav = event.target.closest?.("[data-sidebar-nav]");
@@ -1725,11 +1738,22 @@ export function bindAgentHarness() {
     const liveOpt = event.target.closest?.(".agent-model-option[data-live-offer-id]");
     if (liveOpt?.dataset.liveOfferId) {
       event.preventDefault();
-      selectLiveOffer(liveOpt.dataset.liveOfferId, liveOpt.dataset.modelCid ?? null);
-      syncTruthStrip();
-      renderHarnessPage();
-      persistAgentWorkspaceSoon();
-      closeModelMenu();
+      if (modelSelectionPending) return;
+      modelSelectionPending = true; modelSelectionMessage = "";
+      const selection = selectLiveOfferForUse(liveOpt.dataset.liveOfferId, liveOpt.dataset.modelCid ?? null);
+      renderModelMenu();
+      void selection.then(changed => {
+        if (!changed) return;
+        syncTruthStrip();
+        renderHarnessPage();
+        persistAgentWorkspaceSoon();
+        closeModelMenu();
+      }).catch(() => {
+        modelSelectionMessage = "Could not keep this model on this device. Select it again to retry.";
+      }).finally(() => {
+        modelSelectionPending = false;
+        renderModelMenu();
+      });
       return;
     }
     if (

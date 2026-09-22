@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-20260921a">
+<link rel="stylesheet" href="./style.css?v=system-models-20260922a">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -297,9 +297,30 @@
         </section>
 
         <section class="settings-content" data-settings="models" aria-labelledby="models-title">
-          <h1 id="models-title">Models</h1>
+          <div class="models-heading"><div><h1 id="models-title">Models</h1>
+            <p class="pc2-card-sublabel">Choose where your models run. Manage access and stored keys here.</p></div>
+            <button id="ai-provider-add" class="pc2-btn" type="button">Add hosted model</button></div>
+          <section id="approval-lens" class="pc2-section" aria-labelledby="approval-lens-title">
+            <h2 id="approval-lens-title" class="pc2-section-title">Approval Lens</h2>
+            <p class="pc2-card-sublabel">Jev gives advice on hosted connections. You make the decision in Inbox.</p>
+            <div class="pc2-group"><div class="pc2-group-row approval-lens-controls">
+              <p id="approval-lens-status" role="status">Loading evaluator…</p>
+              <label for="approval-lens-model">Decision model</label>
+              <select id="approval-lens-model" class="pc2-input" aria-label="Decision model"></select>
+              <div class="system-inline-row">
+                <button id="approval-lens-select" class="pc2-btn pc2-btn-secondary" type="button">Use for approval advice</button>
+                <button id="approval-lens-inbox" class="pc2-btn pc2-btn-secondary" type="button">Open Inbox</button>
+              </div>
+              <details id="approval-lens-sample"><summary>Try a sample</summary>
+                <p>Fictional weather helper asks to send a public weather question to a hosted processor, paid by its Home.</p>
+                <p>The selected hosted processor receives this fixed sample. Your Home pays on first use. Later checks show the saved evaluation. Advice grants no permission and runs no weather request.</p>
+                <button id="approval-lens-run" class="pc2-btn" type="button">Evaluate or view sample</button>
+                <p id="approval-lens-result" role="status"></p>
+              </details>
+            </div></div>
+          </section>
           <section class="pc2-section" data-ai-provider aria-labelledby="ai-provider-title">
-            <h2 id="ai-provider-title" class="pc2-section-title">Hosted models</h2>
+            <h2 id="ai-provider-title" class="pc2-section-title">Hosted</h2>
             <div class="pc2-group">
               <div class="pc2-group-row">
                 <p class="pc2-card-sublabel">This Home stores the key.</p>
@@ -308,8 +329,8 @@
                 <p class="pc2-card-value system-status" data-field="ai-provider-state" aria-live="polite"></p>
                 <p class="pc2-card-value system-status" data-field="ai-provider-privacy" hidden></p>
                 <div id="ai-provider-instances" class="ai-provider-instances"></div>
-                <button id="ai-provider-add" class="pc2-btn" type="button">Add hosted model</button>
                 <div id="ai-provider-form" class="ai-provider-form" hidden>
+                  <h2 id="ai-provider-form-title" class="pc2-section-title">Add hosted model</h2>
                   <label class="pc2-card-label" for="ai-provider-name">Name</label>
                   <input id="ai-provider-name" class="pc2-input" type="text" autocomplete="off" spellcheck="false" aria-label="Hosted model name">
                   <label class="pc2-card-label" for="ai-provider-kind">Hosted by</label>
@@ -322,7 +343,7 @@
                   <label class="pc2-card-label" for="ai-provider-model">Model</label>
                   <select id="ai-provider-model" class="pc2-input" aria-label="Selected model"></select>
                   <div class="system-inline-row">
-                    <button id="ai-provider-validate" class="pc2-btn pc2-btn-secondary" type="button">Test</button>
+                    <button id="ai-provider-validate" class="pc2-btn pc2-btn-secondary" type="button">Check key and load models</button>
                     <button id="ai-provider-save" class="pc2-btn" type="button">Save</button>
                     <button id="ai-provider-cancel" class="pc2-btn pc2-btn-secondary" type="button">Cancel</button>
                   </div>
@@ -330,7 +351,11 @@
               </div>
             </div>
           </section>
-          <div data-model-management hidden></div>
+          <section id="local-models" class="pc2-section" aria-labelledby="local-models-title">
+            <h2 id="local-models-title" class="pc2-section-title">On this Home</h2>
+            <p class="pc2-card-sublabel">These models run on this device. Prompts stay here.</p>
+            <div data-model-management hidden></div>
+          </section>
         </section>
         <section class="settings-content" data-settings="catalog" aria-labelledby="catalog-title">
           <div class="catalog-toolbar">
@@ -457,6 +482,6 @@
       });
     })();
   </script>
-  <script type="module" src="./system.js?v=system-20260921a"></script>
+  <script type="module" src="./system.js?v=system-models-20260922a"></script>
 </body>
 </html>

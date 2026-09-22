@@ -2,6 +2,55 @@
 
 ## Current model delivery checkpoint, 22 September 2026 UTC
 
+System Models now supplies the model editor and Approval Lens selection;
+Assistant keeps one model selector. Installed keyboard and responsive checks
+passed. A real Jev sample evaluation completed, and reopening it reused the
+saved journal without another provider request. Marketplace projects the
+existing grant's offer facts and hands the exact offer to Services or Assistant.
+The fresh request and Inbox approval path awaits the current human decision.
+
+The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
+Fresh destination wrong-principal, unapproved, revoked and expired requests each
+returned a bound pre-dispatch refusal with zero provider calls. Earlier runs
+remained readable and cancellable. Private and shared requests respected one
+capacity limit. Exact key rotation preserved the running worker and changed the
+next request's credential. Disconnect withdrew the shared offer, retained the
+other connection and preserved completed-run access across restart. Cancellation
+and owner restart reported settlement unknown where backend settlement could
+not be confirmed; neither replayed a create. These are loopback fixture results,
+accepted by independent review. The prior live provider and ordinary Home
+receipts retain their separate scope. A separate 763-byte Content fixture stayed
+in preparation with its reservation charged while the shared provider was frozen
+for 20 seconds after Cancel. Releasing the provider completed cancellation;
+restart caused no new read. The preallocated admission identifier did not imply
+admission: zero bytes completed and no admission directory existed. Terminal
+cancellation of a frozen provider remains open. A separate running-provider
+check held an HTTP response body: the socket drained after 5.002 seconds, then
+cancellation settled with zero reserved bytes. A separate four-byte read
+succeeded, and restart preserved the terminal journal without replay.
+
+Use now records Keep with a new reservation. Explicit local selection waits for
+a verified catalog mapping and Keep acknowledgement. Remove binds the caller,
+checks foreign claims before withdrawal and preserves Keep until removal
+succeeds. Independent review accepted the removal and recovery contract;
+87 preparation tests and 43 Assistant tests pass. The combined gate passed
+4,559 Rust tests, with 27 explicitly ignored checks, plus formatting, lint and
+source/UI checks. Both human Homes run Runtime
+`86337f318edb33460eb8b5eacbb3db6f6627c3e1956bb2497818d955580fd193`
+and model-provider
+`0be8144ca5785fc69facbfd64bf97a48cc062cfa5965b564bf8928d8d29b1cd3`.
+Nineteen changed browser files per Home match source, installation and served
+bytes. All ten protected configuration/key files and six SmolLM2 artifact
+hashes, inodes and modification times remain unchanged. The isolated installed
+fixture proves new Use creates the caller's Keep before cancellation. Human
+Open and explicit picker selection retain SmolLM2; reload restores that choice
+and the completed conversation. Marketplace passes visual checks at 390, 768
+and 1280 pixels; keyboard navigation reaches the horizontally scrolled mobile
+categories. These checks preserve the separate frozen-provider and fresh-grant
+acceptance gaps.
+
+The following paragraphs retain the earlier five-outcome regression evidence.
+
 The unpublished closeout source preserves the security parent and original
 Carrier/preparation work. A fresh source-built Mac Home completed the signed
 SmolLM2 Marketplace-to-Assistant journey through direct Carrier from a distinct
@@ -67,8 +116,9 @@ new owner run or provider journal; the prior completed run stayed intact. The
 exact share, configuration and existing grant were restored. A new chat and
 explicit unpaid model refresh recovered the same remote offer. The consumer
 conservatively retained unknown acceptance because the current error classes
-can also arise after dispatch. More precise refusal copy needs a destination
-pre-dispatch assertion. A complete installed negative matrix is not claimed. Both owned Homes run Runtime
+can also arise after dispatch. At that baseline, precise refusal copy still needed a destination
+pre-dispatch assertion and the installed negative matrix remained open. Both
+owned Homes then ran Runtime
 `acb5011232841a3cde788494b47172bf8d0503ab2665c7f1715e56ac3d54dc81`
 with matching built and installed provider/capsule hashes. Normal restart,
 served Inbox parity and installed provider verification passed. Assistant's

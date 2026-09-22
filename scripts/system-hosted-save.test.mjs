@@ -11,6 +11,7 @@ function fixture(connections = []) {
   const nodes = new Map();
   const element = () => ({
     value: "", hidden: false, disabled: false, dataset: {}, selectedOptions: [], children: [], handlers: {},
+    focus() {},
     addEventListener(event, callback) { this.handlers[event] = callback; },
     append(...items) { this.children.push(...items); },
     replaceChildren(...items) { this.children = items; },
@@ -97,4 +98,23 @@ test("Edit uses the existing identity with a blank key and explains server-side 
   assert.equal(f.attempts[0].id, id);
   assert.equal(f.attempts[0].api_key, "");
   assert.equal(f.attempts[0].model, "typesafe/jev-1.13");
+});
+
+
+test("hosted handoff replaces the previous selection with the exact requested offer", () => {
+  const entry = readFileSync(new URL("../capsules/assistant/browser/home-agent.js", import.meta.url), "utf8");
+  const apply = entry.slice(entry.indexOf("function applyLaunchQuery("), entry.indexOf("function raiseRoom("));
+  let selected = "model:previous";
+  let saves = 0;
+  const context = vm.createContext({
+    validModelCid: () => false,
+    selectLiveOffer: id => { selected = id; },
+    scheduleAgentWorkspacePersist: () => saves++,
+    selectSession: () => {}, window: {},
+  });
+  vm.runInContext(`${apply}\napplyLaunchQuery({ offer_id: "model:requested" });`, context);
+  assert.equal(selected, "model:requested");
+  assert.equal(saves, 1);
+  vm.runInContext('applyLaunchQuery({ offer_id: "model:unavailable" });', context);
+  assert.equal(selected, "model:unavailable");
 });

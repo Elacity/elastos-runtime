@@ -68,6 +68,7 @@ const SERVICE_KIND_LIST_COPY = "Browser Engine, AI model or Browser Exit";
 
 let currentServices = null;
 let pendingServiceAction = null;
+let requestedServiceOffer = launchParams.get("service_offer_id") || "";
 
 announceReady();
 
@@ -120,6 +121,17 @@ function activateServicesSection(target, options = {}) {
 }
 
 function bindActions() {
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (event.source !== window.parent || event.origin !== "null"
+        || data?.type !== "elastos.services.navigate/v1" || data.homeToken !== homeToken
+        || Object.keys(data).sort().join(",") !== "homeToken,query,type"
+        || !data.query || Object.keys(data.query).join(",") !== "service_offer_id"
+        || typeof data.query.service_offer_id !== "string"
+        || !/^[A-Za-z0-9_.:-]{1,256}$/.test(data.query.service_offer_id)) return;
+    requestedServiceOffer = data.query.service_offer_id;
+    void refreshServices().catch(() => showStatus("Could not check the requested service.", "error"));
+  });
   refreshButton?.addEventListener("click", () => {
     refreshServices().catch((error) => showStatus(error.message || "Could not refresh Services.", "error"));
   });
@@ -151,6 +163,20 @@ async function refreshServices() {
     });
     renderServices(services);
     showStatus("Services updated.", "ok");
+    if (requestedServiceOffer) {
+      const offerId = requestedServiceOffer;
+      requestedServiceOffer = "";
+      const button = [...otherServicesList.querySelectorAll("[data-service-offer-id]")]
+        .find(node => node.dataset.serviceOfferId === offerId);
+      if (button) {
+        activateServicesSection("other-services", { behavior: "instant" });
+        button.scrollIntoView({ block: "center" });
+        button.focus();
+        showStatus("Review this service, then choose its action. Access changes only after your choice.", "muted");
+      } else {
+        showStatus("That service is unavailable. Choose from the current services below.", "muted");
+      }
+    }
   } finally {
     setBusy(false);
   }

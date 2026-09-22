@@ -36,7 +36,6 @@ const JEV_ROOT: &str = "jev-approval-lens";
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_REASON_BYTES: usize = 280;
 const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(8);
-const EVALUATOR_CAPSULE_ID: &str = "assistant";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostedHttpGate {
@@ -235,6 +234,39 @@ pub async fn prepare_assistant_hosted_http(
     context: &AssistantHostedHttpContext<'_>,
 ) -> HostedHttpGate {
     let Some((jev_offer_id, jev_hint)) = crate::api::named_jev_hosted_offer(data_dir) else {
+        if crate::api::approval_lens_has_selection(data_dir) {
+            // Keep human review when the selected evaluator is missing or unavailable.
+            let request_id = match hosted_http_request_id(context.offer_id) {
+                Ok(id) => id,
+                Err(_) => return HostedHttpGate::NeedsReview,
+            };
+            if let Ok(existing) = load_record(data_dir, &request_id) {
+                return match existing.human_decision.as_deref() {
+                    Some("approve") => HostedHttpGate::Proceed,
+                    Some("deny") => HostedHttpGate::Denied,
+                    _ => {
+                        let _ = upsert_inbox_card(data_dir, &existing);
+                        HostedHttpGate::NeedsReview
+                    }
+                };
+            }
+            let record = JevShadowRecord {
+                schema: JEV_RECORD_SCHEMA.to_string(),
+                request_id,
+                mode: JEV_MODE_SHADOW.to_string(),
+                consequence: sanitized_consequence(context),
+                policy: deterministic_policy(),
+                recommendation: unavailable_recommendation(
+                    "Selected evaluator unavailable. Review this connection yourself.",
+                ),
+                relationships: relationships(context),
+                human_decision: None,
+                actual_outcome: None,
+            };
+            let _ = write_record(data_dir, &record);
+            let _ = upsert_inbox_card(data_dir, &record);
+            return HostedHttpGate::NeedsReview;
+        }
         let _ = record_assistant_hosted_http_shadow(data_dir, context);
         return HostedHttpGate::Proceed;
     };
@@ -302,21 +334,49 @@ async fn evaluate_named_jev(
     if context.offer_id == jev_offer_id {
         return unavailable_recommendation("Jev does not evaluate its own request");
     }
+    let eval_request_id = format!("jev-eval:{}:{}", context.request_id, unique_eval_token());
+    evaluate_advice(
+        data_dir,
+        registry,
+        jev_offer_id,
+        model,
+        context,
+        &eval_request_id,
+    )
+    .await
+    .0
+}
+
+async fn evaluate_advice(
+    data_dir: &Path,
+    registry: &ProviderRegistry,
+    jev_offer_id: &str,
+    model: &str,
+    context: &AssistantHostedHttpContext<'_>,
+    eval_request_id: &str,
+) -> (JevRecommendation, Option<String>, Option<bool>) {
     let input = evaluator_input(context);
     if secret_in_text(data_dir, &input.to_string()).is_some() {
-        return unavailable_recommendation("Jev request omitted a secret");
+        return (
+            unavailable_recommendation("Jev request omitted a secret"),
+            None,
+            None,
+        );
     }
-    let eval_request_id = format!("jev-eval:{}:{}", context.request_id, unique_eval_token());
     let Ok(input_hash) = model_input_hash(&input) else {
-        return unavailable_recommendation("Jev request could not be bound");
+        return (
+            unavailable_recommendation("Jev request could not be bound"),
+            None,
+            None,
+        );
     };
     let binding = RuntimeCreateBinding {
         schema: RUNTIME_CREATE_BINDING_SCHEMA.to_string(),
         principal_id: context.principal_id.to_string(),
         session_id: context.session_id.to_string(),
-        capsule_id: EVALUATOR_CAPSULE_ID.to_string(),
+        capsule_id: context.capsule_id.to_string(),
         grant_id: context.grant_id.to_string(),
-        request_id: eval_request_id,
+        request_id: eval_request_id.to_string(),
         offer_id: jev_offer_id.to_string(),
         operation: decisions::OPERATION.to_string(),
         input_hash,
@@ -325,15 +385,45 @@ async fn evaluate_named_jev(
         .validate(jev_offer_id, decisions::OPERATION, &input)
         .is_err()
     {
-        return unavailable_recommendation("Jev request could not be bound");
+        return (
+            unavailable_recommendation("Jev request could not be bound"),
+            None,
+            None,
+        );
     }
-    let request = serde_json::json!({
-        "op": "runs_create",
-        "offer_id": jev_offer_id,
-        "operation": decisions::OPERATION,
-        "input": input,
-        "runtime_binding": binding,
-    });
+    let sample_run_id = elastos_model_contract::model_run_id(&binding);
+    let create_sample = if context.capsule_id == "system" {
+        match claim_sample(data_dir, &sample_run_id) {
+            Ok(first) => first,
+            Err(_) => {
+                return (
+                    unavailable_recommendation("Sample status could not be saved. Try again."),
+                    None,
+                    None,
+                )
+            }
+        }
+    } else {
+        true
+    };
+    let request = if create_sample {
+        serde_json::json!({
+            "op": "runs_create",
+            "offer_id": jev_offer_id,
+            "operation": decisions::OPERATION,
+            "input": input,
+            "runtime_binding": binding,
+        })
+    } else {
+        serde_json::json!({
+            "op": "runs_get", "run_id": sample_run_id,
+            "runtime_binding": RuntimeAccessBinding {
+                schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(), principal_id: context.principal_id.to_string(),
+                session_id: context.session_id.to_string(), capsule_id: context.capsule_id.to_string(),
+                grant_id: context.grant_id.to_string(), request_id: "sample-check".to_string(), run_id: sample_run_id.clone(),
+            }
+        })
+    };
     let result = tokio::time::timeout(EVALUATOR_TIMEOUT, async {
         let created = registry.send_raw("model", &request).await;
         match created {
@@ -343,12 +433,81 @@ async fn evaluate_named_jev(
     })
     .await;
     match result {
-        Err(_) => unavailable_recommendation("Jev did not reply in time"),
-        Ok(Err(_)) => unavailable_recommendation("Jev instance is unavailable"),
-        Ok(Ok(response)) => {
-            recommendation_from_provider_response(data_dir, &response, &input, model)
-        }
+        Err(_) => (
+            unavailable_recommendation(
+                "Evaluation acceptance is unknown. Check this sample again.",
+            ),
+            None,
+            Some(!create_sample),
+        ),
+        Ok(Err(_)) => (
+            unavailable_recommendation(
+                "Evaluation acceptance is unknown. Check this sample again.",
+            ),
+            None,
+            Some(!create_sample),
+        ),
+        Ok(Ok(response)) => (
+            recommendation_from_provider_response(data_dir, &response, &input, model),
+            response
+                .pointer("/data/run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            Some(!create_sample),
+        ),
     }
+}
+
+// Persist the first-dispatch claim before sending. Later checks only read the
+// exact run, even after reload, a lost create reply or journal expiry.
+fn claim_sample(data_dir: &Path, run_id: &str) -> anyhow::Result<bool> {
+    let root = data_dir.join("providers/model-provider/approval-samples");
+    let path = root.join(format!(
+        "{}.json",
+        run_id
+            .strip_prefix("run:sha256:")
+            .context("invalid sample run")?
+    ));
+    crate::auth::ensure_protected_principal_root_object_parent(data_dir, &path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(
+                serde_json::to_string(&serde_json::json!({ "run_id": run_id }))?.as_bytes(),
+            )?;
+            file.sync_all()?;
+            fs::File::open(&root)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A fixed fictional scenario uses Decisions only. It creates no approval record,
+/// Inbox action, grant or downstream text request. Rechecking reuses the run identity.
+pub async fn evaluate_sample(
+    data_dir: &Path,
+    registry: &ProviderRegistry,
+    jev_offer_id: &str,
+    model: &str,
+    context: &AssistantHostedHttpContext<'_>,
+) -> (JevRecommendation, Option<String>, Option<bool>) {
+    evaluate_advice(
+        data_dir,
+        registry,
+        jev_offer_id,
+        model,
+        context,
+        context.request_id,
+    )
+    .await
 }
 
 fn jev_output_ready(response: &serde_json::Value) -> bool {
@@ -387,7 +546,7 @@ async fn wait_for_jev_output(
             schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
             principal_id: context.principal_id.to_string(),
             session_id: context.session_id.to_string(),
-            capsule_id: EVALUATOR_CAPSULE_ID.to_string(),
+            capsule_id: context.capsule_id.to_string(),
             grant_id: context.grant_id.to_string(),
             request_id: format!("jev-eval-get-{poll}"),
             run_id: run_id.clone(),
@@ -704,6 +863,16 @@ fn write_record(data_dir: &Path, record: &JevShadowRecord) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn sample_claim_rejects_symlink_parent_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("providers")).unwrap();
+        assert!(claim_sample(dir.path(), &format!("run:sha256:{}", "a".repeat(64))).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
 
     fn hint() -> HostedModelOfferHint {
         HostedModelOfferHint {

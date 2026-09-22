@@ -67,7 +67,7 @@ credentials, process details, and topology stay inside the model provider. A
 model artifact is separate immutable content. Its canonical package identity
 is the CID of the complete manifest-and-payload closure. Engine, component, and
 payload hashes are verification facts rather than package identities. Runtime
-prepares and admits the package through the planned content provider path in
+prepares and admits the package through the Content provider path in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
 A hosted web API is a provider-internal HTTPS interoperability edge on the
@@ -203,6 +203,16 @@ Errors identify the failed request and whether any output was emitted. They do
 not expose API keys, authorization headers, private URLs, or raw backend logs to
 ordinary capsules.
 
+For a remote create, Runtime can return a request-bound
+`elastos.model.invocation-refusal/v1` assertion. It states that this invocation
+stopped before provider dispatch. The destination emits it, the consumer checks
+the exact request, offer, input hash and remote binding, and the gateway returns
+HTTP 409. Assistant accepts it only for a fresh remote submission. A retained or
+pending request, provider error, malformed assertion or lost reply keeps its
+recovery or unknown status. Carrier tries another address after connection
+failure, but stops after a model create invocation error. This assertion settles
+the current invocation only; it does not settle earlier uncertain attempts.
+
 ## Configuration examples
 
 Hosted gateways such as OpenRouter and local engines such as llama.cpp or
@@ -257,6 +267,10 @@ Model, Test, and Save, then Use in Assistant, Share as service, Edit, and
 Disconnect. An authenticated edit with a blank key retains the stored key of
 that same provider instance. A new instance requires a key. Save retries keep
 one instance identity, including while activation is pending.
+An exact key-only update takes effect for the next request. A running request
+retains its original credential and journal binding. A failed provider refresh
+returns a pending state after saving configuration; the Home must retry activation
+or restart before claiming that configuration is active.
 
 For Decisions, Save binds the exact validated catalog entry's canonical model
 ID to the offer revision. This binding is part of the execution hash. The
@@ -274,35 +288,56 @@ selector, resolved model when the backend reports it, and explicit fallback
 policy. The secret stays in Runtime-owned storage on the provider Home. It
 does not enter catalogues, offers, logs, or a consumer Home.
 
+System Models owns the Approval Lens evaluator selection by saved instance ID.
+Renaming an instance preserves the selection. If that instance becomes
+unavailable, Runtime keeps human review required and Inbox remains the decision
+surface. Another configured evaluator becomes active only through an explicit
+selection.
+
+The labelled sample evaluates a fixed fictional weather request through the
+same Decisions contract and provider journal. The selected processor receives
+the sample and the Home pays for the evaluation. Advice changes no permission
+and dispatches no downstream weather request. A durable receipt binds the
+sample to its principal and evaluator; later checks read that same run. Lost
+responses or missing journal state retain unknown acceptance instead of
+dispatching another paid evaluation.
+
 ## Local content selection and retention
 
-The current closeout includes the complete path from trusted model discovery
-to a real local reply for one verified Qwen package. Runtime source now verifies
-the bounded signed catalog metadata described in
-[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md#implemented-catalog-metadata-profile).
-Source includes bounded local Content preparation, verified package admission,
-admitted-artifact offer binding and native Qwen reply/reuse fixture proof.
-System and Marketplace project model preparation; installed Use has failed
-before admission, with its exact cause still unknown. These facts do not prove
-cold peer delivery or the complete installed journey.
+Runtime verifies bounded signed catalogue metadata, prepares content, checks the
+complete package closure and binds an admitted artifact to a compatible model
+offer. Marketplace owns discovery and details; System owns model configuration
+and storage controls. Assistant selects an exact admitted or granted offer and
+keeps its typed run lifecycle. These surfaces share Runtime state.
 
-The intended flow uses Marketplace for model discovery/details and Open into
-Home Agent, with exact CID selection through the existing Home handoff. System
-manages the same model records and local storage. Assistant and Home Agent
-keep their existing pickers and typed run lifecycle. These are projections of
-one Runtime catalog, admission inventory and offer binding, not separate model
-stores. A model remains identifiable by complete-closure CID even when its
-bytes are not local.
+Marketplace separates verified local content, exact granted shared models, and
+contact access opportunities. The last group opens the existing Services card;
+the person requests access there and the provider Home decides in Inbox. After
+approval, Marketplace reads grant-scoped model offers and hands the selected
+offer to Assistant. Provider Home, processor, prompt destination, payer and
+reported limits use the same facts as Assistant. Discovery gives Marketplace
+read authority; Services and Runtime retain grant and inference authority.
+
+The installed small-model journey and its exact evidence scope are recorded in
+[state.md](../state.md). Acquisition, readiness, inference and warm reuse are
+separate checks. A local pin establishes a retained local copy; it does not
+establish global availability or exclusive custody.
 
 Selecting a model may ask Runtime to prepare it under current authority. The
 person sees availability, Preparing/progress, Ready or actionable failure,
 offline and incompatibility states. Preparation can be cancelled or retried.
-The accepted behavior is that Use retains the selected local model for reliable
-repeated use. System owns explicit storage removal, with active-run protection,
-recoverability evidence, and warning/consent for possible loss of the sole copy.
-Current Keep/release fixtures describe the older implementation; this adaptation
-and its installed proof remain open. Remote inference is a separately selected
-service. The same inventory distinguishes retention, admission and readiness,
+Use records the caller's Keep claim with the new preparation reservation.
+Opening an admitted model or selecting it explicitly in Assistant waits for a
+matching Keep acknowledgement; restoring a workspace reads existing state.
+Assistant requires a verified catalog mapping for admitted local model selection.
+System owns explicit removal. It checks other people's claims before withdrawing
+the offer, preserves the caller's Keep on failure, and releases that claim only
+after successful removal. Recovery uses the recorded Remove caller. Active-run
+protection, recoverability evidence and warning/consent for possible sole-copy
+loss remain part of the removal contract. Installed proof covers a new pending
+Use claim and idempotent Open/selection of an already-kept SmolLM2 model, including
+reload and preserved model files. Removal failure and recovery cases use bounded
+source fixtures. Remote inference is a separately selected service. The same inventory distinguishes retention, admission and readiness,
 while catalog identity stays visible. A local pin alone
 proves neither trust nor engine readiness. There is no user GGUF download,
 file-picker or private

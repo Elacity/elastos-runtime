@@ -36,10 +36,7 @@
     ...PHASE_TEXT, absent: "Not on this device yet", preparing: "Getting the model…",
     reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time",
   });
-  const RECLAIM_CONFIRM_TEXT = Object.freeze({
-    compact: "This removes prepared model files from this device. Conversations stay.",
-    full: "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.",
-  });
+  const RECLAIM_CONFIRM_TEXT = "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.";
   const RECLAIM_BUSY_TEXT = "Stop the current reply in Assistant, then try Remove again.";
   const text = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f]/.test(v);
   function check(ok) { if (!ok) throw new Error("Invalid model response"); }
@@ -212,18 +209,24 @@
         busy = true; message = ""; render();
         const io = controller();
         try {
-          const input = operation === "retention" ? { cid, keep } : operation === "cancel" ? { operation_id: id } : { cid };
+          const opening = operation === "open";
+          const input = opening ? { cid, keep: true } : operation === "retention" ? { cid, keep } : operation === "cancel" ? { operation_id: id } : { cid };
           if (operation === "use" && !unresolvedUse) unresolvedUse = { cid, id: `model-${crypto.randomUUID()}` };
-          const result = await invoke(operation, input, io.signal, operation === "use" ? unresolvedUse.id : undefined);
+          const result = await invoke(opening ? "retention" : operation, input, io.signal, operation === "use" ? unresolvedUse.id : undefined);
           if (epoch !== generation || !show() || model?.cid !== cid) return;
           check(result.cid === cid);
-          if (operation === "retention") {
-            check(result.kept === keep && typeof result.admitted === "boolean");
+          if (operation === "retention" || opening) {
+            check(result.kept === (opening ? true : keep) && typeof result.admitted === "boolean");
+            if (opening) check(result.admitted);
             const catalog = await request("/api/capsules/catalog", null, io.signal);
             if (epoch !== generation || !show() || model?.cid !== cid) return;
             const candidate = parseCatalog(catalog);
             check(candidate?.cid === cid);
             model = candidate;
+            if (opening) {
+              check(model.model_runtime.kept && model.model_runtime.dispatch_ready);
+              onReadyOpen({ cid, offer_id: model.model_runtime.offer_id });
+            }
           } else if (operation === "reclaim") {
             check(typeof result.admitted === "boolean");
             const catalog = await request("/api/capsules/catalog", null, io.signal);
@@ -253,7 +256,9 @@
               } catch {}
             }
             reconcileRequired = true;
-            message = "Model action could not be confirmed. Refresh to check its status.";
+            message = operation === "open"
+              ? "Could not confirm that this model is kept. Refresh, then open it again."
+              : "Model action could not be confirmed. Refresh to check its status.";
           }
         } finally {
           io.done(); busy = false;
@@ -322,27 +327,27 @@
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
-          const open = button("Open in Assistant", () => onReadyOpen({ cid: model.cid, offer_id: r.offer_id }));
+          const open = button("Open in Assistant", () => void act("open"), reconcileRequired);
           open.dataset.modelControl = "open-assistant";
           controls.append(open);
         }
         if (r.admitted && !active(p) && reclaimStep === "busy") {
           row.append(element("p", RECLAIM_BUSY_TEXT, "model-reclaim-busy"));
         }
-        if (r.admitted && !active(p) && reclaimStep === "confirm") {
-          row.append(element("p", compact ? RECLAIM_CONFIRM_TEXT.compact : RECLAIM_CONFIRM_TEXT.full, "model-reclaim-confirm"));
+        if (!compact && r.admitted && !active(p) && reclaimStep === "confirm") {
+          row.append(element("p", RECLAIM_CONFIRM_TEXT, "model-reclaim-confirm"));
           const decline = button("Keep this model", () => { reclaimStep = "idle"; render(); }, reconcileRequired);
           decline.dataset.modelControl = "reclaim-decline";
           const confirm = button("Remove now", () => { reclaimStep = "idle"; void act("reclaim"); }, reconcileRequired);
           confirm.dataset.modelControl = "reclaim-confirm";
           controls.append(decline, confirm);
-        } else if (r.admitted && !active(p)) {
+        } else if (!compact && r.admitted && !active(p)) {
           const reclaim = button("Remove from this device", () => { reclaimStep = "confirm"; render(); }, reconcileRequired);
           reclaim.dataset.modelControl = "reclaim";
           controls.append(reclaim);
         }
         if (active(p)) { const cancel = button("Cancel preparation", () => void act("cancel"), p.cancel_requested || reconcileRequired); cancel.dataset.modelControl = "cancel"; controls.append(cancel); }
-        if (reclaimStep !== "confirm") {
+        if (!compact && reclaimStep !== "confirm") {
           const labelNode = element("label", "", "model-keep"), toggle = element("input");
           toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
           toggle.addEventListener("change", () => void act("retention", toggle.checked));

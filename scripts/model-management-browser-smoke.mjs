@@ -80,11 +80,11 @@ const server = createServer(async (req, res) => {
       assert.ok(["use", "status", "cancel", "retention", "reclaim"].includes(method.operation));
       assert.equal(method.risk, method.operation === "status" ? "read" : "write");
       if (failure) { json({ error: "private runtime provider path /secret" }, 503); return; }
-      if (method.operation === "use") { assert.deepEqual(input.input, { cid }); phase = "preparing"; }
+      if (method.operation === "use") { assert.deepEqual(input.input, { cid }); phase = "preparing"; kept = true; }
       if (method.operation === "use" && loseUseResponse) { req.socket.destroy(); return; }
       if (["status", "cancel"].includes(method.operation)) assert.deepEqual(input.input, { operation_id: operation });
       if (method.operation === "cancel") { phase = "cancelled"; kept = false; }
-      if (method.operation === "retention") { assert.deepEqual(input.input, { cid, keep: !kept }); kept = input.input.keep; }
+      if (method.operation === "retention") { assert.equal(input.input.cid, cid); assert.equal(typeof input.input.keep, "boolean"); kept = input.input.keep; }
       if (method.operation === "reclaim") {
         assert.deepEqual(input.input, { cid });
         if (protectReclaim) {
@@ -157,7 +157,7 @@ try {
     if (app === "marketplace") {
       await frame.getByRole("button", { name: "Details", exact: true }).waitFor();
       assert.equal(await frame.getByRole("heading", { name: "Models", exact: true }).count(), 1, "Models has one page title");
-      assert.equal(await frame.locator("#store-sections .store-section-head").count(), 0, "Models omits the repeated section heading");
+      await frame.getByRole("heading", { name: "On this Home", exact: true }).waitFor();
       await frame.getByRole("button", { name: "Details", exact: true }).click();
     }
     await (app === "marketplace" ? frame.locator(".modal-title") : frame.getByRole("heading", { name: "Fixture model", exact: true })).waitFor();
@@ -184,7 +184,8 @@ try {
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isEnabled(), true);
-    assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isEnabled(), false);
+    if (app === "system") assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isEnabled(), false);
+    else assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).count(), 0);
     phase = "unprepared";
     await frame.getByRole("button", { name: "Refresh models" }).click();
     await frame.getByText(copy.absent, { exact: true }).waitFor();
@@ -196,15 +197,17 @@ try {
     delayUse = null; releaseUse();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, 1);
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
-    if (app === "marketplace") await frame.locator('[data-model-control="keep"]:enabled:checked').waitFor();
-    else await frame.getByText("Keep choice saved for this preparation.", { exact: true }).waitFor();
-    await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.locator('[data-model-management] input:enabled:checked').waitFor();
-    assert.equal(calls.filter(c => c.method === "content.use").length, 1, "retention never starts another preparation");
+    assert.equal(kept, true, "Use saves Keep intent before preparation settles");
+    if (app === "system") {
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
+      await frame.getByText("Keep choice saved for this preparation.", { exact: true }).waitFor();
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+      assert.equal(calls.filter(c => c.method === "content.use").length, 1, "retention never starts another preparation");
+    }
     await frame.getByRole("button", { name: "Cancel preparation" }).click();
     await frame.getByRole("button", { name: "Retry", exact: true }).waitFor();
-    assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), false, "cancelled attempt releases pending choice");
+    if (app === "system") assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), false, "cancelled attempt releases pending choice");
     await frame.getByRole("button", { name: "Retry", exact: true }).click();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     phase = "admitted"; activationPending = app === "marketplace"; dispatchPending = true;
@@ -218,7 +221,24 @@ try {
       // The ready detail hands exactly this model and its live offer to Assistant through Home.
       await page.evaluate(() => { window.homeMessages = []; window.addEventListener("message", event => window.homeMessages.push(event.data)); });
       assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).count(), 0, "a ready model offers no second acquisition");
+      mismatchRetention = true;
       await frame.getByRole("button", { name: "Open in Assistant", exact: true }).click();
+      await frame.getByText("Could not confirm that this model is kept. Refresh, then open it again.", { exact: true }).waitFor();
+      assert.equal((await page.evaluate(() => window.homeMessages)).filter(message => message?.type === "home:open-target").length, 0,
+        "invalid Keep acknowledgement preserves the current surface");
+      mismatchRetention = false;
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+      let releaseOpen;
+      const openRetention = new Promise(resolveRetention => {
+        delayRetention = reply => { releaseOpen = reply; resolveRetention(); };
+      });
+      await frame.getByRole("button", { name: "Open in Assistant", exact: true }).click();
+      await openRetention;
+      assert.equal((await page.evaluate(() => window.homeMessages)).filter(message => message?.type === "home:open-target").length, 0,
+        "Open waits for Keep acknowledgement");
+      assert.deepEqual(calls.at(-1).input, { cid, keep: true });
+      delayRetention = null; releaseOpen();
       await page.waitForFunction(() => window.homeMessages.some(message => message?.type === "home:open-target"));
       const handoff = (await page.evaluate(() => window.homeMessages)).filter(message => message?.type === "home:open-target");
       assert.deepEqual(handoff, [{ type: "home:open-target", target: "assistant", homeToken: "fixture-token",
@@ -227,76 +247,80 @@ try {
     const readyStatuses = calls.filter(c => c.method === "content.status").length;
     await page.waitForTimeout(1750);
     assert.equal(calls.filter(c => c.method === "content.status").length, readyStatuses, "ready state stops polling");
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
-    await frame.locator('[data-model-management] input:enabled:checked').waitFor();
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
-    await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
-    const reclaimCopy = app === "marketplace"
-      ? "This removes prepared model files from this device. Conversations stay."
-      : "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.";
-    const reclaimBeforeDecline = calls.filter(c => c.method === "content.reclaim").length;
-    await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
-    await frame.getByText(reclaimCopy, { exact: true }).waitFor();
-    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline, "first Remove asks before reclaim");
-    assert.doesNotMatch(reclaimCopy, /only copy|will stop/i);
-    await frame.locator('[data-model-control="reclaim-decline"]').click();
-    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
-    assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 1);
-    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline, "decline leaves the admission");
-    protectReclaim = true;
-    await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
-    await frame.getByRole("button", { name: "Remove now", exact: true }).click();
-    await frame.getByText("Stop the current reply in Assistant, then try Remove again.", { exact: true }).waitFor();
-    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
-    assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 1, "busy reclaim keeps Remove");
-    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 1, "busy Remove now still invokes reclaim");
-    protectReclaim = false;
-    await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
-    await frame.getByRole("button", { name: "Remove now", exact: true }).click();
-    await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
-    assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 2, "Remove now dispatches reclaim once after the busy reject");
-    phase = "admitted";
-    await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
-    phase = "preparing";
-    await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
-    const usesBeforeRetentionRace = calls.filter(c => c.method === "content.use").length;
-    const statusesBeforeRetentionRace = calls.filter(c => c.method === "content.status").length;
-    let releaseRetention;
-    const retentionReceived = new Promise(resolveRetention => {
-      delayRetention = (reply, output) => { releaseRetention = reply; resolveRetention(output); };
-    });
-    // Click does not wait for the checked state while the test holds the ack.
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
-    const pendingRetentionAck = await retentionReceived;
-    assert.equal(pendingRetentionAck.admitted, false, "retention acknowledgement captures the pending preparation");
-    assert.equal(pendingRetentionAck.kept, true);
-    phase = "admitted";
-    delayRetention = null; releaseRetention();
-    await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
-    await frame.locator('[data-model-management] input:enabled:checked').waitFor();
-    assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "fresh admission replaces the pending preparation after retention settles");
-    assert.equal(calls.filter(c => c.method === "content.use").length, usesBeforeRetentionRace, "admission during retention does not dispatch another Use");
-    assert.equal(calls.filter(c => c.method === "content.status").length, statusesBeforeRetentionRace, "retention reads fresh admission before another status poll can hide stale state");
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
-    await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
-    failure = true;
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
-    await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
-    assert.doesNotMatch(await frame.locator("body").innerText(), /\/secret|private runtime provider/);
-    failure = false;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.locator('[data-model-management] input:enabled').waitFor();
-    mismatchRetention = true;
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
-    await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
-    assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), false, "invalid retention reply leaves prior state intact");
-    assert.equal(await frame.getByText("Current status unavailable", { exact: true }).count(), 1);
-    mismatchRetention = false;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.locator('[data-model-management] input:enabled:checked').waitFor();
-    assert.equal(await frame.getByRole("button", { name: "Refresh models" }).evaluate(n => n === document.activeElement), true, "refresh retains keyboard focus");
+    if (app === "system") {
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
+      await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
+      await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
+      const reclaimCopy = "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.";
+      const reclaimBeforeDecline = calls.filter(c => c.method === "content.reclaim").length;
+      await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
+      await frame.getByText(reclaimCopy, { exact: true }).waitFor();
+      assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline, "first Remove asks before reclaim");
+      assert.doesNotMatch(reclaimCopy, /only copy|will stop/i);
+      await frame.locator('[data-model-control="reclaim-decline"]').click();
+      await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 1);
+      assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline, "decline leaves the admission");
+      protectReclaim = true;
+      await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
+      await frame.getByRole("button", { name: "Remove now", exact: true }).click();
+      await frame.getByText("Stop the current reply in Assistant, then try Remove again.", { exact: true }).waitFor();
+      await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 1, "busy reclaim keeps Remove");
+      assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 1, "busy Remove now still invokes reclaim");
+      protectReclaim = false;
+      await frame.getByRole("button", { name: "Remove from this device", exact: true }).click();
+      await frame.getByRole("button", { name: "Remove now", exact: true }).click();
+      await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
+      assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 2, "Remove now dispatches reclaim once after the busy reject");
+      phase = "admitted";
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+      phase = "preparing";
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
+      const usesBeforeRetentionRace = calls.filter(c => c.method === "content.use").length;
+      const statusesBeforeRetentionRace = calls.filter(c => c.method === "content.status").length;
+      let releaseRetention;
+      const retentionReceived = new Promise(resolveRetention => {
+        delayRetention = (reply, output) => { releaseRetention = reply; resolveRetention(output); };
+      });
+      // Click does not wait for the checked state while the test holds the ack.
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
+      const pendingRetentionAck = await retentionReceived;
+      assert.equal(pendingRetentionAck.admitted, false, "retention acknowledgement captures the pending preparation");
+      assert.equal(pendingRetentionAck.kept, true);
+      phase = "admitted";
+      delayRetention = null; releaseRetention();
+      await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
+      await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "fresh admission replaces the pending preparation after retention settles");
+      assert.equal(calls.filter(c => c.method === "content.use").length, usesBeforeRetentionRace, "admission during retention does not dispatch another Use");
+      assert.equal(calls.filter(c => c.method === "content.status").length, statusesBeforeRetentionRace, "retention reads fresh admission before another status poll can hide stale state");
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).uncheck();
+      await frame.locator('[data-model-management] input:enabled:not(:checked)').waitFor();
+      failure = true;
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
+      await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
+      assert.doesNotMatch(await frame.locator("body").innerText(), /\/secret|private runtime provider/);
+      failure = false;
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.locator('[data-model-management] input:enabled').waitFor();
+      mismatchRetention = true;
+      await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
+      await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
+      assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), false, "invalid retention reply leaves prior state intact");
+      assert.equal(await frame.getByText("Current status unavailable", { exact: true }).count(), 1);
+      mismatchRetention = false;
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.locator('[data-model-management] input:enabled:checked').waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Refresh models" }).evaluate(n => n === document.activeElement), true, "refresh retains keyboard focus");
+    } else {
+      assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).count(), 0);
+      assert.equal(await frame.getByRole("button", { name: "Remove from this device", exact: true }).count(), 0);
+      assert.equal(await frame.getByRole("button", { name: "Manage storage in System", exact: true }).count(), 1);
+    }
     const bounds = async () => {
       assert.equal(await frame.locator("html").evaluate(n => n.scrollWidth <= n.clientWidth + 1), true, `${app} page clips`);
       assert.equal(await frame.locator("[data-model-management]").evaluate(n => n.scrollWidth <= n.clientWidth + 1), true, `${app} model view clips`);
@@ -305,7 +329,7 @@ try {
     if (process.env.MODEL_UI_SCREENSHOTS) await page.screenshot({ path: `${process.env.MODEL_UI_SCREENSHOTS}/${app}-models-desktop.png` });
     await page.setViewportSize({ width: 390, height: 740 });
     await bounds();
-    await frame.getByRole("checkbox", { name: "Keep on this device" }).scrollIntoViewIfNeeded();
+    if (app === "system") await frame.getByRole("checkbox", { name: "Keep on this device" }).scrollIntoViewIfNeeded();
     if (process.env.MODEL_UI_SCREENSHOTS) await page.screenshot({ path: `${process.env.MODEL_UI_SCREENSHOTS}/${app}-models-narrow.png` });
 
     await frame.locator("html").evaluate(node => node.dataset.elTheme = "light");

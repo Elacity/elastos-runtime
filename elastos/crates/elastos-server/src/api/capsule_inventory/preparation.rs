@@ -148,6 +148,8 @@ struct ModelRetirement {
     operation_id: String,
     admission_id: String,
     phase: RetirementPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reclaim_principal: Option<String>,
 }
 
 impl Default for PreparationInventory {
@@ -406,6 +408,13 @@ impl PreparationInventory {
                 owner && (owner_reclaim || capacity),
                 "invalid model retirement ownership"
             );
+            ensure!(
+                retirement
+                    .reclaim_principal
+                    .as_deref()
+                    .is_none_or(|principal| { owner_reclaim && bounded_id(principal, 160) }),
+                "invalid model reclaim principal"
+            );
         }
         let mut claims = BTreeSet::new();
         for claim in &self.retention_claims {
@@ -598,6 +607,14 @@ fn reserve_at(
         return Ok(existing.clone());
     }
     ensure!(
+        !state.retirement.as_ref().is_some_and(|retirement| {
+            state.records.iter().any(|record| {
+                record.operation_id == retirement.admission_id && record.package_cid == cid
+            })
+        }),
+        "model retirement pending"
+    );
+    ensure!(
         state.records.len() < MAX_RECORDS,
         "preparation inventory is full"
     );
@@ -658,6 +675,15 @@ fn reserve_at(
     record.operation_id = operation_id(&record)?;
     record.admission_id = reuse.unwrap_or_else(|| record.operation_id.clone());
     state.records.push(record.clone());
+    // Explicit Use owns both preparation and desired retention. Save them in
+    // one inventory write before a worker can start. Request replay above keeps
+    // its original result, including a later explicit release or terminal state.
+    if !state.kept(&caller.context.principal_id, cid) {
+        state.retention_claims.push(RetentionClaim {
+            principal: caller.context.principal_id.clone(),
+            cid: cid.into(),
+        });
+    }
     inventory.save(&state)?;
     Ok(record)
 }
@@ -1242,17 +1268,15 @@ fn retirement_protected(
     data_dir: &Path,
     state: &PreparationInventory,
     owner: &PreparationRecord,
+    reclaim_principal: Option<&str>,
 ) -> anyhow::Result<bool> {
-    if state
-        .retention_claims
-        .iter()
-        .any(|claim| claim.cid == owner.package_cid)
-        || state.records.iter().any(|record| {
-            record.admission_id == owner.operation_id
-                && record.operation_id != owner.operation_id
-                && (record.pre_dispatch() || record.active())
-        })
-    {
+    if state.retention_claims.iter().any(|claim| {
+        claim.cid == owner.package_cid && Some(claim.principal.as_str()) != reclaim_principal
+    }) || state.records.iter().any(|record| {
+        record.admission_id == owner.operation_id
+            && record.operation_id != owner.operation_id
+            && (record.pre_dispatch() || record.active())
+    }) {
         return Ok(true);
     }
     let directory = data_dir
@@ -1303,7 +1327,7 @@ fn retirement_candidate(
         .collect();
     owners.sort_by_key(|record| (record.created_at, &record.operation_id));
     for owner in owners {
-        if !retirement_protected(data_dir, state, owner)? {
+        if !retirement_protected(data_dir, state, owner, None)? {
             return Ok(Some(owner.operation_id.clone()));
         }
     }
@@ -1368,7 +1392,12 @@ fn finish_model_retirement(data_dir: &Path) -> anyhow::Result<()> {
         .find(|r| r.operation_id == retirement.admission_id)
         .context("retirement owner unavailable")?;
     ensure!(
-        !retirement_protected(data_dir, &state, owner)?,
+        !retirement_protected(
+            data_dir,
+            &state,
+            owner,
+            retirement.reclaim_principal.as_deref()
+        )?,
         "retirement owner is protected"
     );
     owner
@@ -1376,7 +1405,15 @@ fn finish_model_retirement(data_dir: &Path) -> anyhow::Result<()> {
         .as_ref()
         .context("activation unavailable")?
         .check_root(data_dir, owner)?;
+    let cid = owner.package_cid.clone();
     inventory.remove_admitted(&retirement.admission_id)?;
+    // Keep survives pending withdrawal and failed removal. Consume only the
+    // originating caller's exact claim after confirmed withdrawal and removal.
+    if let Some(principal) = &retirement.reclaim_principal {
+        state
+            .retention_claims
+            .retain(|claim| claim.principal != *principal || claim.cid != cid);
+    }
     for record in &mut state.records {
         if record.admission_id == retirement.admission_id
             && record.state == PreparationState::Admitted
@@ -1472,14 +1509,25 @@ async fn start_owner_reclaim(
             "another retirement owns worker"
         );
         ensure!(
-            existing.phase == RetirementPhase::WithdrawalPending,
-            "invalid retirement phase"
+            existing.reclaim_principal.as_deref() == Some(caller.context.principal_id.as_str()),
+            "model reclaim principal changed"
         );
-    } else {
+        if existing.phase == RetirementPhase::Withdrawn {
+            drop(inventory);
+            finish_model_retirement(data_dir)?;
+            return Ok(load_operation(data_dir, &owner.operation_id)?.projection());
+        }
+    }
+    ensure!(
+        !retirement_protected(data_dir, &state, &owner, Some(&caller.context.principal_id))?,
+        "retirement owner is protected"
+    );
+    if state.retirement.is_none() {
         state.retirement = Some(ModelRetirement {
             operation_id: owner.operation_id.clone(),
             admission_id: owner.operation_id.clone(),
             phase: RetirementPhase::WithdrawalPending,
+            reclaim_principal: Some(caller.context.principal_id.clone()),
         });
         inventory.save(&state)?;
     }
@@ -1499,6 +1547,15 @@ async fn start_owner_reclaim(
         ensure!(
             state.retirement.as_ref() == Some(&retirement),
             "retirement changed"
+        );
+        ensure!(
+            !retirement_protected(
+                data_dir,
+                &state,
+                &owner,
+                retirement.reclaim_principal.as_deref()
+            )?,
+            "retirement owner is protected"
         );
         withdrawal_config(data_dir, &state, &retirement, &live)?
     };
@@ -1606,6 +1663,7 @@ async fn prepare_capacity(
                     operation_id: operation.into(),
                     admission_id,
                     phase: RetirementPhase::WithdrawalPending,
+                    reclaim_principal: None,
                 };
                 state.retirement = Some(retirement.clone());
                 inventory.save(&state)?;
@@ -1626,7 +1684,7 @@ async fn prepare_capacity(
                     .find(|r| r.operation_id == retirement.admission_id)
                     .unwrap();
                 ensure!(
-                    !retirement_protected(data_dir, &state, owner)?,
+                    !retirement_protected(data_dir, &state, owner, None)?,
                     "retirement owner is protected"
                 );
                 withdrawal_config(data_dir, &state, &retirement, &live)?
@@ -2550,7 +2608,7 @@ pub async fn append_admitted_model_startup_offers(
             .find(|r| r.operation_id == retirement.admission_id)
             .context("startup retirement owner unavailable")?;
         ensure!(
-            !retirement_protected(data_dir, &snapshot, owner)?,
+            !retirement_protected(data_dir, &snapshot, owner, None)?,
             "retirement owner is protected"
         );
         let activation = owner
@@ -2603,7 +2661,7 @@ pub async fn settle_pending_model_startup(
         .find(|r| r.operation_id == retirement.admission_id)
         .unwrap();
     ensure!(
-        !retirement_protected(data_dir, &snapshot, owner)?,
+        !retirement_protected(data_dir, &snapshot, owner, None)?,
         "retirement owner is protected"
     );
     let activation = owner.activation.as_ref().unwrap();
@@ -3882,7 +3940,7 @@ mod tests {
             )
             .await;
             assert_eq!(value["dispatch_ready"], true);
-            assert_eq!(value["kept"], false);
+            assert_eq!(value["kept"], true);
             assert_eq!(value["preparation"]["operation_id"], alias.operation_id);
             let unavailable =
                 model_runtime_projection(root.path(), None, &other, &record.package_cid, None)
@@ -4284,6 +4342,17 @@ mod tests {
                 &cancelled.operation_id,
             )
             .unwrap();
+            // Retirement scenarios need an unkept victim. Explicit Use now
+            // retains the original and its aliases under one principal claim.
+            assert!(Inventory::open(root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap()
+                .kept(&context().principal_id, &old.package_cid));
+            let released =
+                retention_intent(root.path(), &context(), &old.package_cid, false).unwrap();
+            assert_eq!(released["kept"], false);
+            assert_eq!(released["admitted"], true);
             let (mut catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
             let cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
             catalog["entries"][0]["cid"] = serde_json::json!(cid);
@@ -4361,6 +4430,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn model_owner_reclaim_busy_live_admission_returns_busy_without_retirement() {
             let f = retirement_fixture().await;
+            retention_intent(f.root.path(), &context(), &f.old.package_cid, true).unwrap();
             f.model.busy.store(true, Ordering::Release);
             let path = admitted_weights(f.root.path(), &f.old.operation_id);
             let original = std::fs::read(&path).unwrap();
@@ -4384,6 +4454,7 @@ mod tests {
                 .load()
                 .unwrap();
             assert_eq!(state.retirement, None);
+            assert!(state.kept(&context().principal_id, &f.old.package_cid));
             assert_eq!(
                 load_operation(f.root.path(), &f.old.operation_id)
                     .unwrap()
@@ -4396,6 +4467,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn model_owner_reclaim_busy_resume_clears_stale_withdrawal_pending() {
             let f = retirement_fixture().await;
+            retention_intent(f.root.path(), &context(), &f.old.package_cid, true).unwrap();
             f.model.busy.store(true, Ordering::Release);
             let inventory = Inventory::open(f.root.path(), false).unwrap();
             let mut state = inventory.load().unwrap();
@@ -4403,6 +4475,7 @@ mod tests {
                 operation_id: f.old.operation_id.clone(),
                 admission_id: f.old.operation_id.clone(),
                 phase: RetirementPhase::WithdrawalPending,
+                reclaim_principal: Some(context().principal_id),
             });
             inventory.save(&state).unwrap();
             drop(inventory);
@@ -4428,6 +4501,7 @@ mod tests {
                 .load()
                 .unwrap();
             assert_eq!(state.retirement, None);
+            assert!(state.kept(&context().principal_id, &f.old.package_cid));
             assert_eq!(
                 load_operation(f.root.path(), &f.old.operation_id)
                     .unwrap()
@@ -4446,6 +4520,7 @@ mod tests {
                 operation_id: f.old.operation_id.clone(),
                 admission_id: f.old.operation_id.clone(),
                 phase: RetirementPhase::WithdrawalPending,
+                reclaim_principal: None,
             });
             inventory.save(&state).unwrap();
             drop(inventory);
@@ -4472,8 +4547,9 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn model_owner_reclaim_idle_admission_withdraws_and_removes_bytes() {
+        async fn model_owner_reclaim_idle_kept_admission_withdraws_and_removes_bytes() {
             let f = retirement_fixture().await;
+            retention_intent(f.root.path(), &context(), &f.old.package_cid, true).unwrap();
             let path = admitted_weights(f.root.path(), &f.old.operation_id);
             assert!(path.is_file());
             let result = PreparationOwner::default()
@@ -4492,6 +4568,8 @@ mod tests {
                 .load()
                 .unwrap();
             assert_eq!(state.retirement, None);
+            assert!(!state.kept(&context().principal_id, &f.old.package_cid));
+            assert!(state.kept(&context().principal_id, &f.pending.package_cid));
             assert_eq!(
                 load_operation(f.root.path(), &f.old.operation_id)
                     .unwrap()
@@ -4499,6 +4577,212 @@ mod tests {
                 PreparationState::Reclaimed
             );
             assert!(!path.exists());
+        }
+
+        #[tokio::test]
+        async fn model_owner_reclaim_foreign_keep_refuses_before_withdrawal() {
+            let f = retirement_fixture().await;
+            retention_intent(f.root.path(), &context(), &f.old.package_cid, true).unwrap();
+            let mut foreign = context();
+            foreign.principal_id = "person:foreign-keeper".into();
+            let inventory = Inventory::open(f.root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            let alias = state
+                .records
+                .iter_mut()
+                .find(|record| {
+                    record.admission_id == f.old.operation_id
+                        && record.operation_id != record.admission_id
+                        && record.state == PreparationState::Admitted
+                })
+                .unwrap();
+            alias.request_binding.principal = foreign.principal_id.clone();
+            alias.operation_id = operation_id(alias).unwrap();
+            inventory.save(&state).unwrap();
+            drop(inventory);
+            retention_intent(f.root.path(), &foreign, &f.old.package_cid, true).unwrap();
+            let state_path = f.root.path().join("model-preparation/state.json");
+            let before = std::fs::read(&state_path).unwrap();
+            let calls = f.model.calls.lock().unwrap().len();
+            let check: Revalidate = Arc::new(|| Ok(()));
+            let error = start_owner_reclaim(
+                f.root.path(),
+                &f.registry,
+                &caller(&context(), &method("reclaim")),
+                &f.old.package_cid,
+                &check,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("retirement owner is protected"));
+            assert_eq!(f.model.calls.lock().unwrap().len(), calls);
+            assert_eq!(std::fs::read(&state_path).unwrap(), before);
+            assert!(admitted_weights(f.root.path(), &f.old.operation_id).is_file());
+        }
+
+        #[tokio::test]
+        async fn model_owner_reclaim_lost_reply_preserves_keep_and_blocks_new_use() {
+            let f = retirement_fixture().await;
+            // Restore the old CID's catalog and clear unrelated capacity work,
+            // so a new Use would otherwise be a valid admitted-content alias.
+            cancel(
+                f.root.path(),
+                &caller(&context(), &method("cancel")),
+                &f.pending.operation_id,
+            )
+            .unwrap();
+            let (catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+            assert_eq!(catalog["entries"][0]["cid"], f.old.package_cid);
+            write_preparation_catalog(f.root.path(), &catalog);
+            retention_intent(f.root.path(), &context(), &f.old.package_cid, true).unwrap();
+            f.model.lose_reply.store(true, Ordering::Release);
+            let check: Revalidate = Arc::new(|| Ok(()));
+            assert!(start_owner_reclaim(
+                f.root.path(),
+                &f.registry,
+                &caller(&context(), &method("reclaim")),
+                &f.old.package_cid,
+                &check
+            )
+            .await
+            .is_err());
+            let inventory = Inventory::open(f.root.path(), false).unwrap();
+            let state = inventory.load().unwrap();
+            let retirement = state.retirement.as_ref().unwrap();
+            assert_eq!(retirement.phase, RetirementPhase::WithdrawalPending);
+            assert_eq!(
+                retirement.reclaim_principal.as_deref(),
+                Some(context().principal_id.as_str())
+            );
+            assert!(state.kept(&context().principal_id, &f.old.package_cid));
+            drop(inventory);
+            let path = f.root.path().join("model-preparation/state.json");
+            let before = std::fs::read(&path).unwrap();
+            let mut foreign = context();
+            foreign.principal_id = "person:new-user-during-removal".into();
+            let error = reserve(
+                f.root.path(),
+                &caller(&foreign, &method("use")),
+                "use-during-removal",
+                &f.old.package_cid,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("model retirement pending"));
+            let calls = f.model.calls.lock().unwrap().len();
+            let error = start_owner_reclaim(
+                f.root.path(),
+                &f.registry,
+                &caller(&foreign, &method("reclaim")),
+                &f.old.package_cid,
+                &check,
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("model reclaim principal changed"));
+            assert_eq!(f.model.calls.lock().unwrap().len(), calls);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(admitted_weights(f.root.path(), &f.old.operation_id).is_file());
+        }
+
+        #[tokio::test]
+        async fn model_owner_reclaim_confirmed_recovery_uses_actual_caller() {
+            for startup in [false, true] {
+                let f = retirement_fixture().await;
+                let mut requester = context();
+                requester.principal_id = "person:shared-removal-caller".into();
+                let inventory = Inventory::open(f.root.path(), false).unwrap();
+                let mut state = inventory.load().unwrap();
+                let alias = state
+                    .records
+                    .iter_mut()
+                    .find(|record| {
+                        record.admission_id == f.old.operation_id
+                            && record.operation_id != record.admission_id
+                            && record.state == PreparationState::Admitted
+                    })
+                    .unwrap();
+                alias.request_binding.principal = requester.principal_id.clone();
+                alias.operation_id = operation_id(alias).unwrap();
+                inventory.save(&state).unwrap();
+                drop(inventory);
+                retention_intent(f.root.path(), &requester, &f.old.package_cid, true).unwrap();
+                let weights = admitted_weights(f.root.path(), &f.old.operation_id);
+                std::fs::set_permissions(&weights, std::fs::Permissions::from_mode(0o644)).unwrap();
+                let check: Revalidate = Arc::new(|| Ok(()));
+                assert!(start_owner_reclaim(
+                    f.root.path(),
+                    &f.registry,
+                    &caller(&requester, &method("reclaim")),
+                    &f.old.package_cid,
+                    &check
+                )
+                .await
+                .is_err());
+                let state = Inventory::open(f.root.path(), false)
+                    .unwrap()
+                    .load()
+                    .unwrap();
+                let retirement = state.retirement.as_ref().unwrap();
+                assert_eq!(retirement.phase, RetirementPhase::Withdrawn);
+                assert_eq!(
+                    retirement.reclaim_principal.as_deref(),
+                    Some(requester.principal_id.as_str())
+                );
+                assert_ne!(requester.principal_id, f.old.request_binding.principal);
+                assert!(state.kept(&requester.principal_id, &f.old.package_cid));
+                assert!(weights.is_file());
+                std::fs::set_permissions(&weights, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let calls = f.model.calls.lock().unwrap().len();
+                let error = start_owner_reclaim(
+                    f.root.path(),
+                    &f.registry,
+                    &caller(&context(), &method("reclaim")),
+                    &f.old.package_cid,
+                    &check,
+                )
+                .await
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("model reclaim principal changed"));
+                if startup {
+                    let mut config =
+                        crate::api::model_provider_bridge_config(f.root.path()).unwrap();
+                    let _worker = append_admitted_model_startup_offers(
+                        f.root.path(),
+                        &f.registry,
+                        &mut config,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    let result = start_owner_reclaim(
+                        f.root.path(),
+                        &f.registry,
+                        &caller(&requester, &method("reclaim")),
+                        &f.old.package_cid,
+                        &check,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result["state"], "reclaimed");
+                }
+                let state = Inventory::open(f.root.path(), false)
+                    .unwrap()
+                    .load()
+                    .unwrap();
+                assert!(state.retirement.is_none());
+                assert!(!state.kept(&requester.principal_id, &f.old.package_cid));
+                assert!(state.kept(&context().principal_id, &f.pending.package_cid));
+                assert!(!weights.exists());
+                assert_eq!(
+                    f.model.calls.lock().unwrap().len(),
+                    calls,
+                    "confirmed recovery does not withdraw twice"
+                );
+            }
         }
 
         #[tokio::test]
@@ -4733,6 +5017,7 @@ mod tests {
                     operation_id: f.pending.operation_id.clone(),
                     admission_id: f.old.operation_id.clone(),
                     phase: RetirementPhase::Withdrawn,
+                    reclaim_principal: None,
                 });
                 inventory.save(&state).unwrap();
                 drop(inventory);
@@ -8537,6 +8822,11 @@ server.serve_forever()
     #[tokio::test]
     async fn model_retention_pending_replay_restart_and_admission_preserve_intent() {
         let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+        assert!(Inventory::open(root.path(), false)
+            .unwrap()
+            .load()
+            .unwrap()
+            .kept(&context().principal_id, &record.package_cid));
         let calls = backend.calls.lock().unwrap().clone();
         let path = root.path().join("model-preparation/state.json");
         let mut foreign = context();
@@ -8870,7 +9160,39 @@ server.serve_forever()
     }
 
     #[test]
-    fn model_retention_pending_cancel_expire_and_fresh_retry_clear_intent() {
+    fn model_use_atomically_retains_and_replay_preserves_explicit_release() {
+        let (root, cid) = fixture();
+        let principal = context();
+        let method = method("use");
+        let caller = caller(&principal, &method);
+        let record = reserve(root.path(), &caller, "use-and-keep", &cid).unwrap();
+        let path = root.path().join("model-preparation/state.json");
+        let saved = std::fs::read(&path).unwrap();
+        let state: PreparationInventory = serde_json::from_slice(&saved).unwrap();
+        assert!(state.kept(&principal.principal_id, &cid));
+        assert_eq!(state.retention_claims.len(), 1);
+        assert_eq!(state.records, vec![record.clone()]);
+        assert_eq!(
+            reserve(root.path(), &caller, "use-and-keep", &cid).unwrap(),
+            record
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        retention_intent(root.path(), &principal, &cid, false).unwrap();
+        let released = std::fs::read(&path).unwrap();
+        assert_eq!(
+            reserve(root.path(), &caller, "use-and-keep", &cid).unwrap(),
+            record
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), released);
+        assert!(!Inventory::open(root.path(), false)
+            .unwrap()
+            .load()
+            .unwrap()
+            .kept(&principal.principal_id, &cid));
+    }
+
+    #[test]
+    fn model_use_retention_cancel_expire_and_fresh_retry_restore_intent() {
         for terminal in ["cancel", "expire", "capacity-cancel", "capacity-expire"] {
             let root = tempfile::tempdir().unwrap();
             let (payload, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -8890,7 +9212,11 @@ server.serve_forever()
                 })
                 .unwrap();
             }
-            retention_intent(root.path(), &context(), cid, true).unwrap();
+            assert!(Inventory::open(root.path(), false)
+                .unwrap()
+                .load()
+                .unwrap()
+                .kept(&context().principal_id, cid));
             let cancelling = terminal.ends_with("cancel");
             let result = manage(
                 root.path(),
@@ -8928,7 +9254,7 @@ server.serve_forever()
             .unwrap();
             assert_ne!(next.operation_id, record.operation_id);
             let inventory = Inventory::open(root.path(), false).unwrap();
-            assert!(!inventory.load().unwrap().kept(&context().principal_id, cid));
+            assert!(inventory.load().unwrap().kept(&context().principal_id, cid));
         }
     }
 
@@ -9113,7 +9439,7 @@ server.serve_forever()
                 )
                 .unwrap();
             join_worker(&owner).await;
-            assert_eq!(reply["kept"], principal.principal_id == first.principal_id);
+            assert_eq!(reply["kept"], true);
             aliases.push(reply["operation_id"].as_str().unwrap().to_owned());
         }
         let before = Inventory::open(root.path(), false)
@@ -9657,6 +9983,9 @@ server.serve_forever()
             assert_eq!(std::fs::read(&state_path).unwrap(), corrupt);
         }
         std::fs::write(&state_path, original).unwrap();
+        // The bounded history below contains only cancelled records. Release
+        // the live reservation's Keep claim before constructing that history.
+        retention_intent(root.path(), &context, &cid, false).unwrap();
         let inventory = Inventory::open(root.path(), false).unwrap();
         let mut state = inventory.load().unwrap();
         state.records.clear();

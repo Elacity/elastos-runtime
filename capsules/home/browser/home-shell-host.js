@@ -1829,6 +1829,12 @@ window.addEventListener("message", (event) => {
   if (context.targetId === "marketplace" && target === "assistant" &&
       (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
        !marketplaceAssistantHandoffQuery(data.query))) return;
+  if (context.targetId === "marketplace" && target === "services" &&
+      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
+       || !data.query || typeof data.query !== "object" || Array.isArray(data.query)
+       || Object.keys(data.query).join(",") !== "service_offer_id"
+       || typeof data.query.service_offer_id !== "string"
+       || !/^[A-Za-z0-9_.:-]{1,256}$/.test(data.query.service_offer_id))) return;
   if (
     context.kind === "app-frame" &&
     context.targetId === "wallet" &&
@@ -1991,6 +1997,9 @@ function assistantAiProviderSettingsQuery(query) {
 }
 
 function marketplaceAssistantHandoffQuery(query) {
+  if (query && typeof query === "object" && !Array.isArray(query)
+      && Object.keys(query).length === 1 && typeof query.offer_id === "string"
+      && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(query.offer_id)) return true;
   if (!query || typeof query !== "object" || Array.isArray(query)
       || !MODEL_CONTENT_CID.test(query.model_cid || "")) {
     return false;
