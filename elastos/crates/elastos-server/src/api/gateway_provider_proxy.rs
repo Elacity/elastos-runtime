@@ -1795,6 +1795,20 @@ pub(super) async fn gateway_provider_proxy(
                     return (StatusCode::OK, Json(remote_response)).into_response();
                 }
                 Ok(None) => {}
+                Err(super::gateway_model_remote::RemoteRouteError::PreDispatchRefused {
+                    binding,
+                    reason,
+                }) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "status": "error", "code": "remote_model_invocation_refused",
+                            "message": "This invocation was refused before provider dispatch.",
+                            "reason": reason, "refusal": binding,
+                        })),
+                    )
+                        .into_response();
+                }
                 Err(super::gateway_model_remote::RemoteRouteError::Transport(message)) => {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,

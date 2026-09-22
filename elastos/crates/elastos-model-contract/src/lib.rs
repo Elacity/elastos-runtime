@@ -136,6 +136,19 @@ impl RuntimeAccessBinding {
     }
 }
 
+/// Stable run identity shared by Runtime recovery and the provider journal.
+/// Session and grant rotation preserve ownership by principal and capsule.
+pub fn model_run_id(binding: &RuntimeCreateBinding) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"elastos:model-run:v1\n");
+    hasher.update(binding.principal_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(binding.capsule_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(binding.request_id.as_bytes());
+    format!("run:sha256:{}", hex_hash(&hasher.finalize()))
+}
+
 pub fn model_input_hash(input: &Value) -> ContractResult<String> {
     let canonical = serde_json::to_vec(input)?;
     let mut hasher = Sha256::new();

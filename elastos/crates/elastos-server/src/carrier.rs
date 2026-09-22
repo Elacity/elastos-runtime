@@ -7769,7 +7769,14 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                 Ok(response) => return Ok(response),
                                 Err(err) => {
                                     self.forget_peer(peer).await;
-                                    errors.push(carrier_provider_public_invoke_error(index, &err))
+                                    errors.push(carrier_provider_public_invoke_error(index, &err));
+                                    // A lost create reply may hide accepted work. A later
+                                    // endpoint's refusal cannot settle that first attempt.
+                                    if invocation.target == "model"
+                                        && invocation.op == "runs_create"
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                         }

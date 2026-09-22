@@ -98,6 +98,7 @@ struct FakeModelProvider {
     next_create_data: std::sync::Mutex<Option<Value>>,
     /// Extra top-level `run_id` that disagrees with `data.run_id`.
     next_create_alias_run_id: std::sync::Mutex<Option<String>>,
+    next_create_status_error: std::sync::Mutex<Option<Value>>,
 }
 
 #[async_trait::async_trait]
@@ -131,6 +132,9 @@ impl Provider for FakeModelProvider {
             ] } }));
         }
         if op == "runs_create" {
+            if let Some(error) = self.next_create_status_error.lock().unwrap().take() {
+                return Ok(error);
+            }
             let binding: RuntimeCreateBinding =
                 serde_json::from_value(request["runtime_binding"].clone())
                     .map_err(provider_error)?;
@@ -654,6 +658,32 @@ async fn offers_list_over_carrier_shares_only_local_offers() {
 }
 
 #[tokio::test]
+async fn marketplace_remote_discovery_requires_grant_and_has_no_run_authority() {
+    let fx = TwoRuntimes::start().await;
+    let listed = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "marketplace")}),
+        )
+        .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["result"]["data"]["offers"][0]["id"], "qwen-local");
+    let wrong = fx.call("offers_list", json!({"op":"offers_list", "remote_model":fx.remote("unapproved-principal", "marketplace")})).await;
+    assert_eq!(wrong["ok"], false, "{wrong}");
+    for operation in ["runs_create", "runs_get", "runs_events", "runs_cancel"] {
+        let denied = fx
+            .call(
+                operation,
+                json!({"op":operation, "remote_model":fx.remote(SEED_PRINCIPAL, "marketplace")}),
+            )
+            .await;
+        assert_eq!(denied["ok"], false, "{operation}: {denied}");
+    }
+    assert_eq!(fx.provider_ops().await, vec!["offers_list"]);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
 async fn runs_create_rebinds_the_request_to_the_remote_principal() {
     let fx = TwoRuntimes::start().await;
     let created = fx.create_run("seed-req-1", "qwen-local").await;
@@ -996,6 +1026,60 @@ mod consumer_path {
         remote_offer_id, remote_run_route, route_run_operation, ConsumerModelGrant,
         RemoteRouteError, REMOTE_RUN_INDEX_MAX,
     };
+
+    #[tokio::test]
+    async fn remote_model_create_does_not_retry_ticket_entries_after_dispatch_error() {
+        let fx = TwoRuntimes::start().await;
+        let mut grant = fx.consumer_grant();
+        let bytes = serde_json::to_vec(&json!({ "topic": null,
+            "endpoints": [&fx.owner_addr, &fx.owner_addr] }))
+        .unwrap();
+        grant.connect_ticket = data_encoding::BASE32_NOPAD
+            .encode(&bytes)
+            .to_ascii_lowercase();
+        *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+            "status":"error", "code":"denied", "message":"provider failed after invocation",
+        }));
+        let offer_id = remote_offer_id(&fx.grant_id, "qwen-local");
+        let request = |id: &str| {
+            json!({ "op":"runs_create", "offer_id":offer_id,
+            "operation":"text.generate", "input":{"prompt":"tiny fixture"},
+            "runtime_binding":{"request_id":id} })
+        };
+        let error = fx
+            .route(
+                &[grant.clone()],
+                "runs_create",
+                request("ambiguous-provider"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(error, RemoteRouteError::PreDispatchRefused { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            fx.create_count().await,
+            1,
+            "a second ticket entry would create again"
+        );
+        fx.write_request_record("denied");
+        let refused = fx
+            .route(&[grant], "runs_create", request("fresh-revoked"))
+            .await
+            .unwrap_err();
+        match refused {
+            RemoteRouteError::PreDispatchRefused { binding, reason } => {
+                assert_eq!(reason, "denied");
+                assert_eq!(binding["offer_id"], offer_id);
+                assert_eq!(binding["request_id"], "fresh-revoked");
+                assert_eq!(binding["scope"], "invocation");
+            }
+            other => panic!("expected bound refusal, got {other}"),
+        }
+        assert_eq!(fx.create_count().await, 1);
+        fx.shutdown().await;
+    }
 
     fn ticket_for(endpoint: &iroh::EndpointAddr) -> String {
         let bytes = serde_json::to_vec(&json!({ "topic": null, "endpoints": [endpoint] })).unwrap();
@@ -1951,5 +2035,56 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
     assert_eq!(fx.create_count().await, baseline + 1);
     let old = fx.run_operation("runs_get", &old_run, SEED_PRINCIPAL).await;
     assert_eq!(old["ok"], true, "{old}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_model_refusal_proves_this_invocation_and_preserves_older_uncertainty() {
+    let fx = TwoRuntimes::start().await;
+    let mut remote = fx.remote(SEED_PRINCIPAL, "assistant");
+    remote["refusal_scope"] = json!("invocation");
+    let request = |id: &str| {
+        json!({
+            "op": "runs_create", "request_id": id, "offer_id": "qwen-local",
+            "operation": "text.generate", "input": {"prompt":"tiny fixture"},
+            "remote_model": remote,
+        })
+    };
+    assert_eq!(
+        fx.call("runs_create", request("old-accepted")).await["ok"],
+        true
+    );
+    let baseline = fx.create_count().await;
+    fx.write_request_record("denied");
+    let refused = fx.call("runs_create", request("new-refused")).await;
+    assert_eq!(refused["ok"], true, "{refused}");
+    assert_eq!(refused["result"]["code"], "remote_model_invocation_refused");
+    assert_eq!(
+        refused["result"]["refusal"],
+        crate::api::gateway::gateway_model_service::invocation_refusal_binding(&request(
+            "new-refused"
+        ))
+        .unwrap()
+    );
+    assert_eq!(fx.create_count().await, baseline);
+    let old = fx.call("runs_create", request("old-accepted")).await;
+    assert_eq!(
+        old["ok"], false,
+        "older accepted request cannot become fresh refusal: {old}"
+    );
+    assert!(old.get("result").is_none());
+    fx.write_request_record("approved");
+    let forged_request = request("provider-forgery");
+    *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+        "status":"error", "code":"remote_model_invocation_refused", "message":"denied",
+        "reason":"denied", "refusal": crate::api::gateway::gateway_model_service::invocation_refusal_binding(&forged_request).unwrap(),
+    }));
+    let forged = fx.call("runs_create", forged_request).await;
+    assert_eq!(
+        forged["ok"], false,
+        "provider cannot assert Runtime dispatch state: {forged}"
+    );
+    assert!(forged.get("result").is_none());
+    assert_eq!(fx.create_count().await, baseline + 1);
     fx.shutdown().await;
 }

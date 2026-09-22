@@ -1049,3 +1049,31 @@ test("actual composer preserves draft for missing runs and unknown acceptance un
     assert.deepEqual(shelf.getComposerDraft().parts.map((p) => p.name), accepted ? ["later.txt"] : ["notes.txt", "later.txt"]);
   }
 });
+
+test("only a matching fresh invocation refusal settles a failed create", async () => {
+  for (const mode of ["valid", "wrong-request", "wrong-offer", "wrong-scope", "missing", "generic-denied", "local-forgery", "wrong-status"]) {
+    const states = [], calls = [];
+    const offerId = mode === "local-forgery" ? "model:local" : "remote:g:fixture";
+    globalThis.fetch = async (url, init) => {
+      const op = new URL(url).pathname.split("/").pop();
+      if (op === "offers_list") return { ok: true, json: async () => ({ offers: [
+        { id: offerId, title: "Fixture", operation: "text.generate", input_modalities: ["text/plain"], output_modalities: ["text/plain"] },
+      ] }) };
+      if (op !== "runs_create") throw new Error(`unexpected ${op}`);
+      const body = JSON.parse(init.body); calls.push(body);
+      const refusal = { schema: "elastos.model.invocation-refusal/v1", scope: "invocation", dispatch: "not_started",
+        request_id: mode === "wrong-request" ? "old" : body.request_id, offer_id: mode === "wrong-offer" ? "other" : body.offer_id };
+      if (mode === "wrong-scope") refusal.scope = "logical-request";
+      return { ok: false, status: mode === "wrong-status" || mode === "local-forgery" ? 200 : 409, json: async () => ({ status: "error",
+        code: mode === "generic-denied" ? "denied" : "remote_model_invocation_refused",
+        ...(mode === "missing" ? {} : { refusal }) }) };
+    };
+    live.selectLiveOffer(offerId);
+    await live.probeLiveInference({ force: true });
+    await assert.rejects(live.streamChatViaContract([{ role:"user", content:"fixture" }], { onState: state => states.push(state) }),
+      error => error.code === (mode === "valid" ? "remote_model_invocation_refused" : "run_acceptance_unknown"));
+    assert.equal(calls.length, 1);
+    assert.equal(states.at(-1).state, mode === "valid" ? "failed" : "settlement_unknown");
+    assert.equal(Boolean(states.at(-1).completedAt), mode === "valid");
+  }
+});

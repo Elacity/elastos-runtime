@@ -247,6 +247,8 @@ pub(crate) fn consumer_grants(
 
 #[derive(Debug)]
 pub(crate) enum RemoteRouteError {
+    /// Authenticated destination proof for this invocation only.
+    PreDispatchRefused { binding: Value, reason: String },
     /// The granting Runtime answered with a bounded class such as `denied`.
     Rejected { code: String },
     /// Carrier could not complete the call; the run state is unknown here.
@@ -258,6 +260,9 @@ pub(crate) enum RemoteRouteError {
 impl std::fmt::Display for RemoteRouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PreDispatchRefused { .. } => {
+                write!(f, "this invocation was refused before provider dispatch")
+            }
             Self::Rejected { code } => {
                 write!(f, "remote model service rejected the operation: {code}")
             }
@@ -294,6 +299,11 @@ fn typed_request(
                 "capsule_id": capsule_id,
             }),
         );
+        if object.get("op").and_then(Value::as_str) == Some("runs_create") {
+            object
+                .get_mut("remote_model")
+                .expect("inserted remote binding")["refusal_scope"] = json!("invocation");
+        }
     }
     request
 }
@@ -304,6 +314,7 @@ async fn call_grant(
     op: &str,
     request: Value,
 ) -> Result<Value, RemoteRouteError> {
+    let expected_refusal = super::gateway_model_service::invocation_refusal_binding(&request);
     let response = registry
         .invoke_provider(ProviderInvocation {
             source: "model-consumer".to_string(),
@@ -321,6 +332,23 @@ async fn call_grant(
         })
         .await
         .map_err(|err| classify_carrier_error(&err.to_string()))?;
+    if response["code"] == "remote_model_invocation_refused" {
+        let reason = response["reason"].as_str().unwrap_or_default();
+        if response["status"] == "error"
+            && matches!(reason, "denied" | "offer_unavailable" | "rate_limited")
+            && expected_refusal
+                .as_ref()
+                .is_some_and(|binding| response["refusal"] == *binding)
+        {
+            return Err(RemoteRouteError::PreDispatchRefused {
+                binding: response["refusal"].clone(),
+                reason: reason.to_string(),
+            });
+        }
+        return Err(RemoteRouteError::Invalid(
+            "remote refusal binding is invalid".into(),
+        ));
+    }
     Ok(response)
 }
 
@@ -518,6 +546,9 @@ pub(crate) async fn append_remote_offers(
             Err(RemoteRouteError::Invalid(message)) => services.push(
                 json!({ "grant_id": grant.grant_id, "status": "invalid", "message": message }),
             ),
+            Err(RemoteRouteError::PreDispatchRefused { .. }) => {
+                services.push(json!({ "grant_id": grant.grant_id, "status": "invalid" }))
+            }
         }
     }
     if !services.is_empty() {
@@ -578,9 +609,12 @@ pub(crate) async fn route_run_operation(
             );
             let mut result = match call_grant(&registry, grant, op, request).await {
                 Ok(result) => result,
-                Err(err) => {
+                Err(mut err) => {
                     if held_slot {
                         release_route_slot(data_dir, now, &key);
+                    }
+                    if let RemoteRouteError::PreDispatchRefused { binding, .. } = &mut err {
+                        binding["offer_id"] = json!(offer_id);
                     }
                     return Err(err);
                 }

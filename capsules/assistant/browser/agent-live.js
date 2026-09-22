@@ -395,7 +395,13 @@ export async function modelRunCall(op, body = {}) {
     error.code = data?.code || "model_error";
     error.status = res.status;
     error.preDispatchRefusal =
-      data?.code === "approval_required" || data?.code === "approval_denied";
+      data?.code === "approval_required" || data?.code === "approval_denied"
+      || (op === "runs_create" && res.status === 409
+        && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(body.offer_id)
+        && data?.code === "remote_model_invocation_refused"
+        && data?.refusal?.schema === "elastos.model.invocation-refusal/v1"
+        && data.refusal.scope === "invocation" && data.refusal.dispatch === "not_started"
+        && data.refusal.request_id === body.request_id && data.refusal.offer_id === body.offer_id);
     throw error;
   }
   return data?.data ?? data;

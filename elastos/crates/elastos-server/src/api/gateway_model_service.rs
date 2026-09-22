@@ -432,6 +432,70 @@ fn denied(code: &str, message: &str) -> Value {
     json!({ "ok": false, "code": code, "error": message })
 }
 
+pub(crate) const INVOCATION_REFUSAL_SCHEMA: &str = "elastos.model.invocation-refusal/v1";
+
+/// Binds a refusal to this invocation, without settling any previous attempt.
+pub(crate) fn invocation_refusal_binding(request: &Value) -> Option<Value> {
+    if request["op"] != "runs_create" || request["remote_model"]["refusal_scope"] != "invocation" {
+        return None;
+    }
+    Some(json!({
+        "schema": INVOCATION_REFUSAL_SCHEMA,
+        "scope": "invocation", "dispatch": "not_started",
+        "request_id": request.get("request_id")?.as_str()?,
+        "offer_id": request.get("offer_id")?.as_str()?,
+        "operation": request.get("operation")?.as_str()?,
+        "input_hash": elastos_model_contract::model_input_hash(request.get("input")?).ok()?,
+        "remote_model": request.get("remote_model")?,
+    }))
+}
+
+fn refused_before_dispatch(
+    data_dir: &Path,
+    source_did: &str,
+    request: &Value,
+    code: &str,
+    message: &str,
+    owns_reservation: bool,
+) -> Value {
+    let Some(binding) = invocation_refusal_binding(request) else {
+        return denied(code, message);
+    };
+    let grant_id = request["remote_model"]["grant_id"]
+        .as_str()
+        .unwrap_or_default();
+    let principal = remote_principal_id(
+        source_did,
+        request["remote_model"]["principal_id"]
+            .as_str()
+            .unwrap_or_default(),
+    );
+    let capsule = request["remote_model"]["capsule_id"]
+        .as_str()
+        .unwrap_or_default();
+    let request_id = request["request_id"].as_str().unwrap_or_default();
+    let Ok(index) = read_run_index(data_dir) else {
+        return denied(code, message);
+    };
+    let known = index.runs.values().any(|run| {
+        run.grant_id == grant_id
+            && run.remote_principal_id == principal
+            && record_capsule_id(run) == capsule
+            && run.request_id == request_id
+    });
+    let pending = index.pending.contains_key(&run_reservation_key(
+        grant_id, &principal, capsule, request_id,
+    ));
+    if known || (pending && !owns_reservation) {
+        return denied(code, message);
+    }
+    json!({ "ok": true, "result": {
+        "status": "error", "code": "remote_model_invocation_refused",
+        "reason": code, "message": "This invocation was refused before provider dispatch.",
+        "refusal": binding,
+    } })
+}
+
 /// Bounded error classes cross Carrier; raw provider text stays on this Runtime.
 fn redact_provider_error(err: &str) -> &'static str {
     let lower = err.to_ascii_lowercase();
@@ -1073,9 +1137,10 @@ pub(crate) async fn invoke(
         remote["principal_id"]
             .as_str()
             .filter(|value| safe_id(value, 128)),
-        remote["capsule_id"]
-            .as_str()
-            .filter(|value| MODEL_CONSUMER_CAPSULES.contains(value)),
+        remote["capsule_id"].as_str().filter(|value| {
+            MODEL_CONSUMER_CAPSULES.contains(value)
+                || (operation == "offers_list" && *value == "marketplace")
+        }),
     ) else {
         return denied(
             "denied",
@@ -1111,12 +1176,26 @@ pub(crate) async fn invoke(
                     Ok(grant) => grant,
                     Err(err) => {
                         tracing::info!("remote model authority denied: {err}");
-                        return denied("denied", "model grant is not active for this requester");
+                        return refused_before_dispatch(
+                            data_dir,
+                            &source_did,
+                            request,
+                            "denied",
+                            "model grant is not active for this requester",
+                            false,
+                        );
                     }
                 };
             if let Err(err) = grant.validate(&source, requester_principal_id, now) {
                 tracing::info!("remote model grant rejected: {err}");
-                return denied("denied", "model grant is not active for this requester");
+                return refused_before_dispatch(
+                    data_dir,
+                    &source_did,
+                    request,
+                    "denied",
+                    "model grant is not active for this requester",
+                    false,
+                );
             }
             let include_local = super::gateway_home_system::local_model_offer_is_shared(
                 data_dir,
@@ -1185,9 +1264,13 @@ pub(crate) async fn invoke(
             Ok(result) => shareable_offers_for_home(&result, data_dir, include_local),
             Err(err) => {
                 tracing::warn!("remote model offers unavailable: {err}");
-                return denied(
+                return refused_before_dispatch(
+                    data_dir,
+                    &source_did,
+                    request,
                     "offer_unavailable",
                     "model offers are unavailable on this Runtime",
+                    false,
                 );
             }
         };
@@ -1196,9 +1279,13 @@ pub(crate) async fn invoke(
             .iter()
             .any(|offer| offer["id"].as_str() == Some(offer_id))
         {
-            return denied(
+            return refused_before_dispatch(
+                data_dir,
+                &source_did,
+                request,
                 "offer_unavailable",
                 "model offer is not shared through this grant",
+                false,
             );
         }
     }
@@ -1238,9 +1325,13 @@ pub(crate) async fn invoke(
             }
             Err(err) => {
                 tracing::info!("remote model run refused before dispatch: {err}");
-                return denied(
+                return refused_before_dispatch(
+                    data_dir,
+                    &source_did,
+                    request,
                     "rate_limited",
                     "model run capacity on this Runtime is exhausted",
+                    false,
                 );
             }
         }
@@ -1252,8 +1343,16 @@ pub(crate) async fn invoke(
         #[cfg(test)]
         await_create_race_barrier(data_dir, CreateRacePoint::BeforeDispatch).await;
         if !grant_is_active(data_dir, &network, source, grant_id, requester_principal_id).await {
+            let refusal = refused_before_dispatch(
+                data_dir,
+                &source_did,
+                request,
+                "denied",
+                "model grant is not active for this requester",
+                true,
+            );
             release_run_slot(data_dir, now, &reservation_key);
-            return denied("denied", "model grant is not active for this requester");
+            return refusal;
         }
     }
 
