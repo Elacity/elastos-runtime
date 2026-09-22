@@ -259,7 +259,7 @@ Consumer System shows
 Venice and Jev paused; owner Assistant completed a local SmolLM2 reply.
 Eighteen protected files kept their hashes and inodes, and disk free space
 remains 21%. Receipt: `.audit/codex-hosted-egress-containment-installed.json`.
-The native provider still lacks OS socket confinement. A new Venice text call
+The native provider in those human Homes still lacks OS socket confinement. A new Venice text call
 waits for Runtime-owned network isolation, an egress broker, an exact owner
 HTTPS grant, and fresh consent. The owner service request is a separate Inbox
 decision; its approval grants service access, not provider HTTPS. Production
@@ -271,12 +271,22 @@ Mac socket-isolation milestone: commit `364d0254` makes Runtime start the
 verified model-provider through Seatbelt. Its fixture got `EPERM` for direct
 external TCP from both the child and a descendant; local TCP succeeded. The
 installed provider binary completed a new SmolLM2 run under the same policy.
-Independent review found that the localhost exception permits a local relay
-and that forced descendant cleanup lacks proof. The new Runtime binary is
-built but has not replaced either signed-in Home installation. Keep hosted
-calls paused. Next, prove installed Runtime startup, design the Runtime broker
-with a narrow llama endpoint, obtain exact owner HTTPS consent, and prove the
-Linux boundary. Receipt: `.audit/hosted-egress-design-scratch/seatbelt-milestone.md`.
+Independent review found that the first localhost exception permits a local
+relay. The first Runtime build did not replace either signed-in Home. Receipt:
+`.audit/hosted-egress-design-scratch/seatbelt-milestone.md`.
+
+The next local commit, `8bd9f3ae`, narrows macOS egress to one selected TCP
+port per initial local offer and denies IPv6 outbound. Child and descendant
+probes refused unrelated loopback and external sockets. An installed diagnostic
+Runtime and provider passed source/built/installed hash checks and Home startup;
+the installed provider binary completed SmolLM2 under the policy and removed
+its guard and engine after a forced kill. The human Homes and protected state
+remain unchanged. Review found an unowned port interval before first inference
+and stale port permission after offer removal. An exact Unix socket rule passed
+child and descendant tests and is the next viable private transport. Keep
+hosted calls paused. Finish that transport and installed Runtime-to-Smol proof
+before Runtime HTTPS broker grants, owner consent, and Linux confinement.
+Receipt: `.audit/hosted-egress-design-scratch/narrow-seatbelt-installed.json`.
 
 Accepted regression evidence for the original five outcomes:
 

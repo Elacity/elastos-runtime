@@ -36,7 +36,8 @@ hashes and inodes. Runtime
 SHA-256 is `90edb7fa1474d23ded52abee44f87c31a4f45f24eb083a8bef658ac6ef84176c`;
 model-provider SHA-256 is `6dc1b33868761b9b3d8e92659d0f9f8911bfa4a6cd60ead700d4ced37842b11b`.
 Receipt: `.audit/codex-hosted-egress-containment-installed.json`.
-This is an application-level pause. The native provider is still unsandboxed.
+This human-Home installation has an application-level pause; its native provider
+is unsandboxed.
 The saved Venice text request waits for Runtime-owned socket isolation, an
 egress broker, and explicit owner HTTPS consent. Production replay proof for
 already-active HTTP jobs and Inbox history and revocation are separate open
@@ -50,12 +51,35 @@ worked. The already-installed model-provider binary completed a fresh SmolLM2
 run under the same policy. The new optimized Runtime binary was built with SHA-256
 `a8dc182a932a1c1f9cfd3c9f33eaf487fa6ece8906428aa7644107fe53e3c02a`.
 It has not replaced the Runtime in either signed-in Home. Those Homes keep the
-previous hosted pause. The policy permits every localhost port so llama.cpp
-can run; a local relay could still send traffic outward. Hosted HTTPS remains
-paused until Runtime brokers exact owner-approved requests and closes that
-localhost path. Installed Runtime startup, forced descendant cleanup, Linux
-confinement, and owner HTTPS consent still need proof. Local proof notes:
+previous hosted pause. This first policy permitted every localhost port so
+llama.cpp could run; a local relay remained reachable. The next checkpoint
+below narrows that rule. Hosted HTTPS remains paused. Local proof notes:
 `.audit/hosted-egress-design-scratch/seatbelt-milestone.md`.
+
+Commit `8bd9f3ae` replaces the broad localhost rule with Runtime-selected
+per-offer TCP ports and denies IPv6 outbound. A fixture child and descendant
+received `EPERM` for external TCP, an unrelated loopback listener, and IPv6
+at the selected port; the selected IPv4 port worked. The installed diagnostic
+Consumer Home restarted on Runtime SHA-256
+`9a4e324a1340c7918cfb15696fb86a70970de66f5898a41b10f85e9372cd6569`
+and model-provider SHA-256
+`26032f273ad2ba13c62c58bd1952db108debff8822dc19f16feb4d5488cbb19e`.
+Its Home returned 200 and its provider child started. That installed provider
+binary completed a separate fresh SmolLM2 run under the narrow policy; after
+a forced provider kill, its guard and llama engine exited. The diagnostic
+Consumer has no admitted SmolLM2 offer, so its Runtime-to-Smol path remains
+untested. The two signed-in human Homes still run the earlier paused binaries,
+and all 18 recorded protected files kept their hashes and inodes.
+
+Independent review found that a selected TCP port becomes unowned before the
+first local run and remains allowed after its offer is removed until Runtime
+restarts. A second small Seatbelt test allowed one named Unix socket while
+refusing an unrelated socket and external TCP for a child and descendant.
+The installed llama-server accepts a `.sock` host and pinned reqwest supports
+Unix sockets. This is the next private transport to implement and test; full
+provider egress authority, owner HTTPS consent, Linux confinement, and active
+HTTP-job replay remain open. Receipt:
+`.audit/hosted-egress-design-scratch/narrow-seatbelt-installed.json`.
 
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each
