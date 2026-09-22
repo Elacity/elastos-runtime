@@ -85,8 +85,8 @@ test("Cancel after a failed Add restores provider choice and gives the next form
 
 test("Edit uses the existing identity with a blank key and explains server-side key retention", async () => {
   const id = `model:hosted-${"a".repeat(32)}`;
-  const f = fixture([{ id, name: "Jev", provider: "openrouter", connected: true,
-    selected_model: "typesafe/jev-1.13", operation: "decision.evaluate" }]);
+  const f = fixture([{ id, name: "Text model", provider: "openrouter", connected: true,
+    selected_model: "openai/gpt-4o-mini", operation: "text.generate" }]);
   await new Promise(setImmediate);
   const card = f.node("#ai-provider-instances").children[0];
   card.children[2].children.find(button => button.textContent === "Edit").handlers.click();
@@ -97,7 +97,7 @@ test("Edit uses the existing identity with a blank key and explains server-side 
   await f.node("#ai-provider-save").handlers.click();
   assert.equal(f.attempts[0].id, id);
   assert.equal(f.attempts[0].api_key, "");
-  assert.equal(f.attempts[0].model, "typesafe/jev-1.13");
+  assert.equal(f.attempts[0].model, "openai/gpt-4o-mini");
 });
 
 
