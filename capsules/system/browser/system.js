@@ -710,7 +710,7 @@ function configureAiProvider() {
     saveButton.disabled = busy || !hasShellAccess();
     cancelButton.disabled = busy;
     instancesNode.querySelectorAll("button").forEach((button) => {
-      button.disabled = busy || !hasShellAccess();
+      button.disabled = busy || !hasShellAccess() || button.dataset.egressPaused === "true";
     });
   };
   const showState = (message, tone) => {
@@ -805,6 +805,8 @@ function configureAiProvider() {
       useButton.className = "pc2-btn";
       useButton.type = "button";
       useButton.textContent = "Use in Assistant";
+      useButton.dataset.egressPaused = connection.egress_state === "paused" ? "true" : "false";
+      useButton.disabled = connection.egress_state === "paused";
       useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
       const shareButton = document.createElement("button");
       shareButton.className = "pc2-btn pc2-btn-secondary";
@@ -844,7 +846,9 @@ function configureAiProvider() {
       });
       const state = document.createElement("span");
       state.className = "ai-provider-state";
-      state.textContent = connection.approval_state === "approved" ? "Assistant access approved" : connection.share_enabled ? "Shared" : "Private";
+      state.textContent = connection.egress_state === "paused" ? "External HTTPS paused"
+        : connection.approval_state === "approved" ? "Assistant access approved"
+        : connection.share_enabled ? "Shared" : "Private";
       title.append(state);
       const more = document.createElement("details");
       more.className = "ai-provider-details";
@@ -900,7 +904,9 @@ function configureAiProvider() {
       lensModel.append(option);
     }
     if (current) lensModel.value = current.id;
-    lensStatus.textContent = current ? `Using ${current.name} · ${current.processor_label}`
+    lensStatus.textContent = current && status.hosted_external_https === "paused"
+      ? `${current.name} selected · external HTTPS paused`
+      : current ? `Using ${current.name} · ${current.processor_label}`
       : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
       : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
     lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;

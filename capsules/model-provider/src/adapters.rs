@@ -54,6 +54,26 @@ fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, Adapt
         })
 }
 
+// The native provider has no network sandbox. Until Runtime owns a confined
+// egress broker, every external adapter fails before it can open a socket.
+// Unit fixtures keep exercising their backend protocol; the production binary
+// is covered by process and installed zero-request tests.
+#[cfg(test)]
+thread_local! {
+    static TEST_EXTERNAL_HTTP_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn require_external_http_containment() -> std::result::Result<(), AdapterFault> {
+    #[cfg(test)]
+    if TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.get()) {
+        return Ok(());
+    }
+    Err(AdapterFault::context(
+        "Hosted external HTTPS is paused.",
+        "Runtime network authority is not available",
+    ))
+}
+
 fn remaining_run_timeout(deadline_ms: u64) -> std::result::Result<Duration, AdapterFault> {
     let remaining_ms = deadline_ms.saturating_sub(now_ms());
     if remaining_ms == 0 {
@@ -957,6 +977,9 @@ impl AdapterExecutor for LiveAdapterExecutor {
         input: &Value,
         deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault> {
+        if !matches!(adapter, AdapterConfig::LocalLlamaCppText { .. }) {
+            require_external_http_containment()?;
+        }
         match adapter {
             AdapterConfig::OpenRouterDecisions {
                 api_url,
@@ -1423,6 +1446,7 @@ async fn run_http_artifact_create_worker_inner(
     binding: &RuntimeCreateBinding,
     input: &Value,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment()?;
     let client = backend_client(offer.policy.runtime_ms_limit)?;
     let request = {
         let mut builder = client
@@ -1480,6 +1504,7 @@ async fn run_http_artifact_status_worker_inner(
     _binding: &RuntimeCreateBinding,
     backend_state: &Value,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment()?;
     let state = parse_http_job_backend_state(backend_state)?;
     let now = now_ms();
     if state.cancel_requested
@@ -1507,6 +1532,9 @@ async fn run_http_artifact_status_worker_inner(
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    if !matches!(&task.backend, LocalTextBackend::LocalLlama { .. }) {
+        require_external_http_containment()?;
+    }
     let mut backend_report = matches!(
         &task.backend,
         LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
@@ -1751,6 +1779,7 @@ async fn run_decision_worker(
     deadline_ms: u64,
     cancel: &mut watch::Receiver<bool>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment()?;
     let client = backend_client(
         remaining_run_timeout(deadline_ms)?
             .as_millis()
@@ -2413,6 +2442,7 @@ async fn run_http_artifact_cancel_worker_inner(
     _binding: &RuntimeCreateBinding,
     backend_state: &Value,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment()?;
     let state = parse_http_job_backend_state(backend_state)?;
     let deadline = state.cancel_deadline_ms.ok_or_else(|| {
         AdapterFault::malformed(
@@ -4875,5 +4905,85 @@ mod tests {
         let public_error = serde_json::to_string(&fault.error).unwrap();
         assert!(!public_error.contains("/status-redirect"));
         assert!(!public_error.contains(&target.base_url));
+    }
+
+    #[test]
+    fn queued_external_workers_refuse_before_create_status_cancel_or_text_sockets() {
+        let sink = start_server(vec![]);
+        let url = format!("{}/blocked", sink.base_url);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.set(false));
+        let artifact = offer();
+        let text = openai_offer(&url);
+        let input = json!({});
+        let fault = runtime.block_on(run_http_artifact_create_worker_inner(
+            &url,
+            Some("fixture-key"),
+            5,
+            &artifact,
+            &binding(),
+            &input,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        let fault = runtime.block_on(run_http_artifact_status_worker_inner(
+            &url,
+            Some("fixture-key"),
+            5,
+            &artifact,
+            &binding(),
+            &input,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        let fault = runtime.block_on(run_http_artifact_cancel_worker_inner(
+            &url,
+            Some("fixture-key"),
+            &artifact,
+            &binding(),
+            &input,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (updates, _receiver) = mpsc::channel(1);
+        for backend in [
+            LocalTextBackend::OpenAiCompatible {
+                api_url: url.clone(),
+                api_key: Some("fixture-key".into()),
+                model: "test".into(),
+            },
+            LocalTextBackend::OpenAiResponses {
+                api_url: url.clone(),
+                api_key: Some("fixture-key".into()),
+                model: "test".into(),
+            },
+        ] {
+            let mut task = LocalTextWorkerTask {
+                run_id: "run:fixture".into(),
+                generation: 1,
+                backend,
+                offer: text.clone(),
+                deadline_ms: now_ms() + 5000,
+                prompt: "test".into(),
+                cancel_rx: cancel_rx.clone(),
+                updates: updates.clone(),
+            };
+            let fault = runtime.block_on(run_local_text_worker_inner(&mut task));
+            assert!(fault.unwrap_err().error.message.contains("paused"));
+        }
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let fault = runtime.block_on(run_decision_worker(
+            &url,
+            Some("fixture-key"),
+            "fixture/jev",
+            &decision_input(),
+            &text,
+            now_ms() + 5000,
+            &mut cancel,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.set(true));
+        assert!(sink.requests.lock().unwrap().is_empty());
     }
 }

@@ -15,6 +15,8 @@ const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models?output_
 const VENICE_RATE_LIMITS_URL: &str = "https://api.venice.ai/api/v1/api_keys/rate_limits";
 #[cfg_attr(test, allow(dead_code))]
 const VENICE_MODELS_URL: &str = "https://api.venice.ai/api/v1/models?type=text";
+const HOSTED_EXTERNAL_HTTPS_PAUSED: &str =
+    "Hosted external HTTPS is paused until Runtime network authority is available.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AiProviderRequestError(&'static str);
@@ -303,6 +305,9 @@ fn hosted_validate_http_client(loopback: bool) -> anyhow::Result<reqwest::Client
             }
         }));
     }
+    if !loopback {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
     builder
         .build()
         .map_err(|_| anyhow::anyhow!("hosted validation unavailable"))
@@ -512,11 +517,15 @@ pub(super) async fn system_ai_provider_get(
     match crate::api::ai_provider_status(&state.data_dir) {
         Ok(status) => {
             let mut result = serde_json::to_value(status).expect("serializable provider status");
+            result["hosted_external_https"] = serde_json::json!("paused");
+            result["hosted_external_https_reason"] =
+                serde_json::json!(HOSTED_EXTERNAL_HTTPS_PAUSED);
             if let Some(connections) = result
                 .get_mut("connections")
                 .and_then(serde_json::Value::as_array_mut)
             {
                 for connection in connections {
+                    connection["egress_state"] = serde_json::json!("paused");
                     let Some(id) = connection.get("id").and_then(serde_json::Value::as_str) else {
                         continue;
                     };
@@ -546,6 +555,9 @@ pub(super) async fn system_ai_provider_validate(
 ) -> Response {
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
+    }
+    if !cfg!(test) {
+        return system_error_response(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED));
     }
     let provider = match parse_provider(&req.provider) {
         Ok(provider) => provider,
@@ -577,6 +589,9 @@ pub(super) async fn system_ai_provider_save(
 ) -> Response {
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
+    }
+    if !cfg!(test) {
+        return system_error_response(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED));
     }
     let provider = match parse_provider(&req.provider) {
         Ok(provider) => provider,
