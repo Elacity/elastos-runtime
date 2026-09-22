@@ -6,6 +6,16 @@ initial Carrier peers. It is configuration authority only: the profile signer
 does not author user messages, grant capsule authority, establish Chat
 membership, or act as a Carrier peer merely by signing a profile.
 
+A bootstrap Runtime can keep a stable UDP listener with the existing Runtime
+configuration command, for example
+`elastos config set carrier_bind_addr 0.0.0.0:4433`. Choose a free address for each
+Runtime, restart it, then export
+its bootstrap receipt. Gateway and full server startup use that address on each
+restart. Invalid configuration or an occupied explicit address stops startup;
+an absent setting keeps the default listener and ephemeral-port fallback.
+The setting changes the listener address only. Carrier network policy and
+collaboration authority keep their own checks.
+
 The canonical JSON envelope uses lexicographically ordered object keys with no
 insignificant whitespace and has exactly three fields: `payload`, `signature`,
 and `signer_did`. The canonical bytes of its `payload` field are signed with the

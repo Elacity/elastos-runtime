@@ -621,10 +621,32 @@ async fn serve_capability_store(
         .map_err(|err| anyhow::anyhow!("capability store unavailable: {err}"))
 }
 
+/// A configured listener is an operator-owned address; it must survive restarts
+/// and fail closed rather than silently selecting an ephemeral replacement.
+fn configured_carrier_bind_addr(data_dir: &Path) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    let contents = match std::fs::read_to_string(data_dir.join("config.toml")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Cannot read Runtime config.toml"),
+    };
+    let table: toml::Table = contents.parse().context("Invalid Runtime config.toml")?;
+    table
+        .get("carrier_bind_addr")
+        .map(|value| {
+            value
+                .as_str()
+                .context("carrier_bind_addr must be a socket address string")?
+                .parse()
+                .context("Invalid carrier_bind_addr")
+        })
+        .transpose()
+}
+
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
+    let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
     let _ = ownership::repair_path_recursive(&data_dir);
     let collaboration_configuration =
         elastos_server::collaboration_startup::load_and_accept_collaboration_startup_configuration(
@@ -1446,7 +1468,7 @@ async fn setup_server_infrastructure_impl(
             &carrier_signing_key,
             &carrier_did,
             &data_dir,
-            None,
+            carrier_bind_addr,
         )
         .await
         {
@@ -1487,6 +1509,9 @@ async fn setup_server_infrastructure_impl(
                     carrier_node,
                 ));
                 tracing::info!("Carrier node online (P2P + gossip)");
+            }
+            Err(e) if carrier_bind_addr.is_some() => {
+                return Err(e).context("Configured Carrier listener could not start");
             }
             Err(e) => {
                 tracing::warn!("Carrier node failed: {:#}", e);
@@ -2024,6 +2049,35 @@ fn provider_config_from_env_or_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_carrier_listener_is_optional_and_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::configured_carrier_bind_addr(dir.path()).unwrap(),
+            None
+        );
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "dev_mode = true\n").unwrap();
+        assert_eq!(
+            super::configured_carrier_bind_addr(dir.path()).unwrap(),
+            None
+        );
+        std::fs::write(&path, r#"carrier_bind_addr = "127.0.0.1:61967""#).unwrap();
+        assert_eq!(
+            super::configured_carrier_bind_addr(dir.path()).unwrap(),
+            Some("127.0.0.1:61967".parse().unwrap())
+        );
+        for invalid in [
+            "carrier_bind_addr = 61967",
+            "carrier_bind_addr = \"invalid\"",
+            "broken = [",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(super::configured_carrier_bind_addr(dir.path()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::ffi::CString;
