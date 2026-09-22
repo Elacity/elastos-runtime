@@ -201,32 +201,46 @@ The next outcomes use the existing acceptance IDs in this order:
    remain outside this proof. The final installed candidate also completed a
    fresh SmolLM2 prompt in ordinary Assistant; the original journey retains
    the cold delivery, restart and zero-payload evidence.
-3. **MA4 live Venice and Jev — partial:** ordinary Home configured private
+3. **MA4 live Venice and Jev — verified:** ordinary Home configured private
    OpenRouter and Venice instances. A new Venice Assistant request completed
    with `qwen-3-8-flash`; its receipt binds visible input, named offer, request,
    run and terminal output. Provider usage and billed cost remain unknown.
-   Real Jev advice through Inbox waits for its named instance setup in Home.
-   The typed OpenRouter Decisions adapter uses `typesafe/jev-1.13`; contract,
-   provider and Runtime fixtures pass, with human review on unavailable advice.
-   Link the connection decision to a submitted request/run and terminal outcome;
-   accepted dispatch is not completed inference. Human authority remains intact.
+   Real Jev evaluation now completes through the typed Decisions adapter and
+   appears in Inbox. The catalog pins the exact provider response identity;
+   strict typed output and provider-reported accounting remain separate.
+   The live advice recommends defer with medium risk and 56% confidence.
+   The human approved in Inbox, then ordinary Assistant resubmitted the calm-river
+   prompt. DS4 completed with a matching input hash, named instance, request,
+   run and terminal reply. The receipt keeps the connection decision separate
+   from create acceptance and terminal inference. Human authority remains intact.
 4. **MA4 remote hosted use:** share one named instance through existing Services,
    complete a second-Home reply and verify destination-enforced revoke, expiry,
    pause, replacement/disconnect and bounded settlement. Use fresh request IDs
    for new-dispatch denials; credentials remain on the owner Home.
    Two source-built Mac Homes now have separate identities, matching signed
-   network configuration and stable local Carrier listeners. The consumer's
-   passkey setup and the owner's Venice sharing terms confirmation wait in
-   visible Home pages. This setup is a local two-Home path; the remote service
-   journey and destination access checks remain open.
-5. **MA5.2 combined candidate — checks passed:** the basic AGENTS gate and
-   `just verify` passed, including workspace lint/tests, all separate capsule
+   network configuration and stable local Carrier listeners. Both Homes are
+   signed in; the owner shared one Venice instance, and the consumer accepted
+   the owner contact. Installed Inbox now preserves the signed contact name.
+   A model-only sharing mailbox guard omitted incoming requests. The repair
+   passed three focused tests and source review; the installed consumer now
+   sends the request and the owner Inbox receives it. Human service approval
+   is pending before the unpaid offer check and shared inference. The shared
+   offer route now recognizes Runtime secret references as well as legacy inline
+   keys. All 29 remote-model tests passed, including exact fresh-request denials,
+   regrant recovery and old-run settlement. One private/remote concurrency test
+   passed. Both Homes now run the matching reviewed Runtime and provider
+   artifacts after normal restart; saved provider settings remain unchanged.
+   The shared reply still needs installed proof. This setup is a local two-Home path. Marketplace projection of
+   service offers and access remains a separate product flow to complete.
+5. **MA5.2 combined candidate — final reconciliation:** the earlier combined
+   candidate passed the basic AGENTS gate and `just verify`, including workspace lint/tests, all separate capsule
    workspaces and the Browser local-exit helper. The server suite passed 2,186
    tests with 16 opt-in skips; the model provider passed 215 unit tests and five
    process tests with two opt-in skips. Other live IPFS and documentation skips
    retain their recorded reasons. Independent review accepted the source,
-   artifact evidence and local commit boundaries. Jev and sharing acceptance
-   remain open for the Home actions above.
+   artifact evidence and local commit boundaries. Focused checks cover the later
+   repairs; freeze their installed artifacts and local commit set after the
+   sharing journey above.
    The initial combined run exposed stale authorization, key-permission,
    direct-discovery and reconciliation fixtures. All 25 affected cases now pass
    after independent review. Optional

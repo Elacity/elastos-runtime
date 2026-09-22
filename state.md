@@ -31,9 +31,37 @@ with a new request/run and reported `qwen-3-8-flash` terminal output. Built and
 installed Runtime, model-provider and changed capsule files match; installed
 provider verification passed on both test Homes. A new ordinary Assistant run
 also completed on the admitted local SmolLM2 model, with an independently checked
-input hash, request, run and terminal reply. Real Jev advice still waits for its
-named instance setup through Home; source fixtures cover the typed Decisions
-contract, failure handling and human decision boundary.
+input hash, request, run and terminal reply.
+
+A later installed Runtime (`45490bf7a0f61155edf3e3a1325585c2ebf90ae4a1918fde53b1b960d67576d4`)
+completed real Jev advice through ordinary Home. The provider reported the exact
+catalog identity `typesafe/jev-1.13-20260917`, 591 input tokens, 85 output tokens,
+and US$0.000024822. The contract result names the selected `typesafe/jev-1.13`
+and retains the provider report separately. Inbox shows defer, medium risk and
+56% confidence. The human approved in Inbox. The prompt was then resubmitted through
+Assistant. A distinct DS4 run completed with the matching input hash and terminal
+reply; OpenRouter reported `deepseek/deepseek-v4.1-flash` and US$0.000189. The
+connection-scoped decision, create acceptance and terminal result remain separate
+facts in the receipt. An earlier response-identity failure stays in the evidence.
+
+Home Edit retains an existing same-provider key when its key field is blank.
+Repeated installed saves preserved all nine connection identities, stored-key
+hashes and list order. Warm local engine retention permits idle hosted additions
+while active and unresolved ownership guards remain in force. The two signed-in
+Homes discovered each other and accepted a contact through ordinary Home; the
+owner has shared one named Venice connection. This proves contact setup, with
+remote model access and inference still awaiting their separate checks.
+The model-only request mailbox repair is installed on both Homes, and the
+owner Inbox received the consumer's service request. A later source test found
+that the sharing route recognized inline keys but omitted saved secret references.
+The correction uses the existing key-presence check. All 29 remote-model tests
+passed, including fresh-request authority denials, pause/disconnect withdrawal,
+regrant recovery and continued access to old runs. These are source fixtures;
+the installed shared reply remains pending. Both owned Homes now run Runtime
+`acb5011232841a3cde788494b47172bf8d0503ab2665c7f1715e56ac3d54dc81`
+with matching built and installed provider/capsule hashes. Normal restart,
+served Inbox parity and installed provider verification passed. The owner's
+nine stored keys and provider configuration remained unchanged.
 
 The installed UI now keeps model preparation polling active until a terminal
 result or view closure. A regression check passed 131 polls and verified timer
@@ -44,7 +72,9 @@ source, including separate capsule workspaces and the Browser local-exit helper.
 The server suite passed 2,186 tests with 16 opt-in skips; the model provider
 passed 215 unit tests and five process tests with two opt-in skips. Live IPFS
 and documentation examples retain their opt-in skips. Two-Home hosted sharing
-and real Jev evaluation remain open for the pending Home actions.
+remains open for the pending Home actions. Focused provider, gateway and UI checks cover the later Save and
+canonical identity repairs; the full-suite counts above describe the earlier
+combined candidate.
 Public installer, reverse Mac dial, approved relay, indefinite
 provider-hang cancellation and full Qwen delivery retain their separate gates.
 The following dated inventory preserves earlier evidence and public state; it
