@@ -705,12 +705,7 @@ fn annotate_listed_offers_with_hosted_share(result: &mut Value, data_dir: &Path)
         if let Some(enabled) = operator.get("enabled") {
             offer["enabled"] = enabled.clone();
         }
-        if operator
-            .pointer("/adapter/api_key")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        {
+        if crate::api::model_provider_config::operator_offer_has_key(operator) {
             offer["key_present"] = Value::Bool(true);
         }
     }

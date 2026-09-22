@@ -9886,6 +9886,97 @@ async fn test_services_runtime_mailbox_receives_and_activates_without_inbox_or_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_shared() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    for hosted in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let offer = format!(
+            "offer:{}:model",
+            home_people_contact_id(&bob.profile.document().profile_did)
+        );
+        let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, body) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"others","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Private models do not open the incoming request mailbox.
+        bob.discovery_service
+            .sync_services_mailboxes_once(right.path(), 0)
+            .await;
+        assert!(services_mailbox_saved_state(
+            right.path(),
+            &bob.authority,
+            "services-requests.json"
+        )["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        if hosted {
+            let id = "model:hosted-0123456789abcdef0123456789abcdef";
+            crate::api::model_provider_config::save_hosted_offer(
+                right.path(),
+                None,
+                HostedOfferSave {
+                    provider: HostedAiProvider::Venice,
+                    api_key: "fixture-key",
+                    model: "fixture/text",
+                    expected_response_model: None,
+                    privacy: None,
+                    name: "Hosted test",
+                    instance_id: Some(id),
+                },
+            )
+            .await
+            .unwrap();
+            crate::api::model_provider_config::set_hosted_offer_share(
+                right.path(),
+                id,
+                true,
+                Some(HostedAiProvider::Venice.share_terms_ack()),
+            )
+            .unwrap();
+        } else {
+            // The Services card requires the installed model provider marker.
+            std::fs::create_dir_all(right.path().join("bin")).unwrap();
+            std::fs::write(right.path().join("bin/model-provider"), b"fixture").unwrap();
+            let token = app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+            let (status, body) = services_contact_post(
+                &bob.app,
+                &token,
+                "/api/apps/services/offers",
+                json!({"offer_id":MODEL_LOCAL_OFFER,"section":"mine","selected":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        bob.discovery_service
+            .sync_services_mailboxes_once(right.path(), 0)
+            .await;
+        let saved =
+            services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json");
+        let requests = saved["requests"].as_object().unwrap();
+        assert_eq!(requests.len(), 1, "hosted={hosted}: {saved}");
+        let request = requests.values().next().unwrap();
+        assert_eq!(request["service_kind"], MODEL_SERVICE_KIND);
+        assert_eq!(request["status"], "pending");
+        assert!(bob.exit_provider.requests.lock().await.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_signed_message() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
@@ -10444,6 +10535,43 @@ async fn test_system_ai_provider_admin_save_replace_disconnect_keeps_peer() {
     let stored = std::fs::read_to_string(&config_path).unwrap();
     assert!(stored.contains(&venice_id));
     assert!(stored.contains(&openrouter_id));
+    let before_edit = private_home_paths(dir.path());
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({"id":venice_id, "provider":"venice",
+            "name":"Venice edited", "api_key":"", "model":"fixture/model"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ai_provider_http_omits_secrets(&body);
+    assert_eq!(
+        hosted_secret(dir.path(), &venice_id),
+        "sk-vnz-fixture-replaced"
+    );
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-valid"
+    );
+    assert_eq!(private_home_paths(dir.path()), before_edit);
+    for (id, provider) in [
+        (venice_id.as_str(), "openrouter"),
+        ("model:hosted-ffffffffffffffffffffffffffffffff", "venice"),
+    ] {
+        let (status, _) = ai_provider_raw(
+            &app,
+            "POST",
+            "/api/apps/system/ai-provider",
+            &authority.system_token,
+            Some(json!({"id":id, "provider":provider,
+                "name":"Invalid edit", "api_key":"", "model":"fixture/model"})),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+    }
     let (status, body) = ai_provider_raw(
         &app,
         "DELETE",

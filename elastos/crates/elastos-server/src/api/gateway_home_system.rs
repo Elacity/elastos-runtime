@@ -3768,6 +3768,8 @@ pub(super) fn home_services_sync_access_requests(
         .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     if !home_services_local_exit_shared(data_dir, context)?
         && !home_services_local_engine_shared(data_dir, context)?
+        && !home_services_local_model_shared(data_dir, context)?
+        && !crate::api::any_hosted_model_shared(data_dir)
     {
         return Ok(());
     }
