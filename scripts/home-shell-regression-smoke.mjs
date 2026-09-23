@@ -2858,4 +2858,76 @@ for (const [target, original] of Object.entries(startingQueries)) {
   assert(JSON.stringify(actual) === JSON.stringify(expected), `${target} lost current selection or changed the independent window`);
 }
 console.log("[home-shell-regression] Library/Archive/GBA/Chat settled selectors, stale/failed changes and fresh independent restore: PASS");
+
+const arrangedSummary = {
+  authority: { signed_in: true },
+  targets: summary.targets,
+  browser_state: {
+    principal_id: "principal:arranged-layout",
+    layout: {
+      desktop: {
+        wallet: { x: 12, y: 12 },
+        browser: { x: 12, y: 116 },
+        system: { x: 12, y: 220 },
+        inbox: { x: 318, y: 58 },
+        people: { x: 414, y: 58 },
+      },
+      taskbar: [],
+      desktopHidden: ["wallet", "browser", "system", "chat-room"],
+      desktopIconsVisible: true,
+    },
+  },
+};
+shellCore.initializeShellLayout(arrangedSummary);
+shellCore.shellState.currentSummary = arrangedSummary;
+assert(shellCore.autoArrangeDesktopIcons(arrangedSummary), "auto-arrange made no change");
+const arrangedVisible = Object.fromEntries(["inbox", "people"].map((id) => [
+  id, { ...shellCore.shellState.shellLayoutState.desktop[id] },
+]));
+const hiddenWallet = { ...shellCore.shellState.shellLayoutState.desktop.wallet };
+const arrangedPatch = savedStatePatches.at(-1);
+assert(arrangedPatch?.layout, "auto-arrange did not persist a layout patch");
+shellCore.initializeShellLayout({ ...arrangedSummary,
+  browser_state: { principal_id: "principal:arranged-layout", layout: arrangedPatch.layout },
+});
+assert(
+  JSON.stringify(Object.fromEntries(["inbox", "people"].map((id) => [
+    id, shellCore.shellState.shellLayoutState.desktop[id],
+  ]))) === JSON.stringify(arrangedVisible),
+  "reload moved visible icons into slots held by hidden targets",
+  shellCore.shellState.shellLayoutState.desktop,
+);
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktop.wallet) === JSON.stringify(hiddenWallet),
+  "reload discarded the hidden target's saved position",
+);
+assert(shellCore.setDesktopPosition("people", { x: 318, y: 58 }), "manual move made no change");
+shellCore.saveShellLayoutState();
+const movedPatch = savedStatePatches.at(-1);
+assert(movedPatch?.layout?.desktop?.people, "manual move did not persist a layout patch");
+shellCore.initializeShellLayout({ ...arrangedSummary,
+  browser_state: { principal_id: "principal:arranged-layout", layout: movedPatch.layout },
+});
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktop.people) === JSON.stringify({ x: 318, y: 58 }),
+  "manual desktop move did not survive reload",
+  shellCore.shellState.shellLayoutState.desktop,
+);
+shellCore.shellState.currentSummary = arrangedSummary;
+assert(shellCore.addTargetToDesktop("wallet"), "hidden Wallet did not reveal");
+const revealedWallet = shellCore.shellState.shellLayoutState.desktop.wallet;
+assert(
+  JSON.stringify(revealedWallet) !== JSON.stringify(shellCore.shellState.shellLayoutState.desktop.inbox),
+  "revealed Wallet overlaps auto-arranged Inbox",
+);
+shellCore.saveShellLayoutState();
+const revealedPatch = savedStatePatches.at(-1);
+shellCore.initializeShellLayout({ ...arrangedSummary,
+  browser_state: { principal_id: "principal:arranged-layout", layout: revealedPatch.layout },
+});
+assert(
+  JSON.stringify(shellCore.shellState.shellLayoutState.desktop.wallet) === JSON.stringify(revealedWallet),
+  "revealed Wallet moved on reload",
+);
+console.log("[home-shell-regression] auto-arrange, manual move and reveal survive reload: PASS");
 console.log("[home-shell-regression] PASS");
