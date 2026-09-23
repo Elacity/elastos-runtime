@@ -426,6 +426,32 @@ async fn dispatch_inbox_action(
         )?;
         return Ok("Rejected Wallet market-price source.".to_string());
     }
+    #[cfg(target_os = "macos")]
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::api::model_provider_egress_decision::APPROVE_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        let proof = context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok("Approved this hosted route for matching requests for ten minutes.".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::api::model_provider_egress_decision::DENY_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        let proof = context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        crate::api::model_provider_egress_decision::deny(data_dir, request_id, proof)?;
+        let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
+        return Ok("Denied this hosted route.".to_string());
+    }
     if let Some(request_id) =
         action_id.strip_prefix(crate::jev_approval_lens::HOSTED_HTTP_APPROVE_PREFIX)
     {

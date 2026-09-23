@@ -470,12 +470,26 @@ pub(super) async fn system_approval_lens_revoke(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
-    match crate::jev_approval_lens::end_connection_approval(&state.data_dir, &req.id) {
-        Ok(()) => {
-            Json(serde_json::json!({ "offer_id": req.id, "approval": "ended" })).into_response()
+    #[cfg(target_os = "macos")]
+    let ended_https =
+        match crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &req.id) {
+            Ok(count) => count,
+            Err(err) => return system_error_response(err),
+        };
+    #[cfg(not(target_os = "macos"))]
+    let ended_https = 0;
+    let jev_active = crate::jev_approval_lens::approved_connection(&state.data_dir, &req.id);
+    if jev_active {
+        if let Err(err) =
+            crate::jev_approval_lens::end_connection_approval(&state.data_dir, &req.id)
+        {
+            return system_error_response(err);
         }
-        Err(err) => system_error_response(err),
     }
+    if ended_https == 0 && !jev_active {
+        return system_error_response(anyhow::anyhow!("hosted connection has no active approval"));
+    }
+    Json(serde_json::json!({ "offer_id": req.id, "approval": "ended" })).into_response()
 }
 
 pub(super) async fn system_ai_provider_get(
@@ -497,12 +511,42 @@ pub(super) async fn system_ai_provider_get(
             {
                 for connection in connections {
                     connection["egress_state"] = serde_json::json!("paused");
-                    let Some(id) = connection.get("id").and_then(serde_json::Value::as_str) else {
+                    let Some(id) = connection
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                    else {
                         continue;
                     };
-                    if crate::jev_approval_lens::approved_connection(&state.data_dir, id) {
+                    #[cfg(target_os = "macos")]
+                    match crate::api::model_provider_egress_decision::offer_state(
+                        &state.data_dir,
+                        &id,
+                    ) {
+                        Ok(egress_state) => {
+                            connection["egress_approval_state"] = serde_json::json!(egress_state)
+                        }
+                        Err(_) => {
+                            connection["egress_approval_state"] = serde_json::json!("unavailable")
+                        }
+                    }
+                    if crate::jev_approval_lens::approved_connection(&state.data_dir, &id) {
                         connection["approval_state"] = serde_json::json!("approved");
                     }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                result["validation_egress_approval_state"] = serde_json::json!({});
+                for provider in ["openrouter", "venice"] {
+                    let offer_id = format!("validation:{provider}");
+                    let state_value = crate::api::model_provider_egress_decision::offer_state(
+                        &state.data_dir,
+                        &offer_id,
+                    )
+                    .unwrap_or("unavailable");
+                    result["validation_egress_approval_state"][provider] =
+                        serde_json::json!(state_value);
                 }
             }
             match crate::api::model_provider_config::approval_lens_offer_id(&state.data_dir) {
@@ -667,6 +711,12 @@ pub(super) async fn system_ai_provider_delete(
         Ok(offer_id) => offer_id,
         Err(err) => return system_error_response(err),
     };
+    #[cfg(target_os = "macos")]
+    if let Err(err) =
+        crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &offer_id)
+    {
+        return system_error_response(err);
+    }
     match crate::api::remove_hosted_offer(
         &state.data_dir,
         state.provider_registry.as_deref(),

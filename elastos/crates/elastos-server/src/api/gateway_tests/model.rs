@@ -1466,6 +1466,102 @@ fn inbox_summary_request(token: String) -> Request<Body> {
         .unwrap()
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn owner_inbox_action_controls_hosted_route_and_system_end() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let app = gateway_router(test_state(dir.path()));
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let scope = crate::api::model_provider_egress_decision::EgressScope {
+        offer_id: "validation:openrouter".into(),
+        effect: "validate_models".into(),
+        method: "GET".into(),
+        url: "http://127.0.0.1:9999/models".into(),
+        origin: "http://127.0.0.1:9999".into(),
+        recipient: "127.0.0.1".into(),
+        payer: "this Home".into(),
+        provider: "OpenRouter".into(),
+        purpose: "Load hosted model choices".into(),
+        configuration_id: "a".repeat(64),
+    };
+    let id = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    let (status, summary) = status_json(
+        app.clone()
+            .oneshot(inbox_summary_request(inbox_token.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = summary["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["action_ref"]["action_id"] == format!("model-egress-approve:{id}"))
+        .unwrap();
+    assert!(entry["body"]
+        .as_str()
+        .unwrap()
+        .contains("Route: GET http://127.0.0.1:9999/models"));
+    let action = format!("model-egress-approve:{id}");
+    let (status, approved) = status_json(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), &action))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert!(crate::api::model_provider_egress_decision::active(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id)
+    )
+    .is_ok());
+    let get_status = || {
+        test_browser_request("localhost:61180", "null")
+            .uri("/api/apps/system/ai-provider")
+            .header("x-elastos-home-token", authority.system_token.clone())
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, body) = status_json(app.clone().oneshot(get_status()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["validation_egress_approval_state"]["openrouter"],
+        "approved"
+    );
+    let end = test_browser_request("localhost:61180", "null")
+        .method("POST")
+        .uri("/api/apps/system/approval-lens/revoke")
+        .header("x-elastos-home-token", authority.system_token.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"id":"validation:openrouter"}).to_string(),
+        ))
+        .unwrap();
+    let (status, ended) = status_json(app.clone().oneshot(end).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{ended}");
+    assert!(crate::api::model_provider_egress_decision::active(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id)
+    )
+    .is_err());
+    let response = app
+        .oneshot(inbox_action_request(inbox_token, &action))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let dir = tempfile::tempdir().unwrap();

@@ -461,6 +461,19 @@ ownership and transport in those components and prove installed SmolLM2 on an
 isolated non-public Linux target. Linux product confinement and public hosted
 HTTPS remain open.
 
+Mac hosted route approval has source and installed diagnostic proof. Runtime
+records exact external HTTP(S) owner decisions in private state, presents them
+in Inbox, and checks active decisions and run-bound grants before and during
+broker dispatch. System can end saved-route and key-check approval. A dummy
+loopback sink saw zero validation requests before approval, one after the real
+admin-passkey Inbox action, and zero additional requests after System End.
+The diagnostic Home was restored to its original binary and private manifest;
+the two signed-in human Homes stayed open. Receipt:
+`.audit/sec1-egress-installed/installed-sink-result.json`. Next: integrate
+the Linux confinement fixture into the production provider path, then prove
+the installed SmolLM2 and hosted routes on each target. Keep public HTTPS
+paused until its separate owner and target proofs pass.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty

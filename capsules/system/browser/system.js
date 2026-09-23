@@ -697,9 +697,19 @@ function configureAiProvider() {
   if (!instancesNode || !addButton || !formNode || !nameInput || !providerSelect || !keyInput || !modelSelect || !validateButton || !saveButton || !cancelButton) {
     return;
   }
+  const validationEndButton = document.createElement("button");
+  validationEndButton.className = "pc2-btn pc2-btn-secondary";
+  validationEndButton.type = "button";
+  validationEndButton.textContent = "End key-check access";
+  validationEndButton.hidden = true;
+  validateButton.after(validationEndButton);
   const selectedProvider = () => (providerSelect.value === "venice" ? "venice" : "openrouter");
   let editingId = "";
   let latestStatus = null;
+  const updateValidationEnd = () => {
+    const state = latestStatus?.validation_egress_approval_state?.[selectedProvider()];
+    validationEndButton.hidden = state !== "pending" && state !== "approved";
+  };
   const setBusy = (busy) => {
     addButton.disabled = busy || !hasShellAccess();
     nameInput.disabled = busy || !hasShellAccess();
@@ -707,6 +717,7 @@ function configureAiProvider() {
     keyInput.disabled = busy || !hasShellAccess();
     modelSelect.disabled = busy || !hasShellAccess();
     validateButton.disabled = busy || !hasShellAccess();
+    validationEndButton.disabled = busy || !hasShellAccess();
     saveButton.disabled = busy || !hasShellAccess();
     cancelButton.disabled = busy;
     instancesNode.querySelectorAll("button").forEach((button) => {
@@ -729,6 +740,7 @@ function configureAiProvider() {
   };
   const applyProviderChrome = () => {
     if (veniceFact) veniceFact.hidden = selectedProvider() !== "venice";
+    updateValidationEnd();
   };
   const fillModels = (models, selected) => {
     const values = [];
@@ -846,7 +858,9 @@ function configureAiProvider() {
       });
       const state = document.createElement("span");
       state.className = "ai-provider-state";
-      state.textContent = connection.egress_state === "paused" ? "External HTTPS paused"
+      state.textContent = connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
+        : connection.egress_approval_state === "pending" ? "Hosted route needs Inbox review"
+        : connection.egress_state === "paused" ? "External HTTPS paused"
         : connection.approval_state === "approved" ? "Assistant access approved"
         : connection.share_enabled ? "Shared" : "Private";
       title.append(state);
@@ -860,11 +874,11 @@ function configureAiProvider() {
       const secondary = document.createElement("div");
       secondary.className = "system-inline-row";
       secondary.append(shareButton);
-      if (connection.approval_state === "approved") {
+      if (connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
         const endApproval = document.createElement("button");
         endApproval.className = "pc2-btn pc2-btn-secondary";
         endApproval.type = "button";
-        endApproval.textContent = "End Assistant approval";
+        endApproval.textContent = "End hosted approval";
         endApproval.addEventListener("click", async () => {
           if (!hasShellAccess()) return;
           endApproval.disabled = true;
@@ -874,7 +888,7 @@ function configureAiProvider() {
               body: JSON.stringify({ id: connection.id }),
             });
             await refreshStatus();
-            showState("Assistant approval ended. A later request needs Inbox review again.", "");
+            showState("Hosted approval ended. A later request needs Inbox review again.", "");
           } catch (error) {
             showState(publicSystemError(error, "Approval could not be ended."), "error");
             endApproval.disabled = false;
@@ -894,6 +908,17 @@ function configureAiProvider() {
   const lensSelect = document.querySelector("#approval-lens-select");
   const lensEdit = document.querySelector("#approval-lens-edit");
   const lensDisconnect = document.querySelector("#approval-lens-disconnect");
+  const lensEnd = document.createElement("button");
+  lensEnd.className = "pc2-btn pc2-btn-secondary";
+  lensEnd.type = "button";
+  lensEnd.textContent = "End hosted approval";
+  lensEnd.hidden = true;
+  lensDisconnect.after(lensEnd);
+  const updateLensEnd = () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    lensEnd.hidden = !connection || (connection.approval_state !== "approved" && !["pending", "approved"].includes(connection.egress_approval_state));
+    lensEnd.disabled = !hasShellAccess();
+  };
   const renderLens = (status) => {
     const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
     const current = decisions.find(c => c.id === status.approval_lens_offer_id);
@@ -910,7 +935,25 @@ function configureAiProvider() {
       : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
       : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
     lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
+    updateLensEnd();
   };
+  lensModel.addEventListener("change", updateLensEnd);
+  lensEnd.addEventListener("click", async () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection || !hasShellAccess()) return;
+    lensEnd.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/approval-lens/revoke", {
+        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: connection.id }),
+      });
+      await refreshStatus();
+      showState("Hosted approval ended.", "");
+    } catch (error) {
+      showState(publicSystemError(error, "Approval could not be ended."), "error");
+      lensEnd.disabled = false;
+    }
+  });
   lensEdit.addEventListener("click", () => {
     const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
     if (!connection) return;
@@ -946,8 +989,25 @@ function configureAiProvider() {
     latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
     renderInstances(latestStatus);
     renderLens(latestStatus);
+    updateValidationEnd();
     return latestStatus;
   };
+  validationEndButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    try {
+      await fetchJson("/api/apps/system/approval-lens/revoke", {
+        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: `validation:${selectedProvider()}` }),
+      });
+      await refreshStatus();
+      showState("Key-check access ended.", "");
+    } catch (error) {
+      showState(publicSystemError(error, "Key-check access could not be ended."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
   addButton.addEventListener("click", () => {
     showForm(null);
     showState("Choose a host, enter its key, then check and choose a model. The name is optional.", "");
@@ -977,6 +1037,7 @@ function configureAiProvider() {
     } catch (error) {
       showState(hostedProviderValidationError(error), "error");
     } finally {
+      await refreshStatus().catch(() => {});
       setBusy(false);
     }
   });

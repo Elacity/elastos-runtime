@@ -1,5 +1,27 @@
 # State
 
+## Mac hosted route approval checkpoint, 23 September 2026 UTC
+
+Runtime now requires an exact owner Inbox decision before the macOS hosted
+broker validates a key or dispatches a matching provider request. The private
+decision records provider, method, destination, recipient, payer, purpose and
+configuration hash. Approval lasts ten minutes; System can end it early, and
+the broker rechecks the decision and its run-bound grant during dispatch. The
+public HTTPS route remains paused.
+
+The diagnostic Home at port 61971 used a dummy OpenRouter key and a controlled
+loopback sink. Before approval, System Validate returned 400 and the sink saw
+zero requests. An admin passkey Inbox approval allowed one validation request;
+System End then made the next validation return 400 with no new sink request.
+The built and temporarily installed Runtime matched SHA-256
+`424c3aeb13f4132cf9a0b601b638dc96bc588cfb5c9e970be12fd99206a07ac1`.
+The diagnostic Runtime, install receipt and private manifest were restored to
+their original bytes after the check. Evidence is retained under
+`.audit/sec1-egress-installed/`. The two signed-in human Homes remained open,
+and no paid provider call occurred. Independent review found no high or medium
+source issue in this Mac fixture scope. Linux product confinement and public
+HTTPS activation remain open.
+
 ## Current model delivery checkpoint, 22 September 2026 UTC
 
 System Models now supplies the model editor and Approval Lens selection;

@@ -21,8 +21,10 @@ use url::Url;
 
 use super::model_provider_config::{
     load_hosted_validate_fixtures, load_model_provider_operator_offers, read_hosted_egress_grants,
-    read_hosted_job_bindings, read_hosted_secret, write_hosted_job_bindings,
+    read_hosted_job_bindings, read_hosted_secret, write_hosted_egress_grants,
+    write_hosted_job_bindings,
 };
+use super::model_provider_egress_decision::{self, EgressScope};
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, allow(dead_code))]
@@ -40,6 +42,13 @@ impl ValidationEndpoint {
             Self::VeniceModels => ("validation:venice", "validate_models"),
         }
     }
+
+    fn provider(self) -> &'static str {
+        match self {
+            Self::OpenRouterModels => "OpenRouter",
+            Self::VeniceAccess | Self::VeniceModels => "Venice",
+        }
+    }
 }
 
 const MAX_HEADERS: usize = 16 * 1024;
@@ -48,10 +57,12 @@ const MAX_CONNECTIONS: usize = 68;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(3605);
 const MAX_JOB_BINDINGS: usize = 4096;
+const MAX_GRANTS: usize = 1024;
 const MAX_JOB_BINDINGS_BYTES: usize = 4 * 1024 * 1024;
 const JOB_BINDING_LIFETIME_MS: u64 = 2 * 60 * 60 * 1000;
 type JobCreateKey = (String, String, String);
 static JOB_CREATES: OnceLock<Mutex<HashSet<JobCreateKey>>> = OnceLock::new();
+static EGRESS_GRANTS: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct JobCreateReservation(JobCreateKey);
 
@@ -85,20 +96,22 @@ struct JobBinding {
     recorded_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct GrantFile {
     schema: String,
     grants: Vec<EgressGrant>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EgressGrant {
+    decision_id: String,
     offer_id: String,
     effect: String,
     method: String,
     url: String,
+    configuration_id: String,
     recipient: String,
     payer: String,
     owner_proof_binding_id: String,
@@ -126,6 +139,8 @@ struct Destination {
     grant_url: String,
     credential: Option<String>,
     job_backend_id: Option<String>,
+    provider: String,
+    configuration_id: String,
 }
 
 pub(crate) async fn fetch_validation(
@@ -170,8 +185,35 @@ async fn fetch_validation_inner(
         grant_url: raw.to_string(),
         credential: Some(api_key.to_string()),
         job_backend_id: None,
+        provider: endpoint.provider().to_string(),
+        configuration_id: hex::encode(Sha256::digest(serde_json::to_vec(&(
+            raw,
+            api_key,
+            endpoint.grant_binding(),
+        ))?)),
     };
+    anyhow::ensure!(
+        fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)?,
+        "public hosted HTTPS remains paused"
+    );
     let (offer_id, effect) = endpoint.grant_binding();
+    let scope = egress_scope(offer_id, effect, "GET", &destination)?;
+    if model_provider_egress_decision::active(data_dir, &scope, Some(owner_proof_binding_id))
+        .is_err()
+    {
+        let _ =
+            model_provider_egress_decision::request(data_dir, &scope, Some(owner_proof_binding_id));
+        anyhow::bail!("hosted egress requires an Inbox decision");
+    }
+    create_grant_after_decision(
+        data_dir,
+        offer_id,
+        effect,
+        "GET",
+        &destination,
+        Some(owner_proof_binding_id),
+        None,
+    )?;
     current_grant_for(
         data_dir,
         offer_id,
@@ -312,7 +354,37 @@ async fn handle(
         Ok(destination) => destination,
         Err(_) => return deny(&mut stream).await,
     };
-    if !bridge.confined_model_run_matches(&request.offer_id, &request.run_id, &request.request_id)
+    if !bridge.confined_model_run_matches(&request.offer_id, &request.run_id, &request.request_id) {
+        return deny(&mut stream).await;
+    }
+    if !fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)
+        .unwrap_or(false)
+    {
+        return deny(&mut stream).await;
+    }
+    let scope = match egress_scope(
+        &request.offer_id,
+        &request.effect,
+        request.method.as_str(),
+        &destination,
+    ) {
+        Ok(scope) => scope,
+        Err(_) => return deny(&mut stream).await,
+    };
+    if model_provider_egress_decision::active(data_dir, &scope, None).is_err() {
+        let _ = model_provider_egress_decision::request(data_dir, &scope, None);
+        return deny(&mut stream).await;
+    }
+    if create_grant_after_decision(
+        data_dir,
+        &request.offer_id,
+        &request.effect,
+        request.method.as_str(),
+        &destination,
+        None,
+        Some((&request.run_id, &request.request_id)),
+    )
+    .is_err()
         || current_grant(data_dir, &request, &destination).is_err()
     {
         return deny(&mut stream).await;
@@ -535,11 +607,22 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         anyhow::bail!("hosted URL contains forbidden authority");
     }
+    let provider = adapter["hosted"]["backend_provider_label"]
+        .as_str()
+        .filter(|label| !label.is_empty())
+        .unwrap_or("Hosted model")
+        .to_string();
+    let configuration_id = hex::encode(Sha256::digest(serde_json::to_vec(&(
+        adapter,
+        credential.as_deref(),
+    ))?));
     Ok(Destination {
         url,
         grant_url,
         credential,
         job_backend_id,
+        provider,
+        configuration_id,
     })
 }
 
@@ -563,6 +646,106 @@ fn current_grant(
     Ok(())
 }
 
+fn egress_scope(
+    offer_id: &str,
+    effect: &str,
+    method: &str,
+    destination: &Destination,
+) -> anyhow::Result<EgressScope> {
+    let purpose = match effect {
+        "validate_models" => "Load hosted model choices",
+        "validate_access" => "Check hosted key access",
+        "text" | "responses" => "Send an Assistant prompt",
+        "decisions" => "Ask Jev for advice",
+        "job_create" => "Create a hosted job",
+        "job_status" => "Read a hosted job status",
+        "job_cancel" => "Cancel a hosted job",
+        _ => anyhow::bail!("hosted effect unavailable"),
+    };
+    Ok(EgressScope {
+        offer_id: offer_id.to_string(),
+        effect: effect.to_string(),
+        method: method.to_string(),
+        url: destination.grant_url.clone(),
+        origin: destination.url.origin().ascii_serialization(),
+        recipient: destination
+            .url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("hosted recipient unavailable"))?
+            .to_string(),
+        payer: "this Home".into(),
+        provider: destination.provider.clone(),
+        purpose: purpose.into(),
+        configuration_id: destination.configuration_id.clone(),
+    })
+}
+
+fn grant_file(data_dir: &Path) -> anyhow::Result<GrantFile> {
+    let Some(bytes) = read_hosted_egress_grants(data_dir)? else {
+        return Ok(GrantFile {
+            schema: "elastos.model.egress-grants/v2".into(),
+            grants: Vec::new(),
+        });
+    };
+    let file: GrantFile = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        file.schema == "elastos.model.egress-grants/v2" && file.grants.len() <= MAX_GRANTS,
+        "invalid hosted egress grants"
+    );
+    Ok(file)
+}
+
+fn create_grant_after_decision(
+    data_dir: &Path,
+    offer_id: &str,
+    effect: &str,
+    method: &str,
+    destination: &Destination,
+    current_admin_proof: Option<&str>,
+    run_binding: Option<(&str, &str)>,
+) -> anyhow::Result<()> {
+    let scope = egress_scope(offer_id, effect, method, destination)?;
+    let decision = model_provider_egress_decision::active(data_dir, &scope, current_admin_proof)?;
+    let _guard = EGRESS_GRANTS
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut file = grant_file(data_dir)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    file.grants
+        .retain(|grant| grant.active && grant.expires_at_ms > now);
+    if file.grants.iter().any(|grant| {
+        grant.active
+            && grant.decision_id == decision.id
+            && grant.configuration_id == destination.configuration_id
+            && grant.offer_id == offer_id
+            && grant.effect == effect
+            && grant.method == method
+            && grant.url == destination.grant_url
+            && grant.run_id.as_deref() == run_binding.map(|binding| binding.0)
+            && grant.request_id.as_deref() == run_binding.map(|binding| binding.1)
+    }) {
+        return Ok(());
+    }
+    anyhow::ensure!(file.grants.len() < MAX_GRANTS, "hosted egress grants full");
+    file.grants.push(EgressGrant {
+        decision_id: decision.id,
+        offer_id: offer_id.into(),
+        effect: effect.into(),
+        method: method.into(),
+        url: destination.grant_url.clone(),
+        configuration_id: destination.configuration_id.clone(),
+        recipient: scope.recipient,
+        payer: scope.payer,
+        owner_proof_binding_id: decision.owner_proof_binding_id,
+        run_id: run_binding.map(|binding| binding.0.to_string()),
+        request_id: run_binding.map(|binding| binding.1.to_string()),
+        expires_at_ms: decision.expires_at_ms,
+        active: true,
+    });
+    write_hosted_egress_grants(data_dir, &serde_json::to_vec(&file)?)
+}
+
 fn current_grant_for(
     data_dir: &Path,
     offer_id: &str,
@@ -572,12 +755,9 @@ fn current_grant_for(
     current_admin_proof: Option<&str>,
     run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
-    let bytes = read_hosted_egress_grants(data_dir)?
-        .ok_or_else(|| anyhow::anyhow!("hosted egress paused"))?;
-    let file: GrantFile = serde_json::from_slice(&bytes)?;
-    if file.schema != "elastos.model.egress-grants/v1" || file.grants.len() > 128 {
-        anyhow::bail!("invalid hosted egress grants");
-    }
+    let scope = egress_scope(offer_id, effect, method, destination)?;
+    let decision = model_provider_egress_decision::active(data_dir, &scope, current_admin_proof)?;
+    let file = grant_file(data_dir)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let host = destination
         .url
@@ -588,13 +768,15 @@ fn current_grant_for(
         .iter()
         .find(|grant| {
             grant.active
+                && grant.decision_id == decision.id
                 && grant.offer_id == offer_id
                 && grant.effect == effect
                 && grant.method == method
                 && grant.url == destination.grant_url
+                && grant.configuration_id == destination.configuration_id
                 && grant.recipient == host
                 && grant.payer == "this Home"
-                && !grant.owner_proof_binding_id.is_empty()
+                && grant.owner_proof_binding_id == decision.owner_proof_binding_id
                 && current_admin_proof.is_none_or(|proof| grant.owner_proof_binding_id == proof)
                 && match run_binding {
                     Some((run_id, request_id)) => {
@@ -1004,8 +1186,48 @@ async fn write_response_head(
 }
 
 async fn pinned_client(data_dir: &Path, url: &Url, grant_url: &str) -> io::Result<reqwest::Client> {
-    let fixtures = load_hosted_validate_fixtures(data_dir).map_err(io::Error::other)?;
-    let fixture = fixtures.as_ref().is_some_and(|fixtures| {
+    let fixture =
+        fixture_destination_allowed(data_dir, url, grant_url).map_err(io::Error::other)?;
+    // Public destinations stay paused until owner grant UI and installed
+    // revocation/replay proof cover every hosted effect.
+    if !fixture {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "public hosted HTTPS remains paused",
+        ));
+    }
+    let host = url.host_str().ok_or_else(invalid_request)?;
+    let port = url.port_or_known_default().ok_or_else(invalid_request)?;
+    let addresses: Vec<SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await??
+    .collect();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|addr| addr.ip() != IpAddr::from([127, 0, 0, 1]))
+    {
+        return Err(invalid_request());
+    }
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addresses)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(STREAM_TIMEOUT)
+        .build()
+        .map_err(io::Error::other)
+}
+
+fn fixture_destination_allowed(
+    data_dir: &Path,
+    url: &Url,
+    grant_url: &str,
+) -> anyhow::Result<bool> {
+    let fixtures = load_hosted_validate_fixtures(data_dir)?;
+    Ok(fixtures.as_ref().is_some_and(|fixtures| {
         [
             Some(fixtures.openrouter_models_url.as_str()),
             Some(fixtures.venice_rate_limits_url.as_str()),
@@ -1022,51 +1244,10 @@ async fn pinned_client(data_dir: &Path, url: &Url, grant_url: &str) -> io::Resul
         // route. The private fixture pins that route, before the added query.
         .any(|pinned| pinned == grant_url)
     }) && url.scheme() == "http"
-        && url.host_str() == Some("127.0.0.1");
-    // Public destinations stay paused until owner grant UI and installed
-    // revocation/replay proof cover every hosted effect.
-    if !fixture {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "public hosted HTTPS remains paused",
-        ));
-    }
-    if !fixture
-        && (url.scheme() != "https"
-            || url.port_or_known_default() != Some(443)
-            || !matches!(url.host(), Some(url::Host::Domain(_))))
-    {
-        return Err(invalid_request());
-    }
-    let host = url.host_str().ok_or_else(invalid_request)?;
-    let port = url.port_or_known_default().ok_or_else(invalid_request)?;
-    let addresses: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await??
-    .collect();
-    if addresses.is_empty()
-        || addresses.iter().any(|addr| {
-            if fixture {
-                addr.ip() != IpAddr::from([127, 0, 0, 1])
-            } else {
-                !public_ip(addr.ip())
-            }
-        })
-    {
-        return Err(invalid_request());
-    }
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, &addresses)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(STREAM_TIMEOUT)
-        .build()
-        .map_err(io::Error::other)
+        && url.host_str() == Some("127.0.0.1"))
 }
 
+#[cfg(test)]
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
@@ -1190,6 +1371,248 @@ mod tests {
             .proof_binding_id
     }
 
+    fn approve_fixture(
+        data_dir: &Path,
+        offer_id: &str,
+        effect: &str,
+        method: &str,
+        destination: &Destination,
+        proof: &str,
+        run_binding: Option<(&str, &str)>,
+    ) -> String {
+        let scope = egress_scope(offer_id, effect, method, destination).unwrap();
+        let request_proof = run_binding.is_none().then_some(proof);
+        let id = model_provider_egress_decision::request(data_dir, &scope, request_proof).unwrap();
+        model_provider_egress_decision::approve(data_dir, &id, proof).unwrap();
+        create_grant_after_decision(
+            data_dir,
+            offer_id,
+            effect,
+            method,
+            destination,
+            request_proof,
+            run_binding,
+        )
+        .unwrap();
+        id
+    }
+
+    fn update_fixture_grant(data_dir: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+        let path = data_dir.join("providers/model-provider/egress-grants.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        change(&mut value);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    fn validation_fixture(url: &str, key: &str, endpoint: ValidationEndpoint) -> Destination {
+        Destination {
+            url: Url::parse(url).unwrap(),
+            grant_url: url.into(),
+            credential: Some(key.into()),
+            job_backend_id: None,
+            provider: endpoint.provider().into(),
+            configuration_id: hex::encode(Sha256::digest(
+                serde_json::to_vec(&(url, key, endpoint.grant_binding())).unwrap(),
+            )),
+        }
+    }
+
+    #[test]
+    fn owner_inbox_decision_precedes_exact_grant_and_end_stays_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        let destination = validation_fixture(
+            "http://127.0.0.1:9999/models",
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        let scope = egress_scope(
+            "validation:openrouter",
+            "validate_models",
+            "GET",
+            &destination,
+        )
+        .unwrap();
+        let id = model_provider_egress_decision::request(dir.path(), &scope, Some(&proof)).unwrap();
+        let summary = crate::notifications::load_summary(dir.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1);
+        let entry = &summary.entries[0];
+        assert!(entry.body.contains("Origin: http://127.0.0.1:9999"));
+        assert!(entry.body.contains("Data recipient: 127.0.0.1"));
+        assert!(entry.body.contains("Payer: this Home"));
+        assert!(entry.body.contains("Duration: 10 minutes"));
+        assert!(entry.body.contains("Load hosted model choices"));
+        assert_eq!(
+            entry.action_ref.as_ref().unwrap().action_id,
+            format!("model-egress-approve:{id}")
+        );
+        assert!(create_grant_after_decision(
+            dir.path(),
+            &scope.offer_id,
+            &scope.effect,
+            &scope.method,
+            &destination,
+            Some(&proof),
+            None
+        )
+        .is_err());
+        assert!(read_hosted_egress_grants(dir.path()).unwrap().is_none());
+        assert!(
+            model_provider_egress_decision::approve(dir.path(), "model-egress-stale", &proof)
+                .is_err()
+        );
+        assert!(model_provider_egress_decision::approve(dir.path(), &id, "wrong-proof").is_err());
+        model_provider_egress_decision::deny(dir.path(), &id, &proof).unwrap();
+        assert!(model_provider_egress_decision::approve(dir.path(), &id, &proof).is_err());
+        assert!(model_provider_egress_decision::request(dir.path(), &scope, Some(&proof)).is_err());
+
+        let mut rotated = destination;
+        rotated.configuration_id = "b".repeat(64);
+        let rotated_scope =
+            egress_scope("validation:openrouter", "validate_models", "GET", &rotated).unwrap();
+        let approved_id =
+            model_provider_egress_decision::request(dir.path(), &rotated_scope, Some(&proof))
+                .unwrap();
+        model_provider_egress_decision::approve(dir.path(), &approved_id, &proof).unwrap();
+        create_grant_after_decision(
+            dir.path(),
+            &rotated_scope.offer_id,
+            &rotated_scope.effect,
+            &rotated_scope.method,
+            &rotated,
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+        current_grant_for(
+            dir.path(),
+            &rotated_scope.offer_id,
+            &rotated_scope.effect,
+            &rotated_scope.method,
+            &rotated,
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+        assert!(current_grant_for(
+            dir.path(),
+            &scope.offer_id,
+            &scope.effect,
+            &scope.method,
+            &validation_fixture(
+                "http://127.0.0.1:9999/models",
+                "fixture-key",
+                ValidationEndpoint::OpenRouterModels
+            ),
+            Some(&proof),
+            None
+        )
+        .is_err());
+        model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
+        assert!(current_grant_for(
+            dir.path(),
+            &rotated_scope.offer_id,
+            &rotated_scope.effect,
+            &rotated_scope.method,
+            &rotated,
+            Some(&proof),
+            None
+        )
+        .is_err());
+        assert!(model_provider_egress_decision::approve(dir.path(), &approved_id, &proof).is_err());
+        assert!(
+            model_provider_egress_decision::request(dir.path(), &rotated_scope, Some(&proof))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn approved_route_can_bind_more_than_128_distinct_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        let destination = Destination {
+            url: Url::parse("http://127.0.0.1:9999/chat").unwrap(),
+            grant_url: "http://127.0.0.1:9999/chat".into(),
+            credential: None,
+            job_backend_id: None,
+            provider: "Fixture".into(),
+            configuration_id: "a".repeat(64),
+        };
+        let scope = egress_scope(
+            "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "text",
+            "POST",
+            &destination,
+        )
+        .unwrap();
+        let id = model_provider_egress_decision::request(dir.path(), &scope, None).unwrap();
+        model_provider_egress_decision::approve(dir.path(), &id, &proof).unwrap();
+        for index in 0..130 {
+            let run_id = format!("run:sha256:{index:064x}");
+            let request_id = format!("request-{index}");
+            create_grant_after_decision(
+                dir.path(),
+                &scope.offer_id,
+                &scope.effect,
+                &scope.method,
+                &destination,
+                None,
+                Some((&run_id, &request_id)),
+            )
+            .unwrap();
+            current_grant_for(
+                dir.path(),
+                &scope.offer_id,
+                &scope.effect,
+                &scope.method,
+                &destination,
+                None,
+                Some((&run_id, &request_id)),
+            )
+            .unwrap();
+        }
+        assert_eq!(grant_file(dir.path()).unwrap().grants.len(), 130);
+    }
+
+    #[tokio::test]
+    async fn public_validation_stays_paused_without_creating_an_inbox_request() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        assert!(fetch_validation(
+            dir.path(),
+            ValidationEndpoint::OpenRouterModels,
+            "fixture-key",
+            &proof,
+        )
+        .await
+        .is_err());
+        assert!(
+            super::super::model_provider_config::read_hosted_egress_decisions(dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(crate::notifications::load_summary(dir.path())
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn hosted_job_effects_require_the_persisted_create_result() {
         let dir = tempfile::tempdir().unwrap();
@@ -1262,28 +1685,23 @@ mod tests {
             "http://127.0.0.1:{}/create",
             sink.local_addr().unwrap().port()
         );
-        write_private(
-            &dir.path()
-                .join("providers/model-provider/egress-grants.json"),
-            json!({
-                "schema":"elastos.model.egress-grants/v1",
-                "grants":[{
-                    "offer_id":create.offer_id,"effect":"job_create","method":"POST",
-                    "url":url,"recipient":"127.0.0.1","payer":"this Home",
-                    "owner_proof_binding_id":proof,"run_id":create.run_id,
-                    "request_id":create.request_id,
-                    "expires_at_ms":job_binding_time_ms().unwrap()+60_000,"active":true
-                }]
-            })
-            .to_string()
-            .as_bytes(),
-        );
         let destination = Destination {
             url: Url::parse(&url).unwrap(),
             grant_url: url,
             credential: None,
             job_backend_id: Some(backend_id),
+            provider: "Fixture".into(),
+            configuration_id: "a".repeat(64),
         };
+        approve_fixture(
+            dir.path(),
+            &create.offer_id,
+            "job_create",
+            "POST",
+            &destination,
+            &proof,
+            Some((&create.run_id, &create.request_id)),
+        );
         let (mut broker, mut provider) = UnixStream::pair().unwrap();
         forward(&mut broker, dir.path(), &create, &destination, || true)
             .await
@@ -1333,28 +1751,24 @@ mod tests {
             method: reqwest::Method::POST,
             body: br#"{"request_id":"request-lost"}"#.to_vec(),
         };
-        write_private(
-            &root.join("egress-grants.json"),
-            json!({
-                "schema":"elastos.model.egress-grants/v1",
-                "grants":[{
-                    "offer_id":request.offer_id,"effect":"job_create","method":"POST",
-                    "url":url,"recipient":"127.0.0.1","payer":"this Home",
-                    "owner_proof_binding_id":proof,"run_id":request.run_id,
-                    "request_id":request.request_id,
-                    "expires_at_ms":job_binding_time_ms().unwrap()+60_000,"active":true
-                }]
-            })
-            .to_string()
-            .as_bytes(),
-        );
         let backend_id = "a".repeat(64);
         let destination = Destination {
             url: Url::parse(&url).unwrap(),
             grant_url: url,
             credential: None,
             job_backend_id: Some(backend_id.clone()),
+            provider: "Fixture".into(),
+            configuration_id: "a".repeat(64),
         };
+        approve_fixture(
+            dir.path(),
+            &request.offer_id,
+            "job_create",
+            "POST",
+            &destination,
+            &proof,
+            Some((&request.run_id, &request.request_id)),
+        );
         let sink_task = tokio::spawn(async move {
             let (mut socket, _) = sink.accept().await.unwrap();
             let mut request_bytes = Vec::new();
@@ -1531,31 +1945,20 @@ mod tests {
         let destination = resolve_effect(dir.path(), &request).unwrap();
         assert_eq!(destination.url.as_str(), path);
         assert!(current_grant(dir.path(), &request, &destination).is_err());
+        approve_fixture(
+            dir.path(),
+            &request.offer_id,
+            "text",
+            "POST",
+            &destination,
+            &proof,
+            Some((&request.run_id, &request.request_id)),
+        );
         let grant_path = root.join("egress-grants.json");
-        let grant = |active| {
-            json!({
-                "schema":"elastos.model.egress-grants/v1",
-                "grants":[{
-                    "offer_id":request.offer_id,
-                    "effect":"text",
-                    "method":"POST",
-                    "url":path,
-                    "recipient":"127.0.0.1",
-                    "payer":"this Home",
-                    "owner_proof_binding_id":proof,
-                    "run_id":request.run_id,
-                    "request_id":request.request_id,
-                    "expires_at_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000,
-                    "active":active
-                }]
-            })
-        };
-        let mut missing_run = grant(true);
-        missing_run["grants"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("run_id");
-        write_private(&grant_path, missing_run.to_string().as_bytes());
+        let valid_grant = fs::read(&grant_path).unwrap();
+        update_fixture_grant(dir.path(), |file| {
+            file["grants"][0].as_object_mut().unwrap().remove("run_id");
+        });
         assert!(current_grant(dir.path(), &request, &destination).is_err());
         let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
         forward(&mut denied, dir.path(), &request, &destination, || true)
@@ -1570,7 +1973,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        fs::write(&grant_path, grant(true).to_string()).unwrap();
+        fs::write(&grant_path, &valid_grant).unwrap();
         current_grant(dir.path(), &request, &destination).unwrap();
         let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
         forward(&mut denied, dir.path(), &request, &destination, || false)
@@ -1609,8 +2012,26 @@ mod tests {
             observed.contains("authorization: Bearer fixture-secret")
                 || observed.contains("Authorization: Bearer fixture-secret")
         );
-        fs::write(&grant_path, grant(false).to_string()).unwrap();
+        let continued = EffectRequest {
+            run_id: format!("run:sha256:{}", "1".repeat(64)),
+            request_id: "fixture-continue".into(),
+            ..request.clone()
+        };
+        assert!(current_grant(dir.path(), &continued, &destination).is_err());
+        create_grant_after_decision(
+            dir.path(),
+            &continued.offer_id,
+            "text",
+            "POST",
+            &destination,
+            None,
+            Some((&continued.run_id, &continued.request_id)),
+        )
+        .unwrap();
+        current_grant(dir.path(), &continued, &destination).unwrap();
+        model_provider_egress_decision::end_offer(dir.path(), &request.offer_id).unwrap();
         assert!(current_grant(dir.path(), &request, &destination).is_err());
+        assert!(current_grant(dir.path(), &continued, &destination).is_err());
         let mut other = EffectRequest {
             effect: "decisions".into(),
             ..request
@@ -1683,24 +2104,20 @@ mod tests {
         )
         .await
         .is_err());
-        let grant_path = root.join("egress-grants.json");
-        let grant = |active| {
-            json!({
-                "schema":"elastos.model.egress-grants/v1",
-                "grants":[{
-                    "offer_id":"validation:openrouter",
-                    "effect":"validate_models",
-                    "method":"GET",
-                    "url":models_url,
-                    "recipient":"127.0.0.1",
-                    "payer":"this Home",
-                    "owner_proof_binding_id":proof,
-                    "expires_at_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000,
-                    "active":active
-                }]
-            })
-        };
-        write_private(&grant_path, grant(true).to_string().as_bytes());
+        let destination = validation_fixture(
+            &models_url,
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        approve_fixture(
+            dir.path(),
+            "validation:openrouter",
+            "validate_models",
+            "GET",
+            &destination,
+            &proof,
+            None,
+        );
         assert!(fetch_validation(
             dir.path(),
             ValidationEndpoint::OpenRouterModels,
@@ -1737,7 +2154,7 @@ mod tests {
             observed.contains("authorization: Bearer fixture-key")
                 || observed.contains("Authorization: Bearer fixture-key")
         );
-        fs::write(&grant_path, grant(false).to_string()).unwrap();
+        model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
         assert!(fetch_validation(
             dir.path(),
             ValidationEndpoint::OpenRouterModels,
@@ -1771,19 +2188,20 @@ mod tests {
             .to_string()
             .as_bytes(),
         );
-        let grant_path = root.join("egress-grants.json");
-        let grant = |active| {
-            json!({
-                "schema":"elastos.model.egress-grants/v1",
-                "grants":[{
-                    "offer_id":"validation:openrouter","effect":"validate_models",
-                    "method":"GET","url":models_url,"recipient":"127.0.0.1",
-                    "payer":"this Home","owner_proof_binding_id":proof,
-                    "expires_at_ms":job_binding_time_ms().unwrap()+60_000,"active":active
-                }]
-            })
-        };
-        write_private(&grant_path, grant(true).to_string().as_bytes());
+        let destination = validation_fixture(
+            &models_url,
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        approve_fixture(
+            dir.path(),
+            "validation:openrouter",
+            "validate_models",
+            "GET",
+            &destination,
+            &proof,
+            None,
+        );
         let (accepted, observed) = tokio::sync::oneshot::channel();
         let sink_task = tokio::spawn(async move {
             let (mut socket, _) = sink.accept().await.unwrap();
@@ -1807,7 +2225,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        fs::write(&grant_path, grant(false).to_string()).unwrap();
+        model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), validation)
             .await
             .expect("revoked validation must stop before its 20-second timeout")

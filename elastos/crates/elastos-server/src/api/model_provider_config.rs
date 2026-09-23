@@ -936,7 +936,68 @@ pub(super) fn read_hosted_egress_grants(data_dir: &Path) -> anyhow::Result<Optio
         &model_provider_root_dir(data_dir),
         "model-provider config root",
     )?;
-    read_model_provider_private_file(&path, &metadata, 64 * 1024, "hosted egress grants").map(Some)
+    read_model_provider_private_file(&path, &metadata, 1024 * 1024, "hosted egress grants")
+        .map(Some)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn write_hosted_egress_grants(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= 1024 * 1024,
+        "hosted egress grants exceed limit"
+    );
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    write_model_provider_config_atomic(
+        &model_provider_root_dir(data_dir).join("egress-grants.json"),
+        bytes,
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn read_hosted_egress_decisions(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let path = model_provider_root_dir(data_dir).join("egress-decisions.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect hosted egress decisions"),
+    };
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    read_model_provider_private_file(&path, &metadata, 64 * 1024, "hosted egress decisions")
+        .map(Some)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn write_hosted_egress_decisions(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= 64 * 1024,
+        "hosted egress decisions exceed limit"
+    );
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    write_model_provider_config_atomic(
+        &model_provider_root_dir(data_dir).join("egress-decisions.json"),
+        bytes,
+    )
 }
 
 pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
