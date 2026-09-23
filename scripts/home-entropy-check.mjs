@@ -12576,6 +12576,13 @@ assert(
   );
 
   assert(
+    read("capsules/archive-manager/browser/index.html").includes('    :root[data-el-form-factor="phone"] .journey-button {\n      min-height: var(--el-touch-target);') &&
+      /"archive-manager": 0, "elacity-player"/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
+      /"archive-manager": 0, "elacity-player"/.test(capsuleRatchet[1].split('"phone-landscape"')[1]),
+    "Archive phone: Open archive and New ZIP are at least 44 px on every engine (padding plus one line rounded to 43 on some), held at 0 small targets by the phone smoke",
+  );
+
+  assert(
     read("capsules/browser/browser/style.css").includes(':root[data-el-form-factor="phone"] .browser-chrome {\n  min-height: 56px;') &&
       read("scripts/browser-product-layout-smoke.mjs").includes('"Browser phone toolbar must start at the leading edge"') &&
       justfile.includes("node scripts/browser-product-layout-smoke.mjs"),
