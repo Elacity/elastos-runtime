@@ -12525,6 +12525,15 @@ assert(
   );
 
   assert(
+    documentsIndex.includes(':root[data-el-form-factor="phone"] .workspace-tab {\n  width: var(--el-touch-target);\n  height: var(--el-touch-target);\n  padding: 3px;\n  border: 0;\n  background-clip: content-box;') &&
+      documentsIndex.includes(':root[data-el-form-factor="phone"] .title-input {\n  flex: 1 1 auto;\n  min-height: var(--el-touch-target);') &&
+      documentsSmoke.includes("closed.titleHeight >= PHONE_TOUCH_TARGET_PX && closed.rowTargets.every((target) => target.height >= PHONE_TOUCH_TARGET_PX)") &&
+      /documents: 0, marketplace/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
+      /documents: 0, marketplace/.test(capsuleRatchet[1].split('"phone-landscape"')[1]),
+    "Documents phone: the title and the Write/Read tabs are full 44 px targets (the tab pill paints inside its padding), asserted by the layout smoke and held at 0 small targets by the phone smoke",
+  );
+
+  assert(
     read("capsules/library/browser/library.css").includes('    :root[data-el-form-factor="phone"] .sidebar {\n      position: absolute;') &&
       read("scripts/library-product-layout-smoke.mjs").includes("Library phone: Favorites must be one sliding row of 44 px chips"),
     "Library phone: one header block (navigation row, then Favorites as a sliding chip row), asserted by the layout smoke",

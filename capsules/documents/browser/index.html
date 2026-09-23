@@ -1381,6 +1381,7 @@ a {
 
 :root[data-el-form-factor="phone"] .title-input {
   flex: 1 1 auto;
+  min-height: var(--el-touch-target);
   min-width: 0;
   max-width: none;
   font-size: 20px;
@@ -1458,13 +1459,22 @@ a {
   min-height: var(--el-touch-target);
 }
 
+/* Each tab is a full 44 px target; the pill paints only inside its padding,
+   and the ring is a shadow so no border eats into the target. */
 :root[data-el-form-factor="phone"] .workspace-toggle {
   height: var(--el-touch-target);
+  padding: 0;
+  gap: 0;
+  border: 0;
+  box-shadow: inset 0 0 0 1px var(--line);
 }
 
 :root[data-el-form-factor="phone"] .workspace-tab {
-  width: 40px;
-  height: 38px;
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  padding: 3px;
+  border: 0;
+  background-clip: content-box;
 }
 
 :root[data-el-form-factor="phone"] #mode-split,

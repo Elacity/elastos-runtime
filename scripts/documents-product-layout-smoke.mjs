@@ -335,6 +335,7 @@ async function assertPhoneMoreMenu(page) {
       rowOverflow: row.scrollWidth - row.clientWidth,
       rowTargets: [...row.querySelectorAll("button")].filter(visible).filter((button) => !menu.contains(button))
         .map((button) => ({ id: button.id, height: Math.round(button.getBoundingClientRect().height) })),
+      titleHeight: Math.round(document.getElementById("title-input").getBoundingClientRect().height),
       expanded: document.getElementById("more-button").getAttribute("aria-expanded"),
       menuOpen: visible(menu) && menuRect.height > 0,
       menuOnTop: menu.contains(document.elementFromPoint(menuRect.left + menuRect.width / 2, menuRect.top + menuRect.height / 2)),
@@ -359,8 +360,8 @@ async function assertPhoneMoreMenu(page) {
     `Documents phone: the row holds Write, Read, Save and More without scrolling; the rest waits in More. Got ${JSON.stringify(closed)}`,
   );
   assert(
-    closed.rowTargets.filter((target) => !target.id.startsWith("mode-")).every((target) => target.height >= PHONE_TOUCH_TARGET_PX),
-    `Documents phone: Save and More must be 44 px targets. Got ${JSON.stringify(closed.rowTargets)}`,
+    closed.titleHeight >= PHONE_TOUCH_TARGET_PX && closed.rowTargets.every((target) => target.height >= PHONE_TOUCH_TARGET_PX),
+    `Documents phone: the title, Write, Read, Save and More must be 44 px targets. Got ${JSON.stringify(closed)}`,
   );
 
   await page.locator("#more-button").click();
