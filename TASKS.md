@@ -182,7 +182,7 @@ in order; each target keeps its own acceptance evidence.
    engine is unavailable, identity differs, or resource/hosting limits fail.
    The dated Get and two typed runs are in
    `.audit/public-seed-gate-61974/receipt.json`; they do not prove the public
-   or local `d60dc043` installation.
+   or local `a1573675` code path.
 2. **J3 / MA1 — public Home:** Only after the isolated engine and resource
    facts pass, request exact approval for one public Marketplace Get. First
    refresh the read-only public free-space and hosting-policy preflight; the
