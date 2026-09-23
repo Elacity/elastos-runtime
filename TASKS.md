@@ -474,6 +474,19 @@ the Linux confinement fixture into the production provider path, then prove
 the installed SmolLM2 and hosted routes on each target. Keep public HTTPS
 paused until its separate owner and target proofs pass.
 
+Owner Inbox route history and exact End are now checked on the isolated Mac
+diagnostic Home. Its private decision file supplies current dispatch authority;
+expired records are retained in write-once private history files. Inbox shows
+Pending, Approved, Denied and Ended route facts to the admin passkey owner,
+with a keyboard-operable End action. A fresh validation after installed Inbox
+End made zero new requests to the controlled sink. Built/installed Runtime,
+source/installed/served Inbox hashes, browser keyboard actions and exact
+restoration are recorded in `.audit/sec1-inbox-history/`. The prior diagnostic
+Runtime and Inbox file are running again, and both signed-in human Homes remain
+open. Next: Linux product confinement, upstream unknown-attempt reconciliation,
+and separate public HTTPS owner/target proof; wider MA/AI/CR acceptance remains
+open.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty

@@ -1,5 +1,30 @@
 # State
 
+## Owner Inbox hosted-route history, 23 September 2026 UTC
+
+On macOS, Inbox now reads the Runtime's private hosted-route decisions for an
+admin passkey owner. It shows Pending, Approved, Denied, Ended and Expired with
+the exact origin, recipient, payer and expiry. The owner can End an active
+route in Inbox. Finished records move into private write-once history files
+when they expire; active decisions remain the sole dispatch authority. Shared
+Home notifications do not carry these route facts. Public HTTPS remains paused.
+
+The diagnostic Home at port 61971 ran source commit `297f699e` with built and
+installed Runtime SHA-256 `4b6b6fc0d0e87a2824bf429fcf073ac3aa2f42f1f57b1061dd2219357a7c7f7e`.
+Its installed and served Inbox file matched source SHA-256
+`848c7637f5113a0a480916dc1e85515d8edc93d6ace95cda23b1f400c9b80a03`.
+In the installed Inbox, keyboard Approve changed Pending to Approved, and
+keyboard End changed Approved to Ended. A new System Validate with the same
+dummy key returned 400 after End and made zero new controlled-sink connections;
+before approval it also returned 400 with zero connections, while the approved
+validation sent one exact request. Denied remained visible without an End
+action. The diagnostic binary, Inbox file, installation receipt and private
+authority manifest were then restored to their original hashes; all three
+Homes return HTTP 200. No paid call occurred. The source tests, Inbox browser
+smokes and bounded independent review passed. Receipts are retained under
+`.audit/sec1-inbox-history/`. This is isolated Mac fixture proof, not public
+HTTPS or Linux product acceptance.
+
 ## Mac hosted route approval checkpoint, 23 September 2026 UTC
 
 Runtime now requires an exact owner Inbox decision before the macOS hosted
