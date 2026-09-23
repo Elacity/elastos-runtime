@@ -12510,6 +12510,20 @@ assert(
     "Documents phone: the editor takes the full width, the list is the push drawer and Split is hidden, asserted by the layout smoke",
   );
 
+  const documentsSmoke = read("scripts/documents-product-layout-smoke.mjs");
+  assert(
+    documentsIndex.includes('<div id="more-menu" class="more-menu" role="group" aria-label="More actions">') &&
+      documentsIndex.includes('aria-expanded="false" aria-controls="more-menu"') &&
+      documentsIndex.includes(".toolbar-more,\n.more-menu {\n  display: contents;\n}") &&
+      documentsIndex.includes(':root[data-el-form-factor="phone"] .toolbar-more[data-open="true"] .more-menu {\n  display: flex;') &&
+      documentsIndex.includes(':root[data-el-form-factor="phone"] .more-menu .action-icon-button::after {\n  content: attr(aria-label);') &&
+      documentsIndex.includes("  /* The narrow-window row scrolls, which would clip the More menu. */\n  overflow: visible;") &&
+      documentsIndex.includes("  wireMoreMenu();\n") &&
+      documentsSmoke.includes("    await assertPhoneMoreMenu(page);\n") &&
+      documentsSmoke.includes("open.menuOpen && open.menuOnTop && open.expanded === \"true\" && open.menuInViewport"),
+    "Documents phone: Write/Read and Save stay in one unscrolled row and the secondary actions move into a More menu of labelled 44 px rows (desktop keeps them inline), asserted on screen by the layout smoke",
+  );
+
   assert(
     read("capsules/library/browser/library.css").includes('    :root[data-el-form-factor="phone"] .sidebar {\n      position: absolute;') &&
       read("scripts/library-product-layout-smoke.mjs").includes("Library phone: Favorites must be one sliding row of 44 px chips"),

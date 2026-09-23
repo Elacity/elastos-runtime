@@ -10,6 +10,8 @@ import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor
 
 const PHONE_SCREENSHOT = "/tmp/documents-phone-390x844.png";
 const PHONE_DRAWER_SCREENSHOT = "/tmp/documents-phone-drawer-390x844.png";
+const PHONE_MORE_SCREENSHOT = "/tmp/documents-phone-more-390x844.png";
+const PHONE_TOUCH_TARGET_PX = 44;
 
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
@@ -317,6 +319,75 @@ function createAppServer() {
   });
 }
 
+// Phone keeps view and Save in the row; the secondary actions live behind More.
+async function assertPhoneMoreMenu(page) {
+  const readMenu = () => page.evaluate(() => {
+    const visible = (node) => node instanceof HTMLElement && node.getClientRects().length > 0;
+    const row = document.querySelector(".toolbar-actions");
+    const menu = document.getElementById("more-menu");
+    const menuRect = menu.getBoundingClientRect();
+    const items = [...menu.querySelectorAll("button")].filter(visible).map((button) => ({
+      id: button.id,
+      height: Math.round(button.getBoundingClientRect().height),
+      label: getComputedStyle(button, "::after").content.replace(/^"|"$/g, ""),
+    }));
+    return {
+      rowOverflow: row.scrollWidth - row.clientWidth,
+      rowTargets: [...row.querySelectorAll("button")].filter(visible).filter((button) => !menu.contains(button))
+        .map((button) => ({ id: button.id, height: Math.round(button.getBoundingClientRect().height) })),
+      expanded: document.getElementById("more-button").getAttribute("aria-expanded"),
+      menuOpen: visible(menu) && menuRect.height > 0,
+      menuOnTop: menu.contains(document.elementFromPoint(menuRect.left + menuRect.width / 2, menuRect.top + menuRect.height / 2)),
+      clippedBy: (() => {
+        const chain = [];
+        for (let node = menu.parentElement; node; node = node.parentElement) {
+          const style = getComputedStyle(node);
+          if (style.overflow !== "visible" || style.zIndex !== "auto") {
+            chain.push(`${node.tagName}.${node.className} overflow=${style.overflow} z=${style.zIndex}`);
+          }
+        }
+        return chain;
+      })(),
+      menuInViewport: menuRect.left >= 0 && menuRect.right <= window.innerWidth,
+      items,
+    };
+  });
+  const closed = await readMenu();
+  assert(
+    closed.rowOverflow <= 1 && !closed.menuOpen && closed.expanded === "false"
+      && closed.rowTargets.map((target) => target.id).join(",") === "mode-write,mode-read,save-button,more-button",
+    `Documents phone: the row holds Write, Read, Save and More without scrolling; the rest waits in More. Got ${JSON.stringify(closed)}`,
+  );
+  assert(
+    closed.rowTargets.filter((target) => !target.id.startsWith("mode-")).every((target) => target.height >= PHONE_TOUCH_TARGET_PX),
+    `Documents phone: Save and More must be 44 px targets. Got ${JSON.stringify(closed.rowTargets)}`,
+  );
+
+  await page.locator("#more-button").click();
+  const open = await readMenu();
+  await page.screenshot({ path: PHONE_MORE_SCREENSHOT });
+  const ids = open.items.map((item) => item.id);
+  assert(
+    open.menuOpen && open.menuOnTop && open.expanded === "true" && open.menuInViewport
+      && ["save-as-button", "publish-button", "unpublish-button", "delete-button"].every((id) => ids.includes(id)),
+    `Documents phone: More must open on screen with Save as, Publish, Unpublish and Delete. Got ${JSON.stringify(open)}`,
+  );
+  assert(
+    open.items.every((item) => item.height >= PHONE_TOUCH_TARGET_PX && item.label.length > 0),
+    `Documents phone: each More action must be a labelled 44 px row. Got ${JSON.stringify(open.items)}`,
+  );
+
+  await page.keyboard.press("Escape");
+  const escaped = await readMenu();
+  const focused = await page.evaluate(() => document.activeElement?.id || "");
+  assert(!escaped.menuOpen && escaped.expanded === "false" && focused === "more-button", `Documents phone: Escape must close More and return focus. Got ${JSON.stringify({ escaped, focused })}`);
+
+  await page.locator("#more-button").click();
+  await page.locator("#editor").click();
+  const dismissed = await readMenu();
+  assert(!dismissed.menuOpen && dismissed.expanded === "false", `Documents phone: tapping outside must close More. Got ${JSON.stringify(dismissed)}`);
+}
+
 async function assertNoHorizontalOverflow(page, label) {
   const overflow = await page.evaluate(() => ({
     body: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -578,6 +649,7 @@ async function run() {
       phoneEditor.editorFont === "16px" && phoneEditor.splitHidden && phoneEditor.hideListHidden,
       `Documents phone: 16 px editor (no iOS focus zoom), no Split or Hide list controls. Got ${JSON.stringify(phoneEditor)}`,
     );
+    await assertPhoneMoreMenu(page);
     await assertPhoneDrawer(page, page, {
       label: "Documents",
       drawer: "#documents-sidebar",
