@@ -327,6 +327,30 @@ HTTPS routing and per-platform process confinement. Keep saved Venice and Jev
 state, the pending Inbox request, and the signed-in Homes available for the
 person's later test; this fixture made no paid request.
 
+Admin/run broker checkpoint: source now requires an active admin passkey
+principal for each private egress grant. System Validate/Save binds that grant
+to its verified Home admin launch proof; model effects also require exact
+run/request fields and a Runtime bridge record created from a valid typed
+`runs_create` binding after the provider pipe flushes. The bridge records only
+hosted offers, so local Smol runs do not consume its admission table. Narrow
+source tests passed for absent run authority, wrong admin proof, wrong run
+fields and exact local dispatch. Diagnostic Home 61971 runs matching built and
+installed Runtime SHA-256 `fe74ea8f` and provider SHA-256 `c23d3e7e`; its
+dummy-key System route denied absent/wrong proof with zero sink connections,
+sent one exact-grant request, then denied after revoke with zero new
+connections. The grant is inactive, all 18 protected hash/inode records match,
+the signed-in Homes return 200, and disk free space remains above 20%. No paid
+call was made. The first installer pass stopped on object-provider's separate
+stale lockfile; a one-entry lock update let the canonical installer pass.
+Independent review confirmed the dispatch gate and identified one bounded
+availability limit: up to 4,096 hosted run records can remain for two hours
+when completion is never observed. Next: installed model-effect denial with
+an exact run/request, HTTP-job status/cancel binding, active validation
+revocation, then public HTTPS consent/routing and Linux confinement. Public
+HTTPS stays paused; this diagnostic source/installed proof is not public
+activation or a completed five-outcome candidate. Receipt:
+`.audit/hosted-egress-design-scratch/admin-run-installed-receipt.json`.
+
 Accepted regression evidence for the original five outcomes:
 
 1. **CR1/CR2 prerequisite closeout — verified:** source lineage and installed

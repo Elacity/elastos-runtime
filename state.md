@@ -119,6 +119,22 @@ run/request and HTTP-job IDs, prompt active validation revocation, and target
 process-isolation proof. Receipt:
 `.audit/hosted-egress-design-scratch/hosted-broker-diagnostic-installed.json`.
 
+The next diagnostic build binds private egress to an active admin passkey proof
+and exact Runtime-issued hosted run/request. System Validate/Save uses its
+verified Home launch proof, and the broker accepts a model run only after the
+Runtime provider pipe flushes its typed create request. Local Smol runs do not
+enter this hosted table. Source tests covered the denied and exact fixture
+paths. Diagnostic Home 61971 has built/installed Runtime SHA-256 `fe74ea8f`
+and provider SHA-256 `c23d3e7e`; its dummy-key System route made zero sink
+connections for absent or wrong admin proof, one for the exact grant, and zero
+new connections after revoke. The provider manifest passes. The two human
+Homes remain signed in and return 200; all 18 protected hash/inode records
+match. Public HTTPS remains paused. Installed model-effect run binding and
+HTTP-job identity, active validation revoke, per-platform process isolation,
+and public owner consent still need proof. An unobserved hosted completion can
+hold one of 4,096 run slots until its two-hour expiry. Receipt:
+`.audit/hosted-egress-design-scratch/admin-run-installed-receipt.json`.
+
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each
 returned a bound pre-dispatch refusal with zero provider calls. Earlier runs
