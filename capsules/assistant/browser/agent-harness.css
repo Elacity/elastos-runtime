@@ -2856,6 +2856,15 @@ html[data-agent-reasoning="off"] .agent-thinking {
   }
 }
 
+/* Phone: the composer keeps Home's Dock gutter, so the Dock → composer morph
+   holds its width end to end. */
+@media (max-width: 640px) {
+  .taskbar.is-agent-face {
+    width: min(720px, calc(100vw - 20px));
+    max-width: calc(100vw - 20px);
+  }
+}
+
 /* Composer toolbar — one shared 32px control box on every viewport.
    (Was mobile-only; desktop showed mixed 28/30px heights = "raised" chips.) */
 .taskbar.is-agent-face .agent-composer-toolbar {

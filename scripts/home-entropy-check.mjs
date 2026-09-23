@@ -12395,6 +12395,20 @@ assert(
     "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.15x to stay lighter than the plates (the Assistant only with its plate-free mark), Control Centre and Notifications span the stage with even margins",
   );
 
+  // Phone Assistant morph: Home's stretch target and the capsule's composer
+  // share the Dock's 20 px gutter, so the pill never narrows then snaps back.
+  const assistantFace = read("capsules/home-gui/browser/shell-assistant-face.js");
+  assert(
+    assistantFace.includes("const FACE_GUTTER_PHONE = 20;") &&
+      assistantFace.includes("return window.innerWidth - (isPhone() ? FACE_GUTTER_PHONE : FACE_GUTTER);") &&
+      assistantFace.includes("const maxW = Math.max(FACE_MIN_W, faceViewportWidth());") &&
+      assistantFace.includes("return Math.round(Math.min(width, faceViewportWidth()));") &&
+      !assistantFace.includes("innerWidth - 48") &&
+      homeGuiStyle.includes("  .taskbar.is-assistant-face {\n    width: var(--assistant-face-w, calc(100vw - 20px));\n    max-width: calc(100vw - 20px);") &&
+      assistantStyle.includes("@media (max-width: 640px) {\n  .taskbar.is-agent-face {\n    width: min(720px, calc(100vw - 20px));\n    max-width: calc(100vw - 20px);"),
+    "Home phone Assistant morph: the stretch targets the phone Dock gutter (20 px) and the Assistant's phone composer keeps it, so the pill holds its width from Dock to composer",
+  );
+
   // Capsule layout: the shell tells every capsule frame its size class; the
   // shared theme runtime accepts it only from the opaque parent and only from
   // an allowlist, and the shared sheet zeroes the desktop chrome safe areas on
