@@ -345,11 +345,26 @@ stale lockfile; a one-entry lock update let the canonical installer pass.
 Independent review confirmed the dispatch gate and identified one bounded
 availability limit: up to 4,096 hosted run records can remain for two hours
 when completion is never observed. Next: installed model-effect denial with
-an exact run/request, HTTP-job status/cancel binding, active validation
-revocation, then public HTTPS consent/routing and Linux confinement. Public
+an exact run/request, active validation revocation, then public HTTPS
+consent/routing and Linux confinement. Public
 HTTPS stays paused; this diagnostic source/installed proof is not public
 activation or a completed five-outcome candidate. Receipt:
 `.audit/hosted-egress-design-scratch/admin-run-installed-receipt.json`.
+
+HTTP-job source checkpoint: Runtime now records a successful create result in
+a private, bounded atomic file before returning the job ID to the provider.
+Status and cancel require the exact offer, run, request, job ID, backend routes
+and credential identity. An authorized retry of a recorded create returns the
+same job ID without a second upstream create. Per-key reservations allow
+unrelated creates to proceed while one upstream is slow. Runtime canonicalizes
+the checked JSON body before forwarding it. Source checks cover missing and
+wrong job IDs, route and account drift, replay without a second dispatch, and
+the existing exact-grant fixture. Independent review found and verified fixes
+for lock, replay, route and account-binding gaps. This checkpoint has no
+installed HTTP-job effect proof. An upstream that accepts create but loses its
+response before Runtime records a job ID can still leave settlement unknown;
+upstream request-ID idempotency or lookup is needed for full recovery. Public
+HTTPS remains paused.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
