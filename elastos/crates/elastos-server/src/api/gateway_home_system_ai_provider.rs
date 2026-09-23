@@ -478,6 +478,14 @@ pub(super) async fn system_approval_lens_revoke(
         };
     #[cfg(not(target_os = "macos"))]
     let ended_https = 0;
+    #[cfg(target_os = "macos")]
+    let ended_demo =
+        match crate::api::model_provider_egress::end_demo_text_offer(&state.data_dir, &req.id) {
+            Ok(ended) => ended,
+            Err(err) => return system_error_response(err),
+        };
+    #[cfg(not(target_os = "macos"))]
+    let ended_demo = false;
     let jev_active = crate::jev_approval_lens::approved_connection(&state.data_dir, &req.id);
     if jev_active {
         if let Err(err) =
@@ -486,7 +494,7 @@ pub(super) async fn system_approval_lens_revoke(
             return system_error_response(err);
         }
     }
-    if ended_https == 0 && !jev_active {
+    if ended_https == 0 && !ended_demo && !jev_active {
         return system_error_response(anyhow::anyhow!("hosted connection has no active approval"));
     }
     Json(serde_json::json!({ "offer_id": req.id, "approval": "ended" })).into_response()
@@ -518,6 +526,13 @@ pub(super) async fn system_ai_provider_get(
                     else {
                         continue;
                     };
+                    #[cfg(target_os = "macos")]
+                    if crate::api::model_provider_egress::demo_text_offer_ready(
+                        &state.data_dir,
+                        &id,
+                    ) {
+                        connection["egress_state"] = serde_json::json!("demo_ready");
+                    }
                     #[cfg(target_os = "macos")]
                     match crate::api::model_provider_egress_decision::offer_state(
                         &state.data_dir,

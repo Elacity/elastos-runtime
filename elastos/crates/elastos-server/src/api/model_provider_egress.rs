@@ -414,20 +414,28 @@ async fn handle(
         Ok(scope) => scope,
         Err(_) => return deny(&mut stream).await,
     };
-    if model_provider_egress_decision::active(data_dir, &scope, None).is_err() {
-        let _ = model_provider_egress_decision::request(data_dir, &scope, None);
-        return deny(&mut stream).await;
-    }
-    if create_grant_after_decision(
+    let demo = demo_text_route(
         data_dir,
         &request.offer_id,
         &request.effect,
         request.method.as_str(),
         &destination,
-        None,
-        Some((&request.run_id, &request.request_id)),
-    )
-    .is_err()
+    );
+    if !demo && model_provider_egress_decision::active(data_dir, &scope, None).is_err() {
+        let _ = model_provider_egress_decision::request(data_dir, &scope, None);
+        return deny(&mut stream).await;
+    }
+    if !demo
+        && create_grant_after_decision(
+            data_dir,
+            &request.offer_id,
+            &request.effect,
+            request.method.as_str(),
+            &destination,
+            None,
+            Some((&request.run_id, &request.request_id)),
+        )
+        .is_err()
         || current_grant(data_dir, &request, &destination).is_err()
     {
         return deny(&mut stream).await;
@@ -734,6 +742,140 @@ fn egress_scope(
     })
 }
 
+// Operator-authorized, expiring local demo window. No environment variable is
+// set by default. The route stays pinned to this one saved Venice instance;
+// the provider still runs behind the Runtime broker and its normal limits.
+fn demo_window_for_offer(data_dir: &Path, offer_id: &str) -> bool {
+    let Ok(root) = std::env::var("ELASTOS_DEMO_HOSTED_DATA_DIR") else {
+        return false;
+    };
+    let Ok(named_offer) = std::env::var("ELASTOS_DEMO_HOSTED_OFFER_ID") else {
+        return false;
+    };
+    let Ok(until) = std::env::var("ELASTOS_DEMO_HOSTED_UNTIL_MS") else {
+        return false;
+    };
+    let Ok(until) = until.parse::<u64>() else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now = now.as_millis() as u64;
+    demo_window_matches(data_dir, offer_id, &root, &named_offer, until, now)
+        && !demo_window_revoked(data_dir, offer_id, until)
+}
+
+fn demo_revoke_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(".audit/temporary-hosted-demo-revoked.json")
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DemoRevocation {
+    offer_id: String,
+    until_ms: u64,
+}
+
+fn demo_window_revoked(data_dir: &Path, offer_id: &str, until: u64) -> bool {
+    let bytes = match std::fs::read(demo_revoke_path(data_dir)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let Ok(revoked) = serde_json::from_slice::<DemoRevocation>(&bytes) else {
+        return true;
+    };
+    revoked.offer_id == offer_id && revoked.until_ms == until
+}
+
+pub(crate) fn end_demo_text_offer(data_dir: &Path, offer_id: &str) -> anyhow::Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let (Ok(root), Ok(named_offer), Ok(until)) = (
+        std::env::var("ELASTOS_DEMO_HOSTED_DATA_DIR"),
+        std::env::var("ELASTOS_DEMO_HOSTED_OFFER_ID"),
+        std::env::var("ELASTOS_DEMO_HOSTED_UNTIL_MS"),
+    ) else {
+        return Ok(false);
+    };
+    let Ok(until) = until.parse::<u64>() else {
+        return Ok(false);
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+    if !demo_window_matches(data_dir, offer_id, &root, &named_offer, until, now) {
+        return Ok(false);
+    }
+    if demo_window_revoked(data_dir, offer_id, until) {
+        return Ok(true);
+    }
+    let path = demo_revoke_path(data_dir);
+    std::fs::create_dir_all(path.parent().expect("demo revoke parent"))?;
+    std::fs::write(
+        path,
+        serde_json::to_vec(&DemoRevocation {
+            offer_id: offer_id.into(),
+            until_ms: until,
+        })?,
+    )?;
+    Ok(true)
+}
+
+fn demo_window_matches(
+    data_dir: &Path,
+    offer_id: &str,
+    root: &str,
+    named_offer: &str,
+    until: u64,
+    now: u64,
+) -> bool {
+    data_dir == Path::new(root)
+        && named_offer == offer_id
+        && until > now
+        && until - now <= 2 * 60 * 60 * 1000
+}
+
+fn demo_text_route(
+    data_dir: &Path,
+    offer_id: &str,
+    effect: &str,
+    method: &str,
+    destination: &Destination,
+) -> bool {
+    cfg!(target_os = "macos")
+        && demo_window_for_offer(data_dir, offer_id)
+        && effect == "text"
+        && method == "POST"
+        && destination.provider == "Venice"
+        && destination.grant_url == VENICE_CHAT_URL
+        && destination.url.scheme() == "https"
+        && destination.fixture_ca_pem.is_none()
+}
+
+pub(crate) fn demo_text_offer_ready(data_dir: &Path, offer_id: &str) -> bool {
+    if !cfg!(target_os = "macos") || !demo_window_for_offer(data_dir, offer_id) {
+        return false;
+    }
+    load_model_provider_operator_offers(data_dir)
+        .ok()
+        .and_then(|offers| {
+            offers.into_iter().find(|offer| {
+                offer["id"] == offer_id
+                    && offer["enabled"] != false
+                    && offer["operation"] == "text.generate"
+                    && offer["adapter"]["kind"] == "open_ai_compatible_text"
+                    && offer["adapter"]["api_url"] == VENICE_CHAT_URL
+                    && offer["adapter"]["hosted"]["backend_provider_label"] == "Venice"
+            })
+        })
+        .is_some()
+        && read_hosted_secret(data_dir, offer_id)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
 fn grant_file(data_dir: &Path) -> anyhow::Result<GrantFile> {
     let Some(bytes) = read_hosted_egress_grants(data_dir)? else {
         return Ok(GrantFile {
@@ -809,6 +951,9 @@ fn current_grant_for(
     current_admin_proof: Option<&str>,
     run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
+    if demo_text_route(data_dir, offer_id, effect, method, destination) {
+        return Ok(());
+    }
     let scope = egress_scope(offer_id, effect, method, destination)?;
     let decision = model_provider_egress_decision::active(data_dir, &scope, current_admin_proof)?;
     let file = grant_file(data_dir)?;
@@ -1448,6 +1593,53 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+
+    #[test]
+    fn temporary_demo_window_matches_only_one_home_offer_and_short_future() {
+        let home = Path::new("/private/demo-owner/elastos");
+        let offer = "model:hosted-venice";
+        let now = 1_000_000;
+        assert!(demo_window_matches(
+            home,
+            offer,
+            "/private/demo-owner/elastos",
+            offer,
+            now + 60_000,
+            now,
+        ));
+        for (root, named_offer, until) in [
+            ("/private/demo-other/elastos", offer, now + 60_000),
+            ("/private/demo-owner/elastos", "model:other", now + 60_000),
+            ("/private/demo-owner/elastos", offer, now),
+            (
+                "/private/demo-owner/elastos",
+                offer,
+                now + 2 * 60 * 60 * 1000 + 1,
+            ),
+        ] {
+            assert!(!demo_window_matches(
+                home,
+                offer,
+                root,
+                named_offer,
+                until,
+                now
+            ));
+        }
+    }
+
+    #[test]
+    fn temporary_demo_revoke_marker_stops_its_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = demo_revoke_path(dir.path());
+        assert!(!demo_window_revoked(dir.path(), "model:venice", 100));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"offer_id":"model:venice","until_ms":100}"#).unwrap();
+        assert!(demo_window_revoked(dir.path(), "model:venice", 100));
+        assert!(!demo_window_revoked(dir.path(), "model:venice", 101));
+        std::fs::write(path, b"invalid").unwrap();
+        assert!(demo_window_revoked(dir.path(), "model:venice", 100));
+    }
 
     fn write_private(path: &Path, bytes: &[u8]) {
         let mut options = OpenOptions::new();
