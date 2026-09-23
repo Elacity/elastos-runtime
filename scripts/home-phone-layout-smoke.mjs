@@ -1068,11 +1068,11 @@ const EXPECTED_CAPSULE_FORM_FACTOR = {
 const CAPSULE_TARGET_BASELINE = {
   "phone-portrait": {
     library: 2, documents: 3, marketplace: 1, system: 0, people: 0, services: 0,
-    wallet: 0, inbox: 1, "archive-manager": 2, "elacity-player": 0, browser: 4,
+    wallet: 0, inbox: 0, "archive-manager": 2, "elacity-player": 0, browser: 4,
   },
   "phone-landscape": {
     library: 2, documents: 3, marketplace: 1, system: 0, people: 0, services: 0,
-    wallet: 0, inbox: 1, "archive-manager": 0, "elacity-player": 0, browser: 4,
+    wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 4,
   },
 };
 

@@ -12538,6 +12538,20 @@ assert(
     "Inbox narrow: the request list is as tall as its requests so the detail follows directly, asserted by the layout smoke",
   );
 
+  const inboxHtml = read("capsules/inbox/browser/index.html");
+  const inboxSmoke = read("scripts/inbox-product-layout-smoke.mjs");
+  assert(
+    inboxHtml.includes('    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .sidebar {\n      display: block;') &&
+      inboxHtml.includes('    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .summary-stack {\n      grid-template-columns: repeat(2, minmax(0, 1fr));') &&
+      inboxHtml.includes('    html[data-inbox-presentation="window"][data-el-form-factor="phone"] .summary-card {\n      justify-content: center;\n      min-height: var(--el-touch-target);') &&
+      inboxHtml.includes('    html[data-el-form-factor="phone"] .action-secondary,\n    html[data-el-form-factor="phone"] .entry-action {\n      min-height: var(--el-touch-target);') &&
+      inboxSmoke.includes('"phone filters must be one row of two 44 px segments above the list",') &&
+      inboxSmoke.includes('"phone Refresh and request actions must be 44 px targets",') &&
+      /inbox: 0, "archive-manager"/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
+      /inbox: 0, "archive-manager"/.test(capsuleRatchet[1].split('"phone-landscape"')[1]),
+    "Inbox phone: the filters (no app menu on the phone bar) return as a two-segment row of 44 px targets above the list, request actions and Refresh are 44 px, asserted by the layout smoke and held at 0 small targets by the phone smoke",
+  );
+
   assert(
     read("capsules/browser/browser/style.css").includes(':root[data-el-form-factor="phone"] .browser-chrome {\n  min-height: 56px;') &&
       read("scripts/browser-product-layout-smoke.mjs").includes('"Browser phone toolbar must start at the leading edge"') &&
