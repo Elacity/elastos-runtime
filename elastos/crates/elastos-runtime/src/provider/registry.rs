@@ -7,7 +7,7 @@
 //! All first-party providers (did, peer, model) use the `elastos://` namespace
 //! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://model/*`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1295,13 +1295,37 @@ impl ProviderRegistry {
                 })?;
             let data = &response["data"];
             let offers = data["offers"].as_array().ok_or_else(unavailable)?;
+            let revisions = data["offer_revisions"]
+                .as_object()
+                .ok_or_else(unavailable)?;
+            let mut seen_ids = HashSet::new();
             if response.as_object().is_none_or(|object| object.len() != 2)
                 || response["status"] != "ok"
-                || data.as_object().is_none_or(|object| object.len() != 4)
+                || data.as_object().is_none_or(|object| object.len() != 5)
                 || data["schema"] != "elastos.model.offers-list/v1"
                 || data["provider"] != "model-provider"
                 || data["protocol_version"] != "elastos.model-provider/v1"
                 || offers.len() > 64
+                || revisions.len() != offers.len()
+                || offers.iter().any(|offer| {
+                    let Some(id) = offer["id"].as_str() else {
+                        return true;
+                    };
+                    if !seen_ids.insert(id) {
+                        return true;
+                    }
+                    let Some(digest) = revisions
+                        .get(id)
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| value.strip_prefix("sha256:"))
+                    else {
+                        return true;
+                    };
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
             {
                 return Err(unavailable());
             }
@@ -2815,13 +2839,41 @@ mod tests {
             .unwrap();
         let valid = serde_json::json!({"status":"ok", "data":{
             "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
-            "protocol_version":"elastos.model-provider/v1", "offers":[]
+            "protocol_version":"elastos.model-provider/v1", "offers":[], "offer_revisions":{}
         }});
         *provider.response.lock().await = Some(valid.clone());
         assert_eq!(
             registry.local_model_offers().await.unwrap(),
             Vec::<serde_json::Value>::new()
         );
+        let offer = serde_json::json!({"id":"model:local"});
+        let mut one = valid.clone();
+        one["data"]["offers"] = serde_json::json!([offer.clone()]);
+        one["data"]["offer_revisions"] =
+            serde_json::json!({"model:local":format!("sha256:{}", "a".repeat(64))});
+        *provider.response.lock().await = Some(one.clone());
+        assert_eq!(registry.local_model_offers().await.unwrap(), vec![offer]);
+        for revisions in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"model:local":"not-a-digest"}),
+            serde_json::json!({"other":format!("sha256:{}", "a".repeat(64))}),
+        ] {
+            let mut response = one.clone();
+            response["data"]["offer_revisions"] = revisions;
+            *provider.response.lock().await = Some(response);
+            assert!(registry.local_model_offers().await.is_err());
+        }
+        let mut duplicate = one.clone();
+        duplicate["data"]["offers"] = serde_json::json!([
+            {"id":"model:local"}, {"id":"model:local"}, {"id":"model:other"}
+        ]);
+        duplicate["data"]["offer_revisions"]["model:other"] =
+            serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+        duplicate["data"]["offer_revisions"]["model:unrelated"] =
+            serde_json::json!(format!("sha256:{}", "c".repeat(64)));
+        *provider.response.lock().await = Some(duplicate);
+        assert!(registry.local_model_offers().await.is_err());
         for (field, value) in [
             ("schema", serde_json::json!("unknown")),
             ("provider", serde_json::json!("other")),

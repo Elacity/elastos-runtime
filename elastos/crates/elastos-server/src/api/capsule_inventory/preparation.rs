@@ -2538,6 +2538,10 @@ pub(in crate::api) async fn model_runtime_projection(
                     .collect::<anyhow::Result<_>>()?,
             })
         })()
+        .map_err(|error| {
+            tracing::debug!(%error, "model readiness binding unavailable");
+            error
+        })
         .ok();
         Ok((projection, expected))
     };
@@ -2554,6 +2558,9 @@ pub(in crate::api) async fn model_runtime_projection(
     // All inventory guards are dropped before I/O. Re-read current trust and
     // admission afterward, including independent Keep changes during the read.
     let offers = registry.local_model_offers().await;
+    if let Err(error) = &offers {
+        tracing::debug!(%error, "model readiness offer read unavailable");
+    }
     let (mut projection, current) = match snapshot() {
         Ok(value) => value,
         Err(_) => return unavailable(),
@@ -2567,8 +2574,12 @@ pub(in crate::api) async fn model_runtime_projection(
             if matching.len() == 1 && matching[0] == &expected.offer {
                 projection["dispatch_ready"] = serde_json::json!(true);
                 projection["offer_id"] = expected.offer["id"].clone();
+            } else {
+                tracing::debug!(matches = matching.len(), "model readiness offer differs");
             }
         }
+    } else {
+        tracing::debug!("model readiness binding changed during offer read");
     }
     projection
 }
@@ -3477,12 +3488,15 @@ mod tests {
             offer.as_object_mut().unwrap().remove("enabled");
             offer["stream_output"] = serde_json::json!(true);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            let mut response = serde_json::json!({"status":"ok", "data":{
+                "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
+                "protocol_version":"elastos.model-provider/v1",
+                "offers":[offer.clone()], "offer_revisions":{}
+            }});
+            response["data"]["offer_revisions"][offer["id"].as_str().unwrap()] =
+                serde_json::json!(format!("sha256:{}", "a".repeat(64)));
             let provider = Arc::new(ReadinessOffersFixture {
-                response: Mutex::new(serde_json::json!({"status":"ok", "data":{
-                    "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
-                    "protocol_version":"elastos.model-provider/v1",
-                    "offers":[offer.clone()]
-                }})),
+                response: Mutex::new(response),
                 calls: Mutex::new(Vec::new()),
                 ..Default::default()
             });
@@ -3627,10 +3641,13 @@ mod tests {
             offer.as_object_mut().unwrap().remove("enabled");
             offer["stream_output"] = serde_json::json!(true);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
-            let response = serde_json::json!({"status":"ok", "data":{
+            let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
-                "protocol_version":"elastos.model-provider/v1", "offers":[offer]
+                "protocol_version":"elastos.model-provider/v1", "offers":[offer.clone()],
+                "offer_revisions":{}
             }});
+            response["data"]["offer_revisions"][offer["id"].as_str().unwrap()] =
+                serde_json::json!(format!("sha256:{}", "a".repeat(64)));
             let provider = Arc::new(ReadinessOffersFixture {
                 response: Mutex::new(response.clone()),
                 ..Default::default()
@@ -4255,9 +4272,19 @@ mod tests {
                         offer["stream_output"] = serde_json::json!(true);
                         offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
                     }
+                    let revisions = offers
+                        .iter()
+                        .map(|offer| {
+                            (
+                                offer["id"].as_str().unwrap().to_string(),
+                                serde_json::json!(format!("sha256:{}", "a".repeat(64))),
+                            )
+                        })
+                        .collect::<serde_json::Map<_, _>>();
                     return Ok(serde_json::json!({"status":"ok","data":{
                         "schema":"elastos.model.offers-list/v1","provider":"model-provider",
-                        "protocol_version":"elastos.model-provider/v1","offers":offers}}));
+                        "protocol_version":"elastos.model-provider/v1","offers":offers,
+                        "offer_revisions":revisions}}));
                 }
                 assert_eq!(request["op"], "init");
                 self.calls.lock().unwrap().push(request.clone());
