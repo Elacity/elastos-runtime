@@ -636,7 +636,7 @@ pub struct ProviderRegistry {
     sub_providers: RwLock<HashMap<String, SubProviderRegistration>>,
     /// Optional Carrier transport for Runtime-mediated provider invocation.
     carrier_invoker: RwLock<Option<Arc<dyn ProviderCarrierInvoker>>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     local_model_sockets: RwLock<Option<std::collections::BTreeMap<String, String>>>,
     #[cfg(target_os = "macos")]
     hosted_model_socket: RwLock<Option<String>>,
@@ -690,7 +690,7 @@ impl ProviderRegistry {
             providers: RwLock::new(HashMap::new()),
             sub_providers: RwLock::new(HashMap::new()),
             carrier_invoker: RwLock::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             local_model_sockets: RwLock::new(None),
             #[cfg(target_os = "macos")]
             hosted_model_socket: RwLock::new(None),
@@ -698,7 +698,7 @@ impl ProviderRegistry {
     }
 
     /// Keep the confined child's engine ports stable across Init refreshes.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub async fn set_local_model_sockets(
         &self,
         sockets: std::collections::BTreeMap<String, String>,
@@ -711,7 +711,7 @@ impl ProviderRegistry {
         *self.hosted_model_socket.write().await = Some(socket);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub async fn apply_local_model_sockets(
         &self,
         config: &mut super::BridgeProviderConfig,
@@ -735,6 +735,7 @@ impl ProviderRegistry {
             }
         }
         config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
+        #[cfg(target_os = "macos")]
         if let Some(socket) = self.hosted_model_socket.read().await.as_deref() {
             config.extra["runtime_hosted_socket"] = serde_json::json!(socket);
         }

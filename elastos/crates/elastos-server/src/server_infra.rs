@@ -1036,7 +1036,14 @@ async fn setup_server_infrastructure_impl(
                             .map(|(bridge, sockets, config, listener)| {
                                 (bridge, Some(sockets), config, Some(listener))
                             });
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(target_os = "linux")]
+                    let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
+                        &path,
+                        model_config.clone(),
+                    )
+                    .await
+                    .map(|(bridge, sockets, config)| (bridge, Some(sockets), config, None::<()>));
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     let bridge_result =
                         provider::ProviderBridge::spawn(&path, model_config.clone())
                             .await
@@ -1044,9 +1051,10 @@ async fn setup_server_infrastructure_impl(
                     match bridge_result {
                         Ok((bridge, local_sockets, confined_config, hosted_listener)) => {
                             model_config = confined_config;
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
                             if let Some(sockets) = local_sockets {
                                 provider_registry.set_local_model_sockets(sockets).await;
+                                #[cfg(target_os = "macos")]
                                 if let Some(socket) =
                                     model_config.extra["runtime_hosted_socket"].as_str()
                                 {
@@ -1055,7 +1063,7 @@ async fn setup_server_infrastructure_impl(
                                         .await;
                                 }
                             }
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             let _ = local_sockets;
                             #[cfg(not(target_os = "macos"))]
                             let _ = hosted_listener;

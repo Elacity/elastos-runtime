@@ -3,10 +3,10 @@
 //! Manages stdin/stdout communication with a provider capsule process.
 //! The runtime sends ProviderRequests and receives ProviderResponses
 //! over line-delimited JSON.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::collections::BTreeMap;
 use std::path::Path;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
@@ -204,13 +204,13 @@ pub struct ProviderBridge {
     /// Timeout applied to each shutdown settle stage (protocol request,
     /// child wait, force reap). Tests inject a short value.
     shutdown_timeout: std::time::Duration,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     _local_brokers: Mutex<BrokerTasks>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     _local_ipc_dir: Mutex<Option<tempfile::TempDir>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     _local_provider_pid: Arc<AtomicU32>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     _local_provider_birth: Arc<AtomicU64>,
     #[cfg(target_os = "macos")]
     hosted_run_bindings: Arc<StdMutex<BTreeMap<String, HostedRunBinding>>>,
@@ -228,11 +228,11 @@ struct HostedRunBinding {
     expires_at: std::time::Instant,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Default)]
 struct BrokerTasks(Vec<tokio::task::JoinHandle<()>>);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for BrokerTasks {
     fn drop(&mut self) {
         for task in &self.0 {
@@ -379,8 +379,14 @@ impl ProviderBridge {
         config.extra["runtime_hosted_socket"] = serde_json::json!(hosted_socket);
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(policy).arg(binary_path);
-        let mut bridge =
-            Self::spawn_command(command, config.clone(), INIT_TIMEOUT, SHUTDOWN_TIMEOUT).await?;
+        let mut bridge = Self::spawn_command(
+            command,
+            config.clone(),
+            INIT_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+            std::process::Stdio::inherit(),
+        )
+        .await?;
         let pid = bridge
             .child
             .lock()
@@ -404,6 +410,98 @@ impl ProviderBridge {
         bridge._local_provider_pid = provider_pid;
         bridge._local_provider_birth = provider_birth;
         Ok((bridge, sockets, config, hosted_listener))
+    }
+
+    /// Start a Linux model provider with private local Unix routes and a
+    /// kernel socket filter inherited by its guard and llama.cpp descendants.
+    #[cfg(target_os = "linux")]
+    pub async fn spawn_confined_model_linux(
+        binary_path: &Path,
+        mut config: ProviderConfig,
+    ) -> Result<(Self, BTreeMap<String, String>, ProviderConfig), BridgeError> {
+        let offers = config
+            .extra
+            .get("offers")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| BridgeError::InitFailed("model offers unavailable".into()))?;
+        let ipc_dir = tempfile::Builder::new()
+            .prefix("em-")
+            .tempdir()
+            .map_err(BridgeError::Spawn)?;
+        let ipc_path = std::fs::canonicalize(ipc_dir.path()).map_err(BridgeError::Spawn)?;
+        let mut sockets = BTreeMap::new();
+        let mut brokers = BrokerTasks::default();
+        let provider_pid = Arc::new(AtomicU32::new(0));
+        let provider_birth = Arc::new(AtomicU64::new(0));
+        for offer in offers {
+            if offer
+                .pointer("/adapter/kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("local_llama_cpp_text")
+            {
+                continue;
+            }
+            let id = offer
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))?;
+            let index = sockets.len();
+            let socket = ipc_path.join(format!("{index}.sock"));
+            let engine_socket = ipc_path.join(format!("{index}.engine.sock"));
+            let socket = socket
+                .to_str()
+                .ok_or_else(|| BridgeError::InitFailed("invalid local socket path".into()))?
+                .to_string();
+            if socket.len() >= 104 || engine_socket.as_os_str().len() >= 104 {
+                return Err(BridgeError::InitFailed("local socket path too long".into()));
+            }
+            if sockets.insert(id.to_string(), socket.clone()).is_some() {
+                return Err(BridgeError::InitFailed("duplicate local offer id".into()));
+            }
+            brokers.0.push(
+                super::local_model_broker::start(
+                    &socket,
+                    engine_socket,
+                    provider_pid.clone(),
+                    provider_birth.clone(),
+                )
+                .map_err(BridgeError::Spawn)?,
+            );
+        }
+        config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
+        let mut command = Command::new(binary_path);
+        super::linux_model_seccomp::install_on_command(&mut command).map_err(BridgeError::Spawn)?;
+        let mut bridge = Self::spawn_command(
+            command,
+            config.clone(),
+            INIT_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+            std::process::Stdio::null(),
+        )
+        .await?;
+        let pid = bridge
+            .child
+            .lock()
+            .await
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .ok_or_else(|| BridgeError::InitFailed("model provider pid unavailable".into()))?;
+        let birth = match super::local_model_broker::process_birth(pid) {
+            Some(birth) => birth,
+            None => {
+                let _ = bridge.shutdown().await;
+                return Err(BridgeError::InitFailed(
+                    "model provider identity unavailable".into(),
+                ));
+            }
+        };
+        provider_birth.store(birth, Ordering::Release);
+        provider_pid.store(pid, Ordering::Release);
+        *bridge._local_ipc_dir.lock().await = Some(ipc_dir);
+        *bridge._local_brokers.lock().await = brokers;
+        bridge._local_provider_pid = provider_pid;
+        bridge._local_provider_birth = provider_birth;
+        Ok((bridge, sockets, config))
     }
 
     #[cfg(target_os = "macos")]
@@ -552,6 +650,7 @@ impl ProviderBridge {
             config,
             init_timeout,
             shutdown_timeout,
+            std::process::Stdio::inherit(),
         )
         .await
     }
@@ -561,11 +660,12 @@ impl ProviderBridge {
         config: ProviderConfig,
         init_timeout: std::time::Duration,
         shutdown_timeout: std::time::Duration,
+        stderr: std::process::Stdio,
     ) -> Result<Self, BridgeError> {
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
             .map_err(BridgeError::Spawn)?;
@@ -599,13 +699,13 @@ impl ProviderBridge {
             child: Mutex::new(Some(child)),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_timeout,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_ipc_dir: Mutex::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_brokers: Mutex::new(BrokerTasks::default()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_provider_pid: Arc::new(AtomicU32::new(0)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_provider_birth: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
             hosted_run_bindings: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -668,13 +768,13 @@ impl ProviderBridge {
             child: Mutex::new(None),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_timeout: SHUTDOWN_TIMEOUT,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_ipc_dir: Mutex::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_brokers: Mutex::new(BrokerTasks::default()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_provider_pid: Arc::new(AtomicU32::new(0)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             _local_provider_birth: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
             hosted_run_bindings: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -915,14 +1015,14 @@ impl ProviderBridge {
                 Err(reap_error) => Err(reap_error),
             },
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if child_guard.is_none() {
             self.stop_local_brokers().await;
         }
         result
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn stop_local_brokers(&self) {
         self._local_provider_pid.store(0, Ordering::Release);
         self._local_provider_birth.store(0, Ordering::Release);
@@ -1874,7 +1974,7 @@ for line in sys.stdin:
         assert!(!Path::new(&sockets["fixture-local"]).exists());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     #[ignore = "requires ELASTOS_MODEL_BROKER_PROOF_CONFIG with installed provider and admitted local Smol artifacts"]
     async fn installed_model_provider_completes_smollm2_through_runtime_broker() {
@@ -1887,10 +1987,15 @@ for line in sys.stdin:
         let config: ProviderConfig =
             serde_json::from_value(fixture["provider_config"].clone()).unwrap();
         let offer_id = fixture["offer_id"].as_str().unwrap();
+        #[cfg(target_os = "macos")]
         let (bridge, sockets, _, _hosted_listener) =
             ProviderBridge::spawn_confined_model(binary, config)
                 .await
                 .unwrap();
+        #[cfg(target_os = "linux")]
+        let (bridge, sockets, _) = ProviderBridge::spawn_confined_model_linux(binary, config)
+            .await
+            .unwrap();
         let socket = sockets[offer_id].clone();
         let input = serde_json::json!({
             "schema": "elastos.model.input.text/v1",

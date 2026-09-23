@@ -1474,9 +1474,9 @@ async fn refresh_registered_model_provider(
         return Ok(());
     };
     let (config, _guard) = model_provider_config(data_dir, registry).await?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut config = config;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     registry.apply_local_model_sockets(&mut config).await?;
     registry
         .refresh_local_model_configuration(&config)

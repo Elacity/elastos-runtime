@@ -1,8 +1,10 @@
-//! The macOS Runtime owns the only socket reachable by the confined model provider.
-//! It forwards only local llama routes to an engine descended from that provider.
+//! Runtime forwards exact local llama routes to an engine descended from its
+//! selected model provider. The provider's OS confinement is set at launch.
 
 use std::io;
-use std::mem::{size_of, MaybeUninit};
+use std::mem::size_of;
+#[cfg(target_os = "macos")]
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -185,21 +187,45 @@ fn request_body_length(headers: &[u8], route: &[u8]) -> io::Result<usize> {
 }
 
 fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
-    let mut pid: libc::pid_t = 0;
-    let mut size = size_of::<libc::pid_t>() as libc::socklen_t;
-    let status = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut size,
-        )
-    };
-    if status != 0 || size as usize != size_of::<libc::pid_t>() || pid <= 1 {
-        return Err(io::Error::last_os_error());
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut size = size_of::<libc::pid_t>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut size,
+            )
+        };
+        if status != 0 || size as usize != size_of::<libc::pid_t>() || pid <= 1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(pid as u32)
     }
-    Ok(pid as u32)
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut size = size_of::<libc::ucred>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 || size as usize != size_of::<libc::ucred>() {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = unsafe { credentials.assume_init() }.pid;
+        (pid > 1)
+            .then_some(pid as u32)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "invalid peer pid"))
+    }
 }
 
 fn is_descendant(mut pid: u32, provider_pid: u32) -> bool {
@@ -209,22 +235,50 @@ fn is_descendant(mut pid: u32, provider_pid: u32) -> bool {
         if pid == provider_pid || pid <= 1 {
             return false;
         }
-        let Some(info) = process_info(pid) else {
+        let Some(parent) = parent_pid(pid) else {
             return false;
         };
-        if info.pbi_ppid == provider_pid {
+        if parent == provider_pid {
             return true;
         }
-        pid = info.pbi_ppid;
+        pid = parent;
     }
     false
 }
 
+#[cfg(target_os = "macos")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    Some(process_info(pid)?.pbi_ppid)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    Some(linux_process_info(pid)?.0)
+}
+
+#[cfg(target_os = "macos")]
 pub(super) fn process_birth(pid: u32) -> Option<u64> {
     let info = process_info(pid)?;
     Some((info.pbi_start_tvsec << 20) | info.pbi_start_tvusec)
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn process_birth(pid: u32) -> Option<u64> {
+    Some(linux_process_info(pid)?.1)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_info(pid: u32) -> Option<(u32, u64)> {
+    // The comm field is parenthesized and may contain spaces or ')' itself.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    if fields.first().copied() == Some("Z") || fields.first().copied() == Some("X") {
+        return None;
+    }
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
+#[cfg(target_os = "macos")]
 fn process_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>();
