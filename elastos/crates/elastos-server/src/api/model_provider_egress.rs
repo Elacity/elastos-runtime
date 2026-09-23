@@ -60,6 +60,18 @@ const MAX_JOB_BINDINGS: usize = 4096;
 const MAX_GRANTS: usize = 1024;
 const MAX_JOB_BINDINGS_BYTES: usize = 4 * 1024 * 1024;
 const JOB_BINDING_LIFETIME_MS: u64 = 2 * 60 * 60 * 1000;
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models?output_modalities=all";
+const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
+const VENICE_ACCESS_URL: &str = "https://api.venice.ai/api/v1/api_keys/rate_limits";
+const VENICE_MODELS_URL: &str = "https://api.venice.ai/api/v1/models?type=text";
+const VENICE_CHAT_URL: &str = "https://api.venice.ai/api/v1/chat/completions";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DestinationClass {
+    Fixture,
+    Public,
+}
 type JobCreateKey = (String, String, String);
 static JOB_CREATES: OnceLock<Mutex<HashSet<JobCreateKey>>> = OnceLock::new();
 static EGRESS_GRANTS: OnceLock<Mutex<()>> = OnceLock::new();
@@ -181,15 +193,15 @@ async fn fetch_validation_inner(
         ValidationEndpoint::OpenRouterModels => fixtures
             .as_ref()
             .map(|value| value.openrouter_models_url.as_str())
-            .unwrap_or("https://openrouter.ai/api/v1/models?output_modalities=all"),
+            .unwrap_or(OPENROUTER_MODELS_URL),
         ValidationEndpoint::VeniceAccess => fixtures
             .as_ref()
             .map(|value| value.venice_rate_limits_url.as_str())
-            .unwrap_or("https://api.venice.ai/api/v1/api_keys/rate_limits"),
+            .unwrap_or(VENICE_ACCESS_URL),
         ValidationEndpoint::VeniceModels => fixtures
             .as_ref()
             .map(|value| value.venice_models_url.as_str())
-            .unwrap_or("https://api.venice.ai/api/v1/models?type=text"),
+            .unwrap_or(VENICE_MODELS_URL),
     };
     let url = Url::parse(raw)?;
     let fixture_ca_pem = if url.scheme() == "https" && url.host_str() == Some("127.0.0.1") {
@@ -216,8 +228,9 @@ async fn fetch_validation_inner(
         fixture_ca_pem,
     };
     anyhow::ensure!(
-        fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)?,
-        "public hosted HTTPS remains paused"
+        fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)?
+            || public_validation_destination_allowed(endpoint, &destination),
+        "hosted validation destination unavailable"
     );
     let (offer_id, effect) = endpoint.grant_binding();
     let scope = egress_scope(offer_id, effect, "GET", &destination)?;
@@ -388,6 +401,7 @@ async fn handle(
     }
     if !fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)
         .unwrap_or(false)
+        && !public_effect_destination_allowed(&request, &destination)
     {
         return deny(&mut stream).await;
     }
@@ -1238,16 +1252,17 @@ async fn pinned_client(
     grant_url: &str,
     ca_pem: Option<&str>,
 ) -> io::Result<reqwest::Client> {
-    let fixture =
-        fixture_destination_allowed(data_dir, url, grant_url).map_err(io::Error::other)?;
-    // Public destinations stay paused until owner grant UI and installed
-    // revocation/replay proof cover every hosted effect.
-    if !fixture {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "public hosted HTTPS remains paused",
-        ));
-    }
+    let class =
+        if fixture_destination_allowed(data_dir, url, grant_url).map_err(io::Error::other)? {
+            DestinationClass::Fixture
+        } else if public_destination_allowed(url, grant_url) && ca_pem.is_none() {
+            DestinationClass::Public
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "hosted destination unavailable",
+            ));
+        };
     let host = url.host_str().ok_or_else(invalid_request)?;
     let port = url.port_or_known_default().ok_or_else(invalid_request)?;
     let addresses: Vec<SocketAddr> = tokio::time::timeout(
@@ -1256,7 +1271,7 @@ async fn pinned_client(
     )
     .await??
     .collect();
-    if !approved_fixture_addresses(&addresses) {
+    if !approved_destination_addresses(class, &addresses) {
         return Err(invalid_request());
     }
     let mut builder = reqwest::Client::builder()
@@ -1265,7 +1280,7 @@ async fn pinned_client(
         .resolve_to_addrs(host, &addresses)
         .connect_timeout(Duration::from_secs(5))
         .timeout(STREAM_TIMEOUT);
-    if url.scheme() == "https" {
+    if class == DestinationClass::Fixture && url.scheme() == "https" {
         let pem = ca_pem.ok_or_else(invalid_request)?;
         let certificate = reqwest::Certificate::from_pem(pem.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid fixture CA"))?;
@@ -1276,11 +1291,60 @@ async fn pinned_client(
     builder.build().map_err(io::Error::other)
 }
 
+fn approved_destination_addresses(class: DestinationClass, addresses: &[SocketAddr]) -> bool {
+    match class {
+        DestinationClass::Fixture => approved_fixture_addresses(addresses),
+        DestinationClass::Public => {
+            !addresses.is_empty() && addresses.iter().all(|address| public_ip(address.ip()))
+        }
+    }
+}
+
 fn approved_fixture_addresses(addresses: &[SocketAddr]) -> bool {
     !addresses.is_empty()
         && addresses
             .iter()
             .all(|addr| addr.ip() == IpAddr::from([127, 0, 0, 1]))
+}
+
+fn public_destination_allowed(url: &Url, grant_url: &str) -> bool {
+    url.as_str() == grant_url
+        && matches!(
+            grant_url,
+            OPENROUTER_MODELS_URL
+                | OPENROUTER_CHAT_URL
+                | OPENROUTER_DECISIONS_URL
+                | VENICE_ACCESS_URL
+                | VENICE_MODELS_URL
+                | VENICE_CHAT_URL
+        )
+}
+
+fn public_validation_destination_allowed(
+    endpoint: ValidationEndpoint,
+    destination: &Destination,
+) -> bool {
+    let expected = match endpoint {
+        ValidationEndpoint::OpenRouterModels => OPENROUTER_MODELS_URL,
+        ValidationEndpoint::VeniceAccess => VENICE_ACCESS_URL,
+        ValidationEndpoint::VeniceModels => VENICE_MODELS_URL,
+    };
+    destination.grant_url == expected
+        && public_destination_allowed(&destination.url, &destination.grant_url)
+        && destination.fixture_ca_pem.is_none()
+}
+
+fn public_effect_destination_allowed(request: &EffectRequest, destination: &Destination) -> bool {
+    let expected = match (request.effect.as_str(), destination.provider.as_str()) {
+        ("text", "OpenRouter") => OPENROUTER_CHAT_URL,
+        ("text", "Venice") => VENICE_CHAT_URL,
+        ("decisions", "OpenRouter") => OPENROUTER_DECISIONS_URL,
+        _ => return false,
+    };
+    request.method == reqwest::Method::POST
+        && destination.grant_url == expected
+        && public_destination_allowed(&destination.url, &destination.grant_url)
+        && destination.fixture_ca_pem.is_none()
 }
 
 fn fixture_destination_allowed(
@@ -1310,7 +1374,6 @@ fn fixture_destination_allowed(
             || (url.scheme() == "http" && url.host_str() == Some("localhost"))))
 }
 
-#[cfg(test)]
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
@@ -1702,7 +1765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_validation_stays_paused_without_creating_an_inbox_request() {
+    async fn public_validation_requests_exact_owner_decision_before_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
             dir.path(),
@@ -1718,15 +1781,12 @@ mod tests {
         )
         .await
         .is_err());
-        assert!(
-            super::super::model_provider_config::read_hosted_egress_decisions(dir.path())
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            model_provider_egress_decision::offer_state(dir.path(), "validation:openrouter")
+                .unwrap(),
+            "pending"
         );
-        assert!(crate::notifications::load_summary(dir.path())
-            .unwrap()
-            .entries
-            .is_empty());
+        assert!(grant_file(dir.path()).unwrap().grants.is_empty());
     }
 
     #[tokio::test]
@@ -2464,5 +2524,94 @@ mod tests {
         }
         assert!(public_ip("8.8.8.8".parse().unwrap()));
         assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_hosted_routes_bind_effect_provider_and_exact_url() {
+        let destination = |raw: &str, provider: &str| Destination {
+            url: Url::parse(raw).unwrap(),
+            grant_url: raw.into(),
+            credential: Some("private-key".into()),
+            job_backend_id: None,
+            provider: provider.into(),
+            configuration_id: "configuration".into(),
+            fixture_ca_pem: None,
+        };
+        let request = |effect: &str| EffectRequest {
+            offer_id: "model:hosted-offer".into(),
+            effect: effect.into(),
+            run_id: format!("run:sha256:{}", "1".repeat(64)),
+            request_id: "request".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: b"{}".to_vec(),
+        };
+        assert!(public_effect_destination_allowed(
+            &request("text"),
+            &destination(VENICE_CHAT_URL, "Venice")
+        ));
+        assert!(public_effect_destination_allowed(
+            &request("text"),
+            &destination(OPENROUTER_CHAT_URL, "OpenRouter")
+        ));
+        assert!(public_effect_destination_allowed(
+            &request("decisions"),
+            &destination(OPENROUTER_DECISIONS_URL, "OpenRouter")
+        ));
+        assert!(!public_effect_destination_allowed(
+            &request("text"),
+            &destination(OPENROUTER_DECISIONS_URL, "OpenRouter")
+        ));
+        assert!(!public_effect_destination_allowed(
+            &request("responses"),
+            &destination(VENICE_CHAT_URL, "Venice")
+        ));
+        assert!(!public_effect_destination_allowed(
+            &request("text"),
+            &destination(VENICE_CHAT_URL, "OpenRouter")
+        ));
+        for raw in [
+            "http://api.venice.ai/api/v1/chat/completions",
+            "https://api.venice.ai:443/api/v1/chat/completions",
+            "https://api.venice.ai/api/v1/chat/completions?extra=1",
+            "https://api.venice.ai.evil.invalid/api/v1/chat/completions",
+            "https://user@api.venice.ai/api/v1/chat/completions",
+        ] {
+            assert!(!public_effect_destination_allowed(
+                &request("text"),
+                &destination(raw, "Venice")
+            ));
+        }
+        assert!(public_validation_destination_allowed(
+            ValidationEndpoint::VeniceModels,
+            &destination(VENICE_MODELS_URL, "Venice")
+        ));
+        assert!(!public_validation_destination_allowed(
+            ValidationEndpoint::VeniceAccess,
+            &destination(VENICE_MODELS_URL, "Venice")
+        ));
+        let mut custom_ca = destination(VENICE_CHAT_URL, "Venice");
+        custom_ca.fixture_ca_pem = Some("private CA".into());
+        assert!(!public_effect_destination_allowed(
+            &request("text"),
+            &custom_ca
+        ));
+    }
+
+    #[test]
+    fn public_hosted_dns_requires_every_address_to_be_public() {
+        let address = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 443);
+        assert!(approved_destination_addresses(
+            DestinationClass::Public,
+            &[address("8.8.8.8"), address("2606:4700:4700::1111")]
+        ));
+        assert!(!approved_destination_addresses(
+            DestinationClass::Public,
+            &[address("8.8.8.8"), address("127.0.0.1")]
+        ));
+        assert!(!approved_destination_addresses(
+            DestinationClass::Public,
+            &[]
+        ));
     }
 }
