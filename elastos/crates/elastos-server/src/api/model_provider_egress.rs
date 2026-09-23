@@ -178,7 +178,7 @@ async fn fetch_validation_inner(
         Some(owner_proof_binding_id),
         None,
     )?;
-    let client = pinned_client(data_dir, &destination.url).await?;
+    let client = pinned_client(data_dir, &destination.url, &destination.grant_url).await?;
     current_grant_for(
         data_dir,
         offer_id,
@@ -841,7 +841,7 @@ async fn forward(
         return deny(stream).await;
     }
     let url = &destination.url;
-    let client = match pinned_client(data_dir, url).await {
+    let client = match pinned_client(data_dir, url, &destination.grant_url).await {
         Ok(client) => client,
         Err(_) => return deny(stream).await,
     };
@@ -956,7 +956,7 @@ async fn write_response_head(
     ).as_bytes()).await
 }
 
-async fn pinned_client(data_dir: &Path, url: &Url) -> io::Result<reqwest::Client> {
+async fn pinned_client(data_dir: &Path, url: &Url, grant_url: &str) -> io::Result<reqwest::Client> {
     let fixtures = load_hosted_validate_fixtures(data_dir).map_err(io::Error::other)?;
     let fixture = fixtures.as_ref().is_some_and(|fixtures| {
         [
@@ -971,7 +971,9 @@ async fn pinned_client(data_dir: &Path, url: &Url) -> io::Result<reqwest::Client
         ]
         .into_iter()
         .flatten()
-        .any(|pinned| pinned == url.as_str())
+        // Status adds the Runtime-bound job_id after resolving the configured
+        // route. The private fixture pins that route, before the added query.
+        .any(|pinned| pinned == grant_url)
     }) && url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1");
     // Public destinations stay paused until owner grant UI and installed
@@ -1443,6 +1445,37 @@ mod tests {
         other.effect = "text".into();
         other.offer_id = "model:hosted-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
         assert!(current_grant(dir.path(), &other, &destination).is_err());
+    }
+
+    #[tokio::test]
+    async fn job_status_fixture_pins_the_configured_route_before_job_id() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let root = dir.path().join("providers/model-provider");
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let route = format!("http://127.0.0.1:{port}/jobs/status");
+        write_private(
+            &root.join("validate-fixtures.json"),
+            json!({
+                "openrouter_models_url":route,
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/models"),
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let status = Url::parse(&format!("{route}?job_id=job-1")).unwrap();
+        assert!(pinned_client(dir.path(), &status, &route).await.is_ok());
+        assert!(
+            pinned_client(dir.path(), &status, &format!("{route}-other"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
