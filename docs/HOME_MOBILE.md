@@ -308,13 +308,44 @@ smooth path. Native shells (Android WebView/GeckoView, iOS WKWebView) come
 later and wrap the same Home behind the Browser/Net/Exit ABI with an explicit
 host-auth adapter; there is no header bypass and no second GUI.
 
+## Capsules on the phone stage (M6)
+
+A capsule cannot tell a phone stage from a narrow desktop window by its own
+width; only the shell knows whether traffic lights sit over the frame. So the
+shell posts `elastos:shell-layout` `{ formFactor, pointer }` to every capsule
+frame on load and whenever the size class changes
+(`shell-capsule-layout.js`). The shared theme runtime accepts it only from the
+opaque parent and only allowlisted values, and sets
+`html[data-el-form-factor]` and `html[data-el-pointer]`. On phone the shared
+sheet zeroes `--window-chrome-safe-top` and `--window-chrome-safe-leading`,
+because the shell's title bar is above the frame, not over it. The phone
+smoke checks the attribute lands in every frame that loads the shared theme,
+on both engines.
+
+A capsule sidebar becomes the shared push drawer (`elastos-drawer.js`, the
+Assistant's saved-chats pattern): content first; a 44 px toggle slides the
+sidebar in and pushes the view aside with a rounded edge; tapping the view,
+Escape, or picking an item closes it. It is bound by markup alone
+(`data-el-drawer`, `data-el-drawer-room`, `data-el-drawer-toggle`,
+`data-el-drawer-close`) and vendored only to capsules that use it.
+`scripts/lib/phone-drawer-assert.mjs` is the shared smoke assertion.
+
+| Capsule | Phone layout |
+| --- | --- |
+| Marketplace | sidebar is the push drawer; the page title leads with its toggle |
+| Documents | the editor takes the full width; the document list is the push drawer; no Split view |
+| Library | one header block: navigation row with the folder as title, Favorites as a sliding chip row; Search takes the navigation row; status floats as a pill |
+| System | menu button on the leading edge, on the page title's line |
+| Inbox | the request list is as tall as its requests (capped at 40 dvh); the detail follows directly |
+| Browser | the navigation row spans the stage (no traffic-light inset) with 44 px controls |
+
 ## Capsule guidance
 
 A first-party capsule fits the phone stage when:
 
-- every control is at least 44 px on a coarse pointer (`--tap-min` from
-  `capsules/_shared/elastos-ui.css`, vendored with `just vendor-ui`; never
-  edit the generated per-capsule copies);
+- every control is at least 44 px on a coarse pointer (`--el-touch-target`
+  from `capsules/_shared/elastos-ui.css`, vendored with `just vendor-ui`;
+  never edit the generated per-capsule copies);
 - text inputs are 16 px on a coarse pointer so iOS does not zoom the page;
 - a sidebar or navigation column becomes a sheet or drawer below 640 px and
   content comes first;
@@ -333,7 +364,7 @@ A first-party capsule fits the phone stage when:
 | M3 | 44 px phone title bar for every chrome mode, boot hairline, Mission Control as the app switcher (title swipe, icon captions, touch Close), stage history for system back on Chromium/Gecko (buttons-only on WebKit, recorded above) |
 | M4 | launcher, Spotlight, Control Centre and Notification Centre as full sheets |
 | M5 | touch grammar: long-press menus as bottom sheets, touch drag |
-| M6 | shared tokens and one PR per first-party capsule |
+| M6 | shell-to-capsule size class, shared tokens and push drawer; phone layouts for Marketplace, Documents, Library, System, Inbox and Browser (more capsules to follow, one PR each) |
 | M7 | tablet and landscape |
 | M8 | PWA polish; native hosts are separate tasks |
 
