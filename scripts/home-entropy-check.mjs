@@ -12389,11 +12389,13 @@ assert(
   // and Notifications span the stage with even side margins.
   assert(
     homeGuiStyle.includes("--phone-dock-glyph-scale: 1.15;") &&
+      homeGuiStyle.includes("  :root {\n    --shelf-face-ms: 1100ms;\n  }") &&
+      homeGuiStyle.includes("  --shelf-face-ms: 950ms;") &&
       homeGuiStyle.includes("  .taskbar-icon-launcher {\n    background-size: calc(var(--phone-dock-glyph-scale) * 100%);") &&
       homeGuiStyle.includes("  .taskbar-item-assistant .taskbar-item-icon.assistant-mark {\n    transform: scale(var(--phone-dock-glyph-scale));") &&
       homeGuiStyle.includes("  .taskbar-item-launcher,\n  .taskbar-item-assistant {\n    flex-shrink: 0;\n  }\n\n  .taskbar-sortable {\n    min-width: 0;") &&
       homeGuiStyle.includes("  .control-centre,\n  .notification-center {\n    left: max(8px, env(safe-area-inset-left, 0px));\n    right: max(8px, env(safe-area-inset-right, 0px));\n    width: auto;"),
-    "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.15x to stay lighter than the plates (the Assistant only with its plate-free mark), Control Centre and Notifications span the stage with even margins",
+    "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.15x to stay lighter than the plates (the Assistant only with its plate-free mark), Apps and Assistant morphs run 1100 ms on phone (950 ms desktop), Control Centre and Notifications span the stage with even margins",
   );
 
   assert(

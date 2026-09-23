@@ -6203,6 +6203,12 @@ body.assistant-space-active #inbox-rail {
     --phone-dock-glyph-scale: 1.15;
   }
 
+  /* The Apps and Assistant morphs read slightly rushed at desktop's 950 ms
+     when the pill grows into a phone-height sheet. */
+  :root {
+    --shelf-face-ms: 1100ms;
+  }
+
   .taskbar-icon-launcher {
     background-size: calc(var(--phone-dock-glyph-scale) * 100%);
   }
