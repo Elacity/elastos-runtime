@@ -101,6 +101,24 @@ and inodes; both signed-in human Homes still serve HTTP 200. Hosted HTTPS
 remains paused pending Runtime-owned egress grants and owner consent. Receipt:
 `.audit/hosted-egress-design-scratch/unix-broker-diagnostic-installed.json`.
 
+Local commit `5e16adaa` adds a Runtime-owned macOS hosted-effect socket. The
+confined model provider sends hosted text, Decisions and HTTP-job requests to
+Runtime; its Init configuration omits hosted credentials. System key validation
+uses the same private grant and destination check. Public HTTPS remains paused.
+On diagnostic Home 61971, System Validate and Save with a dummy key returned
+400 before an active grant and made zero sink connections. One exact loopback
+validation grant made one request; after revocation, the next request returned
+400 with zero new sink connections. The diagnostic provider config and fixture
+stayed unchanged. Built and installed Runtime/provider SHA-256 values match
+`adfeaab2`/`c23d3e7e`, the provider manifest passes, and Home returns 200.
+The two signed-in human Homes still return 200; all 18 protected hash/inode
+records match, and disk free space is above 20%. No paid call was made in this
+milestone. Independent review found no high or medium issue for the diagnostic
+fixture. Public activation still needs verified owner consent, Runtime-bound
+run/request and HTTP-job IDs, prompt active validation revocation, and target
+process-isolation proof. Receipt:
+`.audit/hosted-egress-design-scratch/hosted-broker-diagnostic-installed.json`.
+
 The installed diagnostic Homes passed ten groups of hosted lifecycle checks.
 Fresh destination wrong-principal, unapproved, revoked and expired requests each
 returned a bound pre-dispatch refusal with zero provider calls. Earlier runs

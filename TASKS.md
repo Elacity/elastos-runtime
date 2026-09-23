@@ -308,6 +308,25 @@ then Linux kernel confinement. Hosted calls remain paused until that authority
 is installed. Receipt:
 `.audit/hosted-egress-design-scratch/unix-broker-diagnostic-installed.json`.
 
+Hosted-effect broker checkpoint: local commit `5e16adaa` routes the confined
+macOS model provider's hosted effects through a Runtime-owned Unix socket and
+keeps credentials in Runtime storage. System Validate/Save uses the same exact
+grant/destination check. Public HTTPS remains paused. Installed diagnostic
+Home 61971 returned 400 with zero controlled-sink connections before a grant,
+sent one dummy-key request with an exact loopback grant, then returned 400 with
+zero new connections after revocation. Built/installed Runtime and provider
+hashes match, the provider manifest passes, and the diagnostic and two signed-in
+human Homes return 200. All 18 protected hash/inode records are unchanged;
+disk free space remains above 20%. Independent review accepted this fixture
+scope and found no new high or medium issue. Receipt:
+`.audit/hosted-egress-design-scratch/hosted-broker-diagnostic-installed.json`.
+Next: bind the owner grant to verified admin proof and the exact Runtime
+run/request, bind HTTP-job status/cancel IDs to persisted create results, and
+stop active System validation promptly on revoke. Only then review public
+HTTPS routing and per-platform process confinement. Keep saved Venice and Jev
+state, the pending Inbox request, and the signed-in Homes available for the
+person's later test; this fixture made no paid request.
+
 Accepted regression evidence for the original five outcomes:
 
 1. **CR1/CR2 prerequisite closeout — verified:** source lineage and installed
