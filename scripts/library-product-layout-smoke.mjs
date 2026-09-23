@@ -12,6 +12,7 @@ const { chromium } = require("playwright");
 const capsuleRoot = path.resolve("capsules/library/browser");
 const homeClipboardClientPath = path.resolve("capsules/home/browser/home-clipboard-client.js");
 const homeClipboardProtocolPath = path.resolve("capsules/home/browser/home-clipboard-protocol.js");
+const homeNavigationClientPath = path.resolve("capsules/home/browser/home-navigation-client.js");
 const token = "library-product-layout-token";
 const principalRoot = "localhost://Users/layout";
 const documentsUri = `${principalRoot}/Documents`;
@@ -150,6 +151,11 @@ function createAppServer() {
     if (url.pathname === "/apps/home/home-clipboard-client.js") {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
       createReadStream(homeClipboardClientPath).pipe(res);
+      return;
+    }
+    if (url.pathname === "/apps/home/home-navigation-client.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      createReadStream(homeNavigationClientPath).pipe(res);
       return;
     }
     if (url.pathname === "/apps/home/home-clipboard-protocol.js") {

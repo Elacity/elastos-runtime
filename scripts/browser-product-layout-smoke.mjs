@@ -19,6 +19,9 @@ function assert(condition, message, details = undefined) {
   }
 }
 
+const homeBrowserRoot = join(repoRoot, "capsules/home/browser");
+const HOME_APP_PREFIX = "/apps/home/";
+
 async function buildFixtureRoot() {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "browser-product-layout-"));
   const indexHtml = await readFile(join(browserRoot, "index.html"), "utf8");
@@ -36,8 +39,10 @@ async function serveFile(response, fixtureRoot, pathname) {
     response.end();
     return;
   }
-  const relative = pathname === "/" ? "index.html" : pathname.slice(1);
-  const root = relative === "index.html" ? fixtureRoot : browserRoot;
+  // The Browser imports Home's clipboard client by its gateway path.
+  const fromHome = pathname.startsWith(HOME_APP_PREFIX);
+  const relative = pathname === "/" ? "index.html" : pathname.slice(fromHome ? HOME_APP_PREFIX.length : 1);
+  const root = fromHome ? homeBrowserRoot : relative === "index.html" ? fixtureRoot : browserRoot;
   const path = join(root, relative);
   assert(path.startsWith(`${root}/`) || path === join(root, "index.html"), "invalid Browser asset path", {
     pathname,
