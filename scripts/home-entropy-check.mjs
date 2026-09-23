@@ -12474,6 +12474,18 @@ assert(
     "Capsule ratchet: the phone smoke fails when an app frame on a phone profile has more targets under 44 px than its pinned row",
   );
 
+  const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
+  assert(
+    assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&
+      assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-tool-btn, .agent-mic-btn, .agent-send-btn) {\n  width: var(--el-touch-target);\n  flex: 0 0 var(--el-touch-target);') &&
+      assistantHarnessCss.includes("  border: 6px solid transparent;\n  background-clip: padding-box;") &&
+      assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-input {\n  min-height: var(--el-touch-target);') &&
+      assistantHarnessCss.includes(':root[data-el-form-factor="phone"] :is(.agent-harness-icon-btn, .agent-harness-drawer-toggle, .agent-projects-add) {') &&
+      assistantHarnessCss.includes(':root[data-el-form-factor="phone"] :is(.agent-harness-new-chat, .agent-harness-home, .agent-harness-nav-row) {') &&
+      (capsuleRatchet[1].match(/\n    assistant: 0,\n/g) || []).length === 2,
+    "Assistant phone: composer controls, the field, the header buttons and the session rows are 44 px targets (composer chips keep their 32 px paint inside a transparent border), held at 0 small targets in the Assistant frame by the phone smoke",
+  );
+
   const peopleStyle = read("capsules/people/browser/style.css");
   assert(
     peopleStyle.includes(':root[data-el-form-factor="phone"] button,\n:root[data-el-form-factor="phone"] .profile-form input {\n  min-height: var(--el-touch-target);\n}') &&
