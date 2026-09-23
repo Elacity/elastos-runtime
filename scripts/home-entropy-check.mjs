@@ -12450,6 +12450,15 @@ assert(
       read("scripts/marketplace-product-layout-smoke.mjs").includes('drawer: "#store-sidebar",'),
     "Marketplace phone: the sidebar is the push drawer and the page title leads with its toggle, asserted by the layout smoke",
   );
+
+  const documentsIndex = read("capsules/documents/browser/index.html");
+  assert(
+    documentsIndex.includes('<script src="./elastos-drawer.js"></script>') &&
+      documentsIndex.includes('data-el-drawer-room="documents-sidebar"') &&
+      documentsIndex.includes(':root[data-el-form-factor="phone"] #mode-split,') &&
+      read("scripts/documents-product-layout-smoke.mjs").includes('drawer: "#documents-sidebar",'),
+    "Documents phone: the editor takes the full width, the list is the push drawer and Split is hidden, asserted by the layout smoke",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();

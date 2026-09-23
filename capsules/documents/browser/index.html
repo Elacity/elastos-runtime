@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Documents · ElastOS</title>
 <script src="./elastos-theme.js"></script>
+<script src="./elastos-drawer.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <style>
 :root {
@@ -1328,22 +1329,111 @@ a {
     padding: 0.52rem;
   }
 }
+
+/* Phone stage: the editor gets the whole width (Apple Notes). The list is the
+   shared push drawer (elastos-drawer.js) led by the toggle beside the title;
+   actions sit on one row of 44 px buttons. Split has no room on a phone and
+   reads as Write; the desktop "Hide list" control gives way to the drawer. */
+:root[data-el-form-factor="phone"] .documents-shell {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+:root[data-el-form-factor="phone"] .documents-sidebar {
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  background: var(--sidebar-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+:root[data-el-form-factor="phone"] .sidebar-search {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] .documents-main {
+  padding: 0 12px calc(8px + env(safe-area-inset-bottom, 0px));
+}
+
+:root[data-el-form-factor="phone"] .documents-toolbar {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 4px 0 8px;
+}
+
+:root[data-el-form-factor="phone"] .documents-identity {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: -8px;
+}
+
+:root[data-el-form-factor="phone"] .title-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: none;
+  font-size: 20px;
+}
+
+:root[data-el-form-factor="phone"] .toolbar-actions {
+  justify-content: flex-start;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+:root[data-el-form-factor="phone"] .action-icon-button,
+:root[data-el-form-factor="phone"] .copy-link-button {
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .workspace-toggle {
+  height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .workspace-tab {
+  width: 40px;
+  height: 38px;
+}
+
+:root[data-el-form-factor="phone"] #mode-split,
+:root[data-el-form-factor="phone"] #sidebar-toggle,
+:root[data-el-form-factor="phone"] .editor-pane > .pane-header {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .documents-shell[data-workspace-view="split"] .documents-workspace {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+:root[data-el-form-factor="phone"] .documents-shell[data-workspace-view="split"] .inspector-pane {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .editor {
+  font-size: 16px;
+  line-height: 1.55;
+}
 </style>
 </head>
 <body>
 <div class="page-shell">
   <section id="documents-shell" class="documents-shell hidden">
-    <aside id="documents-sidebar" class="documents-sidebar">
+    <aside id="documents-sidebar" class="documents-sidebar" data-el-drawer>
       <div class="sidebar-controls">
-        <button id="new-document" class="sidebar-create" type="button" aria-label="New document" title="New document">+</button>
+        <button id="new-document" class="sidebar-create" type="button" aria-label="New document" title="New document" data-el-drawer-close>+</button>
         <input id="sidebar-search" class="sidebar-search" type="search" placeholder="Search documents" spellcheck="false">
       </div>
-      <div id="documents-list" class="documents-list"></div>
+      <div id="documents-list" class="documents-list" data-el-drawer-close></div>
     </aside>
 
-    <main class="documents-main">
+    <main class="documents-main" data-el-drawer-room="documents-sidebar">
       <header class="documents-toolbar">
         <div class="documents-identity">
+          <button type="button" class="el-drawer-toggle" data-el-drawer-toggle="documents-sidebar" aria-label="Show documents"></button>
           <input id="title-input" class="title-input" type="text" placeholder="Untitled document" spellcheck="false">
         </div>
         <div class="toolbar-actions">

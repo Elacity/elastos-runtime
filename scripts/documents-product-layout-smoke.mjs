@@ -6,6 +6,10 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
+
+const PHONE_SCREENSHOT = "/tmp/documents-phone-390x844.png";
+const PHONE_DRAWER_SCREENSHOT = "/tmp/documents-phone-drawer-390x844.png";
 
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
@@ -547,8 +551,41 @@ async function run() {
     assert(readMode.highlights >= 2, "Documents read view must keep preview find highlights visible.");
 
     await assertNoHorizontalOverflow(page, "wide");
-    await page.setViewportSize({ width: 390, height: 844 });
+    await page.setViewportSize(PHONE_VIEWPORT);
     await assertNoHorizontalOverflow(page, "narrow");
+
+    await page.locator("#mode-write").click();
+    await setPhoneFormFactor(page);
+    await page.waitForTimeout(DRAWER_SETTLE_MS);
+    await assertNoHorizontalOverflow(page, "phone");
+    const phoneEditor = await page.evaluate(() => {
+      const editor = document.getElementById("editor").getBoundingClientRect();
+      const hidden = (id) => getComputedStyle(document.getElementById(id)).display === "none";
+      return {
+        editorWidth: Math.round(editor.width),
+        editorHeight: Math.round(editor.height),
+        editorFont: getComputedStyle(document.getElementById("editor")).fontSize,
+        splitHidden: hidden("mode-split"),
+        hideListHidden: hidden("sidebar-toggle"),
+      };
+    });
+    await page.screenshot({ path: PHONE_SCREENSHOT });
+    assert(
+      phoneEditor.editorWidth >= PHONE_VIEWPORT.width - 40 && phoneEditor.editorHeight >= PHONE_VIEWPORT.height * 0.6,
+      `Documents phone: the editor must take the whole stage. Got ${JSON.stringify(phoneEditor)}`,
+    );
+    assert(
+      phoneEditor.editorFont === "16px" && phoneEditor.splitHidden && phoneEditor.hideListHidden,
+      `Documents phone: 16 px editor (no iOS focus zoom), no Split or Hide list controls. Got ${JSON.stringify(phoneEditor)}`,
+    );
+    await assertPhoneDrawer(page, page, {
+      label: "Documents",
+      drawer: "#documents-sidebar",
+      room: ".documents-main",
+      closeTarget: '.document-list-item[data-doc-did="doc-beta"]',
+      screenshot: PHONE_DRAWER_SCREENSHOT,
+    });
+    await setPhoneFormFactor(page, false);
 
     await page.close();
     resetDocumentsFixture();
