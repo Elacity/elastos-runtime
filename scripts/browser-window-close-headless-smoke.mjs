@@ -88,14 +88,14 @@ function topDocument(origin) {
 </html>`;
 }
 
-function browserRoute(homeOrigin) {
+function browserRoute(homeOrigin, includeUrl = true) {
   const query = new URLSearchParams({
     browser_instance: browserInstance,
     display_mode: "webrtc_remote_display",
     guarantee_level: "mechanism_microvm",
     home_origin: homeOrigin,
-    url: "https://example.com/close-proof",
   });
+  if (includeUrl) query.set("url", "https://example.com/close-proof");
   return `/apps/browser/?${query}#home_token=${browserToken}`;
 }
 
@@ -120,11 +120,15 @@ function shellDocument(homeOrigin) {
       });
       window.__browserCloseProof = {
         browserRoute: ${JSON.stringify(browserRoute(homeOrigin))},
+        freshRoute: ${JSON.stringify(browserRoute(homeOrigin, false))},
         navigateAway() {
           browser.src = "/blank";
         },
         reopen() {
           browser.src = this.browserRoute;
+        },
+        openFresh() {
+          browser.src = this.freshRoute;
         },
         resultCount() {
           return results.length;
@@ -199,6 +203,7 @@ async function handleApi(req, res, url) {
   }
   if (url.pathname === "/api/apps/browser/summary" && req.method === "GET") {
     json(res, 200, {
+      schema: "elastos.browser.runtime/v1",
       sessions: {
         schema: "elastos.browser.session-capacity/v1",
         status: "configured",
@@ -584,7 +589,8 @@ try {
   const binding = results.at(-2);
   const result = results.at(-1);
   assert(
-    state.closeCalls.length === 1 &&
+    state.openRequests === 2 &&
+      state.closeCalls.length === 1 &&
       state.closeCalls[0].pageId === "page-2" &&
       state.closeCalls[0].body?.schema === "elastos.browser.close-request/v2" &&
       state.closeCalls[0].body?.cleanup_id === "cleanup-2" &&
@@ -618,12 +624,35 @@ try {
     "old retained Browser frame did not accept the exact already-absent reap receipt",
     result,
   );
+  await shellFrame.evaluate(() => window.__browserCloseProof.openFresh());
+  browserFrame = await waitForFrame(
+    page,
+    (frame) => frame.url().includes("/apps/browser/") && !new URL(frame.url()).searchParams.has("url"),
+    "fresh Browser capsule",
+  );
+  await browserFrame.waitForFunction(() => document.body.dataset.loading === "false");
+  await shellFrame.evaluate(
+    (message) => window.__browserCloseProof.send(message),
+    { ...request, requestId: "headless-close-exact-absence" },
+  );
+  await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 5);
+  const freshResult = await shellFrame.evaluate(() => window.__browserCloseProof.results().at(-1));
+  assert(
+    state.openRequests === 2 && state.closeCalls.length === 1 &&
+      freshResult.state === "terminal" &&
+      freshResult.terminalKind === "no_page" &&
+      freshResult.pageId === "" &&
+      freshResult.cleanupId === "",
+    "fresh Browser did not accept Runtime's exact absence without closing another page",
+    { freshResult, closeCalls: state.closeCalls },
+  );
   assert(pageErrors.length === 0, "Browser close fixture raised page errors", pageErrors);
   assert(state.serverErrors.length === 0, "Browser close fixture server failed", state.serverErrors);
   console.log(JSON.stringify({
     schema: "elastos.browser.window-close-headless-smoke/v1",
     ok: true,
     close_calls: state.closeCalls.length,
+    fresh_close: freshResult.terminalKind,
     unload_close_calls: 0,
   }));
 } finally {

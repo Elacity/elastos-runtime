@@ -4903,26 +4903,38 @@ async function checkBrowserViewerPreflight(page) {
 
 async function checkBrowserEmptyClose(page) {
   const rounds = [];
-  for (let round = 0; round < 2; round += 1) {
-    const appFrame = await openDesktopAppWindow(page, "browser");
-    const token = assertIsolatedLaunchRoute(appFrame.url(), "browser");
-    const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
-    const summary = await browserApi(appFrame, token,
-      `/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance || "")}`);
-    assert(summary.ok && summary.body?.sessions?.status === "configured" &&
-      summary.body.sessions.recoverable_page === null &&
-      summary.body.sessions.window_close_ownership?.schema === "elastos.browser.window-close-ownership/v1" &&
-      summary.body.sessions.window_close_ownership.browser_instance === instance &&
-      summary.body.sessions.window_close_ownership.state === "absent",
-    "Fresh Browser window lacks exact Runtime absence", summary);
-    const gui = await homeGuiFrameForPage(page);
-    const window = gui.locator('section.window[data-target="browser"]').last();
-    await window.getByRole("button", { name: "Close", exact: true }).click();
-    await window.waitFor({ state: "hidden", timeout: 30_000 });
-    rounds.push({ absence: "exact", closed: true });
-    if (round === 0) await page.reload({ waitUntil: "domcontentloaded" });
+  let openRequests = 0;
+  const observeOpen = (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/api/apps/browser/open") {
+      openRequests += 1;
+    }
+  };
+  page.on("request", observeOpen);
+  try {
+    for (let round = 0; round < 2; round += 1) {
+      const appFrame = await openDesktopAppWindow(page, "browser");
+      const token = assertIsolatedLaunchRoute(appFrame.url(), "browser");
+      const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+      const summary = await browserApi(appFrame, token,
+        `/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance || "")}`);
+      assert(summary.ok && summary.body?.sessions?.status === "configured" &&
+        summary.body.sessions.recoverable_page === null &&
+        summary.body.sessions.window_close_ownership?.schema === "elastos.browser.window-close-ownership/v1" &&
+        summary.body.sessions.window_close_ownership.browser_instance === instance &&
+        summary.body.sessions.window_close_ownership.state === "absent",
+      "Fresh Browser window lacks exact Runtime absence", summary);
+      const gui = await homeGuiFrameForPage(page);
+      const window = gui.locator('section.window[data-target="browser"]').last();
+      await window.getByRole("button", { name: "Close", exact: true }).click();
+      await window.waitFor({ state: "hidden", timeout: 30_000 });
+      rounds.push({ absence: "exact", closed: true });
+      if (round === 0) await page.reload({ waitUntil: "domcontentloaded" });
+    }
+    assert(openRequests === 0, "Fresh Browser Close dispatched an Engine open", { openRequests });
+    return { target: "browser", empty_close: { rounds, open_requests: openRequests } };
+  } finally {
+    page.off("request", observeOpen);
   }
-  return { target: "browser", empty_close: { rounds } };
 }
 
 async function checkBrowserLaunchGrant(page, homeToken) {
