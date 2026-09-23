@@ -366,6 +366,15 @@ response before Runtime records a job ID can still leave settlement unknown;
 upstream request-ID idempotency or lookup is needed for full recovery. Public
 HTTPS remains paused.
 
+Active System validation revocation now checks the same current admin grant
+every 250 ms while the upstream request or response body waits. A local
+slow-header fixture received one authorized request, then revocation ended
+validation before its 20-second timeout. All six scoped broker tests, the
+basic source gate and a bounded read-only review pass. A slow response body
+uses the same monitor but has no separate fixture proof. Installed validation
+revocation still needs the marked diagnostic Home and built/installed parity;
+public HTTPS remains paused.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty
