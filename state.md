@@ -6,11 +6,28 @@
 | --- | --- | --- |
 | Source candidate | Local branch `feat/0.7.1-model-assistant-closeout` at `a1573675` accepts the current five-field model offer list and checks distinct offer IDs before deriving local readiness. Focused Registry, catalog-readiness and startup-repin checks pass. | This unpublished source does not establish public installation. |
 | Signed-in Mac Homes | Owner Home `http://localhost:61965/home/` runs the source-built Runtime, with built and installed SHA-256 `c4c6286573a23cd06a1727ef29434386d15ffec1c42cbcc90673dad4417abf3c`. System shows the retained SmolLM2 as available. Ordinary Assistant selected its exact offer and completed a new terminal reply. Consumer Home `http://localhost:61966/home/` remains signed in for the separate hosted-sharing journey. | The local SmolLM2 result proves this owner installation and request. It does not qualify full Qwen, all installed failure paths or remote inference. |
-| Public seed and Home | The seed holds the signed SmolLM2 package. The public Get attempts recorded below failed at `metadata_read` with zero transferred bytes on their then-installed provider. | The local Mac result did not change public artifacts or retest public Get. Public installation and release gates remain open. |
+| Public seed and Home | The seed holds the signed SmolLM2 package. Older public Get attempts failed at `metadata_read` with zero transferred bytes. Read-only inspection now finds source receipt `f087a0d9`, installed Runtime SHA-256 `62ddda9a31b9b512ebb82deb6c8152229b1c84dee969cf8621e2c742755a1d70`, sealed ipfs-provider SHA-256 `0609b6e089e8ab08254f41c4f685a39c6c7d5c8bc8cfe24a6b1457705df3152e` and repository mode `0700`. | The current public artifacts have not undergone a new public Get. Public product acceptance and release gates remain open. |
 
 The exact current local receipt is `.audit/local-smol-readiness-installed.json`.
 The earlier cold delivery, restart, warm reuse and hosted results below retain
 their own receipts and scopes. Private receipts stay outside Git.
+
+An isolated Linux Home at `127.0.0.1:61974` used copies of those current public
+Runtime and provider artifacts with a fresh identity and data root. Its
+catalogue routing metadata came from the public installation. A 763-byte fixture
+reproduced a capacity rejection while Kubo's repo was `0775`; the provider
+sealed it to `0700`, then capacity, read and provider restart passed. The first
+Marketplace request on this isolated Home failed at capacity because its test
+`xdg-data` ancestor was also `0775`. After that ancestor was set to `0700`, a
+new typed Marketplace `content.use` admitted the full signed SmolLM2 closure
+(144,835,448 bytes). Two typed local Assistant-model runs completed, one after a full
+isolated Runtime restart with the same weights hash, inode and modification
+time. The holder's recursive pin remained. Receipt:
+`.audit/public-seed-gate-61974/receipt.json`. This qualifies the isolated
+path and the current installed artifact identity. Public Get, signed-in human
+UI and deployment retain their own gates. The startup repo
+seal still merits a separate no-follow and data-root review before a later
+security claim.
 
 ## Mac controlled DNS answer change, 23 September 2026 UTC
 
@@ -457,10 +474,12 @@ Public Home https://elastos.elacitylabs.com/home/ serves 0.7.1 and preserves
 the existing DID, passkeys and `sources.json` hash
 `96b62da57dbfe5d2245403464e99ec65b80968ad96b612724acdb1882aab0676`. Marketplace
 lists verified SmolLM2 CID
-`bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y`. Public Get
-still fails at MetadataRead on the published ipfs-provider. The owning
-layer is Capacity against Kubo umask `0775`, not the 100ms bounded-read
-timeout. Isolated Linux Get with sealed ipfs-provider SHA-256
+`bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y`.
+Those earlier public Get
+attempts failed at MetadataRead on the then-published ipfs-provider. The
+isolated capacity probe found the Kubo `0775` repository blocker; the public
+journal's `metadata_read` label alone does not identify its internal error.
+Isolated Linux Get with sealed ipfs-provider SHA-256
 `8af761a111fdb8b962437e4d530da060569e19defe64c420a26f4e8005227731`
 admitted the package, streamed Assistant `Pong`, settled Stop as
 `settlement_unknown`, and reused the same weights after Runtime restart

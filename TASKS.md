@@ -181,6 +181,18 @@ result; public Get, full Qwen, the wider installed failure matrix and release
 qualification remain open. [Current source, installed and public status](state.md#current-model-delivery-status-23-september-2026-utc)
 keeps these scopes separate.
 
+The public-seed model gate is ready for a separate public decision. Read-only
+inspection found the sealed ipfs-provider in the current public installation;
+the earlier `metadata_read` attempts belong to an older artifact. An isolated
+Linux Home with copied current public artifacts passed a 763-byte capacity and
+restart check, then a fresh typed Marketplace SmolLM2 Get, admission and two
+terminal local Assistant runs across a Runtime restart. Receipt:
+`.audit/public-seed-gate-61974/receipt.json`. Public Get itself remains
+untried on the current installation. A public test needs an exact approval and
+rollback plan that protects the seed pin, data root, account and provider config.
+The repo-seal no-follow and owner-only ancestor review is a separate security
+hardening task; this gate makes no SEC1 completion claim.
+
 ### Model delivery R14 — 0.7.1 on public Home
 
 Execution plan recorded 22 September 2026: complete the remaining model product
@@ -797,9 +809,11 @@ verified SmolLM2, completed Get of 144835448 bytes, returned two Assistant
 replies, then restored the same chat and model after Home reload and a full
 Runtime restart with unchanged weights mtime. Public Home
 https://elastos.elacitylabs.com/home/ runs that 0.7.1 Linux Runtime, keeps
-the existing account, and lists verified SmolLM2. Public Marketplace Get
-still fails at MetadataRead because public ipfs-provider remains the
-published `17128b5e` binary. An isolated public-style Linux Home with the
+the existing account, and lists verified SmolLM2. Earlier public Marketplace
+Get attempts failed at MetadataRead while ipfs-provider was the published
+`17128b5e` binary. The current public installation uses sealed provider
+`0609b6e0`; its public Get awaits a new approved check. An isolated
+public-style Linux Home with the
 sealed ipfs-provider admitted SmolLM2 through ordinary Marketplace Get,
 activated the CPU llama.cpp engine, returned streamed Assistant text
 `Pong`, settled Stop as `settlement_unknown`, then restored the same
