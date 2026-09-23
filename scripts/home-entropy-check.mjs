@@ -12440,6 +12440,16 @@ assert(
       phoneDrawerAssert.includes("check(closed.drawerRight <= 0 && closed.drawerInert && closed.roomLeft === 0 && closed.roomTop === 0,"),
     "Phone push drawer: shared elastos-drawer.js (inert when closed, tap on the pushed view closes and is swallowed, follows the size class) with shared tokens, vendored only to capsules whose sidebar uses it, asserted by scripts/lib/phone-drawer-assert.mjs",
   );
+
+  // Capsule phone layouts, each held by its own layout smoke.
+  const marketplaceIndex = read("capsules/marketplace/browser/index.html");
+  assert(
+    marketplaceIndex.includes('<script src="./elastos-drawer.js"></script>') &&
+      marketplaceIndex.includes('data-el-drawer-room="store-sidebar"') &&
+      marketplaceIndex.includes('data-el-drawer-toggle="store-sidebar"') &&
+      read("scripts/marketplace-product-layout-smoke.mjs").includes('drawer: "#store-sidebar",'),
+    "Marketplace phone: the sidebar is the push drawer and the page title leads with its toggle, asserted by the layout smoke",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
