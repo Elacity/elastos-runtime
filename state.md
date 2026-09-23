@@ -255,6 +255,13 @@ cancellation of a frozen provider remains open. A separate running-provider
 check held an HTTP response body: the socket drained after 5.002 seconds, then
 cancellation settled with zero reserved bytes. A separate four-byte read
 succeeded, and restart preserved the terminal journal without replay.
+On 23 September, a source-only request-exclusive bridge test sent a bounded
+`cat` request (`max_bytes: 763`) to a dedicated mock provider, froze it, then
+reaped it after caller cancellation in 0.43 seconds. The bridge pipe lock was
+released and shutdown was idempotent; independent review found no blocking
+defect. The mock did not transfer 763 Content bytes or exercise product
+settlement. The installed shared-provider result above remains the acceptance
+result, with frozen-provider terminal cancellation open.
 
 Use now records Keep with a new reservation. Explicit local selection waits for
 a verified catalog mapping and Keep acknowledgement. Remove binds the caller,

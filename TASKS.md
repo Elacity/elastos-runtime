@@ -217,6 +217,19 @@ terminal cancellation with zero reservation, a separate small read and restart
 without replay. Combined installation and final source gates pass. Trusted
 publisher successor evidence and global sole-copy evidence remain open clauses.
 
+A 23 September bounded source experiment sent a `cat` request with
+`max_bytes: 763` to a test-owned provider, froze that child, cancelled the
+caller, and reaped the child through bridge shutdown in 0.43 seconds. The pipe
+lock was released. Independent review found no blocking defect. This proves a
+small request-exclusive shutdown mechanism in the bridge harness; the fixture
+did not transfer Content bytes or exercise product reservation and admission.
+Production Content still uses a shared provider bridge, so shutting it down
+would affect other reads. Keep frozen-provider terminal cancellation open.
+Next test a request-owned Content worker or equivalent bounded cancellation
+protocol with other reads kept available, then rerun the installed 763-byte
+fixture and verify terminal state, zero reservation, no admission, preserved
+holder, and restart without replay.
+
 New bounded local-model result, 22 September 2026: the specialized
 `aac6fef/laya-typed-decisions-mlx` checkpoint at revision
 `f9e501c2080cc57c13d6887820329758f5351125` ran offline through the
