@@ -9,6 +9,11 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex as StdMutex;
+
+#[cfg(target_os = "macos")]
+use elastos_model_contract::{model_run_id, RuntimeCreateBinding};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -30,6 +35,12 @@ const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Timeout for provider shutdown (5 seconds)
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const HOSTED_RUN_BINDING_TTL: std::time::Duration = std::time::Duration::from_secs(7200);
+#[cfg(target_os = "macos")]
+// Bounds unobserved hosted runs as well as active runs. Terminal replies retire
+// entries immediately; an unpolled completion remains until the two-hour TTL.
+const MAX_HOSTED_RUN_BINDINGS: usize = 4096;
 
 // === Wire protocol types (mirror capsules/localhost-provider/src/main.rs) ===
 
@@ -201,6 +212,20 @@ pub struct ProviderBridge {
     _local_provider_pid: Arc<AtomicU32>,
     #[cfg(target_os = "macos")]
     _local_provider_birth: Arc<AtomicU64>,
+    #[cfg(target_os = "macos")]
+    hosted_run_bindings: Arc<StdMutex<BTreeMap<String, HostedRunBinding>>>,
+}
+
+#[cfg(target_os = "macos")]
+struct HostedRunBinding {
+    offer_id: String,
+    request_id: String,
+    input_hash: String,
+    pending: usize,
+    accepted: bool,
+    dispatched: bool,
+    terminal: bool,
+    expires_at: std::time::Instant,
 }
 
 #[cfg(target_os = "macos")]
@@ -389,6 +414,133 @@ impl ProviderBridge {
             .then_some((pid, birth))
     }
 
+    #[cfg(target_os = "macos")]
+    fn record_confined_model_run(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<Option<String>, BridgeError> {
+        if self.confined_model_identity().is_none() || request["op"] != "runs_create" {
+            return Ok(None);
+        }
+        let Some(offer_id) = request["offer_id"].as_str() else {
+            return Ok(None);
+        };
+        let hosted_instance = offer_id
+            .strip_prefix("model:hosted-")
+            .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        if !hosted_instance && offer_id != "model:openrouter" && offer_id != "model:venice" {
+            return Ok(None);
+        }
+        let rejected = || BridgeError::Provider {
+            code: "context_rejected".into(),
+            message: "Runtime model run binding unavailable".into(),
+        };
+        let binding: RuntimeCreateBinding = serde_json::from_value(
+            request
+                .get("runtime_binding")
+                .cloned()
+                .ok_or_else(rejected)?,
+        )
+        .map_err(|_| rejected())?;
+        let operation = request["operation"].as_str().ok_or_else(rejected)?;
+        let input = request.get("input").ok_or_else(rejected)?;
+        binding
+            .validate(offer_id, operation, input)
+            .map_err(|_| rejected())?;
+        let run_id = model_run_id(&binding);
+        let now = std::time::Instant::now();
+        let mut runs = self.hosted_run_bindings.lock().map_err(|_| rejected())?;
+        runs.retain(|_, run| run.expires_at > now);
+        if let Some(existing) = runs.get_mut(&run_id) {
+            if existing.offer_id != offer_id
+                || existing.request_id != binding.request_id
+                || existing.input_hash != binding.input_hash
+            {
+                return Err(rejected());
+            }
+            existing.pending = existing.pending.saturating_add(1);
+        } else {
+            if runs.len() >= MAX_HOSTED_RUN_BINDINGS {
+                return Err(rejected());
+            }
+            runs.insert(
+                run_id.clone(),
+                HostedRunBinding {
+                    offer_id: offer_id.to_owned(),
+                    request_id: binding.request_id,
+                    input_hash: binding.input_hash,
+                    pending: 1,
+                    accepted: false,
+                    dispatched: false,
+                    terminal: false,
+                    expires_at: now + HOSTED_RUN_BINDING_TTL,
+                },
+            );
+        }
+        Ok(Some(run_id))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn settle_confined_model_run(&self, run_id: &str, accepted: bool) {
+        if let Ok(mut runs) = self.hosted_run_bindings.lock() {
+            if let Some(run) = runs.get_mut(run_id) {
+                run.pending = run.pending.saturating_sub(1);
+                run.accepted |= accepted;
+                if run.pending == 0 && (!run.accepted || run.terminal) {
+                    runs.remove(run_id);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn retire_terminal_model_run(&self, response: &serde_json::Value) {
+        if response["status"] != "ok" {
+            return;
+        }
+        let data = &response["data"];
+        let terminal_status = matches!(
+            data["status"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "settlement_unknown")
+        );
+        let terminal_event = data["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| event["terminal"] == true));
+        if !(terminal_status || terminal_event) {
+            return;
+        }
+        let Some(run_id) = data["run_id"].as_str() else {
+            return;
+        };
+        if let Ok(mut runs) = self.hosted_run_bindings.lock() {
+            if let Some(run) = runs.get_mut(run_id) {
+                run.terminal = true;
+                if run.pending == 0 {
+                    runs.remove(run_id);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn confined_model_run_matches(
+        &self,
+        offer_id: &str,
+        run_id: &str,
+        request_id: &str,
+    ) -> bool {
+        self.confined_model_identity().is_some()
+            && self.hosted_run_bindings.lock().is_ok_and(|runs| {
+                runs.get(run_id).is_some_and(|run| {
+                    run.offer_id == offer_id
+                        && run.request_id == request_id
+                        && run.dispatched
+                        && !run.terminal
+                        && run.expires_at > std::time::Instant::now()
+                })
+            })
+    }
+
     async fn spawn_with_timeouts(
         binary_path: &Path,
         config: ProviderConfig,
@@ -455,6 +607,8 @@ impl ProviderBridge {
             _local_provider_pid: Arc::new(AtomicU32::new(0)),
             #[cfg(target_os = "macos")]
             _local_provider_birth: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            hosted_run_bindings: Arc::new(StdMutex::new(BTreeMap::new())),
         };
 
         // Send Init request
@@ -522,6 +676,8 @@ impl ProviderBridge {
             _local_provider_pid: Arc::new(AtomicU32::new(0)),
             #[cfg(target_os = "macos")]
             _local_provider_birth: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            hosted_run_bindings: Arc::new(StdMutex::new(BTreeMap::new())),
         }
     }
 
@@ -534,7 +690,7 @@ impl ProviderBridge {
 
     /// Send a request and receive a response (no timeout).
     async fn request_raw(&self, req: ProviderRequest) -> Result<ProviderResponse, BridgeError> {
-        let line = self.send_json_line(req).await?;
+        let line = self.send_json_line(req, None).await?;
         serde_json::from_str(line.trim()).map_err(BridgeError::Serde)
     }
 
@@ -544,8 +700,39 @@ impl ProviderBridge {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, BridgeError> {
-        let line = self.send_json_line(request.clone()).await?;
-        serde_json::from_str(line.trim()).map_err(BridgeError::Serde)
+        #[cfg(target_os = "macos")]
+        let recorded_run = self.record_confined_model_run(request)?;
+        #[cfg(target_os = "macos")]
+        let dispatch_run = recorded_run.clone();
+        #[cfg(not(target_os = "macos"))]
+        let dispatch_run = None;
+        let line = match self.send_json_line(request.clone(), dispatch_run).await {
+            Ok(line) => line,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if let Some(run_id) = &recorded_run {
+                    self.settle_confined_model_run(run_id, false);
+                }
+                return Err(error);
+            }
+        };
+        let response: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(response) => response,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if let Some(run_id) = &recorded_run {
+                    self.settle_confined_model_run(run_id, false);
+                }
+                return Err(BridgeError::Serde(error));
+            }
+        };
+        #[cfg(target_os = "macos")]
+        if let Some(run_id) = recorded_run {
+            self.settle_confined_model_run(&run_id, response["status"] != "error");
+        }
+        #[cfg(target_os = "macos")]
+        self.retire_terminal_model_run(&response);
+        Ok(response)
     }
 
     /// Write one request and always drain exactly one response line.
@@ -554,11 +741,17 @@ impl ProviderBridge {
     /// provider response in the pipe for the next request. Without this, a
     /// cancelled HTTP request can cause the following provider call to receive
     /// the previous call's response, crossing authority/data boundaries.
-    async fn send_json_line<T>(&self, request: T) -> Result<String, BridgeError>
+    async fn send_json_line<T>(
+        &self,
+        request: T,
+        dispatch_run: Option<String>,
+    ) -> Result<String, BridgeError>
     where
         T: Serialize + Send + 'static,
     {
         let io = Arc::clone(&self.io);
+        #[cfg(target_os = "macos")]
+        let bindings = Arc::clone(&self.hosted_run_bindings);
         tokio::spawn(async move {
             // Serialize first so the op can be named in the trace even when
             // the request is an untyped JSON value.
@@ -606,6 +799,16 @@ impl ProviderBridge {
                     .map_err(BridgeError::Io)?;
                 io.writer.write_all(b"\n").await.map_err(BridgeError::Io)?;
                 io.writer.flush().await.map_err(BridgeError::Io)?;
+                #[cfg(target_os = "macos")]
+                if let Some(run_id) = &dispatch_run {
+                    if let Ok(mut runs) = bindings.lock() {
+                        if let Some(run) = runs.get_mut(run_id) {
+                            run.dispatched = true;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = dispatch_run;
                 // Read response line
                 let mut line = String::new();
                 let n = io
@@ -948,6 +1151,8 @@ impl Provider for CapsuleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use elastos_model_contract::{model_input_hash, RUNTIME_CREATE_BINDING_SCHEMA};
     #[cfg(unix)]
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -985,6 +1190,79 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("expected test provider marker {} to exist", path.display());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_run_record_requires_a_valid_runtime_binding() {
+        let (reader, _) = tokio::io::duplex(4096);
+        let (writer, _) = tokio::io::duplex(4096);
+        let bridge = ProviderBridge::from_io(tokio::io::BufReader::new(reader), writer);
+        let pid = std::process::id();
+        let birth = super::super::local_model_broker::process_birth(pid).unwrap();
+        bridge._local_provider_birth.store(birth, Ordering::Release);
+        bridge._local_provider_pid.store(pid, Ordering::Release);
+        let input = serde_json::json!({"prompt":"fixture"});
+        let binding = RuntimeCreateBinding {
+            schema: RUNTIME_CREATE_BINDING_SCHEMA.into(),
+            principal_id: "principal:fixture".into(),
+            session_id: "session:fixture".into(),
+            capsule_id: "assistant".into(),
+            grant_id: "grant:fixture".into(),
+            request_id: "request:fixture".into(),
+            offer_id: "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            operation: "text.generate".into(),
+            input_hash: model_input_hash(&input).unwrap(),
+        };
+        let run_id = model_run_id(&binding);
+        let request = serde_json::json!({
+            "op":"runs_create", "offer_id":binding.offer_id,
+            "operation":binding.operation, "input":input,
+            "runtime_binding":binding,
+        });
+        let hosted = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(!bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
+        let mut wrong = request.clone();
+        wrong["runtime_binding"]["request_id"] = serde_json::json!("other");
+        wrong["runtime_binding"]["input_hash"] = serde_json::json!("sha256:bad");
+        assert!(bridge.record_confined_model_run(&wrong).is_err());
+        assert!(!bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
+        assert_eq!(
+            bridge.record_confined_model_run(&request).unwrap(),
+            Some(run_id.clone())
+        );
+        assert!(!bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
+        bridge
+            .hosted_run_bindings
+            .lock()
+            .unwrap()
+            .get_mut(&run_id)
+            .unwrap()
+            .dispatched = true;
+        let mut collision = request.clone();
+        collision["input"] = serde_json::json!({"prompt":"different"});
+        collision["runtime_binding"]["input_hash"] =
+            serde_json::json!(model_input_hash(&collision["input"]).unwrap());
+        assert!(bridge.record_confined_model_run(&collision).is_err());
+        assert_eq!(
+            bridge.record_confined_model_run(&request).unwrap(),
+            Some(run_id.clone())
+        );
+        bridge.settle_confined_model_run(&run_id, false);
+        assert!(bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
+        bridge.settle_confined_model_run(&run_id, true);
+        assert!(bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
+        assert!(!bridge.confined_model_run_matches(hosted, &run_id, "other"));
+        assert!(!bridge.confined_model_run_matches("other", &run_id, "request:fixture"));
+        let mut local = request.clone();
+        local["offer_id"] = serde_json::json!("model:smollm2");
+        assert_eq!(bridge.record_confined_model_run(&local).unwrap(), None);
+        bridge.retire_terminal_model_run(&serde_json::json!({
+            "status":"ok", "data":{"run_id":run_id,"status":"completed"}
+        }));
+        assert!(!bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
+        bridge._local_provider_pid.store(0, Ordering::Release);
+        assert!(!bridge.confined_model_run_matches(hosted, &run_id, "request:fixture"));
     }
 
     #[cfg(unix)]

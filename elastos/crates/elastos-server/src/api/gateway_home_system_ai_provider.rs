@@ -291,7 +291,10 @@ fn parse_venice_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredModel>
 async fn fetch_openrouter_models(
     data_dir: &std::path::Path,
     api_key: &str,
+    owner_proof_binding_id: &str,
 ) -> anyhow::Result<Vec<DiscoveredModel>> {
+    #[cfg(test)]
+    let _ = owner_proof_binding_id;
     #[cfg(test)]
     {
         let _ = data_dir;
@@ -317,6 +320,7 @@ async fn fetch_openrouter_models(
             data_dir,
             crate::api::model_provider_egress::ValidationEndpoint::OpenRouterModels,
             api_key,
+            owner_proof_binding_id,
         )
         .await
         .map_err(|_| ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))?;
@@ -330,12 +334,18 @@ async fn fetch_openrouter_models(
     }
     #[cfg(all(not(test), not(target_os = "macos")))]
     {
-        let _ = (data_dir, api_key);
+        let _ = (data_dir, api_key, owner_proof_binding_id);
         Err(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))
     }
 }
 
-async fn fetch_venice_access(data_dir: &std::path::Path, api_key: &str) -> anyhow::Result<bool> {
+async fn fetch_venice_access(
+    data_dir: &std::path::Path,
+    api_key: &str,
+    owner_proof_binding_id: &str,
+) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    let _ = owner_proof_binding_id;
     #[cfg(test)]
     {
         let _ = data_dir;
@@ -355,6 +365,7 @@ async fn fetch_venice_access(data_dir: &std::path::Path, api_key: &str) -> anyho
             data_dir,
             crate::api::model_provider_egress::ValidationEndpoint::VeniceAccess,
             api_key,
+            owner_proof_binding_id,
         )
         .await
         .map_err(|_| ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))?;
@@ -368,7 +379,7 @@ async fn fetch_venice_access(data_dir: &std::path::Path, api_key: &str) -> anyho
     }
     #[cfg(all(not(test), not(target_os = "macos")))]
     {
-        let _ = (data_dir, api_key);
+        let _ = (data_dir, api_key, owner_proof_binding_id);
         Err(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))
     }
 }
@@ -376,7 +387,10 @@ async fn fetch_venice_access(data_dir: &std::path::Path, api_key: &str) -> anyho
 async fn fetch_venice_models(
     data_dir: &std::path::Path,
     api_key: &str,
+    owner_proof_binding_id: &str,
 ) -> anyhow::Result<Vec<DiscoveredModel>> {
+    #[cfg(test)]
+    let _ = owner_proof_binding_id;
     #[cfg(test)]
     {
         let _ = data_dir;
@@ -392,6 +406,7 @@ async fn fetch_venice_models(
             data_dir,
             crate::api::model_provider_egress::ValidationEndpoint::VeniceModels,
             api_key,
+            owner_proof_binding_id,
         )
         .await
         .map_err(|_| ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))?;
@@ -402,7 +417,7 @@ async fn fetch_venice_models(
     }
     #[cfg(all(not(test), not(target_os = "macos")))]
     {
-        let _ = (data_dir, api_key);
+        let _ = (data_dir, api_key, owner_proof_binding_id);
         Err(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))
     }
 }
@@ -411,17 +426,18 @@ async fn validate_hosted_key(
     data_dir: &std::path::Path,
     provider: crate::api::HostedAiProvider,
     api_key: &str,
+    owner_proof_binding_id: &str,
 ) -> anyhow::Result<Vec<DiscoveredModel>> {
     let api_key = normalize_secret(provider, api_key)?;
     match provider {
         crate::api::HostedAiProvider::OpenRouter => {
-            fetch_openrouter_models(data_dir, &api_key).await
+            fetch_openrouter_models(data_dir, &api_key, owner_proof_binding_id).await
         }
         crate::api::HostedAiProvider::Venice => {
-            if !fetch_venice_access(data_dir, &api_key).await? {
+            if !fetch_venice_access(data_dir, &api_key, owner_proof_binding_id).await? {
                 return Err(invalid_key(provider));
             }
-            fetch_venice_models(data_dir, &api_key).await
+            fetch_venice_models(data_dir, &api_key, owner_proof_binding_id).await
         }
     }
 }
@@ -508,9 +524,10 @@ pub(super) async fn system_ai_provider_validate(
     headers: HeaderMap,
     Json(req): Json<AiProviderValidateRequest>,
 ) -> Response {
-    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
-        return system_error_response(err);
-    }
+    let admin = match require_system_admin(&state.data_dir, &headers) {
+        Ok(admin) => admin,
+        Err(err) => return system_error_response(err),
+    };
     if !cfg!(test) && !cfg!(target_os = "macos") {
         return system_error_response(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED));
     }
@@ -527,7 +544,14 @@ pub(super) async fn system_ai_provider_validate(
         Ok(key) => key,
         Err(err) => return system_error_response(err),
     };
-    match validate_hosted_key(&state.data_dir, provider, &api_key).await {
+    match validate_hosted_key(
+        &state.data_dir,
+        provider,
+        &api_key,
+        admin.proof_binding_id.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
         Ok(models) => Json(AiProviderValidateResponse {
             valid: true,
             models,
@@ -542,9 +566,10 @@ pub(super) async fn system_ai_provider_save(
     headers: HeaderMap,
     Json(req): Json<AiProviderSaveRequest>,
 ) -> Response {
-    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
-        return system_error_response(err);
-    }
+    let admin = match require_system_admin(&state.data_dir, &headers) {
+        Ok(admin) => admin,
+        Err(err) => return system_error_response(err),
+    };
     if !cfg!(test) && !cfg!(target_os = "macos") {
         return system_error_response(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED));
     }
@@ -569,7 +594,14 @@ pub(super) async fn system_ai_provider_save(
         Ok(model) => model,
         Err(err) => return system_error_response(err),
     };
-    let models = match validate_hosted_key(&state.data_dir, provider, &api_key).await {
+    let models = match validate_hosted_key(
+        &state.data_dir,
+        provider,
+        &api_key,
+        admin.proof_binding_id.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
         Ok(models) => models,
         Err(err) => return system_error_response(err),
     };

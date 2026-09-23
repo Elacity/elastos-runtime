@@ -64,6 +64,10 @@ struct EgressGrant {
     recipient: String,
     payer: String,
     owner_proof_binding_id: String,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
     expires_at_ms: u64,
     active: bool,
 }
@@ -89,10 +93,11 @@ pub(crate) async fn fetch_validation(
     data_dir: &Path,
     endpoint: ValidationEndpoint,
     api_key: &str,
+    owner_proof_binding_id: &str,
 ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
     tokio::time::timeout(
         Duration::from_secs(20),
-        fetch_validation_inner(data_dir, endpoint, api_key),
+        fetch_validation_inner(data_dir, endpoint, api_key, owner_proof_binding_id),
     )
     .await?
 }
@@ -101,6 +106,7 @@ async fn fetch_validation_inner(
     data_dir: &Path,
     endpoint: ValidationEndpoint,
     api_key: &str,
+    owner_proof_binding_id: &str,
 ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
     if api_key.trim().is_empty() || api_key.len() > 8192 {
         anyhow::bail!("hosted validation key unavailable");
@@ -126,9 +132,25 @@ async fn fetch_validation_inner(
         credential: Some(api_key.to_string()),
     };
     let (offer_id, effect) = endpoint.grant_binding();
-    current_grant_for(data_dir, offer_id, effect, "GET", &destination)?;
+    current_grant_for(
+        data_dir,
+        offer_id,
+        effect,
+        "GET",
+        &destination,
+        Some(owner_proof_binding_id),
+        None,
+    )?;
     let client = pinned_client(data_dir, &destination.url).await?;
-    current_grant_for(data_dir, offer_id, effect, "GET", &destination)?;
+    current_grant_for(
+        data_dir,
+        offer_id,
+        effect,
+        "GET",
+        &destination,
+        Some(owner_proof_binding_id),
+        None,
+    )?;
     let mut response = client
         .get(destination.url.clone())
         .bearer_auth(api_key)
@@ -140,7 +162,15 @@ async fn fetch_validation_inner(
     let status = response.status();
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        current_grant_for(data_dir, offer_id, effect, "GET", &destination)?;
+        current_grant_for(
+            data_dir,
+            offer_id,
+            effect,
+            "GET",
+            &destination,
+            Some(owner_proof_binding_id),
+            None,
+        )?;
         if bytes.len().saturating_add(chunk.len()) > MAX_BODY {
             anyhow::bail!("hosted validation response too large");
         }
@@ -212,18 +242,27 @@ async fn handle(
         Ok(destination) => destination,
         Err(_) => return deny(&mut stream).await,
     };
-    if current_grant(data_dir, &request, &destination).is_err() {
+    if !bridge.confined_model_run_matches(&request.offer_id, &request.run_id, &request.request_id)
+        || current_grant(data_dir, &request, &destination).is_err()
+    {
         return deny(&mut stream).await;
     }
     let result = {
         let mut monitor = tokio::time::interval(Duration::from_millis(250));
-        let outbound = forward(&mut stream, data_dir, &request, &destination);
+        let outbound = forward(&mut stream, data_dir, &request, &destination, || {
+            bridge.confined_model_run_matches(
+                &request.offer_id,
+                &request.run_id,
+                &request.request_id,
+            )
+        });
         tokio::pin!(outbound);
         loop {
             tokio::select! {
                 result = &mut outbound => break result,
                 _ = monitor.tick() => {
                     if bridge.confined_model_identity().map(|(pid, _)| pid) != Some(provider_pid)
+                        || !bridge.confined_model_run_matches(&request.offer_id, &request.run_id, &request.request_id)
                         || current_grant(data_dir, &request, &destination).is_err()
                     {
                         break Err(io::Error::new(io::ErrorKind::PermissionDenied, "hosted authority ended"));
@@ -428,6 +467,8 @@ fn current_grant(
         &request.effect,
         request.method.as_str(),
         destination,
+        None,
+        Some((&request.run_id, &request.request_id)),
     )?;
     if request.request_id.is_empty() || request.request_id.len() > 256 {
         anyhow::bail!("invalid hosted request binding");
@@ -441,6 +482,8 @@ fn current_grant_for(
     effect: &str,
     method: &str,
     destination: &Destination,
+    current_admin_proof: Option<&str>,
+    run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
     let bytes = read_hosted_egress_grants(data_dir)?
         .ok_or_else(|| anyhow::anyhow!("hosted egress paused"))?;
@@ -465,10 +508,24 @@ fn current_grant_for(
                 && grant.recipient == host
                 && grant.payer == "this Home"
                 && !grant.owner_proof_binding_id.is_empty()
+                && current_admin_proof.is_none_or(|proof| grant.owner_proof_binding_id == proof)
+                && match run_binding {
+                    Some((run_id, request_id)) => {
+                        grant.run_id.as_deref() == Some(run_id)
+                            && grant.request_id.as_deref() == Some(request_id)
+                    }
+                    None => grant.run_id.is_none() && grant.request_id.is_none(),
+                }
                 && grant.expires_at_ms > now
         })
         .ok_or_else(|| anyhow::anyhow!("hosted egress grant unavailable"))?;
-    let _ = grant;
+    let principal =
+        crate::auth::load_principal_for_proof_binding(data_dir, &grant.owner_proof_binding_id)?;
+    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
+    anyhow::ensure!(
+        crate::auth::is_admin(&principal) && principal.proof_binding.passkey.is_some(),
+        "hosted egress owner unavailable"
+    );
     Ok(())
 }
 
@@ -477,13 +534,14 @@ async fn forward(
     data_dir: &Path,
     request: &EffectRequest,
     destination: &Destination,
+    run_authorized: impl Fn() -> bool,
 ) -> io::Result<()> {
     let url = &destination.url;
     let client = match pinned_client(data_dir, url).await {
         Ok(client) => client,
         Err(_) => return deny(stream).await,
     };
-    if current_grant(data_dir, request, destination).is_err() {
+    if !run_authorized() || current_grant(data_dir, request, destination).is_err() {
         return deny(stream).await;
     }
     let mut outbound = client.request(request.method.clone(), url.clone());
@@ -685,9 +743,52 @@ mod tests {
         options.open(path).unwrap().write_all(bytes).unwrap();
     }
 
+    fn admin_proof(dir: &Path) -> String {
+        let mut identity = elastos_identity::IdentityManager::new(dir.to_path_buf()).unwrap();
+        let secret = crate::auth::random_secret_hex();
+        let owner = crate::auth::OwnerAdmission {
+            origin: "http://localhost:61971",
+            rp_id: "localhost",
+            claimant: &secret,
+            loopback: true,
+        };
+        let (_, options) = crate::auth::begin_owner_enrollment(
+            dir,
+            &mut identity,
+            &owner,
+            "owner",
+            crate::auth::now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let attestation = crate::auth::owner_attestation_for_test(
+            &options.unwrap().public_key.challenge,
+            owner.rp_id,
+            owner.origin,
+        );
+        crate::auth::complete_owner_enrollment(
+            dir,
+            &mut identity,
+            &owner,
+            "owner",
+            Some(&attestation),
+            None,
+            crate::auth::now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        crate::auth::active_passkey_principals(dir)
+            .unwrap()
+            .into_iter()
+            .find(crate::auth::is_admin)
+            .unwrap()
+            .proof_binding_id
+    }
+
     #[tokio::test]
     async fn exact_fixture_grant_routes_one_text_effect_and_revoke_denies_next_effect() {
         let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
         let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = sink.local_addr().unwrap().port();
         let path = format!("http://127.0.0.1:{port}/openrouter/api/v1/chat/completions");
@@ -753,14 +854,49 @@ mod tests {
                     "url":path,
                     "recipient":"127.0.0.1",
                     "payer":"this Home",
-                    "owner_proof_binding_id":"proof:fixture-owner",
+                    "owner_proof_binding_id":proof,
+                    "run_id":request.run_id,
+                    "request_id":request.request_id,
                     "expires_at_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000,
                     "active":active
                 }]
             })
         };
-        write_private(&grant_path, grant(true).to_string().as_bytes());
+        let mut missing_run = grant(true);
+        missing_run["grants"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("run_id");
+        write_private(&grant_path, missing_run.to_string().as_bytes());
+        assert!(current_grant(dir.path(), &request, &destination).is_err());
+        let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
+        forward(&mut denied, dir.path(), &request, &destination, || true)
+            .await
+            .unwrap();
+        denied.shutdown().await.unwrap();
+        let mut denial = String::new();
+        denied_peer.read_to_string(&mut denial).await.unwrap();
+        assert!(denial.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
+        fs::write(&grant_path, grant(true).to_string()).unwrap();
         current_grant(dir.path(), &request, &destination).unwrap();
+        let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
+        forward(&mut denied, dir.path(), &request, &destination, || false)
+            .await
+            .unwrap();
+        denied.shutdown().await.unwrap();
+        let mut denial = String::new();
+        denied_peer.read_to_string(&mut denial).await.unwrap();
+        assert!(denial.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
         let sink_task = tokio::spawn(async move {
             let (mut socket, _) = sink.accept().await.unwrap();
             let mut bytes = vec![0u8; 4096];
@@ -769,9 +905,11 @@ mod tests {
             String::from_utf8_lossy(&bytes[..count]).to_string()
         });
         let (mut broker_side, mut provider_side) = UnixStream::pair().unwrap();
-        forward(&mut broker_side, dir.path(), &request, &destination)
-            .await
-            .unwrap();
+        forward(&mut broker_side, dir.path(), &request, &destination, || {
+            true
+        })
+        .await
+        .unwrap();
         broker_side.shutdown().await.unwrap();
         let mut response = String::new();
         provider_side.read_to_string(&mut response).await.unwrap();
@@ -797,6 +935,7 @@ mod tests {
     #[tokio::test]
     async fn validation_uses_the_same_exact_grant_and_stops_after_revoke() {
         let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
         super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
             dir.path(),
             vec![],
@@ -819,7 +958,8 @@ mod tests {
         assert!(fetch_validation(
             dir.path(),
             ValidationEndpoint::OpenRouterModels,
-            "fixture-key"
+            "fixture-key",
+            &proof,
         )
         .await
         .is_err());
@@ -834,13 +974,26 @@ mod tests {
                     "url":models_url,
                     "recipient":"127.0.0.1",
                     "payer":"this Home",
-                    "owner_proof_binding_id":"proof:fixture-owner",
+                    "owner_proof_binding_id":proof,
                     "expires_at_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000,
                     "active":active
                 }]
             })
         };
         write_private(&grant_path, grant(true).to_string().as_bytes());
+        assert!(fetch_validation(
+            dir.path(),
+            ValidationEndpoint::OpenRouterModels,
+            "fixture-key",
+            "proof:wrong-admin",
+        )
+        .await
+        .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
         let sink_task = tokio::spawn(async move {
             let (mut socket, _) = sink.accept().await.unwrap();
             let mut bytes = vec![0u8; 4096];
@@ -852,6 +1005,7 @@ mod tests {
             dir.path(),
             ValidationEndpoint::OpenRouterModels,
             "fixture-key",
+            &proof,
         )
         .await
         .unwrap();
@@ -867,7 +1021,8 @@ mod tests {
         assert!(fetch_validation(
             dir.path(),
             ValidationEndpoint::OpenRouterModels,
-            "fixture-key"
+            "fixture-key",
+            &proof,
         )
         .await
         .is_err());
