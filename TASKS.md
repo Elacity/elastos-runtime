@@ -421,6 +421,17 @@ second POST. The provider settled the run as `settlement_unknown`; the
 private fixture was restored and Home returned HTTP 200. Installed Runtime
 SHA-256 `e4a27068…` and provider SHA-256 `c23d3e7e…` are bound in
 `.audit/hosted-egress-design-scratch/lost-response-installed-1616-retry/receipt.json`.
+
+The follow-on installed restart check kept the null-job marker byte-identical
+while the marked Runtime and model-provider restarted. The first terminal run
+record was held in the private audit, so a same-ID retry made a fresh provider
+dispatch decision. With its exact grant active, that attempt settled
+`settlement_unknown` and sent zero further POSTs to the listening sink. The
+fixture was restored with no live job binding or run journal; Home returned
+HTTP 200. Bounded independent review found no high or medium evidence issue.
+Receipt:
+`.audit/hosted-egress-design-scratch/lost-response-installed-restart-1616/receipt.json`.
+
 Upstream lookup or idempotency and explicit reconciliation of unknown attempts
 remain required before public hosted use. External HTTPS remains paused; the
 signed-in Homes and public seed were not changed.
