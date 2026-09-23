@@ -782,7 +782,7 @@ function configureAiProvider() {
     applyProviderChrome();
     document.querySelector("#ai-provider-form-title").textContent = editingId ? "Edit hosted model" : "Add hosted model";
     saveButton.textContent = "Save";
-    nameInput.focus();
+    keyInput.focus();
     setBusy(false);
   };
   const renderInstances = (status) => {
@@ -950,7 +950,7 @@ function configureAiProvider() {
   };
   addButton.addEventListener("click", () => {
     showForm(null);
-    showState("Name this model, check its key, choose a model and Save.", "");
+    showState("Choose a host, enter its key, then check and choose a model. The name is optional.", "");
   });
   cancelButton.addEventListener("click", () => {
     hideForm();
@@ -975,7 +975,7 @@ function configureAiProvider() {
       fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
       showState("This key is valid.", "success");
     } catch (error) {
-      showState(publicSystemError(error, "This key is invalid."), "error");
+      showState(hostedProviderValidationError(error), "error");
     } finally {
       setBusy(false);
     }
@@ -3665,6 +3665,20 @@ function publicSystemError(value, fallback) {
     return fallback;
   }
   return message;
+}
+
+function hostedProviderValidationError(value) {
+  const message = readText(value && value.message ? value.message : value);
+  if (message.includes("Hosted external HTTPS is paused until Runtime network authority is available.")) {
+    return "External HTTPS is paused on this Home. The key has not been checked.";
+  }
+  if (/invalid (OpenRouter|Venice) key/i.test(message)) {
+    return "The provider could not validate this key.";
+  }
+  if (/^request failed: 403 admin passkey required$/i.test(message)) {
+    return "Sign in as the Home admin to check provider keys.";
+  }
+  return publicSystemError(value, "This Home could not check the key. Try again.");
 }
 
 function showError(error) {

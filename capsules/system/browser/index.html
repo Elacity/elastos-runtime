@@ -300,6 +300,11 @@
           <div class="models-heading"><div><h1 id="models-title">Models</h1>
             <p class="pc2-card-sublabel">Choose where your models run. Manage access and stored keys here.</p></div>
             <button id="ai-provider-add" class="pc2-btn" type="button">Add hosted model</button></div>
+          <section id="local-models" class="pc2-section" aria-labelledby="local-models-title">
+            <h2 id="local-models-title" class="pc2-section-title">On this Home</h2>
+            <p class="pc2-card-sublabel">These models run on this device. Prompts stay here.</p>
+            <div data-model-management hidden></div>
+          </section>
           <section id="approval-lens" class="pc2-section" aria-labelledby="approval-lens-title">
             <h2 id="approval-lens-title" class="pc2-section-title">Approval Lens</h2>
             <p class="pc2-card-sublabel">Choose who gives advice on hosted connections. You decide in Inbox.</p>
@@ -320,7 +325,7 @@
           </section>
           <section class="pc2-section" data-ai-provider aria-labelledby="ai-provider-title">
             <h2 id="ai-provider-title" class="pc2-section-title">Hosted</h2>
-            <p id="ai-provider-egress-note" class="pc2-card-sublabel" role="status">External HTTPS is paused. Saved keys, models, and past results stay here.</p>
+            <p id="ai-provider-egress-note" class="pc2-card-sublabel" role="status">External HTTPS is paused. Key checks and hosted requests are unavailable. Saved keys, models, and past results stay here.</p>
             <div class="pc2-group">
               <div class="pc2-group-row">
                 <p class="pc2-card-sublabel">This Home stores the key.</p>
@@ -331,8 +336,6 @@
                 <div id="ai-provider-instances" class="ai-provider-instances"></div>
                 <div id="ai-provider-form" class="ai-provider-form" hidden>
                   <h2 id="ai-provider-form-title" class="pc2-section-title">Add hosted model</h2>
-                  <label class="pc2-card-label" for="ai-provider-name">Name</label>
-                  <input id="ai-provider-name" class="pc2-input" type="text" autocomplete="off" spellcheck="false" aria-label="Hosted model name">
                   <label class="pc2-card-label" for="ai-provider-kind">Hosted by</label>
                   <select id="ai-provider-kind" class="pc2-input" aria-label="Hosted by">
                     <option value="openrouter">OpenRouter</option>
@@ -340,6 +343,8 @@
                   </select>
                   <label class="pc2-card-label" for="ai-provider-key" data-ai-provider-key-label>API key</label>
                   <input id="ai-provider-key" class="pc2-input" type="password" autocomplete="off" spellcheck="false" aria-label="API key">
+                  <label class="pc2-card-label" for="ai-provider-name">Name (optional)</label>
+                  <input id="ai-provider-name" class="pc2-input" type="text" autocomplete="off" spellcheck="false" aria-label="Hosted model name">
                   <label class="pc2-card-label" for="ai-provider-model">Model</label>
                   <select id="ai-provider-model" class="pc2-input" aria-label="Selected model"></select>
                   <div class="system-inline-row">
@@ -350,11 +355,6 @@
                 </div>
               </div>
             </div>
-          </section>
-          <section id="local-models" class="pc2-section" aria-labelledby="local-models-title">
-            <h2 id="local-models-title" class="pc2-section-title">On this Home</h2>
-            <p class="pc2-card-sublabel">These models run on this device. Prompts stay here.</p>
-            <div data-model-management hidden></div>
           </section>
         </section>
         <section class="settings-content" data-settings="catalog" aria-labelledby="catalog-title">
