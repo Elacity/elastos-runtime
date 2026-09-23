@@ -262,6 +262,14 @@ released and shutdown was idempotent; independent review found no blocking
 defect. The mock did not transfer 763 Content bytes or exercise product
 settlement. The installed shared-provider result above remains the acceptance
 result, with frozen-provider terminal cancellation open.
+A later source-only two-bridge test kept an unrelated provider responsive
+while the dedicated child was frozen. The unrelated bridge returned exactly
+763 synthetic bytes before and after cancellation; the frozen child was
+reaped. Test failure cleanup also reaps the child. This
+supports process isolation only. The installed Content path still uses one
+shared registry and `ipfs` target for fetch and failure drain; it has no
+request-owned route or cancellation handle. No installed terminal-cancellation
+claim follows from the two-bridge test.
 
 Use now records Keep with a new reservation. Explicit local selection waits for
 a verified catalog mapping and Keep acknowledgement. Remove binds the caller,

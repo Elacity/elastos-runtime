@@ -229,6 +229,20 @@ Next test a request-owned Content worker or equivalent bounded cancellation
 protocol with other reads kept available, then rerun the installed 763-byte
 fixture and verify terminal state, zero reservation, no admission, preserved
 holder, and restart without replay.
+The next Mac source experiment kept a second provider bridge live while the
+dedicated child was frozen. That bridge returned and verified 763 synthetic
+bytes before and after the frozen child was cancelled and reaped. A test
+cleanup guard reaps the child on failure. This proves process
+lanes can remain independent, but does not route a product Content read to a
+request-owned lane. Model preparation currently holds the shared registry;
+ContentProvider holds a weak reference to that registry, `fetch` invokes its
+shared `ipfs` target, and failure cleanup calls the same target for a drain.
+A bridge-only change therefore cannot prove drained work or release the
+reservation. Request-owned routing must bind readiness, bounded fetch, cancel
+cleanup and restart reconciliation to the same owned provider process while
+unrelated Content reads retain the shared process. That change crosses the
+registry, Content and preparation ownership boundary; keep installed acceptance
+open until this route and its failure cleanup are implemented and tested.
 
 New bounded local-model result, 22 September 2026: the specialized
 `aac6fef/laya-typed-decisions-mlx` checkpoint at revision
