@@ -5870,6 +5870,11 @@ body.assistant-space-active #inbox-rail {
     padding: 11px 0;
   }
 
+  /* The ≤820 px 90 px wordmark reads undersized on the 44 px phone bar. */
+  .toolbar-brand img {
+    width: 104px;
+  }
+
   .toolbar-clock {
     min-height: var(--toolbar-h);
     margin-left: 0;

@@ -12395,6 +12395,11 @@ assert(
     "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.15x to stay lighter than the plates (the Assistant only with its plate-free mark), Control Centre and Notifications span the stage with even margins",
   );
 
+  assert(
+    homeGuiStyle.includes("  .toolbar-brand {\n    width: auto;\n    padding: 11px 0;\n  }\n\n  /* The ≤820 px 90 px wordmark reads undersized on the 44 px phone bar. */\n  .toolbar-brand img {\n    width: 104px;\n  }"),
+    "Home phone bar: the ElastOS wordmark is 104 px wide, between the 90 px narrow-window size and the 107 px desktop size",
+  );
+
   // Phone Assistant morph: Home's stretch target and the capsule's composer
   // share the Dock's 20 px gutter, so the pill never narrows then snaps back.
   const assistantFace = read("capsules/home-gui/browser/shell-assistant-face.js");
