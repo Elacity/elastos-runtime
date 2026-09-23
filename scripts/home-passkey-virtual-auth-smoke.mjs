@@ -36,6 +36,7 @@ const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
 const CLEANUP_PASSKEY = process.env.HOME_VIRTUAL_AUTH_CLEANUP !== "0";
 const INCLUDE_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER === "1";
 const CHECK_BROWSER_VIEWER_PREFLIGHT = process.env.HOME_VIRTUAL_AUTH_BROWSER_VIEWER_PREFLIGHT === "1";
+const CHECK_BROWSER_EMPTY_CLOSE = process.env.HOME_VIRTUAL_AUTH_BROWSER_EMPTY_CLOSE === "1";
 const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
@@ -4870,7 +4871,13 @@ async function checkBrowserViewerPreflight(page) {
     const appFrame = await openDesktopAppWindow(page, "browser");
     const browserToken = assertIsolatedLaunchRoute(appFrame.url(), "browser");
     const message = "This browser cannot show the Browser session. Use a supported browser or enable WebRTC.";
-    await appFrame.getByText(message, { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    try {
+      await appFrame.getByText(message, { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    } catch (error) {
+      error.details = { browser_text: (await appFrame.locator("body").innerText()).slice(0, 1000),
+        browser_url: new URL(appFrame.url()).pathname, open_requests: openRequests };
+      throw error;
+    }
     assert(openRequests === 0, "Unsupported viewer dispatched an Engine open", { openRequests });
     const summary = await browserApi(appFrame, browserToken, "/api/apps/browser/summary");
     assert(summary.ok, "Viewer preflight summary failed", summary);
@@ -4894,8 +4901,33 @@ async function checkBrowserViewerPreflight(page) {
   }
 }
 
+async function checkBrowserEmptyClose(page) {
+  const rounds = [];
+  for (let round = 0; round < 2; round += 1) {
+    const appFrame = await openDesktopAppWindow(page, "browser");
+    const token = assertIsolatedLaunchRoute(appFrame.url(), "browser");
+    const instance = new URL(appFrame.url()).searchParams.get("browser_instance");
+    const summary = await browserApi(appFrame, token,
+      `/api/apps/browser/summary?browser_instance=${encodeURIComponent(instance || "")}`);
+    assert(summary.ok && summary.body?.sessions?.status === "configured" &&
+      summary.body.sessions.recoverable_page === null &&
+      summary.body.sessions.window_close_ownership?.schema === "elastos.browser.window-close-ownership/v1" &&
+      summary.body.sessions.window_close_ownership.browser_instance === instance &&
+      summary.body.sessions.window_close_ownership.state === "absent",
+    "Fresh Browser window lacks exact Runtime absence", summary);
+    const gui = await homeGuiFrameForPage(page);
+    const window = gui.locator('section.window[data-target="browser"]').last();
+    await window.getByRole("button", { name: "Close", exact: true }).click();
+    await window.waitFor({ state: "hidden", timeout: 30_000 });
+    rounds.push({ absence: "exact", closed: true });
+    if (round === 0) await page.reload({ waitUntil: "domcontentloaded" });
+  }
+  return { target: "browser", empty_close: { rounds } };
+}
+
 async function checkBrowserLaunchGrant(page, homeToken) {
   assert(homeToken, "checkBrowserLaunchGrant requires a passkey-issued Home token");
+  if (CHECK_BROWSER_EMPTY_CLOSE) return checkBrowserEmptyClose(page);
   if (CHECK_BROWSER_VIEWER_PREFLIGHT) {
     assert(!OPEN_BROWSER && !CHECK_BROWSER_UI_SETUP && !CHECK_BROWSER_UI_INPUT && !CHECK_BROWSER_EMBEDDED_UI_INPUT,
       "Viewer rejection proof runs separately from Engine/media tests");
@@ -5585,6 +5617,7 @@ async function main() {
       shell_switch: shellSwitch,
       browser_launch_checked: Boolean(browserLaunch),
       browser_viewer_preflight: browserLaunch?.viewer_preflight || null,
+      browser_empty_close: browserLaunch?.empty_close || null,
       browser_summary: browserLaunch?.browser_summary || null,
       browser_ui_setup: browserLaunch?.browser_ui_setup || null,
       browser_ui_input: browserLaunch?.browser_ui_input || null,

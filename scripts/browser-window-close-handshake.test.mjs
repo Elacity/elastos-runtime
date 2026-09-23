@@ -677,6 +677,39 @@ test("cleanup-pending outcome plus an empty summary never proves absence", async
   assert.equal(harness.posted[0].message.reason, "runtime_ownership_unproven");
 });
 
+test("fresh close accepts only Runtime's exact instance-bound absence receipt", async () => {
+  const instance = "browser:0123456789abcdef0123456789abcdef";
+  for (const [proof, recoverablePage, terminal] of [
+    [{ schema: "elastos.browser.window-close-ownership/v1", browser_instance: instance, state: "absent" }, null, true],
+    [{ schema: "elastos.browser.window-close-ownership/v1", browser_instance: "browser:ffffffffffffffffffffffffffffffff", state: "absent" }, null, false],
+    [{ schema: "elastos.browser.window-close-ownership/v1", browser_instance: instance, state: "unresolved" }, null, false],
+    [null, null, false],
+    [{ schema: "elastos.browser.window-close-ownership/v1", browser_instance: instance, state: "absent" }, { state: "unknown" }, false],
+  ]) {
+    const harness = createHarness({
+      ownerless: true,
+      fetchResponses: [{
+        schema: "elastos.browser.runtime/v1",
+        sessions: {
+          schema: "elastos.browser.session-capacity/v1",
+          status: "configured",
+          recoverable_page: recoverablePage,
+          window_close_ownership: proof,
+        },
+      }],
+    });
+    await harness.handle({
+      origin: "null",
+      source: harness.parent,
+      data: harness.request,
+    });
+    assert.equal(harness.closeCalls.length, 0);
+    assert.match(harness.fetchCalls[0].path, /browser_instance=/);
+    assert.equal(harness.posted[0].message.state, terminal ? "terminal" : "pending");
+    assert.equal(harness.posted[0].message.terminalKind, terminal ? "no_page" : "");
+  }
+});
+
 test("exact internal terminal cleanup proves absence to the later window close", async () => {
   const harness = createHarness();
   assert.equal(harness.finalize(harness.owner), true);

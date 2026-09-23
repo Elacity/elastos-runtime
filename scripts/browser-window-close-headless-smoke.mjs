@@ -15,6 +15,7 @@ const state = {
   openStatusRequests: 0,
   releaseInitialOpen: null,
   serverErrors: [],
+  requests: [],
   unknownOpenResult: null,
 };
 
@@ -186,6 +187,7 @@ function openResult() {
 }
 
 async function handleApi(req, res, url) {
+  if (url.pathname.startsWith("/api/")) state.requests.push(`${req.method} ${url.pathname}`);
   if (req.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
     res.writeHead(204, {
       "access-control-allow-headers": "content-type,x-elastos-home-token",
@@ -196,7 +198,21 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/browser/summary" && req.method === "GET") {
-    json(res, 200, { sessions: {}, browser_engines: [], remote_carrier_exits: [] });
+    json(res, 200, {
+      sessions: {
+        schema: "elastos.browser.session-capacity/v1",
+        status: "configured",
+        fresh_start_allowed: true,
+        recoverable_page: null,
+        window_close_ownership: {
+          schema: "elastos.browser.window-close-ownership/v1",
+          browser_instance: browserInstance,
+          state: "absent",
+        },
+      },
+      browser_engines: [],
+      remote_carrier_exits: [],
+    });
     return true;
   }
   if (url.pathname === "/api/apps/browser/open" && req.method === "POST") {
@@ -367,6 +383,9 @@ try {
   const { chromium } = imported.default || imported;
   chromiumBrowser = await chromium.launch({
     headless: true,
+    ...(process.env.ELASTOS_BROWSER_CLOSE_CHROMIUM_EXECUTABLE
+      ? { executablePath: process.env.ELASTOS_BROWSER_CLOSE_CHROMIUM_EXECUTABLE }
+      : {}),
     args: ["--disable-background-networking", "--no-first-run", "--no-proxy-server"],
   });
   const context = await chromiumBrowser.newContext();
@@ -381,6 +400,7 @@ try {
       addEventListener() {}
       addIceCandidate() { return Promise.resolve(); }
       addTransceiver() {}
+      createDataChannel() { return { readyState: "open", close() {} }; }
       close() { this.connectionState = "closed"; }
       createOffer() { return Promise.resolve({ type: "offer", sdp: "v=0\r\n" }); }
       getStats() { return Promise.resolve(new Map()); }
@@ -419,7 +439,7 @@ try {
     (frame) => frame.url().includes("/apps/browser/"),
     "actual Browser capsule",
   );
-  for (let attempt = 0; attempt < 100 && state.openRequests < 1; attempt += 1) {
+  for (let attempt = 0; attempt < 500 && state.openRequests < 1; attempt += 1) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));
   }
   assert(state.openRequests === 1, "initial Browser open did not enter the fixture", {
@@ -428,6 +448,8 @@ try {
     consoleErrors,
     failedRequests,
     serverErrors: state.serverErrors,
+    requests: state.requests,
+    browserText: await browserFrame.locator("body").innerText(),
   });
   const transitionRequest = {
     type: "elastos.browser.window-close.request/v1",

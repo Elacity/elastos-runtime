@@ -2226,7 +2226,8 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
     let matching_job = jobs.jobs.values().any(|job| {
         job.scope == scope
             && job.principal_id == principal_id
-            && now.duration_since(job.updated_at) <= OPEN_JOB_TTL
+            && (matches!(job.state, BrowserOpenJobState::Pending)
+                || now.duration_since(job.updated_at) <= OPEN_JOB_TTL)
             && ((owner_launch_id == Some(job.owner_launch_id.as_str())
                 && job.state.coalesces_open())
                 || (browser_instance
@@ -2253,6 +2254,19 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
     let fresh_start_allowed = verified_scope
         && !pending_remote_preparation
         && capacity_available
+        && !matching_session
+        && !matching_job
+        && principal_launch_reconciliation_obligations == 0
+        && principal_engine_cleanup_obligations == 0
+        && !pending_stream_cleanup;
+    // A close request needs an exact negative ownership receipt. An empty
+    // recoverable_page alone cannot distinguish absence from an in-flight open
+    // or cleanup. This proof uses the same authenticated principal, launch and
+    // Browser instance that Runtime checked for an open, without making an
+    // unrelated window's capacity part of this window's ownership.
+    let window_close_absent = verified_scope
+        && browser_instance.is_some()
+        && !pending_remote_preparation
         && !matching_session
         && !matching_job
         && principal_launch_reconciliation_obligations == 0
@@ -2330,6 +2344,11 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
         "max_sessions_per_principal": limits.per_principal,
         "capacity_available": capacity_available,
         "fresh_start_allowed": fresh_start_allowed,
+        "window_close_ownership": {
+            "schema": "elastos.browser.window-close-ownership/v1",
+            "browser_instance": browser_instance,
+            "state": if window_close_absent { "absent" } else { "unresolved" },
+        },
         "recoverable_page": recoverable_page,
         "lifecycle": {
             "schema": "elastos.browser.lifecycle-status/v1",
@@ -3684,8 +3703,12 @@ impl BrowserOpenJobRegistry {
     }
 
     fn purge_expired(&mut self, now: Instant) {
-        self.jobs
-            .retain(|_, job| now.duration_since(job.updated_at) <= OPEN_JOB_TTL);
+        // The async open task has no whole-operation deadline. A Pending job
+        // remains ownership evidence even after the response polling TTL.
+        self.jobs.retain(|_, job| {
+            matches!(job.state, BrowserOpenJobState::Pending)
+                || now.duration_since(job.updated_at) <= OPEN_JOB_TTL
+        });
     }
 }
 
@@ -4563,6 +4586,18 @@ mod tests {
             assert_eq!(status["capacity_available"], true);
             assert!(status["recoverable_page"].is_null());
             assert_eq!(status["fresh_start_allowed"], allowed);
+            assert_eq!(
+                status["window_close_ownership"]["state"],
+                if allowed && instance.is_some() {
+                    "absent"
+                } else {
+                    "unresolved"
+                }
+            );
+            assert_eq!(
+                status["window_close_ownership"]["browser_instance"],
+                serde_json::json!(instance)
+            );
         }
         let broken = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(browser_ownership_dir(broken.path())).unwrap();
@@ -4711,6 +4746,48 @@ mod tests {
         )
         .await;
         assert_eq!(status["fresh_start_allowed"], false);
+        assert_eq!(status["window_close_ownership"]["state"], "unresolved");
+        clear_browser_lifecycle_memory_for_restart(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn window_close_absence_keeps_an_aged_pending_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = "browser:abcdefabcdefabcdefabcdefabcdefab";
+        let job = create_browser_open_job(
+            dir.path(),
+            "person:local:test",
+            "launch:pending",
+            Some(instance),
+            "intent:pending",
+        )
+        .await
+        .unwrap();
+        {
+            let mut jobs = BROWSER_OPEN_JOB_REGISTRY.get().unwrap().lock().await;
+            jobs.jobs.get_mut(&job.handle.id).unwrap().updated_at =
+                Instant::now() - OPEN_JOB_TTL - Duration::from_secs(1);
+        }
+        let status = browser_gateway_session_status(
+            dir.path(),
+            "person:local:test",
+            Some("launch:refreshed"),
+            Some(instance),
+        )
+        .await;
+        assert_eq!(status["window_close_ownership"]["state"], "unresolved");
+        assert_eq!(status["fresh_start_allowed"], false);
+        assert!(matches!(
+            browser_open_job_for_owner(
+                dir.path(),
+                &job.handle.id,
+                "person:local:test",
+                "launch:pending",
+            )
+            .await,
+            Some(BrowserOpenJobSnapshot::Pending)
+        ));
+        forget_browser_open_job_for_owner(dir.path(), "person:local:test", "launch:pending").await;
         clear_browser_lifecycle_memory_for_restart(dir.path()).await;
     }
 
@@ -4915,6 +4992,15 @@ mod tests {
         assert!(status["recoverable_page"].is_null());
         assert_eq!(status["capacity_available"], false);
         assert_eq!(status["fresh_start_allowed"], false);
+        let exact = browser_gateway_session_status(
+            dir.path(),
+            "person:local:test",
+            Some("launch:new"),
+            Some("browser:abcdefabcdefabcdefabcdefabcdefab"),
+        )
+        .await;
+        assert_eq!(exact["fresh_start_allowed"], false);
+        assert_eq!(exact["window_close_ownership"]["state"], "absent");
         clear_browser_lifecycle_memory_for_restart(dir.path()).await;
     }
 
