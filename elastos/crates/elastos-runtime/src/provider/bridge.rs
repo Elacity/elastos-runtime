@@ -1379,6 +1379,22 @@ mod tests {
         panic!("expected provider process {pid} to be terminated and reaped");
     }
 
+    #[cfg(unix)]
+    struct ReapTestChild(Option<u32>);
+
+    #[cfg(unix)]
+    impl Drop for ReapTestChild {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.take() {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(pid as i32, &mut status, 0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_provider_request_serialization() {
         let req = ProviderRequest::Read {
@@ -1747,8 +1763,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_exclusive_bridge_reaps_blocked_request_after_caller_cancel() {
+        use base64::Engine as _;
+
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("blocked-provider.sh");
+        let other_binary = temp.path().join("other-provider.sh");
         let pid_file = temp.path().join("blocked-provider.pid");
         let entered = temp.path().join("blocked-provider.entered");
         let gate = temp.path().join("blocked-provider.gate");
@@ -1766,6 +1785,19 @@ mod tests {
         );
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 763]);
+        let other_response = serde_json::json!({"status":"ok", "data":{"data":payload}});
+        let other_script = format!(
+            "#!/bin/sh\nset -eu\nIFS= read -r _init || exit 1\nprintf '%s\\n' '{}'\nfor _index in 1 2; do\n  IFS= read -r _read || exit 1\n  case \"$_read\" in *'\"op\":\"cat\"'*) ;; *) exit 2 ;; esac\n  case \"$_read\" in *'\"max_bytes\":763'*) ;; *) exit 2 ;; esac\n  printf '%s\\n' '{}'\ndone\nIFS= read -r _shutdown || exit 1\nprintf '%s\\n' '{}'\n",
+            r#"{"status":"ok"}"#,
+            other_response,
+            r#"{"status":"ok"}"#,
+        );
+        std::fs::write(&other_binary, other_script).unwrap();
+        std::fs::set_permissions(&other_binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let other_bridge = spawn_test_bridge(&other_binary, ProviderConfig::default())
+            .await
+            .unwrap();
         let bridge = Arc::new(
             spawn_test_bridge_with_timeouts(
                 &binary,
@@ -1777,6 +1809,7 @@ mod tests {
             .unwrap(),
         );
         let pid = read_pid(&pid_file);
+        let mut stopped_child = ReapTestChild(Some(pid));
         let request_bridge = Arc::clone(&bridge);
         let request = tokio::spawn(async move {
             request_bridge
@@ -1799,6 +1832,18 @@ mod tests {
         assert_eq!(received["max_bytes"], 763);
         assert!(!request.is_finished());
         assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+        let other_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            other_bridge.send_raw(&serde_json::json!({"op":"cat", "max_bytes":763})),
+        )
+        .await
+        .expect("an unrelated read completed while the exclusive child was frozen")
+        .unwrap();
+        let other_bytes = base64::engine::general_purpose::STANDARD
+            .decode(other_result["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(other_bytes, vec![b'x'; 763]);
+        assert!(!request.is_finished());
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
 
@@ -1810,11 +1855,24 @@ mod tests {
         assert!(matches!(error, BridgeError::Timeout), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_process_absent(&pid.to_string());
+        stopped_child.0.take();
         let _io = tokio::time::timeout(std::time::Duration::from_secs(1), bridge.io.lock())
             .await
             .expect("the blocked request released the pipe");
         drop(_io);
         bridge.shutdown().await.unwrap();
+        let after_cancel = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            other_bridge.send_raw(&serde_json::json!({"op":"cat", "max_bytes":763})),
+        )
+        .await
+        .expect("an unrelated read completed after exclusive cancellation")
+        .unwrap();
+        let after_cancel_bytes = base64::engine::general_purpose::STANDARD
+            .decode(after_cancel["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(after_cancel_bytes, vec![b'x'; 763]);
+        other_bridge.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
