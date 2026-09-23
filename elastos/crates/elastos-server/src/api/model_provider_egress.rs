@@ -141,6 +141,17 @@ struct Destination {
     job_backend_id: Option<String>,
     provider: String,
     configuration_id: String,
+    fixture_ca_pem: Option<String>,
+}
+
+fn configuration_id_with_fixture_ca(base: String, ca_pem: Option<&str>) -> String {
+    match ca_pem {
+        Some(pem) => hex::encode(Sha256::digest(
+            serde_json::to_vec(&(base, hex::encode(Sha256::digest(pem.as_bytes()))))
+                .expect("configuration identity is serializable"),
+        )),
+        None => base,
+    }
 }
 
 pub(crate) async fn fetch_validation(
@@ -180,17 +191,29 @@ async fn fetch_validation_inner(
             .map(|value| value.venice_models_url.as_str())
             .unwrap_or("https://api.venice.ai/api/v1/models?type=text"),
     };
+    let url = Url::parse(raw)?;
+    let fixture_ca_pem = if url.scheme() == "https" && url.host_str() == Some("127.0.0.1") {
+        fixtures
+            .as_ref()
+            .and_then(|value| value.loopback_ca_pem.clone())
+    } else {
+        None
+    };
     let destination = Destination {
-        url: Url::parse(raw)?,
+        url,
         grant_url: raw.to_string(),
         credential: Some(api_key.to_string()),
         job_backend_id: None,
         provider: endpoint.provider().to_string(),
-        configuration_id: hex::encode(Sha256::digest(serde_json::to_vec(&(
-            raw,
-            api_key,
-            endpoint.grant_binding(),
-        ))?)),
+        configuration_id: configuration_id_with_fixture_ca(
+            hex::encode(Sha256::digest(serde_json::to_vec(&(
+                raw,
+                api_key,
+                endpoint.grant_binding(),
+            ))?)),
+            fixture_ca_pem.as_deref(),
+        ),
+        fixture_ca_pem,
     };
     anyhow::ensure!(
         fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)?,
@@ -223,7 +246,13 @@ async fn fetch_validation_inner(
         Some(owner_proof_binding_id),
         None,
     )?;
-    let client = pinned_client(data_dir, &destination.url, &destination.grant_url).await?;
+    let client = pinned_client(
+        data_dir,
+        &destination.url,
+        &destination.grant_url,
+        destination.fixture_ca_pem.as_deref(),
+    )
+    .await?;
     current_grant_for(
         data_dir,
         offer_id,
@@ -518,6 +547,7 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
         .find(|offer| offer["id"] == request.offer_id && offer["enabled"] != false)
         .ok_or_else(|| anyhow::anyhow!("hosted offer unavailable"))?;
     let adapter = &offer["adapter"];
+    let fixtures = load_hosted_validate_fixtures(data_dir)?;
     let (raw_url, credential, job_backend_id) = match request.effect.as_str() {
         "text" | "responses" | "decisions" => {
             let kind = adapter["kind"].as_str().unwrap_or_default();
@@ -537,7 +567,7 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("hosted URL unavailable"))?
                 .to_string();
-            if let Some(fixtures) = load_hosted_validate_fixtures(data_dir)? {
+            if let Some(fixtures) = fixtures.as_ref() {
                 url = match adapter["hosted"]["backend_provider_label"].as_str() {
                     Some("OpenRouter") => fixtures
                         .openrouter_chat_url
@@ -612,10 +642,19 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
         .filter(|label| !label.is_empty())
         .unwrap_or("Hosted model")
         .to_string();
-    let configuration_id = hex::encode(Sha256::digest(serde_json::to_vec(&(
+    let base_configuration_id = hex::encode(Sha256::digest(serde_json::to_vec(&(
         adapter,
         credential.as_deref(),
     ))?));
+    let fixture_ca_pem = if url.scheme() == "https" && url.host_str() == Some("127.0.0.1") {
+        fixtures
+            .as_ref()
+            .and_then(|value| value.loopback_ca_pem.clone())
+    } else {
+        None
+    };
+    let configuration_id =
+        configuration_id_with_fixture_ca(base_configuration_id, fixture_ca_pem.as_deref());
     Ok(Destination {
         url,
         grant_url,
@@ -623,6 +662,7 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
         job_backend_id,
         provider,
         configuration_id,
+        fixture_ca_pem,
     })
 }
 
@@ -1065,7 +1105,14 @@ async fn forward(
         return deny(stream).await;
     }
     let url = &destination.url;
-    let client = match pinned_client(data_dir, url, &destination.grant_url).await {
+    let client = match pinned_client(
+        data_dir,
+        url,
+        &destination.grant_url,
+        destination.fixture_ca_pem.as_deref(),
+    )
+    .await
+    {
         Ok(client) => client,
         Err(_) => return deny(stream).await,
     };
@@ -1185,7 +1232,12 @@ async fn write_response_head(
     ).as_bytes()).await
 }
 
-async fn pinned_client(data_dir: &Path, url: &Url, grant_url: &str) -> io::Result<reqwest::Client> {
+async fn pinned_client(
+    data_dir: &Path,
+    url: &Url,
+    grant_url: &str,
+    ca_pem: Option<&str>,
+) -> io::Result<reqwest::Client> {
     let fixture =
         fixture_destination_allowed(data_dir, url, grant_url).map_err(io::Error::other)?;
     // Public destinations stay paused until owner grant UI and installed
@@ -1211,14 +1263,21 @@ async fn pinned_client(data_dir: &Path, url: &Url, grant_url: &str) -> io::Resul
     {
         return Err(invalid_request());
     }
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, &addresses)
         .connect_timeout(Duration::from_secs(5))
-        .timeout(STREAM_TIMEOUT)
-        .build()
-        .map_err(io::Error::other)
+        .timeout(STREAM_TIMEOUT);
+    if url.scheme() == "https" {
+        let pem = ca_pem.ok_or_else(invalid_request)?;
+        let certificate = reqwest::Certificate::from_pem(pem.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid fixture CA"))?;
+        builder = builder
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(certificate);
+    }
+    builder.build().map_err(io::Error::other)
 }
 
 fn fixture_destination_allowed(
@@ -1243,7 +1302,7 @@ fn fixture_destination_allowed(
         // Status adds the Runtime-bound job_id after resolving the configured
         // route. The private fixture pins that route, before the added query.
         .any(|pinned| pinned == grant_url)
-    }) && url.scheme() == "http"
+    }) && matches!(url.scheme(), "http" | "https")
         && url.host_str() == Some("127.0.0.1"))
 }
 
@@ -1415,7 +1474,55 @@ mod tests {
             configuration_id: hex::encode(Sha256::digest(
                 serde_json::to_vec(&(url, key, endpoint.grant_binding())).unwrap(),
             )),
+            fixture_ca_pem: None,
         }
+    }
+
+    #[test]
+    fn fixture_ca_rotation_requires_a_new_exact_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        let mut destination = validation_fixture(
+            "https://127.0.0.1:44321/models",
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        let base = destination.configuration_id.clone();
+        destination.configuration_id =
+            configuration_id_with_fixture_ca(base.clone(), Some("ca-one"));
+        let original = egress_scope(
+            "validation:openrouter",
+            "validate_models",
+            "GET",
+            &destination,
+        )
+        .unwrap();
+        let id =
+            model_provider_egress_decision::request(dir.path(), &original, Some(&proof)).unwrap();
+        model_provider_egress_decision::approve(dir.path(), &id, &proof).unwrap();
+        assert!(
+            model_provider_egress_decision::active(dir.path(), &original, Some(&proof)).is_ok()
+        );
+        destination.configuration_id = configuration_id_with_fixture_ca(base, Some("ca-two"));
+        let rotated = egress_scope(
+            "validation:openrouter",
+            "validate_models",
+            "GET",
+            &destination,
+        )
+        .unwrap();
+        assert!(
+            model_provider_egress_decision::active(dir.path(), &rotated, Some(&proof)).is_err()
+        );
+        assert_ne!(
+            model_provider_egress_decision::request(dir.path(), &rotated, Some(&proof)).unwrap(),
+            id
+        );
     }
 
     #[test]
@@ -1542,6 +1649,7 @@ mod tests {
             job_backend_id: None,
             provider: "Fixture".into(),
             configuration_id: "a".repeat(64),
+            fixture_ca_pem: None,
         };
         let scope = egress_scope(
             "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1686,6 +1794,7 @@ mod tests {
             job_backend_id: Some(backend_id),
             provider: "Fixture".into(),
             configuration_id: "a".repeat(64),
+            fixture_ca_pem: None,
         };
         approve_fixture(
             dir.path(),
@@ -1753,6 +1862,7 @@ mod tests {
             job_backend_id: Some(backend_id.clone()),
             provider: "Fixture".into(),
             configuration_id: "a".repeat(64),
+            fixture_ca_pem: None,
         };
         approve_fixture(
             dir.path(),
@@ -2059,9 +2169,11 @@ mod tests {
             .as_bytes(),
         );
         let status = Url::parse(&format!("{route}?job_id=job-1")).unwrap();
-        assert!(pinned_client(dir.path(), &status, &route).await.is_ok());
+        assert!(pinned_client(dir.path(), &status, &route, None)
+            .await
+            .is_ok());
         assert!(
-            pinned_client(dir.path(), &status, &format!("{route}-other"))
+            pinned_client(dir.path(), &status, &format!("{route}-other"), None)
                 .await
                 .is_err()
         );
@@ -2157,6 +2269,98 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn validation_redirect_never_contacts_unapproved_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let approved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unapproved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = approved.local_addr().unwrap().port();
+        let approved_url = format!("http://127.0.0.1:{port}/models");
+        let unapproved_url = format!(
+            "http://127.0.0.1:{}/stolen",
+            unapproved.local_addr().unwrap().port()
+        );
+        let root = dir.path().join("providers/model-provider");
+        write_private(
+            &root.join("validate-fixtures.json"),
+            json!({
+                "openrouter_models_url": approved_url,
+                "venice_rate_limits_url": format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url": format!("http://127.0.0.1:{port}/venice-models"),
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let destination = validation_fixture(
+            &approved_url,
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        approve_fixture(
+            dir.path(),
+            "validation:openrouter",
+            "validate_models",
+            "GET",
+            &destination,
+            &proof,
+            None,
+        );
+        let approved_task = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            let responses = [
+                format!("HTTP/1.1 302 Found\r\nLocation: {unapproved_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes(),
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}".to_vec(),
+            ];
+            for response in responses {
+                let (mut socket, _) = approved.accept().await.unwrap();
+                let mut bytes = [0u8; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                observed.push(String::from_utf8_lossy(&bytes[..count]).to_string());
+                socket.write_all(&response).await.unwrap();
+            }
+            observed
+        });
+        assert!(fetch_validation(
+            dir.path(),
+            ValidationEndpoint::OpenRouterModels,
+            "fixture-key",
+            &proof
+        )
+        .await
+        .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unapproved.accept())
+                .await
+                .is_err()
+        );
+        let (status, body) = fetch_validation(
+            dir.path(),
+            ValidationEndpoint::OpenRouterModels,
+            "fixture-key",
+            &proof,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, br#"{"data":[]}"#);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unapproved.accept())
+                .await
+                .is_err()
+        );
+        let observed = approved_task.await.unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed
+            .iter()
+            .all(|request| request.starts_with("GET /models ")));
     }
 
     #[tokio::test]

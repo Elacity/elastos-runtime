@@ -22,7 +22,7 @@ const HOSTED_DISPLAY_NAME_MAX_BYTES: usize = 80;
 const HOSTED_SECRET_REF_PREFIX: &str = "runtime:model-provider:";
 static MODEL_PROVIDER_CONFIG_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
-/// Loopback HTTP URL accepted only from owner-scoped validate-fixtures.json.
+/// Loopback HTTP(S) URL accepted only from owner-scoped validate-fixtures.json.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoopbackHttpUrl(String);
 
@@ -39,6 +39,7 @@ pub(crate) struct HostedValidateFixtures {
     pub venice_models_url: LoopbackHttpUrl,
     pub openrouter_chat_url: Option<LoopbackHttpUrl>,
     pub venice_chat_url: Option<LoopbackHttpUrl>,
+    pub loopback_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,8 @@ struct ValidateFixturesFile {
     openrouter_chat_url: Option<String>,
     #[serde(default)]
     venice_chat_url: Option<String>,
+    #[serde(default)]
+    loopback_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,15 +237,15 @@ fn is_hosted_instance_offer(offer: &serde_json::Value) -> bool {
             .is_some_and(|id| id.starts_with("model:hosted-"))
 }
 
-/// Parse a validate-fixture URL. Accept only http, host 127.0.0.1, an explicit
+/// Parse a validate-fixture URL. Accept only http(s), host 127.0.0.1, an explicit
 /// numeric port, and a path. Reject DNS, IPv6, localhost, credentials, and
 /// fragments.
 pub(crate) fn parse_loopback_http_url(raw: &str) -> anyhow::Result<LoopbackHttpUrl> {
     let trimmed = raw.trim();
     let parsed = url::Url::parse(trimmed)
         .map_err(|_| anyhow::anyhow!("hosted validate fixture URL is invalid"))?;
-    if parsed.scheme() != "http" {
-        anyhow::bail!("hosted validate fixture URL must use http");
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("hosted validate fixture URL must use http or https");
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("hosted validate fixture URL must omit credentials");
@@ -312,6 +315,7 @@ fn load_hosted_validate_fixtures_unlocked(
         venice_models_url: parse_loopback_http_url(&file.venice_models_url)?,
         openrouter_chat_url: optional_loopback_http_url(file.openrouter_chat_url.as_deref())?,
         venice_chat_url: optional_loopback_http_url(file.venice_chat_url.as_deref())?,
+        loopback_ca_pem: file.loopback_ca_pem,
     }))
 }
 
@@ -2059,6 +2063,8 @@ mod validate_fixture_tests {
             venice.as_str(),
             "http://127.0.0.1:43721/venice/api/v1/models?type=text"
         );
+        let tls = parse_loopback_http_url("https://127.0.0.1:43721/models").unwrap();
+        assert_eq!(tls.as_str(), "https://127.0.0.1:43721/models");
     }
 
     #[test]
@@ -2072,6 +2078,8 @@ mod validate_fixture_tests {
     #[test]
     fn parse_loopback_http_url_rejects_non_loopback_ip() {
         assert!(parse_loopback_http_url("http://8.8.8.8:80/openrouter/api/v1/models").is_err());
+        assert!(parse_loopback_http_url("http://127.0.0.2:43721/models").is_err());
+        assert!(parse_loopback_http_url("https://127.0.0.2:43721/models").is_err());
         assert!(
             parse_loopback_http_url("http://localhost:43721/openrouter/api/v1/models").is_err()
         );
