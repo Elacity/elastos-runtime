@@ -436,6 +436,29 @@ Upstream lookup or idempotency and explicit reconciliation of unknown attempts
 remain required before public hosted use. External HTTPS remains paused; the
 signed-in Homes and public seed were not changed.
 
+SEC1 upstream qualification on 23 September kept this boundary fail-closed.
+The tested `http_job_artifact` route names a controlled local fixture, not a
+selected commercial job provider. Its adapter accepts create, status and
+cancel URLs; it has no qualified lookup by the caller's request ID or an
+upstream create-idempotency rule. The configured Venice and Jev offers use text
+adapters, so their completed requests do not qualify the HTTP-job contract.
+OpenRouter documents video status lookup by its returned job ID, but that ID
+is unavailable when create loses its response. Its generation lookup also
+requires a returned generation ID. The reviewed video API docs give no
+caller-request-ID lookup or create-idempotency guarantee. OpenRouter's
+response cache covers text endpoints, not video create, and does not supply
+this guarantee. These published APIs do not justify a second create after an
+unknown first result. The accepted
+installed controlled-sink receipts above show one full POST, zero extra POSTs
+on same-ID retry and after Runtime/provider restart, and durable
+`settlement_unknown`. The installed known-job fixture binds status and cancel
+to the original offer, run, request, job ID, routes and credential identity,
+while exact create replay uses its persisted ID without a second POST. Receipt
+`.audit/sec1-unknown-create-contract/receipt.json` binds the reused evidence
+and official API references. A named upstream must publish and pass a
+request-ID idempotency or lookup contract before automatic unknown-create
+recovery can be implemented. No paid call or human Home mutation was needed.
+
 Linux SEC1 diagnostic: an isolated C fixture on the owned Linux target passed
 with a `no_new_privs` seccomp filter. Its child and forked descendant received
 `EPERM` for new IPv4, IPv6, and Unix sockets, for local/external TCP connects

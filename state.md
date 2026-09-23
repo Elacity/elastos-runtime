@@ -1812,6 +1812,13 @@ complete. Installed proof and the atomic authority cutover remain open.
   receipt is `.audit/linux-sec1-confinement/installed-observation.json`.
   Linux Home Assistant use under this filter and a stricter preopened-channel
   engine design still need proof. Public hosted HTTPS remains paused.
+- HTTP-job create writes a private pending marker before dispatch. A lost create
+  response leaves that request at `settlement_unknown`; same-ID retry and a
+  Runtime/provider restart send no second create. A known job ID can be replayed
+  only for its original offer, run, request and backend identity. The current
+  HTTP-job test route is a local fixture with no qualified upstream request-ID
+  lookup or create-idempotency guarantee. The accepted installed evidence and
+  upstream qualification are in `.audit/sec1-unknown-create-contract/receipt.json`.
 - The current source does not integrate the Codex SDK. Codex remains a later
   agent-execution adapter behind typed agent operations and explicit
   filesystem, network, tool, and approval grants. It is not a model offer.
