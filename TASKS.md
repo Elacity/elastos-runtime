@@ -360,9 +360,10 @@ unrelated creates to proceed while one upstream is slow. Runtime canonicalizes
 the checked JSON body before forwarding it. Source checks cover missing and
 wrong job IDs, route and account drift, replay without a second dispatch, and
 the existing exact-grant fixture. Independent review found and verified fixes
-for lock, replay, route and account-binding gaps. This checkpoint has no
-installed HTTP-job effect proof. An upstream that accepts create but loses its
-response before Runtime records a job ID can still leave settlement unknown;
+for lock, replay, route and account-binding gaps. At this source checkpoint,
+installed HTTP-job effects were still unproved. An upstream that accepts create
+but loses its response before Runtime records a job ID can still leave
+settlement unknown;
 upstream request-ID idempotency or lookup is needed for full recovery. Public
 HTTPS remains paused.
 
@@ -383,6 +384,28 @@ and 29 protected files kept hashes and inodes. Disk remained above 20% free;
 no paid call was made. Receipt:
 `.audit/hosted-egress-design-scratch/active-validation-installed-receipt.json`.
 Public HTTPS remains paused.
+
+Installed HTTP-job checkpoint: marked diagnostic Home 61971 now runs Runtime
+built and installed at matching SHA-256 `ccf6763d…`, with its native model
+provider verified at `c23d3e7e…`. A dummy loopback sink saw one authorized
+create, one status for the bound job ID, and one cancel. It saw zero requests
+before a grant, for wrong-route or wrong-account grants, and after revocation.
+An adversarial diagnostic run preserved then moved its provider journal entry
+before an exact create replay: Runtime returned the persisted job ID with no
+second upstream create. Changing only that diagnostic journal's job ID made
+cancel and status receive broker 403 responses without reaching the sink. The
+first fixture used an offer ID outside Runtime's hosted format; it made zero
+sink requests and was corrected before this proof. All fixture-created run
+journals and the job binding are now preserved under the ignored audit
+directory so the restored diagnostic model provider starts cleanly. Its offer
+config is absent, original fixture and grant bytes are restored, and grants
+are inactive. Installed `offers_list` returns HTTP 200 with zero diagnostic
+offers; all three Homes return HTTP 200. Independent review found no remaining
+high or medium evidence issue in this diagnostic scope. No paid request
+occurred. Receipt:
+`.audit/hosted-egress-design-scratch/installed-http-job-receipt-v3.json`.
+Public HTTPS consent/routing, Linux confinement, and upstream recovery for a
+lost create response remain open.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
