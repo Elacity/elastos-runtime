@@ -171,6 +171,7 @@ verify:
     node --test scripts/system-hosted-save.test.mjs
     node --test scripts/home-form-factor.test.mjs
     node --test scripts/home-phone-dock.test.mjs
+    node --test scripts/home-phone-stage.test.mjs
     node --test scripts/home-link-status.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh

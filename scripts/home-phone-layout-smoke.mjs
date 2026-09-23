@@ -807,6 +807,7 @@ async function runProfile(browser, engineId, profile, origin) {
   });
   const surfaces = [];
   let dockProbe = null;
+  let stageProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -841,6 +842,7 @@ async function runProfile(browser, engineId, profile, origin) {
       await openWindow(frame, target);
       if (profile.id.startsWith("phone") && !dockProbe) {
         dockProbe = await probePhoneDock(frame, page, dir);
+        stageProbe = await probePhoneStage(frame, page, dir, profile, target);
       }
       const shell = await measure(frame, "window");
       shell.target = target;
@@ -860,7 +862,107 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, bootRetries };
+}
+
+// Phone stage contract with a window open: a downward drag on the title bar
+// opens Mission Control (cards carry icon + name and a Close on touch);
+// system back goes home and leaves no history entry behind; rotating keeps
+// the window on the stage at full width. Ends with the window open again.
+async function probePhoneStage(frame, page, dir, profile, target) {
+  const windowState = () =>
+    frame.evaluate((selector) => {
+      const win = document.querySelector(selector);
+      const rect = win?.getBoundingClientRect();
+      return {
+        visible: Boolean(win) && !win.classList.contains("hidden"),
+        width: rect ? Math.round(rect.width) : null,
+        viewportWidth: window.innerWidth,
+        exposeActive: document.body.classList.contains("expose-active"),
+        historyState: history.state,
+        stageHistory: document.body.dataset.stageHistory || null,
+        captionIcon: Boolean(document.querySelector(".expose-card .expose-caption-icon")),
+        cardClose: Boolean(document.querySelector(".expose-card .expose-close")?.getClientRects().length),
+      };
+    }, `.window[data-target="${target}"]`);
+
+  const head = await frame.locator(`.window[data-target="${target}"] .window-head-draggable`).boundingBox();
+  await page.mouse.move(head.x + head.width / 2, head.y + head.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(head.x + head.width / 2, head.y + head.height / 2 + 40, { steps: 4 });
+  await page.mouse.move(head.x + head.width / 2, head.y + head.height / 2 + 90, { steps: 4 });
+  await page.mouse.up();
+  await sleep(SHEET_SETTLE_MS);
+  const swiped = await windowState();
+  await screenshot(page, dir, "switcher");
+  await pressEscape(frame);
+  await sleep(SHEET_SETTLE_MS);
+
+  const before = await windowState();
+  // Same joint-session-history step the system back button takes; Playwright's
+  // page.goBack() waits for a main-frame navigation that never comes. Where
+  // the shell runs buttons-only (WebKit), back is not the shell's to answer
+  // and the probe only checks nothing was pushed.
+  let afterBack = before;
+  if (before.stageHistory === "history") {
+    await frame.evaluate(() => history.back());
+    await sleep(SHEET_SETTLE_MS);
+    afterBack = await windowState();
+    await openWindow(frame, target);
+  }
+  afterBack.homeAlive = !frame.isDetached() && frame.url().includes("/apps/home-gui/");
+  await sleep(SURFACE_SETTLE_MS);
+
+  const rotated = { width: profile.viewport.height, height: profile.viewport.width };
+  await page.setViewportSize(rotated);
+  await sleep(SHEET_SETTLE_MS);
+  const afterRotate = await windowState();
+  await page.setViewportSize(profile.viewport);
+  await sleep(SHEET_SETTLE_MS);
+  const restored = await windowState();
+  return { swiped, before, afterBack, afterRotate, restored };
+}
+
+function phoneStageFailures(run) {
+  if (!run.stage) {
+    return [];
+  }
+  const { swiped, before, afterBack, afterRotate, restored } = run.stage;
+  const label = `${run.engine}/${run.profile}/stage`;
+  const failures = [];
+  if (!swiped.exposeActive) {
+    failures.push(`${label}: title-bar swipe down must open Mission Control`);
+  }
+  if (swiped.exposeActive && (!swiped.captionIcon || !swiped.cardClose)) {
+    failures.push(`${label}: Mission Control cards must show the app icon and a Close on touch`);
+  }
+  if (!before.visible) {
+    failures.push(`${label}: the window must be on the stage before back`);
+  }
+  if (!afterBack.homeAlive) {
+    failures.push(`${label}: system back must never navigate the Home frame away`);
+  }
+  if (before.stageHistory === "history") {
+    if (!before.historyState?.elastosStage) {
+      failures.push(`${label}: an open window must hold one stage history entry`);
+    }
+    if (afterBack.visible || afterBack.historyState?.elastosStage) {
+      failures.push(`${label}: system back must go home and leave no stage history entry`);
+    }
+  } else if (before.stageHistory === "buttons") {
+    if (before.historyState?.elastosStage) {
+      failures.push(`${label}: buttons-only shells must not push stage history`);
+    }
+  } else {
+    failures.push(`${label}: body[data-stage-history] must say history or buttons`);
+  }
+  if (!afterRotate.visible || afterRotate.width !== afterRotate.viewportWidth) {
+    failures.push(`${label}: rotating must keep the window on the stage at full width (${afterRotate.width}/${afterRotate.viewportWidth})`);
+  }
+  if (!restored.visible || restored.width !== restored.viewportWidth) {
+    failures.push(`${label}: rotating back must keep the window at full width`);
+  }
+  return failures;
 }
 
 // Phone Dock contract with a window open: the Dock is off screen and the
@@ -1020,7 +1122,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {

@@ -197,6 +197,50 @@ would be; no `image-set()` variant.
   follows the touch); nothing is deleted, the desktop maths is unchanged.
 - The continuous-chrome windows (Wallet, Archive, GBA, connectors) already
   obey the stage through the generic phone `.window` rule.
+- Open: the window rises from the Dock in 200 ms (`phone-window-enter`,
+  transform + opacity only); none under `prefers-reduced-motion`.
+
+## App switcher, swipe and system back (M3)
+
+- Mission Control is the phone's app switcher. A downward drag on the title
+  bar (≥ 48 px, cancelled by ≥ 32 px of sideways drift) opens it; the drag
+  starts on the title bar only, because capsule frames own their touches
+  (`shell-phone-stage.js`, `TITLE_SWIPE_DOWN_PX`, `TITLE_SWIPE_DRIFT_PX`).
+  The head takes pointer capture so the moves keep arriving once the finger
+  crosses into the capsule frame, and the click that ends the gesture is
+  swallowed — it would land on the card and undo the open. The Minimise
+  chevron is the button twin.
+- Cards carry the capsule icon and name (`.expose-caption`, counter-scaled by
+  `--expose-card-scale` so they read at natural size) and, on coarse
+  pointers, a 44 px Close (`.expose-close`) — the scaled title bar's own Close
+  is no longer a target. Touch cards let both hang outside the scaled window
+  (`overflow: visible; contain: none`). Portrait stages size the Space thumbs
+  by height (`MISSION_PORTRAIT_THUMB_MIN_W`); the landscape width floor made a
+  portrait thumb ~350 px tall and left the cards a quarter of the screen.
+- Copy on coarse pointers: "Tap + for a new Desktop…", no mouse language.
+- Stage history (`shell-phone-stage-history.js`, pure, unit-tested): the
+  shell keeps at most one entry of its own, pushed when the first layer (a
+  window, a sheet, Mission Control) opens and consumed when the last closes,
+  so back on the bare desktop leaves Home as before. popstate closes the top
+  layer: the shell's Escape registry, then Mission Control, then any open
+  sheet through its own closer, then the window goes home (minimise). The
+  decision reads `history.state` — capsule frames add joint-session steps of
+  their own above ours and traversal is asynchronous, so counting pushes
+  drifts — and never issues more than one `back()` per close cycle: a second
+  one before the first lands could walk out of the host's history.
+- **WebKit fallback (recorded per plan).** Safari and every iOS browser
+  record nested frame loads as joint steps and, seen from the shell frame,
+  one `history.back()` after a `pushState` took the shell frame itself to
+  `about:blank` in the phone smoke (2026-09-23). `stageHistorySupported()`
+  therefore keeps stage history off on WebKit (`body[data-stage-history]` is
+  `buttons` there, `history` on Chromium/Gecko). Every function stays
+  reachable by button and swipe; iOS has no system back button, Android
+  (Chromium) gets it. Revisit if the frame loads move to
+  `location.replace()`.
+- The phone smoke probes all of it on the first window: swipe → switcher
+  with caption icon and Close, `history.back()` → home with no entry left
+  (Chromium) or nothing pushed (WebKit), the Home frame alive either way, and
+  rotation to landscape and back with the window still filling the stage.
 
 ### After M2–M3 (bar, Dock, title bar), 2026-09-23
 

@@ -12340,6 +12340,48 @@ assert(
       windowGeometry.includes('if (windowNode.dataset.maximized === "true" || isPhone()) {'),
     "Home phone title bar: 44 px .window-head presentation for every chrome mode (Close, icon + title, Minimise; no fullscreen), body below the head in all modes, boot hairline until the frame is ready, chrome map untouched, window drag/resize guarded on phone",
   );
+
+  // Phone stage: one history entry per stage (pushed on the first layer,
+  // consumed on the last; back closes the top layer), decided from
+  // history.state and never more than one back() per close cycle; off on
+  // WebKit (buttons only); title-bar swipe to the switcher with the follow-up
+  // click swallowed, Mission Control cards with icon + name and a touch
+  // Close, portrait Space thumbs sized by height.
+  const phoneStageModule = read("capsules/home-gui/browser/shell-phone-stage.js");
+  const phoneStageHistory = read("capsules/home-gui/browser/shell-phone-stage-history.js");
+  const shellExpose = read("capsules/home-gui/browser/shell-expose.js");
+  assert(
+    phoneStageHistory.includes("export const STAGE_HISTORY_STATE = Object.freeze({ elastosStage: true });") &&
+      phoneStageHistory.includes("export function isStageHistoryState(state) {\n  return Boolean(state && typeof state === \"object\" && state.elastosStage === true);\n}") &&
+      phoneStageHistory.includes("  const leave = () => {\n    if (leaving) {\n      return;\n    }\n    leaving = true;\n    back();\n  };") &&
+      phoneStageHistory.includes("      if (layers > 0) {\n        // A new cycle: whatever the last leave did has long landed.\n        leaving = false;\n        if (!ours) {\n          pushState();\n        }\n        return;\n      }\n      if (ours) {\n        leave();\n      }") &&
+      phoneStageHistory.includes("      const remaining = onBack();\n      if (remaining > 0 && !ours) {\n        pushState();\n      } else if (remaining === 0 && ours) {\n        leave();\n      }") &&
+      phoneStageModule.includes("  const webkit = /AppleWebKit\\//.test(agent) && !/(Chrome|Chromium|Edg)\\//.test(agent);\n  return !webkit;") &&
+      phoneStageModule.includes("  if (!stageHistorySupported(view)) {\n    doc.body.dataset.stageHistory = \"buttons\";\n    return null;\n  }\n  doc.body.dataset.stageHistory = \"history\";") &&
+      phoneStageModule.includes("    onOurEntry: () => isStageHistoryState(view.history.state),") &&
+      phoneStageModule.includes("export const TITLE_SWIPE_DOWN_PX = 48;") &&
+      phoneStageModule.includes("export const TITLE_SWIPE_DRIFT_PX = 32;") &&
+      phoneStageModule.includes("      if (dx >= TITLE_SWIPE_DRIFT_PX) {\n        gesture = null;\n        return;\n      }\n      if (dy >= TITLE_SWIPE_DOWN_PX) {\n        gesture = null;\n        suppressGestureClick(doc);\n        openExpose();\n      }") &&
+      phoneStageModule.includes("        head.setPointerCapture(event.pointerId);") &&
+      phoneStageModule.includes("  if (handleShellEscape()) {\n    return stageLayerCount(doc);\n  }\n  if (isExposeOpen()) {\n    closeExpose();\n    return stageLayerCount(doc);\n  }") &&
+      phoneStageModule.includes("    minimizeWindow(id);\n  }\n  return stageLayerCount(doc);") &&
+      homeGuiJs.includes("bindPhoneStage();") &&
+      shellExpose.includes("const MISSION_PORTRAIT_THUMB_MIN_W = 64;") &&
+      shellExpose.includes("      ? Math.round(Math.max(MISSION_PORTRAIT_THUMB_MIN_W, previewH * aspect))") &&
+      shellExpose.includes('    node.style.setProperty("--expose-card-scale", String(scale));') &&
+      shellExpose.includes('  caption.append(icon, label);') &&
+      shellExpose.includes('    close.className = "expose-close";') &&
+      homeGuiStyle.includes("  transform: translateX(-50%) scale(calc(1 / var(--expose-card-scale, 1)));") &&
+      homeGuiStyle.includes('body[data-pointer="coarse"].expose-active .window.expose-card {\n  overflow: visible;\n  contain: none;\n}') &&
+      homeGuiStyle.includes('body[data-pointer="coarse"].expose-active .window.expose-card .expose-close {\n  display: block;\n}') &&
+      homeGuiStyle.includes("    /* The title bar is the swipe-down surface for the switcher. */\n    touch-action: none;") &&
+      homeGuiStyle.includes("    animation: phone-window-enter 200ms cubic-bezier(0.2, 0, 0, 1);") &&
+      phoneSmoke.includes("async function probePhoneStage(frame, page, dir, profile, target) {") &&
+      phoneSmoke.includes("  if (before.stageHistory === \"history\") {\n    await frame.evaluate(() => history.back());") &&
+      phoneSmoke.includes("    failures.push(`${label}: system back must never navigate the Home frame away`);") &&
+      justfile.includes("node --test scripts/home-phone-stage.test.mjs"),
+    "Home phone stage: one stage history entry (first layer pushes, last close consumes, back closes the top layer then goes home; decided from history.state, one back() per close cycle, buttons-only on WebKit) unit-tested in verify, title-bar swipe-down to Mission Control with pointer capture and the follow-up click swallowed, cards with icon + name and a 44 px Close on touch, portrait Space thumbs sized by height, 200 ms rise-from-Dock open, all probed by the phone smoke",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
