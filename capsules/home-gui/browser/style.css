@@ -5909,6 +5909,20 @@ body.assistant-space-active #inbox-rail {
     scroll-snap-align: center;
   }
 
+  /* Plate-free glyphs (Apps launcher, Assistant mark) are drawn at 58.6% of
+     their square for the desktop's pointer-scale dock; on a phone they read
+     as small next to the 48 px app plates. 1.3× puts both at ~76% of the
+     slot. The launcher glyph is a background (its .taskbar-icon transform is
+     reserved for magnification); the Assistant scales its inner icon node so
+     the mark's own layer animation is untouched. */
+  .taskbar-icon-launcher {
+    background-size: 130%;
+  }
+
+  .taskbar-item-assistant .taskbar-item-icon {
+    transform: scale(1.3);
+  }
+
   /* Running indicator grows to a legible 4 px pill under the 58 px tile. */
   .active-taskbar-indicator {
     width: 14px;
