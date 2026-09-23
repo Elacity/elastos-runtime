@@ -77,7 +77,10 @@ struct JobBinding {
     offer_id: String,
     run_id: String,
     request_id: String,
-    job_id: String,
+    // None means create may have reached upstream, but Runtime has no result.
+    // Keep that state across restart so an identical request cannot dispatch twice.
+    #[serde(default)]
+    job_id: Option<String>,
     backend_id: String,
     recorded_at_ms: u64,
 }
@@ -629,7 +632,7 @@ fn job_bindings(data_dir: &Path) -> anyhow::Result<JobBindingsFile> {
         file.schema == "elastos.model.egress-job-bindings/v1"
             && file.bindings.len() <= MAX_JOB_BINDINGS
             && file.bindings.iter().all(|binding| {
-                valid_job_id(&binding.job_id)
+                binding.job_id.as_deref().is_none_or(valid_job_id)
                     && binding.backend_id.len() == 64
                     && binding
                         .backend_id
@@ -688,7 +691,7 @@ fn current_job_binding(
             binding.offer_id == request.offer_id
                 && binding.run_id == request.run_id
                 && binding.request_id == request.request_id
-                && binding.job_id == job_id
+                && binding.job_id.as_deref() == Some(job_id.as_str())
                 && binding.backend_id == backend_id
                 && binding.recorded_at_ms <= now
                 && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
@@ -712,13 +715,17 @@ fn recorded_job_create(
     }) else {
         return Ok(None);
     };
+    let job_id = binding
+        .job_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("hosted job create settlement unknown"))?;
     anyhow::ensure!(
         binding.recorded_at_ms <= now
             && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
             && binding.backend_id == backend_id,
         "hosted job result expired or backend changed"
     );
-    Ok(Some(binding.job_id.clone()))
+    Ok(Some(job_id.to_string()))
 }
 
 fn job_create_has_capacity(
@@ -736,8 +743,12 @@ fn job_create_has_capacity(
         }),
         "hosted job create already recorded"
     );
+    // Unknown attempts stay until upstream settlement can be reconciled. The
+    // bounded journal fails closed rather than allowing a duplicate create.
     file.bindings.retain(|binding| {
-        binding.recorded_at_ms <= now && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
+        binding.job_id.is_none()
+            || (binding.recorded_at_ms <= now
+                && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS)
     });
     anyhow::ensure!(
         file.bindings.len().saturating_add(pending) < MAX_JOB_BINDINGS,
@@ -775,6 +786,34 @@ fn reserve_job_create(
     Ok(JobCreateReservation(key))
 }
 
+fn mark_job_create_attempt(
+    data_dir: &Path,
+    request: &EffectRequest,
+    backend_id: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(backend_id.len() == 64, "invalid hosted job backend");
+    let _pending = job_creates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    job_create_has_capacity(data_dir, request, 0)?;
+    let mut file = job_bindings(data_dir)?;
+    let now = job_binding_time_ms()?;
+    file.bindings.retain(|binding| {
+        binding.job_id.is_none()
+            || (binding.recorded_at_ms <= now
+                && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS)
+    });
+    file.bindings.push(JobBinding {
+        offer_id: request.offer_id.clone(),
+        run_id: request.run_id.clone(),
+        request_id: request.request_id.clone(),
+        job_id: None,
+        backend_id: backend_id.to_string(),
+        recorded_at_ms: now,
+    });
+    write_hosted_job_bindings(data_dir, &serde_json::to_vec(&file)?)
+}
+
 fn record_job_create(
     data_dir: &Path,
     request: &EffectRequest,
@@ -791,20 +830,23 @@ fn record_job_create(
     let _pending = job_creates()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    job_create_has_capacity(data_dir, request, 0)?;
     let mut file = job_bindings(data_dir)?;
     let now = job_binding_time_ms()?;
-    file.bindings.retain(|binding| {
-        binding.recorded_at_ms <= now && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
-    });
-    file.bindings.push(JobBinding {
-        offer_id: request.offer_id.clone(),
-        run_id: request.run_id.clone(),
-        request_id: request.request_id.clone(),
-        job_id: job_id.to_string(),
-        backend_id: backend_id.to_string(),
-        recorded_at_ms: now,
-    });
+    let binding = file
+        .bindings
+        .iter_mut()
+        .find(|binding| {
+            binding.offer_id == request.offer_id
+                && binding.run_id == request.run_id
+                && binding.request_id == request.request_id
+        })
+        .ok_or_else(|| anyhow::anyhow!("hosted job create attempt unavailable"))?;
+    anyhow::ensure!(
+        binding.job_id.is_none() && binding.backend_id == backend_id,
+        "hosted job create attempt changed"
+    );
+    binding.job_id = Some(job_id.to_string());
+    binding.recorded_at_ms = now;
     write_hosted_job_bindings(data_dir, &serde_json::to_vec(&file)?)
 }
 
@@ -866,6 +908,11 @@ async fn forward(
         outbound = outbound
             .header("content-type", "application/json")
             .body(serde_json::to_vec(&body).map_err(io::Error::other)?);
+    }
+    if request.effect == "job_create"
+        && mark_job_create_attempt(data_dir, request, backend_id).is_err()
+    {
+        return deny(stream).await;
     }
     let mut response = match outbound.send().await {
         Ok(response) if !response.status().is_redirection() => response,
@@ -1171,6 +1218,8 @@ mod tests {
         assert!(current_job_binding(dir.path(), &status, &backend_id).is_err());
         assert!(record_job_create(dir.path(), &create, &backend_id, br#"{}"#).is_err());
         assert!(read_hosted_job_bindings(dir.path()).unwrap().is_none());
+        mark_job_create_attempt(dir.path(), &create, &backend_id).unwrap();
+        assert!(recorded_job_create(dir.path(), &create, &backend_id).is_err());
         record_job_create(dir.path(), &create, &backend_id, br#"{"job_id":"job-1"}"#).unwrap();
         assert!(job_create_has_capacity(dir.path(), &create, 0).is_err());
         assert_eq!(
@@ -1244,6 +1293,131 @@ mod tests {
         provider.read_to_string(&mut replay).await.unwrap();
         assert!(replay.starts_with("HTTP/1.1 200 OK"));
         assert!(replay.contains("\"job_id\":\"job-1\""));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_job_create_with_lost_response_blocks_identical_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/create");
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let root = dir.path().join("providers/model-provider");
+        write_private(
+            &root.join("validate-fixtures.json"),
+            json!({
+                "openrouter_models_url":format!("http://127.0.0.1:{port}/models"),
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/venice-models"),
+                "openrouter_chat_url":url
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let request = EffectRequest {
+            offer_id: "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            effect: "job_create".into(),
+            run_id: format!("run:sha256:{}", "0".repeat(64)),
+            request_id: "request-lost".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: br#"{"request_id":"request-lost"}"#.to_vec(),
+        };
+        write_private(
+            &root.join("egress-grants.json"),
+            json!({
+                "schema":"elastos.model.egress-grants/v1",
+                "grants":[{
+                    "offer_id":request.offer_id,"effect":"job_create","method":"POST",
+                    "url":url,"recipient":"127.0.0.1","payer":"this Home",
+                    "owner_proof_binding_id":proof,"run_id":request.run_id,
+                    "request_id":request.request_id,
+                    "expires_at_ms":job_binding_time_ms().unwrap()+60_000,"active":true
+                }]
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let backend_id = "a".repeat(64);
+        let destination = Destination {
+            url: Url::parse(&url).unwrap(),
+            grant_url: url,
+            credential: None,
+            job_backend_id: Some(backend_id.clone()),
+        };
+        let sink_task = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut request_bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && request_bytes.len() + count <= 4096);
+                request_bytes.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request_bytes
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request_bytes[..header_end]);
+                assert!(headers.starts_with("POST /create "));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap();
+                if request_bytes.len() >= header_end + 4 + length {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(
+                            &request_bytes[header_end + 4..header_end + 4 + length]
+                        )
+                        .unwrap()["request_id"],
+                        "request-lost"
+                    );
+                    break;
+                }
+            }
+            drop(socket); // Upstream accepted create but lost its response.
+            sink
+        });
+        let (mut broker, mut provider) = UnixStream::pair().unwrap();
+        forward(&mut broker, dir.path(), &request, &destination, || true)
+            .await
+            .unwrap();
+        broker.shutdown().await.unwrap();
+        let mut first_response = String::new();
+        provider.read_to_string(&mut first_response).await.unwrap();
+        assert!(
+            first_response.starts_with("HTTP/1.1 502"),
+            "{first_response}"
+        );
+        let sink = sink_task.await.unwrap();
+        assert!(job_bindings(dir.path()).unwrap().bindings[0]
+            .job_id
+            .is_none());
+        assert!(recorded_job_create(dir.path(), &request, &backend_id).is_err());
+
+        let (mut broker, mut provider) = UnixStream::pair().unwrap();
+        forward(&mut broker, dir.path(), &request, &destination, || true)
+            .await
+            .unwrap();
+        broker.shutdown().await.unwrap();
+        let mut retry_response = String::new();
+        provider.read_to_string(&mut retry_response).await.unwrap();
+        assert!(retry_response.starts_with("HTTP/1.1 403"));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), sink.accept())
                 .await

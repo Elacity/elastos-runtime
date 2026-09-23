@@ -769,9 +769,8 @@ fn write_model_provider_config_atomic(path: &Path, bytes: &[u8]) -> anyhow::Resu
         fs::rename(&temp, path).with_context(|| {
             format!("failed to replace model-provider config {}", path.display())
         })?;
-        if let Ok(directory) = fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {

@@ -407,6 +407,18 @@ occurred. Receipt:
 Public HTTPS consent/routing, Linux confinement, and upstream recovery for a
 lost create response remain open.
 
+Lost-response source checkpoint: Runtime now writes a private create-attempt
+record and syncs its directory before sending an HTTP job create. If the
+upstream receives the full request but its response is lost, a retry with the
+same offer/run/request ID is denied without a second dispatch. A successful
+response replaces the pending record with the exact job ID. The local sink
+test checks the full received POST and zero requests on retry; the focused
+broker tests and independent read-only review pass. Unknown attempts remain
+in the bounded 4 MiB/4,096-entry journal and fail closed when it fills.
+Upstream lookup or idempotency, explicit reconciliation of unknown attempts,
+and installed proof are still required before public hosted use. External
+HTTPS remains paused; the signed-in Homes and public seed were not changed.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty
