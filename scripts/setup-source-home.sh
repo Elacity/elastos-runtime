@@ -1133,6 +1133,8 @@ import hashlib
 import json
 import os
 import pathlib
+import re
+import stat
 
 components_src = pathlib.Path(os.environ["COMPONENTS_SRC"])
 components_dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
@@ -1140,6 +1142,7 @@ data_dir = pathlib.Path(os.environ["DATA_DIR"])
 platform = os.environ["SETUP_PLATFORM"]
 
 manifest = json.loads(components_src.read_text())
+previous = json.loads(components_dest.read_text()) if components_dest.is_file() else {}
 host_components = [
     "shell",
     *json.loads(os.environ["SOURCE_HOME_BINARY_NAMES_JSON"]),
@@ -1165,9 +1168,54 @@ for name in host_components:
     info["install_path"] = f"bin/{name}"
     info.setdefault("release_path", f"{name}-{platform}")
 
+# These release providers can remain installed across source-home rebuilds.
+# Keep their prior pins only while the same installed binary still verifies.
+retained_providers = (
+    "operator-drive-adapter", "drm-provider", "rights-provider",
+    "key-provider", "decrypt-provider",
+)
+for name in retained_providers:
+    if name in host_components:
+        continue
+    component = manifest["external"][name]
+    info = component.get("platforms", {}).get(platform)
+    if not isinstance(info, dict):
+        continue
+    expected_path = f"bin/{name}"
+    if info.get("install_path", component.get("install_path")) != expected_path:
+        continue
+    binary = data_dir / expected_path
+    if not binary.exists():
+        continue
+    prior_component = previous.get("external", {}).get(name, {})
+    prior_info = prior_component.get("platforms", {}).get(platform)
+    if not isinstance(prior_info, dict) or any(
+        prior_info.get(field) != info.get(field)
+        for field in ("install_path", "release_path")
+    ) or prior_component.get("install_path") != component.get("install_path"):
+        raise SystemExit(f"{name} has no matching prior {platform} platform pin")
+    metadata = binary.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"{name} installed binary is not a regular file")
+    checksum = prior_info.get("checksum")
+    size = prior_info.get("size")
+    cid = prior_info.get("cid")
+    if not isinstance(checksum, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", checksum):
+        raise SystemExit(f"{name} prior {platform} checksum is unavailable")
+    if type(size) is not int or size <= 0 or not isinstance(cid, str):
+        raise SystemExit(f"{name} prior {platform} size or CID is unavailable")
+    if metadata.st_size != size or hashlib.sha256(binary.read_bytes()).hexdigest() != checksum[7:]:
+        raise SystemExit(f"{name} installed binary does not match its prior {platform} pin")
+    if (info.get("checksum") not in (None, "", checksum)
+        or info.get("size") not in (None, 0, size)
+        or info.get("cid") not in (None, "", cid)):
+        raise SystemExit(f"{name} source and installed {platform} pins conflict")
+    info.update(checksum=checksum, size=size, cid=cid)
+    source_home_components.append(name)
+
 manifest.setdefault("profiles", {})["source-home"] = {
-    "description": "Components built and installed by setup-source-home.sh",
-    "components": source_home_components,
+    "description": "Components built by setup-source-home.sh or retained with verified pins",
+    "components": list(dict.fromkeys(source_home_components)),
 }
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
