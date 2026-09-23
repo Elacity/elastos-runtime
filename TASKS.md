@@ -447,11 +447,19 @@ found no high or medium issue in this fixture scope. This is kernel-boundary
 evidence, not an installed model-provider or SmolLM2 inference result. The
 current Linux provider has no confined launch, its clients use pathname Unix
 sockets, and it spawns llama.cpp as a descendant that would inherit the filter.
-Next: move engine launch and accepts to Runtime-owned code outside the provider
-filter lineage, pass only selected connected broker channels to the provider,
-and close unrelated descriptors. Then prove installed SmolLM2 and
-child/descendant denial. Linux product confinement and public hosted HTTPS
-remain open.
+The next source fixture, `scripts/linux-model-seccomp-transport-proof.c`,
+separates a Runtime-owned synthetic engine from an exec'd provider child.
+The engine accepts on Runtime's Unix listener outside the filter; Runtime
+relays two exact requests. The provider receives only connected FD 3 after
+`close_range`, and its child and descendant each complete a broker round trip
+while direct socket operations return `EPERM`. The isolated Linux build and
+run pass, with source/binary/result hashes in
+`.audit/linux-sec1-confinement/transport-receipt.json`. Independent review
+found no high or medium issue in this design fixture. It does not execute the
+Rust Runtime, native model-provider or SmolLM2. Next: integrate this
+ownership and transport in those components and prove installed SmolLM2 on an
+isolated non-public Linux target. Linux product confinement and public hosted
+HTTPS remain open.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
