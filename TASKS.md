@@ -594,6 +594,29 @@ restoration are bound in `.audit/sec1-dns-rebinding/receipt.json`. Public DNS
 and CA routing, Linux production confinement, unknown-create reconciliation,
 external HTTPS activation and real hosted acceptance remain open.
 
+Consumer hosted-model acceptance remains open. Its saved Jev advice for the
+Venice connection was `defer` at medium risk with 72% reported confidence; the
+admin approved the connection, but two later Assistant runs stopped before
+hosted HTTPS dispatch. The Jev record proves prior advice and human approval,
+not a fresh Jev call or a successful model response. A Mac Runtime broker
+source candidate `71b4ea79` now permits only the fixed Venice/OpenRouter validation,
+chat, and Decisions routes after an exact owner Inbox decision, with public DNS
+pinning and normal TLS roots. Sixteen broker tests and bounded independent
+read-only review passed with no P1/P2 finding. These source checks do
+not yet prove installed public HTTPS, revocation, or a completed Venice run.
+Keep the two signed-in Homes and their keys intact; use a separate owner action
+and installed target proof before external HTTPS activation.
+
+Guest-hosted setup is a separate release blocker. System currently shows Add
+to a signed-in guest even though the provider routes require the Home admin;
+the provider config and secret store are Home-global. Preserve that admin
+boundary until a verified guest principal can own its key, offer, dispatch,
+Inbox decision and revoke in private principal state. Prove on two installed
+principals that the other principal, including the admin UI, cannot list, use
+or change the guest key or offer, and that one guest's revoke affects only its
+own runs. An anonymous Home visit has no recoverable private owner. Hide the
+unusable Add path until guest authority is implemented and proved.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty
