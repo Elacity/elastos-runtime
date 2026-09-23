@@ -1028,7 +1028,7 @@ async fn setup_server_infrastructure_impl(
     match binaries::resolve_verified_native_provider_binary("model-provider") {
         Ok(Some(path)) => {
             match model_provider_startup_config(&data_dir, &provider_registry).await {
-                Ok((mut model_config, worker)) => {
+                Ok((model_config, worker)) => {
                     #[cfg(target_os = "macos")]
                     let bridge_result =
                         provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
@@ -1038,10 +1038,10 @@ async fn setup_server_infrastructure_impl(
                     let bridge_result =
                         provider::ProviderBridge::spawn(&path, model_config.clone())
                             .await
-                            .map(|bridge| (bridge, None, model_config.clone()));
+                            .map(|bridge| (bridge, None::<()>, model_config.clone()));
                     match bridge_result {
                         Ok((bridge, local_sockets, confined_config)) => {
-                            model_config = confined_config;
+                            let model_config = confined_config;
                             #[cfg(target_os = "macos")]
                             if let Some(sockets) = local_sockets {
                                 provider_registry.set_local_model_sockets(sockets).await;

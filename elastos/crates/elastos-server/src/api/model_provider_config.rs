@@ -1229,7 +1229,9 @@ async fn refresh_registered_model_provider(
     let Some(registry) = registry else {
         return Ok(());
     };
-    let (mut config, _guard) = model_provider_config(data_dir, registry).await?;
+    let (config, _guard) = model_provider_config(data_dir, registry).await?;
+    #[cfg(target_os = "macos")]
+    let mut config = config;
     #[cfg(target_os = "macos")]
     registry.apply_local_model_sockets(&mut config).await?;
     registry
