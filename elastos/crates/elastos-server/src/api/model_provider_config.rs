@@ -237,9 +237,10 @@ fn is_hosted_instance_offer(offer: &serde_json::Value) -> bool {
             .is_some_and(|id| id.starts_with("model:hosted-"))
 }
 
-/// Parse a validate-fixture URL. Accept only http(s), host 127.0.0.1, an explicit
-/// numeric port, and a path. Reject DNS, IPv6, localhost, credentials, and
-/// fragments.
+/// Parse a validate-fixture URL. Accept http(s) at literal 127.0.0.1 and
+/// diagnostic HTTP at localhost, with an explicit numeric port and path.
+/// Reject other DNS names, IPv6 literals, credentials, and fragments. The
+/// broker checks the resolved address before dispatch.
 pub(crate) fn parse_loopback_http_url(raw: &str) -> anyhow::Result<LoopbackHttpUrl> {
     let trimmed = raw.trim();
     let parsed = url::Url::parse(trimmed)
@@ -252,7 +253,8 @@ pub(crate) fn parse_loopback_http_url(raw: &str) -> anyhow::Result<LoopbackHttpU
     }
     match parsed.host() {
         Some(url::Host::Ipv4(addr)) if addr.octets() == [127, 0, 0, 1] => {}
-        _ => anyhow::bail!("hosted validate fixture URL must use host 127.0.0.1"),
+        Some(url::Host::Domain("localhost")) if parsed.scheme() == "http" => {}
+        _ => anyhow::bail!("hosted validate fixture URL must use host 127.0.0.1 or localhost"),
     }
     let Some(port) = parsed.port() else {
         anyhow::bail!("hosted validate fixture URL must include a numeric port");
@@ -2065,6 +2067,9 @@ mod validate_fixture_tests {
         );
         let tls = parse_loopback_http_url("https://127.0.0.1:43721/models").unwrap();
         assert_eq!(tls.as_str(), "https://127.0.0.1:43721/models");
+        let hostname = parse_loopback_http_url("http://localhost:43721/models").unwrap();
+        assert_eq!(hostname.as_str(), "http://localhost:43721/models");
+        assert!(parse_loopback_http_url("https://localhost:43721/models").is_err());
     }
 
     #[test]
@@ -2080,9 +2085,7 @@ mod validate_fixture_tests {
         assert!(parse_loopback_http_url("http://8.8.8.8:80/openrouter/api/v1/models").is_err());
         assert!(parse_loopback_http_url("http://127.0.0.2:43721/models").is_err());
         assert!(parse_loopback_http_url("https://127.0.0.2:43721/models").is_err());
-        assert!(
-            parse_loopback_http_url("http://localhost:43721/openrouter/api/v1/models").is_err()
-        );
+        assert!(parse_loopback_http_url("http://localhost.evil:43721/models").is_err());
         assert!(parse_loopback_http_url("http://[::1]:43721/openrouter/api/v1/models").is_err());
         assert!(parse_loopback_http_url(
             "http://user:pass@127.0.0.1:43721/openrouter/api/v1/models"

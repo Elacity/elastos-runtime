@@ -1256,11 +1256,7 @@ async fn pinned_client(
     )
     .await??
     .collect();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|addr| addr.ip() != IpAddr::from([127, 0, 0, 1]))
-    {
+    if !approved_fixture_addresses(&addresses) {
         return Err(invalid_request());
     }
     let mut builder = reqwest::Client::builder()
@@ -1278,6 +1274,13 @@ async fn pinned_client(
             .add_root_certificate(certificate);
     }
     builder.build().map_err(io::Error::other)
+}
+
+fn approved_fixture_addresses(addresses: &[SocketAddr]) -> bool {
+    !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|addr| addr.ip() == IpAddr::from([127, 0, 0, 1]))
 }
 
 fn fixture_destination_allowed(
@@ -1303,7 +1306,8 @@ fn fixture_destination_allowed(
         // route. The private fixture pins that route, before the added query.
         .any(|pinned| pinned == grant_url)
     }) && matches!(url.scheme(), "http" | "https")
-        && url.host_str() == Some("127.0.0.1"))
+        && (url.host_str() == Some("127.0.0.1")
+            || (url.scheme() == "http" && url.host_str() == Some("localhost"))))
 }
 
 #[cfg(test)]
@@ -1476,6 +1480,16 @@ mod tests {
             )),
             fixture_ca_pem: None,
         }
+    }
+
+    #[test]
+    fn fixture_dns_answer_must_stay_on_the_approved_ip() {
+        let approved: SocketAddr = "127.0.0.1:50348".parse().unwrap();
+        let changed: SocketAddr = "[::1]:50348".parse().unwrap();
+        assert!(approved_fixture_addresses(&[approved]));
+        assert!(!approved_fixture_addresses(&[]));
+        assert!(!approved_fixture_addresses(&[changed]));
+        assert!(!approved_fixture_addresses(&[approved, changed]));
     }
 
     #[test]
