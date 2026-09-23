@@ -12,7 +12,8 @@ bootstrap configuration, while Profile and Runtime checks own person, contact
 and message authority.
 
 Current implementation and installed acceptance are recorded in
-[state.md](../state.md). Open collaboration work belongs in [TASKS.md](../TASKS.md).
+[state.md](../state.md). Current J6 work belongs in [TASKS.md](../TASKS.md);
+later collaboration work belongs in [deferred work](DEFERRED_WORK.md).
 
 ## Goal
 
@@ -442,14 +443,16 @@ offline, and neither invents a third party to hide it:
 
 - Direct messages: the sender's Runtime durably retries until the envelope's
   lifetime ends, then the message is terminal and visibly `expired`. There is
-  no store-and-forward; the encrypted mailbox design in TASKS.md is the
-  deliberate path to more reach.
+  no store-and-forward; the
+  [encrypted mailbox follow-up](DEFERRED_WORK.md#collaboration-identity-and-carrier-boundary)
+  is the deliberate path to more reach.
 - The shared room: gossip topic buffers are in-memory on whichever peer holds
   them, and consumer cursors are what let a returning peer collect what it
   missed. A peer offline past that buffer's retention, or across a restart of
   the peer holding it, misses that interval; whatever does arrive is ingested
   durably. This is a transport reach limit, not a storage bug, and it is the
-  shared-room half of the same offline gap.
+  shared-room half of the same offline gap. J6 CH5 requires bounded retained
+  public-room catch-up before release acceptance.
 - Profile updates: the announcement chain segment retains the last 8 signed
   revisions. A contact more than 8 renames behind cannot be bridged; the
   receiving store refuses the gap explicitly ("accepted profile chain skips a

@@ -1,7 +1,8 @@
 # ElastOS Runtime roadmap
 
-This roadmap describes future work. See [TASKS.md](TASKS.md) for active work
-and [state.md](state.md) for current behavior.
+This roadmap describes future work. See [TASKS.md](TASKS.md) for active work,
+[deferred work](docs/DEFERRED_WORK.md) for the open backlog, and
+[state.md](state.md) for current behavior.
 
 ## Mission
 
@@ -251,7 +252,7 @@ must remain fast and usable without a remote round trip. Carrier and providers
 carry remote synchronization, sharing, and repair.
 
 The namespace contract lives in [Namespaces](docs/NAMESPACES.md). Open syntax
-and provider questions stay in [Tasks](TASKS.md).
+and provider questions stay in [deferred work](docs/DEFERRED_WORK.md).
 
 ### 6. Establish signed capsule publication and installation
 
@@ -418,7 +419,7 @@ contract, but they do not define the native model.
 
 See [People and conversations](docs/PEOPLE_CONVERSATIONS.md) for the target
 model and ordered implementation slices, and
-[Tasks](TASKS.md#collaboration-and-messaging) for open outcomes.
+[deferred work](docs/DEFERRED_WORK.md#collaboration-and-messaging) for later outcomes.
 
 ### 10. Keep release, install, share, and sites on truthful paths
 

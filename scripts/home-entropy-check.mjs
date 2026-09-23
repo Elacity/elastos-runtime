@@ -8434,8 +8434,10 @@ assert(
   "System must not hold browser wallet adapter authority",
 );
 const tasks = read("TASKS.md");
+const deferredWork = read("docs/audits/2026-09-23-open-backlog-snapshot.md");
 const browserPlanningSurface = [
   tasks,
+  deferredWork,
   read("docs/BROWSER_CAPSULE.md"),
   read("docs/BROWSER_PROVIDER_BAKEOFF.md"),
 ].join("\n");
@@ -9501,7 +9503,7 @@ assert(
     currentState.includes("provider-role capsules now") &&
     currentState.includes("project authority metadata for service-plane inspection") &&
     currentState.includes("first_party_capsules_have_complete_projection_contract") &&
-    tasks.includes("Keep first-party capsule projection validation covered") &&
+    deferredWork.includes("Keep first-party capsule projection validation covered") &&
     homeShellHostContract.includes("first_party_capsules_have_complete_projection_contract") &&
     includesNormalized(currentState, "Runtime gates, approval, launch tokens, providers, and audit remain") &&
     includesNormalized(currentState, "no desktop GUI markup or code in the neutral host document") &&
@@ -9523,9 +9525,9 @@ assert(
     includesNormalized(currentState, "origin-isolation change requires a fresh commit-bound operator pass") &&
     currentState.includes("any later Home shell behavior change requires a new or re-reviewed") &&
     !tasks.includes("finish operator-profile proof for the reduced CLI dispatch boundary") &&
-    tasks.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
-    includesNormalized(tasks, "Keep `elastos:bus@v1` bounded and immutable"),
-  "state.md and TASKS.md must preserve current Home shell proof truth and keep future Components and Bus work versioned",
+    deferredWork.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
+    includesNormalized(deferredWork, "Keep `elastos:bus@v1` bounded and immutable"),
+  "State and the dated backlog must preserve Home shell proof and versioned future Components and Bus work",
 );
 assert(
   homeShellManualUxReport.includes('const SCHEMA = "elastos.home-shell.manual-ux/v1"') &&
@@ -12015,7 +12017,7 @@ assert(
   "Local carrier setup smoke must exercise the direct Home CLI contract, not a PTY wrapper path",
 );
 const productionStorageTaskLines =
-  tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
+  deferredWork.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
   [];
 assert(
   productionStorageTaskLines.length === 1 &&
@@ -12037,7 +12039,7 @@ assert(
     productionStorageTaskLines[0].includes(
       "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
     ),
-  "TASKS.md must keep exactly one open production multi-peer availability/storage infrastructure blocker",
+  "The dated open-backlog snapshot must preserve exactly one production multi-peer availability/storage infrastructure blocker",
   productionStorageTaskLines,
 );
 assert(
@@ -12102,7 +12104,7 @@ assert(
       "Optional storage-market endpoint-quorum admission gate",
     ) &&
     contentAvailabilityDoc.includes("Optional external repair-fleet dispatch") &&
-    tasks.includes(
+    deferredWork.includes(
       "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
     ) &&
     namespacesDoc.includes("explicit capability keys"),

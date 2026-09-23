@@ -535,6 +535,6 @@ not an alternate compatibility path.
 This placement is an implementation choice, not a rule that all Carrier
 protocol logic belongs in the trusted core. A later adapter may move protocol
 work behind a private host contract if Runtime continues to own endpoint
-admission, routing, lifecycle, capabilities, and audit. Open implementation and
-research work belongs in [`TASKS.md`](../TASKS.md) and
-[`ROADMAP.md`](../ROADMAP.md).
+admission, routing, lifecycle, capabilities, and audit. Active work belongs in
+[`TASKS.md`](../TASKS.md); future research belongs in
+[deferred work](DEFERRED_WORK.md) and [`ROADMAP.md`](../ROADMAP.md).

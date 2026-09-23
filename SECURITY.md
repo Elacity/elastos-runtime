@@ -43,7 +43,7 @@ request-size cap or read deadline at that boundary. The I/O bridge rejects
 complete lines above 1 MiB, but its line readers allocate before that check.
 Size checks after reading do not bound memory use or an incomplete frame's
 lifetime. Add bounds while reading, with oversized and slow-frame tests;
-the Carrier integration task is tracked in [TASKS.md](TASKS.md#retained-source-integration).
+the Carrier integration task is tracked in [deferred work](docs/DEFERRED_WORK.md#retained-source-integration).
 
 ## Resolved Findings
 

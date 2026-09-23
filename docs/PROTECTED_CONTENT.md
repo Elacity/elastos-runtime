@@ -262,7 +262,7 @@ part requires:
    including restart, replay, tamper rejection, settlement and cleanup;
    proven headless by the same driver (`finalize` reads `overall_ok: true`,
    see `state.md`), not yet through Brave on the seed;
-8. the manual UIUX matrix in `TASKS.md`; and
+8. the manual J5 UI acceptance in the [0.7.1 release plan](https://app.notion.com/p/3d6b682adcca81948f78d12abcd677b9); and
 9. one atomic cutover that removes the provisional authority surfaces.
 
 The cutover activates the Runtime-owned path and removes provisional startup,

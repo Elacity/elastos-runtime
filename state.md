@@ -9,7 +9,7 @@
 | Consumer Home 61966 | `.audit/codex-hosted-egress-containment-installed.json`; Runtime SHA-256 `90edb7fa1474d23ded52abee44f87c31a4f45f24eb083a8bef658ac6ef84176c` | Signed-in Consumer remains available; hosted Validate/Save pause was installed and checked with a controlled endpoint. | No SmolLM2 admission here; hosted HTTPS and the separate service-grant journey remain open. |
 | Public Runtime and provider | `f087a0d9` (tree `87e61b3e`); `.audit/public-seed-gate-61974/receipt.json`; Runtime SHA-256 `62ddda9a31b9b512ebb82deb6c8152229b1c84dee969cf8621e2c742755a1d70`, ipfs-provider SHA-256 `0609b6e089e8ab08254f41c4f685a39c6c7d5c8bc8cfe24a6b1457705df3152e` | Read-only artifact inspection found the sealed provider and repo mode `0700`; the seed retains the signed SmolLM2 pin. | Older public Get attempts failed at `metadata_read` with zero bytes. No Get or signed-in Assistant run has been proved on the current public installation. |
 | Public UI and manifest overlay | `81875544` (tree `a0cfeb3e`) over `f087a0d9`; `.audit/hosted-egress-design-scratch/installed-ui-33aba416/public-live-postcheck-81875544.json`; manifest SHA-256 `4dd3f1e42a71b0474a6e34264048a4bab88f52945bf8fb2610f00060763ccd27` | Installed and served Home/System assets match the overlay receipt; signed-in System shows hosted HTTPS paused. | UI and manifest identity differs from the public Runtime source; a UI check is not public model Get or inference. |
-| Isolated Linux Home 61974 | `.audit/public-seed-gate-61974/receipt.json`; copied public Runtime, provider and manifest hashes above, with separate identity and data root | After correcting its test data-root ancestor to `0700`, typed Marketplace Get admitted 144,835,448 bytes; two typed local runs completed across a Runtime restart with unchanged weights hash, inode and mtime. | This isolated Get and these runs are neither public Get nor proof of the local `a1573675` code path; signed-in UI and compatible pinned Linux engine still need target proof. |
+| Isolated public-artifact Linux fixture | `.audit/public-seed-gate-61974/receipt.json` (the port is historical receipt metadata); copied public Runtime, provider and manifest hashes above, with separate identity and data root | After correcting its test data-root ancestor to `0700`, typed Marketplace Get admitted 144,835,448 bytes; two typed local runs completed across a Runtime restart with unchanged weights hash, inode and mtime. | Re-identify its data root and process before use: port 61974 was occupied by a different Mac diagnostic during this reconciliation. This isolated Get and these runs are neither public Get nor proof of the local `a1573675` code path; signed-in UI and compatible pinned Linux engine still need target proof. |
 
 The last recorded public free-space reading is 11.72% in the 23 September UI
 postcheck receipt. It is dated evidence. Before any later public action, obtain
@@ -1261,7 +1261,8 @@ full acceptance gates remain open. The accepted contract permits dependent work
 to continue; B01's open support matrix does not block every implementation slice.
 [Acceptance requirements](docs/BROWSER_ACCEPTANCE.md),
 [support matrix](docs/BROWSER_SUPPORT.md), and the
-[resume queue](TASKS.md#browser-maturity-workstream) remain canonical.
+[current J4 handoff](TASKS.md#now) and
+[B01–B16 controls](TASKS.md#browser-maturity-workstream) remain canonical.
 
 The task Mac and Linux consumer/Exit have these installed artifacts:
 
@@ -1414,11 +1415,14 @@ The older July Carrier branch contains framing, deadline and protocol work
 that needs an adapted integration: the current incoming request handler still
 has an unbounded line read, while the donor's whole protocol would disable
 provider invocation used by the current protected-content path. This remains
-an explicit source-integration decision in [TASKS.md](TASKS.md). Inclusion of
-all retained work requires a behavior-level comparison, not only commit counts.
+an explicit source-integration decision in
+[deferred work](docs/DEFERRED_WORK.md#retained-source-integration).
+Inclusion of all retained work requires a behavior-level comparison, not only
+commit counts.
 
 Older Assistant attachment, knowledge/search/citation and advanced Studio
-implementations remain retained donors for the open work in [TASKS.md](TASKS.md).
+implementations remain retained donors for the open work in
+[deferred work](docs/DEFERRED_WORK.md#retained-source-integration).
 The PR15 legacy-auth migration also remains separate because it replaces
 unchained audit history. Current signed-checkpoint policy owns compatibility;
 retaining those donors does not mean their behavior is in the candidate.
