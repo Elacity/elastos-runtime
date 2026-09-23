@@ -1,3 +1,5 @@
+import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
+
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
 export let desktopWorkspace = document.querySelector(".desktop-workspace");
@@ -1292,7 +1294,7 @@ function arrayEquals(left, right) {
 }
 
 export function shouldOpenMaximizedByDefault() {
-  return window.innerWidth <= 640;
+  return isPhone();
 }
 
 export function shouldIgnoreDesktopKeydown(event) {

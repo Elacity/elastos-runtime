@@ -12232,6 +12232,52 @@ assert(
       read("ROADMAP.md").includes("[Home on phones and tablets](docs/HOME_MOBILE.md)"),
     "Home phone layout must keep its ratchet smoke (44 px targets, 12 px text, three profiles, both engines) in the browser lane and its charter linked from the roadmap",
   );
+
+  // Viewport truth: safe areas are only real with viewport-fit=cover, the
+  // soft keyboard only shrinks the visual viewport with resizes-visual, and
+  // every 100vh must carry a 100dvh twin on the next line.
+  const viewportMeta =
+    '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-visual" />';
+  const bareViewportHeights = homeGuiStyle
+    .split("\n")
+    .filter((line, index, lines) => line.includes("100vh") && !(lines[index + 1] || "").includes(line.replace("100vh", "100dvh").trim()));
+  assert(
+    read("capsules/home/browser/index.html").includes(viewportMeta) &&
+      read("capsules/home-gui/browser/index.html").includes(viewportMeta) &&
+      bareViewportHeights.length === 0 &&
+      homeGuiStyle.includes("overscroll-behavior: none;") &&
+      homeGuiStyle.includes("touch-action: manipulation;") &&
+      homeGuiStyle.includes("-webkit-tap-highlight-color: transparent;") &&
+      homeGuiStyle.includes(".toolbar,\n.taskbar,\n.window-head,\n.launcher {\n  -webkit-touch-callout: none;") &&
+      homeGuiStyle.includes("--keyboard-inset: 0px;") &&
+      homeGuiStyle.includes("+ env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));") &&
+      homeGuiStyle.includes("max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));"),
+    "Home phone viewport truth: viewport-fit=cover with resizes-visual on both index files, no bare 100vh, overscroll and tap-highlight off on the shell, touch-callout off on shell chrome only, keyboard inset in the stage bottom, side safe-areas on the bar",
+    { bareViewportHeights },
+  );
+
+  // Form factor has one reader. Every other GUI module asks shell-form-factor.
+  const formFactorModule = read("capsules/home-gui/browser/shell-form-factor.js");
+  const otherGuiModules = readdirSync(new URL("capsules/home-gui/browser/", repoRoot))
+    .filter((name) => name.endsWith(".js") && name !== "shell-form-factor.js")
+    .map((name) => [name, read(`capsules/home-gui/browser/${name}`)]);
+  const strayBreakpointReaders = otherGuiModules
+    .filter(([, source]) => /innerWidth\s*<=?\s*\d+/.test(source))
+    .map(([name]) => name);
+  assert(
+    formFactorModule.includes("export const PHONE_MAX_WIDTH = 640;") &&
+      formFactorModule.includes("export const TABLET_MAX_WIDTH = 1100;") &&
+      formFactorModule.includes('matches("(pointer: coarse)") || matches("(hover: none)")') &&
+      formFactorModule.includes("doc.body.dataset.formFactor = factor;") &&
+      formFactorModule.includes('doc.documentElement.style.setProperty("--keyboard-inset", `${inset}px`);') &&
+      strayBreakpointReaders.length === 0 &&
+      homeGuiCore.includes('import { isPhone } from "./shell-form-factor.js?v=home-20260813a";') &&
+      homeGuiCore.includes("export function shouldOpenMaximizedByDefault() {\n  return isPhone();\n}") &&
+      homeGuiJs.includes("bindFormFactor();") &&
+      justfile.includes("node --test scripts/home-form-factor.test.mjs"),
+    "Home form factor must have one reader (shell-form-factor.js: 640/1100 size classes, media-feature pointer class, body dataset, --keyboard-inset) bound at GUI boot and unit-tested in verify",
+    { strayBreakpointReaders },
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();

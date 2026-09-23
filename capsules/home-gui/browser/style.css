@@ -46,7 +46,10 @@
   /* Stage contract: windows (incl. maximize/snap) live between the system bar
      and the dock clearance — system chrome is never covered. */
   --stage-top: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
-  --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px));
+  --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
+  /* Soft-keyboard height on coarse-pointer hosts; shell-form-factor.js writes
+     it from visualViewport so the stage ends above the keyboard. 0 on desktop. */
+  --keyboard-inset: 0px;
   /* Shelf scale: slightly larger than the original 60/50/40 for XDR density. */
   --taskbar-h: 72px;
   --taskbar-offset: 12px;
@@ -74,6 +77,8 @@ body {
   margin: 0;
   min-height: 100%;
   overflow: hidden;
+  /* The shell is not a page: no rubber-band or pull-to-refresh on it. */
+  overscroll-behavior: none;
   background: var(--bg);
   color: var(--text);
   font-family: var(--el-font);
@@ -94,6 +99,26 @@ button {
   padding: 0;
   background: transparent;
   color: inherit;
+}
+
+/* Touch truth for shell controls: no 300 ms double-tap delay, no grey tap
+   flash. Drag surfaces (.desktop-shortcut, .taskbar-item) keep their own
+   `touch-action: none` further down and win. */
+button,
+a,
+[role="button"],
+.launcher-card {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Shell chrome only — never capsule frames — so a long-press reaches our
+   menus instead of the browser's link/image callout. */
+.toolbar,
+.taskbar,
+.window-head,
+.launcher {
+  -webkit-touch-callout: none;
 }
 
 img {
@@ -203,7 +228,8 @@ img {
   justify-content: flex-start;
   gap: 0;
   height: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
-  padding: env(safe-area-inset-top, 0px) 12px 0;
+  /* Landscape notches: keep the bar's ends clear of the rounded corners. */
+  padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
   background-color: var(--chrome-fill);
   box-shadow:
     inset 0 -0.5px 0 var(--hairline),
@@ -774,6 +800,7 @@ img {
   gap: 0;
   width: min(300px, calc(100vw - 16px));
   max-height: calc(100vh - var(--stage-top) - var(--stage-bottom) - 24px);
+  max-height: calc(100dvh - var(--stage-top) - var(--stage-bottom) - 24px);
   overflow-x: hidden;
   overflow-y: auto;
   padding: var(--bar-menu-pad);
@@ -5737,10 +5764,11 @@ body.assistant-space-active #inbox-rail {
     margin-bottom: 0;
   }
 
-  /* Windows fill the stage between bar and dock — apps read as full-screen. */
+  /* Windows fill the stage between bar and dock — apps read as full-screen.
+     Left/right insets keep capsule content out of landscape notches. */
   .window {
     position: fixed !important;
-    inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;
+    inset: var(--stage-top) env(safe-area-inset-right, 0px) var(--stage-bottom) env(safe-area-inset-left, 0px) !important;
     width: auto !important;
     height: auto !important;
     max-width: none !important;

@@ -25,10 +25,41 @@ Pointer class comes from `(pointer: coarse)` and `(hover: none)`, never from
 the user agent string. A tablet with a trackpad is a fine-pointer tablet; a
 touch laptop under 640 px is a phone.
 
+A phone held sideways is still a phone: a coarse-pointer viewport whose
+height is at most 640 px keeps the phone class (844 × 390 is a phone, not a
+tablet), so rotating with a window open does not change the layout family. A
+short desktop window with a mouse stays desktop; height only counts on a
+coarse pointer.
+
 The single source of truth for the class in JavaScript is
-`shell-form-factor.js` (M1); `isPhone()` in `shell-core.js` delegates to it,
-and the class is mirrored onto `document.body.dataset.formFactor` so CSS and
-tests read the same fact.
+`shell-form-factor.js`; `shouldOpenMaximizedByDefault()` in `shell-core.js`
+delegates to it, and the class is mirrored onto
+`document.body.dataset.formFactor` and `dataset.pointer` so CSS and tests read
+the same fact. New phone rules key on `body[data-form-factor="phone"]`, not
+on `@media (max-width: 640px)`, so landscape follows.
+
+## Viewport truth (M1)
+
+- Both `index.html` files declare `viewport-fit=cover` (safe areas become
+  real on iOS) and `interactive-widget=resizes-visual` (Android Chrome shrinks
+  only the visual viewport for the soft keyboard, like iOS).
+- `shell-form-factor.js` writes `--keyboard-inset` on `:root` from
+  `visualViewport` on coarse-pointer hosts; `--stage-bottom` adds it, so an
+  open window ends above the keyboard. Desktop pinch-zoom never produces an
+  inset.
+- `overscroll-behavior: none` on `html, body`; `touch-action: manipulation`
+  and no tap highlight on shell controls; `-webkit-touch-callout: none` on
+  shell chrome only, never on capsule frames.
+- Every `100vh` carries a `100dvh` twin on the next line.
+- The bar pads its ends with `env(safe-area-inset-left/right)`; the phone
+  window inset does the same, so landscape notches never cover content.
+
+Deferred from M1 on purpose: converting the shell's 66 `px` font sizes to
+`rem`. iOS Safari does not scale `rem` with Dynamic Type (only
+`-apple-system-body` fonts scale), Android Chrome does. The phone layer (M4)
+declares its own sizes and will use `rem` there; changing every desktop size
+in one sweep would touch dozens of pinned visual contracts for a benefit
+limited to Android.
 
 ## Rubric
 
@@ -113,8 +144,8 @@ Identical in Chromium and WebKit.
 | assistant face (shell chrome only) | 0 / 0 | 0 / 0 | 0 / 0 |
 | any window (bar + 12 px controls) | 10–12 / 1 | 11–12 / 1 | 11–12 / 1 |
 
-Source: `viewport-fit=cover` absent in both index files; 3 bare `100vh`;
-34 `backdrop-filter` surfaces.
+Source: `viewport-fit=cover` absent in both index files; one bare `100vh`
+(two more already had `100dvh` twins); 34 `backdrop-filter` surfaces.
 
 Known engine noise: WebKit reports the caught cross-frame probe in
 `installFrameAutoFit` (`shell-windows.js`) as a "Sandbox access violation"

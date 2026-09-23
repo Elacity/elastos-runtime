@@ -841,9 +841,15 @@ function sourceTruths() {
   const guiIndex = readFileSync(join(repoRoot, "capsules/home-gui/browser/index.html"), "utf8");
   const guiStyle = readFileSync(join(repoRoot, "capsules/home-gui/browser/style.css"), "utf8");
   const viewportFit = (html) => /<meta\s+name="viewport"\s+content="[^"]*viewport-fit=cover[^"]*"/.test(html);
+  // A 100vh line is a fallback when the next line repeats it with 100dvh;
+  // any other 100vh is bare and wrong on phones.
+  const styleLines = guiStyle.split("\n");
+  const bareViewportHeightUnits = styleLines.filter((line, index) =>
+    line.includes("100vh") && !(styleLines[index + 1] || "").includes(line.replace("100vh", "100dvh").trim())).length;
   return {
     viewportFitCover: { home: viewportFit(homeIndex), gui: viewportFit(guiIndex) },
-    bareViewportHeightUnits: (guiStyle.match(/\b100vh\b/g) || []).length,
+    bareViewportHeightUnits,
+    viewportHeightFallbacks: (guiStyle.match(/\b100vh\b/g) || []).length - bareViewportHeightUnits,
     dynamicViewportHeightUnits: (guiStyle.match(/\b100dvh\b/g) || []).length,
     backdropFilters: (guiStyle.match(/backdrop-filter\s*:/g) || []).length,
   };

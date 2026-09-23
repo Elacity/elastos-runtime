@@ -150,6 +150,7 @@ import {
   retireConnectorSheet,
   showConnectorSheet,
 } from "./shell-connector-sheet.js?v=home-20260813a";
+import { bindFormFactor } from "./shell-form-factor.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -1190,6 +1191,10 @@ export function bindHomeGuiInteractions(options = {}) {
     ? options.requestSummaryRefresh
     : null;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
+
+  // Size class, pointer class and soft-keyboard inset before any surface
+  // binds, so CSS keyed on body[data-form-factor] is right on first paint.
+  bindFormFactor();
 
   // The brand button itself toggles the ElastOS menu (bound in
   // bindIdentityMenu); the go-home action lives inside it as Show desktop.
