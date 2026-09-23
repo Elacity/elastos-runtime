@@ -12467,6 +12467,15 @@ assert(
     "Capsule ratchet: the phone smoke fails when an app frame on a phone profile has more targets under 44 px than its pinned row",
   );
 
+  const peopleStyle = read("capsules/people/browser/style.css");
+  assert(
+    peopleStyle.includes(':root[data-el-form-factor="phone"] button,\n:root[data-el-form-factor="phone"] .profile-form input {\n  min-height: var(--el-touch-target);\n}') &&
+      peopleStyle.includes(':root[data-el-form-factor="phone"] .profile-form input {\n  font-size: 16px;') &&
+      /people: 0, services/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
+      /people: 0, services/.test(capsuleRatchet[1].split('"phone-landscape"')[1]),
+    "People on the phone stage: every button and the profile field are 44 px touch targets, the field is 16 px so iOS does not zoom, and the phone smoke holds People at 0 small targets",
+  );
+
   // Phone push drawer: one shared module (inert when closed, a tap on the
   // pushed view closes without activating it, follows the size class),
   // vendored only where a sidebar uses it, and one shared smoke assertion.

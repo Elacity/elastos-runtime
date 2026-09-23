@@ -530,3 +530,14 @@ button:disabled {
     justify-self: start;
   }
 }
+
+/* Phone stage: every control is a full touch target. Person rows already
+   stand above 48 px (38 px avatar plus padding). */
+:root[data-el-form-factor="phone"] button,
+:root[data-el-form-factor="phone"] .profile-form input {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .profile-form input {
+  font-size: 16px; /* below 16 px iOS Safari zooms the page on focus */
+}
