@@ -415,9 +415,15 @@ response replaces the pending record with the exact job ID. The local sink
 test checks the full received POST and zero requests on retry; the focused
 broker tests and independent read-only review pass. Unknown attempts remain
 in the bounded 4 MiB/4,096-entry journal and fail closed when it fills.
-Upstream lookup or idempotency, explicit reconciliation of unknown attempts,
-and installed proof are still required before public hosted use. External
-HTTPS remains paused; the signed-in Homes and public seed were not changed.
+The installed diagnostic Home repeated this fault: the local sink received
+one full create POST, closed before a job ID, and a same-ID retry sent no
+second POST. The provider settled the run as `settlement_unknown`; the
+private fixture was restored and Home returned HTTP 200. Installed Runtime
+SHA-256 `e4a27068…` and provider SHA-256 `c23d3e7e…` are bound in
+`.audit/hosted-egress-design-scratch/lost-response-installed-1616-retry/receipt.json`.
+Upstream lookup or idempotency and explicit reconciliation of unknown attempts
+remain required before public hosted use. External HTTPS remains paused; the
+signed-in Homes and public seed were not changed.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their

@@ -464,6 +464,65 @@ fn provision_model_installed_fixture() {
     println!("Diagnostic model fixture prepared at {}. Private authority file: {}. Owner gateway 61970 / Carrier 61972; consumer gateway 61971 / Carrier 61973. Grant {} expires at {}. Retain both Homes for operator review.", root.display(), output.display(), grant_id, expiry);
 }
 
+/// Renew only the marked fixture's Assistant launch authority after its
+/// short-lived token expires. The prior private manifest stays in an explicit
+/// operator backup; human Home sessions are outside this test root.
+#[test]
+#[ignore = "explicit marked fixture root, action and private backup path"]
+fn refresh_model_installed_fixture_assistant_token() {
+    assert_eq!(
+        std::env::var("MODEL_INSTALLED_FIXTURE_ACTION").unwrap(),
+        "refresh-consumer-assistant-token"
+    );
+    let root = fixture_root(false);
+    let output = root.join("diagnostic-authority.private.json");
+    let before = std::fs::read(&output).unwrap();
+    let backup = PathBuf::from(std::env::var_os("MODEL_INSTALLED_FIXTURE_TOKEN_BACKUP").unwrap());
+    assert!(backup.is_absolute() && !backup.exists());
+    write_new_private(&backup, &before);
+    let mut manifest: Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(
+        manifest["schema"],
+        "elastos.model.installed-diagnostic-fixture/v1"
+    );
+    let data = root.join("consumer/Library/Application Support/elastos");
+    assert_eq!(manifest["consumer"]["data"].as_str(), data.to_str());
+    let principal_id = manifest["consumer"]["authority"]["principal_id"]
+        .as_str()
+        .unwrap();
+    let principal = crate::auth::active_passkey_principals(&data)
+        .unwrap()
+        .into_iter()
+        .find(|principal| {
+            principal.principal_id == principal_id && crate::auth::is_admin(principal)
+        })
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let grant = AuthSessionGrantV1 {
+        schema: AuthSessionGrantV1::SCHEMA.to_string(),
+        grant_id: format!("grant:{}", uuid_like_token()),
+        session_id: format!("auth:{}", uuid_like_token()),
+        principal_id: principal.principal_id,
+        proof_binding_id: principal.proof_binding_id,
+        issued_at: now,
+        expires_at: now + 12 * 60 * 60,
+        apps: vec!["assistant".to_string()],
+    };
+    crate::auth::store_session_grant(&data, grant.clone()).unwrap();
+    let token = issue_home_launch_token_for_auth_grant(&data, "assistant", &grant).unwrap();
+    manifest["consumer"]["authority"]["tokens"]["assistant"] = json!(token);
+    let staged = root.join(format!(
+        ".diagnostic-authority.{}.private.json",
+        uuid_like_token()
+    ));
+    write_new_private(&staged, &serde_json::to_vec_pretty(&manifest).unwrap());
+    std::fs::rename(&staged, &output).unwrap();
+    std::fs::File::open(&root).unwrap().sync_all().unwrap();
+    println!(
+        "Refreshed only the marked Consumer Assistant diagnostic token; prior manifest preserved."
+    );
+}
+
 /// Explicit fixture time/authority control; never used by ordinary Home UI.
 #[test]
 #[ignore = "explicit marked fixture root and MODEL_INSTALLED_FIXTURE_ACTION"]
