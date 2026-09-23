@@ -1746,6 +1746,79 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_exclusive_bridge_reaps_blocked_request_after_caller_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("blocked-provider.sh");
+        let pid_file = temp.path().join("blocked-provider.pid");
+        let entered = temp.path().join("blocked-provider.entered");
+        let gate = temp.path().join("blocked-provider.gate");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap()
+            .success());
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{}'\nIFS= read -r _init || exit 1\nprintf '%s\\n' '{}'\nIFS= read -r _read || exit 0\nprintf '%s\\n' \"$_read\" > '{}'\nexec cat '{}'\n",
+            pid_file.display(),
+            r#"{"status":"ok"}"#,
+            entered.display(),
+            gate.display(),
+        );
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge = Arc::new(
+            spawn_test_bridge_with_timeouts(
+                &binary,
+                ProviderConfig::default(),
+                INIT_TIMEOUT,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap(),
+        );
+        let pid = read_pid(&pid_file);
+        let request_bridge = Arc::clone(&bridge);
+        let request = tokio::spawn(async move {
+            request_bridge
+                .send_raw(&serde_json::json!({"op":"cat", "max_bytes":763}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::fs::read_to_string(&entered)
+                .map(|line| line.is_empty())
+                .unwrap_or(true)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the exclusive provider received the bounded read");
+        let received: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&entered).unwrap()).unwrap();
+        assert_eq!(received["op"], "cat");
+        assert_eq!(received["max_bytes"], 763);
+        assert!(!request.is_finished());
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown())
+            .await
+            .expect("exclusive provider shutdown stayed bounded")
+            .unwrap_err();
+        assert!(matches!(error, BridgeError::Timeout), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_process_absent(&pid.to_string());
+        let _io = tokio::time::timeout(std::time::Duration::from_secs(1), bridge.io.lock())
+            .await
+            .expect("the blocked request released the pipe");
+        drop(_io);
+        bridge.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_bridge_shutdown_is_idempotent_after_clean_exit() {
         let temp = tempfile::tempdir().unwrap();
         let (binary, pid_file) = write_mock_provider_script(
