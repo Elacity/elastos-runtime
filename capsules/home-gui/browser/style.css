@@ -5896,6 +5896,16 @@ body.assistant-space-active #inbox-rail {
     display: block;
   }
 
+  /* Status sheets span the phone with the same margin on both sides; a
+     300–340 px card hung off the right edge left a ragged strip on the left. */
+  .control-centre,
+  .notification-center {
+    left: max(8px, env(safe-area-inset-left, 0px));
+    right: max(8px, env(safe-area-inset-right, 0px));
+    width: auto;
+    transform-origin: top center;
+  }
+
   .launcher-popover {
     height: min(48vh, 380px);
     margin-bottom: 0;
@@ -6156,18 +6166,35 @@ body.assistant-space-active #inbox-rail {
     scroll-snap-align: center;
   }
 
-  /* Plate-free glyphs (Apps launcher, Assistant mark) are drawn at 58.6% of
-     their square for the desktop's pointer-scale dock; on a phone they read
-     as small next to the 48 px app plates. 1.3× puts both at ~76% of the
-     slot. The launcher glyph is a background (its .taskbar-icon transform is
-     reserved for magnification); the Assistant scales its inner icon node so
-     the mark's own layer animation is untouched. */
-  .taskbar-icon-launcher {
-    background-size: 130%;
+  /* The fixed glyphs keep full tiles; only the scrolling app row gives way
+     when the pill reaches its width limit. */
+  .taskbar-item-launcher,
+  .taskbar-item-assistant {
+    flex-shrink: 0;
   }
 
-  .taskbar-item-assistant .taskbar-item-icon {
-    transform: scale(1.3);
+  .taskbar-sortable {
+    min-width: 0;
+  }
+
+  /* Plate-free glyphs (the Apps launcher; the Assistant when it wears its
+     .assistant-mark) fill 58.6% of their square; app plates fill 87.9% of
+     theirs (measured from the 256 px PNGs). On a phone the glyphs match the
+     plates' height: 87.9 / 58.6 = 1.5×. A plate raster in the Assistant slot
+     already fills its square and takes no scale. The launcher glyph is a
+     background (its .taskbar-icon transform is reserved for magnification);
+     the Assistant scales its icon node so the mark's own layer animation is
+     untouched. */
+  :root {
+    --phone-dock-glyph-scale: 1.5;
+  }
+
+  .taskbar-icon-launcher {
+    background-size: calc(var(--phone-dock-glyph-scale) * 100%);
+  }
+
+  .taskbar-item-assistant .taskbar-item-icon.assistant-mark {
+    transform: scale(var(--phone-dock-glyph-scale));
   }
 
   /* Running indicator grows to a legible 4 px pill under the 58 px tile. */
