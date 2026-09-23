@@ -436,6 +436,23 @@ Upstream lookup or idempotency and explicit reconciliation of unknown attempts
 remain required before public hosted use. External HTTPS remains paused; the
 signed-in Homes and public seed were not changed.
 
+Linux SEC1 diagnostic: an isolated C fixture on the owned Linux target passed
+with a `no_new_privs` seccomp filter. Its child and forked descendant received
+`EPERM` for new IPv4, IPv6, and Unix sockets, for local/external TCP connects
+through an inherited unconnected socket, and for local/external UDP sends.
+Both completed a synthetic local round trip through the selected preopened
+Unix broker channel; the parent reaped both. Exact source, binary, and result
+hashes are in `.audit/linux-sec1-confinement/receipt.json`. Independent review
+found no high or medium issue in this fixture scope. This is kernel-boundary
+evidence, not an installed model-provider or SmolLM2 inference result. The
+current Linux provider has no confined launch, its clients use pathname Unix
+sockets, and it spawns llama.cpp as a descendant that would inherit the filter.
+Next: move engine launch and accepts to Runtime-owned code outside the provider
+filter lineage, pass only selected connected broker channels to the provider,
+and close unrelated descriptors. Then prove installed SmolLM2 and
+child/descendant denial. Linux product confinement and public hosted HTTPS
+remain open.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty
