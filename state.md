@@ -10,6 +10,11 @@ returned `127.0.0.1` and changed its next answer to `::1` before the broker
 dialed. The approved IPv4 sink received one request, and the IPv6 sink received
 zero. A fresh request while the answer was `::1` returned 400 with zero new
 sink requests; restoring `127.0.0.1` allowed one more approved request.
+The final check counted TCP accepts before request parsing: two at the approved
+IPv4 sink and zero at the IPv6 sink. A private resolver trace records the
+answer flip and a successful live lookup that returned `::1`. The earlier
+HTTP-only count and a trace without the resolver result remain preliminary
+evidence in the receipt.
 
 Source commit `dfc1a945` passed 14 broker tests, three URL parser tests and
 bounded independent review. Its installed diagnostic Runtime matched the

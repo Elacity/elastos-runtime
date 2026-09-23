@@ -506,7 +506,10 @@ The isolated Mac SEC1 DNS challenge now has installed proof for an approved
 its answer to `::1` before dial, and the HTTP client sent only to the pinned
 IPv4 sink. With `::1` as the next answer, the broker returned 400 before any
 new request; restoring `127.0.0.1` let the same approved route work again.
-The IPv6 sink received zero requests throughout. Source commit `dfc1a945`,
+The corrected final check counted two IPv4 TCP accepts and zero IPv6 TCP
+accepts; its private resolver trace records a successful `::1` answer in the
+live gateway. The earlier HTTP-only count and first trace remain preliminary
+evidence. Source commit `dfc1a945`,
 built/installed artifact parity, exact sink counts and byte-for-byte diagnostic
 restoration are bound in `.audit/sec1-dns-rebinding/receipt.json`. Public DNS
 and CA routing, Linux production confinement, unknown-create reconciliation,
