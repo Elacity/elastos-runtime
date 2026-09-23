@@ -1804,6 +1804,14 @@ complete. Installed proof and the atomic authority cutover remain open.
   restart reconciliation and provider-internal Chat Completions/Responses adapters.
   Model-provider source verification passes 204 unit and five process tests;
   paid hosted calls and installed Qwen acceptance retain their separate gates.
+- On Linux x86_64/aarch64, the candidate Runtime starts model-provider with a
+  kernel filter that denies new Internet sockets to the provider and descendants.
+  Runtime owns exact local llama routes through a Unix broker. An isolated Linux
+  Home registered the filtered installed provider, and a separate installed
+  bridge test completed SmolLM2 under the same filter. The process and artifact
+  receipt is `.audit/linux-sec1-confinement/installed-observation.json`.
+  Linux Home Assistant use under this filter and a stricter preopened-channel
+  engine design still need proof. Public hosted HTTPS remains paused.
 - The current source does not integrate the Codex SDK. Codex remains a later
   agent-execution adapter behind typed agent operations and explicit
   filesystem, network, tool, and approval grants. It is not a model offer.

@@ -443,10 +443,11 @@ through an inherited unconnected socket, and for local/external UDP sends.
 Both completed a synthetic local round trip through the selected preopened
 Unix broker channel; the parent reaped both. Exact source, binary, and result
 hashes are in `.audit/linux-sec1-confinement/receipt.json`. Independent review
-found no high or medium issue in this fixture scope. This is kernel-boundary
-evidence, not an installed model-provider or SmolLM2 inference result. The
-current Linux provider has no confined launch, its clients use pathname Unix
-sockets, and it spawns llama.cpp as a descendant that would inherit the filter.
+found no high or medium issue in this fixture scope. This was kernel-boundary
+evidence, not an installed model-provider or SmolLM2 inference result. At that
+stage, the Linux provider had no confined launch; its clients used pathname
+Unix sockets, and it spawned llama.cpp as a descendant that would inherit the
+filter.
 The next source fixture, `scripts/linux-model-seccomp-transport-proof.c`,
 separates a Runtime-owned synthetic engine from an exec'd provider child.
 The engine accepts on Runtime's Unix listener outside the filter; Runtime
@@ -460,6 +461,23 @@ Rust Runtime, native model-provider or SmolLM2. Next: integrate this
 ownership and transport in those components and prove installed SmolLM2 on an
 isolated non-public Linux target. Linux product confinement and public hosted
 HTTPS remain open.
+
+The Linux SEC1 source slice now launches model-provider through a Runtime-owned
+local Unix broker with a fail-closed seccomp filter. New IPv4 and IPv6 sockets
+return `EPERM` in its child and descendant test; the installed provider, guard
+and llama.cpp processes report `NoNewPrivs=1` and `Seccomp=2`. An isolated,
+non-public Linux Home on loopback port 61973 registered the installed provider.
+The installed Runtime and provider match their built SHA-256 values
+`d59bf992…` and `0b8e6c76…`; the installed SmolLM2 bridge test completed.
+The exact hashes, process ancestry, socket families, HTTP checks and 10.33%
+disk reserve are in `.audit/linux-sec1-confinement/installed-observation.json`.
+The first Home start skipped the provider because the copied model directory
+did not match preparation inventory rules; moving it into the valid model
+location and restarting this isolated Home restored registration. This is
+source-linked installed bridge evidence. A signed-in Assistant run through
+that Home, strict preopened-channel-only engine ownership, and public hosted
+HTTPS remain open. Bounded independent review found no high or medium issue
+in the source slice and kept the Home Assistant claim open.
 
 Mac hosted route approval has source and installed diagnostic proof. Runtime
 records exact external HTTP(S) owner decisions in private state, presents them
