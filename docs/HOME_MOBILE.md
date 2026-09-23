@@ -330,7 +330,7 @@ A first-party capsule fits the phone stage when:
 | M0 | this charter, the phone layout smoke and its baseline |
 | M1 | viewport and input truth: `viewport-fit`, overscroll, `dvh`, form-factor module, keyboard inset |
 | M2 | 44 px bar with wallet/Overview in Control Centre, thumb-scrolled Dock that tucks under an open window behind a 24 px handle |
-| M3 | phone title bar, instant title while loading, stage history for system back, app switcher |
+| M3 | 44 px phone title bar for every chrome mode, boot hairline, Mission Control as the app switcher (title swipe, icon captions, touch Close), stage history for system back on Chromium/Gecko (buttons-only on WebKit, recorded above) |
 | M4 | launcher, Spotlight, Control Centre and Notification Centre as full sheets |
 | M5 | touch grammar: long-press menus as bottom sheets, touch drag |
 | M6 | shared tokens and one PR per first-party capsule |
