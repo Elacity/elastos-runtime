@@ -12394,6 +12394,52 @@ assert(
       homeGuiStyle.includes("  .control-centre,\n  .notification-center {\n    left: max(8px, env(safe-area-inset-left, 0px));\n    right: max(8px, env(safe-area-inset-right, 0px));\n    width: auto;"),
     "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.5x to the plates' height (the Assistant only with its plate-free mark), Control Centre and Notifications span the stage with even margins",
   );
+
+  // Capsule layout: the shell tells every capsule frame its size class; the
+  // shared theme runtime accepts it only from the opaque parent and only from
+  // an allowlist, and the shared sheet zeroes the desktop chrome safe areas on
+  // phone. The phone smoke proves it lands in real frames on both engines.
+  const capsuleLayoutModule = read("capsules/home-gui/browser/shell-capsule-layout.js");
+  const sharedTheme = read("capsules/_shared/elastos-theme.js");
+  const sharedUi = read("capsules/_shared/elastos-ui.css");
+  const sharedDrawer = read("capsules/_shared/elastos-drawer.js");
+  const vendorUi = read("scripts/vendor-ui-tokens.sh");
+  const phoneDrawerAssert = read("scripts/lib/phone-drawer-assert.mjs");
+  const themeOriginGuard = 'if (event.source !== window.parent || event.origin !== "null") {';
+  const themeLayoutBranch = '    if (message.type === "elastos:shell-layout") {\n      applyShellLayout(message.layout);\n      return;\n    }';
+  assert(
+    capsuleLayoutModule.includes('export const SHELL_LAYOUT_MESSAGE = "elastos:shell-layout";') &&
+      capsuleLayoutModule.includes('import { formFactor, isCoarsePointer } from "./shell-form-factor.js?v=home-20260813a";') &&
+      capsuleLayoutModule.includes('  doc.addEventListener("load", handleFrameLoad, true);') &&
+      capsuleLayoutModule.includes("    if (sameLayout(next, current)) {\n      return;\n    }") &&
+      homeGuiJs.includes('import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";') &&
+      homeGuiJs.includes("  bindPhoneStage();\n  // Capsule frames learn the size class so they can take their phone layout.\n  bindCapsuleLayout();\n") &&
+      sharedTheme.includes('const FORM_FACTORS = ["phone", "tablet", "desktop"];') &&
+      sharedTheme.includes('const POINTERS = ["coarse", "fine"];') &&
+      sharedTheme.indexOf(themeOriginGuard) !== -1 &&
+      sharedTheme.indexOf(themeOriginGuard) < sharedTheme.indexOf(themeLayoutBranch) &&
+      sharedUi.includes(':root[data-el-form-factor="phone"] {\n  --window-chrome-safe-top: 0px;\n  --window-chrome-safe-leading: 0px;\n}') &&
+      sharedUi.includes("  --el-touch-target: 44px;") &&
+      justfile.includes("node --test scripts/home-capsule-layout.test.mjs") &&
+      phoneSmoke.includes("const EXPECTED_CAPSULE_FORM_FACTOR = {") &&
+      phoneSmoke.includes("sharedTheme: Boolean(document.querySelector('script[src*=\"elastos-theme.js\"]')),"),
+    "Capsule layout: shell-capsule-layout.js posts elastos:shell-layout to every frame on load and on size-class change; the shared theme runtime takes it only from the opaque parent and only allowlisted values; phone zeroes the desktop chrome safe areas; unit-tested in verify and checked in real frames by the phone smoke",
+  );
+
+  // Phone push drawer: one shared module (inert when closed, a tap on the
+  // pushed view closes without activating it, follows the size class),
+  // vendored only where a sidebar uses it, and one shared smoke assertion.
+  assert(
+    sharedDrawer.includes("      drawer.inert = phone && !open;") &&
+      sharedDrawer.includes("        event.preventDefault();\n        event.stopPropagation();\n        setOpen(false);") &&
+      sharedDrawer.includes('.observe(document.documentElement, { attributes: true, attributeFilter: ["data-el-form-factor"] });') &&
+      sharedUi.includes("  --el-drawer-w: min(300px, 82vw);") &&
+      sharedUi.includes(':root[data-el-form-factor="phone"] [data-el-drawer-room][data-el-drawer-state="open"] {') &&
+      vendorUi.includes('for target_dir in marketplace/browser documents/browser; do\n  drawer_target="capsules/$target_dir/elastos-drawer.js"') &&
+      phoneDrawerAssert.includes("export async function assertPhoneDrawer(page, target, { label, drawer, room, closeTarget, screenshot }) {") &&
+      phoneDrawerAssert.includes("check(closed.drawerRight <= 0 && closed.drawerInert && closed.roomLeft === 0 && closed.roomTop === 0,"),
+    "Phone push drawer: shared elastos-drawer.js (inert when closed, tap on the pushed view closes and is swallowed, follows the size class) with shared tokens, vendored only to capsules whose sidebar uses it, asserted by scripts/lib/phone-drawer-assert.mjs",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();

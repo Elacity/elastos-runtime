@@ -135,6 +135,19 @@ else
   cp "$model_facts_source" "$model_facts_target"
 fi
 
+# The phone push drawer ships only to capsules whose sidebar uses it.
+for target_dir in marketplace/browser documents/browser; do
+  drawer_target="capsules/$target_dir/elastos-drawer.js"
+  if [[ "$MODE" == "--check" ]]; then
+    if ! cmp -s capsules/_shared/elastos-drawer.js "$drawer_target"; then
+      echo "[vendor-ui] DRIFT: $drawer_target" >&2
+      FAILED=1
+    fi
+  else
+    cp capsules/_shared/elastos-drawer.js "$drawer_target"
+  fi
+done
+
 for target_dir in assistant/browser; do
   model_target="capsules/$target_dir/model-selection.js"
   if [[ "$MODE" == "--check" ]]; then

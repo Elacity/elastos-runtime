@@ -153,6 +153,7 @@ import {
 import { bindFormFactor } from "./shell-form-factor.js?v=home-20260813a";
 import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
 import { bindPhoneStage } from "./shell-phone-stage.js?v=home-20260813a";
+import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -1201,6 +1202,8 @@ export function bindHomeGuiInteractions(options = {}) {
   bindPhoneDock();
   // Phone system-back history and the title-bar swipe to the switcher.
   bindPhoneStage();
+  // Capsule frames learn the size class so they can take their phone layout.
+  bindCapsuleLayout();
 
   // The brand button itself toggles the ElastOS menu (bound in
   // bindIdentityMenu); the go-home action lives inside it as Show desktop.

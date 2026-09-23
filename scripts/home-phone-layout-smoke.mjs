@@ -850,6 +850,12 @@ async function runProfile(browser, engineId, profile, origin) {
       shell.capsule = capsuleFrame
         ? await capsuleFrame.evaluate(measureSurface, { minTarget: MIN_TARGET_PX, minText: MIN_TEXT_PX }).catch(() => null)
         : null;
+      shell.capsuleLayout = capsuleFrame
+        ? await capsuleFrame.evaluate(() => ({
+          sharedTheme: Boolean(document.querySelector('script[src*="elastos-theme.js"]')),
+          formFactor: document.documentElement.getAttribute("data-el-form-factor"),
+        })).catch(() => null)
+        : null;
       surfaces.push(shell);
       await screenshot(page, dir, `window-${target}`);
       if (target === "browser") {
@@ -1048,10 +1054,22 @@ function sourceTruths() {
   };
 }
 
+// The shell posts its size class to every capsule frame (elastos:shell-layout);
+// capsules on the shared theme runtime land it on the frame's <html>.
+const EXPECTED_CAPSULE_FORM_FACTOR = {
+  "phone-portrait": "phone",
+  "phone-landscape": "phone",
+  tablet: "tablet",
+};
+
 function shellFailures(run) {
   const failures = [];
   const baseline = BASELINE[run.profile] || {};
   for (const surface of run.surfaces) {
+    const layout = surface.capsuleLayout;
+    if (layout?.sharedTheme && layout.formFactor !== EXPECTED_CAPSULE_FORM_FACTOR[run.profile]) {
+      failures.push(`${run.engine}/${run.profile}/window:${surface.target}: capsule frame form factor ${layout.formFactor} (expected ${EXPECTED_CAPSULE_FORM_FACTOR[run.profile]})`);
+    }
     const limits = baseline[surface.surface];
     if (!limits) continue;
     const label = `${run.engine}/${run.profile}/${surface.surface}${surface.target ? `:${surface.target}` : ""}`;
