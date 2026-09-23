@@ -858,7 +858,8 @@ function configureAiProvider() {
       });
       const state = document.createElement("span");
       state.className = "ai-provider-state";
-      state.textContent = connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
+      state.textContent = connection.egress_state === "demo_ready" ? "Temporary Venice route active"
+        : connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
         : connection.egress_approval_state === "pending" ? "Hosted route needs Inbox review"
         : connection.egress_state === "paused" ? "External HTTPS paused"
         : connection.approval_state === "approved" ? "Assistant access approved"
@@ -874,7 +875,7 @@ function configureAiProvider() {
       const secondary = document.createElement("div");
       secondary.className = "system-inline-row";
       secondary.append(shareButton);
-      if (connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
+      if (connection.egress_state === "demo_ready" || connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
         const endApproval = document.createElement("button");
         endApproval.className = "pc2-btn pc2-btn-secondary";
         endApproval.type = "button";
