@@ -617,6 +617,19 @@ or change the guest key or offer, and that one guest's revoke affects only its
 own runs. An anonymous Home visit has no recoverable private owner. Hide the
 unusable Add path until guest authority is implemented and proved.
 
+Remote-local SmolLM2 sharing needs an offer-bound grant before a demo claim.
+`gateway_model_service.rs` stores the existing peer grant by provider and
+requester principal, without an offer ID. Its next offer list and run request
+re-read the current set of shared local models. Consumer already has a live
+generic AI-model grant for Owner's shared hosted Venice offer, so selecting
+`Share my AI model` on Owner would add SmolLM2 to that same grant without a
+separate SmolLM2 Inbox request. The read-only preflight stopped before Share;
+both shares and the existing grant stayed unchanged. Bind a grant to each
+approved model offer, preserve or migrate the current Venice grant explicitly,
+then prove fresh Smol request, owner approval, run and revoke on two installed
+Homes. The fresh ordinary local SmolLM2 Assistant run on Owner Home passed;
+remote-local SmolLM2 is still open.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty
