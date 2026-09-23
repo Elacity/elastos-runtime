@@ -12478,6 +12478,13 @@ assert(
       read("scripts/inbox-product-layout-smoke.mjs").includes('"mobile list must fit its requests so the detail reads directly beneath, not mid-screen",'),
     "Inbox narrow: the request list is as tall as its requests so the detail follows directly, asserted by the layout smoke",
   );
+
+  assert(
+    read("capsules/browser/browser/style.css").includes(':root[data-el-form-factor="phone"] .browser-chrome {\n  min-height: 56px;') &&
+      read("scripts/browser-product-layout-smoke.mjs").includes('"Browser phone toolbar must start at the leading edge"') &&
+      justfile.includes("node scripts/browser-product-layout-smoke.mjs"),
+    "Browser phone: the navigation row spans the stage with 44 px controls, asserted by the layout smoke in the browser lane",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
