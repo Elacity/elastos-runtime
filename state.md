@@ -1,5 +1,17 @@
 # State
 
+## Current model delivery status, 23 September 2026 UTC
+
+| Surface | Verified state | Remaining boundary |
+| --- | --- | --- |
+| Source candidate | Local branch `feat/0.7.1-model-assistant-closeout` at `a1573675` accepts the current five-field model offer list and checks distinct offer IDs before deriving local readiness. Focused Registry, catalog-readiness and startup-repin checks pass. | This unpublished source does not establish public installation. |
+| Signed-in Mac Homes | Owner Home `http://localhost:61965/home/` runs the source-built Runtime, with built and installed SHA-256 `c4c6286573a23cd06a1727ef29434386d15ffec1c42cbcc90673dad4417abf3c`. System shows the retained SmolLM2 as available. Ordinary Assistant selected its exact offer and completed a new terminal reply. Consumer Home `http://localhost:61966/home/` remains signed in for the separate hosted-sharing journey. | The local SmolLM2 result proves this owner installation and request. It does not qualify full Qwen, all installed failure paths or remote inference. |
+| Public seed and Home | The seed holds the signed SmolLM2 package. The public Get attempts recorded below failed at `metadata_read` with zero transferred bytes on their then-installed provider. | The local Mac result did not change public artifacts or retest public Get. Public installation and release gates remain open. |
+
+The exact current local receipt is `.audit/local-smol-readiness-installed.json`.
+The earlier cold delivery, restart, warm reuse and hosted results below retain
+their own receipts and scopes. Private receipts stay outside Git.
+
 ## Mac controlled DNS answer change, 23 September 2026 UTC
 
 The isolated Mac diagnostic broker now accepts literal `localhost` only in its
@@ -1407,7 +1419,8 @@ retaining those donors does not mean their behavior is in the candidate.
 The reviewed content-distribution, Recovery/Profile and WSL-first documents
 are included. The combined source projects installed capsules and a verified signed model
 catalog. Local Content preparation and admission are implemented; ordinary cold
-Carrier delivery and the Marketplace-to-Assistant handoff remain open. WSL
+Carrier delivery and the Marketplace-to-Assistant handoff passed for SmolLM2
+on the signed-in Mac Home. Full Qwen and broader installed acceptance remain open. WSL
 packaging and native Windows support also remain unproved product targets.
 
 Runtime owns authenticated principal and session authority, capability

@@ -171,9 +171,19 @@ verification separate from product acceptance and required human review.
 
 ## Now
 
+The 23 September source candidate `a1573675` and local receipt
+`.audit/local-smol-readiness-installed.json` close the current Mac owner
+SmolLM2 readiness regression: the installed Runtime matches its build, System
+shows the retained model as available, and ordinary Assistant selected the
+exact offer and completed a new terminal reply. The signed-in Owner and Consumer
+Homes remain available for human testing. This is an installed local-model
+result; public Get, full Qwen, the wider installed failure matrix and release
+qualification remain open. [Current source, installed and public status](state.md#current-model-delivery-status-23-september-2026-utc)
+keeps these scopes separate.
+
 ### Model delivery R14 — 0.7.1 on public Home
 
-Current execution, 22 September 2026: complete the remaining model product
+Execution plan recorded 22 September 2026: complete the remaining model product
 before the next human test. The reviewed five-outcome candidate below is the
 regression baseline. Codex owns source, builds, installed test Homes and evidence;
 one read-only reviewer checks material milestones. The coordinator owns Notion
@@ -189,12 +199,13 @@ kept separate. Generic remote failures retain unknown acceptance until an explic
 destination assertion proves refusal before dispatch. Full Qwen work and the
 previously deferred relay/performance gates retain their original scope.
 
-Current revision: installed System Models and Assistant use one editor and one
+At that checkpoint, installed System Models and Assistant used one editor and one
 selector. Approval Lens selection and the labelled sample work; reopening the
 sample reuses its saved evaluation. Marketplace shows the granted offer's Home,
 upstream, payer, limits and availability, and hands that exact offer to Services
 or Assistant. The existing-grant path passed. A fresh request and six-hour Inbox
-approval waits on the current human confirmation.
+approval awaited human confirmation; the later hosted-sharing result is recorded
+in the accepted regression evidence below.
 
 Public model Get targets the Runtime that serves Home. In public Home, Get
 therefore prepares the public seed; it does not install bytes on the viewer's

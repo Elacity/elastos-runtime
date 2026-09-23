@@ -362,8 +362,8 @@ model and provider are ready.
 
 Bounded transfer and manifest/inventory limits are in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
-The single execution queue and proof dependencies are in
-[Builder-only execution](../TASKS.md#builder-only-execution).
+The current execution queue and proof dependencies are in
+[TASKS Now](../TASKS.md#now).
 Fresh-install acceptance must prove the compatible engine and its verified
 libraries are available, then select the real signed catalog entry with no
 pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact

@@ -16,11 +16,15 @@ The isolated cold Qwen source/process proof covers admission, reply, active
 cancellation, exact restart replay and Keep persistence with a fixture catalog
 and successful authority-revalidation callback. Operator-signed packaging,
 bounded local Content import and installed catalog visibility are verified.
-The actual installed Use failed after metadata progress, before admission or
-activation; its exact exception was not retained. That result and cleanup facts
-are recorded in [state.md](../state.md#current-isolated-owner-home).
-Combined GUI/retention acceptance, content-to-Agent handoff and bounded off-box
-delivery remain open. This is a local foundation for full model distribution.
+An earlier installed Qwen Use failed after metadata progress, before admission
+or activation; its exact exception was not retained. This historical attempt
+does not describe the later SmolLM2 result.
+A later signed-in Mac Home acquired and admitted SmolLM2 through ordinary
+Marketplace and Carrier, then completed a terminal Assistant reply. Its current
+installed readiness regression also passed after Runtime restart; the exact
+local receipt is recorded in [state.md](../state.md#current-model-delivery-status-23-september-2026-utc).
+Full Qwen, combined retention and failure-path acceptance, and public delivery
+remain open.
 
 The implemented content plane already provides `elastos://content` publish,
 fetch, status, ensure, repair, and unpublish operations. It records signed local
@@ -316,7 +320,8 @@ Keep persists and owned processes/staging are cleaned up. Cancellation records
 unknown settlement when backend stop is unconfirmed. The catalog signer and
 successful revalidation callback belong to the fixture. They do not prove the
 installed Home grant/session path. The installed operator catalog and receipt
-exist, but full Use failed; current evidence and limits are in [state.md](../state.md).
+exist. That earlier Qwen Use failed; the later SmolLM2 installed journey passed.
+Their separate evidence and limits are in [state.md](../state.md).
 Resource samples do not establish continuous peaks or complete idle/busy
 retention and eviction acceptance.
 
