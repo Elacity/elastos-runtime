@@ -1440,18 +1440,12 @@ mod tests {
         )
         .unwrap();
         let id = model_provider_egress_decision::request(dir.path(), &scope, Some(&proof)).unwrap();
-        let summary = crate::notifications::load_summary(dir.path()).unwrap();
-        assert_eq!(summary.entries.len(), 1);
-        let entry = &summary.entries[0];
-        assert!(entry.body.contains("Origin: http://127.0.0.1:9999"));
-        assert!(entry.body.contains("Data recipient: 127.0.0.1"));
-        assert!(entry.body.contains("Payer: this Home"));
-        assert!(entry.body.contains("Duration: 10 minutes"));
-        assert!(entry.body.contains("Load hosted model choices"));
-        assert_eq!(
-            entry.action_ref.as_ref().unwrap().action_id,
-            format!("model-egress-approve:{id}")
-        );
+        assert!(crate::notifications::load_summary(dir.path())
+            .unwrap()
+            .entries
+            .is_empty());
+        let history = model_provider_egress_decision::inbox_history(dir.path()).unwrap();
+        assert_eq!(history.len(), 1);
         assert!(create_grant_after_decision(
             dir.path(),
             &scope.offer_id,

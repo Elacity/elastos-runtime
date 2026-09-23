@@ -937,7 +937,25 @@ pub(super) fn home_state(data_dir: &std::path::Path) -> HomeState {
     }
     let people = home_people_summary(&room_summary, identity.did.as_deref());
     let services = home_services_summary(data_dir, &room_summary, &people);
-    let notifications = crate::notifications::load_summary(data_dir).unwrap_or_default();
+    let mut notifications = crate::notifications::load_summary(data_dir).unwrap_or_default();
+    // Legacy hosted-route prompts are projected from private owner decisions
+    // only in Inbox. Keep them out of the shared Home notification summary.
+    notifications.entries.retain(|entry| {
+        !entry
+            .action_ref
+            .as_ref()
+            .is_some_and(|action| action.action_id.starts_with("model-egress-approve:"))
+    });
+    notifications.unread_count = notifications
+        .entries
+        .iter()
+        .filter(|entry| !entry.read)
+        .count();
+    notifications.attention_count = notifications
+        .entries
+        .iter()
+        .filter(|entry| entry.severity == crate::notifications::NotificationSeverity::Attention)
+        .count();
 
     HomeState {
         site,

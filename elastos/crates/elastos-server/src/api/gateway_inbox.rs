@@ -40,12 +40,47 @@ pub(super) async fn inbox_summary(
     {
         append_inspect_action_notifications(&mut notifications, inspect_requests);
     }
+    #[cfg(target_os = "macos")]
+    let hosted_routes = {
+        notifications.entries.retain(|entry| {
+            !entry.action_ref.as_ref().is_some_and(|action| {
+                action
+                    .action_id
+                    .starts_with(crate::api::model_provider_egress_decision::APPROVE_PREFIX)
+            })
+        });
+        notifications.unread_count = notifications
+            .entries
+            .iter()
+            .filter(|entry| !entry.read)
+            .count();
+        notifications.attention_count = notifications
+            .entries
+            .iter()
+            .filter(|entry| entry.severity == "attention")
+            .count();
+        if ensure_admin_context(&state.data_dir, &context).is_ok() {
+            match crate::api::model_provider_egress_decision::inbox_history(&state.data_dir) {
+                Ok(routes) => {
+                    let pending = routes.iter().filter(|route| route.is_pending()).count();
+                    notifications.attention_count += pending;
+                    notifications.unread_count += pending;
+                    routes
+                }
+                Err(err) => return inbox_error_response(err),
+            }
+        } else {
+            Vec::new()
+        }
+    };
     Json(InboxSummaryResponse {
         app: HomeCapsuleIdentity {
             id: INBOX_CAPSULE_ID.to_string(),
             route: "/apps/inbox/".to_string(),
         },
         notifications,
+        #[cfg(target_os = "macos")]
+        hosted_routes,
     })
     .into_response()
 }
@@ -425,6 +460,21 @@ async fn dispatch_inbox_action(
             "Rejected Wallet market-price HTTP source through Inbox",
         )?;
         return Ok("Rejected Wallet market-price source.".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::api::model_provider_egress_decision::END_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        let proof = context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        crate::api::model_provider_egress_decision::end_decision(data_dir, request_id, proof)?;
+        let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
+        return Ok(
+            "Ended this hosted route. Matching requests need a new Inbox decision.".to_string(),
+        );
     }
     #[cfg(target_os = "macos")]
     if let Some(request_id) =

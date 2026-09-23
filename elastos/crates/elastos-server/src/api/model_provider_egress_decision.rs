@@ -11,13 +11,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-use super::model_provider_config::{read_hosted_egress_decisions, write_hosted_egress_decisions};
+use super::model_provider_config::{
+    archive_hosted_egress_decision, read_hosted_egress_decisions, recent_hosted_egress_history,
+    write_hosted_egress_decisions,
+};
 
 pub(super) const APPROVE_PREFIX: &str = "model-egress-approve:";
 pub(super) const DENY_PREFIX: &str = "model-egress-deny:";
+pub(super) const END_PREFIX: &str = "model-egress-end:";
 const SCHEMA: &str = "elastos.model.egress-decisions/v1";
 const DURATION_MS: u64 = 10 * 60 * 1000;
-const MAX_DECISIONS: usize = 128;
+const MAX_DECISIONS: usize = 1024;
 static DECISION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) struct ActiveDecision {
@@ -57,6 +61,8 @@ struct EgressDecision {
     owner_proof_binding_id: Option<String>,
     requested_at_ms: u64,
     decided_at_ms: Option<u64>,
+    #[serde(default)]
+    ended_at_ms: Option<u64>,
     expires_at_ms: u64,
     status: DecisionStatus,
 }
@@ -68,6 +74,31 @@ enum DecisionStatus {
     Approved,
     Denied,
     Ended,
+}
+
+#[derive(Serialize)]
+pub(super) struct HostedRouteSummary {
+    id: String,
+    provider: String,
+    offer_id: String,
+    method: String,
+    origin: String,
+    path: String,
+    url_sha256: String,
+    recipient: String,
+    payer: String,
+    purpose: String,
+    status: &'static str,
+    requested_at: u64,
+    decided_at: Option<u64>,
+    ended_at: Option<u64>,
+    expires_at: u64,
+}
+
+impl HostedRouteSummary {
+    pub(super) fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
 }
 
 fn lock() -> &'static Mutex<()> {
@@ -147,8 +178,23 @@ pub(super) fn request(
     let _guard = lock().lock().unwrap_or_else(|error| error.into_inner());
     let now = now_ms()?;
     let mut file = read(data_dir)?;
-    file.decisions
-        .retain(|decision| decision.expires_at_ms > now);
+    let expired = file
+        .decisions
+        .iter()
+        .filter(|decision| decision.expires_at_ms <= now)
+        .collect::<Vec<_>>();
+    for decision in &expired {
+        archive_hosted_egress_decision(
+            data_dir,
+            &format!("{:020}-{}.json", decision.requested_at_ms, decision.id),
+            &serde_json::to_vec(decision)?,
+        )?;
+    }
+    if !expired.is_empty() {
+        file.decisions
+            .retain(|decision| decision.expires_at_ms > now);
+        write(data_dir, &file)?;
+    }
     let existing = file.decisions.iter().rev().find(|decision| {
         decision.scope == *scope
             && decision.requested_by_proof.as_deref() == requested_by_proof
@@ -162,7 +208,7 @@ pub(super) fn request(
             existing.status == DecisionStatus::Pending,
             "hosted egress request was denied or ended"
         );
-        return project_notification(data_dir, scope, &existing.id, now);
+        return Ok(existing.id.clone());
     }
     anyhow::ensure!(
         file.decisions.len() < MAX_DECISIONS,
@@ -176,47 +222,12 @@ pub(super) fn request(
         owner_proof_binding_id: None,
         requested_at_ms: now,
         decided_at_ms: None,
+        ended_at_ms: None,
         expires_at_ms: now + DURATION_MS,
         status: DecisionStatus::Pending,
     });
     write(data_dir, &file)?;
-    project_notification(data_dir, scope, &id, now)
-}
-
-fn project_notification(
-    data_dir: &Path,
-    scope: &EgressScope,
-    id: &str,
-    now: u64,
-) -> anyhow::Result<String> {
-    let source_app = if scope.offer_id.starts_with("validation:") {
-        "system"
-    } else {
-        "assistant"
-    };
-    let protocol = if scope.origin.starts_with("https://") {
-        "HTTPS"
-    } else {
-        "HTTP fixture"
-    };
-    let url = Url::parse(&scope.url)?;
-    let title = format!("Approve {} {} access", scope.provider, protocol);
-    let body = format!(
-        "Provider: {} ({})\nRoute: {} {}{}\nExact URL SHA-256: {}\nEffect: {}\nOrigin: {}\nData recipient: {}\nPayer: {}\nPurpose: {}\nDuration: 10 minutes after approval. Matching requests during that period use separate run grants. This decision is bound to the current key and model configuration. Service access is a separate approval.",
-        scope.provider, scope.offer_id, scope.method, scope.origin, url.path(),
-        hex::encode(Sha256::digest(scope.url.as_bytes())), scope.effect,
-        scope.origin, scope.recipient, scope.payer, scope.purpose,
-    );
-    crate::notifications::upsert_external_http_request(
-        data_dir,
-        &id,
-        source_app,
-        &title,
-        &body,
-        &format!("{APPROVE_PREFIX}{id}"),
-        now / 1000,
-    )?;
-    Ok(id.to_string())
+    Ok(id)
 }
 
 pub(super) fn approve(data_dir: &Path, id: &str, proof: &str) -> anyhow::Result<()> {
@@ -270,7 +281,91 @@ pub(super) fn deny(data_dir: &Path, id: &str, proof: &str) -> anyhow::Result<()>
         "hosted egress request is no longer pending"
     );
     decision.status = DecisionStatus::Denied;
+    decision.decided_at_ms = Some(now_ms()?);
     write(data_dir, &file)
+}
+
+pub(super) fn end_decision(data_dir: &Path, id: &str, proof: &str) -> anyhow::Result<()> {
+    let principal = crate::auth::load_principal_for_proof_binding(data_dir, proof)?;
+    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
+    anyhow::ensure!(
+        crate::auth::is_admin(&principal) && principal.proof_binding.passkey.is_some(),
+        "hosted egress owner unavailable"
+    );
+    let _guard = lock().lock().unwrap_or_else(|error| error.into_inner());
+    let now = now_ms()?;
+    let mut file = read(data_dir)?;
+    let decision = file
+        .decisions
+        .iter_mut()
+        .find(|decision| decision.id == id)
+        .ok_or_else(|| anyhow::anyhow!("hosted egress decision unavailable"))?;
+    anyhow::ensure!(
+        matches!(
+            decision.status,
+            DecisionStatus::Pending | DecisionStatus::Approved
+        ) && decision.expires_at_ms > now,
+        "hosted egress decision is no longer active"
+    );
+    decision.status = DecisionStatus::Ended;
+    decision.ended_at_ms = Some(now);
+    write(data_dir, &file)
+}
+
+pub(super) fn inbox_history(data_dir: &Path) -> anyhow::Result<Vec<HostedRouteSummary>> {
+    let now = now_ms()?;
+    let file = read(data_dir)?;
+    let mut decisions = file.decisions;
+    let mut known = decisions
+        .iter()
+        .map(|decision| decision.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for bytes in recent_hosted_egress_history(data_dir, 256)? {
+        let archived: EgressDecision = serde_json::from_slice(&bytes)?;
+        if known.insert(archived.id.clone()) {
+            decisions.push(archived);
+        }
+    }
+    decisions.sort_by_key(|decision| decision.requested_at_ms);
+    decisions
+        .iter()
+        .rev()
+        .map(|decision| {
+            validate_scope(&decision.scope)?;
+            let url = Url::parse(&decision.scope.url)?;
+            let status = if decision.expires_at_ms <= now
+                && matches!(
+                    decision.status,
+                    DecisionStatus::Pending | DecisionStatus::Approved
+                ) {
+                "expired"
+            } else {
+                match decision.status {
+                    DecisionStatus::Pending => "pending",
+                    DecisionStatus::Approved => "approved",
+                    DecisionStatus::Denied => "denied",
+                    DecisionStatus::Ended => "ended",
+                }
+            };
+            Ok(HostedRouteSummary {
+                id: decision.id.clone(),
+                provider: decision.scope.provider.clone(),
+                offer_id: decision.scope.offer_id.clone(),
+                method: decision.scope.method.clone(),
+                origin: decision.scope.origin.clone(),
+                path: url.path().to_string(),
+                url_sha256: hex::encode(Sha256::digest(decision.scope.url.as_bytes())),
+                recipient: decision.scope.recipient.clone(),
+                payer: decision.scope.payer.clone(),
+                purpose: decision.scope.purpose.clone(),
+                status,
+                requested_at: decision.requested_at_ms / 1000,
+                decided_at: decision.decided_at_ms.map(|value| value / 1000),
+                ended_at: decision.ended_at_ms.map(|value| value / 1000),
+                expires_at: decision.expires_at_ms / 1000,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn active(
@@ -315,6 +410,7 @@ pub(super) fn end_offer(data_dir: &Path, offer_id: &str) -> anyhow::Result<usize
     let _guard = lock().lock().unwrap_or_else(|error| error.into_inner());
     let mut file = read(data_dir)?;
     let mut ended = 0;
+    let now = now_ms()?;
     for decision in &mut file.decisions {
         if decision.scope.offer_id == offer_id
             && matches!(
@@ -323,6 +419,7 @@ pub(super) fn end_offer(data_dir: &Path, offer_id: &str) -> anyhow::Result<usize
             )
         {
             decision.status = DecisionStatus::Ended;
+            decision.ended_at_ms = Some(now);
             ended += 1;
         }
     }

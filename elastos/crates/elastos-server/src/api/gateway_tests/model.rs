@@ -1492,6 +1492,31 @@ async fn owner_inbox_action_controls_hosted_route_and_system_end() {
         Some(&authority.proof_binding_id),
     )
     .unwrap();
+    assert!(crate::notifications::load_summary(dir.path())
+        .unwrap()
+        .entries
+        .is_empty());
+    // A pre-migration shared notification is hidden from every Home context.
+    crate::notifications::upsert_external_http_request(
+        dir.path(),
+        &id,
+        "system",
+        "Legacy route",
+        "Private route facts",
+        &format!("model-egress-approve:{id}"),
+        1,
+    )
+    .unwrap();
+    assert!(home_state(dir.path())
+        .notifications
+        .entries
+        .iter()
+        .all(|entry| {
+            entry
+                .action_ref
+                .as_ref()
+                .is_none_or(|action| !action.action_id.starts_with("model-egress-approve:"))
+        }));
     let (status, summary) = status_json(
         app.clone()
             .oneshot(inbox_summary_request(inbox_token.clone()))
@@ -1500,16 +1525,19 @@ async fn owner_inbox_action_controls_hosted_route_and_system_end() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let entry = summary["notifications"]["entries"]
+    let entry = summary["hosted_routes"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["action_ref"]["action_id"] == format!("model-egress-approve:{id}"))
+        .find(|entry| entry["id"] == id)
         .unwrap();
-    assert!(entry["body"]
-        .as_str()
-        .unwrap()
-        .contains("Route: GET http://127.0.0.1:9999/models"));
+    assert_eq!(entry["status"], "pending");
+    assert_eq!(entry["method"], "GET");
+    assert_eq!(entry["origin"], "http://127.0.0.1:9999");
+    assert_eq!(entry["path"], "/models");
+    assert_eq!(entry["recipient"], "127.0.0.1");
+    assert_eq!(entry["payer"], "this Home");
+    assert!(entry["expires_at"].as_u64().unwrap() > entry["requested_at"].as_u64().unwrap());
     let action = format!("model-egress-approve:{id}");
     let (status, approved) = status_json(
         app.clone()
@@ -1519,6 +1547,15 @@ async fn owner_inbox_action_controls_hosted_route_and_system_end() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{approved}");
+    let (status, approved_history) = status_json(
+        app.clone()
+            .oneshot(inbox_summary_request(inbox_token.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(approved_history["hosted_routes"][0]["status"], "approved");
     assert!(crate::api::model_provider_egress_decision::active(
         dir.path(),
         &scope,
@@ -1555,11 +1592,192 @@ async fn owner_inbox_action_controls_hosted_route_and_system_end() {
         Some(&authority.proof_binding_id)
     )
     .is_err());
+    let (status, ended_history) = status_json(
+        app.clone()
+            .oneshot(inbox_summary_request(inbox_token.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ended_history["hosted_routes"][0]["status"], "ended");
+    assert!(ended_history["hosted_routes"][0]["ended_at"]
+        .as_u64()
+        .is_some());
     let response = app
         .oneshot(inbox_action_request(inbox_token, &action))
         .await
         .unwrap();
     assert_ne!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn owner_inbox_retains_hosted_route_history_and_ends_exact_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let app = gateway_router(test_state(dir.path()));
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let mut scope = crate::api::model_provider_egress_decision::EgressScope {
+        offer_id: "validation:venice".into(),
+        effect: "validate_models".into(),
+        method: "GET".into(),
+        url: "http://127.0.0.1:9998/models".into(),
+        origin: "http://127.0.0.1:9998".into(),
+        recipient: "127.0.0.1".into(),
+        payer: "this Home".into(),
+        provider: "Venice".into(),
+        purpose: "Load hosted model choices".into(),
+        configuration_id: "b".repeat(64),
+    };
+    let approved_id = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    let approve = format!("model-egress-approve:{approved_id}");
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), &approve))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let end = format!("model-egress-end:{approved_id}");
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), &end))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(crate::api::model_provider_egress_decision::active(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id)
+    )
+    .is_err());
+    let response = app
+        .clone()
+        .oneshot(inbox_action_request(inbox_token.clone(), &end))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+
+    scope.url = "http://127.0.0.1:9998/other-models".into();
+    scope.configuration_id = "c".repeat(64);
+    let denied_id = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    let deny = format!("model-egress-deny:{denied_id}");
+    let (status, body) = status_json(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), &deny))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, summary) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let routes = summary["hosted_routes"].as_array().unwrap();
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0]["id"], denied_id);
+    assert_eq!(routes[0]["status"], "denied");
+    assert_eq!(routes[1]["id"], approved_id);
+    assert_eq!(routes[1]["status"], "ended");
+    assert!(routes[1]["decided_at"].as_u64().is_some());
+    assert!(routes[1]["ended_at"].as_u64().is_some());
+
+    let bytes = crate::api::model_provider_config::read_hosted_egress_decisions(dir.path())
+        .unwrap()
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let old = record["decisions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["id"] == denied_id)
+        .unwrap();
+    old["expires_at_ms"] = json!(1);
+    let expired = old.clone();
+    crate::api::model_provider_config::write_hosted_egress_decisions(
+        dir.path(),
+        &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    // Simulate a restart after the immutable archive write but before active compaction.
+    let archive_bytes = serde_json::to_vec(&expired).unwrap();
+    crate::api::model_provider_config::archive_hosted_egress_decision(
+        dir.path(),
+        &format!(
+            "{:020}-{}.json",
+            expired["requested_at_ms"].as_u64().unwrap(),
+            denied_id
+        ),
+        &archive_bytes,
+    )
+    .unwrap();
+    let new_id = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    assert_ne!(new_id, denied_id);
+    let history = crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap();
+    assert_eq!(history.len(), 3);
+    let archived =
+        crate::api::model_provider_config::recent_hosted_egress_history(dir.path(), 10).unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0], archive_bytes);
+    let prior: serde_json::Value = serde_json::from_slice(&archived[0]).unwrap();
+    assert_eq!(prior["id"], denied_id);
+    assert_eq!(prior["status"], "denied");
+
+    let bytes = crate::api::model_provider_config::read_hosted_egress_decisions(dir.path())
+        .unwrap()
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let template = record["decisions"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    for index in 0..260 {
+        let mut pending = template.clone();
+        pending["id"] = json!(format!("model-egress-many-{index:04}"));
+        record["decisions"].as_array_mut().unwrap().push(pending);
+    }
+    crate::api::model_provider_config::write_hosted_egress_decisions(
+        dir.path(),
+        &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let history = crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap();
+    assert_eq!(history.len(), 263);
+    let app = gateway_router(test_state(dir.path()));
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let (status, summary) = status_json(
+        app.oneshot(inbox_summary_request(inbox_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(summary["notifications"]["attention_count"], 261);
 }
 
 #[tokio::test]

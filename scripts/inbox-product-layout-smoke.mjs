@@ -30,9 +30,19 @@ function json(response, value, status = 200, headers = {}) {
   response.end(body);
 }
 
+let hostedRouteStatus = null;
+const hostedRouteActions = [];
+
 function inboxSummary() {
   const now = Math.floor(Date.now() / 1000);
   return {
+    hosted_routes: hostedRouteStatus ? [{
+      id: "model-egress-fixture", provider: "Venice", offer_id: "validation:venice",
+      method: "GET", origin: "https://api.venice.ai", path: "/api/v1/models",
+      url_sha256: "a".repeat(64), recipient: "api.venice.ai", payer: "this Home",
+      purpose: "Load hosted model choices", status: hostedRouteStatus,
+      requested_at: now, expires_at: now + 600,
+    }] : [],
     notifications: {
       attention_count: 1,
       unread_count: 0,
@@ -94,6 +104,13 @@ function startServer() {
         return;
       }
       if (url.pathname === "/api/apps/inbox/actions") {
+        const chunks = [];
+        for await (const chunk of request) chunks.push(chunk);
+        const action = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (action.action_id === "model-egress-end:model-egress-fixture") {
+          hostedRouteActions.push(action.action_id);
+          hostedRouteStatus = "ended";
+        }
         json(response, {});
         return;
       }
@@ -226,6 +243,21 @@ async function run() {
     assert(rail.railCards === 2, "rail view must render inline request cards", rail);
     assert(rail.rows === 0, "rail view must not render window-mode rows", rail);
     await noHorizontalOverflow(railPage, "rail");
+
+    hostedRouteStatus = "approved";
+    await page.getByRole("button", { name: "Refresh" }).click();
+    await page.getByRole("option", { name: /Venice route · Approved/ }).click();
+    const routeDetail = page.locator("#entry-detail");
+    assert(await routeDetail.getByText("Origin: https://api.venice.ai", { exact: false }).count() === 1,
+      "hosted route origin must be visible");
+    const endButton = routeDetail.getByRole("button", { name: "End", exact: true });
+    await endButton.focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("option", { name: /Venice route · Ended/ }).waitFor();
+    assert(hostedRouteActions.length === 1, "keyboard End must send one exact Inbox action", hostedRouteActions);
+    assert(await routeDetail.getByRole("button", { name: "End", exact: true }).count() === 0,
+      "ended route must have no End action");
+    await noHorizontalOverflow(page, "hosted route history");
   } finally {
     server.close();
     await browser.close();

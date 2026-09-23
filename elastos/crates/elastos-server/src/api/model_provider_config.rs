@@ -976,14 +976,14 @@ pub(super) fn read_hosted_egress_decisions(data_dir: &Path) -> anyhow::Result<Op
         &model_provider_root_dir(data_dir),
         "model-provider config root",
     )?;
-    read_model_provider_private_file(&path, &metadata, 64 * 1024, "hosted egress decisions")
+    read_model_provider_private_file(&path, &metadata, 4 * 1024 * 1024, "hosted egress decisions")
         .map(Some)
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn write_hosted_egress_decisions(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
-        bytes.len() <= 64 * 1024,
+        bytes.len() <= 4 * 1024 * 1024,
         "hosted egress decisions exceed limit"
     );
     validate_model_provider_private_directory(
@@ -998,6 +998,129 @@ pub(super) fn write_hosted_egress_decisions(data_dir: &Path, bytes: &[u8]) -> an
         &model_provider_root_dir(data_dir).join("egress-decisions.json"),
         bytes,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn hosted_egress_history_dir(data_dir: &Path) -> PathBuf {
+    model_provider_root_dir(data_dir).join("egress-decision-history")
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn archive_hosted_egress_decision(
+    data_dir: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file_name.len() <= 96
+            && file_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+            && file_name.ends_with(".json")
+            && bytes.len() <= 64 * 1024,
+        "invalid hosted egress history entry"
+    );
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    let directory = hosted_egress_history_dir(data_dir);
+    if !directory.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new().mode(0o700).create(&directory)?;
+            fs::File::open(model_provider_root_dir(data_dir))?.sync_all()?;
+        }
+    }
+    validate_model_provider_private_directory(&directory, "hosted egress history")?;
+    let path = directory.join(file_name);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        let previous = read_model_provider_private_file(
+            &path,
+            &metadata,
+            64 * 1024,
+            "hosted egress history entry",
+        )?;
+        anyhow::ensure!(
+            serde_json::from_slice::<serde_json::Value>(&previous)?
+                == serde_json::from_slice::<serde_json::Value>(bytes)?,
+            "hosted egress history entry changed"
+        );
+        fs::File::open(&directory)?.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(directory.as_os_str().as_bytes())?;
+        let mut volume = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        anyhow::ensure!(
+            unsafe { libc::statvfs(name.as_ptr(), volume.as_mut_ptr()) } == 0,
+            "failed to inspect hosted egress history volume"
+        );
+        let volume = unsafe { volume.assume_init() };
+        anyhow::ensure!(
+            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
+            "hosted egress history disk reserve reached"
+        );
+    }
+    let stage = directory.join(format!(
+        ".{file_name}.{:016x}.tmp",
+        rand::thread_rng().next_u64()
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&stage)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::hard_link(&stage, &path)?;
+        fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&stage);
+    result
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn recent_hosted_egress_history(
+    data_dir: &Path,
+    limit: usize,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let directory = hosted_egress_history_dir(data_dir);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    validate_model_provider_private_directory(&directory, "hosted egress history")?;
+    let mut names = fs::read_dir(&directory)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.retain(|name| {
+        name.to_str()
+            .is_some_and(|name| name.ends_with(".json") && !name.starts_with('.'))
+    });
+    names.sort();
+    let mut records = Vec::new();
+    for name in names.into_iter().rev().take(limit) {
+        let path = directory.join(name);
+        let metadata = fs::symlink_metadata(&path)?;
+        records.push(read_model_provider_private_file(
+            &path,
+            &metadata,
+            64 * 1024,
+            "hosted egress history entry",
+        )?);
+    }
+    Ok(records)
 }
 
 pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {

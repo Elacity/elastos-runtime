@@ -662,7 +662,7 @@
           try {
             const payload = await api("/api/apps/inbox/summary");
             if (current() && !elements.refresh.disabled) {
-              state.entries = Array.isArray(payload.notifications?.entries) ? payload.notifications.entries : [];
+              state.entries = inboxEntries(payload);
               state.requestedSelectionId = data.query.notification_id;
               state.selectedId = "";
               setFilter("all");
@@ -710,7 +710,9 @@
       // include words used in technical messages. Render those names as text.
       const namedRequest = entry.kind === "contact_request"
         || entry.kind === "service_access_request"
-        || entry.kind === "service_access_grant";
+        || entry.kind === "service_access_grant"
+        || entry.kind === "hosted_route_decision"
+        || entry.kind === "hosted_route_history";
       return namedRequest ? text || fallback : publicInboxText(text, fallback);
     }
 
@@ -727,7 +729,7 @@
       if (presentation !== "rail" || window.parent === window) {
         return;
       }
-      const unreadPending = state.entries.filter((entry) => entry && !entry.read).length;
+      const unreadPending = state.entries.filter((entry) => entry && (!entry.read || entry.kind === "hosted_route_decision")).length;
       window.parent.postMessage({
         type: "inbox:pending-count",
         count: unreadPending,
@@ -903,11 +905,36 @@
 
     async function loadInbox() {
       const payload = await api("/api/apps/inbox/summary");
-      const notifications = payload.notifications || {};
-      state.entries = Array.isArray(notifications.entries) ? notifications.entries : [];
+      state.entries = inboxEntries(payload);
       renderInbox();
       markVisibleRead();
       notifyHome();
+    }
+
+    function inboxEntries(payload) {
+      const entries = Array.isArray(payload.notifications?.entries) ? payload.notifications.entries.slice() : [];
+      const routes = Array.isArray(payload.hosted_routes) ? payload.hosted_routes : [];
+      for (const route of routes) {
+        if (!route || !/^[a-zA-Z0-9:-]{1,128}$/.test(route.id || "")
+          || !["pending", "approved", "denied", "ended", "expired"].includes(route.status)) continue;
+        const status = route.status[0].toUpperCase() + route.status.slice(1);
+        const expires = Number.isSafeInteger(route.expires_at)
+          ? new Date(route.expires_at * 1000).toLocaleString() : "Unavailable";
+        const actionId = route.status === "pending" ? `model-egress-approve:${route.id}`
+          : route.status === "approved" ? `model-egress-end:${route.id}` : "";
+        entries.push({
+          id: `external-http-request:${route.id}`,
+          kind: route.status === "pending" ? "hosted_route_decision" : "hosted_route_history",
+          source_app: String(route.offer_id || "").startsWith("validation:") ? "system" : "assistant",
+          title: `${route.provider || "Hosted model"} route · ${status}`,
+          body: `Provider: ${route.provider || "Hosted model"}\nRoute: ${route.method || ""} ${route.origin || ""}${route.path || ""}\nExact URL SHA-256: ${route.url_sha256 || ""}\nOrigin: ${route.origin || ""}\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nPurpose: ${route.purpose || ""}\nExpires: ${expires}`,
+          severity: route.status === "pending" ? "attention" : "info",
+          read: true,
+          created_at: route.requested_at,
+          action_ref: actionId ? { app: "inbox", action_id: actionId } : null,
+        });
+      }
+      return entries.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
     }
 
     function requestInboxRefresh() {
@@ -944,7 +971,7 @@
     }
 
     function pendingRequestEntries() {
-      return state.entries.filter((entry) => entry && entry.kind !== "service_access_grant");
+      return state.entries.filter((entry) => entry && entry.kind !== "service_access_grant" && entry.kind !== "hosted_route_history");
     }
 
     function renderInbox() {
@@ -1095,12 +1122,15 @@
       } else if (typeof actionId === "string" && actionId.startsWith("model-egress-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "model-egress-deny:" + actionId.slice("model-egress-approve:".length), "danger"));
+        actions.appendChild(createActionButton("End", "model-egress-end:" + actionId.slice("model-egress-approve:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("model-egress-end:")) {
+        actions.appendChild(createActionButton("End", actionId, "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("hosted-http-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "hosted-http-deny:" + actionId.slice("hosted-http-approve:".length), "danger"));
       }
 
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant") {
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "hosted_route_decision" && entry.kind !== "hosted_route_history" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
     }

@@ -283,6 +283,32 @@ async function runInboxHomeChromeSmoke() {
   }
   assert.equal(context.inboxEntryText({ kind: "contact_request", title: "" }, "title", "Request"), "Request");
   assert.equal(context.inboxEntryText({ kind: "external_http_request", body: "provider boundary failed" }, "body", "Review"), "Review");
+  const route = {
+    id: "model-egress-fixture", provider: "Venice", offer_id: "validation:venice",
+    method: "GET", origin: "https://api.venice.ai", path: "/api/v1/models",
+    url_sha256: "a".repeat(64), recipient: "api.venice.ai", payer: "this Home",
+    purpose: "Load hosted model choices", requested_at: Math.floor(Date.now() / 1000),
+    expires_at: Math.floor(Date.now() / 1000) + 600,
+  };
+  for (const [status, expectedAction] of [
+    ["pending", "model-egress-approve:model-egress-fixture"],
+    ["approved", "model-egress-end:model-egress-fixture"],
+    ["denied", null],
+    ["ended", null],
+  ]) {
+    const [entry] = context.inboxEntries({ notifications: { entries: [] }, hosted_routes: [{ ...route, status }] });
+    assert.equal(entry.action_ref?.action_id || null, expectedAction);
+    assert(entry.body.includes("Origin: https://api.venice.ai"));
+    assert(entry.body.includes("Recipient: api.venice.ai"));
+    assert(entry.body.includes("Payer: this Home"));
+    assert(entry.body.includes("Expires:"));
+    assert.equal(context.inboxEntryText(entry, "body", "Review"), entry.body);
+    const actions = new FakeElement("div");
+    context.fillEntryActions(actions, entry);
+    const end = actions.children.find(node => node.dataset.actionId === "model-egress-end:model-egress-fixture");
+    assert.equal(Boolean(end), status === "pending" || status === "approved");
+    if (end) assert.equal(end.type, "button");
+  }
   context.setStatus("unauthorized provider");
   assert.equal(nodes.get("status-text").textContent, "Inbox action could not be completed.");
 
