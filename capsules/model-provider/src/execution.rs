@@ -1360,13 +1360,26 @@ mod tests {
 
         let stalled_input = text_input("stall");
         let stalled_binding = create_binding("request:stall", &offer, &stalled_input);
-        let started = Instant::now();
-        let stalled_run = create_run(&provider, &offer, &stalled_binding, &stalled_input);
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "stalled create must return promptly, took {:?}",
-            started.elapsed()
+        let create_rx = spawn_request(
+            &provider,
+            ProviderEnvelope {
+                operation: ProviderOperation::RunsCreate,
+                value: json!({
+                    "op": "runs_create",
+                    "offer_id": offer.id,
+                    "operation": offer.operation,
+                    "input": stalled_input,
+                    "runtime_binding": stalled_binding,
+                }),
+            },
         );
+        let stalled_run = create_rx
+            .recv_timeout(WAIT_TIMEOUT)
+            .unwrap_or_else(|_| {
+                release.store(true, Ordering::Relaxed);
+                panic!("stalled create must return while the backend response is held open")
+            })
+            .unwrap();
         let stalled_run_id = stalled_run["data"]["run_id"].as_str().unwrap().to_string();
         assert_eq!(stalled_run["data"]["status"], "running");
         wait_for_flag(&stalled_started);
@@ -1401,13 +1414,28 @@ mod tests {
 
         let input = artifact_input("stall");
         let binding = create_binding("request:artifact-create-prompt", &offer, &input);
-        let started = Instant::now();
-        let create_response = create_run(&provider, &offer, &binding, &input);
-        assert!(
-            started.elapsed() < PROMPT_RETURN_BOUND,
-            "stalled artifact create must return promptly, took {:?}",
-            started.elapsed()
+        let create_rx = spawn_request(
+            &provider,
+            ProviderEnvelope {
+                operation: ProviderOperation::RunsCreate,
+                value: json!({
+                    "op": "runs_create",
+                    "offer_id": offer.id,
+                    "operation": offer.operation,
+                    "input": input,
+                    "runtime_binding": binding,
+                }),
+            },
         );
+        let create_response = create_rx
+            .recv_timeout(WAIT_TIMEOUT)
+            .unwrap_or_else(|_| {
+                release.store(true, Ordering::Relaxed);
+                panic!(
+                    "stalled artifact create must return while the backend response is held open"
+                )
+            })
+            .unwrap();
         let run_id = create_response["data"]["run_id"]
             .as_str()
             .unwrap()

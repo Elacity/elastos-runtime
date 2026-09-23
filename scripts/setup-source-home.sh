@@ -107,6 +107,8 @@ case "${SOURCE_HOME_CARGO_PROFILE}" in
         exit 1
         ;;
 esac
+# Bash 3.2 with nounset treats empty arrays as unset; guard their expansions
+# at Cargo call sites so an empty array contributes zero arguments.
 # Extra `cargo build` arguments, used to carry the VS Code launch's debug-info
 # overrides so both produce the same artifact. Word-split on purpose.
 read -r -a SOURCE_HOME_CARGO_EXTRA_ARGS <<< "${SOURCE_HOME_CARGO_EXTRA_ARGS:-}"
@@ -362,14 +364,14 @@ build_browser_vm_guest_helper() {
         env "$linker_env=$linker" "$CARGO_BIN" build --quiet \
             --manifest-path "$manifest" \
             --target "$rust_target" \
-            "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
+            ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"}
         return
     fi
 
     "$CARGO_BIN" build --quiet \
         --manifest-path "$manifest" \
         --target "$rust_target" \
-        "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
+        ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"}
 }
 
 build_browser_vm_guest_helpers() {
@@ -1815,11 +1817,11 @@ if ! grep -Eq '^[[:space:]]*trusted_keys[[:space:]]*=' "${CONFIG_TOML}"; then
 fi
 
 echo "[setup-source-home] build runtime server"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}" "${SOURCE_HOME_CARGO_EXTRA_ARGS[@]}" -p elastos-server
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"} ${SOURCE_HOME_CARGO_EXTRA_ARGS[@]+"${SOURCE_HOME_CARGO_EXTRA_ARGS[@]}"} -p elastos-server
 verify_collaboration_startup_config_input
 if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
-    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}" -p elastos-vz --bin browser-vz-engine-supervisor
+    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"} -p elastos-vz --bin browser-vz-engine-supervisor
 fi
 build_browser_vm_guest_helpers
 
@@ -1841,13 +1843,13 @@ source_home_binary_manifest_path() {
 }
 
 echo "[setup-source-home] build native provider binaries"
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"}
 source_home_binary_names | while IFS= read -r provider; do
-    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"
+    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"}
 done
 
 echo "[setup-source-home] build Home CLI native renderer"
-"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" "${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}" --bin home-cli
+"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" ${SOURCE_HOME_CARGO_PROFILE_ARGS[@]+"${SOURCE_HOME_CARGO_PROFILE_ARGS[@]}"} --bin home-cli
 
 echo "[setup-source-home] build app WASM capsules"
 for capsule in "${APP_CAPSULES[@]}"; do
