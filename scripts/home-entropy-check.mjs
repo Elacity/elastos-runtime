@@ -12456,6 +12456,13 @@ assert(
     "Capsule layout: shell-capsule-layout.js posts elastos:shell-layout to every frame on load and on size-class change; the shared theme runtime takes it only from the opaque parent and only allowlisted values; phone zeroes the desktop chrome safe areas; unit-tested in verify and checked in real frames by the phone smoke",
   );
 
+  assert(
+    vendorUi.includes("  home-gui/browser\n  assistant/browser\n  system/browser\n") &&
+      phoneSmoke.includes('    id: "assistant-face",\n    capsule: "assistant",') &&
+      phoneSmoke.includes("        Object.assign(shellSurface, await measureCapsuleFrame(page, surface.capsule));"),
+    "Assistant layout: the Assistant room is a vendor-ui target, so its theme runtime lands the shell size class like every capsule's; the phone smoke measures its frame when the face opens",
+  );
+
   // Capsule ratchet: the phone smoke gates small targets inside each app frame
   // per phone profile; rows only ever go down.
   const capsuleRatchet = phoneSmoke.match(/const CAPSULE_TARGET_BASELINE = \{([\s\S]*?)\n\};/);

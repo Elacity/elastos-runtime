@@ -25,7 +25,8 @@ PICKER_JS_HEADER="/* GENERATED from ${SOURCE_PICKER_JS} — do not edit. Run \`j
 # Entries are the browser-serving dir relative to capsules/ — most apps serve
 # from a browser/ subdir; viewer-style capsules serve straight from their root.
 # home/browser is the shell host (unlock surface); home-gui/browser is the GUI
-# shell package. home-cli stays out: its terminal surface is capsule-local xterm
+# shell package; assistant/browser is the Assistant room Home frames like any
+# capsule. home-cli stays out: its terminal surface is capsule-local xterm
 # rendering by contract. The vendored theme runtime owns no browser-profile
 # storage, so it is safe in an opaque capsule; only the host installs a
 # persistence adapter, in its own non-vendored file.
@@ -33,6 +34,7 @@ TARGETS=(
   browser/browser
   home/browser
   home-gui/browser
+  assistant/browser
   system/browser
   services/browser
   people/browser

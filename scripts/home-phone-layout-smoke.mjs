@@ -707,11 +707,27 @@ const SHELL_SURFACES = [
   },
   {
     id: "assistant-face",
+    capsule: "assistant",
     open: (frame) => frame.locator("#assistant-toggle").click(),
     settle: SHEET_SETTLE_MS,
     close: pressEscape,
   },
 ];
+
+// Targets and text inside a capsule's own frame, and the size class it landed.
+async function measureCapsuleFrame(page, target) {
+  const capsuleFrame = page.frames().find((candidate) => candidate.url().includes(`/apps/${target}/`));
+  if (!capsuleFrame) {
+    return { capsule: null, capsuleLayout: null };
+  }
+  return {
+    capsule: await capsuleFrame.evaluate(measureSurface, { minTarget: MIN_TARGET_PX, minText: MIN_TEXT_PX }).catch(() => null),
+    capsuleLayout: await capsuleFrame.evaluate(() => ({
+      sharedTheme: Boolean(document.querySelector('script[src*="elastos-theme.js"]')),
+      formFactor: document.documentElement.getAttribute("data-el-form-factor"),
+    })).catch(() => null),
+  };
+}
 
 async function openWindow(frame, target) {
   const dockButton = frame.locator(`.taskbar-item[data-target="${target}"]`);
@@ -830,7 +846,12 @@ async function runProfile(browser, engineId, profile, origin) {
     for (const surface of SHELL_SURFACES) {
       await surface.open(frame);
       await sleep(surface.settle);
-      surfaces.push(await measure(frame, surface.id));
+      const shellSurface = await measure(frame, surface.id);
+      if (surface.capsule) {
+        shellSurface.target = surface.capsule;
+        Object.assign(shellSurface, await measureCapsuleFrame(page, surface.capsule));
+      }
+      surfaces.push(shellSurface);
       await screenshot(page, dir, surface.id);
       await surface.close(frame);
     }
@@ -846,16 +867,7 @@ async function runProfile(browser, engineId, profile, origin) {
       }
       const shell = await measure(frame, "window");
       shell.target = target;
-      const capsuleFrame = page.frames().find((candidate) => candidate.url().includes(`/apps/${target}/`));
-      shell.capsule = capsuleFrame
-        ? await capsuleFrame.evaluate(measureSurface, { minTarget: MIN_TARGET_PX, minText: MIN_TEXT_PX }).catch(() => null)
-        : null;
-      shell.capsuleLayout = capsuleFrame
-        ? await capsuleFrame.evaluate(() => ({
-          sharedTheme: Boolean(document.querySelector('script[src*="elastos-theme.js"]')),
-          formFactor: document.documentElement.getAttribute("data-el-form-factor"),
-        })).catch(() => null)
-        : null;
+      Object.assign(shell, await measureCapsuleFrame(page, target));
       surfaces.push(shell);
       await screenshot(page, dir, `window-${target}`);
       if (target === "browser") {
