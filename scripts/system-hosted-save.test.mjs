@@ -30,6 +30,7 @@ function fixture(connections = []) {
     readText: value => typeof value === "string" ? value.trim() : "",
     setTextFields: (field, message) => { if (field === "ai-provider-state") messages.push(message); },
     shellHeaders: extra => extra || {}, publicSystemError: (_, fallback) => fallback,
+    hostedProviderValidationError: () => "This Home could not check the key. Try again.",
     openCapsuleTarget: () => {},
     fetchJson: async (_url, init = {}) => {
       if (init.method !== "POST") return { connections };
@@ -66,6 +67,27 @@ test("hosted Save keeps one identity and entered key across activation failure a
   f.node("#ai-provider-add").handlers.click();
   await f.node("#ai-provider-save").handlers.click();
   assert.notEqual(f.attempts[2].id, first.id);
+});
+
+test("hosted key feedback separates paused egress, Home authority, and provider rejection", () => {
+  const functions = source.slice(
+    source.indexOf("function publicSystemError("),
+    source.indexOf("function showError("),
+  );
+  const context = vm.createContext({ readText: value => typeof value === "string" ? value.trim() : "" });
+  vm.runInContext(functions, context);
+  const message = detail => vm.runInContext(
+    `hostedProviderValidationError(new Error(${JSON.stringify(detail)}))`, context,
+  );
+  assert.equal(
+    message("request failed: 400 Hosted external HTTPS is paused until Runtime network authority is available."),
+    "External HTTPS is paused on this Home. The key has not been checked.",
+  );
+  assert.equal(message("request failed: 403 admin passkey required"), "Sign in as the Home admin to check provider keys.");
+  assert.equal(message("request failed: 403 home launch token expired"), "This Home could not check the key. Try again.");
+  assert.equal(message("request failed: 400 invalid Venice key"), "The provider could not validate this key.");
+  assert.equal(message("request failed: 502 Bad Gateway"), "This Home could not check the key. Try again.");
+  assert(!source.includes('publicSystemError(error, "This key is invalid.")'));
 });
 
 test("Cancel after a failed Add restores provider choice and gives the next form a new identity", async () => {
