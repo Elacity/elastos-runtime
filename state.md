@@ -1,5 +1,28 @@
 # State
 
+## Mac controlled DNS answer change, 23 September 2026 UTC
+
+The isolated Mac diagnostic broker now accepts literal `localhost` only in its
+owner-scoped HTTP fixture. It checks every resolved address against
+`127.0.0.1` and gives the accepted address to the HTTP client. An Inbox owner
+approved the exact `http://localhost:50348` route. A controlled resolver then
+returned `127.0.0.1` and changed its next answer to `::1` before the broker
+dialed. The approved IPv4 sink received one request, and the IPv6 sink received
+zero. A fresh request while the answer was `::1` returned 400 with zero new
+sink requests; restoring `127.0.0.1` allowed one more approved request.
+
+Source commit `dfc1a945` passed 14 broker tests, three URL parser tests and
+bounded independent review. Its installed diagnostic Runtime matched the
+built SHA-256 `49c841b0f0ea0c5e396b30d3e2a3babe1c43826298426fdaf4dd9d0fe451ef86`.
+The controlled resolver ran only in that diagnostic process. The original
+Runtime, receipts, fixture, components and authority manifest were restored
+byte for byte, and the restarted diagnostic process has no resolver injection.
+Both signed-in human Homes and diagnostic Home returned HTTP 200. No paid call
+occurred. Receipt: `.audit/sec1-dns-rebinding/receipt.json`. This proves the
+controlled localhost answer change; public DNS, public CA routing, Linux
+production confinement, unknown-create reconciliation, external HTTPS
+activation and real hosted acceptance remain open.
+
 ## Mac hosted destination boundary, 23 September 2026 UTC
 
 The Runtime-owned broker now keeps the private diagnostic HTTPS certificate
@@ -22,7 +45,7 @@ same test CA, returned 400 and delivered zero HTTP requests. The diagnostic
 binary, receipts, fixture and authority manifest were restored byte for byte;
 the two signed-in human Homes and diagnostic Home each returned HTTP 200. No
 paid call occurred. Receipt: `.audit/sec1-destination-boundary/receipt.json`.
-This is isolated Mac proof. Approved-hostname DNS answer rebinding, public CA
+This is isolated Mac proof. Public-hostname DNS answer rebinding, public CA
 routing, Linux production confinement, upstream unknown-create reconciliation,
 public activation and wider MA/AI/CR acceptance remain open.
 

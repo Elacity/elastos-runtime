@@ -497,9 +497,20 @@ diagnostic Runtime and private state were restored; the signed-in human Homes
 remained open. Source commit `623affc3`, installed artifact parity, sink counts,
 restoration hashes and independent review are recorded in
 `.audit/sec1-destination-boundary/receipt.json`. Next: Linux production
-confinement, upstream unknown-create reconciliation, approved-hostname DNS
+confinement, upstream unknown-create reconciliation, public-hostname DNS
 answer rebinding, public CA routing, and separate public HTTPS owner/target
 proof; wider MA/AI/CR acceptance remains open. External HTTPS stays paused.
+
+The isolated Mac SEC1 DNS challenge now has installed proof for an approved
+`localhost` HTTP route. A controlled resolver returned `127.0.0.1`, switched
+its answer to `::1` before dial, and the HTTP client sent only to the pinned
+IPv4 sink. With `::1` as the next answer, the broker returned 400 before any
+new request; restoring `127.0.0.1` let the same approved route work again.
+The IPv6 sink received zero requests throughout. Source commit `dfc1a945`,
+built/installed artifact parity, exact sink counts and byte-for-byte diagnostic
+restoration are bound in `.audit/sec1-dns-rebinding/receipt.json`. Public DNS
+and CA routing, Linux production confinement, unknown-create reconciliation,
+external HTTPS activation and real hosted acceptance remain open.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
