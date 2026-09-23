@@ -12459,6 +12459,12 @@ assert(
       read("scripts/documents-product-layout-smoke.mjs").includes('drawer: "#documents-sidebar",'),
     "Documents phone: the editor takes the full width, the list is the push drawer and Split is hidden, asserted by the layout smoke",
   );
+
+  assert(
+    read("capsules/library/browser/library.css").includes('    :root[data-el-form-factor="phone"] .sidebar {\n      position: absolute;') &&
+      read("scripts/library-product-layout-smoke.mjs").includes("Library phone: Favorites must be one sliding row of 44 px chips"),
+    "Library phone: one header block (navigation row, then Favorites as a sliding chip row), asserted by the layout smoke",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
