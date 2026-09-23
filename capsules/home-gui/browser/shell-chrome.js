@@ -247,6 +247,13 @@ export function bindIdentityMenu() {
 
 /* Apple menubar chip: "Mon 20 Jul 12:51" — no commas, day before month. */
 export function formatMenubarClock(now = new Date()) {
+  const { date, time } = menubarClockParts(now);
+  return `${date} ${time}`;
+}
+
+/* Date and time render as separate spans so the phone bar can drop the date
+   in CSS (iPhone status bar: time only) without waiting for the next tick. */
+export function menubarClockParts(now = new Date()) {
   const parts = new Intl.DateTimeFormat(undefined, {
     weekday: "short",
     day: "numeric",
@@ -262,13 +269,18 @@ export function formatMenubarClock(now = new Date()) {
   const hour = pick("hour");
   const minute = pick("minute");
   // Apple menubar omits AM/PM on the chip; hour is still 12-hour cycle.
-  return `${weekday} ${day} ${month} ${hour}:${minute}`.replace(/\s+/g, " ").trim();
+  return {
+    date: `${weekday} ${day} ${month}`.replace(/\s+/g, " ").trim(),
+    time: `${hour}:${minute}`,
+  };
 }
 
 export function updateClock() {
   const now = new Date();
   if (clockNode) {
-    clockNode.textContent = formatMenubarClock(now);
+    const { date, time } = menubarClockParts(now);
+    clockNode.querySelector(".toolbar-clock-date").textContent = date;
+    clockNode.querySelector(".toolbar-clock-time").textContent = time;
   }
   renderNcTimeChrome(now);
 }

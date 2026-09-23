@@ -5892,9 +5892,17 @@ body.assistant-space-active #inbox-rail {
 
   .toolbar-active-title,
   .toolbar-menubar,
-  #toolbar-wallet,
-  #toolbar-mission-control {
+  #toolbar-mission-control,
+  .toolbar-clock-date {
     display: none;
+  }
+
+  /* Below 360 px the Wallet button would crowd the clock off the bar; Wallet
+     stays one tap away in Control Centre's Quick open. */
+  @media (max-width: 359.98px) {
+    #toolbar-wallet {
+      display: none;
+    }
   }
 
   .control-centre-quick-open {

@@ -12295,7 +12295,8 @@ assert(
       !/@media \(max-width: 640px\)(?!,)/.test(homeGuiStyle) &&
       homeGuiStyle.includes("--toolbar-h: 44px;") &&
       homeGuiStyle.includes(".toolbar-btn {\n    width: var(--toolbar-h);\n    height: var(--toolbar-h);") &&
-      homeGuiStyle.includes("#toolbar-wallet,\n  #toolbar-mission-control {\n    display: none;") &&
+      homeGuiStyle.includes("#toolbar-mission-control,\n  .toolbar-clock-date {\n    display: none;") &&
+      homeGuiStyle.includes("  @media (max-width: 359.98px) {\n    #toolbar-wallet {\n      display: none;") &&
       homeGuiStyle.includes(".toolbar-inbox-count {\n    top: 5px;\n    right: 5px;\n    min-width: 16px;\n    height: 16px;\n    font-size: 12px;") &&
       homeGuiStyle.includes("max-width: calc(100vw - 20px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));") &&
       homeGuiStyle.includes("scroll-snap-type: x proximity;") &&
@@ -12318,7 +12319,7 @@ assert(
       phoneSmoke.includes("async function probePhoneDock(frame, page, dir) {") &&
       phoneSmoke.includes('await frame.locator("#control-centre-show-windows").click();') &&
       justfile.includes("node --test scripts/home-phone-dock.test.mjs"),
-    "Home phone bar and Dock: one phone media list mirroring PHONE_MAX_WIDTH, 44 px bar with 44 px hit boxes (wallet and Overview move to Control Centre), thumb-scrolled Dock with edge fades and safe-area sides, Dock tucked under windows behind a 24 px handle via shell-phone-dock.js, probed by the phone smoke and unit-tested in verify",
+    "Home phone bar and Dock: one phone media list mirroring PHONE_MAX_WIDTH, 44 px bar with 44 px hit boxes (Overview moves to Control Centre, Wallet too below 360 px; the clock shows time only), thumb-scrolled Dock with edge fades and safe-area sides, Dock tucked under windows behind a 24 px handle via shell-phone-dock.js, probed by the phone smoke and unit-tested in verify",
   );
 
   // Phone title bar: one 44 px presentation of .window-head for every chrome
@@ -12398,6 +12399,14 @@ assert(
   assert(
     homeGuiStyle.includes("  .toolbar-brand {\n    width: auto;\n    padding: 11px 0;\n  }\n\n  /* The ≤820 px 90 px wordmark reads undersized on the 44 px phone bar. */\n  .toolbar-brand img {\n    width: 104px;\n  }"),
     "Home phone bar: the ElastOS wordmark is 104 px wide, between the 90 px narrow-window size and the 107 px desktop size",
+  );
+
+  const shellChrome = read("capsules/home-gui/browser/shell-chrome.js");
+  assert(
+    homeGuiTemplate.includes('><span class="toolbar-clock-date"></span> <span class="toolbar-clock-time">--:--</span></button>') &&
+      shellChrome.includes('clockNode.querySelector(".toolbar-clock-date").textContent = date;') &&
+      shellChrome.includes('clockNode.querySelector(".toolbar-clock-time").textContent = time;'),
+    "Home bar clock: date and time render as separate spans so the phone bar drops the date in CSS without waiting for the next tick",
   );
 
   // Phone Assistant morph: Home's stretch target and the capsule's composer
