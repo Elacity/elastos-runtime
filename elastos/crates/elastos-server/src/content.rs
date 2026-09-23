@@ -3084,10 +3084,17 @@ impl ContentProvider {
         let registry = self.registry()?;
         let transfer = ContentFetchTransfer::from_request(request)?;
         let local_only = request.get("local_only").and_then(|value| value.as_bool()) == Some(true);
-        let result = match self
+        let model_index = path == CONTENT_OBJECT_MANIFEST_PATH
+            && transfer.bounded_read
+            && transfer.max_bytes.is_some();
+        let local = self
             .fetch_from_local_backend(&registry, cid, path, &transfer)
-            .await
-        {
+            .await;
+        if model_index && local.is_err() {
+            tracing::warn!(target: "elastos::model_index_read", stage = "local_bounded_index_cat",
+                "model index read substage failed");
+        }
+        let result = match local {
             Ok(result) => result,
             Err(local_err) if local_only => {
                 if local_backend_needs_prepare(&local_err)
@@ -3104,18 +3111,29 @@ impl ContentProvider {
                     return Err(local_err);
                 }
             }
-            Err(local_err) => match self
-                .fetch_from_availability_provider(&registry, cid, path, &transfer)
-                .await
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => return Err(local_err),
-                Err(availability_err) => {
-                    return Err(ProviderError::Provider(format!(
-                        "{local_err}; availability fetch failed: {availability_err}"
-                    )))
+            Err(local_err) => {
+                let fallback = self
+                    .fetch_from_availability_provider(&registry, cid, path, &transfer)
+                    .await;
+                if model_index {
+                    let outcome = match &fallback {
+                        Ok(Some(_)) => "completed",
+                        Ok(None) => "unavailable",
+                        Err(_) => "failed",
+                    };
+                    tracing::warn!(target: "elastos::model_index_read", stage = "availability_fallback",
+                        outcome, "model index read fallback settled");
                 }
-            },
+                match fallback {
+                    Ok(Some(result)) => result,
+                    Ok(None) => return Err(local_err),
+                    Err(availability_err) => {
+                        return Err(ProviderError::Provider(format!(
+                            "{local_err}; availability fetch failed: {availability_err}"
+                        )))
+                    }
+                }
+            }
         };
 
         let receipt_availability = self
@@ -12232,6 +12250,61 @@ mod tests {
             assert_eq!(request["path"], OBJECT_MANIFEST_PATH);
             assert!(request["_runtime_invocation"]["range"].is_null());
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_index_diagnostic_names_local_and_fallback_failure_without_payload() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct LogWriter(StdArc<StdMutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_root, registry, ipfs, _content) = registry_with_content_and_ipfs().await;
+        *ipfs.bounded_read_not_ready.lock().await = true;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_error("unavailable", "private-fixture-marker")),
+        });
+        registry.register(availability.clone()).await;
+        let log = StdArc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let log = log.clone();
+                move || LogWriter(log.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        fetch_model_part(&registry, TEST_CID, OBJECT_MANIFEST_PATH, None)
+            .await
+            .expect_err("the bounded index read must fail in the controlled fixture");
+        let output = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("stage=\"local_bounded_index_cat\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("stage=\"availability_fallback\""),
+            "{output}"
+        );
+        assert!(output.contains("outcome=\"failed\""), "{output}");
+        assert!(!output.contains("stage=\"runtime_stream_validation\""));
+        assert!(!output.contains(TEST_CID));
+        assert!(!output.contains("private-fixture-marker"));
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+        assert_eq!(availability.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

@@ -30,6 +30,17 @@ fn private_model_configuration(target: &str, op: &str) -> bool {
     target.eq_ignore_ascii_case("model") && op == "init"
 }
 
+fn model_index_stream(invocation: &ProviderInvocation) -> bool {
+    invocation.source == "runtime-model-preparation"
+        && invocation.target == "content"
+        && invocation.op == "fetch"
+        && invocation.request["path"] == "_elastos_object.json"
+        && invocation.request["bounded_read"] == true
+        && invocation.request["max_bytes"]
+            .as_u64()
+            .is_some_and(|limit| (1..=65536).contains(&limit))
+}
+
 // Internal wire types. Only the typed local methods below can dispatch them.
 #[derive(serde::Serialize)]
 struct LocalStagedFile<'a> {
@@ -1612,7 +1623,12 @@ impl ProviderRegistry {
                     .await?
             }
         };
-        apply_provider_transfer_response(&mut response, &invocation)?;
+        let validated = apply_provider_transfer_response(&mut response, &invocation);
+        if model_index_stream(&invocation) && validated.is_err() {
+            tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
+                "model index read substage failed");
+        }
+        validated?;
         attach_provider_transfer_receipt(&mut response, &invocation, "completed");
         Ok(response)
     }
@@ -1640,15 +1656,22 @@ impl ProviderRegistry {
                 "provider stream open failed: {message}"
             )));
         }
-        let data = response
-            .get("data")
-            .and_then(|data| data.as_object())
-            .ok_or_else(|| {
-                ProviderError::Provider(
-                    "provider stream open requires response data object".to_string(),
-                )
-            })?;
-        let bytes = provider_stream_response_bytes(data)?;
+        let bytes = (|| {
+            let data = response
+                .get("data")
+                .and_then(|data| data.as_object())
+                .ok_or_else(|| {
+                    ProviderError::Provider(
+                        "provider stream open requires response data object".to_string(),
+                    )
+                })?;
+            provider_stream_response_bytes(data)
+        })();
+        if model_index_stream(&invocation) && bytes.is_err() {
+            tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
+                "model index read substage failed");
+        }
+        let bytes = bytes?;
         let chunk_size = options.chunk_size.clamp(1, PROVIDER_STREAM_CHUNK_BYTES);
         let max_in_flight_chunks = options.max_in_flight_chunks.max(1);
         let id = format!(

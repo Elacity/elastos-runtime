@@ -1908,10 +1908,12 @@ async fn prepare(
     revalidate: &Revalidate,
 ) -> anyhow::Result<()> {
     let record = require_active(data_dir, id, stop, revalidate)?;
-    registry
-        .prepare_local_ipfs_backend()
-        .await
-        .context(PreparationFailurePhase::MetadataRead)?;
+    let backend = registry.prepare_local_ipfs_backend().await;
+    if backend.is_err() {
+        tracing::warn!(target: "elastos::model_index_read", stage = "ipfs_prepare",
+            "model index read substage failed");
+    }
+    backend.context(PreparationFailurePhase::MetadataRead)?;
     require_active(data_dir, id, stop, revalidate)?;
     let entry = current_entry(data_dir, &record)?;
     let closure = crate::content::parse_content_object_manifest(
