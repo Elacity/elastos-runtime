@@ -2,16 +2,17 @@
 //! The provider names an offer and effect; Runtime selects the destination,
 //! checks current owner authority, and adds the stored credential.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use elastos_runtime::provider::ProviderBridge;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
@@ -20,7 +21,7 @@ use url::Url;
 
 use super::model_provider_config::{
     load_hosted_validate_fixtures, load_model_provider_operator_offers, read_hosted_egress_grants,
-    read_hosted_secret,
+    read_hosted_job_bindings, read_hosted_secret, write_hosted_job_bindings,
 };
 
 #[derive(Clone, Copy)]
@@ -46,6 +47,40 @@ const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 68;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(3605);
+const MAX_JOB_BINDINGS: usize = 4096;
+const MAX_JOB_BINDINGS_BYTES: usize = 4 * 1024 * 1024;
+const JOB_BINDING_LIFETIME_MS: u64 = 2 * 60 * 60 * 1000;
+type JobCreateKey = (String, String, String);
+static JOB_CREATES: OnceLock<Mutex<HashSet<JobCreateKey>>> = OnceLock::new();
+
+struct JobCreateReservation(JobCreateKey);
+
+impl Drop for JobCreateReservation {
+    fn drop(&mut self) {
+        job_creates()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobBindingsFile {
+    schema: String,
+    bindings: Vec<JobBinding>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobBinding {
+    offer_id: String,
+    run_id: String,
+    request_id: String,
+    job_id: String,
+    backend_id: String,
+    recorded_at_ms: u64,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,7 +107,7 @@ struct EgressGrant {
     active: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EffectRequest {
     offer_id: String,
     effect: String,
@@ -87,6 +122,7 @@ struct Destination {
     url: Url,
     grant_url: String,
     credential: Option<String>,
+    job_backend_id: Option<String>,
 }
 
 pub(crate) async fn fetch_validation(
@@ -130,6 +166,7 @@ async fn fetch_validation_inner(
         url: Url::parse(raw)?,
         grant_url: raw.to_string(),
         credential: Some(api_key.to_string()),
+        job_backend_id: None,
     };
     let (offer_id, effect) = endpoint.grant_binding();
     current_grant_for(
@@ -376,7 +413,7 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
         .find(|offer| offer["id"] == request.offer_id && offer["enabled"] != false)
         .ok_or_else(|| anyhow::anyhow!("hosted offer unavailable"))?;
     let adapter = &offer["adapter"];
-    let (raw_url, credential) = match request.effect.as_str() {
+    let (raw_url, credential, job_backend_id) = match request.effect.as_str() {
         "text" | "responses" | "decisions" => {
             let kind = adapter["kind"].as_str().unwrap_or_default();
             if !matches!(
@@ -410,7 +447,7 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
                     _ => url,
                 };
             }
-            (url, read_hosted_secret(data_dir, &request.offer_id)?)
+            (url, read_hosted_secret(data_dir, &request.offer_id)?, None)
         }
         "job_create" | "job_status" | "job_cancel" => {
             if adapter["kind"] != "http_job_artifact" {
@@ -433,12 +470,28 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
                 .ok_or_else(|| anyhow::anyhow!("job URL unavailable"))?
                 .to_string();
             let credential = adapter["bearer_token"].as_str().map(ToOwned::to_owned);
-            (url, credential)
+            let routes = ["create_url", "status_url", "cancel_url"]
+                .map(|field| adapter[field].as_str())
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| anyhow::anyhow!("job routes unavailable"))?;
+            // A credential rotation can select a different upstream account
+            // even when all three URLs stay the same.
+            let backend_id = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                routes,
+                credential.as_deref(),
+            ))?));
+            (url, credential, Some(backend_id))
         }
         _ => anyhow::bail!("effect unavailable"),
     };
     let grant_url = raw_url.clone();
     let mut url = Url::parse(&raw_url)?;
+    if matches!(request.effect.as_str(), "job_status" | "job_cancel")
+        && url.query_pairs().any(|(key, _)| key == "job_id")
+    {
+        anyhow::bail!("job URL contains a fixed job id");
+    }
     if request.effect == "job_status" {
         let job_id = request
             .job_id
@@ -453,6 +506,7 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
         url,
         grant_url,
         credential,
+        job_backend_id,
     })
 }
 
@@ -529,6 +583,201 @@ fn current_grant_for(
     Ok(())
 }
 
+fn job_creates() -> &'static Mutex<HashSet<JobCreateKey>> {
+    JOB_CREATES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn job_bindings(data_dir: &Path) -> anyhow::Result<JobBindingsFile> {
+    let Some(bytes) = read_hosted_job_bindings(data_dir)? else {
+        return Ok(JobBindingsFile {
+            schema: "elastos.model.egress-job-bindings/v1".into(),
+            bindings: Vec::new(),
+        });
+    };
+    let file: JobBindingsFile = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        file.schema == "elastos.model.egress-job-bindings/v1"
+            && file.bindings.len() <= MAX_JOB_BINDINGS
+            && file.bindings.iter().all(|binding| {
+                valid_job_id(&binding.job_id)
+                    && binding.backend_id.len() == 64
+                    && binding
+                        .backend_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            }),
+        "invalid hosted job bindings"
+    );
+    let mut seen = HashSet::new();
+    anyhow::ensure!(
+        file.bindings.iter().all(|binding| {
+            seen.insert((
+                binding.offer_id.as_str(),
+                binding.run_id.as_str(),
+                binding.request_id.as_str(),
+            ))
+        }),
+        "duplicate hosted job binding"
+    );
+    Ok(file)
+}
+
+fn job_binding_time_ms() -> anyhow::Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
+}
+
+fn job_binding_id(request: &EffectRequest) -> anyhow::Result<String> {
+    match request.effect.as_str() {
+        "job_status" => request
+            .job_id
+            .as_deref()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("job id unavailable")),
+        "job_cancel" => {
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            body.get("job_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("job id unavailable"))
+        }
+        _ => anyhow::bail!("job binding unavailable"),
+    }
+}
+
+fn current_job_binding(
+    data_dir: &Path,
+    request: &EffectRequest,
+    backend_id: &str,
+) -> anyhow::Result<()> {
+    let job_id = job_binding_id(request)?;
+    anyhow::ensure!(valid_job_id(&job_id), "invalid hosted job id");
+    let now = job_binding_time_ms()?;
+    let file = job_bindings(data_dir)?;
+    anyhow::ensure!(
+        file.bindings.iter().any(|binding| {
+            binding.offer_id == request.offer_id
+                && binding.run_id == request.run_id
+                && binding.request_id == request.request_id
+                && binding.job_id == job_id
+                && binding.backend_id == backend_id
+                && binding.recorded_at_ms <= now
+                && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
+        }),
+        "hosted job result unavailable"
+    );
+    Ok(())
+}
+
+fn recorded_job_create(
+    data_dir: &Path,
+    request: &EffectRequest,
+    backend_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let now = job_binding_time_ms()?;
+    let file = job_bindings(data_dir)?;
+    let Some(binding) = file.bindings.iter().find(|binding| {
+        binding.offer_id == request.offer_id
+            && binding.run_id == request.run_id
+            && binding.request_id == request.request_id
+    }) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        binding.recorded_at_ms <= now
+            && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
+            && binding.backend_id == backend_id,
+        "hosted job result expired or backend changed"
+    );
+    Ok(Some(binding.job_id.clone()))
+}
+
+fn job_create_has_capacity(
+    data_dir: &Path,
+    request: &EffectRequest,
+    pending: usize,
+) -> anyhow::Result<()> {
+    let now = job_binding_time_ms()?;
+    let mut file = job_bindings(data_dir)?;
+    anyhow::ensure!(
+        !file.bindings.iter().any(|binding| {
+            binding.offer_id == request.offer_id
+                && binding.run_id == request.run_id
+                && binding.request_id == request.request_id
+        }),
+        "hosted job create already recorded"
+    );
+    file.bindings.retain(|binding| {
+        binding.recorded_at_ms <= now && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
+    });
+    anyhow::ensure!(
+        file.bindings.len().saturating_add(pending) < MAX_JOB_BINDINGS,
+        "hosted job bindings full"
+    );
+    // All incoming identifiers are bounded to 256 bytes and job IDs to 512.
+    anyhow::ensure!(
+        serde_json::to_vec(&file)?
+            .len()
+            .saturating_add(1600usize.saturating_mul(pending.saturating_add(1)))
+            <= MAX_JOB_BINDINGS_BYTES,
+        "hosted job bindings full"
+    );
+    Ok(())
+}
+
+fn reserve_job_create(
+    data_dir: &Path,
+    request: &EffectRequest,
+) -> anyhow::Result<JobCreateReservation> {
+    let key = (
+        request.offer_id.clone(),
+        request.run_id.clone(),
+        request.request_id.clone(),
+    );
+    let mut pending = job_creates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    anyhow::ensure!(
+        !pending.contains(&key),
+        "hosted job create already in flight"
+    );
+    job_create_has_capacity(data_dir, request, pending.len())?;
+    pending.insert(key.clone());
+    Ok(JobCreateReservation(key))
+}
+
+fn record_job_create(
+    data_dir: &Path,
+    request: &EffectRequest,
+    backend_id: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let response: serde_json::Value = serde_json::from_slice(body)?;
+    let job_id = response
+        .get("job_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("hosted create result has no job id"))?;
+    anyhow::ensure!(valid_job_id(job_id), "invalid hosted create job id");
+    anyhow::ensure!(backend_id.len() == 64, "invalid hosted job backend");
+    let _pending = job_creates()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    job_create_has_capacity(data_dir, request, 0)?;
+    let mut file = job_bindings(data_dir)?;
+    let now = job_binding_time_ms()?;
+    file.bindings.retain(|binding| {
+        binding.recorded_at_ms <= now && now - binding.recorded_at_ms <= JOB_BINDING_LIFETIME_MS
+    });
+    file.bindings.push(JobBinding {
+        offer_id: request.offer_id.clone(),
+        run_id: request.run_id.clone(),
+        request_id: request.request_id.clone(),
+        job_id: job_id.to_string(),
+        backend_id: backend_id.to_string(),
+        recorded_at_ms: now,
+    });
+    write_hosted_job_bindings(data_dir, &serde_json::to_vec(&file)?)
+}
+
 async fn forward(
     stream: &mut UnixStream,
     data_dir: &Path,
@@ -536,12 +785,41 @@ async fn forward(
     destination: &Destination,
     run_authorized: impl Fn() -> bool,
 ) -> io::Result<()> {
+    let backend_id = destination.job_backend_id.as_deref().unwrap_or_default();
+    let _create_reservation = if request.effect == "job_create" {
+        if backend_id.is_empty()
+            || !run_authorized()
+            || current_grant(data_dir, request, destination).is_err()
+        {
+            return deny(stream).await;
+        }
+        match recorded_job_create(data_dir, request, backend_id) {
+            Ok(Some(job_id)) => return write_job_replay(stream, &job_id).await,
+            Ok(None) => {}
+            Err(_) => return deny(stream).await,
+        }
+        match reserve_job_create(data_dir, request) {
+            Ok(reservation) => Some(reservation),
+            Err(_) => return deny(stream).await,
+        }
+    } else {
+        None
+    };
+    if matches!(request.effect.as_str(), "job_status" | "job_cancel")
+        && current_job_binding(data_dir, request, backend_id).is_err()
+    {
+        return deny(stream).await;
+    }
     let url = &destination.url;
     let client = match pinned_client(data_dir, url).await {
         Ok(client) => client,
         Err(_) => return deny(stream).await,
     };
-    if !run_authorized() || current_grant(data_dir, request, destination).is_err() {
+    if !run_authorized()
+        || current_grant(data_dir, request, destination).is_err()
+        || (matches!(request.effect.as_str(), "job_status" | "job_cancel")
+            && current_job_binding(data_dir, request, backend_id).is_err())
+    {
         return deny(stream).await;
     }
     let mut outbound = client.request(request.method.clone(), url.clone());
@@ -549,9 +827,15 @@ async fn forward(
         outbound = outbound.bearer_auth(credential);
     }
     if request.method == reqwest::Method::POST {
+        // Forward the same JSON meaning that Runtime checked. Duplicate keys
+        // in the provider's raw body must not select a different upstream ID.
+        let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+            Ok(body) => body,
+            Err(_) => return deny(stream).await,
+        };
         outbound = outbound
             .header("content-type", "application/json")
-            .body(request.body.clone());
+            .body(serde_json::to_vec(&body).map_err(io::Error::other)?);
     }
     let mut response = match outbound.send().await {
         Ok(response) if !response.status().is_redirection() => response,
@@ -567,11 +851,34 @@ async fn forward(
                 .bytes()
                 .all(|byte| byte.is_ascii_graphic() || byte == b' ')
         })
-        .unwrap_or("application/json");
-    stream.write_all(format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-        status.as_u16(), status.canonical_reason().unwrap_or("Response"), content_type,
-    ).as_bytes()).await?;
+        .unwrap_or("application/json")
+        .to_string();
+    if request.effect == "job_create" && status.is_success() {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
+            if body.len().saturating_add(chunk.len()) > MAX_BODY
+                || !run_authorized()
+                || current_grant(data_dir, request, destination).is_err()
+            {
+                return unavailable(stream).await;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if !run_authorized()
+            || current_grant(data_dir, request, destination).is_err()
+            || record_job_create(data_dir, request, backend_id, &body).is_err()
+        {
+            return unavailable(stream).await;
+        }
+        write_response_head(stream, status, &content_type).await?;
+        stream
+            .write_all(format!("{:X}\r\n", body.len()).as_bytes())
+            .await?;
+        stream.write_all(&body).await?;
+        stream.write_all(b"\r\n0\r\n\r\n").await?;
+        return Ok(());
+    }
+    write_response_head(stream, status, &content_type).await?;
     let mut total = 0usize;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -598,6 +905,25 @@ async fn forward(
     }
     stream.write_all(b"0\r\n\r\n").await?;
     Ok(())
+}
+
+async fn write_job_replay(stream: &mut UnixStream, job_id: &str) -> io::Result<()> {
+    let body = serde_json::json!({"job_id": job_id}).to_string();
+    write_response_head(stream, reqwest::StatusCode::OK, "application/json").await?;
+    stream
+        .write_all(format!("{:X}\r\n{body}\r\n0\r\n\r\n", body.len()).as_bytes())
+        .await
+}
+
+async fn write_response_head(
+    stream: &mut UnixStream,
+    status: reqwest::StatusCode,
+    content_type: &str,
+) -> io::Result<()> {
+    stream.write_all(format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        status.as_u16(), status.canonical_reason().unwrap_or("Response"), content_type,
+    ).as_bytes()).await
 }
 
 async fn pinned_client(data_dir: &Path, url: &Url) -> io::Result<reqwest::Client> {
@@ -786,6 +1112,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_job_effects_require_the_persisted_create_result() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let create = EffectRequest {
+            offer_id: "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            effect: "job_create".into(),
+            run_id: format!("run:sha256:{}", "0".repeat(64)),
+            request_id: "request-1".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: json!({"offer_id":"model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"request-1"}).to_string().into_bytes(),
+        };
+        let backend_id = "a".repeat(64);
+        let mut status = EffectRequest {
+            effect: "job_status".into(),
+            job_id: Some("job-1".into()),
+            method: reqwest::Method::GET,
+            body: Vec::new(),
+            ..create.clone()
+        };
+        assert!(current_job_binding(dir.path(), &status, &backend_id).is_err());
+        assert!(record_job_create(dir.path(), &create, &backend_id, br#"{}"#).is_err());
+        assert!(read_hosted_job_bindings(dir.path()).unwrap().is_none());
+        record_job_create(dir.path(), &create, &backend_id, br#"{"job_id":"job-1"}"#).unwrap();
+        assert!(job_create_has_capacity(dir.path(), &create, 0).is_err());
+        assert_eq!(
+            recorded_job_create(dir.path(), &create, &backend_id)
+                .unwrap()
+                .as_deref(),
+            Some("job-1")
+        );
+        assert!(recorded_job_create(dir.path(), &create, &"b".repeat(64)).is_err());
+        assert!(current_job_binding(dir.path(), &status, &backend_id).is_ok());
+        assert!(current_job_binding(dir.path(), &status, &"b".repeat(64)).is_err());
+        let mut cancel = EffectRequest {
+            effect: "job_cancel".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: br#"{"job_id":"job-1"}"#.to_vec(),
+            ..status.clone()
+        };
+        assert!(current_job_binding(dir.path(), &cancel, &backend_id).is_ok());
+        cancel.body = br#"{"job_id":"job-other"}"#.to_vec();
+        assert!(current_job_binding(dir.path(), &cancel, &backend_id).is_err());
+        status = EffectRequest {
+            effect: "job_status".into(),
+            job_id: Some("job-other".into()),
+            method: reqwest::Method::GET,
+            body: Vec::new(),
+            ..cancel
+        };
+        assert!(current_job_binding(dir.path(), &status, &backend_id).is_err());
+        status.job_id = Some("job-1".into());
+        status.request_id = "request-other".into();
+        assert!(current_job_binding(dir.path(), &status, &backend_id).is_err());
+        status.request_id = create.request_id.clone();
+        status.run_id = format!("run:sha256:{}", "1".repeat(64));
+        assert!(current_job_binding(dir.path(), &status, &backend_id).is_err());
+
+        let proof = admin_proof(dir.path());
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/create",
+            sink.local_addr().unwrap().port()
+        );
+        write_private(
+            &dir.path()
+                .join("providers/model-provider/egress-grants.json"),
+            json!({
+                "schema":"elastos.model.egress-grants/v1",
+                "grants":[{
+                    "offer_id":create.offer_id,"effect":"job_create","method":"POST",
+                    "url":url,"recipient":"127.0.0.1","payer":"this Home",
+                    "owner_proof_binding_id":proof,"run_id":create.run_id,
+                    "request_id":create.request_id,
+                    "expires_at_ms":job_binding_time_ms().unwrap()+60_000,"active":true
+                }]
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let destination = Destination {
+            url: Url::parse(&url).unwrap(),
+            grant_url: url,
+            credential: None,
+            job_backend_id: Some(backend_id),
+        };
+        let (mut broker, mut provider) = UnixStream::pair().unwrap();
+        forward(&mut broker, dir.path(), &create, &destination, || true)
+            .await
+            .unwrap();
+        broker.shutdown().await.unwrap();
+        let mut replay = String::new();
+        provider.read_to_string(&mut replay).await.unwrap();
+        assert!(replay.starts_with("HTTP/1.1 200 OK"));
+        assert!(replay.contains("\"job_id\":\"job-1\""));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hosted_job_backend_identity_covers_all_three_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = EffectRequest {
+            offer_id: "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            effect: "job_create".into(),
+            run_id: format!("run:sha256:{}", "0".repeat(64)),
+            request_id: "request-1".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: br#"{"offer_id":"model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"request-1"}"#.to_vec(),
+        };
+        let seed = |cancel_url: &str, bearer_token: &str| {
+            super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+                dir.path(),
+                vec![json!({
+                    "id":request.offer_id,"enabled":true,
+                    "adapter":{
+                        "kind":"http_job_artifact",
+                        "create_url":"https://jobs.example/create",
+                        "status_url":"https://jobs.example/status",
+                        "cancel_url":cancel_url,
+                        "bearer_token":bearer_token
+                    }
+                })],
+            )
+            .unwrap();
+        };
+        seed("https://jobs.example/cancel", "account-a");
+        let create = resolve_effect(dir.path(), &request).unwrap();
+        let status = resolve_effect(
+            dir.path(),
+            &EffectRequest {
+                effect: "job_status".into(),
+                job_id: Some("job-1".into()),
+                method: reqwest::Method::GET,
+                body: Vec::new(),
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(create.job_backend_id, status.job_backend_id);
+        seed("https://jobs.example/cancel-v2", "account-a");
+        let changed = resolve_effect(dir.path(), &request).unwrap();
+        assert_ne!(create.job_backend_id, changed.job_backend_id);
+        seed("https://jobs.example/cancel", "account-b");
+        let changed_account = resolve_effect(dir.path(), &request).unwrap();
+        assert_ne!(create.job_backend_id, changed_account.job_backend_id);
+    }
+
+    #[tokio::test]
     async fn exact_fixture_grant_routes_one_text_effect_and_revoke_denies_next_effect() {
         let dir = tempfile::tempdir().unwrap();
         let proof = admin_proof(dir.path());
@@ -836,9 +1320,7 @@ mod tests {
             request_id: "fixture-request".into(),
             job_id: None,
             method: reqwest::Method::POST,
-            body: json!({"model":"fixture/model","messages":[]})
-                .to_string()
-                .into_bytes(),
+            body: br#"{"model":"wrong/model","model":"fixture/model","messages":[]}"#.to_vec(),
         };
         let destination = resolve_effect(dir.path(), &request).unwrap();
         assert_eq!(destination.url.as_str(), path);
@@ -916,6 +1398,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let observed = sink_task.await.unwrap();
         assert!(observed.starts_with("POST /openrouter/api/v1/chat/completions "));
+        assert!(!observed.contains("wrong/model"));
         assert!(
             observed.contains("authorization: Bearer fixture-secret")
                 || observed.contains("Authorization: Bearer fixture-secret")

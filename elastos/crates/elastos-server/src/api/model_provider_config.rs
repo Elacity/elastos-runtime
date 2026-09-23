@@ -940,6 +940,44 @@ pub(super) fn read_hosted_egress_grants(data_dir: &Path) -> anyhow::Result<Optio
     read_model_provider_private_file(&path, &metadata, 64 * 1024, "hosted egress grants").map(Some)
 }
 
+pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let path = model_provider_root_dir(data_dir).join("egress-job-bindings.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect hosted job bindings"),
+    };
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    read_model_provider_private_file(&path, &metadata, 4 * 1024 * 1024, "hosted job bindings")
+        .map(Some)
+}
+
+pub(super) fn write_hosted_job_bindings(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= 4 * 1024 * 1024,
+        "hosted job bindings exceed limit"
+    );
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    write_model_provider_config_atomic(
+        &model_provider_root_dir(data_dir).join("egress-job-bindings.json"),
+        bytes,
+    )
+}
+
 /// Called only after System admin authorization. Blank edits retain the key of
 /// this existing provider instance; this helper never returns a key to Home.
 pub(crate) fn hosted_key_for_save(
