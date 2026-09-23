@@ -1871,3 +1871,60 @@ code {
   outline: 1.5px dotted currentColor;
   outline-offset: 2px;
 }
+
+/* Phone stage: no traffic lights to clear, so the menu button takes the
+   leading edge as a 44 px target and shares the first line with the page
+   title; the open sidebar starts below it so the button can close it. The
+   button only exists below 768 px (phone landscape keeps the sidebar). */
+:root[data-el-form-factor="phone"] {
+  --system-phone-menu: var(--el-touch-target);
+  --system-phone-title-line: 32px;
+}
+
+:root[data-el-form-factor="phone"] .settings-search {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] .settings-sidebar-item {
+  min-height: var(--el-touch-target);
+}
+
+@media (max-width: 767.98px) {
+  :root[data-el-form-factor="phone"] .sidebar-toggle {
+    left: max(4px, env(safe-area-inset-left, 0px));
+    top: 4px;
+    width: var(--system-phone-menu);
+    height: var(--system-phone-menu);
+    padding: 0;
+    border-radius: 12px;
+  }
+
+  :root[data-el-form-factor="phone"] .sidebar-toggle .sidebar-toggle-button {
+    margin: 0 auto;
+  }
+
+  :root[data-el-form-factor="phone"] .sidebar-toggle:active {
+    background: var(--el-lift);
+  }
+
+  :root[data-el-form-factor="phone"] .sidebar-toggle:focus-visible {
+    outline: 2px solid var(--el-focus);
+    outline-offset: -2px;
+  }
+
+  :root[data-el-form-factor="phone"] .settings-sidebar {
+    padding: calc(var(--system-phone-menu) + 12px) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  }
+
+  :root[data-el-form-factor="phone"] .settings-content-container {
+    padding: calc(4px + (var(--system-phone-menu) - var(--system-phone-title-line)) / 2) max(16px, env(safe-area-inset-right, 0px)) calc(24px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+  }
+
+  :root[data-el-form-factor="phone"] .settings-content h1,
+  :root[data-el-form-factor="phone"] .settings-content h1.pc2-section-title {
+    min-height: var(--system-phone-title-line);
+    margin-left: calc(var(--system-phone-menu) - 8px);
+    font-size: 28px;
+    line-height: var(--system-phone-title-line);
+  }
+}

@@ -12465,6 +12465,13 @@ assert(
       read("scripts/library-product-layout-smoke.mjs").includes("Library phone: Favorites must be one sliding row of 44 px chips"),
     "Library phone: one header block (navigation row, then Favorites as a sliding chip row), asserted by the layout smoke",
   );
+
+  assert(
+    read("capsules/system/browser/style.css").includes("  :root[data-el-form-factor=\"phone\"] .settings-content h1,\n  :root[data-el-form-factor=\"phone\"] .settings-content h1.pc2-section-title {\n    min-height: var(--system-phone-title-line);\n    margin-left: calc(var(--system-phone-menu) - 8px);") &&
+      read("scripts/system-uiux-layout-smoke.mjs").includes('"System phone menu button must share the page title\'s line",') &&
+      justfile.includes("node scripts/system-uiux-layout-smoke.mjs"),
+    "System phone: the menu button sits on the leading edge on the page title's line, asserted by the UI/UX smoke in the browser lane",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
