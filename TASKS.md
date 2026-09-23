@@ -497,8 +497,9 @@ diagnostic Runtime and private state were restored; the signed-in human Homes
 remained open. Source commit `623affc3`, installed artifact parity, sink counts,
 restoration hashes and independent review are recorded in
 `.audit/sec1-destination-boundary/receipt.json`. Next: Linux production
-confinement, upstream unknown-create reconciliation, and separate public HTTPS
-owner/target proof; wider MA/AI/CR acceptance remains open.
+confinement, upstream unknown-create reconciliation, approved-hostname DNS
+answer rebinding, public CA routing, and separate public HTTPS owner/target
+proof; wider MA/AI/CR acceptance remains open. External HTTPS stays paused.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their

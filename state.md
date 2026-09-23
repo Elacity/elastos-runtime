@@ -14,16 +14,17 @@ diagnostic Runtime had matching built and installed SHA-256
 `e795fee17b15c369ec03a52a4888b720e15f348aef5a8ef771060b97f527ec6a`.
 Using a dummy key, the approved HTTP sink received two requests. An unapproved
 redirect sink received zero. Replacing the fixture hostname with `localhost`
-returned 400 with zero requests there; the literal IP rule leaves no DNS name
-to rebind. An approved TLS request with a certificate for IP `127.0.0.1`
+returned 400 with zero requests there. This literal-IP fixture does not test
+DNS answer rebinding for an approved hostname. An approved TLS request with a
+certificate for IP `127.0.0.1`
 returned 200; the same URL with a certificate for `wrong.test`, signed by the
 same test CA, returned 400 and delivered zero HTTP requests. The diagnostic
 binary, receipts, fixture and authority manifest were restored byte for byte;
 the two signed-in human Homes and diagnostic Home each returned HTTP 200. No
 paid call occurred. Receipt: `.audit/sec1-destination-boundary/receipt.json`.
-This is isolated Mac proof. Linux production confinement, upstream unknown
-create reconciliation, public activation and wider MA/AI/CR acceptance remain
-open.
+This is isolated Mac proof. Approved-hostname DNS answer rebinding, public CA
+routing, Linux production confinement, upstream unknown-create reconciliation,
+public activation and wider MA/AI/CR acceptance remain open.
 
 ## Owner Inbox hosted-route history, 23 September 2026 UTC
 
