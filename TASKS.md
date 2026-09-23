@@ -181,17 +181,21 @@ result; public Get, full Qwen, the wider installed failure matrix and release
 qualification remain open. [Current source, installed and public status](state.md#current-model-delivery-status-23-september-2026-utc)
 keeps these scopes separate.
 
-The public-seed model gate is ready for a separate public decision. Read-only
-inspection found the sealed ipfs-provider in the current public installation;
-the earlier `metadata_read` attempts belong to an older artifact. An isolated
-Linux Home with copied current public artifacts passed a 763-byte capacity and
-restart check, then a fresh typed Marketplace SmolLM2 Get, admission and two
-terminal local Assistant runs across a Runtime restart. Receipt:
-`.audit/public-seed-gate-61974/receipt.json`. Public Get itself remains
-untried on the current installation. A public test needs an exact approval and
-rollback plan that protects the seed pin, data root, account and provider config.
-The repo-seal no-follow and owner-only ancestor review is a separate security
-hardening task; this gate makes no SEC1 completion claim.
+The public-seed model gate has isolated Linux evidence. Read-only inspection
+found the sealed ipfs-provider in the current public installation; the earlier
+`metadata_read` attempts belong to an older artifact. An isolated Home with
+copies of the current public artifacts passed a 763-byte capacity and restart
+check, a fresh typed Marketplace SmolLM2 Get and admission, and two terminal
+local Assistant runs across a Runtime restart. Receipt:
+`.audit/public-seed-gate-61974/receipt.json`. Next, prove a compatible, pinned
+Linux local engine in that isolated Home, with a read-only CPU, RAM, free-space
+and hosting-policy preflight for the public seed. Record the engine binary and
+library hashes and receipt, resource readings and a bounded SmolLM2 run; stop
+if the engine is unavailable or the seed has resource pressure. Then seek
+exact approval for one public Get and a conditional signed-in public Assistant
+prompt under the private public-check plan. Public Get remains
+untried on the current installation. The repo-seal no-follow and owner-only
+ancestor review is separate security hardening; this gate makes no SEC1 claim.
 
 ### Model delivery R14 — 0.7.1 on public Home
 
@@ -201,7 +205,7 @@ regression baseline. Codex owns source, builds, installed test Homes and evidenc
 one read-only reviewer checks material milestones. The coordinator owns Notion
 and monitoring. Preserve all human connections, keys, conversations and drafts.
 
-The active sequence is: simplify Models and Approval Lens with installed keyboard
+The sequence at that checkpoint was: simplify Models and Approval Lens with installed keyboard
 and responsive proof; project existing shared service offers in Marketplace and
 complete its ordinary access handoff; complete the installed access and failure
 matrix with controlled test state; finish remaining catalogue, retention and AI
@@ -219,16 +223,15 @@ or Assistant. The existing-grant path passed. A fresh request and six-hour Inbox
 approval awaited human confirmation; the later hosted-sharing result is recorded
 in the accepted regression evidence below.
 
-Public model Get targets the Runtime that serves Home. In public Home, Get
-therefore prepares the public seed; it does not install bytes on the viewer's
-Mac. The public seed's five SmolLM2 attempts settled at `metadata_read` with
-zero index and transferred bytes. Its managed Kubo currently serves the signed
-index and bounded offline reads, so the ordinary Content/provider failure still
-needs exact classification before another Retry. Make Marketplace name the
-target Home and its local model capability before Get. Acceptance requires a
-signed-in Mac Home to Get SmolLM2 from the seed holder through its own Content
-and Carrier path, then use the admitted local offer in Assistant. The seed
-continues to hold the package and does not run local inference for this proof.
+At the 22 September checkpoint, public Home Get targeted the seed Runtime,
+while the viewer's Mac kept its own separate Content and Carrier path. Five
+public SmolLM2 attempts settled at `metadata_read` with zero index and
+transferred bytes on the then-installed provider. That label did not identify
+the provider's internal cause. The later Mac small-model journey passed; the
+current public artifact and isolated Linux result are recorded in Now and
+[state.md](state.md#current-model-delivery-status-23-september-2026-utc).
+Marketplace target-Home clarity and signed-in seed-local inference remain open
+product acceptance, with the next proof specified in Now.
 
 The isolated installed hosted matrix passed destination authority, sharing
 pause/resume, combined private/shared capacity, key replacement, removal,
