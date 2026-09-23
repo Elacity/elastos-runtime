@@ -188,17 +188,38 @@ async fn fetch_validation_inner(
         Some(owner_proof_binding_id),
         None,
     )?;
-    let mut response = client
+    let send = client
         .get(destination.url.clone())
         .bearer_auth(api_key)
-        .send()
-        .await?;
+        .send();
+    tokio::pin!(send);
+    let mut monitor = tokio::time::interval(Duration::from_millis(250));
+    let mut response = loop {
+        tokio::select! {
+            result = &mut send => break result?,
+            _ = monitor.tick() => current_grant_for(
+                data_dir, offer_id, effect, "GET", &destination,
+                Some(owner_proof_binding_id), None,
+            )?,
+        }
+    };
     if response.status().is_redirection() {
         anyhow::bail!("hosted validation redirect denied");
     }
     let status = response.status();
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    loop {
+        let chunk = tokio::select! {
+            result = response.chunk() => result?,
+            _ = monitor.tick() => {
+                current_grant_for(
+                    data_dir, offer_id, effect, "GET", &destination,
+                    Some(owner_proof_binding_id), None,
+                )?;
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else { break };
         current_grant_for(
             data_dir,
             offer_id,
@@ -213,6 +234,15 @@ async fn fetch_validation_inner(
         }
         bytes.extend_from_slice(&chunk);
     }
+    current_grant_for(
+        data_dir,
+        offer_id,
+        effect,
+        "GET",
+        &destination,
+        Some(owner_proof_binding_id),
+        None,
+    )?;
     Ok((status, bytes))
 }
 
@@ -1509,6 +1539,74 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn active_validation_stops_while_upstream_waits_after_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let models_url = format!("http://127.0.0.1:{port}/models");
+        let root = dir.path().join("providers/model-provider");
+        write_private(
+            &root.join("validate-fixtures.json"),
+            json!({
+                "openrouter_models_url":models_url,
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/venice-models")
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let grant_path = root.join("egress-grants.json");
+        let grant = |active| {
+            json!({
+                "schema":"elastos.model.egress-grants/v1",
+                "grants":[{
+                    "offer_id":"validation:openrouter","effect":"validate_models",
+                    "method":"GET","url":models_url,"recipient":"127.0.0.1",
+                    "payer":"this Home","owner_proof_binding_id":proof,
+                    "expires_at_ms":job_binding_time_ms().unwrap()+60_000,"active":active
+                }]
+            })
+        };
+        write_private(&grant_path, grant(true).to_string().as_bytes());
+        let (accepted, observed) = tokio::sync::oneshot::channel();
+        let sink_task = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut bytes = [0u8; 4096];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            let _ = accepted.send(());
+            std::future::pending::<()>().await;
+        });
+        let data_dir = dir.path().to_path_buf();
+        let proof_for_request = proof.clone();
+        let validation = tokio::spawn(async move {
+            fetch_validation(
+                &data_dir,
+                ValidationEndpoint::OpenRouterModels,
+                "fixture-key",
+                &proof_for_request,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), observed)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::write(&grant_path, grant(false).to_string()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), validation)
+            .await
+            .expect("revoked validation must stop before its 20-second timeout")
+            .unwrap();
+        assert!(result.is_err());
+        sink_task.abort();
     }
 
     #[test]
