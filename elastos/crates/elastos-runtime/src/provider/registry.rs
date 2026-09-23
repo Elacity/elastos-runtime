@@ -638,6 +638,8 @@ pub struct ProviderRegistry {
     carrier_invoker: RwLock<Option<Arc<dyn ProviderCarrierInvoker>>>,
     #[cfg(target_os = "macos")]
     local_model_sockets: RwLock<Option<std::collections::BTreeMap<String, String>>>,
+    #[cfg(target_os = "macos")]
+    hosted_model_socket: RwLock<Option<String>>,
 }
 
 enum SubProviderRegistration {
@@ -690,6 +692,8 @@ impl ProviderRegistry {
             carrier_invoker: RwLock::new(None),
             #[cfg(target_os = "macos")]
             local_model_sockets: RwLock::new(None),
+            #[cfg(target_os = "macos")]
+            hosted_model_socket: RwLock::new(None),
         }
     }
 
@@ -700,6 +704,11 @@ impl ProviderRegistry {
         sockets: std::collections::BTreeMap<String, String>,
     ) {
         *self.local_model_sockets.write().await = Some(sockets);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn set_hosted_model_socket(&self, socket: String) {
+        *self.hosted_model_socket.write().await = Some(socket);
     }
 
     #[cfg(target_os = "macos")]
@@ -726,6 +735,9 @@ impl ProviderRegistry {
             }
         }
         config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
+        if let Some(socket) = self.hosted_model_socket.read().await.as_deref() {
+            config.extra["runtime_hosted_socket"] = serde_json::json!(socket);
+        }
         Ok(())
     }
 

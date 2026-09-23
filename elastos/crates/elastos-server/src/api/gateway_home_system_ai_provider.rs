@@ -9,12 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-#[cfg_attr(test, allow(dead_code))]
-const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models?output_modalities=all";
-#[cfg_attr(test, allow(dead_code))]
-const VENICE_RATE_LIMITS_URL: &str = "https://api.venice.ai/api/v1/api_keys/rate_limits";
-#[cfg_attr(test, allow(dead_code))]
-const VENICE_MODELS_URL: &str = "https://api.venice.ai/api/v1/models?type=text";
 const HOSTED_EXTERNAL_HTTPS_PAUSED: &str =
     "Hosted external HTTPS is paused until Runtime network authority is available.";
 
@@ -294,25 +288,6 @@ fn parse_venice_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredModel>
     Ok(models)
 }
 
-#[cfg(not(test))]
-fn hosted_validate_http_client(loopback: bool) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
-    if loopback {
-        builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
-            match crate::api::parse_loopback_http_url(attempt.url().as_str()) {
-                Ok(_) => attempt.follow(),
-                Err(_) => attempt.error("hosted validate fixture redirect left 127.0.0.1"),
-            }
-        }));
-    }
-    if !loopback {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
-    }
-    builder
-        .build()
-        .map_err(|_| anyhow::anyhow!("hosted validation unavailable"))
-}
-
 async fn fetch_openrouter_models(
     data_dir: &std::path::Path,
     api_key: &str,
@@ -336,34 +311,27 @@ async fn fetch_openrouter_models(
             None => Err(anyhow::anyhow!("OpenRouter validation transport unset")),
         })
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "macos"))]
     {
-        let fixtures = crate::api::load_hosted_validate_fixtures(data_dir)
-            .map_err(|_| anyhow::anyhow!("OpenRouter validation unavailable"))?;
-        let url = match fixtures.as_ref() {
-            Some(fixtures) => fixtures.openrouter_models_url.as_str(),
-            None => OPENROUTER_MODELS_URL,
-        };
-        let client = hosted_validate_http_client(fixtures.is_some())
-            .map_err(|_| anyhow::anyhow!("OpenRouter validation unavailable"))?;
-        let response = client
-            .get(url)
-            .bearer_auth(api_key)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("OpenRouter validation unavailable"))?;
-        let status = response.status();
+        let (status, bytes) = crate::api::model_provider_egress::fetch_validation(
+            data_dir,
+            crate::api::model_provider_egress::ValidationEndpoint::OpenRouterModels,
+            api_key,
+        )
+        .await
+        .map_err(|_| ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))?;
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(ai_provider_request_error("invalid OpenRouter key"));
         }
         if !status.is_success() {
             return Err(anyhow::anyhow!("OpenRouter validation unavailable"));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| anyhow::anyhow!("OpenRouter validation unavailable"))?;
         parse_openrouter_models_body(&bytes)
+    }
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    {
+        let _ = (data_dir, api_key);
+        Err(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))
     }
 }
 
@@ -381,34 +349,27 @@ async fn fetch_venice_access(data_dir: &std::path::Path, api_key: &str) -> anyho
             None => Err(anyhow::anyhow!("Venice validation transport unset")),
         })
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "macos"))]
     {
-        let fixtures = crate::api::load_hosted_validate_fixtures(data_dir)
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
-        let url = match fixtures.as_ref() {
-            Some(fixtures) => fixtures.venice_rate_limits_url.as_str(),
-            None => VENICE_RATE_LIMITS_URL,
-        };
-        let client = hosted_validate_http_client(fixtures.is_some())
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
-        let response = client
-            .get(url)
-            .bearer_auth(api_key)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
-        let status = response.status();
+        let (status, bytes) = crate::api::model_provider_egress::fetch_validation(
+            data_dir,
+            crate::api::model_provider_egress::ValidationEndpoint::VeniceAccess,
+            api_key,
+        )
+        .await
+        .map_err(|_| ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ai_provider_request_error("invalid Venice key"));
         }
         if !status.is_success() {
             return Err(anyhow::anyhow!("Venice validation unavailable"));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
         parse_venice_rate_limits_body(&bytes)
+    }
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    {
+        let _ = (data_dir, api_key);
+        Err(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))
     }
 }
 
@@ -425,30 +386,24 @@ async fn fetch_venice_models(
             None => Err(anyhow::anyhow!("Venice models transport unset")),
         })
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "macos"))]
     {
-        let fixtures = crate::api::load_hosted_validate_fixtures(data_dir)
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
-        let url = match fixtures.as_ref() {
-            Some(fixtures) => fixtures.venice_models_url.as_str(),
-            None => VENICE_MODELS_URL,
-        };
-        let client = hosted_validate_http_client(fixtures.is_some())
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
-        let response = client
-            .get(url)
-            .bearer_auth(api_key)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
-        if !response.status().is_success() {
+        let (status, bytes) = crate::api::model_provider_egress::fetch_validation(
+            data_dir,
+            crate::api::model_provider_egress::ValidationEndpoint::VeniceModels,
+            api_key,
+        )
+        .await
+        .map_err(|_| ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))?;
+        if !status.is_success() {
             return Err(anyhow::anyhow!("Venice validation unavailable"));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| anyhow::anyhow!("Venice validation unavailable"))?;
         parse_venice_models_body(&bytes)
+    }
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    {
+        let _ = (data_dir, api_key);
+        Err(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED))
     }
 }
 
@@ -556,7 +511,7 @@ pub(super) async fn system_ai_provider_validate(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
-    if !cfg!(test) {
+    if !cfg!(test) && !cfg!(target_os = "macos") {
         return system_error_response(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED));
     }
     let provider = match parse_provider(&req.provider) {
@@ -590,7 +545,7 @@ pub(super) async fn system_ai_provider_save(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
-    if !cfg!(test) {
+    if !cfg!(test) && !cfg!(target_os = "macos") {
         return system_error_response(ai_provider_request_error(HOSTED_EXTERNAL_HTTPS_PAUSED));
     }
     let provider = match parse_provider(&req.provider) {

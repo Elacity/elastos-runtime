@@ -259,7 +259,15 @@ impl ProviderBridge {
     pub async fn spawn_confined_model(
         binary_path: &Path,
         mut config: ProviderConfig,
-    ) -> Result<(Self, BTreeMap<String, String>, ProviderConfig), BridgeError> {
+    ) -> Result<
+        (
+            Self,
+            BTreeMap<String, String>,
+            ProviderConfig,
+            tokio::net::UnixListener,
+        ),
+        BridgeError,
+    > {
         let offers = config
             .extra
             .get("offers")
@@ -324,7 +332,26 @@ impl ProviderBridge {
                 .map_err(BridgeError::Spawn)?,
             );
         }
+        let hosted_socket = ipc_path.join("hosted.sock");
+        let hosted_socket = hosted_socket
+            .to_str()
+            .ok_or_else(|| BridgeError::InitFailed("invalid hosted socket path".into()))?;
+        if hosted_socket.len() >= 104
+            || !hosted_socket.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+            })
+        {
+            return Err(BridgeError::InitFailed(
+                "hosted socket path too long".into(),
+            ));
+        }
+        policy.push_str(&format!(
+            "(allow network-outbound (literal \"{hosted_socket}\"))\n"
+        ));
+        let hosted_listener =
+            tokio::net::UnixListener::bind(hosted_socket).map_err(BridgeError::Spawn)?;
         config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
+        config.extra["runtime_hosted_socket"] = serde_json::json!(hosted_socket);
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(policy).arg(binary_path);
         let mut bridge =
@@ -351,7 +378,15 @@ impl ProviderBridge {
         *bridge._local_brokers.lock().await = brokers;
         bridge._local_provider_pid = provider_pid;
         bridge._local_provider_birth = provider_birth;
-        Ok((bridge, sockets, config))
+        Ok((bridge, sockets, config, hosted_listener))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn confined_model_identity(&self) -> Option<(u32, u64)> {
+        let pid = self._local_provider_pid.load(Ordering::Acquire);
+        let birth = self._local_provider_birth.load(Ordering::Acquire);
+        (pid != 0 && super::local_model_broker::process_birth(pid) == Some(birth))
+            .then_some((pid, birth))
     }
 
     async fn spawn_with_timeouts(
@@ -1531,7 +1566,7 @@ for line in sys.stdin:
             }),
             ..Default::default()
         };
-        let (bridge, sockets, confined_config) =
+        let (bridge, sockets, confined_config, _hosted_listener) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
                 .unwrap();
@@ -1574,9 +1609,10 @@ for line in sys.stdin:
         let config: ProviderConfig =
             serde_json::from_value(fixture["provider_config"].clone()).unwrap();
         let offer_id = fixture["offer_id"].as_str().unwrap();
-        let (bridge, sockets, _) = ProviderBridge::spawn_confined_model(binary, config)
-            .await
-            .unwrap();
+        let (bridge, sockets, _, _hosted_listener) =
+            ProviderBridge::spawn_confined_model(binary, config)
+                .await
+                .unwrap();
         let socket = sockets[offer_id].clone();
         let input = serde_json::json!({
             "schema": "elastos.model.input.text/v1",

@@ -39,9 +39,33 @@ const LOCAL_TEXT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const LOCAL_TEXT_TIMED_FLUSH_LIMIT: usize = crate::config::MAX_RUN_EVENT_COUNT_LIMIT / 2;
 const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
+const RUNTIME_HOSTED_EFFECT_URL: &str = "http://runtime.invalid/v1/hosted-effect";
 
-fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, AdapterFault> {
-    backend_client_with_socket(timeout_ms, None)
+fn effect_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    direct_url: &str,
+    runtime_socket: Option<&str>,
+    offer_id: &str,
+    run_id: &str,
+    request_id: &str,
+    effect: &'static str,
+) -> reqwest::RequestBuilder {
+    let url = if runtime_socket.is_some() {
+        RUNTIME_HOSTED_EFFECT_URL
+    } else {
+        direct_url
+    };
+    let builder = client.request(method, url);
+    if runtime_socket.is_some() {
+        builder
+            .header("x-elastos-offer-id", offer_id)
+            .header("x-elastos-run-id", run_id)
+            .header("x-elastos-request-id", request_id)
+            .header("x-elastos-effect", effect)
+    } else {
+        builder
+    }
 }
 
 fn backend_client_with_socket(
@@ -83,7 +107,15 @@ thread_local! {
     static TEST_EXTERNAL_HTTP_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-fn require_external_http_containment() -> std::result::Result<(), AdapterFault> {
+fn require_external_http_containment(
+    runtime_socket: Option<&str>,
+) -> std::result::Result<(), AdapterFault> {
+    #[cfg(target_os = "macos")]
+    if runtime_socket.is_some() {
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = runtime_socket;
     #[cfg(test)]
     if TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.get()) {
         return Ok(());
@@ -409,6 +441,7 @@ impl HostedBackendReport {
 
 struct LocalTextWorkerTask {
     run_id: String,
+    request_id: String,
     generation: u64,
     backend: LocalTextBackend,
     offer: ConfiguredOffer,
@@ -416,6 +449,7 @@ struct LocalTextWorkerTask {
     prompt: String,
     cancel_rx: watch::Receiver<bool>,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 enum LocalTextBackend {
@@ -462,6 +496,7 @@ struct HttpArtifactCreateWorkerTask {
     binding: RuntimeCreateBinding,
     input: Value,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 struct HttpArtifactStatusWorkerTask {
@@ -474,6 +509,7 @@ struct HttpArtifactStatusWorkerTask {
     binding: RuntimeCreateBinding,
     backend_state: Value,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 struct HttpArtifactCancelWorkerTask {
@@ -485,6 +521,7 @@ struct HttpArtifactCancelWorkerTask {
     binding: RuntimeCreateBinding,
     backend_state: Value,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 impl LocalTextStreamState {
@@ -544,6 +581,7 @@ pub struct LiveAdapterExecutor {
     workers: Arc<Mutex<BTreeMap<String, WorkerRecord>>>,
     next_generation: Arc<AtomicU64>,
     local_llama: LocalLlamaEngines,
+    hosted_socket: Option<String>,
 }
 
 impl LiveAdapterExecutor {
@@ -568,10 +606,20 @@ impl LiveAdapterExecutor {
         Self::new_with_local_sockets(runtime, updates, BTreeMap::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_local_sockets(
         runtime: Handle,
         updates: mpsc::Sender<WorkerUpdate>,
         sockets: BTreeMap<String, String>,
+    ) -> Self {
+        Self::new_with_runtime_sockets(runtime, updates, sockets, None)
+    }
+
+    pub(crate) fn new_with_runtime_sockets(
+        runtime: Handle,
+        updates: mpsc::Sender<WorkerUpdate>,
+        sockets: BTreeMap<String, String>,
+        hosted_socket: Option<String>,
     ) -> Self {
         Self {
             runtime,
@@ -579,6 +627,7 @@ impl LiveAdapterExecutor {
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             local_llama: LocalLlamaEngines::with_runtime_sockets(sockets),
+            hosted_socket,
         }
     }
 
@@ -729,6 +778,7 @@ impl LiveAdapterExecutor {
         self.spawn_text_worker(
             backend,
             offer,
+            &binding.request_id,
             prompt,
             deadline_ms,
             PreparedLocalTextWorker {
@@ -745,6 +795,7 @@ impl LiveAdapterExecutor {
         &self,
         backend: LocalTextBackend,
         offer: &ConfiguredOffer,
+        request_id: &str,
         prompt: &str,
         deadline_ms: u64,
         prepared: PreparedLocalTextWorker,
@@ -759,10 +810,13 @@ impl LiveAdapterExecutor {
         let updates = self.updates.clone();
         let offer = offer.clone();
         let prompt = prompt.to_string();
+        let request_id = request_id.to_string();
+        let hosted_socket = self.hosted_socket.clone();
         let run_id_for_task = run_id.clone();
         let join_handle = self.runtime.spawn(async move {
             let timed_out = run_local_text_worker(LocalTextWorkerTask {
                 run_id: run_id_for_task.clone(),
+                request_id,
                 generation,
                 backend,
                 offer,
@@ -770,6 +824,7 @@ impl LiveAdapterExecutor {
                 prompt,
                 cancel_rx,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -822,6 +877,7 @@ impl LiveAdapterExecutor {
         let create_url = create_url.to_string();
         let bearer_token = bearer_token.map(str::to_string);
         let run_id_for_task = run_id.clone();
+        let hosted_socket = self.hosted_socket.clone();
         let join_handle = self.runtime.spawn(async move {
             run_http_artifact_create_worker(HttpArtifactCreateWorkerTask {
                 run_id: run_id_for_task.clone(),
@@ -833,6 +889,7 @@ impl LiveAdapterExecutor {
                 binding,
                 input,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -885,6 +942,7 @@ impl LiveAdapterExecutor {
         let status_url = status_url.to_string();
         let bearer_token = bearer_token.map(str::to_string);
         let run_id_for_task = run_id.clone();
+        let hosted_socket = self.hosted_socket.clone();
         let backend_state_for_task = next_backend_state.clone();
         let join_handle = self.runtime.spawn(async move {
             run_http_artifact_status_worker(HttpArtifactStatusWorkerTask {
@@ -897,6 +955,7 @@ impl LiveAdapterExecutor {
                 binding,
                 backend_state: backend_state_for_task,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -968,6 +1027,7 @@ impl LiveAdapterExecutor {
         let cancel_url = cancel_url.to_string();
         let bearer_token = bearer_token.map(str::to_string);
         let run_id_for_task = run_id.clone();
+        let hosted_socket = self.hosted_socket.clone();
         let backend_state_for_task = backend_state.clone();
         let join_handle = self.runtime.spawn(async move {
             run_http_artifact_cancel_worker(HttpArtifactCancelWorkerTask {
@@ -979,6 +1039,7 @@ impl LiveAdapterExecutor {
                 binding,
                 backend_state: backend_state_for_task,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -1007,7 +1068,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
         deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault> {
         if !matches!(adapter, AdapterConfig::LocalLlamaCppText { .. }) {
-            require_external_http_containment()?;
+            require_external_http_containment(self.hosted_socket.as_deref())?;
         }
         match adapter {
             AdapterConfig::OpenRouterDecisions {
@@ -1389,6 +1450,7 @@ async fn run_http_artifact_create_worker(task: HttpArtifactCreateWorkerTask) {
         &task.offer,
         &task.binding,
         &task.input,
+        task.hosted_socket.as_deref(),
     )
     .await
     {
@@ -1416,6 +1478,7 @@ async fn run_http_artifact_status_worker(task: HttpArtifactStatusWorkerTask) {
         &task.offer,
         &task.binding,
         &task.backend_state,
+        task.hosted_socket.as_deref(),
     )
     .await
     {
@@ -1445,6 +1508,7 @@ async fn run_http_artifact_cancel_worker(task: HttpArtifactCancelWorkerTask) {
         &task.offer,
         &task.binding,
         &task.backend_state,
+        task.hosted_socket.as_deref(),
     )
     .await
     {
@@ -1474,21 +1538,32 @@ async fn run_http_artifact_create_worker_inner(
     offer: &ConfiguredOffer,
     binding: &RuntimeCreateBinding,
     input: &Value,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    require_external_http_containment()?;
-    let client = backend_client(offer.policy.runtime_ms_limit)?;
+    require_external_http_containment(hosted_socket)?;
+    let client = backend_client_with_socket(offer.policy.runtime_ms_limit, hosted_socket)?;
     let request = {
-        let mut builder = client
-            .post(create_url)
-            .header("content-type", "application/json")
-            .json(&json!({
-                "request_id": binding.request_id,
-                "offer_id": offer.id,
-                "operation": offer.operation,
-                "input": input,
-            }));
-        if let Some(bearer_token) = bearer_token {
-            builder = builder.header("authorization", format!("Bearer {bearer_token}"));
+        let mut builder = effect_request(
+            &client,
+            reqwest::Method::POST,
+            create_url,
+            hosted_socket,
+            &offer.id,
+            &deterministic_run_id(binding),
+            &binding.request_id,
+            "job_create",
+        )
+        .header("content-type", "application/json")
+        .json(&json!({
+            "request_id": binding.request_id,
+            "offer_id": offer.id,
+            "operation": offer.operation,
+            "input": input,
+        }));
+        if hosted_socket.is_none() {
+            if let Some(bearer_token) = bearer_token {
+                builder = builder.header("authorization", format!("Bearer {bearer_token}"));
+            }
         }
         builder
     };
@@ -1532,8 +1607,9 @@ async fn run_http_artifact_status_worker_inner(
     offer: &ConfiguredOffer,
     _binding: &RuntimeCreateBinding,
     backend_state: &Value,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    require_external_http_containment()?;
+    require_external_http_containment(hosted_socket)?;
     let state = parse_http_job_backend_state(backend_state)?;
     let now = now_ms();
     if state.cancel_requested
@@ -1545,10 +1621,24 @@ async fn run_http_artifact_status_worker_inner(
         return Ok(worker_settlement_unknown_result());
     }
     let url = status_request_url(status_url, &state.job_id)?;
-    let client = backend_client(offer.policy.runtime_ms_limit)?;
-    let mut request = client.get(url);
-    if let Some(bearer_token) = bearer_token {
-        request = request.header("authorization", format!("Bearer {bearer_token}"));
+    let client = backend_client_with_socket(offer.policy.runtime_ms_limit, hosted_socket)?;
+    let mut request = effect_request(
+        &client,
+        reqwest::Method::GET,
+        &url,
+        hosted_socket,
+        &offer.id,
+        &deterministic_run_id(_binding),
+        &_binding.request_id,
+        "job_status",
+    );
+    if hosted_socket.is_some() {
+        request = request.header("x-elastos-job-id", &state.job_id);
+    }
+    if hosted_socket.is_none() {
+        if let Some(bearer_token) = bearer_token {
+            request = request.header("authorization", format!("Bearer {bearer_token}"));
+        }
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
@@ -1562,7 +1652,7 @@ async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
     if !matches!(&task.backend, LocalTextBackend::LocalLlama { .. }) {
-        require_external_http_containment()?;
+        require_external_http_containment(task.hosted_socket.as_deref())?;
     }
     let mut backend_report = matches!(
         &task.backend,
@@ -1585,6 +1675,9 @@ async fn run_local_text_worker_inner(
                 &task.offer,
                 task.deadline_ms,
                 &mut task.cancel_rx,
+                &task.run_id,
+                &task.request_id,
+                task.hosted_socket.as_deref(),
             )
             .await;
         }
@@ -1640,15 +1733,35 @@ async fn run_local_text_worker_inner(
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX),
-        local_socket.as_deref(),
+        local_socket.as_deref().or(task.hosted_socket.as_deref()),
     )?;
     let request = {
-        let mut builder = client
-            .post(&api_url)
-            .header("content-type", "application/json")
-            .json(&body);
-        if let Some(api_key) = api_key.as_deref() {
-            builder = builder.header("authorization", format!("Bearer {api_key}"));
+        let runtime_socket = if private_endpoint {
+            None
+        } else {
+            task.hosted_socket.as_deref()
+        };
+        let effect = if matches!(&task.backend, LocalTextBackend::OpenAiResponses { .. }) {
+            "responses"
+        } else {
+            "text"
+        };
+        let mut builder = effect_request(
+            &client,
+            reqwest::Method::POST,
+            &api_url,
+            runtime_socket,
+            &task.offer.id,
+            &task.run_id,
+            &task.request_id,
+            effect,
+        )
+        .header("content-type", "application/json")
+        .json(&body);
+        if runtime_socket.is_none() {
+            if let Some(api_key) = api_key.as_deref() {
+                builder = builder.header("authorization", format!("Bearer {api_key}"));
+            }
         }
         builder
     };
@@ -1810,19 +1923,35 @@ async fn run_decision_worker(
     offer: &ConfiguredOffer,
     deadline_ms: u64,
     cancel: &mut watch::Receiver<bool>,
+    run_id: &str,
+    request_id: &str,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    require_external_http_containment()?;
-    let client = backend_client(
+    require_external_http_containment(hosted_socket)?;
+    let client = backend_client_with_socket(
         remaining_run_timeout(deadline_ms)?
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX),
+        hosted_socket,
     )?;
     let body = json!({"model": model, "state": input.state, "questions": input.questions,
         "provider": {"allow_fallbacks": false}});
-    let mut request = client.post(api_url).json(&body);
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
+    let mut request = effect_request(
+        &client,
+        reqwest::Method::POST,
+        api_url,
+        hosted_socket,
+        &offer.id,
+        run_id,
+        request_id,
+        "decisions",
+    )
+    .json(&body);
+    if hosted_socket.is_none() {
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
     }
     let response = tokio::select! {
         _ = cancel.changed() => return Ok(worker_settlement_unknown_result()),
@@ -2473,8 +2602,9 @@ async fn run_http_artifact_cancel_worker_inner(
     offer: &ConfiguredOffer,
     _binding: &RuntimeCreateBinding,
     backend_state: &Value,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    require_external_http_containment()?;
+    require_external_http_containment(hosted_socket)?;
     let state = parse_http_job_backend_state(backend_state)?;
     let deadline = state.cancel_deadline_ms.ok_or_else(|| {
         AdapterFault::malformed(
@@ -2485,13 +2615,23 @@ async fn run_http_artifact_cancel_worker_inner(
     if now_ms() >= deadline {
         return Ok(worker_settlement_unknown_result());
     }
-    let client = backend_client(offer.policy.runtime_ms_limit)?;
-    let mut request = client
-        .post(cancel_url)
-        .header("content-type", "application/json")
-        .json(&json!({ "job_id": state.job_id }));
-    if let Some(bearer_token) = bearer_token {
-        request = request.header("authorization", format!("Bearer {bearer_token}"));
+    let client = backend_client_with_socket(offer.policy.runtime_ms_limit, hosted_socket)?;
+    let mut request = effect_request(
+        &client,
+        reqwest::Method::POST,
+        cancel_url,
+        hosted_socket,
+        &offer.id,
+        &deterministic_run_id(_binding),
+        &_binding.request_id,
+        "job_cancel",
+    )
+    .header("content-type", "application/json")
+    .json(&json!({ "job_id": state.job_id }));
+    if hosted_socket.is_none() {
+        if let Some(bearer_token) = bearer_token {
+            request = request.header("authorization", format!("Bearer {bearer_token}"));
+        }
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
@@ -3356,6 +3496,9 @@ mod tests {
                     &offer,
                     now_ms() + 5000,
                     &mut cancel,
+                    "run:fixture",
+                    "fixture-request",
+                    None,
                 ))
                 .unwrap();
             let ReconcileResult::Terminal {
@@ -3439,6 +3582,9 @@ mod tests {
                     &offer,
                     now_ms() + 2000,
                     &mut cancel,
+                    "run:fixture",
+                    "fixture-request",
+                    None,
                 );
                 let interrupt = async {
                     ready_rx.await.unwrap();
@@ -3651,6 +3797,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(1);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-hosted-status".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -3720,6 +3868,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(1);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-hosted-timeout".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -3814,6 +3964,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(1);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-delayed-first-byte".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -4025,6 +4177,8 @@ mod tests {
                 .unwrap();
             let result = runtime.block_on(async move {
                 let mut task = LocalTextWorkerTask {
+                    request_id: "fixture-request".into(),
+                    hosted_socket: None,
                     run_id: "run-coalesced".to_string(),
                     generation: 1,
                     backend: LocalTextBackend::OpenAiCompatible {
@@ -4176,6 +4330,8 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker = tokio::spawn(async move {
             let mut task = LocalTextWorkerTask {
+                request_id: "fixture-request".into(),
+                hosted_socket: None,
                 run_id: "small-live-delta".into(),
                 generation: 1,
                 backend: LocalTextBackend::OpenAiCompatible {
@@ -4297,6 +4453,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-admitted-budget".into(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -4500,6 +4658,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-truncated".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -4538,6 +4698,8 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         drop(cancel_tx);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-control-loss".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -4617,6 +4779,7 @@ mod tests {
                 &offer,
                 &binding(),
                 &serialize_http_job_backend_state(&state).unwrap(),
+                None,
             ))
             .unwrap();
         let ReconcileResult::StillRunning {
@@ -4675,6 +4838,7 @@ mod tests {
                     cancel_deadline_ms: None,
                 })
                 .unwrap(),
+                None,
             ))
             .unwrap();
 
@@ -4929,6 +5093,7 @@ mod tests {
                     cancel_deadline_ms: None,
                 })
                 .unwrap(),
+                None,
             ))
             .unwrap_err();
 
@@ -4958,6 +5123,7 @@ mod tests {
             &artifact,
             &binding(),
             &input,
+            None,
         ));
         assert!(fault.unwrap_err().error.message.contains("paused"));
         let fault = runtime.block_on(run_http_artifact_status_worker_inner(
@@ -4967,6 +5133,7 @@ mod tests {
             &artifact,
             &binding(),
             &input,
+            None,
         ));
         assert!(fault.unwrap_err().error.message.contains("paused"));
         let fault = runtime.block_on(run_http_artifact_cancel_worker_inner(
@@ -4975,6 +5142,7 @@ mod tests {
             &artifact,
             &binding(),
             &input,
+            None,
         ));
         assert!(fault.unwrap_err().error.message.contains("paused"));
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -4992,6 +5160,8 @@ mod tests {
             },
         ] {
             let mut task = LocalTextWorkerTask {
+                request_id: "fixture-request".into(),
+                hosted_socket: None,
                 run_id: "run:fixture".into(),
                 generation: 1,
                 backend,
@@ -5013,6 +5183,9 @@ mod tests {
             &text,
             now_ms() + 5000,
             &mut cancel,
+            "run:fixture",
+            "fixture-request",
+            None,
         ));
         assert!(fault.unwrap_err().error.message.contains("paused"));
         TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.set(true));

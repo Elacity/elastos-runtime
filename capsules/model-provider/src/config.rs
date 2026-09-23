@@ -108,6 +108,9 @@ pub struct ProviderInitExtra {
     /// Private engine socket paths selected by the Runtime's macOS Seatbelt launch.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runtime_local_sockets: BTreeMap<String, String>,
+    /// Runtime-owned hosted HTTPS effect socket. It carries no provider key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_hosted_socket: Option<String>,
 }
 
 /// Private Init provenance projected by Runtime from its verified inventory.
@@ -156,6 +159,11 @@ impl ProviderInitExtra {
             {
                 anyhow::bail!("invalid Runtime local model sockets");
             }
+        }
+        if self.runtime_hosted_socket.as_ref().is_some_and(|path| {
+            !path.starts_with('/') || !path.ends_with(".sock") || path.len() >= 104
+        }) {
+            anyhow::bail!("invalid Runtime hosted effect socket");
         }
         if self.runtime_admitted_offers.len() > MAX_OFFER_COUNT {
             anyhow::bail!("too many Runtime model admissions");
@@ -1012,6 +1020,7 @@ mod tests {
             runtime_admitted_offers: Vec::new(),
             owner_reclaim: false,
             runtime_local_sockets: BTreeMap::new(),
+            runtime_hosted_socket: None,
             provider_id: Some("model-provider".to_string()),
             journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
             offers: vec![local_llama_offer(&engine, &model)],
@@ -1113,6 +1122,7 @@ mod tests {
             runtime_admitted_offers: Vec::new(),
             owner_reclaim: false,
             runtime_local_sockets: BTreeMap::new(),
+            runtime_hosted_socket: None,
             provider_id: None,
             journal_dir: Some("/tmp/model-provider".to_string()),
             offers: vec![ConfiguredOffer {

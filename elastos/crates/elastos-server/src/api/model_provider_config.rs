@@ -349,7 +349,7 @@ pub fn model_provider_bridge_config(
     let fixtures = load_hosted_validate_fixtures_unlocked(data_dir)?;
     let offers: Vec<serde_json::Value> = load_model_provider_operator_offers(data_dir)?
         .into_iter()
-        .map(|offer| materialize_provider_offer(data_dir, offer, fixtures.as_ref()))
+        .map(|offer| materialize_provider_offer(offer, fixtures.as_ref()))
         .map(strip_runtime_share_fields)
         .collect();
     Ok(provider::BridgeProviderConfig {
@@ -887,7 +887,10 @@ fn write_hosted_secret(data_dir: &Path, offer_id: &str, api_key: &str) -> anyhow
     write_model_provider_config_atomic(&path, api_key.as_bytes())
 }
 
-fn read_hosted_secret(data_dir: &Path, offer_id: &str) -> anyhow::Result<Option<String>> {
+pub(super) fn read_hosted_secret(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<Option<String>> {
     let path = hosted_secret_path(data_dir, offer_id)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -917,6 +920,24 @@ fn read_hosted_secret(data_dir: &Path, offer_id: &str) -> anyhow::Result<Option<
         return Ok(None);
     }
     Ok(Some(secret.to_string()))
+}
+
+pub(super) fn read_hosted_egress_grants(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let path = model_provider_root_dir(data_dir).join("egress-grants.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect hosted egress grants"),
+    };
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(
+        &model_provider_root_dir(data_dir),
+        "model-provider config root",
+    )?;
+    read_model_provider_private_file(&path, &metadata, 64 * 1024, "hosted egress grants").map(Some)
 }
 
 /// Called only after System admin authorization. Blank edits retain the key of
@@ -1022,22 +1043,18 @@ fn apply_fixture_chat_url(
 }
 
 fn materialize_provider_offer(
-    data_dir: &Path,
     mut offer: serde_json::Value,
     fixtures: Option<&HostedValidateFixtures>,
 ) -> serde_json::Value {
-    let Some(id) = offer_id_of(&offer).map(ToOwned::to_owned) else {
-        return offer;
-    };
-    let secret = read_hosted_secret(data_dir, &id).ok().flatten();
     if let Some(adapter) = offer
         .get_mut("adapter")
         .and_then(serde_json::Value::as_object_mut)
     {
         adapter.remove("secret_ref");
-        if let Some(secret) = secret {
-            adapter.insert("api_key".to_string(), serde_json::Value::String(secret));
-        }
+        // Runtime keeps hosted credentials; the native provider receives only
+        // a named offer and requests each external effect through Runtime.
+        adapter.remove("api_key");
+        adapter.remove("bearer_token");
     }
     apply_fixture_chat_url(fixtures, &mut offer);
     offer
@@ -2002,6 +2019,22 @@ mod validate_fixture_tests {
             venice["adapter"]["api_url"],
             "http://127.0.0.1:43721/venice/api/v1/chat/completions"
         );
+        assert!(jev["adapter"].get("api_key").is_none());
+        assert!(venice["adapter"].get("api_key").is_none());
+        assert!(jev["adapter"].get("secret_ref").is_none());
+        assert!(venice["adapter"].get("secret_ref").is_none());
+        assert!(super::read_hosted_secret(
+            dir.path(),
+            "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .unwrap()
+        .is_some());
+        assert!(super::read_hosted_secret(
+            dir.path(),
+            "model:hosted-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+        .unwrap()
+        .is_some());
         let disk = std::fs::read_to_string(
             dir.path()
                 .join("providers")

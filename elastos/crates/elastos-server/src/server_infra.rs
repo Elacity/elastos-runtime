@@ -1033,22 +1033,43 @@ async fn setup_server_infrastructure_impl(
                     let bridge_result =
                         provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
                             .await
-                            .map(|(bridge, sockets, config)| (bridge, Some(sockets), config));
+                            .map(|(bridge, sockets, config, listener)| {
+                                (bridge, Some(sockets), config, Some(listener))
+                            });
                     #[cfg(not(target_os = "macos"))]
                     let bridge_result =
                         provider::ProviderBridge::spawn(&path, model_config.clone())
                             .await
-                            .map(|bridge| (bridge, None, model_config.clone()));
+                            .map(|bridge| (bridge, None, model_config.clone(), None::<()>));
                     match bridge_result {
-                        Ok((bridge, local_sockets, confined_config)) => {
+                        Ok((bridge, local_sockets, confined_config, hosted_listener)) => {
                             model_config = confined_config;
                             #[cfg(target_os = "macos")]
                             if let Some(sockets) = local_sockets {
                                 provider_registry.set_local_model_sockets(sockets).await;
+                                if let Some(socket) =
+                                    model_config.extra["runtime_hosted_socket"].as_str()
+                                {
+                                    provider_registry
+                                        .set_hosted_model_socket(socket.to_owned())
+                                        .await;
+                                }
                             }
                             #[cfg(not(target_os = "macos"))]
                             let _ = local_sockets;
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = hosted_listener;
                             let bridge = Arc::new(bridge);
+                            #[cfg(target_os = "macos")]
+                            if let Some(listener) = hosted_listener {
+                                if let Err(error) = api::model_provider_egress::start(
+                                    listener,
+                                    bridge.clone(),
+                                    data_dir.clone(),
+                                ) {
+                                    tracing::warn!(%error, "model hosted egress broker unavailable");
+                                }
+                            }
                             let startup = async {
                                 #[cfg(unix)]
                                 api::settle_pending_model_startup(
