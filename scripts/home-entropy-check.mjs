@@ -12210,6 +12210,29 @@ assert(
   !/!\s*doc\.querySelector\([^)]*\)\?\.classList\.contains/.test(shellSmoke),
   "Smoke checks must not treat missing DOM nodes as visible with !optional chaining",
 );
+{
+  // Phone/tablet layout is gated by a ratchet: the smoke pins per-profile
+  // baselines that later PRs may only lower, runs Chromium and WebKit, and
+  // lives in the browser lane next to the other layout smokes.
+  const phoneSmoke = read("scripts/home-phone-layout-smoke.mjs");
+  const mobileCharter = read("docs/HOME_MOBILE.md");
+  assert(
+    phoneSmoke.includes("const MIN_TARGET_PX = 44;") &&
+      phoneSmoke.includes("const MIN_TEXT_PX = 12;") &&
+      phoneSmoke.includes('"phone-portrait": {') &&
+      phoneSmoke.includes('"phone-landscape": {') &&
+      phoneSmoke.includes("tablet: {") &&
+      phoneSmoke.includes('process.env.HOME_PHONE_SMOKE_ENGINES || "chromium,webkit"') &&
+      phoneSmoke.includes('failures.push(`${label}: horizontal overflow`);') &&
+      phoneSmoke.includes('"phone layout regressed past its baseline"') &&
+      phoneSmoke.includes("home-phone-layout-smoke: PASS") &&
+      justfile.includes("node scripts/home-phone-layout-smoke.mjs") &&
+      mobileCharter.includes("## Size classes") &&
+      mobileCharter.includes("## Gesture surface rule") &&
+      read("ROADMAP.md").includes("[Home on phones and tablets](docs/HOME_MOBILE.md)"),
+    "Home phone layout must keep its ratchet smoke (44 px targets, 12 px text, three profiles, both engines) in the browser lane and its charter linked from the roadmap",
+  );
+}
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
 assertCapabilityRequestStructsRejectUnknownFields();

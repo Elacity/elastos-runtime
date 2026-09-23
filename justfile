@@ -205,6 +205,7 @@ product-ui-browser:
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
+    node scripts/home-phone-layout-smoke.mjs
 
 product-ui-virtual-auth:
     HOME_VIRTUAL_AUTH_APP_MATRIX=1 node scripts/home-passkey-virtual-auth-smoke.mjs

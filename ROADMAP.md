@@ -318,7 +318,9 @@ Spaces, Apps, and System surfaces. It should hide provider names and transport
 details unless the user opens technical inspection.
 
 The host boundary is defined in
-[Home shell host contract](docs/HOME_SHELL_HOST_CONTRACT.md).
+[Home shell host contract](docs/HOME_SHELL_HOST_CONTRACT.md). The phone and
+tablet presentation of the same shell is defined in
+[Home on phones and tablets](docs/HOME_MOBILE.md).
 
 ### 8. Complete Browser behind one Browser, Net, and Exit contract
 
