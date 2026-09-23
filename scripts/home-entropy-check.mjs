@@ -7539,8 +7539,8 @@ assert(
     system.includes('data-ai-provider') &&
     system.includes('id="ai-provider-title" class="pc2-section-title">Hosted<') &&
     system.includes("Add hosted model") &&
-    system.includes("This Home stores the key.") &&
-    system.includes("The selected processor receives prompts outside this Home.") &&
+    !system.includes("This Home stores the key.") &&
+    !system.includes("The selected processor receives prompts outside this Home.") &&
     system.includes("This Home owns the system prompt for Venice.") &&
     system.includes('id="ai-provider-name"') &&
     system.includes('id="ai-provider-kind"') &&
