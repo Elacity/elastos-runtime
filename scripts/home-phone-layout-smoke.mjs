@@ -892,6 +892,11 @@ async function probePhoneDock(frame, page, dir) {
   return { tucked, peeked, dismissed };
 }
 
+// Idle pill height on phone: --taskbar-h. The hidden launcher and Assistant
+// face stay in flow (display: flex, collapsed) so any column gap on
+// .taskbar-inner shows up as dead space above the icons.
+const DOCK_IDLE_HEIGHT_PX = 72;
+
 function phoneDockFailures(run) {
   if (!run.dock) {
     return [];
@@ -899,6 +904,10 @@ function phoneDockFailures(run) {
   const { tucked, peeked, dismissed } = run.dock;
   const label = `${run.engine}/${run.profile}/dock`;
   const failures = [];
+  const idleDock = run.surfaces.find((surface) => surface.surface === "desktop")?.geometry?.dock;
+  if (!idleDock || Math.abs(idleDock.height - DOCK_IDLE_HEIGHT_PX) > 1) {
+    failures.push(`${label}: idle Dock pill is ${idleDock?.height}px tall, expected ${DOCK_IDLE_HEIGHT_PX} (icons must sit centred)`);
+  }
   const viewportHeight = run.viewport.height;
   if (!tucked.tucked || tucked.dockOnScreen || !tucked.handleVisible) {
     failures.push(`${label}: Dock must tuck under an open window with the handle showing`);

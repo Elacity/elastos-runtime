@@ -5882,10 +5882,6 @@ body.assistant-space-active #inbox-rail {
     max-width: calc(100vw - 20px);
   }
 
-  .taskbar-inner {
-    gap: 8px;
-  }
-
   /* The pinned row scrolls with the thumb: icons snap to slots, and the pill
      fades its edges only where more icons are hiding (scroll-driven). */
   .taskbar-sortable {
