@@ -12387,12 +12387,12 @@ assert(
   // scrolling row gives way) and scale to the plates' height; Control Centre
   // and Notifications span the stage with even side margins.
   assert(
-    homeGuiStyle.includes("--phone-dock-glyph-scale: 1.5;") &&
+    homeGuiStyle.includes("--phone-dock-glyph-scale: 1.3;") &&
       homeGuiStyle.includes("  .taskbar-icon-launcher {\n    background-size: calc(var(--phone-dock-glyph-scale) * 100%);") &&
       homeGuiStyle.includes("  .taskbar-item-assistant .taskbar-item-icon.assistant-mark {\n    transform: scale(var(--phone-dock-glyph-scale));") &&
       homeGuiStyle.includes("  .taskbar-item-launcher,\n  .taskbar-item-assistant {\n    flex-shrink: 0;\n  }\n\n  .taskbar-sortable {\n    min-width: 0;") &&
       homeGuiStyle.includes("  .control-centre,\n  .notification-center {\n    left: max(8px, env(safe-area-inset-left, 0px));\n    right: max(8px, env(safe-area-inset-right, 0px));\n    width: auto;"),
-    "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.5x to the plates' height (the Assistant only with its plate-free mark), Control Centre and Notifications span the stage with even margins",
+    "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.3x to sit just inside the plates (the Assistant only with its plate-free mark), Control Centre and Notifications span the stage with even margins",
   );
 
   // Capsule layout: the shell tells every capsule frame its size class; the

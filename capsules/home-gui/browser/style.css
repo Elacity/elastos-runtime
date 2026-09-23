@@ -6179,14 +6179,15 @@ body.assistant-space-active #inbox-rail {
 
   /* Plate-free glyphs (the Apps launcher; the Assistant when it wears its
      .assistant-mark) fill 58.6% of their square; app plates fill 87.9% of
-     theirs (measured from the 256 px PNGs). On a phone the glyphs match the
-     plates' height: 87.9 / 58.6 = 1.5×. A plate raster in the Assistant slot
+     theirs (measured from the 256 px PNGs). 1.5× would match the plates'
+     height exactly, which reads too heavy beside them on a phone; 1.3× sits
+     the glyphs just inside the plates. A plate raster in the Assistant slot
      already fills its square and takes no scale. The launcher glyph is a
      background (its .taskbar-icon transform is reserved for magnification);
      the Assistant scales its icon node so the mark's own layer animation is
      untouched. */
   :root {
-    --phone-dock-glyph-scale: 1.5;
+    --phone-dock-glyph-scale: 1.3;
   }
 
   .taskbar-icon-launcher {
