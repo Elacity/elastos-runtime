@@ -196,6 +196,17 @@ upstream, payer, limits and availability, and hands that exact offer to Services
 or Assistant. The existing-grant path passed. A fresh request and six-hour Inbox
 approval waits on the current human confirmation.
 
+Public model Get targets the Runtime that serves Home. In public Home, Get
+therefore prepares the public seed; it does not install bytes on the viewer's
+Mac. The public seed's five SmolLM2 attempts settled at `metadata_read` with
+zero index and transferred bytes. Its managed Kubo currently serves the signed
+index and bounded offline reads, so the ordinary Content/provider failure still
+needs exact classification before another Retry. Make Marketplace name the
+target Home and its local model capability before Get. Acceptance requires a
+signed-in Mac Home to Get SmolLM2 from the seed holder through its own Content
+and Carrier path, then use the admitted local offer in Assistant. The seed
+continues to hold the package and does not run local inference for this proof.
+
 The isolated installed hosted matrix passed destination authority, sharing
 pause/resume, combined private/shared capacity, key replacement, removal,
 retained-run access, transport loss, cancellation and owner restart checks.
