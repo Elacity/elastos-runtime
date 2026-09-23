@@ -113,6 +113,9 @@ a temp directory).
 The gate is a ratchet. `BASELINE` in the script pins today's numbers per
 profile and surface; a run may not exceed them. A PR that improves a surface
 lowers its row in the same commit. Nothing raises a row.
+`CAPSULE_TARGET_BASELINE` is the same ratchet inside each app's own frame
+(and the Assistant's, measured when its face opens) for targets under 44 px
+on the phone profiles; M6 takes a capsule's row to 0 as it fits the phone.
 
 ```bash
 HOME_PHONE_SMOKE_OUT=/tmp/phone-smoke node scripts/home-phone-layout-smoke.mjs
@@ -333,10 +336,13 @@ Escape, or picking an item closes it. It is bound by markup alone
 | Capsule | Phone layout |
 | --- | --- |
 | Marketplace | sidebar is the push drawer; the page title leads with its toggle |
-| Documents | the editor takes the full width; the document list is the push drawer; no Split view |
+| Documents | the editor takes the full width; the document list is the push drawer; no Split view; Write/Read and Save in one row, the other actions in a More menu |
 | Library | one header block: navigation row with the folder as title, Favorites as a sliding chip row; Search takes the navigation row; status floats as a pill |
-| System | menu button on the leading edge, on the page title's line |
-| Inbox | the request list is as tall as its requests (capped at 40 dvh); the detail follows directly |
+| System | menu button on the leading edge, on the page title's line, leads the push drawer at every phone width |
+| Inbox | the filters (the phone bar has no app menu) return as a two-segment row above the list; the request list is as tall as its requests (capped at 40 dvh); the detail follows directly |
+| People | 44 px buttons and 16 px profile fields |
+| Archive | 44 px Open archive and New ZIP |
+| Assistant | a vendor-ui target, so the room lands the size class; composer controls, the field, header buttons and session rows are 44 px, with the composer chips keeping their 32 px paint |
 | Browser | the navigation row spans the stage (no traffic-light inset) with 44 px controls |
 
 ## Capsule guidance
@@ -364,7 +370,7 @@ A first-party capsule fits the phone stage when:
 | M3 | 44 px phone title bar for every chrome mode, boot hairline, Mission Control as the app switcher (title swipe, icon captions, touch Close), stage history for system back on Chromium/Gecko (buttons-only on WebKit, recorded above) |
 | M4 | launcher, Spotlight, Control Centre and Notification Centre as full sheets |
 | M5 | touch grammar: long-press menus as bottom sheets, touch drag |
-| M6 | shell-to-capsule size class, shared tokens and push drawer; phone layouts for Marketplace, Documents, Library, System, Inbox and Browser (more capsules to follow, one PR each) |
+| M6 | shell-to-capsule size class, shared tokens and push drawer; phone layouts for Marketplace, Documents, Library, System, Inbox, Browser, People, Archive and the Assistant (more capsules to follow, one PR each) |
 | M7 | tablet and landscape |
 | M8 | PWA polish; native hosts are separate tasks |
 
