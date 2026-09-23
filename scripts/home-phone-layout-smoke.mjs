@@ -87,24 +87,24 @@ const PROFILES = [
 // the surface is recorded but not yet gated on that profile.
 const BASELINE = {
   "phone-portrait": {
-    desktop: { targets: 8, text: 2 },
-    launcher: { targets: 9, text: 2 },
-    spotlight: { targets: 8, text: 2 },
-    "control-centre": { targets: 33, text: 9 },
-    notifications: { targets: 9, text: 42 },
+    desktop: { targets: 1, text: 1 },
+    launcher: { targets: 2, text: 1 },
+    spotlight: { targets: 1, text: 1 },
+    "control-centre": { targets: 26, text: 8 },
+    notifications: { targets: 2, text: 41 },
     "mission-control": { targets: 1, text: 1 },
     "assistant-face": { targets: 1, text: 1 },
-    window: { targets: 13, text: 2 },
+    window: { targets: 5, text: 1 },
   },
   "phone-landscape": {
-    desktop: { targets: 8, text: 2 },
-    launcher: { targets: 9, text: 2 },
-    spotlight: { targets: 8, text: 2 },
-    "control-centre": { targets: 25, text: 7 },
-    notifications: { targets: 9, text: 5 },
+    desktop: { targets: 1, text: 1 },
+    launcher: { targets: 2, text: 1 },
+    spotlight: { targets: 1, text: 1 },
+    "control-centre": { targets: 19, text: 6 },
+    notifications: { targets: 2, text: 4 },
     "mission-control": { targets: 1, text: 1 },
     "assistant-face": { targets: 1, text: 1 },
-    window: { targets: 13, text: 2 },
+    window: { targets: 5, text: 1 },
   },
   tablet: {
     desktop: { targets: 8, text: 2 },
@@ -695,7 +695,13 @@ const SHELL_SURFACES = [
   },
   {
     id: "mission-control",
-    open: (frame) => frame.locator("#toolbar-mission-control").click(),
+    // Overview leaves the bar on phone and tablet-with-touch; Control Centre's
+    // Overview row is the route every size class has.
+    open: async (frame) => {
+      await frame.locator("#toolbar-control-centre").click();
+      await sleep(SHEET_SETTLE_MS);
+      await frame.locator("#control-centre-show-windows").click();
+    },
     settle: SHEET_SETTLE_MS,
     close: pressEscape,
   },
@@ -800,8 +806,26 @@ async function runProfile(browser, engineId, profile, origin) {
     reducedMotion: "reduce",
   });
   const surfaces = [];
+  let dockProbe = null;
+  let bootRetries = 0;
   try {
-    const { page, frame } = await bootHome(context, origin);
+    let booted;
+    try {
+      booted = await bootHome(context, origin);
+    } catch (error) {
+      // WebKit occasionally never attaches the GUI frame on the first page of
+      // a fresh engine (the host reports ready, the frame never lands). This
+      // smoke measures layout, not boot reliability; one retry is recorded in
+      // the report so a real regression still shows as repeated retries.
+      if (!/Home GUI frame/.test(error.message)) {
+        throw error;
+      }
+      bootRetries += 1;
+      console.warn(`[home-phone-layout] ${engineId}/${profile.id} boot retry: ${error.message.split("\n")[0]}`);
+      await Promise.all(context.pages().map((page) => page.close()));
+      booted = await bootHome(context, origin);
+    }
+    const { page, frame } = booted;
     for (const surface of SHELL_SURFACES) {
       await surface.open(frame);
       await sleep(surface.settle);
@@ -815,6 +839,9 @@ async function runProfile(browser, engineId, profile, origin) {
         continue;
       }
       await openWindow(frame, target);
+      if (profile.id.startsWith("phone") && !dockProbe) {
+        dockProbe = await probePhoneDock(frame, page, dir);
+      }
       const shell = await measure(frame, "window");
       shell.target = target;
       const capsuleFrame = page.frames().find((candidate) => candidate.url().includes(`/apps/${target}/`));
@@ -833,7 +860,62 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, bootRetries };
+}
+
+// Phone Dock contract with a window open: the Dock is off screen and the
+// window reaches down to the handle; the handle peeks the Dock over the app;
+// the scrim tucks it again. Runs against the first window of a phone profile.
+async function probePhoneDock(frame, page, dir) {
+  const dockState = () =>
+    frame.evaluate(() => {
+      const dock = document.querySelector(".taskbar").getBoundingClientRect();
+      const win = document.querySelector(".window:not([aria-hidden='true'])")?.getBoundingClientRect();
+      const handle = document.querySelector("#phone-dock-handle");
+      return {
+        tucked: document.body.classList.contains("phone-dock-tucked"),
+        peek: document.body.classList.contains("phone-dock-peek"),
+        dockOnScreen: dock.top < window.innerHeight,
+        windowBottom: win ? Math.round(win.bottom) : null,
+        handleVisible: Boolean(handle && !handle.hidden && handle.getClientRects().length > 0),
+        handleHeight: handle ? Math.round(handle.getBoundingClientRect().height) : 0,
+      };
+    });
+  const tucked = await dockState();
+  await frame.locator("#phone-dock-handle").click();
+  await sleep(SURFACE_SETTLE_MS);
+  const peeked = await dockState();
+  await screenshot(page, dir, "dock-peek");
+  await frame.locator("#phone-dock-scrim").click();
+  await sleep(SURFACE_SETTLE_MS);
+  const dismissed = await dockState();
+  return { tucked, peeked, dismissed };
+}
+
+function phoneDockFailures(run) {
+  if (!run.dock) {
+    return [];
+  }
+  const { tucked, peeked, dismissed } = run.dock;
+  const label = `${run.engine}/${run.profile}/dock`;
+  const failures = [];
+  const viewportHeight = run.viewport.height;
+  if (!tucked.tucked || tucked.dockOnScreen || !tucked.handleVisible) {
+    failures.push(`${label}: Dock must tuck under an open window with the handle showing`);
+  }
+  if (tucked.handleHeight < 24) {
+    failures.push(`${label}: Dock handle is ${tucked.handleHeight}px tall (minimum 24)`);
+  }
+  if (tucked.windowBottom === null || tucked.windowBottom < viewportHeight - tucked.handleHeight - 1) {
+    failures.push(`${label}: window bottom ${tucked.windowBottom} must reach the Dock handle (${viewportHeight - tucked.handleHeight})`);
+  }
+  if (!peeked.peek || !peeked.dockOnScreen) {
+    failures.push(`${label}: handle must peek the Dock over the app`);
+  }
+  if (dismissed.peek || dismissed.dockOnScreen) {
+    failures.push(`${label}: scrim must tuck the Dock again`);
+  }
+  return failures;
 }
 
 function sourceTruths() {
@@ -929,7 +1011,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {
@@ -955,6 +1037,7 @@ try {
     `home-phone-layout-smoke: PASS engines=${report.runs.map((run) => run.engine).filter((value, index, all) => all.indexOf(value) === index).join("+")} ` +
       `viewport_fit=${source.viewportFitCover.home && source.viewportFitCover.gui ? "cover" : "none"} ` +
       `bare_100vh=${source.bareViewportHeightUnits} backdrop_filters=${source.backdropFilters} ` +
+      `boot_retries=${report.runs.reduce((sum, run) => sum + run.bootRetries, 0)} ` +
       `${skippedEngines.length ? `skipped=${skippedEngines.join(",")} (not installed) ` : ""}report=${join(outputRoot, "report.json")}`,
   );
 } finally {

@@ -12278,6 +12278,48 @@ assert(
     "Home form factor must have one reader (shell-form-factor.js: 640/1100 size classes, media-feature pointer class, body dataset, --keyboard-inset) bound at GUI boot and unit-tested in verify",
     { strayBreakpointReaders },
   );
+
+  // Phone bar and Dock. CSS keys the phone size class on one media list that
+  // mirrors classifyFormFactor (width, or coarse pointer + landscape height);
+  // the bar is 44 px with 44 px hit boxes and only brand · inbox · search ·
+  // status · clock; the Dock scrolls by thumb, fades its hidden edges and
+  // tucks under an open window behind a 24 px handle (shell-phone-dock.js).
+  const phoneMaxWidth = /export const PHONE_MAX_WIDTH = (\d+);/.exec(formFactorModule)?.[1];
+  const phoneMediaList =
+    `@media (max-width: ${phoneMaxWidth}px), (pointer: coarse) and (max-height: ${phoneMaxWidth}px), ` +
+    `(hover: none) and (max-height: ${phoneMaxWidth}px) {`;
+  const phoneDockModule = read("capsules/home-gui/browser/shell-phone-dock.js");
+  const homeGuiTemplate = read("capsules/home-gui/browser/home-gui-template.html");
+  assert(
+    homeGuiStyle.includes(phoneMediaList) &&
+      !/@media \(max-width: 640px\)(?!,)/.test(homeGuiStyle) &&
+      homeGuiStyle.includes("--toolbar-h: 44px;") &&
+      homeGuiStyle.includes(".toolbar-btn {\n    width: var(--toolbar-h);\n    height: var(--toolbar-h);") &&
+      homeGuiStyle.includes("#toolbar-wallet,\n  #toolbar-mission-control {\n    display: none;") &&
+      homeGuiStyle.includes(".toolbar-inbox-count {\n    top: 5px;\n    right: 5px;\n    min-width: 16px;\n    height: 16px;\n    font-size: 12px;") &&
+      homeGuiStyle.includes("max-width: calc(100vw - 20px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));") &&
+      homeGuiStyle.includes("scroll-snap-type: x proximity;") &&
+      homeGuiStyle.includes("#000 var(--dock-fade-start, 0px),") &&
+      homeGuiStyle.includes(".taskbar-item {\n    touch-action: pan-x;") &&
+      homeGuiStyle.includes("--phone-dock-handle-h: 24px;") &&
+      homeGuiStyle.includes(
+        "body.phone-dock-tucked {\n    --stage-bottom: calc(var(--phone-dock-handle-h) + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));",
+      ) &&
+      homeGuiStyle.includes("body.phone-dock-tucked:not(.phone-dock-peek):not(.expose-active) .taskbar:not(:focus-within) {") &&
+      homeGuiTemplate.includes('<button id="phone-dock-handle" class="phone-dock-handle" type="button" aria-label="Show Dock" hidden>') &&
+      homeGuiTemplate.includes('<button id="phone-dock-scrim" class="phone-dock-scrim" type="button" aria-label="Hide Dock" tabindex="-1"></button>') &&
+      phoneDockModule.includes('import { isPhone } from "./shell-form-factor.js?v=home-20260813a";') &&
+      phoneDockModule.includes("export function syncPhoneDock(doc = document, view = window) {") &&
+      phoneDockModule.includes("export const DOCK_HANDLE_SWIPE_PX = 12;") &&
+      shellSurface.includes(
+        "    updateTaskbarButton(button, button.dataset.target);\n  }\n  // Every window open/close/focus lands here; the phone Dock tucks or returns.\n  syncPhoneDock();\n}",
+      ) &&
+      homeGuiJs.includes("bindPhoneDock();") &&
+      phoneSmoke.includes("async function probePhoneDock(frame, page, dir) {") &&
+      phoneSmoke.includes('await frame.locator("#control-centre-show-windows").click();') &&
+      justfile.includes("node --test scripts/home-phone-dock.test.mjs"),
+    "Home phone bar and Dock: one phone media list mirroring PHONE_MAX_WIDTH, 44 px bar with 44 px hit boxes (wallet and Overview move to Control Centre), thumb-scrolled Dock with edge fades and safe-area sides, Dock tucked under windows behind a 24 px handle via shell-phone-dock.js, probed by the phone smoke and unit-tested in verify",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();

@@ -608,6 +608,13 @@
   </div>
 </footer>
 
+<!-- Phone only: the Dock tucks under an open window; this handle brings it back
+     and the scrim dismisses the peek (shell-phone-dock.js). -->
+<button id="phone-dock-handle" class="phone-dock-handle" type="button" aria-label="Show Dock" hidden>
+  <span class="phone-dock-handle-bar" aria-hidden="true"></span>
+</button>
+<button id="phone-dock-scrim" class="phone-dock-scrim" type="button" aria-label="Hide Dock" tabindex="-1"></button>
+
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 
 <section

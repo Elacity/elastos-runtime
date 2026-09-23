@@ -87,6 +87,7 @@ import {
 } from "./shell-motion.js?v=home-20260813a";
 import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
 import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260813a";
+import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -635,6 +636,8 @@ export function updateTaskbarState() {
   for (const button of taskbarTargets.querySelectorAll(".taskbar-item[data-target]")) {
     updateTaskbarButton(button, button.dataset.target);
   }
+  // Every window open/close/focus lands here; the phone Dock tucks or returns.
+  syncPhoneDock();
 }
 
 function commitTaskbarLayoutChange() {

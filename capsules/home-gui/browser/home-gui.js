@@ -151,6 +151,7 @@ import {
   showConnectorSheet,
 } from "./shell-connector-sheet.js?v=home-20260813a";
 import { bindFormFactor } from "./shell-form-factor.js?v=home-20260813a";
+import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -1195,6 +1196,8 @@ export function bindHomeGuiInteractions(options = {}) {
   // Size class, pointer class and soft-keyboard inset before any surface
   // binds, so CSS keyed on body[data-form-factor] is right on first paint.
   bindFormFactor();
+  // Phone Dock tuck/peek handle; a no-op on tablet and desktop.
+  bindPhoneDock();
 
   // The brand button itself toggles the ElastOS menu (bound in
   // bindIdentityMenu); the go-home action lives inside it as Show desktop.

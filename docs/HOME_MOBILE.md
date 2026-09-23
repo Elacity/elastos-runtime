@@ -129,6 +129,70 @@ Source truths that the smoke measures are also pinned by
 so a phone contract cannot drift without a gate going red even on a machine
 without browsers.
 
+## Bar and Dock (M2)
+
+CSS keys the phone size class on one media list that mirrors
+`classifyFormFactor()`: `(max-width: 640px)`, or a coarse/hover-less pointer
+with `(max-height: 640px)`. A phone held sideways therefore keeps the phone
+shell. The entropy check derives the list from `PHONE_MAX_WIDTH`, so the two
+readers cannot drift apart.
+
+Bar:
+
+- `--toolbar-h: 44px`. Every bar control is a 44 × 44 hit box (11 px padding
+  around the same 22 px glyph); the clock's line-height is the bar height;
+  the inbox badge is 16 px with 12 px numerals.
+- Composition on phone is brand · inbox · search · status · clock. Wallet and
+  Overview leave the bar; Control Centre keeps both one tap away (Quick open
+  and Overview rows), so nothing is lost. The phone smoke opens Mission
+  Control through that route.
+- The bar pads its trailing edge with `env(safe-area-inset-right)` only; the
+  44 px boxes supply the visual margin.
+
+Dock:
+
+- The pinned row scrolls with the thumb (`touch-action: pan-x` on tiles; the
+  desktop reorder drag still works because Playwright/pointer cancel ends the
+  drag), snaps tiles to slots, and fades only the edge that hides more tiles
+  (`--dock-fade-start/end`, written on scroll by `shell-phone-dock.js`).
+- The pill keeps `env(safe-area-inset-left/right)` clear in landscape.
+- The running indicator is a 14 × 4 px capsule.
+- With a window open the Dock tucks off screen (`body.phone-dock-tucked`) and
+  `--stage-bottom` shrinks to a 24 px handle above the home indicator, so the
+  app gets the stage. Tap or swipe the handle up to peek the Dock over the app
+  (`body.phone-dock-peek`, scrim behind it); tapping the scrim, pressing
+  Escape, or picking a window tucks it again. Mission Control, the launcher
+  face and keyboard focus inside the Dock always show it. The desktop
+  auto-hide preference is untouched; a peek wins over it.
+- `syncPhoneDock()` runs from `updateTaskbarState()`, the one place every
+  window open, close and focus already passes through, and on resize.
+
+The smoke probes the tuck → peek → tuck cycle on both phone profiles and
+fails if the window does not reach the handle or the handle is under 24 px.
+`scripts/home-phone-dock.test.mjs` covers the decision logic under
+`node:test`.
+
+The 74 KB `wallpaper.webp` is already smaller than a phone-specific crop
+would be; no `image-set()` variant.
+
+### After M2 (bar and Dock), 2026-09-23
+
+Identical in Chromium and WebKit. Remaining window targets are the three
+12 px window controls (M3) and the 24 px Dock handle, which is that size by
+design (it lives in the home-indicator strip and must not cover the app);
+the launcher view toggle, Control Centre and calendar rows are M4.
+
+| Surface | Portrait targets < 44 / text < 12 | Landscape | Tablet |
+| --- | --- | --- | --- |
+| desktop (bar + dock) | 0 / 0 | 0 / 0 | 7 / 1 |
+| launcher | 1 / 0 | 1 / 0 | 8 / 1 |
+| spotlight | 0 / 0 | 0 / 0 | 7 / 1 |
+| control centre | 25 / 7 | 18 / 5 | 29 / 7 |
+| notifications (calendar) | 1 / 40 | 1 / 3 | 8 / 41 |
+| mission control | 0 / 0 | 0 / 0 | 0 / 0 |
+| assistant face (shell chrome only) | 0 / 0 | 0 / 0 | 0 / 0 |
+| any window | 4 / 0 | 4 / 0 | 11–12 / 1 |
+
 ### Baseline on 2026-09-23 (before any phone work)
 
 Identical in Chromium and WebKit.
@@ -198,7 +262,7 @@ A first-party capsule fits the phone stage when:
 | --- | --- |
 | M0 | this charter, the phone layout smoke and its baseline |
 | M1 | viewport and input truth: `viewport-fit`, overscroll, `dvh`, form-factor module, keyboard inset |
-| M2 | 44 px bar, dock that hides under an open window with a handle |
+| M2 | 44 px bar with wallet/Overview in Control Centre, thumb-scrolled Dock that tucks under an open window behind a 24 px handle |
 | M3 | phone title bar, instant title while loading, stage history for system back, app switcher |
 | M4 | launcher, Spotlight, Control Centre and Notification Centre as full sheets |
 | M5 | touch grammar: long-press menus as bottom sheets, touch drag |

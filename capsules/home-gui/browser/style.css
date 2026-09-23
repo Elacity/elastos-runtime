@@ -3453,6 +3453,52 @@ body.dock-autohide::after {
   z-index: 100099;
 }
 
+/* Phone Dock handle + peek scrim (shell-phone-dock.js). Inert everywhere but
+   the phone size class, which sets --phone-dock-handle-h and the tuck rules. */
+.phone-dock-handle,
+.phone-dock-scrim {
+  display: none;
+  position: fixed;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.phone-dock-handle {
+  left: 50%;
+  bottom: env(safe-area-inset-bottom, 0px);
+  z-index: 100101;
+  width: 180px;
+  height: var(--phone-dock-handle-h, 24px);
+  place-items: center;
+  transform: translateX(-50%);
+  touch-action: none;
+}
+
+.phone-dock-handle:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: -2px;
+  border-radius: 8px;
+}
+
+/* Reads over any app: light bar, dark keyline. */
+.phone-dock-handle-bar {
+  width: 96px;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+
+.phone-dock-scrim {
+  inset: 0;
+  z-index: 100099;
+  background: rgba(0, 0, 0, 0.28);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .taskbar {
     transition: none;
@@ -5739,19 +5785,55 @@ body.assistant-space-active #inbox-rail {
   }
 }
 
-@media (max-width: 640px) {
-  /* Phone shell: bar keeps brand · identity · clock; the focused-window title
-     and identity name yield the space. The clock never hides. */
+/* Phone size class. Mirrors classifyFormFactor() in shell-form-factor.js
+   (PHONE_MAX_WIDTH / coarse-pointer landscape) so a rotated phone keeps the
+   phone shell instead of becoming a 390 px-tall desktop. home-entropy-check
+   pins the two together. */
+@media (max-width: 640px), (pointer: coarse) and (max-height: 640px), (hover: none) and (max-height: 640px) {
+  /* Phone bar: 44 px tall; every control is a 44×44 hit box around the same
+     22 px glyph. Wallet and Overview leave the bar — Control Centre keeps
+     them one tap away (Quick open / Overview) — so brand · inbox · search ·
+     status · clock fit a 390 px bar. The clock never hides. */
+  :root {
+    --toolbar-h: 44px;
+  }
+
   .toolbar {
-    padding-right: 8px;
+    padding-right: max(2px, env(safe-area-inset-right, 0px));
   }
 
   .toolbar-btn {
-    margin-left: 7px;
+    width: var(--toolbar-h);
+    height: var(--toolbar-h);
+    margin-left: 0;
+    padding: 11px;
+    border-radius: 10px;
+  }
+
+  .toolbar-brand {
+    width: auto;
+    padding: 11px 0;
+  }
+
+  .toolbar-clock {
+    min-height: var(--toolbar-h);
+    margin-left: 0;
+    padding: 0 10px;
+    line-height: var(--toolbar-h);
+  }
+
+  .toolbar-inbox-count {
+    top: 5px;
+    right: 5px;
+    min-width: 16px;
+    height: 16px;
+    font-size: 12px;
   }
 
   .toolbar-active-title,
-  .toolbar-menubar {
+  .toolbar-menubar,
+  #toolbar-wallet,
+  #toolbar-mission-control {
     display: none;
   }
 
@@ -5783,7 +5865,9 @@ body.assistant-space-active #inbox-rail {
   /* Dock: fixed bottom row, horizontally scrollable, no magnification (the
      magnification code also gates itself off below 641px / non-hover). */
   .taskbar {
-    max-width: calc(100vw - 20px);
+    /* Landscape notch: the pill stays clear of the rounded corners on the
+       side that carries the sensor housing. */
+    max-width: calc(100vw - 20px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
     padding-left: 8px;
     padding-right: 8px;
   }
@@ -5802,14 +5886,72 @@ body.assistant-space-active #inbox-rail {
     gap: 8px;
   }
 
+  /* The pinned row scrolls with the thumb: icons snap to slots, and the pill
+     fades its edges only where more icons are hiding (scroll-driven). */
   .taskbar-sortable {
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
+    scroll-snap-type: x proximity;
+    scroll-padding-inline: 2px;
+    -webkit-overflow-scrolling: touch;
+    mask-image: linear-gradient(
+      to right,
+      transparent,
+      #000 var(--dock-fade-start, 0px),
+      #000 calc(100% - var(--dock-fade-end, 0px)),
+      transparent
+    );
   }
 
   .taskbar-sortable::-webkit-scrollbar {
     display: none;
+  }
+
+  .taskbar-item,
+  .taskbar-entry {
+    scroll-snap-align: center;
+  }
+
+  /* Running indicator grows to a legible 4 px pill under the 58 px tile. */
+  .active-taskbar-indicator {
+    width: 14px;
+    height: 4px;
+  }
+
+  /* The thumb scrolls the row; reordering waits for long-press (M5). */
+  .taskbar-item {
+    touch-action: pan-x;
+  }
+
+  /* Dock under an open window (shell-phone-dock.js): the app takes the stage
+     down to a 24 px handle above the home indicator. Tap or swipe the handle
+     to peek the Dock over the app; tap the app (scrim) or Escape tucks it
+     again. Mission Control and keyboard focus always show the Dock. */
+  :root {
+    --phone-dock-handle-h: 24px;
+  }
+
+  body.phone-dock-tucked {
+    --stage-bottom: calc(var(--phone-dock-handle-h) + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px));
+  }
+
+  body.phone-dock-tucked:not(.phone-dock-peek):not(.expose-active) .taskbar:not(:focus-within) {
+    transform: translateY(calc(100% + var(--taskbar-offset) + 8px + env(safe-area-inset-bottom, 0px)));
+    pointer-events: none;
+  }
+
+  /* A peek wins over the desktop auto-hide preference too. */
+  body.phone-dock-peek .taskbar {
+    transform: translateY(0);
+  }
+
+  body.phone-dock-tucked:not(.phone-dock-peek) .phone-dock-handle:not([hidden]) {
+    display: grid;
+  }
+
+  body.phone-dock-peek .phone-dock-scrim {
+    display: block;
   }
 
   .taskbar.is-launcher-face .launcher {
