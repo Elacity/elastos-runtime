@@ -487,6 +487,19 @@ open. Next: Linux product confinement, upstream unknown-attempt reconciliation,
 and separate public HTTPS owner/target proof; wider MA/AI/CR acceptance remains
 open.
 
+Mac SEC1 destination challenge is complete for the installed diagnostic Home.
+The broker binds a private test CA to the owner decision and uses it as the
+only TLS root for an exact loopback HTTPS route. A controlled redirect did not
+reach its second sink, a `localhost` hostname substitution was refused before
+dispatch, and a wrong-name certificate signed by the approved test CA sent no
+HTTP request. The exact approved HTTP and HTTPS routes each worked. The
+diagnostic Runtime and private state were restored; the signed-in human Homes
+remained open. Source commit `623affc3`, installed artifact parity, sink counts,
+restoration hashes and independent review are recorded in
+`.audit/sec1-destination-boundary/receipt.json`. Next: Linux production
+confinement, upstream unknown-create reconciliation, and separate public HTTPS
+owner/target proof; wider MA/AI/CR acceptance remains open.
+
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
 old bytes while setup replaced their checksum, size and CID pins with empty
