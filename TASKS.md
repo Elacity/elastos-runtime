@@ -371,9 +371,18 @@ every 250 ms while the upstream request or response body waits. A local
 slow-header fixture received one authorized request, then revocation ended
 validation before its 20-second timeout. All six scoped broker tests, the
 basic source gate and a bounded read-only review pass. A slow response body
-uses the same monitor but has no separate fixture proof. Installed validation
-revocation still needs the marked diagnostic Home and built/installed parity;
-public HTTPS remains paused.
+uses the same monitor but has no separate fixture proof. The canonical
+source-home install and owned restart on marked diagnostic Home 61971 produced
+matching built/installed Runtime SHA-256 `541890cc…`; provider SHA-256
+`c23d3e7e…` and manifest verification passed. The installed slow-header
+fixture sent one dummy-key request to its local sink, revoked the exact grant,
+and received System HTTP 400 in 0.002 s while the sink still withheld its
+response. Original grant bytes, provider config and fixture stayed intact.
+The two signed-in human Homes returned HTTP 200, their gateway PIDs stayed,
+and 29 protected files kept hashes and inodes. Disk remained above 20% free;
+no paid call was made. Receipt:
+`.audit/hosted-egress-design-scratch/active-validation-installed-receipt.json`.
+Public HTTPS remains paused.
 
 Source-home release stamp correction: the public demo cutover exposed five
 unchanged preexisting Linux providers whose installed binaries retained their
