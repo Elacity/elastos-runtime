@@ -12456,6 +12456,17 @@ assert(
     "Capsule layout: shell-capsule-layout.js posts elastos:shell-layout to every frame on load and on size-class change; the shared theme runtime takes it only from the opaque parent and only allowlisted values; phone zeroes the desktop chrome safe areas; unit-tested in verify and checked in real frames by the phone smoke",
   );
 
+  // Capsule ratchet: the phone smoke gates small targets inside each app frame
+  // per phone profile; rows only ever go down.
+  const capsuleRatchet = phoneSmoke.match(/const CAPSULE_TARGET_BASELINE = \{([\s\S]*?)\n\};/);
+  assert(
+    capsuleRatchet !== null &&
+      ["phone-portrait", "phone-landscape"].every((profile) => capsuleRatchet[1].includes(`"${profile}": {`)) &&
+      phoneSmoke.includes("    const capsuleLimit = CAPSULE_TARGET_BASELINE[run.profile]?.[surface.target];") &&
+      phoneSmoke.includes("    if (capsuleLimit !== undefined && capsuleSmall > capsuleLimit) {"),
+    "Capsule ratchet: the phone smoke fails when an app frame on a phone profile has more targets under 44 px than its pinned row",
+  );
+
   // Phone push drawer: one shared module (inert when closed, a tap on the
   // pushed view closes without activating it, follows the size class),
   // vendored only where a sidebar uses it, and one shared smoke assertion.

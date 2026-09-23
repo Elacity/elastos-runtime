@@ -1062,6 +1062,20 @@ const EXPECTED_CAPSULE_FORM_FACTOR = {
   tablet: "tablet",
 };
 
+// Capsule ratchet (M6): targets < 44 px inside each app's frame on the phone
+// stage, the higher of both engines on 2026-09-23. Each capsule change lowers
+// its row; the M6 goal is 0 everywhere. Tablet is recorded, not yet gated.
+const CAPSULE_TARGET_BASELINE = {
+  "phone-portrait": {
+    library: 2, documents: 3, marketplace: 1, system: 0, people: 2, services: 0,
+    wallet: 0, inbox: 1, "archive-manager": 2, "elacity-player": 0, browser: 4,
+  },
+  "phone-landscape": {
+    library: 2, documents: 3, marketplace: 1, system: 1, people: 4, services: 0,
+    wallet: 0, inbox: 1, "archive-manager": 0, "elacity-player": 0, browser: 4,
+  },
+};
+
 function shellFailures(run) {
   const failures = [];
   const baseline = BASELINE[run.profile] || {};
@@ -1069,6 +1083,11 @@ function shellFailures(run) {
     const layout = surface.capsuleLayout;
     if (layout?.sharedTheme && layout.formFactor !== EXPECTED_CAPSULE_FORM_FACTOR[run.profile]) {
       failures.push(`${run.engine}/${run.profile}/window:${surface.target}: capsule frame form factor ${layout.formFactor} (expected ${EXPECTED_CAPSULE_FORM_FACTOR[run.profile]})`);
+    }
+    const capsuleLimit = CAPSULE_TARGET_BASELINE[run.profile]?.[surface.target];
+    const capsuleSmall = surface.capsule?.smallTargets.length ?? 0;
+    if (capsuleLimit !== undefined && capsuleSmall > capsuleLimit) {
+      failures.push(`${run.engine}/${run.profile}/window:${surface.target}: ${capsuleSmall} capsule targets < ${MIN_TARGET_PX}px (baseline ${capsuleLimit})`);
     }
     const limits = baseline[surface.surface];
     if (!limits) continue;
