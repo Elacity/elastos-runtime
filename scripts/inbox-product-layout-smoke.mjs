@@ -216,14 +216,22 @@ async function run() {
     const mobile = await page.evaluate(() => {
       const rows = document.getElementById("entry-rows").getBoundingClientRect();
       const detail = document.getElementById("entry-detail").getBoundingClientRect();
+      const lastRow = [...document.querySelectorAll("#entry-rows .entry-row")].at(-1).getBoundingClientRect();
       return {
         splitColumns: getComputedStyle(document.getElementById("entry-split")).gridTemplateColumns,
         rowsTop: rows.top,
+        rowsBottom: rows.bottom,
+        lastRowBottom: lastRow.bottom,
         detailTop: detail.top,
       };
     });
     assert(mobile.splitColumns === "520px" || mobile.splitColumns.split(" ").length === 1, "mobile must stack the list/detail split", mobile);
     assert(mobile.detailTop > mobile.rowsTop, "mobile detail must sit below the list", mobile);
+    assert(
+      mobile.rowsBottom - mobile.lastRowBottom <= 16 && mobile.detailTop - mobile.rowsBottom <= 1,
+      "mobile list must fit its requests so the detail reads directly beneath, not mid-screen",
+      mobile,
+    );
     await noHorizontalOverflow(page, "mobile");
 
     const railPage = await browser.newPage({ viewport: { width: 420, height: 900 } });

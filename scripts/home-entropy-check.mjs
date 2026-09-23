@@ -12472,6 +12472,12 @@ assert(
       justfile.includes("node scripts/system-uiux-layout-smoke.mjs"),
     "System phone: the menu button sits on the leading edge on the page title's line, asserted by the UI/UX smoke in the browser lane",
   );
+
+  assert(
+    read("capsules/inbox/browser/index.html").includes("        grid-template-rows: auto minmax(0, 1fr);\n      }\n\n      .entry-rows {\n        max-height: 40dvh;") &&
+      read("scripts/inbox-product-layout-smoke.mjs").includes('"mobile list must fit its requests so the detail reads directly beneath, not mid-screen",'),
+    "Inbox narrow: the request list is as tall as its requests so the detail follows directly, asserted by the layout smoke",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
