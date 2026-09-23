@@ -407,7 +407,7 @@ pass installed lifecycle tests before it can be shared:
    owner enters that provider's key in Home. Prove the existing
    provider-internal OpenAI Responses API adapter separately. xAI/Grok stays
    later.
-4. Prove optional sharing of the accepted Mac local model with another Runtime.
+4. Prove J3 sharing of the accepted Mac local model with another Runtime.
    This requires signed offer and grant admission plus bounded Carrier ingress.
    A Jetson deployment is a separate acceptance track.
 5. After each private connection exists, add an explicit owner-funded Share of

@@ -124,11 +124,11 @@ workflow, file picker or editable model path. It uses this sequence:
    Runtime keeps paths and backend routes private. Selection preserves drafts
    and existing runs and never silently substitutes another model.
 
-Off-box catalog and package delivery belongs to the existing Content and
-availability contracts over Carrier. Runtime applies the same publisher,
-identity and authority checks. The bounded preparation path currently dispatches
-locally and excludes availability retrieval; this paragraph defines intended
-distribution, not implemented remote model transfer.
+Off-box catalog and package delivery uses the existing Content and availability
+contracts over Carrier. Runtime applies the same publisher, identity and
+authority checks. A bounded local miss can fetch from an authenticated holder;
+the installed direct-Carrier SmolLM2 result is recorded in [state.md](../state.md).
+Independent-holder and wider route acceptance remain open.
 
 The CID proves the closure bytes. The publisher signature proves who made the
 source claim. Availability receipts prove accepted retention. Runtime owns
@@ -224,8 +224,9 @@ package CID before admission.
 Operator configuration in `components.json.model_catalog` pins the exact raw
 CIDv1/SHA-256 head and one to eight trusted publisher DIDs. Runtime reads the
 fixed local `model-catalog.json` snapshot with a 128 KiB bound, verifies that
-head and signature independently from entry claims, and accepts one current
-signed entry. The entry names a canonical DAG-PB/SHA-256 package closure CID.
+head and signature independently from entry claims, and accepts one to eight
+unique current signed entries. Each entry names a canonical DAG-PB/SHA-256
+package closure CID.
 The existing authenticated catalog exposes verified publisher identity,
 declared CID/size and model metadata, with installed and launchable both false.
 The caller's admission and exact-offer dispatch readiness determine whether the
@@ -349,7 +350,7 @@ content CID and the consumer's typed model-run authority.
 
 | Existing path to reuse | Bounded change to review |
 | --- | --- |
-| `gateway_capsule_catalog/read_model.rs` already merges signed passive model entries into the capsule catalog. | Make Marketplace the primary content discovery path; retain System management and one catalog. Review the exact-one-entry validation and both helpers' at-most-one limit before broader choices. |
+| `gateway_capsule_catalog/read_model.rs` already merges signed passive model entries into the capsule catalog. | Keep Marketplace as content discovery, System as management, and one signed catalogue. Runtime validates one to eight unique entries; verify the matching UI projection on the named candidate. |
 | Generic `CapsuleManifest.viewer`, viewer compatibility audit and Home open-target handoff describe a content consumer. | The model profile rejects `viewer`; the current audit also requires an installed viewer-role target with a content interface. Agent/Assistant use their own roles and model interfaces. Map compatible selection explicitly rather than removing checks or relabeling execution as passive content. |
 | Library's protected-video handoff and Home launch context keep identity separate from authority. | Define the smallest exact-CID selection handoff into Assistant, preserving drafts, current launch binding and deliberate run intent. Open Models now opens Marketplace Models, and a ready result can select that exact CID in Assistant. |
 | Runtime preparation inventory, private artifact descriptors and the existing model provider own admission, retention and execution. | Compose selection with preparation while retaining fail-closed admission, exact offer binding and cancellation/outcome ownership. The content manifest supplies no execution capability. |
@@ -491,8 +492,9 @@ state rather than using an ambient executable or another model. Engine delivery
 uses the existing verified component mechanism, not a second UI downloader.
 No production publisher, signed catalog CID or availability deployment is
 invented by fixtures. Git contains code, tests, docs and reviewed manifests;
-large model bytes and private publisher keys remain outside it. Remote hosted
-inference publication, Jetson and mandates remain later work.
+large model bytes and private publisher keys remain outside it. Exact
+owner-funded hosted sharing is Required for J3 under MA4 and AI2/AI3. Wider
+hosted-service rollout, Jetson and mandates remain later work.
 
 ## Bootstrap while the network matures
 

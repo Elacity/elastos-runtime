@@ -1838,8 +1838,9 @@ complete. Installed proof and the atomic authority cutover remain open.
   boundary.
 - A missing installed components manifest or model-provider entry leaves the
   provider unconfigured and unavailable. Runtime does not select a fallback.
-- The preserved human-test installations still report zero offers. The combined
-  source now owns the bounded local llama lifecycle, verified model admission,
+- At this earlier checkpoint, the preserved human-test installations reported
+  zero offers. The combined source owned the bounded local llama lifecycle,
+  verified model admission,
   restart reconciliation and provider-internal Chat Completions/Responses adapters.
   Model-provider source verification passes 204 unit and five process tests;
   paid hosted calls and installed Qwen acceptance retain their separate gates.
