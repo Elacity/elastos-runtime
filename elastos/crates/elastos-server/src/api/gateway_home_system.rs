@@ -269,6 +269,10 @@ struct HomeServiceAccessRequestRecord {
     grant_scope: Option<String>,
     request_id: String,
     offer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_model_offer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_model_offer_revision: Option<String>,
     service_uri: String,
     service_kind: String,
     service_display_name: String,
@@ -287,6 +291,10 @@ struct HomeServiceAccessRequestRecord {
     authenticated_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    approved_offer_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    approved_offer_revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exit_max_active_streams: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2058,6 +2066,15 @@ pub(super) async fn services_offer_update(
         };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
+    let _model_share_guard = if req.section.trim() == "mine" {
+        Some(
+            super::gateway_model_service::model_share_gate()
+                .write()
+                .await,
+        )
+    } else {
+        None
+    };
     match tokio::task::spawn_blocking(move || {
         let mutation_lock = home_services_mutation_lock(&data_dir)?;
         let _guard = mutation_lock
@@ -2706,7 +2723,8 @@ fn home_services_send_access_decision(
             "grant_id": super::model_grant_id(&request.request_id),
             "peer_did": runtime.peer_id,
             "connect_ticket": runtime.connect_ticket,
-            "offer_scope": "local_engines",
+            "offer_ids": &request.approved_offer_ids,
+            "offer_revision": &request.approved_offer_revision,
             "operations": super::MODEL_OPERATIONS,
             "expires_at": request.grant_expires_at,
         });
@@ -3523,12 +3541,22 @@ fn home_services_remote_model_grant(
             && grant["grant_id"].as_str()
                 == Some(super::model_grant_id(&record.request_id).as_str())
             && grant["peer_did"].as_str() == Some(&record.target_peer_id)
-            && grant["offer_scope"] == "local_engines"
             && grant["operations"] == serde_json::json!(super::MODEL_OPERATIONS)
             && expiry > now_ts()
             && expiry > revision
             && expiry - revision <= super::MODEL_GRANT_TTL_SECS,
         "model grant is expired or does not match the requested service"
+    );
+    let offer_ids: BTreeSet<String> = serde_json::from_value(grant["offer_ids"].clone())?;
+    let offer_revision = grant["offer_revision"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        offer_ids.len() == 1
+            && offer_ids
+                .iter()
+                .all(|id| super::gateway_model_service::safe_id(id, 256))
+            && offer_revision.len() == 64
+            && offer_revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "model grant needs one exact approved offer"
     );
     record.target_peer_id.parse::<iroh::PublicKey>()?;
     Ok(serde_json::json!({
@@ -3539,7 +3567,8 @@ fn home_services_remote_model_grant(
         "connect_ticket": ticket,
         "principal_id": context.principal_id,
         "service_display_name": record.service_display_name,
-        "offer_scope": "local_engines",
+        "offer_ids": offer_ids,
+        "offer_revision": offer_revision,
         "operations": grant["operations"],
         "expires_at": expiry,
     }))
@@ -3669,6 +3698,8 @@ pub(crate) fn authorize_home_service_model(
                 expires_at: record
                     .grant_expires_at
                     .ok_or_else(|| anyhow::anyhow!("model grant expiry required"))?,
+                approved_offer_ids: record.approved_offer_ids.clone(),
+                approved_offer_revision: record.approved_offer_revision.clone(),
             };
             grant.validate(source, requester_principal_id, now)?;
             anyhow::ensure!(authorized.is_none(), "model grant ownership is ambiguous");
@@ -3920,6 +3951,12 @@ fn home_services_merge_access_request(
         grant_scope: home_services_payload_text(payload, "grant_scope", 128),
         request_id: request_id.clone(),
         offer_id: home_services_payload_text(payload, "offer_id", 256).unwrap_or_default(),
+        requested_model_offer_id: home_services_payload_text(payload, "model_offer_id", 256),
+        requested_model_offer_revision: home_services_payload_text(
+            payload,
+            "model_offer_revision",
+            64,
+        ),
         service_uri,
         service_kind,
         service_display_name: home_services_payload_text(payload, "service_display_name", 256)
@@ -3938,6 +3975,8 @@ fn home_services_merge_access_request(
         status,
         authenticated_request: true,
         grant_expires_at: None,
+        approved_offer_ids: BTreeSet::new(),
+        approved_offer_revision: String::new(),
         exit_max_active_streams: None,
         exit_max_active_streams_per_principal: None,
     };
@@ -3974,7 +4013,7 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
     } else if kind == super::MODEL_SERVICE_KIND && uri == super::MODEL_SERVICE_URI {
         (
             "AI model",
-            "Approval lets their Assistant run a shared model through your Runtime. Your Runtime decides every request. Hosted connections stay private until you enable Share for that provider and model.",
+            "Approval is for one named model offer through your Runtime. A generic request needs a new exact-offer request before approval.",
         )
     } else {
         (
@@ -4027,6 +4066,25 @@ pub(super) fn append_home_service_access_notifications(
             home_services_request_notification_copy(&request.service_kind, &request.service_uri);
         notifications.unread_count += 1;
         notifications.attention_count += 1;
+        let approval_effect = if request.service_kind == super::MODEL_SERVICE_KIND {
+            match request.requested_model_offer_id.as_deref() {
+                Some(id) => {
+                    let detail =
+                        crate::api::model_provider_config::hosted_model_offer_hint(data_dir, id)
+                            .map(|hint| {
+                                format!(
+                                    "{} via {}, model {}",
+                                    hint.offer_title, hint.provider_label, hint.requested_selector
+                                )
+                            })
+                            .unwrap_or_else(|| id.to_string());
+                    format!("{approval_effect} Requested offer: {detail} ({id}).")
+                }
+                None => approval_effect.to_string(),
+            }
+        } else {
+            approval_effect.to_string()
+        };
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
             source_app: SERVICES_CAPSULE_ID.to_string(),
@@ -4081,12 +4139,20 @@ pub(super) fn append_home_service_access_notifications(
 pub(super) fn approve_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "approved")
+    home_services_mark_access_request(
+        data_dir,
+        context,
+        registry,
+        discovery_service,
+        request_id,
+        "approved",
+    )
 }
 
 /// Deny as this principal. `Err` means no denial was saved (unknown request
@@ -4099,7 +4165,14 @@ pub(super) fn deny_home_service_access_request(
     >,
     request_id: &str,
 ) -> anyhow::Result<HomeServiceAccessDecisionRecorded> {
-    home_services_record_access_decision(data_dir, context, discovery_service, request_id, "denied")
+    home_services_record_access_decision(
+        data_dir,
+        context,
+        None,
+        discovery_service,
+        request_id,
+        "denied",
+    )
 }
 
 /// A service access decision this principal made and this Runtime saved. The
@@ -4121,14 +4194,22 @@ impl HomeServiceAccessDecisionRecorded {
 fn home_services_mark_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request_id: &str,
     status: &str,
 ) -> anyhow::Result<String> {
-    home_services_record_access_decision(data_dir, context, discovery_service, request_id, status)?
-        .into_message()
+    home_services_record_access_decision(
+        data_dir,
+        context,
+        registry,
+        discovery_service,
+        request_id,
+        status,
+    )?
+    .into_message()
 }
 
 /// Authorize (principal-scoped lookup), apply and save the decision, then try
@@ -4137,6 +4218,7 @@ fn home_services_mark_access_request(
 fn home_services_record_access_decision(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
@@ -4177,6 +4259,40 @@ fn home_services_record_access_decision(
         }
     }
     let mut request = request;
+    if status == "approved"
+        && request.service_kind == super::MODEL_SERVICE_KIND
+        && request.service_uri == super::MODEL_SERVICE_URI
+    {
+        let registry = registry.ok_or_else(|| anyhow::anyhow!("model provider unavailable"))?;
+        let result = tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                registry.send_raw("model", &serde_json::json!({"op":"offers_list"})),
+            )
+            .await
+        })??;
+        let requested_id = request
+            .requested_model_offer_id
+            .as_deref()
+            .filter(|id| super::gateway_model_service::safe_id(id, 256))
+            .ok_or_else(|| anyhow::anyhow!("exact model offer request required"))?;
+        super::gateway_model_service::shareable_offer_for_home(
+            &result,
+            data_dir,
+            home_services_local_model_shared(data_dir, context)?,
+            requested_id,
+        )
+        .ok_or_else(|| anyhow::anyhow!("requested model offer is unavailable"))?;
+        let offer_revision =
+            super::gateway_model_service::offer_execution_revision(&result, requested_id)
+                .ok_or_else(|| anyhow::anyhow!("requested model offer revision unavailable"))?;
+        anyhow::ensure!(
+            request.requested_model_offer_revision.as_deref() == Some(offer_revision),
+            "requested model offer revision changed; request again"
+        );
+        request.approved_offer_ids = BTreeSet::from([requested_id.to_string()]);
+        request.approved_offer_revision = offer_revision.to_string();
+    }
     request.status = status.to_string();
     request.updated_at = revision;
     let grant_ttl = if request.service_kind == super::MODEL_SERVICE_KIND {

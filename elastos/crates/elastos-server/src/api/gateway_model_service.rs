@@ -8,9 +8,9 @@
 //! created for that grant so revocation can find them. Unshared hosted
 //! connections stay private.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -25,7 +25,7 @@ use super::gateway_provider_proxy::normalize_model_provider_request;
 pub(crate) const MODEL_SERVICE_KIND: &str = "remote_model";
 pub(crate) const MODEL_SERVICE_URI: &str = "elastos://peer/model";
 pub(crate) const MODEL_LOCAL_OFFER: &str = "local:provider:model";
-pub(crate) const MODEL_GRANT_SCHEMA: &str = "elastos.service.remote-model-grant/v1";
+pub(crate) const MODEL_GRANT_SCHEMA: &str = "elastos.service.remote-model-grant/v2";
 pub(crate) const MODEL_GRANT_SCOPE: &str = "principal_scoped_remote_model_grant";
 pub(crate) const MODEL_GRANT_TTL_SECS: u64 = 6 * 3600;
 pub(crate) const MODEL_RUN_RETENTION_SECS: u64 = 24 * 3600;
@@ -41,6 +41,13 @@ const MODEL_RUN_INDEX_SCHEMA: &str = "elastos.services.model-runs/v1";
 const MODEL_RUN_INDEX_MAX: usize = 512;
 const MODEL_REQUEST_MAX_BYTES: usize = 256 * 1024;
 const AUTHORITY_DEADLINE: Duration = Duration::from_secs(1);
+
+/// A Share or Disconnect decision waits for an admitted create to reach the
+/// provider. New creates then observe the completed owner decision.
+pub(in crate::api::gateway) fn model_share_gate() -> &'static tokio::sync::RwLock<()> {
+    static GATE: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::RwLock::new(()))
+}
 
 pub(crate) fn model_grant_id(request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
@@ -67,6 +74,10 @@ pub(crate) struct ModelServiceGrant {
     pub grant_id: String,
     pub revision: u64,
     pub expires_at: u64,
+    /// Exact model offers present when the person approved this grant.
+    /// An older grant has no snapshot and cannot authorize a new run.
+    pub approved_offer_ids: BTreeSet<String>,
+    pub approved_offer_revision: String,
 }
 
 impl ModelServiceGrant {
@@ -88,6 +99,19 @@ impl ModelServiceGrant {
                 && self.expires_at > self.revision
                 && self.expires_at - self.revision <= MODEL_GRANT_TTL_SECS,
             "model grant expired or invalid"
+        );
+        anyhow::ensure!(
+            self.approved_offer_ids.len() == 1
+                && self.approved_offer_ids.iter().all(|id| safe_id(id, 256)),
+            "model grant needs one exact approved offer"
+        );
+        anyhow::ensure!(
+            self.approved_offer_revision.len() == 64
+                && self
+                    .approved_offer_revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "model grant needs an exact offer revision"
         );
         Ok(())
     }
@@ -420,7 +444,7 @@ pub(crate) fn remote_model_runs_for_grant(
         .collect())
 }
 
-fn safe_id(value: &str, max: usize) -> bool {
+pub(in crate::api::gateway) fn safe_id(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value
@@ -820,11 +844,55 @@ fn shareable_offers_for_home(result: &Value, data_dir: &Path, include_local: boo
         .collect()
 }
 
+pub(in crate::api::gateway) fn offer_execution_revision<'a>(
+    result: &'a Value,
+    id: &str,
+) -> Option<&'a str> {
+    result["data"]["offer_revisions"][id]
+        .as_str()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+pub(in crate::api::gateway) fn shareable_offer_for_home(
+    result: &Value,
+    data_dir: &Path,
+    include_local: bool,
+    id: &str,
+) -> Option<Value> {
+    shareable_offers_for_home(result, data_dir, include_local)
+        .into_iter()
+        .find(|offer| offer["id"].as_str() == Some(id) && offer["operation"] == "text.generate")
+}
+
+fn shareable_offers_for_grant(
+    result: &Value,
+    data_dir: &Path,
+    include_local: bool,
+    approved_offer_ids: &BTreeSet<String>,
+    approved_offer_revision: &str,
+) -> Vec<Value> {
+    shareable_offers_for_home(result, data_dir, include_local)
+        .into_iter()
+        .filter(|offer| {
+            offer["id"].as_str().is_some_and(|id| {
+                approved_offer_ids.contains(id)
+                    && offer_execution_revision(result, id) == Some(approved_offer_revision)
+            })
+        })
+        .collect()
+}
+
 fn with_offers(mut result: Value, offers: Vec<Value>) -> Value {
     if result.pointer("/data/offers").is_some() {
         result["data"]["offers"] = Value::Array(offers);
+        if let Some(data) = result.get_mut("data").and_then(Value::as_object_mut) {
+            data.remove("offer_revisions");
+        }
     } else {
         result["offers"] = Value::Array(offers);
+        if let Some(object) = result.as_object_mut() {
+            object.remove("offer_revisions");
+        }
     }
     result
 }
@@ -1167,11 +1235,17 @@ pub(crate) async fn invoke(
     local_object.remove("_runtime_invocation");
     local_object.remove("op");
 
-    let (context, indexed_run, include_local) = match operation {
-        "offers_list" | "runs_create" => {
-            let grant =
-                match read_authority(data_dir, &network, source, grant_id, requester_principal_id)
-                    .await
+    let (context, indexed_run, include_local, approved_offer_ids, approved_offer_revision) =
+        match operation {
+            "offers_list" | "runs_create" => {
+                let grant = match read_authority(
+                    data_dir,
+                    &network,
+                    source,
+                    grant_id,
+                    requester_principal_id,
+                )
+                .await
                 {
                     Ok(grant) => grant,
                     Err(err) => {
@@ -1186,82 +1260,102 @@ pub(crate) async fn invoke(
                         );
                     }
                 };
-            if let Err(err) = grant.validate(&source, requester_principal_id, now) {
-                tracing::info!("remote model grant rejected: {err}");
-                return refused_before_dispatch(
+                if let Err(err) = grant.validate(&source, requester_principal_id, now) {
+                    tracing::info!("remote model grant rejected: {err}");
+                    return refused_before_dispatch(
+                        data_dir,
+                        &source_did,
+                        request,
+                        "denied",
+                        "model grant is not active for this requester",
+                        false,
+                    );
+                }
+                let include_local = super::gateway_home_system::local_model_offer_is_shared(
                     data_dir,
-                    &source_did,
-                    request,
-                    "denied",
-                    "model grant is not active for this requester",
-                    false,
+                    &grant.provider_principal_id,
                 );
+                (
+                    remote_context(
+                        &remote_principal_id(&source_did, requester_principal_id),
+                        &grant.grant_id,
+                    ),
+                    None,
+                    include_local,
+                    grant.approved_offer_ids,
+                    grant.approved_offer_revision,
+                )
             }
-            let include_local = super::gateway_home_system::local_model_offer_is_shared(
-                data_dir,
-                &grant.provider_principal_id,
-            );
-            (
-                remote_context(
-                    &remote_principal_id(&source_did, requester_principal_id),
-                    &grant.grant_id,
-                ),
-                None,
-                include_local,
-            )
-        }
-        _ => {
-            let Some(run_id) = local_object
-                .get("run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
+            _ => {
+                let Some(run_id) = local_object
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
+                    return denied(
+                        "invalid_provider_invocation",
+                        "model run operation requires run_id",
+                    );
+                };
+                let record = match remote_model_run(data_dir, &run_id) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return denied("denied", "model run is not owned by this grant"),
+                    Err(err) => {
+                        tracing::warn!("remote model run index unavailable: {err}");
+                        return denied("provider_failure", "model run index is unavailable");
+                    }
+                };
+                if record.grant_id != grant_id
+                    || record.source_endpoint_did != source_did
+                    || record.requester_principal_id != requester_principal_id
+                    || record.capsule_id != capsule_id
+                {
+                    return denied("denied", "model run is not owned by this grant");
+                }
+                (
+                    remote_context(&record.remote_principal_id, grant_id),
+                    Some((run_id, record)),
+                    true,
+                    BTreeSet::new(),
+                    String::new(),
+                )
+            }
+        };
+
+    let mut normalized =
+        match normalize_model_provider_request(operation, &local, &context, capsule_id) {
+            Ok(normalized) => normalized,
+            Err((_, message)) => {
+                tracing::info!("remote model request rejected: {message}");
                 return denied(
                     "invalid_provider_invocation",
-                    "model run operation requires run_id",
+                    "model request did not match the typed contract",
                 );
-            };
-            let record = match remote_model_run(data_dir, &run_id) {
-                Ok(Some(record)) => record,
-                Ok(None) => return denied("denied", "model run is not owned by this grant"),
-                Err(err) => {
-                    tracing::warn!("remote model run index unavailable: {err}");
-                    return denied("provider_failure", "model run index is unavailable");
-                }
-            };
-            if record.grant_id != grant_id
-                || record.source_endpoint_did != source_did
-                || record.requester_principal_id != requester_principal_id
-                || record.capsule_id != capsule_id
-            {
-                return denied("denied", "model run is not owned by this grant");
             }
-            (
-                remote_context(&record.remote_principal_id, grant_id),
-                Some((run_id, record)),
-                true,
-            )
-        }
-    };
+        };
 
-    let normalized = match normalize_model_provider_request(operation, &local, &context, capsule_id)
-    {
-        Ok(normalized) => normalized,
-        Err((_, message)) => {
-            tracing::info!("remote model request rejected: {message}");
-            return denied(
-                "invalid_provider_invocation",
-                "model request did not match the typed contract",
-            );
-        }
+    // A Share change waits until an admitted create has reached the provider
+    // and its run has been recorded or cancelled on this Runtime.
+    let share_guard = if operation == "runs_create" {
+        Some(model_share_gate().read().await)
+    } else {
+        None
     };
-
     if operation == "runs_create" {
-        let offers = match registry
+        let (offers, revisions) = match registry
             .send_raw("model", &json!({ "op": "offers_list" }))
             .await
         {
-            Ok(result) => shareable_offers_for_home(&result, data_dir, include_local),
+            Ok(result) => (
+                shareable_offers_for_grant(
+                    &result,
+                    data_dir,
+                    include_local,
+                    &approved_offer_ids,
+                    &approved_offer_revision,
+                ),
+                result["data"]["offer_revisions"].clone(),
+            ),
             Err(err) => {
                 tracing::warn!("remote model offers unavailable: {err}");
                 return refused_before_dispatch(
@@ -1288,6 +1382,19 @@ pub(crate) async fn invoke(
                 false,
             );
         }
+        let Some(execution_revision) = revisions[offer_id].as_str().filter(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) else {
+            return refused_before_dispatch(
+                data_dir,
+                &source_did,
+                request,
+                "offer_unavailable",
+                "model offer revision is unavailable on this Runtime",
+                false,
+            );
+        };
+        normalized["expected_execution_binding_hash"] = json!(execution_revision);
     }
 
     // A create holds its record slot before any model work starts. A retry of
@@ -1457,7 +1564,13 @@ pub(crate) async fn invoke(
     let result = match operation {
         "offers_list" => with_offers(
             result.clone(),
-            shareable_offers_for_home(&result, data_dir, include_local),
+            shareable_offers_for_grant(
+                &result,
+                data_dir,
+                include_local,
+                &approved_offer_ids,
+                &approved_offer_revision,
+            ),
         ),
         "runs_create" => {
             if let Some(run_id) = reply.run_id.clone() {
@@ -1502,6 +1615,7 @@ pub(crate) async fn invoke(
             result
         }
     };
+    drop(share_guard);
     if held_slot
         && !grant_is_active(data_dir, &network, source, grant_id, requester_principal_id).await
     {
@@ -1640,6 +1754,8 @@ mod tests {
             grant_id: model_grant_id("r"),
             revision: 1_000,
             expires_at: 1_000 + MODEL_GRANT_TTL_SECS,
+            approved_offer_ids: BTreeSet::from(["qwen".into()]),
+            approved_offer_revision: "a".repeat(64),
         };
         assert!(grant.validate(&key, "seed-principal", 1_500).is_ok());
         assert!(grant.validate(&other, "seed-principal", 1_500).is_err());
@@ -1652,6 +1768,16 @@ mod tests {
             ..grant.clone()
         };
         assert!(too_long.validate(&key, "seed-principal", 1_500).is_err());
+        for ids in [
+            BTreeSet::new(),
+            BTreeSet::from(["qwen".into(), "other".into()]),
+        ] {
+            let invalid = ModelServiceGrant {
+                approved_offer_ids: ids,
+                ..grant.clone()
+            };
+            assert!(invalid.validate(&key, "seed-principal", 1_500).is_err());
+        }
     }
 
     #[test]

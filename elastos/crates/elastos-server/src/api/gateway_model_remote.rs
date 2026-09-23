@@ -209,6 +209,22 @@ impl ConsumerModelGrant {
     /// `peer_did` (shared wire shape with Engine grants). The Carrier route
     /// pins the ticket to a `did:key`, so the id is converted once here.
     pub(crate) fn from_record(grant: &Value) -> Option<Self> {
+        if grant["schema"] != super::MODEL_GRANT_SCHEMA {
+            return None;
+        }
+        let offer_ids: std::collections::BTreeSet<String> =
+            serde_json::from_value(grant["offer_ids"].clone()).ok()?;
+        if offer_ids.len() != 1
+            || !offer_ids
+                .iter()
+                .all(|id| super::gateway_model_service::safe_id(id, 256))
+        {
+            return None;
+        }
+        let revision = grant["offer_revision"].as_str()?;
+        if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
         let peer_id = grant["peer_did"]
             .as_str()?
             .parse::<iroh::PublicKey>()
@@ -717,6 +733,9 @@ mod tests {
     fn consumer_grant_routes_by_the_granting_runtime_did() {
         let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let grant = ConsumerModelGrant::from_record(&json!({
+            "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA,
+            "offer_ids": ["qwen-local"],
+            "offer_revision": "a".repeat(64),
             "grant_id": "services-remote-model-grant-0011223344556677",
             "peer_did": key.to_string(),
             "connect_ticket": "ticket",
@@ -730,7 +749,13 @@ mod tests {
         );
         assert!(grant.peer_did.starts_with("did:key:z6Mk"));
         assert!(ConsumerModelGrant::from_record(&json!({
+            "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA, "offer_ids": ["qwen-local"], "offer_revision": "a".repeat(64),
             "grant_id": "g", "peer_did": "not-a-peer-id", "connect_ticket": "t", "expires_at": 1,
+        }))
+        .is_none());
+        assert!(ConsumerModelGrant::from_record(&json!({
+            "schema": "elastos.service.remote-model-grant/v1", "offer_ids": ["qwen-local"],
+            "grant_id": "g", "peer_did": key.to_string(), "connect_ticket": "t", "expires_at": 1,
         }))
         .is_none());
     }

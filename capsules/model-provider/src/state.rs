@@ -382,11 +382,19 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .filter(|offer| offer.enabled)
             .map(ConfiguredOffer::summary)
             .collect::<Vec<_>>();
+        let offer_revisions = self
+            .offers
+            .values()
+            .filter(|offer| offer.enabled)
+            .map(|offer| Ok((offer.id.clone(), offer.execution_binding_hash()?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()
+            .map_err(|_| ProviderFault::internal("model offer revision unavailable"))?;
         Ok(ok_response(json!({
             "schema": crate::contract::OFFERS_LIST_SCHEMA,
             "provider": PROVIDER_ID,
             "protocol_version": PROVIDER_PROTOCOL_VERSION,
             "offers": offers,
+            "offer_revisions": offer_revisions,
         })))
     }
 
@@ -405,6 +413,16 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .get(&request.offer_id)
             .ok_or_else(|| ProviderFault::selection_unavailable("unknown offer_id"))?
             .clone();
+        if let Some(expected) = request.expected_execution_binding_hash.as_deref() {
+            let current = offer
+                .execution_binding_hash()
+                .map_err(|_| ProviderFault::internal("model offer revision unavailable"))?;
+            if expected != current {
+                return Err(ProviderFault::selection_unavailable(
+                    "model offer revision changed",
+                ));
+            }
+        }
         if !offer.enabled {
             return Err(ProviderFault::selection_unavailable("offer is disabled"));
         }
@@ -1944,6 +1962,7 @@ mod tests {
                 let mut binding = create_binding(request_id, &original.id, &input);
                 binding.operation = original.operation.clone();
                 RunsCreateRequest {
+                    expected_execution_binding_hash: None,
                     op: "runs_create".into(),
                     offer_id: original.id.clone(),
                     operation: original.operation.clone(),
@@ -2386,6 +2405,7 @@ mod tests {
         assert!(state.plan_refresh(old.clone(), false, &[]).is_err());
         let input = json!({"prompt":"blocked"});
         let request = RunsCreateRequest {
+            expected_execution_binding_hash: None,
             op: "runs_create".into(),
             offer_id: "admitted".into(),
             operation: "text.generate".into(),
@@ -2608,6 +2628,9 @@ mod tests {
             "prompt": "hello"
         });
         let request = RunsCreateRequest {
+            expected_execution_binding_hash: Some(
+                state.offers["local-text"].execution_binding_hash().unwrap(),
+            ),
             op: "runs_create".to_string(),
             offer_id: "local-text".to_string(),
             operation: "text.generate".to_string(),
@@ -2619,6 +2642,28 @@ mod tests {
         assert_eq!(first["status"], "ok");
         assert_eq!(first["data"]["run_id"], second["data"]["run_id"]);
         assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn expected_execution_revision_is_checked_before_a_run_is_created() {
+        let root = temp_root("revision-mismatch");
+        let adapters = FakeAdapters::default();
+        let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
+        let input = serde_json::json!({
+            "schema": "elastos.model.input.text/v1",
+            "prompt": "hello"
+        });
+        let wrong = RunsCreateRequest {
+            expected_execution_binding_hash: Some("b".repeat(64)),
+            op: "runs_create".into(),
+            offer_id: "local-text".into(),
+            operation: "text.generate".into(),
+            input: input.clone(),
+            runtime_binding: create_binding("request:revision", "local-text", &input),
+        };
+        let error = state.handle_runs_create(wrong).unwrap_err();
+        assert_eq!(error.code(), "selection_unavailable");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
     }
 
     #[test]
@@ -3896,6 +3941,7 @@ mod tests {
         let second_binding = create_binding("request:two", "local-text", &input2);
         let first = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -3904,6 +3950,7 @@ mod tests {
             })
             .unwrap();
         let second_request = RunsCreateRequest {
+            expected_execution_binding_hash: None,
             op: "runs_create".to_string(),
             offer_id: "local-text".to_string(),
             operation: "text.generate".to_string(),
@@ -3990,6 +4037,7 @@ mod tests {
         remote.grant_id = "grant:shared-model".to_string();
         assert_ne!(private.principal_id, remote.principal_id);
         let request = |binding| RunsCreateRequest {
+            expected_execution_binding_hash: None,
             op: "runs_create".to_string(),
             offer_id: id.to_string(),
             operation: "text.generate".to_string(),
@@ -4094,6 +4142,7 @@ mod tests {
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"new"});
         let response = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -4140,6 +4189,7 @@ mod tests {
             serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"new"});
         let error = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "image.generate".to_string(),
@@ -4345,6 +4395,7 @@ mod tests {
 
         for conflicting_request in [
             RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -4355,6 +4406,7 @@ mod tests {
                 let mut binding = create_binding(request_id, "local-text", &input);
                 binding.operation = "image.generate".to_string();
                 RunsCreateRequest {
+                    expected_execution_binding_hash: None,
                     op: "runs_create".to_string(),
                     offer_id: "local-text".to_string(),
                     operation: "image.generate".to_string(),
@@ -4366,6 +4418,7 @@ mod tests {
                 let mut binding = create_binding(request_id, "other-offer", &input);
                 binding.operation = "text.generate".to_string();
                 RunsCreateRequest {
+                    expected_execution_binding_hash: None,
                     op: "runs_create".to_string(),
                     offer_id: "other-offer".to_string(),
                     operation: "text.generate".to_string(),
@@ -4408,6 +4461,7 @@ mod tests {
 
         let first = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -4417,6 +4471,7 @@ mod tests {
             .unwrap();
         let second = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -4967,6 +5022,7 @@ mod tests {
         });
         let error = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),
@@ -5002,6 +5058,7 @@ mod tests {
         });
         let response = state
             .handle_runs_create(RunsCreateRequest {
+                expected_execution_binding_hash: None,
                 op: "runs_create".to_string(),
                 offer_id: "local-text".to_string(),
                 operation: "text.generate".to_string(),

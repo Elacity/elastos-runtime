@@ -88,6 +88,7 @@ fn events_page(run_id: &str, page: u32) -> Value {
 #[derive(Default)]
 struct FakeModelProvider {
     calls: TokioMutex<Vec<Value>>,
+    execution_revision: std::sync::Mutex<Option<String>>,
     run_owners: std::sync::Mutex<BTreeMap<String, String>>,
     run_offers: std::sync::Mutex<BTreeMap<String, String>>,
     event_pages: std::sync::Mutex<BTreeMap<String, u32>>,
@@ -117,7 +118,14 @@ impl Provider for FakeModelProvider {
         let op = request["op"].as_str().unwrap_or_default();
         let typed_fields = match op {
             "offers_list" => vec!["op"],
-            "runs_create" => vec!["op", "offer_id", "operation", "input", "runtime_binding"],
+            "runs_create" => vec![
+                "op",
+                "offer_id",
+                "operation",
+                "input",
+                "runtime_binding",
+                "expected_execution_binding_hash",
+            ],
             "runs_events" => vec!["op", "run_id", "after_sequence", "runtime_binding"],
             _ => vec!["op", "run_id", "runtime_binding"],
         };
@@ -125,13 +133,30 @@ impl Provider for FakeModelProvider {
             return Ok(json!({ "status": "error", "message": "fields differ from the contract" }));
         }
         if op == "offers_list" {
+            let revision = self
+                .execution_revision
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "a".repeat(64));
             return Ok(json!({ "status": "ok", "data": { "offers": [
                 { "id": "qwen-local", "title": "Qwen", "operation": "text.generate", "hosted": null },
                 { "id": "model:openrouter", "title": "GPT", "operation": "text.generate",
                   "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" } },
-            ] } }));
+            ], "offer_revisions": {"qwen-local": revision, "model:openrouter": revision} } }));
         }
         if op == "runs_create" {
+            let revision = self
+                .execution_revision
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "a".repeat(64));
+            if request["expected_execution_binding_hash"].as_str() != Some(revision.as_str()) {
+                return Ok(
+                    json!({"status":"error", "code":"selection_unavailable", "message":"model offer revision changed"}),
+                );
+            }
             if let Some(error) = self.next_create_status_error.lock().unwrap().take() {
                 return Ok(error);
             }
@@ -488,7 +513,21 @@ impl TwoRuntimes {
     }
 
     fn write_request_record_with_expiry(&self, status: &str, expires_at: u64) {
+        self.write_request_record_with_expiry_and_offers(status, expires_at, &["qwen-local"]);
+    }
+
+    fn write_request_record_with_expiry_and_offers(
+        &self,
+        status: &str,
+        expires_at: u64,
+        approved_offer_ids: &[&str],
+    ) {
         let now = now_ts();
+        let approved_offer_revision = if approved_offer_ids.is_empty() {
+            String::new()
+        } else {
+            "a".repeat(64)
+        };
         write_home_principal_object_json_for_authority(
             self.owner.path(),
             &self.authority,
@@ -513,6 +552,8 @@ impl TwoRuntimes {
                     "status": status,
                     "authenticated_request": true,
                     "grant_expires_at": expires_at,
+                    "approved_offer_ids": approved_offer_ids,
+                    "approved_offer_revision": approved_offer_revision,
                 } },
             }),
         );
@@ -658,6 +699,89 @@ async fn offers_list_over_carrier_shares_only_local_offers() {
 }
 
 #[tokio::test]
+async fn older_generic_grant_and_newly_shared_hosted_offer_cannot_expand_access() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    // An older owner request has no approved-offer snapshot, even if local
+    // sharing is currently on. It cannot start new work.
+    fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[]);
+    let legacy = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "assistant")}),
+        )
+        .await;
+    assert_eq!(legacy["code"], "denied", "{legacy}");
+    let local = fx.create_run("legacy-local", "qwen-local").await;
+    assert_eq!(local["code"], "denied", "{local}");
+    assert!(fx.provider_ops().await.is_empty());
+
+    // A newer grant approved only the local offer. Sharing a hosted offer
+    // afterwards leaves the signed scope unchanged.
+    fx.write_request_record("approved");
+    let id = "model:openrouter";
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(id),
+        },
+    )
+    .await
+    .unwrap();
+    crate::api::model_provider_config::set_hosted_offer_share(
+        fx.owner.path(),
+        id,
+        true,
+        Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+    )
+    .unwrap();
+    let listed = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "assistant")}),
+        )
+        .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(
+        listed["result"]["data"]["offers"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(listed["result"]["data"]["offers"][0]["id"], "qwen-local");
+    let hosted = fx.create_run("newly-shared-hosted", id).await;
+    assert_eq!(hosted["code"], "offer_unavailable", "{hosted}");
+    assert_eq!(fx.create_count().await, 0);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn replacing_local_model_under_the_same_id_requires_a_new_grant() {
+    let fx = TwoRuntimes::start().await;
+    *fx.provider.execution_revision.lock().unwrap() = Some("b".repeat(64));
+    let listed = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "assistant")}),
+        )
+        .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert!(listed["result"]["data"]["offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let refused = fx.create_run("changed-local-model", "qwen-local").await;
+    assert_eq!(refused["code"], "offer_unavailable", "{refused}");
+    assert!(fx.provider.run_owners.lock().unwrap().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
 async fn marketplace_remote_discovery_requires_grant_and_has_no_run_authority() {
     let fx = TwoRuntimes::start().await;
     let listed = fx
@@ -694,7 +818,14 @@ async fn runs_create_rebinds_the_request_to_the_remote_principal() {
     let native = fx.last_provider_call().await;
     assert_eq!(
         keys(&native),
-        BTreeSet::from(["input", "offer_id", "op", "operation", "runtime_binding"])
+        BTreeSet::from([
+            "expected_execution_binding_hash",
+            "input",
+            "offer_id",
+            "op",
+            "operation",
+            "runtime_binding"
+        ])
     );
     assert_eq!(
         native["runtime_binding"]["principal_id"],
@@ -810,6 +941,85 @@ async fn revoke_before_dispatch_sends_no_create() {
             "seed-req-revoke-before"
         ))
         .is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_rejects_a_changed_execution_revision_after_owner_precheck() {
+    let fx = TwoRuntimes::start().await;
+    let barrier = install_create_race_barrier(fx.owner.path(), CreateRacePoint::BeforeDispatch);
+    let (created, _) = tokio::join!(
+        fx.create_run("seed-req-revision-race", "qwen-local"),
+        async {
+            barrier.wait_prepared().await;
+            *fx.provider.execution_revision.lock().unwrap() = Some("b".repeat(64));
+            barrier.release();
+        }
+    );
+    assert_eq!(created["ok"], false, "{created}");
+    assert!(fx.provider.run_owners.lock().unwrap().is_empty());
+    assert!(fx
+        .run_record(&run_id_for(
+            &fx.remote_principal(),
+            "seed-req-revision-race"
+        ))
+        .is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_share_pause_waits_for_admitted_create_then_refuses_next_create() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Other shared offer",
+            instance_id: Some("model:openrouter"),
+        },
+    )
+    .await
+    .unwrap();
+    crate::api::model_provider_config::set_hosted_offer_share(
+        fx.owner.path(),
+        "model:openrouter",
+        true,
+        Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+    )
+    .unwrap();
+    let barrier = install_create_race_barrier(fx.owner.path(), CreateRacePoint::BeforeDispatch);
+    let (created, _) = tokio::join!(
+        fx.create_run("before-local-share-pause", "qwen-local"),
+        async {
+            barrier.wait_prepared().await;
+            barrier.release();
+            let _guard = crate::api::gateway::gateway_model_service::model_share_gate()
+                .write()
+                .await;
+            write_home_principal_object_json_for_authority(
+                fx.owner.path(),
+                &fx.authority,
+                "services-state.json",
+                json!({
+                    "schema":"elastos.services.state/v1",
+                    "principal_id":fx.authority.principal_id,
+                    "localhost_root":fx.localhost_root(),
+                    "updated_at":now_ts(),
+                    "local_offer_ids":[],
+                }),
+            );
+        }
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let refused = fx.create_run("after-local-share-pause", "qwen-local").await;
+    assert_eq!(refused["code"], "offer_unavailable", "{refused}");
+    assert_eq!(fx.create_count().await, 1);
     fx.shutdown().await;
 }
 
@@ -1100,6 +1310,9 @@ mod consumer_path {
     impl TwoRuntimes {
         fn consumer_grant(&self) -> ConsumerModelGrant {
             ConsumerModelGrant::from_record(&json!({
+                "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA,
+                "offer_ids": ["qwen-local"],
+                "offer_revision": "a".repeat(64),
                 "grant_id": self.grant_id,
                 "peer_did": self.owner_service.endpoint().unwrap().id().to_string(),
                 "connect_ticket": ticket_for(&self.owner_addr),
@@ -1970,6 +2183,8 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
         .unwrap()
     };
     share(true);
+    let hosted_scope = &[id];
+    fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, hosted_scope);
     let created = fx.create_run("hosted-before-denial", id).await;
     assert_eq!(created["ok"], true, "{created}");
     let old_run = run_id_for(&fx.remote_principal(), "hosted-before-denial");
@@ -1988,7 +2203,11 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
             "unauthorized-grant" => {
                 remote["grant_id"] = json!(model_grant_id("unapproved-request"))
             }
-            "expired" => fx.write_request_record_with_expiry("approved", now_ts() - 1),
+            "expired" => fx.write_request_record_with_expiry_and_offers(
+                "approved",
+                now_ts() - 1,
+                hosted_scope,
+            ),
             "paused" => {
                 share(false);
             }
@@ -2020,11 +2239,30 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
         let settled = fx.run_operation("runs_get", &old_run, SEED_PRINCIPAL).await;
         assert_eq!(settled["ok"], true, "{case}: old run lost: {settled}");
         assert_eq!(settled["result"]["data"]["offer_id"], id);
-        fx.write_request_record("approved");
+        fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, hosted_scope);
         share(true);
     }
     let resumed = fx.create_run("hosted-after-regrant", id).await;
     assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(fx.create_count().await, baseline + 1);
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/changed",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(id),
+        },
+    )
+    .await
+    .unwrap();
+    *fx.provider.execution_revision.lock().unwrap() = Some("b".repeat(64));
+    let changed = fx.create_run("hosted-after-model-change", id).await;
+    assert_eq!(changed["code"], "offer_unavailable", "{changed}");
     assert_eq!(fx.create_count().await, baseline + 1);
     crate::api::model_provider_config::remove_hosted_offer(fx.owner.path(), None, id)
         .await

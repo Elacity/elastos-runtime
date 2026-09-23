@@ -653,6 +653,9 @@ pub(super) async fn system_ai_provider_save(
         return system_error_response(invalid_model(provider));
     };
     let name = req.name.clone().unwrap_or_default();
+    let _model_share_guard = super::gateway_model_service::model_share_gate()
+        .write()
+        .await;
     match crate::api::save_hosted_offer(
         &state.data_dir,
         state.provider_registry.as_deref(),
@@ -717,6 +720,9 @@ pub(super) async fn system_ai_provider_delete(
     {
         return system_error_response(err);
     }
+    let _model_share_guard = super::gateway_model_service::model_share_gate()
+        .write()
+        .await;
     match crate::api::remove_hosted_offer(
         &state.data_dir,
         state.provider_registry.as_deref(),
@@ -745,6 +751,9 @@ pub(super) async fn system_ai_provider_share(
         Ok(offer_id) => offer_id,
         Err(err) => return system_error_response(err),
     };
+    let _model_share_guard = super::gateway_model_service::model_share_gate()
+        .write()
+        .await;
     match crate::api::set_hosted_offer_share(
         &state.data_dir,
         &offer_id,

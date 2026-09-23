@@ -399,6 +399,7 @@ async fn dispatch_inbox_action(
     }
     if let Some(request_id) = action_id.strip_prefix("service-approve-request:") {
         let discovery_service = state.collaboration_discovery_service.clone();
+        let provider_registry = state.provider_registry.clone();
         let data_dir = data_dir.clone();
         let context = context.clone();
         let request_id = request_id.to_string();
@@ -406,6 +407,7 @@ async fn dispatch_inbox_action(
             approve_home_service_access_request(
                 &data_dir,
                 &context,
+                provider_registry.as_deref(),
                 discovery_service.as_ref(),
                 &request_id,
             )
