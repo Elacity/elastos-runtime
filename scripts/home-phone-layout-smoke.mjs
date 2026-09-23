@@ -94,7 +94,7 @@ const BASELINE = {
     notifications: { targets: 2, text: 41 },
     "mission-control": { targets: 1, text: 1 },
     "assistant-face": { targets: 1, text: 1 },
-    window: { targets: 5, text: 1 },
+    window: { targets: 2, text: 1 },
   },
   "phone-landscape": {
     desktop: { targets: 1, text: 1 },
@@ -104,7 +104,7 @@ const BASELINE = {
     notifications: { targets: 2, text: 4 },
     "mission-control": { targets: 1, text: 1 },
     "assistant-face": { targets: 1, text: 1 },
-    window: { targets: 5, text: 1 },
+    window: { targets: 2, text: 1 },
   },
   tablet: {
     desktop: { targets: 8, text: 2 },

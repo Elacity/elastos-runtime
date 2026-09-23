@@ -175,12 +175,35 @@ fails if the window does not reach the handle or the handle is under 24 px.
 The 74 KB `wallpaper.webp` is already smaller than a phone-specific crop
 would be; no `image-set()` variant.
 
-### After M2 (bar and Dock), 2026-09-23
+## Window title bar (M3)
 
-Identical in Chromium and WebKit. Remaining window targets are the three
-12 px window controls (M3) and the 24 px Dock handle, which is that size by
-design (it lives in the home-indicator strip and must not cover the app);
-the launcher view toggle, Control Centre and calendar rows are M4.
+- One 44 px presentation of the existing `.window-head` for every chrome
+  mode: leading Close (✕), centred capsule icon + title, trailing Minimise
+  drawn as a chevron — on a phone minimise means "go home", the capsule keeps
+  running and the Dock returns. Fullscreen is hidden; the stage is already
+  the whole screen. `WINDOW_CHROME_BY_TARGET`, `parseWindowChromeMode` and
+  `applyWindowChrome` are untouched; the traffic-light group becomes
+  `display: contents` so the same three buttons land in a three-column grid.
+- The head is in flow above the body in all modes, including unified
+  sidebar/toolbar, because a phone-width capsule has content at the very top
+  of its main column and an overlay would cover it. Capsules still pad their
+  own 52 px / 96 px safe areas for the desktop; lifting that per capsule on
+  phone is M6.
+- The title bar is on screen the instant the window opens (the title comes
+  from the summary, not the capsule). A 2 px accent hairline runs under it
+  until `.window-frame.is-ready`; under `prefers-reduced-motion` it is a
+  static line.
+- `shell-window-geometry.js` guards drag and resize on phone (focus still
+  follows the touch); nothing is deleted, the desktop maths is unchanged.
+- The continuous-chrome windows (Wallet, Archive, GBA, connectors) already
+  obey the stage through the generic phone `.window` rule.
+
+### After M2–M3 (bar, Dock, title bar), 2026-09-23
+
+Identical in Chromium and WebKit. The only remaining window target is the
+24 px Dock handle, which is that size by design (it lives in the
+home-indicator strip and must not cover the app); the launcher view toggle,
+Control Centre and calendar rows are M4. Window controls became 44 px in M3.
 
 | Surface | Portrait targets < 44 / text < 12 | Landscape | Tablet |
 | --- | --- | --- | --- |
@@ -191,7 +214,7 @@ the launcher view toggle, Control Centre and calendar rows are M4.
 | notifications (calendar) | 1 / 40 | 1 / 3 | 8 / 41 |
 | mission control | 0 / 0 | 0 / 0 | 0 / 0 |
 | assistant face (shell chrome only) | 0 / 0 | 0 / 0 | 0 / 0 |
-| any window | 4 / 0 | 4 / 0 | 11–12 / 1 |
+| any window | 1 / 0 (the 24 px Dock handle) | 1 / 0 | 11–12 / 1 |
 
 ### Baseline on 2026-09-23 (before any phone work)
 

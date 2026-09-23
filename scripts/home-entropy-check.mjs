@@ -12320,6 +12320,26 @@ assert(
       justfile.includes("node --test scripts/home-phone-dock.test.mjs"),
     "Home phone bar and Dock: one phone media list mirroring PHONE_MAX_WIDTH, 44 px bar with 44 px hit boxes (wallet and Overview move to Control Centre), thumb-scrolled Dock with edge fades and safe-area sides, Dock tucked under windows behind a 24 px handle via shell-phone-dock.js, probed by the phone smoke and unit-tested in verify",
   );
+
+  // Phone title bar: one 44 px presentation of .window-head for every chrome
+  // mode (Close · icon + title · Minimise), in flow for all modes, with the
+  // boot hairline until the frame is ready. Chrome modes stay byte-identical;
+  // drag and resize maths are guarded, not deleted.
+  const windowGeometry = read("capsules/home-gui/browser/shell-window-geometry.js");
+  assert(
+    homeGuiStyle.includes("--phone-window-head-h: 44px;") &&
+      homeGuiStyle.includes("grid-template-columns: var(--phone-window-head-h) minmax(0, 1fr) var(--phone-window-head-h);") &&
+      homeGuiStyle.includes(".window .window-traffic-lights {\n    display: contents;") &&
+      homeGuiStyle.includes(".window .window-action-btn[data-action=\"maximize\"],\n  .window .window-head-balance {\n    display: none;") &&
+      homeGuiStyle.includes(".window .window-body,\n  .window.window-chrome-unified-sidebar .window-body {\n    height: calc(100% - var(--phone-window-head-h)) !important;") &&
+      homeGuiStyle.includes(".window:has(.window-frame.is-ready) .window-head::after,") &&
+      homeGuiStyle.includes("@keyframes phone-window-progress {") &&
+      homeGuiCore.includes("const WINDOW_CHROME_BY_TARGET = {\n  marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR,") &&
+      windowGeometry.includes('import { isPhone } from "./shell-form-factor.js?v=home-20260813a";') &&
+      windowGeometry.includes("    if (isPhone()) {\n      focusWindow(windowNode.dataset.windowId);\n      return;\n    }") &&
+      windowGeometry.includes('if (windowNode.dataset.maximized === "true" || isPhone()) {'),
+    "Home phone title bar: 44 px .window-head presentation for every chrome mode (Close, icon + title, Minimise; no fullscreen), body below the head in all modes, boot hairline until the frame is ready, chrome map untouched, window drag/resize guarded on phone",
+  );
 }
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();

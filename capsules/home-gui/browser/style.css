@@ -5862,6 +5862,173 @@ body.assistant-space-active #inbox-rail {
     display: none;
   }
 
+  /* Phone title bar: one 44 px presentation of .window-head for every chrome
+     mode — leading Close, centred icon + title, trailing Minimise (go home;
+     the capsule keeps running). Fullscreen has no meaning on a phone stage.
+     Unified modes keep the head as an overlay across the capsule's own
+     52 px safe-top; standard and continuous keep it in flow above the body.
+     Chrome modes themselves are untouched (shell-core.js). */
+  :root {
+    --phone-window-head-h: 44px;
+  }
+
+  .window .window-head {
+    position: relative;
+    display: grid;
+    grid-template-columns: var(--phone-window-head-h) minmax(0, 1fr) var(--phone-window-head-h);
+    align-items: center;
+    width: 100%;
+    height: var(--phone-window-head-h);
+    min-height: var(--phone-window-head-h);
+    margin-bottom: 0;
+    padding: 0;
+    border-radius: 0;
+    filter: none;
+  }
+
+  /* Unified modes float the head over the capsule's safe-top on the desktop;
+     on a phone the capsule's main column starts at the very top, so the head
+     goes in flow here too and takes the sidebar's fill. The !important pair
+     answers the desktop unified-sidebar rules, which are !important. */
+  .window.window-chrome-unified-sidebar .window-head,
+  .window.window-chrome-unified-toolbar .window-head {
+    position: relative;
+    width: 100%;
+    height: var(--phone-window-head-h);
+    min-height: var(--phone-window-head-h);
+    padding: 0;
+    align-items: center;
+    border-radius: 0;
+    background-color: var(--panel-strong) !important;
+    box-shadow: inset 0 -1px 0 var(--hairline) !important;
+  }
+
+  .window .window-body,
+  .window.window-chrome-unified-sidebar .window-body {
+    height: calc(100% - var(--phone-window-head-h)) !important;
+  }
+
+  .window .window-traffic-lights {
+    display: contents;
+  }
+
+  .window .window-action-btn {
+    grid-row: 1;
+    width: var(--phone-window-head-h);
+    height: var(--phone-window-head-h);
+    border: 0;
+    border-radius: 10px;
+    background-color: transparent;
+  }
+
+  .window .window-action-btn[data-action="close"] {
+    grid-column: 1;
+  }
+
+  .window .window-action-btn[data-action="minimize"] {
+    grid-column: 3;
+  }
+
+  .window .window-action-btn[data-action="maximize"],
+  .window .window-head-balance {
+    display: none;
+  }
+
+  .window .window-action-btn img {
+    width: 18px;
+    height: 18px;
+    opacity: 0.9;
+  }
+
+  /* The control glyphs are black strokes drawn for coloured discs. */
+  :root:not([data-el-theme="light"]) .window .window-action-btn img {
+    filter: invert(1);
+  }
+
+  /* Minimise means "go home" here: a chevron reads as dismiss where the
+     desktop's dash reads as nothing at all. */
+  .window .window-action-btn[data-action="minimize"] img {
+    display: none;
+  }
+
+  .window .window-action-btn[data-action="minimize"] {
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / 20px 20px no-repeat;
+    opacity: 0.9;
+  }
+
+  :root[data-el-theme="light"] .window .window-action-btn[data-action="minimize"] {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d2438' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  }
+
+  .window .window-head-draggable,
+  .window.window-chrome-unified-sidebar .window-head-draggable,
+  .window.window-chrome-unified-toolbar .window-head-draggable {
+    grid-column: 2;
+    grid-row: 1;
+    min-height: 0;
+    justify-content: center;
+    align-self: center;
+  }
+
+  .window .window-head-icon,
+  .window .window-head-title,
+  .window.window-chrome-unified-sidebar .window-head-icon,
+  .window.window-chrome-unified-sidebar .window-head-title,
+  .window.window-chrome-unified-toolbar .window-head-icon,
+  .window.window-chrome-unified-toolbar .window-head-title {
+    display: block;
+  }
+
+  .window .window-head-icon {
+    width: 20px;
+    height: 20px;
+    margin: 0;
+    border-radius: 6px;
+  }
+
+  .window .window-head-title {
+    margin-left: 8px;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  /* The title bar is on screen the instant the window opens; this hairline
+     under it says the capsule is still booting, and goes with the skeleton
+     the moment the frame is ready. */
+  .window .window-head::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--el-accent, #4f7fff), transparent) 0 0 / 40% 100% no-repeat;
+    animation: phone-window-progress 1.2s ease-in-out infinite;
+    pointer-events: none;
+  }
+
+  .window:has(.window-frame.is-ready) .window-head::after,
+  .window:not(:has(.window-body-frame)) .window-head::after {
+    display: none;
+  }
+
+  @keyframes phone-window-progress {
+    from {
+      background-position: -40% 0;
+    }
+    to {
+      background-position: 140% 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .window .window-head::after {
+      animation: none;
+      background-size: 100% 100%;
+      opacity: 0.6;
+    }
+  }
+
   /* Dock: fixed bottom row, horizontally scrollable, no magnification (the
      magnification code also gates itself off below 641px / non-hover). */
   .taskbar {
