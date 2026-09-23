@@ -351,6 +351,21 @@ HTTPS stays paused; this diagnostic source/installed proof is not public
 activation or a completed five-outcome candidate. Receipt:
 `.audit/hosted-egress-design-scratch/admin-run-installed-receipt.json`.
 
+Source-home release stamp correction: the public demo cutover exposed five
+unchanged preexisting Linux providers whose installed binaries retained their
+old bytes while setup replaced their checksum, size and CID pins with empty
+source fields. Source-home stamping now carries the previous pin only for
+operator-drive-adapter, drm-provider, rights-provider, key-provider and
+decrypt-provider, after the installed binary matches the prior SHA-256 and
+size and the source/installed path identities agree. A changed binary or
+stripped prior pin stops the stamp without replacing the manifest. Kubo keeps
+its separate archive pin path. The focused inventory smoke, shell syntax,
+basic gate and bounded read-only review pass on source. This has no Linux
+installed claim: before a later release, verify the prior manifest against an
+independent receipt, then prove the canonical setup and all five provider
+verifications on an isolated Linux Home. The public seed's separate owner
+already repaired its live pins and remains outside this source test.
+
 Accepted regression evidence for the original five outcomes:
 
 1. **CR1/CR2 prerequisite closeout — verified:** source lineage and installed
