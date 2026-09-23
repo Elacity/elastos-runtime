@@ -107,13 +107,11 @@ case "${SOURCE_HOME_CARGO_PROFILE}" in
         exit 1
         ;;
 esac
+# Bash 3.2 with nounset treats empty arrays as unset; guard their expansions
+# at Cargo call sites so an empty array contributes zero arguments.
 # Extra `cargo build` arguments, used to carry the VS Code launch's debug-info
 # overrides so both produce the same artifact. Word-split on purpose.
 read -r -a SOURCE_HOME_CARGO_EXTRA_ARGS <<< "${SOURCE_HOME_CARGO_EXTRA_ARGS:-}"
-# Both arrays are expanded as ${name[@]+"${name[@]}"}: either may be empty
-# (the dev profile passes no profile flag, and most runs pass no extra args),
-# and the bash 3.2 a stock Mac ships treats an empty array as unbound under
-# `set -u`.
 
 cargo_built_binary_path() {
     local manifest_path="$1"

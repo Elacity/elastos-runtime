@@ -9,7 +9,6 @@ use custody_provider::{
     PROVISIONING_SCHEMA_V1,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
-use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
     CustodyCommitteeAuthorizationStatementV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
