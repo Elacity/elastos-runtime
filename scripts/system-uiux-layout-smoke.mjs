@@ -9,6 +9,7 @@ import {
   makeSystemSummary,
   startSystemFixtureServer,
 } from "./system-uiux-fixture.mjs";
+import { assertPhoneDrawer } from "./lib/phone-drawer-assert.mjs";
 
 function appearanceRecord() {
   return makeAppearanceRecord({
@@ -357,8 +358,15 @@ async function assertPhoneTitleRow(page, screenshotPath) {
     "System phone menu button must share the page title's line",
     row,
   );
-  await ensureSidebarVisible(frame);
-  await activateTab(frame, "personalization");
+  await assertPhoneDrawer(page, frame, {
+    label: "System",
+    drawer: "#system-sidebar",
+    room: ".settings-content-container",
+    closeTarget: '.settings-sidebar-item[data-settings="personalization"]',
+    screenshot: "/tmp/system-uiux-phone-drawer-390x844.png",
+  });
+  const activeTab = await frame.evaluate(() => document.querySelector(".settings-content.active")?.dataset.settings);
+  assert(activeTab === "personalization", "System phone: picking a section in the drawer must open it", { activeTab });
 }
 
 async function main() {

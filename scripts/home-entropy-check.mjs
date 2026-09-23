@@ -12485,7 +12485,7 @@ assert(
       sharedDrawer.includes('.observe(document.documentElement, { attributes: true, attributeFilter: ["data-el-form-factor"] });') &&
       sharedUi.includes("  --el-drawer-w: min(300px, 82vw);") &&
       sharedUi.includes(':root[data-el-form-factor="phone"] [data-el-drawer-room][data-el-drawer-state="open"] {') &&
-      vendorUi.includes('for target_dir in marketplace/browser documents/browser; do\n  drawer_target="capsules/$target_dir/elastos-drawer.js"') &&
+      vendorUi.includes('for target_dir in marketplace/browser documents/browser system/browser; do\n  drawer_target="capsules/$target_dir/elastos-drawer.js"') &&
       phoneDrawerAssert.includes("export async function assertPhoneDrawer(page, target, { label, drawer, room, closeTarget, screenshot }) {") &&
       phoneDrawerAssert.includes("check(closed.drawerRight <= 0 && closed.drawerInert && closed.roomLeft === 0 && closed.roomTop === 0,"),
     "Phone push drawer: shared elastos-drawer.js (inert when closed, tap on the pushed view closes and is swallowed, follows the size class) with shared tokens, vendored only to capsules whose sidebar uses it, asserted by scripts/lib/phone-drawer-assert.mjs",
@@ -12517,10 +12517,19 @@ assert(
   );
 
   assert(
-    read("capsules/system/browser/style.css").includes("  :root[data-el-form-factor=\"phone\"] .settings-content h1,\n  :root[data-el-form-factor=\"phone\"] .settings-content h1.pc2-section-title {\n    min-height: var(--system-phone-title-line);\n    margin-left: calc(var(--system-phone-menu) - 8px);") &&
+    systemStyle.includes(":root[data-el-form-factor=\"phone\"] .settings-content h1,\n:root[data-el-form-factor=\"phone\"] .settings-content h1.pc2-section-title {\n  min-height: var(--system-phone-title-line);\n  margin-left: calc(var(--system-phone-menu) - 8px);") &&
+      systemStyle.includes(":root[data-el-form-factor=\"phone\"] .sidebar-toggle {\n  display: block !important;") &&
+      systemStyle.includes(":root[data-el-form-factor=\"phone\"] .settings-sidebar {\n  display: flex;") &&
+      system.includes('<script src="./elastos-drawer.js"></script>') &&
+      system.includes('<aside id="system-sidebar" class="settings-sidebar disable-user-select disable-context-menu" aria-label="System sections" data-el-drawer>') &&
+      system.includes('data-el-drawer-toggle="system-sidebar"') &&
+      system.includes('<div class="settings-content-container" data-el-drawer-room="system-sidebar">') &&
+      (system.match(/class="settings-sidebar-item[^"]*" type="button" data-el-drawer-close data-settings="/g) || []).length === 7 &&
+      systemJs.includes('    if (document.documentElement.getAttribute("data-el-form-factor") === "phone") {\n      return;\n    }\n    document.querySelector(".settings-sidebar")?.classList.toggle("active");') &&
       read("scripts/system-uiux-layout-smoke.mjs").includes('"System phone menu button must share the page title\'s line",') &&
+      read("scripts/system-uiux-layout-smoke.mjs").includes('    drawer: "#system-sidebar",') &&
       justfile.includes("node scripts/system-uiux-layout-smoke.mjs"),
-    "System phone: the menu button sits on the leading edge on the page title's line, asserted by the UI/UX smoke in the browser lane",
+    "System phone: the menu button sits on the leading edge on the page title's line at every phone width and leads the shared push drawer (every section closes it; System's own overlay toggle stands down on phone), asserted by the UI/UX smoke in the browser lane",
   );
 
   assert(
