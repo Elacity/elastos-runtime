@@ -7,13 +7,14 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../capsules/system/browser/system.js", import.meta.url), "utf8");
 const controller = source.slice(source.indexOf("function configureAiProvider() {"), source.indexOf("function configurePasskeyAccess() {"));
 
-function fixture(connections = []) {
+function fixture(connections = [], guest = false) {
   const nodes = new Map();
   const element = () => ({
     value: "", hidden: false, disabled: false, dataset: {}, selectedOptions: [], children: [], handlers: {},
     focus() {},
     addEventListener(event, callback) { this.handlers[event] = callback; },
     append(...items) { this.children.push(...items); },
+    after() {},
     replaceChildren(...items) { this.children = items; },
     querySelectorAll() { return []; },
   });
@@ -33,7 +34,10 @@ function fixture(connections = []) {
     hostedProviderValidationError: () => "This Home could not check the key. Try again.",
     openCapsuleTarget: () => {},
     fetchJson: async (_url, init = {}) => {
-      if (init.method !== "POST") return { connections };
+      if (init.method !== "POST") {
+        if (guest) throw new Error("request failed: 403 admin passkey required");
+        return { connections };
+      }
       const body = JSON.parse(init.body);
       attempts.push(body);
       saved.set(body.id, body);
@@ -44,6 +48,18 @@ function fixture(connections = []) {
   vm.runInContext(`${controller}\nconfigureAiProvider();`, context);
   return { node, saved, messages, attempts, activate: () => { rejectActivation = false; } };
 }
+
+test("guest setup does not keep an entered key or offer an unusable Add form", async () => {
+  const f = fixture([], true);
+  f.node("#ai-provider-key").value = "guest-key";
+  await new Promise(setImmediate);
+  assert.equal(f.node("#ai-provider-key").value, "");
+  assert.equal(f.node("#ai-provider-add").hidden, true);
+  assert.equal(f.node("#ai-provider-form").hidden, true);
+  assert.equal(f.node("#approval-lens").hidden, true);
+  assert.match(f.messages.at(-1), /not available for this account/);
+  assert.equal(f.attempts.length, 0);
+});
 
 test("hosted Save keeps one identity and entered key across activation failure and retry", async () => {
   const f = fixture();

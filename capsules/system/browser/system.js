@@ -1076,7 +1076,16 @@ function configureAiProvider() {
   hideForm();
   setBusy(false);
   if (hasShellAccess()) {
-    refreshStatus().catch((error) => {
+    addButton.disabled = true;
+    refreshStatus().then(() => setBusy(false)).catch((error) => {
+      if (/^request failed: 403 admin passkey required$/i.test(String(error.message || error))) {
+        keyInput.value = "";
+        formNode.hidden = true;
+        addButton.hidden = true;
+        document.querySelector("#approval-lens").hidden = true;
+        showState("Hosted model setup is not available for this account yet.", "error");
+        return;
+      }
       showState(publicSystemError(error, "Hosted model status is unavailable."), "error");
     });
   }
