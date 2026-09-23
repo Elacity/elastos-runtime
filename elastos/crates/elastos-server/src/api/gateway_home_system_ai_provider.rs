@@ -479,13 +479,15 @@ pub(super) async fn system_approval_lens_revoke(
     #[cfg(not(target_os = "macos"))]
     let ended_https = 0;
     #[cfg(target_os = "macos")]
-    let ended_demo =
-        match crate::api::model_provider_egress::end_demo_text_offer(&state.data_dir, &req.id) {
-            Ok(ended) => ended,
-            Err(err) => return system_error_response(err),
-        };
+    let ended_operator = match crate::api::model_provider_egress::end_operator_hosted_access(
+        &state.data_dir,
+        &req.id,
+    ) {
+        Ok(ended) => ended,
+        Err(err) => return system_error_response(err),
+    };
     #[cfg(not(target_os = "macos"))]
-    let ended_demo = false;
+    let ended_operator = false;
     let jev_active = crate::jev_approval_lens::approved_connection(&state.data_dir, &req.id);
     if jev_active {
         if let Err(err) =
@@ -494,7 +496,7 @@ pub(super) async fn system_approval_lens_revoke(
             return system_error_response(err);
         }
     }
-    if ended_https == 0 && !ended_demo && !jev_active {
+    if ended_https == 0 && !ended_operator && !jev_active {
         return system_error_response(anyhow::anyhow!("hosted connection has no active approval"));
     }
     Json(serde_json::json!({ "offer_id": req.id, "approval": "ended" })).into_response()
@@ -510,9 +512,21 @@ pub(super) async fn system_ai_provider_get(
     match crate::api::ai_provider_status(&state.data_dir) {
         Ok(status) => {
             let mut result = serde_json::to_value(status).expect("serializable provider status");
-            result["hosted_external_https"] = serde_json::json!("paused");
-            result["hosted_external_https_reason"] =
-                serde_json::json!(HOSTED_EXTERNAL_HTTPS_PAUSED);
+            #[cfg(target_os = "macos")]
+            let operator_enabled =
+                crate::api::model_provider_egress::operator_hosted_access_enabled(&state.data_dir);
+            #[cfg(not(target_os = "macos"))]
+            let operator_enabled = false;
+            result["hosted_external_https"] = serde_json::json!(if operator_enabled {
+                "operator_ready"
+            } else {
+                "paused"
+            });
+            result["hosted_external_https_reason"] = serde_json::json!(if operator_enabled {
+                "Owner-authorized hosted HTTPS is active for configured providers."
+            } else {
+                HOSTED_EXTERNAL_HTTPS_PAUSED
+            });
             if let Some(connections) = result
                 .get_mut("connections")
                 .and_then(serde_json::Value::as_array_mut)
@@ -527,11 +541,11 @@ pub(super) async fn system_ai_provider_get(
                         continue;
                     };
                     #[cfg(target_os = "macos")]
-                    if crate::api::model_provider_egress::demo_text_offer_ready(
+                    if crate::api::model_provider_egress::operator_hosted_offer_ready(
                         &state.data_dir,
                         &id,
                     ) {
-                        connection["egress_state"] = serde_json::json!("demo_ready");
+                        connection["egress_state"] = serde_json::json!("operator_ready");
                     }
                     #[cfg(target_os = "macos")]
                     match crate::api::model_provider_egress_decision::offer_state(
