@@ -1,33 +1,21 @@
 # State
 
-## Current model delivery status, 23 September 2026 UTC
+## Current model foundation, 23 September 2026 UTC
 
-| Surface | Verified state | Remaining boundary |
-| --- | --- | --- |
-| Source candidate | Model-readiness change `a1573675` on local branch `feat/0.7.1-model-assistant-closeout` accepts the current five-field model offer list and checks distinct offer IDs before deriving local readiness. Focused Registry, catalog-readiness and startup-repin checks pass. | This unpublished source does not establish public installation. |
-| Signed-in Mac Homes | Owner Home `http://localhost:61965/home/` runs the source-built Runtime, with built and installed SHA-256 `c4c6286573a23cd06a1727ef29434386d15ffec1c42cbcc90673dad4417abf3c`. System shows the retained SmolLM2 as available. Ordinary Assistant selected its exact offer and completed a new terminal reply. Consumer Home `http://localhost:61966/home/` remains signed in for the separate hosted-sharing journey. | The local SmolLM2 result proves this owner installation and request. It does not qualify full Qwen, all installed failure paths or remote inference. |
-| Public seed and Home | The seed holds the signed SmolLM2 package. Older public Get attempts failed at `metadata_read` with zero transferred bytes. Read-only inspection now finds source receipt `f087a0d9`, installed Runtime SHA-256 `62ddda9a31b9b512ebb82deb6c8152229b1c84dee969cf8621e2c742755a1d70`, sealed ipfs-provider SHA-256 `0609b6e089e8ab08254f41c4f685a39c6c7d5c8bc8cfe24a6b1457705df3152e` and repository mode `0700`. | The current public artifacts have not undergone a new public Get or local Assistant run. The next isolated preflight is in [TASKS Now](TASKS.md#now); public product acceptance and release gates remain open. |
+| Surface | Receipt and exact identity | Proven behavior | Open boundary |
+| --- | --- | --- | --- |
+| Local source candidate | `feat/0.7.1-model-assistant-closeout` at `d60dc043` (tree `0b3b5c91`); code-bearing SmolLM2 change `a1573675`; `.audit/local-smol-readiness-installed.json` | Five-field offers and distinct IDs pass focused readiness checks. | Unpublished source; `d60dc043` has no installed or public product proof of its own. |
+| Owner Home 61965 | `.audit/local-smol-readiness-installed.json`; built and installed Runtime SHA-256 `c4c6286573a23cd06a1727ef29434386d15ffec1c42cbcc90673dad4417abf3c` from `a1573675` | Signed-in System shows retained SmolLM2 available; ordinary Assistant selected its exact offer and completed a new reply. | This Owner installation does not qualify Consumer, public, full Qwen or the wider failure matrix. |
+| Consumer Home 61966 | `.audit/codex-hosted-egress-containment-installed.json`; Runtime SHA-256 `90edb7fa1474d23ded52abee44f87c31a4f45f24eb083a8bef658ac6ef84176c` | Signed-in Consumer remains available; hosted Validate/Save pause was installed and checked with a controlled endpoint. | No SmolLM2 admission here; hosted HTTPS and the separate service-grant journey remain open. |
+| Public Runtime and provider | `f087a0d9` (tree `87e61b3e`); `.audit/public-seed-gate-61974/receipt.json`; Runtime SHA-256 `62ddda9a31b9b512ebb82deb6c8152229b1c84dee969cf8621e2c742755a1d70`, ipfs-provider SHA-256 `0609b6e089e8ab08254f41c4f685a39c6c7d5c8bc8cfe24a6b1457705df3152e` | Read-only artifact inspection found the sealed provider and repo mode `0700`; the seed retains the signed SmolLM2 pin. | Older public Get attempts failed at `metadata_read` with zero bytes. No Get or signed-in Assistant run has been proved on the current public installation. |
+| Public UI and manifest overlay | `81875544` (tree `a0cfeb3e`) over `f087a0d9`; `.audit/hosted-egress-design-scratch/installed-ui-33aba416/public-live-postcheck-81875544.json`; manifest SHA-256 `4dd3f1e42a71b0474a6e34264048a4bab88f52945bf8fb2610f00060763ccd27` | Installed and served Home/System assets match the overlay receipt; signed-in System shows hosted HTTPS paused. | UI and manifest identity differs from the public Runtime source; a UI check is not public model Get or inference. |
+| Isolated Linux Home 61974 | `.audit/public-seed-gate-61974/receipt.json`; copied public Runtime, provider and manifest hashes above, with separate identity and data root | After correcting its test data-root ancestor to `0700`, typed Marketplace Get admitted 144,835,448 bytes; two typed local runs completed across a Runtime restart with unchanged weights hash, inode and mtime. | This isolated Get and these runs are neither public Get nor proof of `d60dc043`; signed-in UI and compatible pinned Linux engine still need target proof. |
 
-The exact current local receipt is `.audit/local-smol-readiness-installed.json`.
-The earlier cold delivery, restart, warm reuse and hosted results below retain
-their own receipts and scopes. Private receipts stay outside Git.
-
-An isolated Linux Home at `127.0.0.1:61974` used copies of those current public
-Runtime and provider artifacts with a fresh identity and data root. Its
-catalogue routing metadata came from the public installation. A 763-byte fixture
-reproduced a capacity rejection while Kubo's repo was `0775`; the provider
-sealed it to `0700`, then capacity, read and provider restart passed. The first
-Marketplace request on this isolated Home failed at capacity because its test
-`xdg-data` ancestor was also `0775`. After that ancestor was set to `0700`, a
-new typed Marketplace `content.use` admitted the full signed SmolLM2 closure
-(144,835,448 bytes). Two typed local Assistant-model runs completed, one after a full
-isolated Runtime restart with the same weights hash, inode and modification
-time. The holder's recursive pin remained. Receipt:
-`.audit/public-seed-gate-61974/receipt.json`. This qualifies the isolated
-path and the current installed artifact identity. Public Get, signed-in human
-UI and deployment retain their own gates. The startup repo
-seal still merits a separate no-follow and data-root review before a later
-security claim.
+The last recorded public free-space reading is 11.72% in the 23 September UI
+postcheck receipt. It is dated evidence. Before any later public action, obtain
+a fresh read-only resource and hosting-policy preflight. The next isolated
+engine proof and public approval sequence are in [TASKS Now](TASKS.md#now).
+Private receipts stay outside Git; completed detail remains in the dated audits.
 
 ## Mac controlled DNS answer change, 23 September 2026 UTC
 

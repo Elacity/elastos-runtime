@@ -18,10 +18,11 @@ Agent Host or App
 ```
 
 Runtime authorizes the caller, resource, action, model policy, and session.
-The model provider owns backend credentials, endpoint selection, protocol
-adaptation, request serialization, streaming, rate-limit translation, and
-provider-specific error handling. The model backend supplies output; it does
-not gain Runtime authority.
+Runtime stores hosted credentials in its owner-only secret store, selects the
+approved HTTPS destination, and brokers each hosted effect. The confined model
+provider owns protocol adaptation, request serialization, streaming,
+rate-limit translation, and provider-specific error handling. The model backend
+supplies output; it does not gain Runtime authority.
 
 A tool call or effect proposal returned by a model is untrusted input. The
 Agent Host must submit it as a new typed Runtime operation under the active
@@ -58,21 +59,30 @@ this binding. Carrier authenticates and transports the route that Runtime
 selects; the destination grants model authority. Publication advertises the
 selected capability. Destination-owned grants authorize its use. The host Home,
 workspace, and other runs retain their separate access rules. Hosted credentials
-and local model artifacts stay inside their owning boundaries.
+stay in the owning Runtime's secret store; local model artifacts stay in their
+owning boundaries.
 
 The owning Runtime DID signs the service offer, which names the admitted
 provider capability and contains only bounded capability and policy facts. The
-provider identity remains an internal execution binding. Backend URLs,
-credentials, process details, and topology stay inside the model provider. A
+provider identity remains an internal execution binding. Hosted URLs and
+credentials stay in Runtime's private route; provider process details and
+topology stay behind the model-provider contract. A
 model artifact is separate immutable content. Its canonical package identity
 is the CID of the complete manifest-and-payload closure. Engine, component, and
 payload hashes are verification facts rather than package identities. Runtime
 prepares and admits the package through the Content provider path in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
-A hosted web API is a provider-internal HTTPS interoperability edge on the
-Runtime that owns the credential. Mac to local model provider to hosted API is
-local configured use. Mac Runtime to Carrier to a Jetson or seed Runtime, then
+A hosted web API is a Runtime-owned HTTPS interoperability edge on the Home
+that stores the credential. Runtime checks the exact owner route and sends the
+selected destination and credential through its broker. The installed Mac path
+confines the provider's direct external sockets; Linux product confinement
+still needs proof. The temporary Mac operator route
+bypasses normal Inbox decision and grant checks when enabled. Runtime still
+selects its permitted destination and credential, and the owner can End that
+route. Permanent SEC1 acceptance remains open.
+
+Mac Runtime to Carrier to a Jetson or seed Runtime, then
 to that Runtime's model provider and backend, is service use. Ordinary capsules
 see only typed `elastos://model/*` resources. Publishing a paid hosted offer
 requires operator-owned quota, accounting, and data-policy facts.
@@ -233,7 +243,9 @@ availability. Cost appears in a completed run receipt when the backend
 reports it. The UI never shows the secret.
 
 Runtime validates the credential separately from a consented paid test.
-Validate uses the pinned public HTTPS hosts when the Home has no owner-scoped
+Validate requires Runtime-owned HTTPS authority to the pinned public host.
+The temporary Mac operator route has the bypass and End behavior described
+above. The Home can also use an owner-scoped
 `providers/model-provider/validate-fixtures.json`. That file, when present,
 may bind validate HTTP only to `http://127.0.0.1` with an explicit port.
 Save stays private and publishes no service offer. A later Share action uses

@@ -171,6 +171,52 @@ verification separate from product acceptance and required human review.
 
 ## Now
 
+Current identities and limits are in [state.md](state.md#current-model-foundation-23-september-2026-utc).
+The model builder and monitor remain paused. These are the unfinished actions,
+in order; each target keeps its own acceptance evidence.
+
+1. **J3 / MA1 / MA3 — isolated Linux 61974:** Use the copied public-artifact
+   installation only. First verify a compatible, pinned local engine and its
+   binary/library hashes, then read CPU, RAM, free space and hosting policy.
+   Next proof is one bounded SmolLM2 run with an engine receipt. Stop if the
+   engine is unavailable, identity differs, or resource/hosting limits fail.
+   The dated Get and two typed runs are in
+   `.audit/public-seed-gate-61974/receipt.json`; they do not prove the public
+   or local `d60dc043` installation.
+2. **J3 / MA1 — public Home:** Only after the isolated engine and resource
+   facts pass, request exact approval for one public Marketplace Get. First
+   refresh the read-only public free-space and hosting-policy preflight; the
+   last 23 September reading was 11.72%, not an action-time reading. Next proof
+   is a public Get receipt on the named public Runtime/provider. Stop at missing
+   approval, resource pressure, artifact drift, or a Get failure. A separate
+   signed-in Assistant run and manual UI evidence must then be proved on that
+   public installation; the isolated run cannot close either clause.
+3. **MA / AI — Owner 61965 and Consumer 61966:** Preserve the Owner's accepted
+   SmolLM2 reply and the Consumer's separate installed state. Resume the exact
+   pending hosted connection, service grant, Jev, sharing and negative-path
+   criteria only with a named Home, current grant, owner decision and permitted
+   HTTPS route. Next proof is a fresh, receipt-bound ordinary journey on that
+   installation. Stop before dispatch if its Inbox decision or grant is absent;
+   historical results are in the [11 September team audit](docs/audits/2026-09-11-team-sync.md)
+   and [model convergence audit](docs/audits/2026-09-11-assistant-convergence.md).
+4. **MA1 / MA3 / AI / CR3:** Keep signed successor catalogue, both Qwen
+   acquisition orders, full Qwen distribution/benchmark, global sole-copy
+   retention, frozen-provider cancellation and approved relay support open.
+   Each needs its named publisher authority, source/target resources, or scope
+   decision before a new proof. Stop if that prerequisite is missing. Preserve
+   the original criteria, checkbox states and dated failures in the historical
+   record below and the [integration audit](docs/audits/2026-09-11-integration-preservation.md).
+5. **SEC1 — hosted network authority:** Keep the permanent Linux confinement,
+   public HTTPS, owner grant/revocation and unknown-create reconciliation gate
+   open. The temporary Mac operator route bypasses normal Inbox decision and
+   grant checks while enabled; end it before a permanent-authority claim.
+   Prove each path on its named installation with zero-request denial and
+   recovery receipts. Stop before external dispatch without the required owner
+   authority. The `/tmp` serve default and overlapping `components.json`
+   `capsules`/`external` records are bounded code follow-ups, not this docs gate.
+
+### Dated model execution evidence and original acceptance
+
 The 23 September source candidate `a1573675` and local receipt
 `.audit/local-smol-readiness-installed.json` close the current Mac owner
 SmolLM2 readiness regression: the installed Runtime matches its build, System
@@ -178,7 +224,7 @@ shows the retained model as available, and ordinary Assistant selected the
 exact offer and completed a new terminal reply. The signed-in Owner and Consumer
 Homes remain available for human testing. This is an installed local-model
 result; public Get, full Qwen, the wider installed failure matrix and release
-qualification remain open. [Current source, installed and public status](state.md#current-model-delivery-status-23-september-2026-utc)
+qualification remain open. [Current source, installed and public status](state.md#current-model-foundation-23-september-2026-utc)
 keeps these scopes separate.
 
 The public-seed model gate has isolated Linux evidence. Read-only inspection
@@ -229,7 +275,7 @@ public SmolLM2 attempts settled at `metadata_read` with zero index and
 transferred bytes on the then-installed provider. That label did not identify
 the provider's internal cause. The later Mac small-model journey passed; the
 current public artifact and isolated Linux result are recorded in Now and
-[state.md](state.md#current-model-delivery-status-23-september-2026-utc).
+[state.md](state.md#current-model-foundation-23-september-2026-utc).
 Marketplace target-Home clarity and signed-in seed-local inference remain open
 product acceptance, with the next proof specified in Now.
 
@@ -1524,6 +1570,7 @@ installed behavior and public-live behavior require separate evidence.
 ### 5. Truth surfaces and anti-drift
 - [ ] Remove duplicated volatile facts such as scattered versions, metrics, and proof transcripts from durable docs.
 - [ ] Simplify `components.json` so installable first-party components do not live in two competing top-level registries (`capsules` and `external`) with duplicate names. Keep one canonical component record and derive release/setup views from it.
+- [ ] Replace the `/tmp/elastos/storage` serve default in `elastos/crates/elastos-server/src/run_cmd.rs` with a stable data-root path. Prove an ordinary restart keeps the same owned state before changing installed Homes. This is a later code slice.
 - [ ] Collapse or clearly document the two capsule source roots: root `capsules/` holds most first-party capsules, while `elastos/capsules/` still holds `shell` and `localhost-provider`. The repo should expose one obvious source layout for developers before the next release line.
 - [ ] Keep `PRINCIPLES.md`, docs, and command surfaces aligned through fail-closed checks instead of periodic prose cleanup.
 - [ ] Encode the proof-first and command-surface guardrails in durable repo docs so agents do not keep reinventing launch models or overstating proof.

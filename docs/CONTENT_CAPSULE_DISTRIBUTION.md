@@ -22,7 +22,7 @@ does not describe the later SmolLM2 result.
 A later signed-in Mac Home acquired and admitted SmolLM2 through ordinary
 Marketplace and Carrier, then completed a terminal Assistant reply. Its current
 installed readiness regression also passed after Runtime restart; the exact
-local receipt is recorded in [state.md](../state.md#current-model-delivery-status-23-september-2026-utc).
+local receipt is recorded in [state.md](../state.md#current-model-foundation-23-september-2026-utc).
 Full Qwen, combined retention and failure-path acceptance, and public delivery
 remain open.
 
@@ -42,7 +42,7 @@ URL entry in Home.
 - A GGUF model is a `role=content`, `type=data` capsule whose manifest describes
   the model format, quantization, resource requirements, license, provenance,
   and compatible model-provider interface.
-- The intended model consumer is Agent/chat, analogous to a video's Player.
+- The intended model consumer is Assistant, analogous to a video's Player.
   Marketplace is primary content discovery; System also manages models.
   Selection carries content identity. Runtime owns admission and run authority,
   and the model provider owns execution. The content capsule remains passive.
@@ -113,10 +113,10 @@ workflow, file picker or editable model path. It uses this sequence:
    Package identity remains separate from service-offer identity and install
    authority.
 7. Marketplace content browse/details/Use, System model management and existing
-   Assistant/Home Agent pickers project the same catalog, inventory and offer
+   Assistant pickers project the same catalog, inventory and offer
    records. They show availability, Preparing with progress, Ready, or an
    actionable failed, offline or incompatible state. The intended Open handoff
-   selects that model in Agent/chat and composes preparation with use; inference
+   selects that model in Assistant and composes preparation with use; inference
    waits for admission and provider readiness. Open Models opens Marketplace
    Models. A ready model can open Assistant with that exact CID. Inference
    still waits for admission, provider readiness, and Send.
@@ -351,7 +351,7 @@ content CID and the consumer's typed model-run authority.
 | --- | --- |
 | `gateway_capsule_catalog/read_model.rs` already merges signed passive model entries into the capsule catalog. | Make Marketplace the primary content discovery path; retain System management and one catalog. Review the exact-one-entry validation and both helpers' at-most-one limit before broader choices. |
 | Generic `CapsuleManifest.viewer`, viewer compatibility audit and Home open-target handoff describe a content consumer. | The model profile rejects `viewer`; the current audit also requires an installed viewer-role target with a content interface. Agent/Assistant use their own roles and model interfaces. Map compatible selection explicitly rather than removing checks or relabeling execution as passive content. |
-| Library's protected-video handoff and Home launch context keep identity separate from authority. | Define the smallest exact-CID selection handoff into Agent/chat, preserving drafts, current launch binding and deliberate run intent. Open Models now opens Marketplace Models, and a ready result can select that exact CID in Assistant. |
+| Library's protected-video handoff and Home launch context keep identity separate from authority. | Define the smallest exact-CID selection handoff into Assistant, preserving drafts, current launch binding and deliberate run intent. Open Models now opens Marketplace Models, and a ready result can select that exact CID in Assistant. |
 | Runtime preparation inventory, private artifact descriptors and the existing model provider own admission, retention and execution. | Compose selection with preparation while retaining fail-closed admission, exact offer binding and cancellation/outcome ownership. The content manifest supplies no execution capability. |
 | Content/availability own delivery; Carrier is the private off-box transport. | Adapt bounded local preparation reads to that delivery contract with finite byte/time/cancellation limits. Both the ordinary whole-file materializer and `viewer_gateway::viewer_content`, which reads the entrypoint into browser-delivered bytes, are unsuitable for model weights. Reuse handoff identity, not those byte paths. |
 
@@ -377,7 +377,7 @@ The following separates implemented primitives from remaining package work:
 | Existing surface | Current state and required extension |
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented, including the current viewer rejection. Review handoff compatibility separately from execution authority; preparation verifies facts against the complete fetched package. |
-| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant/Home Agent match exact ready offers and preserve optional CID intent. |
+| `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant matches exact ready offers and preserves optional CID intent. |
 | `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
@@ -448,7 +448,7 @@ Implemented source boundaries and remaining acceptance:
    Visible in-flight preparation has bounded polling; request and CID ownership
    reject stale replies. An unconfirmed Use keeps its request identity until a
    successful read reconciles it. Keep is a caller retention choice, not deletion.
-   Assistant/Home Agent keep exact offer/CID intent in existing workspaces and
+   Assistant keeps exact offer/CID intent in existing workspaces and
    use current unique ready mappings. Missing choices and failed refreshes
    preserve drafts and accepted runs; new dispatch requires current readiness
    and deliberate Send. Open Models uses the Home handoff to Marketplace Models.
@@ -461,7 +461,7 @@ Implemented source boundaries and remaining acceptance:
    bounded local import and installed artifact receipts. Resolve the observed
    Use failure before retry; record fresh-install prerequisites separately from
    the existing owner Home. After reviewed adaptation, select the real signed
-   Qwen entry in Marketplace and open Agent/chat, prepare, receive a real reply
+   Qwen entry in Marketplace and open Assistant, prepare, receive a real reply
    through the existing typed run contract,
    restart, reuse without transfer, and verify explicit recoverability-aware
    removal through System storage management with busy-safe eviction.
@@ -482,7 +482,7 @@ llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
 signed closure size. The local operator package records exact bytes,
 complete-closure CID, publisher signature/trust, licenses, provenance claims,
 resource limits and local availability. Its verified scope and upstream
-provenance limits are in [state.md](../state.md#current-isolated-owner-home).
+provenance limits are in [state.md](../state.md#model-and-assistant-truth).
 That local package proof does not establish off-box distribution. The existing
 engine's platform/checksum receipt
 and shared libraries must work on a genuinely fresh supported install; missing

@@ -139,16 +139,16 @@ in the UI. Recipients verify it before retaining, mounting, or forking it.
 The contract and its limits live in
 [Content availability](docs/CONTENT_AVAILABILITY.md).
 
-The first package-delivery milestone is a signed, CID-identified Qwen content
-capsule used through Runtime-owned preparation. Source has bounded local
-admission/offer binding and reply/reuse fixture proof; installed Use and cold
-peer delivery remain unaccepted. The intended experience uses Marketplace
-discovery/Open into Home Agent, retains the selected local model, and provides
-recoverability-aware removal in System. Generic Get is not current shipped
-support. The contract lives in
+The first package-delivery milestone was planned around a signed,
+CID-identified Qwen content capsule. That wording is historical: later
+receipts record installed Qwen and SmolLM2 journeys on named Homes. Current
+acceptance and target limits are in [state.md](state.md#current-model-foundation-23-september-2026-utc)
+and [TASKS Now](TASKS.md#now). The intended experience uses Marketplace
+discovery and exact handoff into Assistant, keeps the selected local model,
+and provides recoverability-aware removal in System. The contract lives in
 [Content capsule distribution](docs/CONTENT_CAPSULE_DISTRIBUTION.md).
 Execution and proof dependencies live in
-[Builder-only execution](TASKS.md#builder-only-execution).
+[TASKS Now](TASKS.md#now).
 
 ### 3. Build Runtime-mediated protected content
 

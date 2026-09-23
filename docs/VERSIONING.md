@@ -13,7 +13,8 @@ This repo currently has three distinct version layers. They should not be read a
 1. **Core runtime release train**
    - the coordinated workspace line under [`elastos/Cargo.toml`](../elastos/Cargo.toml)
    - read its version from the workspace manifest; release status belongs in `state.md`
-   - this is the public release identity for the runtime/server crates
+   - the workspace currently says `0.7.0`; this is source package metadata,
+     while the signed public release is stamped `0.7.1`
 
 2. **Stamped public release version**
    - the publish/install/update version injected through `ELASTOS_RELEASE_VERSION`
@@ -27,7 +28,8 @@ This repo currently has three distinct version layers. They should not be read a
 
 Current rule:
 
-- treat the coordinated runtime release train and the stamped public release as the product version
+- use the stamped `0.7.1` identity for the signed public release; a local
+  workspace `0.7.0` value alone does not identify the installed product
 - treat capsule-local `0.1.0` values as local package metadata unless and until the repo intentionally unifies them
 - do not present capsule-local `0.1.0` values as if they supersede or contradict a stamped public release
 
