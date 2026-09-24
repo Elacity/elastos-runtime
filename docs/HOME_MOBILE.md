@@ -304,6 +304,7 @@ is gated at these numbers.
 | Surface | Portrait targets < 44 / text < 12 | Landscape |
 | --- | --- | --- |
 | desktop, launcher, Spotlight (empty and with results), Control Centre, Notification Centre, Mission Control, Assistant face | 0 / 0 | 0 / 0 |
+| app menu (M5, long-press on a Dock app) | 0 / 0 | 0 / 0 |
 | any window | 1 / 0 (the 24 px Dock handle) | 1 / 0 |
 
 ### After M2–M3 (bar, Dock, title bar), 2026-09-23
@@ -347,6 +348,40 @@ Known engine noise: WebKit reports the caught cross-frame probe in
 page error. Chromium returns `null` silently. The shell keeps working; the
 smoke records it and does not fail on it.
 
+## Touch menus (M5)
+
+Every shell menu is bound to `contextmenu`: Dock apps, launcher cards, the
+Bin, desktop objects and the empty desktop. Android Chrome fires it for a
+held finger; iOS Safari never does, so on an iPhone those menus had no way
+in. `shell-touch.js` closes the gap once for all of them:
+
+- A touch or pen held still for 500 ms (drifting under 10 px) dispatches
+  `contextmenu` at the finger. A drift, a lift or a `pointercancel` (the
+  browser took the gesture to scroll) cancels it. A mouse is left alone.
+- The release clicks only when no menu took the press. Holding a Dock app
+  opens its menu and does not launch it; a slow tap on a plain button still
+  presses it.
+- The browser's own long-press `contextmenu` (Android) and ours never both
+  land: whichever comes first opens the menu and the other is dropped.
+- Desktop icons keep their own long-press, which also arms the touch drag.
+  Their tap-to-open on touch (`shouldOpenDesktopShortcutFromClick`) stays;
+  it is not a suppression of long-press.
+
+On the phone the menu is a bottom sheet (`.context-menu-sheet`), not a
+popup under the finger that hides it: full width 8 px from the edges and
+the bottom, 48 px rows at 16 px, over a dimmed shell. A sheet sits away from
+the icon, so an app menu starts with the app's name (the menu's accessible
+name carries it at every size). A tap beside the sheet only dismisses it;
+the tap does not land on whatever sat under it. Tablet and desktop keep the
+popup at the pointer.
+
+The smoke measures the menu as the `context-menu` surface and, on portrait,
+long-presses a Dock app: the menu must open as the named sheet with thumb
+rows, no window may open, and a tap on the bar's Control Centre button
+beside it must only dismiss (screenshot `context-menu-sheet`). Playwright
+cannot hold a finger down, so the probe plays the browser's touch
+`pointerdown`, the hold, then the `pointerup` and click a release produces.
+
 ## Real-device checks the smoke cannot do
 
 These are done by a person on a phone and recorded in the PR that changes
@@ -361,6 +396,9 @@ the behaviour.
 - System back: Android back and the iOS edge swipe must close the top sheet
   or return Home, and must leave Home from the bare desktop.
 - Rotation with a window open keeps the window and its state.
+- Long-press: holding a Dock app opens its menu sheet once on iOS Safari and
+  Android Chrome, with no text selection, magnifier or link callout, and
+  lifting the finger does not launch the app.
 
 ## Reach and origin
 
