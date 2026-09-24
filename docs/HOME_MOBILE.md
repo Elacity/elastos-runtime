@@ -92,7 +92,9 @@ Capsules run in opaque sandboxed iframes and own every touch that lands on
 them. A shell gesture may start only on shell chrome: the title bar, the dock
 handle, a sheet handle, the desktop. The shell never listens for a swipe
 that begins over capsule content, and never uses a horizontal edge gesture,
-because Android back and iOS back both live there.
+because Android back and iOS back both live there. The Home pages turn with
+a swipe across the grid, not from the edge; the edit mode's page turn is a
+dragged icon held near the edge, not a swipe from it.
 
 ## How it is measured
 
@@ -356,14 +358,14 @@ metaphor (files on the wallpaper, an Apps sheet sliding up from the Dock)
 read as a desktop squeezed onto a phone.
 
 - The grid (`#phone-home`, `shell-phone-home.js`) fills the stage between
-  the bar and the Dock: 4 columns in portrait, 6 in landscape, 60 px icons
-  with names on up to two lines at 12 px. It keeps the launcher's order
-  (apps, then Library items) and does not reshuffle as apps run.
-- The Dock holds the Assistant and the first 4 Shelf pins. An app is in the
-  Dock or on the grid, never both. The phone Dock is a view of the same
-  Shelf the desktop Dock shows, not a second layout: pins past the 4th stay
-  on the grid, and pinning from the grid is offered only while the Dock has
-  room.
+  the bar and the Dock: 4 columns in portrait with names on up to two lines,
+  6 in landscape with names on one line (which buys a second row), 60 px
+  icons, names at 12 px. Until the person arranges it, it keeps the
+  launcher's order (apps, then Library items); it never reshuffles as apps
+  run.
+- The Dock holds the Assistant and up to 4 apps. An app is in the Dock or on
+  the grid, never both. Until the person arranges it the phone Dock is the
+  first 4 Shelf pins; pins past the 4th stay on the grid.
 - On the phone the Apps button, the desktop's files and first-run hint, and
   the Dock's Bin and running apps stand down. Library has the Desktop and
   the Bin as places; the switcher has running apps. The empty Home's menu
@@ -375,12 +377,66 @@ It checks every app sits on the grid or in the Dock exactly once, the Dock
 holds at most 4 apps beside the Assistant with no Apps button, Bin or
 running apps, no desktop file shows, the grid sits between the bar and the
 Dock at 4 or 6 columns, and a long-press on a grid app opens its menu sheet
-and launches nothing. `scripts/home-phone-home.test.mjs` covers the Dock
-and grid split under `node:test`.
+and launches nothing. On both phone profiles the smoke then plays the
+thumb through edit mode (screenshots `home-edit`, `home-assistant`): hold a
+grid app (its menu opens), move it (edit mode, the menu closes, Done shows),
+push it against the right edge until the page turns and drop it there
+(two pages, two dots); a tap opens nothing; a Dock app goes onto the grid
+and back; Done ends the mode and keeps the arrangement; the first dot turns
+back to page 1; swiping right past page 1 opens the Assistant and closing
+it lands on page 1. `scripts/home-phone-home.test.mjs` covers the Dock and
+grid split, the stored arrangement and every drop under `node:test`; the
+server's `test_home_browser_state_drops_unknown_targets` covers the
+cleaning.
 
-Next: pages the thumb swipes between (native scroll snap, with tappable
-page dots as the button twin) once the apps outgrow one screen, then an
-edit mode (hold, drag, Done) for the grid and the Dock.
+### Pages
+
+The grid is pages the thumb swipes between, one page per swipe (native
+scroll snap, `shell-phone-home-pager.js`). A page holds as many rows as the
+screen fits (20 apps on an iPhone 14 in portrait, 12 sideways); a page too
+long for a smaller screen runs on to the next. Under the pages, the dots are
+the button twin: an adjustable control (tap a dot, or the arrow keys) over a
+44 px row that stays reserved on a single page, so the grid never jumps.
+
+Left of page 1 sits the Assistant: the Agent Space that is far left of the
+Space ring on every size. Swiping right from page 1 and settling there opens
+the Assistant; once its room covers the floor the grid turns back to page 1
+unseen, so closing the Assistant lands on the Home. The page is also a
+button, for anyone who taps rather than swipes.
+
+### Edit mode
+
+`shell-phone-home-edit.js`, as on a phone. Hold an app until its menu opens
+and move it (the menu gives way), or choose Edit Home Screen from an app's
+or the empty Home's menu. The bar gives way to Done, icons jiggle, and a tap
+no longer opens anything. Then any app on the grid or in the Dock can be
+dragged:
+
+- along a page (the other icons slide to their new slots);
+- against a screen edge to turn the page; past the last page a new page
+  opens, unless the dragged app would leave its old page empty;
+- from the grid into the Dock while it has room (a full Dock takes no
+  newcomer; the Assistant's tile stays put), or out of the Dock onto the
+  grid. The menus offer the same as Add to Dock and Remove from Dock.
+
+A page pushed past full hands its last app to the front of the next page.
+Done, Escape or a tap on an empty spot ends the mode. Every drop is saved as
+it lands. Once a hold has armed a drag the thumb moves the icon, not the
+pages; in edit mode a touch on an icon never pans. Reduced motion stops the
+jiggle and the slides. It is pointer events throughout, so a mouse drags in
+edit mode too. On the phone the Dock rearranges only here; the desktop's
+Dock drag stands down.
+
+### The phone's own arrangement
+
+Arranging the phone never moves the desktop. The Home layout (the per-person
+state the Home saves to `/api/apps/home/state`) keeps the phone's
+arrangement beside the desktop Shelf: `homeDock`, up to 4 target ids, and
+`homePages`, pages of target ids. Both are absent until the first edit,
+which is why an unarranged phone mirrors the Shelf and the launcher. They are
+wishes, not contracts: ids this Home no longer has drop out (the server
+cleans them as it cleans the Shelf's), and new installs join the last page.
+No capsule API, no new authority: it is presentation state like the Shelf.
 
 ## Touch menus (M5)
 
@@ -433,6 +489,11 @@ the behaviour.
 - Long-press: holding a Dock app opens its menu sheet once on iOS Safari and
   Android Chrome, with no text selection, magnifier or link callout, and
   lifting the finger does not launch the app.
+- Home pages and edit mode: a swipe turns exactly one page and never pulls
+  the browser's own back gesture; holding an app then moving it drags the
+  icon without scrolling the pages; an edge hold turns the page; swiping
+  right from page 1 opens the Assistant. The smoke plays pointer events;
+  only a real finger proves the native scroll hand-off.
 
 ## Reach and origin
 
