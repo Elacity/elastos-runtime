@@ -1000,3 +1000,16 @@ button {
   margin: 0;
   font-size: 28px;
 }
+
+/* Row actions keep their 28 px pill but take a 44 px target: the transparent
+   border is tappable and the pill paints inside it. */
+:root[data-el-form-factor="phone"] .store-pill {
+  min-height: var(--el-touch-target);
+  border: solid transparent;
+  border-width: 8px 0;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] .store-pill:focus-visible {
+  outline-offset: -6px;
+}

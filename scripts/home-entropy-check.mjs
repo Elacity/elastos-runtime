@@ -12539,8 +12539,12 @@ assert(
     marketplaceIndex.includes('<script src="./elastos-drawer.js"></script>') &&
       marketplaceIndex.includes('data-el-drawer-room="store-sidebar"') &&
       marketplaceIndex.includes('data-el-drawer-toggle="store-sidebar"') &&
-      read("scripts/marketplace-product-layout-smoke.mjs").includes('drawer: "#store-sidebar",'),
-    "Marketplace phone: the sidebar is the push drawer and the page title leads with its toggle, asserted by the layout smoke",
+      read("scripts/marketplace-product-layout-smoke.mjs").includes('drawer: "#store-sidebar",') &&
+      read("capsules/marketplace/browser/marketplace.css").includes(':root[data-el-form-factor="phone"] .store-pill {\n  min-height: var(--el-touch-target);\n  border: solid transparent;\n  border-width: 8px 0;\n  background-clip: padding-box;') &&
+      read("scripts/marketplace-product-layout-smoke.mjs").includes('"phone row actions must be 44 px targets",') &&
+      /marketplace: 0, system/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
+      /marketplace: 0, system/.test(capsuleRatchet[1].split('"phone-landscape"')[1]),
+    "Marketplace phone: the sidebar is the push drawer, the page title leads with its toggle, and row actions keep their pill inside a 44 px target, asserted by the layout smoke and held at 0 small targets by the phone smoke",
   );
 
   const documentsIndex = read("capsules/documents/browser/index.html");

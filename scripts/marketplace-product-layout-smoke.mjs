@@ -533,6 +533,7 @@ async function readHomeMessages(page) {
 
 const PHONE_SCREENSHOT = "/tmp/marketplace-phone-390x844.png";
 const PHONE_DRAWER_SCREENSHOT = "/tmp/marketplace-phone-drawer-390x844.png";
+const PHONE_TOUCH_TARGET_PX = 44;
 async function waitForFrameWidth(frame, expectedWidth) {
   await frame.waitForFunction((width) => window.innerWidth === width, expectedWidth);
 }
@@ -892,6 +893,17 @@ async function run() {
     await page.waitForTimeout(DRAWER_SETTLE_MS);
     await assertNoHorizontalOverflow(frame, "phone Marketplace layout");
     await page.screenshot({ path: PHONE_SCREENSHOT });
+    const phonePills = await frame.locator(".store-pill").evaluateAll((pills) =>
+      pills.map((pill) => {
+        const rect = pill.getBoundingClientRect();
+        return { label: pill.textContent.trim(), height: Math.round(rect.height) };
+      }),
+    );
+    assert(
+      phonePills.length > 0 && phonePills.every((pill) => pill.height >= PHONE_TOUCH_TARGET_PX),
+      "phone row actions must be 44 px targets",
+      phonePills,
+    );
     await assertPhoneDrawer(page, frame, {
       label: "Marketplace",
       drawer: "#store-sidebar",
