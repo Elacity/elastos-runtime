@@ -90,6 +90,7 @@ const BASELINE = {
     desktop: { targets: 1, text: 1 },
     launcher: { targets: 0, text: 0 },
     spotlight: { targets: 1, text: 1 },
+    "spotlight-results": { targets: 0, text: 0 },
     "control-centre": { targets: 0, text: 0 },
     notifications: { targets: 0, text: 0 },
     "mission-control": { targets: 1, text: 1 },
@@ -100,6 +101,7 @@ const BASELINE = {
     desktop: { targets: 1, text: 1 },
     launcher: { targets: 0, text: 0 },
     spotlight: { targets: 1, text: 1 },
+    "spotlight-results": { targets: 0, text: 0 },
     "control-centre": { targets: 0, text: 0 },
     notifications: { targets: 0, text: 0 },
     "mission-control": { targets: 1, text: 1 },
@@ -110,6 +112,7 @@ const BASELINE = {
     desktop: { targets: 8, text: 2 },
     launcher: { targets: 9, text: 2 },
     spotlight: { targets: 8, text: 2 },
+    "spotlight-results": { targets: null, text: null },
     "control-centre": { targets: 30, text: 8 },
     notifications: { targets: 9, text: 42 },
     "mission-control": { targets: 1, text: 1 },
@@ -661,6 +664,9 @@ async function pressEscape(frame) {
   await sleep(SURFACE_SETTLE_MS);
 }
 
+// One letter that fills Spotlight with result rows.
+const SPOTLIGHT_PROBE_QUERY = "e";
+
 // Each surface: how to open it, how long it takes to settle, how to close it.
 const SHELL_SURFACES = [
   {
@@ -679,6 +685,16 @@ const SHELL_SURFACES = [
     id: "spotlight",
     open: (frame) => frame.locator("#toolbar-spotlight").click(),
     settle: SHEET_SETTLE_MS,
+    close: pressEscape,
+  },
+  {
+    id: "spotlight-results",
+    open: async (frame) => {
+      await frame.locator("#toolbar-spotlight").click();
+      await sleep(SHEET_SETTLE_MS);
+      await frame.locator("#spotlight-input").fill(SPOTLIGHT_PROBE_QUERY);
+    },
+    settle: SURFACE_SETTLE_MS,
     close: pressEscape,
   },
   {
@@ -825,6 +841,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let dockProbe = null;
   let stageProbe = null;
   let keyboardProbe = null;
+  let spotlightProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -857,6 +874,9 @@ async function runProfile(browser, engineId, profile, origin) {
       if (surface.id === "assistant-face" && profile.id.startsWith("phone")) {
         keyboardProbe = await probeKeyboardInset(page, frame);
       }
+      if (surface.id === "spotlight-results" && profile.id === "phone-portrait") {
+        spotlightProbe = await probeSpotlight(page, frame);
+      }
       await surface.close(frame);
     }
     for (const [target] of FIRST_PARTY_APPS) {
@@ -884,7 +904,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -894,10 +914,14 @@ async function runProfile(browser, engineId, profile, origin) {
 const KEYBOARD_PROBE_INSET_PX = 300;
 const KEYBOARD_SETTLE_MS = 150;
 
-async function probeKeyboardInset(page, frame) {
-  const postFromHost = (inset) => page.evaluate((message) => {
+function postKeyboardInsetFromHost(page, inset) {
+  return page.evaluate((message) => {
     document.getElementById("active-shell-frame").contentWindow.postMessage(message, "*");
   }, { type: "home:keyboard-inset", inset });
+}
+
+async function probeKeyboardInset(page, frame) {
+  const postFromHost = (inset) => postKeyboardInsetFromHost(page, inset);
   const readRoom = () => frame.evaluate(() => ({
     inset: getComputedStyle(document.documentElement).getPropertyValue("--keyboard-inset").trim(),
     roomBottom: Math.round(document.querySelector(".assistant-space").getBoundingClientRect().bottom),
@@ -931,6 +955,46 @@ function phoneKeyboardFailures(run) {
   }
   if (lowered.inset !== "0px" || lowered.roomBottom !== lowered.viewportHeight) {
     failures.push(`${label}: an inset of 0 must give the room back. Got ${JSON.stringify(lowered)}`);
+  }
+  return failures;
+}
+
+// Spotlight with results on a portrait phone: the panel hangs just under the
+// bar, and with the host's keyboard inset it ends above the keyboard.
+// (Landscape leaves the keyboard almost no stage; not probed.)
+const SPOTLIGHT_MAX_GAP_UNDER_BAR_PX = 12;
+
+async function probeSpotlight(page, frame) {
+  const readPanel = () => frame.evaluate(() => {
+    const panel = document.querySelector(".spotlight-panel").getBoundingClientRect();
+    return {
+      barBottom: Math.round(document.querySelector(".toolbar").getBoundingClientRect().bottom),
+      panelTop: Math.round(panel.top),
+      panelBottom: Math.round(panel.bottom),
+      viewportHeight: window.innerHeight,
+    };
+  });
+  await postKeyboardInsetFromHost(page, KEYBOARD_PROBE_INSET_PX);
+  await sleep(KEYBOARD_SETTLE_MS);
+  const raised = await readPanel();
+  await postKeyboardInsetFromHost(page, 0);
+  await sleep(KEYBOARD_SETTLE_MS);
+  return { raised, lowered: await readPanel() };
+}
+
+function phoneSpotlightFailures(run) {
+  if (!run.spotlight) {
+    return [];
+  }
+  const { raised, lowered } = run.spotlight;
+  const label = `${run.engine}/${run.profile}/spotlight-results`;
+  const failures = [];
+  const gap = lowered.panelTop - lowered.barBottom;
+  if (gap < 0 || gap > SPOTLIGHT_MAX_GAP_UNDER_BAR_PX) {
+    failures.push(`${label}: the panel must hang just under the bar. Got ${JSON.stringify(lowered)}`);
+  }
+  if (raised.panelBottom > raised.viewportHeight - KEYBOARD_PROBE_INSET_PX) {
+    failures.push(`${label}: with the keyboard up the results must end above it. Got ${JSON.stringify(raised)}`);
   }
   return failures;
 }
@@ -1225,7 +1289,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {

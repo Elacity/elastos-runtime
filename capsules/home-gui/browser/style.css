@@ -6049,6 +6049,39 @@ body.assistant-space-active #inbox-rail {
     overflow-wrap: anywhere;
   }
 
+  /* Spotlight hangs 8 px under the bar and grows down to the Dock or the
+     soft keyboard (--stage-bottom carries both), so no result sits under it. */
+  .spotlight {
+    padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .spotlight-panel {
+    max-height: 100%;
+  }
+
+  .spotlight-section {
+    font-size: 12px;
+  }
+
+  .spotlight-item {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    gap: 12px;
+    min-height: 48px;
+  }
+
+  .spotlight-glyph {
+    width: 28px;
+    height: 28px;
+  }
+
+  .spotlight-title {
+    font-size: 16px;
+  }
+
+  .spotlight-detail {
+    font-size: 13px;
+  }
+
   /* Windows fill the stage between bar and dock — apps read as full-screen.
      Left/right insets keep capsule content out of landscape notches. */
   .window {

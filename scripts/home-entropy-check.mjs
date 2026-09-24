@@ -12298,7 +12298,7 @@ assert(
       !formFactorModule.includes("visualViewport") &&
       homeGuiStyle.includes(".assistant-space {\n  position: fixed;\n  inset: 0 0 var(--keyboard-inset, 0px);") &&
       justfile.includes("node --test scripts/home-keyboard-inset.test.mjs") &&
-      phoneSmoke.includes("...phoneStageFailures(run), ...phoneKeyboardFailures(run));"),
+      phoneSmoke.includes("...phoneStageFailures(run), ...phoneKeyboardFailures(run),"),
     "Soft keyboard: the host page measures the covered height (a framed visual viewport never sees the keyboard) and relays home:keyboard-inset to the shell, which takes it only from its trusted parent, applies it on coarse pointers and ends the stage and the Assistant room above it; unit-tested in verify and probed in both engines by the phone smoke",
   );
 
@@ -12531,6 +12531,20 @@ assert(
       read("capsules/home-gui/browser/shell-surface.js").includes("function shouldFocusLauncherSearch() {\n  // Typed search lives in Spotlight; the launcher is browse-only.\n  return false;\n}") &&
       (shellBaseline[1].match(/    launcher: \{ targets: 0, text: 0 \},/g) || []).length === 2,
     "Launcher phone sheet: the Apps face fills the stage from 8 px under the bar to the Dock, grid names wrap to two lines, the view toggle is 44 px, and opening never focuses a field (no keyboard jump), held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
+  );
+
+  assert(
+    homeGuiStyle.includes(".spotlight {\n  position: fixed;\n  inset: var(--stage-top) 0 var(--stage-bottom) 0;") &&
+      (homeGuiStyle.match(/--stage-bottom: [^;]*;/g) || []).length > 0 &&
+      (homeGuiStyle.match(/--stage-bottom: [^;]*;/g) || []).every((declaration) => declaration.includes("var(--keyboard-inset, 0px)")) &&
+      phoneRule("  .spotlight {\n    padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));") &&
+      phoneRule("  .spotlight-panel {\n    max-height: 100%;\n  }") &&
+      phoneRule("  .spotlight-section {\n    font-size: 12px;") &&
+      phoneRule("  .spotlight-item {\n    grid-template-columns: 28px minmax(0, 1fr) auto;\n    gap: 12px;\n    min-height: 48px;") &&
+      (shellBaseline[1].match(/    "spotlight-results": \{ targets: 0, text: 0 \},/g) || []).length === 2 &&
+      phoneSmoke.includes('await frame.locator("#spotlight-input").fill(SPOTLIGHT_PROBE_QUERY);') &&
+      phoneSmoke.includes("...phoneSpotlightFailures(run)"),
+    "Spotlight phone sheet: hangs 8 px under the bar and grows only to the Dock or the soft keyboard (--stage-bottom carries --keyboard-inset), 48 px result rows and 12 px section headings, with typed results held at 0 small targets and 0 small text on both phone profiles and the keyboard probe run by the phone smoke",
   );
 
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
