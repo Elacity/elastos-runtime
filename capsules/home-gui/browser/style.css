@@ -6153,6 +6153,78 @@ body.assistant-space-active #inbox-rail {
     cursor: grab;
   }
 
+  /* Menus (right-click or long-press) rise as a bottom sheet over a dimmed
+     shell (openDesktopContextMenu sets .context-menu-sheet): full width at
+     the thumb, 48 px rows at 16 px. A tap beside it only dismisses. */
+  .context-menu.context-menu-sheet {
+    left: max(8px, env(safe-area-inset-left, 0px));
+    right: max(8px, env(safe-area-inset-right, 0px));
+    top: auto;
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    min-width: 0;
+    max-width: none;
+    max-height: calc(100dvh - var(--stage-top) - 16px - env(safe-area-inset-bottom, 0px));
+    padding: 6px;
+    border-radius: 16px;
+    box-shadow: var(--shadow-soft), 0 0 0 100vmax rgba(0, 0, 0, 0.32);
+    transform-origin: bottom center;
+    animation-name: context-menu-sheet-enter;
+  }
+
+  .context-menu-sheet .context-menu-item {
+    min-height: 48px;
+    padding: 0 14px;
+    border-radius: 10px;
+    font-size: 16px;
+  }
+
+  .context-menu-sheet .context-menu-divider {
+    margin: 4px 14px;
+  }
+
+  .context-menu-title {
+    padding: 8px 14px 4px;
+    color: var(--soft);
+    font-size: 13px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .context-menu.context-menu-sheet.bar-menu-leaving {
+    animation-name: context-menu-sheet-leave;
+  }
+
+  @keyframes context-menu-sheet-enter {
+    from {
+      opacity: 0;
+      transform: translateY(16px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes context-menu-sheet-leave {
+    from {
+      opacity: 1;
+      transform: none;
+    }
+    to {
+      opacity: 0;
+      transform: translateY(16px);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .context-menu.context-menu-sheet,
+    .context-menu.context-menu-sheet.bar-menu-leaving {
+      animation: none;
+    }
+  }
+
   /* Windows fill the stage between bar and dock — apps read as full-screen.
      Left/right insets keep capsule content out of landscape notches. */
   .window {

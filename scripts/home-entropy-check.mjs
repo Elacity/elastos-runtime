@@ -12632,6 +12632,20 @@ assert(
     "Touch long-press: a touch or pen held still for 500 ms (under 10 px of drift) dispatches contextmenu, so every right-click menu opens by long-press; the release clicks only when no menu took the press, and the browser's own long-press contextmenu never doubles it; desktop icons keep their own long-press; Dock tiles and launcher cards cannot start a text selection; unit-tested in verify",
   );
 
+  assert(
+    homeGuiJs.includes('      if (desktopContextMenu?.classList.contains("context-menu-sheet")) {\n        touchLongPress.swallowNextClick();\n      }\n      hideDesktopContextMenu();') &&
+      shellSurface.includes('  const sheet = isPhone();\n  renderContextMenu(target, { sheet });') &&
+      shellSurface.includes('  if (sheet && title) {\n    const heading = document.createElement("div");\n    heading.className = "context-menu-title";') &&
+      phoneRule("  .context-menu.context-menu-sheet.bar-menu-leaving {\n    animation-name: context-menu-sheet-leave;\n  }") &&
+      shellSurface.includes('  desktopContextMenu.classList.toggle("context-menu-sheet", sheet);') &&
+      phoneRule("  .context-menu.context-menu-sheet {\n    left: max(8px, env(safe-area-inset-left, 0px));\n    right: max(8px, env(safe-area-inset-right, 0px));\n    top: auto;\n    bottom: calc(8px + env(safe-area-inset-bottom, 0px));") &&
+      phoneRule("  .context-menu-sheet .context-menu-item {\n    min-height: 48px;") &&
+      phoneRule("    .context-menu.context-menu-sheet,\n    .context-menu.context-menu-sheet.bar-menu-leaving {\n      animation: none;") &&
+      phoneSmoke.includes('    "context-menu": { targets: 0, text: 0 },') &&
+      phoneSmoke.includes("...phoneTouchMenuFailures(run)"),
+    "Phone menu sheet: on the phone every menu is a full-width bottom sheet with 48 px rows at 16 px, an app menu names its app, and a tap beside the sheet only dismisses it; the phone smoke long-presses a Dock app, which must open the sheet and launch nothing",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&

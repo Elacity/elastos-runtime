@@ -1344,6 +1344,10 @@ export function bindHomeGuiInteractions(options = {}) {
       now >= shellState.contextMenuIgnoreOutsideUntil &&
       !event.target.closest("#desktop-context-menu")
     ) {
+      // The phone menu sheet covers the Dock; a tap beside it only dismisses.
+      if (desktopContextMenu?.classList.contains("context-menu-sheet")) {
+        touchLongPress.swallowNextClick();
+      }
       hideDesktopContextMenu();
     }
     if (launcher.hidden) {

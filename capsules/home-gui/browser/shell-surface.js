@@ -89,6 +89,7 @@ import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-
 import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260813a";
 import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
 import { bindSheetHandle, SHEET_DRAG_DOWN } from "./shell-sheet-handle.js?v=home-20260813a";
+import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -1905,7 +1906,10 @@ export function openDesktopContextMenu(clientX, clientY, target) {
     document.activeElement && document.activeElement !== document.body
       ? document.activeElement
       : null;
-  renderContextMenu(target);
+  // On the phone the menu is a bottom sheet the thumb reaches, not a popup
+  // under a finger that hides it; CSS places the sheet.
+  const sheet = isPhone();
+  renderContextMenu(target, { sheet });
   closeOtherShellPopovers("context-menu");
   // Clear inert before measuring so geometry is valid.
   prepareSurfaceOpen(desktopContextMenu);
@@ -1917,12 +1921,17 @@ export function openDesktopContextMenu(clientX, clientY, target) {
     (window.performance ? window.performance.now() : Date.now()) +
     CONTEXT_MENU_IGNORE_OUTSIDE_MS;
 
-  const menuRect = desktopContextMenu.getBoundingClientRect();
-  const left = clamp(clientX, 12, window.innerWidth - menuRect.width - 12);
-  const top = clamp(clientY, 42, window.innerHeight - menuRect.height - 12);
-
-  desktopContextMenu.style.left = `${left}px`;
-  desktopContextMenu.style.top = `${top}px`;
+  desktopContextMenu.classList.toggle("context-menu-sheet", sheet);
+  if (sheet) {
+    desktopContextMenu.style.removeProperty("left");
+    desktopContextMenu.style.removeProperty("top");
+  } else {
+    const menuRect = desktopContextMenu.getBoundingClientRect();
+    const left = clamp(clientX, 12, window.innerWidth - menuRect.width - 12);
+    const top = clamp(clientY, 42, window.innerHeight - menuRect.height - 12);
+    desktopContextMenu.style.left = `${left}px`;
+    desktopContextMenu.style.top = `${top}px`;
+  }
   setOverlayOpen(desktopContextMenu, true, {
     invoker: shellState.contextMenuInvoker,
     focusEl: contextMenuFocusables()[0],
@@ -1982,8 +1991,18 @@ function handleContextMenuKeydown(event) {
   }
 }
 
-function renderContextMenu(target) {
+function renderContextMenu(target, { sheet = false } = {}) {
   desktopContextMenu.replaceChildren();
+  const title = target.kind === "target" ? targetTitle(shellState.currentSummary, target.targetId) : "";
+  desktopContextMenu.setAttribute("aria-label", title ? `${title} actions` : "Home actions");
+  // A sheet sits away from the pressed icon, so it names what it acts on.
+  if (sheet && title) {
+    const heading = document.createElement("div");
+    heading.className = "context-menu-title";
+    heading.setAttribute("aria-hidden", "true");
+    heading.textContent = title;
+    desktopContextMenu.appendChild(heading);
+  }
   for (const item of contextMenuItems(target)) {
     if (item.kind === "divider") {
       const divider = document.createElement("div");

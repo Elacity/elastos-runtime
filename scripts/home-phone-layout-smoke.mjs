@@ -89,6 +89,7 @@ const BASELINE = {
   "phone-portrait": {
     desktop: { targets: 0, text: 0 },
     launcher: { targets: 0, text: 0 },
+    "context-menu": { targets: 0, text: 0 },
     spotlight: { targets: 0, text: 0 },
     "spotlight-results": { targets: 0, text: 0 },
     "control-centre": { targets: 0, text: 0 },
@@ -101,6 +102,7 @@ const BASELINE = {
   "phone-landscape": {
     desktop: { targets: 0, text: 0 },
     launcher: { targets: 0, text: 0 },
+    "context-menu": { targets: 0, text: 0 },
     spotlight: { targets: 0, text: 0 },
     "spotlight-results": { targets: 0, text: 0 },
     "control-centre": { targets: 0, text: 0 },
@@ -113,6 +115,7 @@ const BASELINE = {
   tablet: {
     desktop: { targets: 8, text: 2 },
     launcher: { targets: 9, text: 2 },
+    "context-menu": { targets: null, text: null },
     spotlight: { targets: 8, text: 2 },
     "spotlight-results": { targets: null, text: null },
     "control-centre": { targets: 30, text: 8 },
@@ -669,6 +672,42 @@ async function pressEscape(frame) {
 // One letter that fills Spotlight with result rows.
 const SPOTLIGHT_PROBE_QUERY = "e";
 
+// Longer than shell-touch.js LONG_PRESS_MS (500).
+const LONG_PRESS_HOLD_MS = 700;
+
+// Playwright cannot hold a finger down, so this plays the browser: a touch
+// pointerdown on the first visible Dock app, a hold, then the pointerup and
+// the click a release produces. Returns the app the tile opens.
+async function longPressDockApp(frame) {
+  const target = await frame.evaluate(() => {
+    const tile = Array.from(document.querySelectorAll(".taskbar-item[data-target]")).find((node) => {
+      if (node.id === "launcher-toggle" || node.id === "assistant-toggle") return false;
+      const box = node.getBoundingClientRect();
+      return box.width > 0 && box.left >= 0 && box.right <= window.innerWidth;
+    });
+    const box = tile.getBoundingClientRect();
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      pointerId: 41,
+      pointerType: "touch",
+      isPrimary: true,
+      clientX: box.x + box.width / 2,
+      clientY: box.y + box.height / 2,
+    };
+    tile.dispatchEvent(new PointerEvent("pointerdown", init));
+    window.__smokeReleaseLongPress = () => {
+      tile.dispatchEvent(new PointerEvent("pointerup", init));
+      tile.dispatchEvent(new MouseEvent("click", init));
+    };
+    return tile.dataset.target;
+  });
+  await sleep(LONG_PRESS_HOLD_MS);
+  await frame.evaluate(() => window.__smokeReleaseLongPress());
+  return target;
+}
+
 // Each surface: how to open it, how long it takes to settle, how to close it.
 const SHELL_SURFACES = [
   {
@@ -681,6 +720,12 @@ const SHELL_SURFACES = [
     id: "launcher",
     open: (frame) => frame.locator("#launcher-toggle").click(),
     settle: SHEET_SETTLE_MS,
+    close: pressEscape,
+  },
+  {
+    id: "context-menu",
+    open: longPressDockApp,
+    settle: SURFACE_SETTLE_MS,
     close: pressEscape,
   },
   {
@@ -846,6 +891,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let spotlightProbe = null;
   let sheetHandleProbe = null;
   let linkProbe = null;
+  let touchMenuProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -888,6 +934,7 @@ async function runProfile(browser, engineId, profile, origin) {
     }
     if (profile.id === "phone-portrait") {
       sheetHandleProbe = await probeSheetHandles(page, frame);
+      touchMenuProbe = await probeTouchMenu(page, frame, dir);
     }
     for (const [target] of FIRST_PARTY_APPS) {
       if (target === "assistant") {
@@ -914,7 +961,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -1061,6 +1108,82 @@ function phoneLinkFailures(run) {
   }
   if (up.link !== "" || up.bar !== "" || up.banner !== "none") {
     failures.push(`${label}: a reachable message must clear the bar and the explanation. Got ${JSON.stringify(up)}`);
+  }
+  return failures;
+}
+
+// Touch menus on a portrait phone: a long-press on a Dock app opens its menu
+// as a full-width bottom sheet with thumb-size rows and does not launch the
+// app; a tap beside the sheet only dismisses it (the click-driven Control
+// Centre button under that tap stays shut).
+const MENU_SHEET_EDGE_PX = 16;
+const MENU_SHEET_ROW_PX = 48;
+const MENU_SHEET_FONT_PX = 16;
+
+async function probeTouchMenu(page, frame, dir) {
+  const windowsBefore = await frame.locator(".window").count();
+  const target = await longPressDockApp(frame);
+  await sleep(SURFACE_SETTLE_MS);
+  const opened = await frame.evaluate(() => {
+    const menu = document.querySelector("#desktop-context-menu");
+    const box = menu.getBoundingClientRect();
+    const rows = Array.from(menu.querySelectorAll(".context-menu-item")).map((row) => ({
+      height: row.getBoundingClientRect().height,
+      font: parseFloat(getComputedStyle(row).fontSize),
+    }));
+    return {
+      open: !menu.hidden,
+      sheet: menu.classList.contains("context-menu-sheet"),
+      title: menu.querySelector(".context-menu-title")?.textContent || "",
+      label: menu.getAttribute("aria-label"),
+      left: Math.round(box.left),
+      rightGap: Math.round(window.innerWidth - box.right),
+      bottomGap: Math.round(window.innerHeight - box.bottom),
+      rows: rows.length,
+      minRow: Math.round(Math.min(...rows.map((row) => row.height))),
+      minFont: Math.min(...rows.map((row) => row.font)),
+    };
+  });
+  await screenshot(page, dir, "context-menu-sheet");
+  const windowsAfterPress = await frame.locator(".window").count();
+  const beside = await frame.locator("#toolbar-control-centre").boundingBox();
+  await page.touchscreen.tap(beside.x + beside.width / 2, beside.y + beside.height / 2);
+  await sleep(SHEET_SETTLE_MS);
+  const dismissed = await frame.evaluate(() => ({
+    menuOpen: !document.querySelector("#desktop-context-menu").hidden,
+    controlCentreOpen: !document.querySelector("#control-centre").hidden,
+  }));
+  if (dismissed.menuOpen || dismissed.controlCentreOpen) {
+    await pressEscape(frame);
+  }
+  return { target, windowsBefore, windowsAfterPress, opened, dismissed };
+}
+
+function phoneTouchMenuFailures(run) {
+  if (!run.touchMenu) {
+    return [];
+  }
+  const { windowsBefore, windowsAfterPress, opened, dismissed } = run.touchMenu;
+  const label = `${run.engine}/${run.profile}/touch-menu`;
+  const failures = [];
+  if (!opened.open || opened.rows === 0) {
+    failures.push(`${label}: a long-press on a Dock app must open its menu. Got ${JSON.stringify(run.touchMenu)}`);
+    return failures;
+  }
+  if (windowsAfterPress !== windowsBefore) {
+    failures.push(`${label}: the release after a long-press must not launch the app. Got ${JSON.stringify(run.touchMenu)}`);
+  }
+  if (!opened.sheet || opened.left > MENU_SHEET_EDGE_PX || opened.rightGap > MENU_SHEET_EDGE_PX || opened.bottomGap > MENU_SHEET_EDGE_PX) {
+    failures.push(`${label}: the menu must be a full-width sheet at the bottom of the phone. Got ${JSON.stringify(opened)}`);
+  }
+  if (!opened.title || opened.label !== `${opened.title} actions`) {
+    failures.push(`${label}: the menu sheet must name the app it acts on. Got ${JSON.stringify(opened)}`);
+  }
+  if (opened.minRow < MENU_SHEET_ROW_PX || opened.minFont < MENU_SHEET_FONT_PX) {
+    failures.push(`${label}: menu sheet rows must be ${MENU_SHEET_ROW_PX} px at ${MENU_SHEET_FONT_PX} px text. Got ${JSON.stringify(opened)}`);
+  }
+  if (dismissed.menuOpen || dismissed.controlCentreOpen) {
+    failures.push(`${label}: a tap beside the menu sheet must only dismiss it. Got ${JSON.stringify(dismissed)}`);
   }
   return failures;
 }
@@ -1441,7 +1564,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {
