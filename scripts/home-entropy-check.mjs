@@ -12547,6 +12547,25 @@ assert(
     "Spotlight phone sheet: hangs 8 px under the bar and grows only to the Dock or the soft keyboard (--stage-bottom carries --keyboard-inset), 48 px result rows and 12 px section headings, with typed results held at 0 small targets and 0 small text on both phone profiles and the keyboard probe run by the phone smoke",
   );
 
+  const phoneBaselineRows = (profile) =>
+    (shellBaseline[1].match(new RegExp(`"${profile}": \\{([\\s\\S]*?)\\n  \\}`))?.[1] || "")
+      .split("\n")
+      .filter((line) => line.includes("targets:"))
+      .map((line) => line.trim());
+  const phoneBaselineAtFloor = (profile) => {
+    const rows = phoneBaselineRows(profile);
+    return (
+      rows.length >= 9 &&
+      rows.every((row) => row === "window: { targets: 1, text: 0 }," || row.endsWith(": { targets: 0, text: 0 },")) &&
+      rows.includes("window: { targets: 1, text: 0 },")
+    );
+  };
+  assert(
+    phoneBaselineAtFloor("phone-portrait") && phoneBaselineAtFloor("phone-landscape"),
+    "Phone shell ratchet: every shell surface is held at 0 small targets and 0 small text on both phone profiles; a window allows only the 24 px Dock handle",
+    { portrait: phoneBaselineRows("phone-portrait"), landscape: phoneBaselineRows("phone-landscape") },
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&

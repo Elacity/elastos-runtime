@@ -87,26 +87,28 @@ const PROFILES = [
 // the surface is recorded but not yet gated on that profile.
 const BASELINE = {
   "phone-portrait": {
-    desktop: { targets: 1, text: 1 },
+    desktop: { targets: 0, text: 0 },
     launcher: { targets: 0, text: 0 },
-    spotlight: { targets: 1, text: 1 },
+    spotlight: { targets: 0, text: 0 },
     "spotlight-results": { targets: 0, text: 0 },
     "control-centre": { targets: 0, text: 0 },
     notifications: { targets: 0, text: 0 },
-    "mission-control": { targets: 1, text: 1 },
-    "assistant-face": { targets: 1, text: 1 },
-    window: { targets: 2, text: 1 },
+    "mission-control": { targets: 0, text: 0 },
+    "assistant-face": { targets: 0, text: 0 },
+    // The 24 px handle that brings the Dock back over a window, by design.
+    window: { targets: 1, text: 0 },
   },
   "phone-landscape": {
-    desktop: { targets: 1, text: 1 },
+    desktop: { targets: 0, text: 0 },
     launcher: { targets: 0, text: 0 },
-    spotlight: { targets: 1, text: 1 },
+    spotlight: { targets: 0, text: 0 },
     "spotlight-results": { targets: 0, text: 0 },
     "control-centre": { targets: 0, text: 0 },
     notifications: { targets: 0, text: 0 },
-    "mission-control": { targets: 1, text: 1 },
-    "assistant-face": { targets: 1, text: 1 },
-    window: { targets: 2, text: 1 },
+    "mission-control": { targets: 0, text: 0 },
+    "assistant-face": { targets: 0, text: 0 },
+    // The 24 px handle that brings the Dock back over a window, by design.
+    window: { targets: 1, text: 0 },
   },
   tablet: {
     desktop: { targets: 8, text: 2 },
