@@ -106,11 +106,7 @@ impl ModelServiceGrant {
             "model grant needs one exact approved offer"
         );
         anyhow::ensure!(
-            self.approved_offer_revision.len() == 64
-                && self
-                    .approved_offer_revision
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit()),
+            valid_offer_execution_revision(&self.approved_offer_revision),
             "model grant needs an exact offer revision"
         );
         Ok(())
@@ -854,7 +850,16 @@ pub(in crate::api::gateway) fn offer_execution_revision<'a>(
 ) -> Option<&'a str> {
     result["data"]["offer_revisions"][id]
         .as_str()
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .filter(|value| valid_offer_execution_revision(value))
+}
+
+pub(in crate::api::gateway) fn valid_offer_execution_revision(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 pub(in crate::api::gateway) fn shareable_offer_for_home(
@@ -1386,9 +1391,10 @@ pub(crate) async fn invoke(
                 false,
             );
         }
-        let Some(execution_revision) = revisions[offer_id].as_str().filter(|value| {
-            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) else {
+        let Some(execution_revision) = revisions[offer_id]
+            .as_str()
+            .filter(|value| valid_offer_execution_revision(value))
+        else {
             return refused_before_dispatch(
                 data_dir,
                 &source_did,
@@ -1759,7 +1765,7 @@ mod tests {
             revision: 1_000,
             expires_at: 1_000 + MODEL_GRANT_TTL_SECS,
             approved_offer_ids: BTreeSet::from(["qwen".into()]),
-            approved_offer_revision: "a".repeat(64),
+            approved_offer_revision: format!("sha256:{}", "a".repeat(64)),
         };
         assert!(grant.validate(&key, "seed-principal", 1_500).is_ok());
         assert!(grant.validate(&other, "seed-principal", 1_500).is_err());

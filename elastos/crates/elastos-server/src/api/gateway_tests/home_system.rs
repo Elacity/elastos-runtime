@@ -10003,7 +10003,7 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
         }
-        let revision = Arc::new(std::sync::Mutex::new("a".repeat(64)));
+        let revision = Arc::new(std::sync::Mutex::new(format!("sha256:{}", "a".repeat(64))));
         bob.registry
             .register_sub_provider(
                 "model",
@@ -10035,13 +10035,13 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
         assert_eq!(status, StatusCode::OK, "{summary}");
         let catalog = &summary["model_catalogs"][&offer][0];
         assert_eq!(catalog["id"], model_id);
-        assert_eq!(catalog["revision"], "a".repeat(64));
+        assert_eq!(catalog["revision"], format!("sha256:{}", "a".repeat(64)));
         let (status, _) = services_contact_post(
             &alice.app,
             &token,
             "/api/apps/services/offers",
             json!({"offer_id":offer,"section":"others","selected":true,
-                "model_offer_id":model_id,"model_offer_revision":"b".repeat(64)}),
+                "model_offer_id":model_id,"model_offer_revision":format!("sha256:{}", "b".repeat(64))}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -10050,7 +10050,7 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             &token,
             "/api/apps/services/offers",
             json!({"offer_id":offer,"section":"others","selected":true,
-                "model_offer_id":model_id,"model_offer_revision":"a".repeat(64)}),
+                "model_offer_id":model_id,"model_offer_revision":format!("sha256:{}", "a".repeat(64))}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -10065,7 +10065,10 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
         assert_eq!(request["service_kind"], MODEL_SERVICE_KIND);
         assert_eq!(request["status"], "pending");
         assert_eq!(request["requested_model_offer_id"], model_id);
-        assert_eq!(request["requested_model_offer_revision"], "a".repeat(64));
+        assert_eq!(
+            request["requested_model_offer_revision"],
+            format!("sha256:{}", "a".repeat(64))
+        );
         assert!(bob.exit_provider.requests.lock().await.is_empty());
         let (status, _) = home_test_post_json(
             &bob.app,
@@ -10088,7 +10091,7 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             .as_str()
             .unwrap();
         if hosted {
-            *revision.lock().unwrap() = "b".repeat(64);
+            *revision.lock().unwrap() = format!("sha256:{}", "b".repeat(64));
         }
         let (status, body) = services_contact_post(
             &bob.app,

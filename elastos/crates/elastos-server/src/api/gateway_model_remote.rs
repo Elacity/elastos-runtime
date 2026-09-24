@@ -222,7 +222,7 @@ impl ConsumerModelGrant {
             return None;
         }
         let revision = grant["offer_revision"].as_str()?;
-        if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !super::gateway_model_service::valid_offer_execution_revision(revision) {
             return None;
         }
         let peer_id = grant["peer_did"]
@@ -735,7 +735,7 @@ mod tests {
         let grant = ConsumerModelGrant::from_record(&json!({
             "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA,
             "offer_ids": ["qwen-local"],
-            "offer_revision": "a".repeat(64),
+            "offer_revision": format!("sha256:{}", "a".repeat(64)),
             "grant_id": "services-remote-model-grant-0011223344556677",
             "peer_did": key.to_string(),
             "connect_ticket": "ticket",
@@ -749,7 +749,7 @@ mod tests {
         );
         assert!(grant.peer_did.starts_with("did:key:z6Mk"));
         assert!(ConsumerModelGrant::from_record(&json!({
-            "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA, "offer_ids": ["qwen-local"], "offer_revision": "a".repeat(64),
+            "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA, "offer_ids": ["qwen-local"], "offer_revision": format!("sha256:{}", "a".repeat(64)),
             "grant_id": "g", "peer_did": "not-a-peer-id", "connect_ticket": "t", "expires_at": 1,
         }))
         .is_none());

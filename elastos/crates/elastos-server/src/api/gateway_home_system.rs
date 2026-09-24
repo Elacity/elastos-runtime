@@ -2740,8 +2740,7 @@ fn home_services_send_access_request(
         anyhow::ensure!(
             offer.service_kind == super::MODEL_SERVICE_KIND
                 && super::gateway_model_service::safe_id(id, 256)
-                && revision.len() == 64
-                && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                && super::gateway_model_service::valid_offer_execution_revision(revision),
             "invalid named model request"
         );
         payload["model_offer_id"] = serde_json::json!(id);
@@ -3233,8 +3232,7 @@ fn home_services_merge_model_catalog(
             super::gateway_model_service::safe_id(&entry.id, 256)
                 && !entry.title.is_empty()
                 && entry.title.len() <= 128
-                && entry.revision.len() == 64
-                && entry.revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && super::gateway_model_service::valid_offer_execution_revision(&entry.revision)
                 && ids.insert(entry.id.clone()),
             "model catalog entry is invalid"
         );
@@ -3950,8 +3948,7 @@ fn home_services_remote_model_grant(
             && offer_ids
                 .iter()
                 .all(|id| super::gateway_model_service::safe_id(id, 256))
-            && offer_revision.len() == 64
-            && offer_revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            && super::gateway_model_service::valid_offer_execution_revision(offer_revision),
         "model grant needs one exact approved offer"
     );
     record.target_peer_id.parse::<iroh::PublicKey>()?;
@@ -4469,7 +4466,7 @@ fn home_services_merge_access_request(
         requested_model_offer_revision: home_services_payload_text(
             payload,
             "model_offer_revision",
-            64,
+            71,
         ),
         service_uri,
         service_kind,

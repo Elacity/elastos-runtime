@@ -138,7 +138,7 @@ impl Provider for FakeModelProvider {
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| "a".repeat(64));
+                .unwrap_or_else(|| format!("sha256:{}", "a".repeat(64)));
             return Ok(json!({ "status": "ok", "data": { "offers": [
                 { "id": "qwen-local", "title": "Qwen", "operation": "text.generate", "hosted": null },
                 { "id": "model:openrouter", "title": "GPT", "operation": "text.generate",
@@ -151,7 +151,7 @@ impl Provider for FakeModelProvider {
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| "a".repeat(64));
+                .unwrap_or_else(|| format!("sha256:{}", "a".repeat(64)));
             if request["expected_execution_binding_hash"].as_str() != Some(revision.as_str()) {
                 return Ok(
                     json!({"status":"error", "code":"selection_unavailable", "message":"model offer revision changed"}),
@@ -526,7 +526,7 @@ impl TwoRuntimes {
         let approved_offer_revision = if approved_offer_ids.is_empty() {
             String::new()
         } else {
-            "a".repeat(64)
+            format!("sha256:{}", "a".repeat(64))
         };
         write_home_principal_object_json_for_authority(
             self.owner.path(),
@@ -763,7 +763,7 @@ async fn older_generic_grant_and_newly_shared_hosted_offer_cannot_expand_access(
 #[tokio::test]
 async fn replacing_local_model_under_the_same_id_requires_a_new_grant() {
     let fx = TwoRuntimes::start().await;
-    *fx.provider.execution_revision.lock().unwrap() = Some("b".repeat(64));
+    *fx.provider.execution_revision.lock().unwrap() = Some(format!("sha256:{}", "b".repeat(64)));
     let listed = fx
         .call(
             "offers_list",
@@ -952,7 +952,8 @@ async fn provider_rejects_a_changed_execution_revision_after_owner_precheck() {
         fx.create_run("seed-req-revision-race", "qwen-local"),
         async {
             barrier.wait_prepared().await;
-            *fx.provider.execution_revision.lock().unwrap() = Some("b".repeat(64));
+            *fx.provider.execution_revision.lock().unwrap() =
+                Some(format!("sha256:{}", "b".repeat(64)));
             barrier.release();
         }
     );
@@ -1312,7 +1313,7 @@ mod consumer_path {
             ConsumerModelGrant::from_record(&json!({
                 "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA,
                 "offer_ids": ["qwen-local"],
-                "offer_revision": "a".repeat(64),
+                "offer_revision": format!("sha256:{}", "a".repeat(64)),
                 "grant_id": self.grant_id,
                 "peer_did": self.owner_service.endpoint().unwrap().id().to_string(),
                 "connect_ticket": ticket_for(&self.owner_addr),
@@ -2260,7 +2261,7 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
     )
     .await
     .unwrap();
-    *fx.provider.execution_revision.lock().unwrap() = Some("b".repeat(64));
+    *fx.provider.execution_revision.lock().unwrap() = Some(format!("sha256:{}", "b".repeat(64)));
     let changed = fx.create_run("hosted-after-model-change", id).await;
     assert_eq!(changed["code"], "offer_unavailable", "{changed}");
     assert_eq!(fx.create_count().await, baseline + 1);
