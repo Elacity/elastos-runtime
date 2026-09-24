@@ -2703,7 +2703,8 @@ pub(crate) async fn fetch_model_part(
         request["max_bytes"] = json!(65536);
         65536
     };
-    let mut stream = registry
+    let index_read = path == CONTENT_OBJECT_MANIFEST_PATH && range.is_none();
+    let opened = registry
         .open_provider_stream(
             ProviderInvocation {
                 source: "runtime-model-preparation".into(),
@@ -2717,9 +2718,25 @@ pub(crate) async fn fetch_model_part(
             },
             ProviderStreamOptions::default(),
         )
-        .await?;
-    let bytes = stream.drain_to_vec()?;
-    anyhow::ensure!(bytes.len() as u64 <= limit, "model read exceeds bound");
+        .await;
+    if index_read && opened.is_err() {
+        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_open",
+            "model index read substage failed");
+    }
+    let mut stream = opened?;
+    let drained = stream.drain_to_vec();
+    if index_read && drained.is_err() {
+        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_drain",
+            "model index read substage failed");
+    }
+    let bytes = drained?;
+    if bytes.len() as u64 > limit {
+        if index_read {
+            tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
+                "model index read substage failed");
+        }
+        anyhow::bail!("model read exceeds bound");
+    }
     if range.is_some() {
         anyhow::ensure!(bytes.len() as u64 == limit, "incomplete model range");
     }
@@ -12300,6 +12317,7 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("outcome=\"failed\""), "{output}");
+        assert!(output.contains("stage=\"runtime_stream_open\""), "{output}");
         assert!(!output.contains("stage=\"runtime_stream_validation\""));
         assert!(!output.contains(TEST_CID));
         assert!(!output.contains("private-fixture-marker"));
