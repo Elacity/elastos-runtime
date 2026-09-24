@@ -1975,7 +1975,7 @@ assert(
     homeGuiStyle.includes(".taskbar .launcher[hidden] {") &&
     homeGuiStyle.includes(".launcher {\n  position: static;") &&
     !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
-    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,\n  .launcher-header,\n  .launcher-scroll,\n  .taskbar.is-launcher-face .launcher-header,\n  .taskbar.is-launcher-face .launcher-scroll,\n  .taskbar {\n    transition: none;") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,\n  .launcher-header,\n  .launcher-scroll,\n  .taskbar.is-launcher-face .launcher,\n  .taskbar.is-launcher-face .launcher-header,\n  .taskbar.is-launcher-face .launcher-scroll,\n  .taskbar {\n    transition: none;") &&
     homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
     homeGuiStyle.includes(".launcher-popover {\n    height: var(--phone-launcher-h);") &&
     homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: var(--phone-launcher-h);") &&

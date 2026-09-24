@@ -4528,6 +4528,7 @@ body.dragging-target {
   .launcher,
   .launcher-header,
   .launcher-scroll,
+  .taskbar.is-launcher-face .launcher,
   .taskbar.is-launcher-face .launcher-header,
   .taskbar.is-launcher-face .launcher-scroll,
   .taskbar {
