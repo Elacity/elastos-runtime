@@ -1283,8 +1283,9 @@ assert(
     shellSpotlight.spotlightOpen() === true &&
       spotlight.hidden === false &&
       spotlightInput === document.activeElement &&
-      spotlight.getAttribute("aria-hidden") === "false",
-    "Home Spotlight did not open and focus the search field",
+      spotlight.getAttribute("aria-hidden") === "false" &&
+      spotlightInvoker.getAttribute("aria-expanded") === "true",
+    "Home Spotlight did not open, focus the search field and mark its bar button expanded",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,
@@ -1361,8 +1362,9 @@ assert(
   spotlightPanel.dispatch("animationend", { target: spotlightPanel });
   assert(
     shellSpotlight.spotlightOpen() === false &&
-      document.activeElement === spotlightInvoker,
-    "Home Spotlight did not close on Escape and restore focus",
+      document.activeElement === spotlightInvoker &&
+      spotlightInvoker.getAttribute("aria-expanded") === "false",
+    "Home Spotlight did not close on Escape, restore focus and mark its bar button collapsed",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,

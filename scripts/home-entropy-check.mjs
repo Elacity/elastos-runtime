@@ -12566,6 +12566,22 @@ assert(
     { portrait: phoneBaselineRows("phone-portrait"), landscape: phoneBaselineRows("phone-landscape") },
   );
 
+  const sheetDialog = (id, label) =>
+    homeGuiTemplateHtml.includes(`  id="${id}"\n  class="${id}"\n  role="dialog"\n  aria-modal="false"\n  aria-label="${label}"`);
+  const sheetOpener = (id, controls) =>
+    new RegExp(`id="${id}"[^>]*aria-haspopup="dialog"\\s+aria-expanded="false"\\s+aria-controls="${controls}"`).test(homeGuiTemplateHtml);
+  assert(
+    sheetDialog("control-centre", "Status") &&
+      sheetDialog("notification-center", "Notification history") &&
+      homeGuiTemplateHtml.includes('  role="dialog"\n  aria-label="Search"\n  aria-modal="false"') &&
+      sheetOpener("toolbar-control-centre", "control-centre") &&
+      sheetOpener("clock", "notification-center") &&
+      sheetOpener("toolbar-spotlight", "spotlight") &&
+      shellSpotlight.includes('spotlightButton?.setAttribute("aria-expanded", "true");') &&
+      shellSpotlight.includes('spotlightButton?.setAttribute("aria-expanded", "false");'),
+    "Bar sheets are non-modal dialogs (the bar and Dock stay live while one is open): Control Centre, Notification Centre and Spotlight carry role=dialog with aria-modal=false, and each bar opener announces a dialog popup, what it controls and whether it is open",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&

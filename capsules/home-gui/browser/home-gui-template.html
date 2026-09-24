@@ -105,6 +105,9 @@
     type="button"
     aria-label="Search"
     title="Search (Cmd+Space)"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-controls="spotlight"
   ></button>
   <button
     id="toolbar-mission-control"
@@ -131,7 +134,7 @@
     id="clock"
     class="toolbar-clock"
     type="button"
-    aria-haspopup="true"
+    aria-haspopup="dialog"
     aria-expanded="false"
     aria-controls="notification-center"
     aria-label="Clock. Open notification history"
@@ -142,7 +145,8 @@
 <aside
   id="notification-center"
   class="notification-center"
-  role="group"
+  role="dialog"
+  aria-modal="false"
   aria-label="Notification history"
   tabindex="-1"
   aria-hidden="true"
@@ -180,7 +184,8 @@
 <aside
   id="control-centre"
   class="control-centre"
-  role="group"
+  role="dialog"
+  aria-modal="false"
   aria-label="Status"
   tabindex="-1"
   aria-hidden="true"

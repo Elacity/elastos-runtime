@@ -36,6 +36,7 @@ import {
 let spotlight = null;
 let spotlightInput = null;
 let spotlightResults = null;
+let spotlightButton = null;
 
 const DOCUMENTS_CACHE_MS = 60_000;
 
@@ -315,6 +316,7 @@ export function showSpotlight() {
   spotlight.hidden = false;
   spotlight.inert = false;
   spotlight.setAttribute("aria-hidden", "false");
+  spotlightButton?.setAttribute("aria-expanded", "true");
   spotlightInput.value = "";
   runSearch("");
   spotlightInput.focus();
@@ -325,6 +327,7 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
   if (!spotlight || spotlight.hidden) {
     return;
   }
+  spotlightButton?.setAttribute("aria-expanded", "false");
   const panel = spotlight.querySelector(".spotlight-panel");
   const finish = () => {
     spotlight.hidden = true;
@@ -371,6 +374,7 @@ export function bindSpotlight() {
   spotlight = document.querySelector("#spotlight");
   spotlightInput = document.querySelector("#spotlight-input");
   spotlightResults = document.querySelector("#spotlight-results");
+  spotlightButton = document.querySelector("#toolbar-spotlight");
   if (!spotlight || !spotlightInput) {
     return;
   }
