@@ -3095,6 +3095,12 @@ html[data-agent-reasoning="off"] .agent-thinking {
   height: 32px;
 }
 
+/* When the row is tight the model name ellipsizes; the left tools keep their
+   size. */
+.agent-composer-tools-left {
+  flex-shrink: 0;
+}
+
 .agent-composer-attachments {
   display: flex;
   flex-wrap: wrap;
@@ -3561,11 +3567,12 @@ html[data-agent-reasoning="off"] .agent-thinking {
   min-width: 0;
   font-size: 13px;
   line-height: 1;
+  white-space: nowrap;
 }
 
 .agent-model-name {
   display: inline-block;
-  min-width: 0;
+  min-width: 1.2em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -901,6 +901,12 @@ assert(
   "Assistant must not add browser-owned persistence",
 );
 assert(
+  assistantStyle.includes("  max-width: min(280px, 58vw);\n  min-width: 0;\n  font-size: 13px;\n  line-height: 1;\n  white-space: nowrap;\n}") &&
+    assistantStyle.includes(".agent-model-name {\n  display: inline-block;\n  min-width: 1.2em;\n  overflow: hidden;\n  text-overflow: ellipsis;") &&
+    assistantStyle.includes(".agent-composer-tools-left {\n  flex-shrink: 0;\n}"),
+  "Assistant composer: the model name stays on one line and ends in an ellipsis when the row is tight (always showing at least the ellipsis), while the left tools keep their size",
+);
+assert(
   assistantWorkspace.includes('const WORKSPACE_URL = "/api/apps/assistant/workspace-v2"') &&
     !assistantWorkspace.includes("workspace.json") &&
     !assistantWorkspace.includes("session.agent"),
