@@ -17,7 +17,7 @@ the Home GUI frame.
 
 | Class | Width | Pointer | Layout |
 | --- | --- | --- | --- |
-| phone | ≤ 640 px | usually coarse | one window at a time, sheets instead of popovers, 44 px chrome |
+| phone | ≤ 640 px | usually coarse | app-grid Home, one window at a time, sheets instead of popovers, 44 px chrome |
 | tablet | 641–1100 px | coarse or fine | desktop layout with 44 px chrome when the pointer is coarse |
 | desktop | > 1100 px | usually fine | the existing desktop |
 
@@ -107,7 +107,8 @@ WebKit at three profiles:
 | phone-landscape | 844 × 390 | 3 |
 | tablet | 820 × 1180 | 2 |
 
-For the desktop, launcher, Spotlight, Control Centre, Notification Centre,
+For the desktop (the Home grid on the phone profiles), the launcher (tablet
+only), the app menu, Spotlight, Control Centre, Notification Centre,
 Mission Control, the Assistant face and one window per first-party app it
 records targets under 44 px, text under 12 px and horizontal overflow, plus
 the source truths that need no browser (`viewport-fit=cover` in both
@@ -170,8 +171,8 @@ Dock:
   `--stage-bottom` shrinks to a 24 px handle above the home indicator, so the
   app gets the stage. Tap or swipe the handle up to peek the Dock over the app
   (`body.phone-dock-peek`, scrim behind it); tapping the scrim, pressing
-  Escape, or picking a window tucks it again. Mission Control, the launcher
-  face and keyboard focus inside the Dock always show it. The desktop
+  Escape, or picking a window tucks it again. Mission Control and keyboard
+  focus inside the Dock always show it. The desktop
   auto-hide preference is untouched; a peek wins over it.
 - `syncPhoneDock()` runs from `updateTaskbarState()`, the one place every
   window open, close and focus already passes through, and on resize.
@@ -253,10 +254,10 @@ would be; no `image-set()` variant.
 
 ## Sheets (M4)
 
-- Launcher: the Apps face grows from the Dock row to 8 px under the bar
-  (`--phone-launcher-h`), grid names wrap to two lines and the grid/list
-  toggle is 44 px. It is browse-only: opening never focuses a field, so the
-  keyboard does not jump up; typed search is Spotlight's.
+- Launcher: superseded on the phone by the Home grid (below), which retired
+  the phone Apps sheet. On tablet and desktop it stays browse-only: opening
+  never focuses a field, so a touch tablet's keyboard does not jump up;
+  typed search is Spotlight's.
 - Spotlight hangs 8 px under the bar and grows only to the Dock or the soft
   keyboard (`--stage-bottom` carries `--keyboard-inset`). Result rows are
   48 px with 16 px names and 12 px section headings. A finger landing on a
@@ -271,9 +272,8 @@ would be; no `image-set()` variant.
   as its height change.
 - Grab handles (`shell-sheet-handle.js`): Control Centre, Notification Centre
   and Spotlight end in a 44 px Close handle at the thumb end; a tap closes, a
-  48 px drag up closes, a shorter drag snaps back. The launcher grows from
-  the Dock and its Apps button already closes it, so it gets a drag-down
-  grabber only. Every sheet also closes on Escape and on system back.
+  48 px drag up closes, a shorter drag snaps back. Every sheet also closes
+  on Escape and on system back.
 - The bar sheets are non-modal dialogs (`role="dialog"`,
   `aria-modal="false"`) because the bar and Dock stay live while one is
   open; each bar opener announces the popup and whether it is open.
@@ -348,10 +348,44 @@ Known engine noise: WebKit reports the caught cross-frame probe in
 page error. Chromium returns `null` silently. The shell keeps working; the
 smoke records it and does not fail on it.
 
+## Home screen (phone)
+
+The phone's resting screen is the app grid, as on every phone OS, not the
+desktop. Team review of the first phone build asked for it: the desktop
+metaphor (files on the wallpaper, an Apps sheet sliding up from the Dock)
+read as a desktop squeezed onto a phone.
+
+- The grid (`#phone-home`, `shell-phone-home.js`) fills the stage between
+  the bar and the Dock: 4 columns in portrait, 6 in landscape, 60 px icons
+  with names on up to two lines at 12 px. It keeps the launcher's order
+  (apps, then Library items) and does not reshuffle as apps run.
+- The Dock holds the Assistant and the first 4 Shelf pins. An app is in the
+  Dock or on the grid, never both. The phone Dock is a view of the same
+  Shelf the desktop Dock shows, not a second layout: pins past the 4th stay
+  on the grid, and pinning from the grid is offered only while the Dock has
+  room.
+- On the phone the Apps button, the desktop's files and first-run hint, and
+  the Dock's Bin and running apps stand down. Library has the Desktop and
+  the Bin as places; the switcher has running apps. The empty Home's menu
+  offers Change Wallpaper.
+- Tablet and desktop are unchanged.
+
+The smoke's `desktop` surface on the phone profiles is the grid (0 / 0).
+It checks every app sits on the grid or in the Dock exactly once, the Dock
+holds at most 4 apps beside the Assistant with no Apps button, Bin or
+running apps, no desktop file shows, the grid sits between the bar and the
+Dock at 4 or 6 columns, and a long-press on a grid app opens its menu sheet
+and launches nothing. `scripts/home-phone-home.test.mjs` covers the Dock
+and grid split under `node:test`.
+
+Next: pages the thumb swipes between (native scroll snap, with tappable
+page dots as the button twin) once the apps outgrow one screen, then an
+edit mode (hold, drag, Done) for the grid and the Dock.
+
 ## Touch menus (M5)
 
-Every shell menu is bound to `contextmenu`: Dock apps, launcher cards, the
-Bin, desktop objects and the empty desktop. Android Chrome fires it for a
+Every shell menu is bound to `contextmenu`: Dock apps, Home grid apps,
+launcher cards, the Bin, desktop objects and the empty desktop. Android Chrome fires it for a
 held finger; iOS Safari never does, so on an iPhone those menus had no way
 in. `shell-touch.js` closes the gap once for all of them:
 
@@ -387,7 +421,7 @@ cannot hold a finger down, so the probe plays the browser's touch
 These are done by a person on a phone and recorded in the PR that changes
 the behaviour.
 
-- `backdrop-filter` cost: open Control Centre and the launcher on a mid-range
+- `backdrop-filter` cost: open Control Centre and a menu sheet on a mid-range
   Android phone and an iPhone; note dropped frames in the browser's
   performance panel. If either stutters, the phone layer replaces blur with a
   flat scrim behind sheets.
@@ -468,8 +502,8 @@ A first-party capsule fits the phone stage when:
 | M1 | viewport and input truth: `viewport-fit`, overscroll, `dvh`, form-factor module, keyboard inset |
 | M2 | 44 px bar with wallet/Overview in Control Centre, thumb-scrolled Dock that tucks under an open window behind a 24 px handle |
 | M3 | 44 px phone title bar for every chrome mode, boot hairline, Mission Control as the app switcher (title swipe, icon captions, touch Close), stage history for system back on Chromium/Gecko (buttons-only on WebKit, recorded above) |
-| M4 | launcher, Spotlight, Control Centre and Notification Centre as full sheets |
-| M5 | touch grammar: long-press menus as bottom sheets, touch drag |
+| M4 | launcher, Spotlight, Control Centre and Notification Centre as full sheets (the phone launcher later gave way to the Home grid) |
+| M5 | touch grammar: long-press menus as bottom sheets; the phone Home as an app grid with pages and an edit mode (hold, drag, Done) |
 | M6 | shell-to-capsule size class, shared tokens and push drawer; phone layouts for Marketplace, Documents, Library, System, Inbox, Browser, People, Archive and the Assistant; every measured capsule at 0 small targets on both phone profiles |
 | M7 | tablet and landscape |
 | M8 | PWA polish; native hosts are separate tasks |
