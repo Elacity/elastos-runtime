@@ -12279,6 +12279,29 @@ assert(
     { strayBreakpointReaders },
   );
 
+  // Soft keyboard: only the top-level document's visual viewport shrinks for
+  // it, so the host page measures and relays it; the framed shell takes it
+  // only from its trusted parent and ends the Assistant room above it.
+  const keyboardRelay = read("capsules/home/browser/home-keyboard-inset.js");
+  const trustedGuard = "  if (!isTrustedHomeGuiMessage(event, window.parent, homeOrigin)) {\n    return;\n  }";
+  const keyboardBranch = '  if (message.type === "home:keyboard-inset") {\n    relayKeyboardInset(message.inset);\n    return;\n  }';
+  assert(
+    keyboardRelay.includes('export const KEYBOARD_INSET_MESSAGE = "home:keyboard-inset";') &&
+      keyboardRelay.includes("  return Math.max(0, Math.round(view.innerHeight - visual.height - offsetTop));") &&
+      keyboardRelay.includes('  frame?.addEventListener("load", handleFrameLoad);') &&
+      shellJs.includes('import { bindKeyboardInsetRelay } from "./home-keyboard-inset.js?v=home-20260924a";') &&
+      shellJs.includes("bindKeyboardInsetRelay({ post: postToActiveShell, frame: activeShellFrame });") &&
+      homeGuiShell.indexOf(trustedGuard) !== -1 &&
+      homeGuiShell.indexOf(trustedGuard) < homeGuiShell.indexOf(keyboardBranch) &&
+      formFactorModule.includes("  relayedKeyboardInset = Number.isFinite(inset) ? Math.max(0, Math.round(inset)) : 0;") &&
+      formFactorModule.includes("  const inset = coarse ? relayedKeyboardInset : 0;") &&
+      !formFactorModule.includes("visualViewport") &&
+      homeGuiStyle.includes(".assistant-space {\n  position: fixed;\n  inset: 0 0 var(--keyboard-inset, 0px);") &&
+      justfile.includes("node --test scripts/home-keyboard-inset.test.mjs") &&
+      phoneSmoke.includes("...phoneStageFailures(run), ...phoneKeyboardFailures(run));"),
+    "Soft keyboard: the host page measures the covered height (a framed visual viewport never sees the keyboard) and relays home:keyboard-inset to the shell, which takes it only from its trusted parent, applies it on coarse pointers and ends the stage and the Assistant room above it; unit-tested in verify and probed in both engines by the phone smoke",
+  );
+
   // Phone bar and Dock. CSS keys the phone size class on one media list that
   // mirrors classifyFormFactor (width, or coarse pointer + landscape height);
   // the bar is 44 px with 44 px hit boxes and only brand · inbox · search ·

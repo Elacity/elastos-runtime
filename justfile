@@ -170,6 +170,7 @@ verify:
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
     node --test scripts/home-form-factor.test.mjs
+    node --test scripts/home-keyboard-inset.test.mjs
     node --test scripts/home-capsule-layout.test.mjs
     node --test scripts/home-phone-dock.test.mjs
     node --test scripts/home-phone-stage.test.mjs

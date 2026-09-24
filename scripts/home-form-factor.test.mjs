@@ -10,7 +10,7 @@ import {
   formFactor,
   isCoarsePointer,
   isPhone,
-  keyboardInset,
+  relayKeyboardInset,
   syncFormFactor,
 } from "../capsules/home-gui/browser/shell-form-factor.js";
 
@@ -99,53 +99,48 @@ test("pointer class comes from media features, not width", () => {
   assert.equal(isCoarsePointer({ innerWidth: 390 }), false, "no matchMedia fails closed to fine");
 });
 
-test("keyboard inset is the visual-viewport shortfall, never negative", () => {
-  assert.equal(keyboardInset(fakeView({ height: 844 })), 0, "no visualViewport");
-  assert.equal(keyboardInset(fakeView({ height: 844, visual: { height: 844, offsetTop: 0 } })), 0);
-  assert.equal(keyboardInset(fakeView({ height: 844, visual: { height: 508, offsetTop: 0 } })), 336, "iOS keyboard");
-  assert.equal(keyboardInset(fakeView({ height: 844, visual: { height: 508, offsetTop: 100 } })), 236, "scrolled visual viewport");
-  assert.equal(keyboardInset(fakeView({ height: 844, visual: { height: 900, offsetTop: 0 } })), 0, "clamped at zero");
-  assert.equal(keyboardInset(fakeView({ height: 844, visual: { height: 507.6, offsetTop: 0 } })), 336, "rounded to whole px");
-});
-
-test("syncFormFactor mirrors the facts onto body and :root", () => {
+test("syncFormFactor mirrors the facts and the host's keyboard inset onto body and :root", () => {
   const doc = fakeDocument();
-  const result = syncFormFactor(doc, fakeView({ width: 390, height: 844, coarse: true, hover: false, visual: { height: 508, offsetTop: 0 } }));
-  assert.deepEqual(result, { factor: "phone", coarse: true, inset: 336 });
+  const phone = fakeView({ width: 390, height: 844, coarse: true, hover: false });
+  assert.deepEqual(relayKeyboardInset(336, doc, phone), { factor: "phone", coarse: true, inset: 336 });
   assert.equal(doc.body.dataset.formFactor, "phone");
   assert.equal(doc.body.dataset.pointer, "coarse");
   assert.equal(doc.vars.get("--keyboard-inset"), "336px");
+  assert.equal(relayKeyboardInset(335.6, doc, phone).inset, 336, "rounded to whole px");
+  assert.equal(relayKeyboardInset(-40, doc, phone).inset, 0, "clamped at zero");
+  assert.equal(relayKeyboardInset("336", doc, phone).inset, 0, "only a finite number counts");
+  relayKeyboardInset(0, doc, phone);
+});
+
+test("a framed shell ignores its own visual viewport; only the relay moves the inset", () => {
+  const doc = fakeDocument();
+  syncFormFactor(doc, fakeView({ width: 390, height: 844, coarse: true, hover: false, visual: { height: 508, offsetTop: 0 } }));
+  assert.equal(doc.vars.get("--keyboard-inset"), "0px");
 });
 
 test("desktop pinch-zoom never becomes a keyboard inset", () => {
   const doc = fakeDocument();
-  syncFormFactor(doc, fakeView({ width: 1440, height: 900, coarse: false, visual: { height: 450, offsetTop: 0 } }));
+  relayKeyboardInset(450, doc, fakeView({ width: 1440, height: 900, coarse: false }));
   assert.equal(doc.body.dataset.formFactor, "desktop");
   assert.equal(doc.body.dataset.pointer, "fine");
   assert.equal(doc.vars.get("--keyboard-inset"), "0px");
+  relayKeyboardInset(0, doc, fakeView({ width: 1440, height: 900, coarse: false }));
 });
 
-test("bindFormFactor syncs now, on resize and visual-viewport changes, and unbinds cleanly", () => {
+test("bindFormFactor syncs now and on resize, and unbinds cleanly", () => {
   const doc = fakeDocument();
-  const view = fakeView({ width: 390, height: 844, coarse: true, hover: false, visual: { height: 844, offsetTop: 0 } });
+  const view = fakeView({ width: 390, height: 844, coarse: true, hover: false });
   const unbind = bindFormFactor(doc, view);
   assert.equal(doc.body.dataset.formFactor, "phone");
   assert.equal(doc.vars.get("--keyboard-inset"), "0px");
 
-  view.visualViewport.height = 508;
-  view.fire("visual", "resize");
-  assert.equal(doc.vars.get("--keyboard-inset"), "336px");
-
   view.innerWidth = 844;
   view.innerHeight = 390;
-  view.visualViewport.height = 390;
   view.fire("window", "resize");
   assert.equal(doc.body.dataset.formFactor, "phone", "rotation to landscape keeps the phone class");
-  assert.equal(doc.vars.get("--keyboard-inset"), "0px");
 
   view.innerWidth = 1180;
   view.innerHeight = 820;
-  view.visualViewport.height = 820;
   view.fire("window", "resize");
   assert.equal(doc.body.dataset.formFactor, "desktop", "a landscape tablet is the desktop class");
 

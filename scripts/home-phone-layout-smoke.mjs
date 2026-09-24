@@ -824,6 +824,7 @@ async function runProfile(browser, engineId, profile, origin) {
   const surfaces = [];
   let dockProbe = null;
   let stageProbe = null;
+  let keyboardProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -853,6 +854,9 @@ async function runProfile(browser, engineId, profile, origin) {
       }
       surfaces.push(shellSurface);
       await screenshot(page, dir, surface.id);
+      if (surface.id === "assistant-face" && profile.id.startsWith("phone")) {
+        keyboardProbe = await probeKeyboardInset(page, frame);
+      }
       await surface.close(frame);
     }
     for (const [target] of FIRST_PARTY_APPS) {
@@ -880,7 +884,55 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, bootRetries };
+}
+
+// Soft keyboard: only the host page sees it, so the host relays its height
+// (home:keyboard-inset). With the Assistant face open, the probe plays the
+// host: the room must end above the inset, the same message from a capsule
+// frame must change nothing, and 0 must give the room back.
+const KEYBOARD_PROBE_INSET_PX = 300;
+const KEYBOARD_SETTLE_MS = 150;
+
+async function probeKeyboardInset(page, frame) {
+  const postFromHost = (inset) => page.evaluate((message) => {
+    document.getElementById("active-shell-frame").contentWindow.postMessage(message, "*");
+  }, { type: "home:keyboard-inset", inset });
+  const readRoom = () => frame.evaluate(() => ({
+    inset: getComputedStyle(document.documentElement).getPropertyValue("--keyboard-inset").trim(),
+    roomBottom: Math.round(document.querySelector(".assistant-space").getBoundingClientRect().bottom),
+    viewportHeight: window.innerHeight,
+  }));
+  await postFromHost(KEYBOARD_PROBE_INSET_PX);
+  await sleep(KEYBOARD_SETTLE_MS);
+  const raised = await readRoom();
+  const capsuleFrame = page.frames().find((candidate) => candidate.url().includes("/apps/assistant/"));
+  await capsuleFrame?.evaluate(() => window.parent.postMessage({ type: "home:keyboard-inset", inset: 120 }, "*"));
+  await sleep(KEYBOARD_SETTLE_MS);
+  const spoofed = await readRoom();
+  await postFromHost(0);
+  await sleep(KEYBOARD_SETTLE_MS);
+  const lowered = await readRoom();
+  return { raised, spoofed, lowered, capsuleFrame: Boolean(capsuleFrame) };
+}
+
+function phoneKeyboardFailures(run) {
+  if (!run.keyboard) {
+    return [];
+  }
+  const { raised, spoofed, lowered, capsuleFrame } = run.keyboard;
+  const label = `${run.engine}/${run.profile}/keyboard`;
+  const failures = [];
+  if (raised.inset !== `${KEYBOARD_PROBE_INSET_PX}px` || raised.roomBottom !== raised.viewportHeight - KEYBOARD_PROBE_INSET_PX) {
+    failures.push(`${label}: the host's inset must end the Assistant room above the keyboard. Got ${JSON.stringify(raised)}`);
+  }
+  if (!capsuleFrame || spoofed.inset !== raised.inset) {
+    failures.push(`${label}: a capsule frame must not move the keyboard inset. Got ${JSON.stringify({ capsuleFrame, spoofed })}`);
+  }
+  if (lowered.inset !== "0px" || lowered.roomBottom !== lowered.viewportHeight) {
+    failures.push(`${label}: an inset of 0 must give the room back. Got ${JSON.stringify(lowered)}`);
+  }
+  return failures;
 }
 
 // Phone stage contract with a window open: a downward drag on the title bar
@@ -1173,7 +1225,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {

@@ -4705,9 +4705,11 @@ body.dragging-target {
    menubar fade away; the frame is shown at once and the room inside it does
    its own breathe, exactly as it always did. The frame is the capsule,
    launched as the wallet rail launches the wallet. */
+/* The room ends above the soft keyboard, so the Assistant's composer (the
+   bottom of its frame) rises with it; the capsule needs no keyboard code. */
 .assistant-space {
   position: fixed;
-  inset: 0;
+  inset: 0 0 var(--keyboard-inset, 0px);
   z-index: 100085;
   overflow: hidden;
   background: transparent;

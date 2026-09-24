@@ -43,10 +43,15 @@ on `@media (max-width: 640px)`, so landscape follows.
 - Both `index.html` files declare `viewport-fit=cover` (safe areas become
   real on iOS) and `interactive-widget=resizes-visual` (Android Chrome shrinks
   only the visual viewport for the soft keyboard, like iOS).
-- `shell-form-factor.js` writes `--keyboard-inset` on `:root` from
-  `visualViewport` on coarse-pointer hosts; `--stage-bottom` adds it, so an
-  open window ends above the keyboard. Desktop pinch-zoom never produces an
-  inset.
+- Only the top-level document's visual viewport shrinks for the soft
+  keyboard; a framed document's visual viewport is its layout viewport. So the
+  host page measures the covered height (`home/browser/home-keyboard-inset.js`)
+  and relays it to the shell as `home:keyboard-inset`. `shell-form-factor.js`
+  takes it only from the trusted parent and writes `--keyboard-inset` on
+  `:root` on coarse-pointer hosts; `--stage-bottom` adds it and the Assistant
+  room ends above it, so an open window and the Assistant composer stay above
+  the keyboard. Desktop pinch-zoom never produces an inset. The phone smoke
+  plays the host in both engines.
 - `overscroll-behavior: none` on `html, body`; `touch-action: manipulation`
   and no tap highlight on shell controls; `-webkit-touch-callout: none` on
   shell chrome only, never on capsule frames.
@@ -75,7 +80,7 @@ Every shell surface is graded on the same five things, in this order.
    menu right-click opens. Swipe-down on a title bar dismisses; the leading
    button does the same. No horizontal edge gestures anywhere in the shell.
 5. **Truth.** Safe areas are real (`viewport-fit=cover`), the soft keyboard
-   never covers a focused input (`visualViewport` → `--keyboard-inset`),
+   never covers a focused input (host `visualViewport` → `--keyboard-inset`),
    `100dvh` not `100vh`, no rubber-band overscroll on the shell.
 
 Capsules are graded on 1, 2 and 5 inside the phone stage; 3 and 4 are shell
@@ -356,8 +361,9 @@ A first-party capsule fits the phone stage when:
 - a sidebar or navigation column becomes a sheet or drawer below 640 px and
   content comes first;
 - rows are at least 48 px tall;
-- the capsule handles its own `visualViewport` for composers (capsules stay
-  opaque; the shell does not reach in);
+- the capsule needs no keyboard code: the shell ends its frame above the soft
+  keyboard (a framed `visualViewport` never sees the keyboard, so capsule-side
+  measuring does not work);
 - nothing in the capsule listens for horizontal edge swipes.
 
 ## Milestones
