@@ -12514,6 +12514,15 @@ assert(
     "Control Centre phone sheet: 48 px rows with 51x31 switches, full-width Quick open rows, 12 px section labels, 44 px appearance segments and 44 px hit boxes around the accent dots, held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
   );
 
+  assert(
+    phoneRule("  .nc-cal-weekday {\n    font-size: 12px;") &&
+      phoneRule("  .nc-cal-day {\n    width: 34px;\n    height: 34px;\n    font-size: 15px;") &&
+      phoneRule("  .notification-center-clear {\n    min-height: var(--el-touch-target);") &&
+      phoneRule("  .notification-center-section,\n  .notification-center-item-time {\n    font-size: 12px;") &&
+      (shellBaseline[1].match(/    notifications: \{ targets: 0, text: 0 \},/g) || []).length === 2,
+    "Notification Centre phone sheet: calendar, section heading and times read at 12 px or more and Clear history is a 44 px target, held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&

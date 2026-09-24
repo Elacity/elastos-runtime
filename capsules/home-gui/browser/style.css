@@ -5994,6 +5994,29 @@ body.assistant-space-active #inbox-rail {
     font-size: 16px;
   }
 
+  /* Notification Centre on the phone: calendar and metadata read at 12 px
+     or more, and Clear history is a 44 px target. */
+  .nc-cal-weekday {
+    font-size: 12px;
+  }
+
+  .nc-cal-day {
+    width: 34px;
+    height: 34px;
+    font-size: 15px;
+  }
+
+  .notification-center-clear {
+    min-height: var(--el-touch-target);
+    padding: 0 12px;
+    font-size: 14px;
+  }
+
+  .notification-center-section,
+  .notification-center-item-time {
+    font-size: 12px;
+  }
+
   .launcher-popover {
     height: min(48vh, 380px);
     margin-bottom: 0;
