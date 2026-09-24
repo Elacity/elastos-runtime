@@ -121,6 +121,14 @@ a,
   -webkit-touch-callout: none;
 }
 
+/* A held finger opens the app menu (shell-touch.js), so it must not start a
+   text selection on the name first. */
+.taskbar-item,
+.launcher-card {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 img {
   display: block;
 }

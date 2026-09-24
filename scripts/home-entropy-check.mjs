@@ -12616,6 +12616,22 @@ assert(
     "Unreachable gateway on phone: the bar shows only the Reconnecting dot (the words stay for screen readers) and the phone smoke plays the host",
   );
 
+  // iOS Safari never fires contextmenu for a held finger, so without this
+  // every Dock, launcher, Bin and desktop menu was mouse-only on an iPhone.
+  const shellTouch = read("capsules/home-gui/browser/shell-touch.js");
+  assert(
+    shellTouch.includes("export const LONG_PRESS_MS = 500;") &&
+      shellTouch.includes("export const LONG_PRESS_DRIFT_PX = 10;") &&
+      shellTouch.includes('  return event.pointerType === "touch" || event.pointerType === "pen";') &&
+      shellTouch.includes("    press.handled = !press.target.dispatchEvent(event);") &&
+      shellTouch.includes("    if (press.handled) {\n      swallowNextClick();\n    }") &&
+      shellTouch.includes("    if (press.fired) {\n      // Ours already opened the menu; the browser's own would open it twice.\n      event.preventDefault();\n      event.stopImmediatePropagation();") &&
+      homeGuiJs.includes('const touchLongPress = bindTouchLongPress(document, { skip: ".desktop-shortcut" });') &&
+      homeGuiStyle.includes(".taskbar-item,\n.launcher-card {\n  user-select: none;\n  -webkit-user-select: none;\n}") &&
+      justfile.includes("node --test scripts/home-touch-long-press.test.mjs"),
+    "Touch long-press: a touch or pen held still for 500 ms (under 10 px of drift) dispatches contextmenu, so every right-click menu opens by long-press; the release clicks only when no menu took the press, and the browser's own long-press contextmenu never doubles it; desktop icons keep their own long-press; Dock tiles and launcher cards cannot start a text selection; unit-tested in verify",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&
