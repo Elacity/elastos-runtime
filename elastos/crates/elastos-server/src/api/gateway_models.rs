@@ -216,6 +216,14 @@ struct HomeServiceRuntimeContractSummary {
     wallet_injection: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeServicesModelCatalogEntry {
+    id: String,
+    title: String,
+    revision: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HomeServicesSummary {
     schema: String,
@@ -231,6 +239,8 @@ struct HomeServicesSummary {
     available_local_offers: Vec<HomeServiceOfferSummary>,
     #[serde(default)]
     available_remote_offers: Vec<HomeServiceOfferSummary>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_catalogs: BTreeMap<String, Vec<HomeServicesModelCatalogEntry>>,
     grant_model: String,
     carrier_contract: String,
     capsule_contract: String,
@@ -248,6 +258,7 @@ impl Default for HomeServicesSummary {
             remote_offers: Vec::new(),
             available_local_offers: Vec::new(),
             available_remote_offers: Vec::new(),
+            model_catalogs: BTreeMap::new(),
             grant_model: "principal_scoped_provider_grant".to_string(),
             carrier_contract: "People discovers trusted offers; Carrier carries signed offer envelopes; providers enforce grants.".to_string(),
             capsule_contract: "capsule -> runtime capability -> provider grant -> service".to_string(),

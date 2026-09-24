@@ -140,6 +140,30 @@ function bindActions() {
     if (!target) {
       return;
     }
+    const catalogButton = target.closest("[data-model-catalog]");
+    if (catalogButton) {
+      const offerId = readText(catalogButton.getAttribute("data-model-catalog"));
+      setServiceOfferSelection({ offerId, section: "catalog", selected: true })
+        .then(() => {
+          showStatus("Checking named models shared by this person. Refresh if they do not appear yet.", "muted");
+          window.setTimeout(() => { void refreshServices().catch(() => {}); }, 2000);
+        })
+        .catch((error) => showStatus(error.message || "Could not check models.", "error"));
+      return;
+    }
+    const modelButton = target.closest("[data-model-request]");
+    if (modelButton) {
+      const offerId = readText(modelButton.getAttribute("data-model-request"));
+      const choice = [...otherServicesList.querySelectorAll("[data-model-choice]")]
+        .find(node => node.getAttribute("data-model-choice") === offerId);
+      const option = choice instanceof HTMLSelectElement ? choice.selectedOptions[0] : null;
+      setServiceOfferSelection({
+        offerId, section: "others", selected: true,
+        modelOfferId: readText(option?.value),
+        modelOfferRevision: readText(option?.getAttribute("data-model-revision")),
+      }).catch((error) => showStatus(error.message || "Could not request this model.", "error"));
+      return;
+    }
     const confirmButton = target.closest("[data-confirm-service-action]");
     if (confirmButton) {
       handlePendingServiceAction(confirmButton)
@@ -166,8 +190,9 @@ async function refreshServices() {
     if (requestedServiceOffer) {
       const offerId = requestedServiceOffer;
       requestedServiceOffer = "";
-      const button = [...otherServicesList.querySelectorAll("[data-service-offer-id]")]
-        .find(node => node.dataset.serviceOfferId === offerId);
+      const button = [...otherServicesList.querySelectorAll("[data-service-offer-id], [data-model-catalog], [data-model-request]")]
+        .find(node => node.dataset.serviceOfferId === offerId
+          || node.dataset.modelCatalog === offerId || node.dataset.modelRequest === offerId);
       if (button) {
         activateServicesSection("other-services", { behavior: "instant" });
         button.scrollIntoView({ block: "center" });
@@ -241,6 +266,15 @@ function renderServiceCard(offer, source, selected) {
   // An expired grant stays in the subscribed list. Asking again posts
   // selected=true so the Runtime sends a fresh request.
   const nextSelected = expired ? "true" : selected ? "false" : "true";
+  const modelRequest = source === "others" && readText(offer?.service_kind) === MODEL_SERVICE_KIND;
+  const modelEntries = currentServices?.model_catalogs?.[offerId] || [];
+  const modelActions = modelRequest
+    ? modelEntries.length
+      ? `<label>Named model <select data-model-choice="${escapeHtml(offerId)}">${modelEntries.map(entry =>
+          `<option value="${escapeHtml(entry.id)}" data-model-revision="${escapeHtml(entry.revision)}">${escapeHtml(entry.title)}</option>`
+        ).join("")}</select></label><button class="pc2-btn" type="button" data-model-request="${escapeHtml(offerId)}">Request this model</button>`
+      : `<button class="pc2-btn" type="button" data-model-catalog="${escapeHtml(offerId)}">Check named models</button>`
+    : "";
   return `
     <article class="service-card">
       <div class="service-card-main">
@@ -253,7 +287,8 @@ function renderServiceCard(offer, source, selected) {
           <p class="service-copy">${escapeHtml(copy)}</p>
         </div>
         <div class="service-actions">
-          ${offerId && !readOnly ? `<button class="pc2-btn" type="button" data-service-offer-id="${escapeHtml(offerId)}" data-service-section="${source}" data-service-selected="${nextSelected}">${primaryAction}</button>` : ""}
+          ${modelActions}
+          ${offerId && !readOnly && (!modelRequest || selected) ? `<button class="pc2-btn" type="button" data-service-offer-id="${escapeHtml(offerId)}" data-service-section="${source}" data-service-selected="${nextSelected}">${primaryAction}</button>` : ""}
           ${readOnly ? '<span class="status-badge" data-tone="ok">Managed by config</span>' : ""}
         </div>
       </div>
@@ -347,6 +382,8 @@ async function setServiceOfferSelection(button) {
   const section = readText(button?.dataset?.serviceSection || button?.section);
   const selected = button?.dataset?.serviceSelected === "true" || button?.selected === true;
   const termsAck = readText(button?.termsAck);
+  const modelOfferId = readText(button?.modelOfferId);
+  const modelOfferRevision = readText(button?.modelOfferRevision);
   if (!offerId || !section) {
     throw new Error("This service could not be selected. Refresh and try again.");
   }
@@ -359,6 +396,10 @@ async function setServiceOfferSelection(button) {
     const payload = { offer_id: offerId, section, selected };
     if (selected && termsAck) {
       payload.terms_ack = termsAck;
+    }
+    if (modelOfferId && modelOfferRevision) {
+      payload.model_offer_id = modelOfferId;
+      payload.model_offer_revision = modelOfferRevision;
     }
     const services = await fetchJson("/api/apps/services/offers", {
       method: "POST",

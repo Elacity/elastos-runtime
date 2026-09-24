@@ -835,7 +835,11 @@ fn public_shared_offer(mut offer: Value) -> Value {
     offer
 }
 
-fn shareable_offers_for_home(result: &Value, data_dir: &Path, include_local: bool) -> Vec<Value> {
+pub(in crate::api::gateway) fn shareable_offers_for_home(
+    result: &Value,
+    data_dir: &Path,
+    include_local: bool,
+) -> Vec<Value> {
     let mut annotated = result.clone();
     annotate_listed_offers_with_hosted_share(&mut annotated, data_dir);
     shareable_listed_offers(&annotated, include_local)

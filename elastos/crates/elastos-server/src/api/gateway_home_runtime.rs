@@ -54,6 +54,7 @@ pub(super) async fn home_launch(
     let data_dir = state.data_dir.clone();
     let launch_context = context.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
+    let provider_registry = state.provider_registry.clone();
     let sync_services = target_summary.target == INBOX_CAPSULE_ID;
     let services_sync_error = tokio::task::spawn_blocking(move || {
         super::gateway_home_system::migrate_legacy_services_peer_contacts(
@@ -65,6 +66,7 @@ pub(super) async fn home_launch(
                 &data_dir,
                 &launch_context,
                 discovery_service.as_ref(),
+                provider_registry.as_deref(),
             )
             .err()
             .map(|error| error.to_string())

@@ -1926,6 +1926,43 @@ struct ServicesContactFixture {
     peer_id: String,
 }
 
+struct ServicesCatalogModelProvider {
+    offer: serde_json::Value,
+    revision: Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl elastos_runtime::provider::Provider for ServicesCatalogModelProvider {
+    fn name(&self) -> &'static str {
+        "services-catalog-model-fixture"
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    async fn handle(
+        &self,
+        _: elastos_runtime::provider::ResourceRequest,
+    ) -> Result<elastos_runtime::provider::ResourceResponse, elastos_runtime::provider::ProviderError>
+    {
+        panic!("catalog fixture uses only the private model operation")
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+        assert_eq!(request["op"], "offers_list");
+        let id = self.offer["id"].as_str().unwrap();
+        let revision = self.revision.lock().unwrap().clone();
+        Ok(json!({"status":"ok","data":{
+            "offers":[self.offer],
+            "offer_revisions":{(id):revision},
+        }}))
+    }
+}
+
 async fn services_contact_fixture(
     data_dir: &std::path::Path,
     name: &str,
@@ -3134,7 +3171,7 @@ async fn test_services_exit_activation_fences_held_ack_and_rolls_back_failed_sta
             configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
         let alice =
             services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
-        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
         accept_services_contact_pair(&alice, &bob);
         let action =
             services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
@@ -9897,7 +9934,7 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
         let alice =
             services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
-        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
         accept_services_contact_pair(&alice, &bob);
         let offer = format!(
             "offer:{}:model",
@@ -9911,8 +9948,8 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             json!({"offer_id":offer,"section":"others","selected":true}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        // Private models do not open the incoming request mailbox.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // A generic request cannot create an approvable model grant.
         bob.discovery_service
             .sync_services_mailboxes_once(right.path(), 0)
             .await;
@@ -9924,8 +9961,12 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             .as_object()
             .unwrap()
             .is_empty());
+        let model_id = if hosted {
+            "model:hosted-0123456789abcdef0123456789abcdef"
+        } else {
+            "model:local-0123456789abcdef0123456789abcdef"
+        };
         if hosted {
-            let id = "model:hosted-0123456789abcdef0123456789abcdef";
             crate::api::model_provider_config::save_hosted_offer(
                 right.path(),
                 None,
@@ -9936,14 +9977,14 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
                     expected_response_model: None,
                     privacy: None,
                     name: "Hosted test",
-                    instance_id: Some(id),
+                    instance_id: Some(model_id),
                 },
             )
             .await
             .unwrap();
             crate::api::model_provider_config::set_hosted_offer_share(
                 right.path(),
-                id,
+                model_id,
                 true,
                 Some(HostedAiProvider::Venice.share_terms_ack()),
             )
@@ -9962,6 +10003,57 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
         }
+        let revision = Arc::new(std::sync::Mutex::new("a".repeat(64)));
+        bob.registry
+            .register_sub_provider(
+                "model",
+                Arc::new(ServicesCatalogModelProvider {
+                    offer: if hosted {
+                        json!({"id":model_id,"title":"Hosted test","operation":"text.generate",
+                            "hosted":{"placement":"hosted","backend_provider_label":"Venice"}})
+                    } else {
+                        json!({"id":model_id,"title":"SmolLM2","operation":"text.generate"})
+                    },
+                    revision: revision.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let (status, body) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"catalog","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        bob.discovery_service
+            .sync_services_mailboxes_once(right.path(), 0)
+            .await;
+        let (status, summary) =
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        let catalog = &summary["model_catalogs"][&offer][0];
+        assert_eq!(catalog["id"], model_id);
+        assert_eq!(catalog["revision"], "a".repeat(64));
+        let (status, _) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"others","selected":true,
+                "model_offer_id":model_id,"model_offer_revision":"b".repeat(64)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"others","selected":true,
+                "model_offer_id":model_id,"model_offer_revision":"a".repeat(64)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         bob.discovery_service
             .sync_services_mailboxes_once(right.path(), 0)
             .await;
@@ -9972,7 +10064,44 @@ async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_sh
         let request = requests.values().next().unwrap();
         assert_eq!(request["service_kind"], MODEL_SERVICE_KIND);
         assert_eq!(request["status"], "pending");
+        assert_eq!(request["requested_model_offer_id"], model_id);
+        assert_eq!(request["requested_model_offer_revision"], "a".repeat(64));
         assert!(bob.exit_provider.requests.lock().await.is_empty());
+        let (status, _) = home_test_post_json(
+            &bob.app,
+            "/api/apps/home/launch",
+            &bob.authority.home_token,
+            "http://localhost:61180",
+            json!({"target":INBOX_CAPSULE_ID}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (_, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        let action = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "service_access_request")
+            .unwrap()["action_ref"]["action_id"]
+            .as_str()
+            .unwrap();
+        if hosted {
+            *revision.lock().unwrap() = "b".repeat(64);
+        }
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        if hosted {
+            assert!(!status.is_success(), "{body}");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
     }
 }
 
