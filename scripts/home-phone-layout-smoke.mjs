@@ -844,6 +844,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let stageProbe = null;
   let keyboardProbe = null;
   let spotlightProbe = null;
+  let sheetHandleProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -881,6 +882,9 @@ async function runProfile(browser, engineId, profile, origin) {
       }
       await surface.close(frame);
     }
+    if (profile.id === "phone-portrait") {
+      sheetHandleProbe = await probeSheetHandles(page, frame);
+    }
     for (const [target] of FIRST_PARTY_APPS) {
       if (target === "assistant") {
         // The Assistant opens as the face, measured above, never as a window.
@@ -906,7 +910,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -997,6 +1001,92 @@ function phoneSpotlightFailures(run) {
   }
   if (raised.panelBottom > raised.viewportHeight - KEYBOARD_PROBE_INSET_PX) {
     failures.push(`${label}: with the keyboard up the results must end above it. Got ${JSON.stringify(raised)}`);
+  }
+  return failures;
+}
+
+// Sheet grab handles on a portrait phone: each bar sheet's handle is a 44 px
+// Close (a tap closes), a short drag snaps the sheet back, and a long drag
+// toward its origin closes it (up for bar sheets, down for the launcher).
+const SHEET_HANDLE_SHORT_DRAG_PX = 20;
+const SHEET_HANDLE_LONG_DRAG_PX = 90;
+const SHEET_HANDLES = [
+  { id: "control-centre", opener: "#toolbar-control-centre", sheet: "#control-centre", handle: "#control-centre-handle", dragSign: -1, tapCloses: true },
+  { id: "notifications", opener: "#clock", sheet: "#notification-center", handle: "#notification-center-handle", dragSign: -1, tapCloses: true },
+  { id: "spotlight", opener: "#toolbar-spotlight", sheet: "#spotlight", handle: "#spotlight-handle", dragSign: -1, tapCloses: true },
+  { id: "launcher", opener: "#launcher-toggle", sheet: "#launcher", handle: "#launcher-handle", dragSign: 1, tapCloses: false },
+];
+
+async function probeSheetHandles(page, frame) {
+  const results = [];
+  for (const spec of SHEET_HANDLES) {
+    const isOpen = () => frame.evaluate((selector) => !document.querySelector(selector).hidden, spec.sheet);
+    const drag = async (distance) => {
+      const box = await frame.locator(spec.handle).boundingBox();
+      const x = box.x + box.width / 2;
+      const y = box.y + box.height / 2;
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x, y + (spec.dragSign * distance) / 2, { steps: 4 });
+      await page.mouse.move(x, y + spec.dragSign * distance, { steps: 4 });
+      await page.mouse.up();
+      await sleep(SURFACE_SETTLE_MS);
+    };
+    const open = async () => {
+      await frame.locator(spec.opener).click();
+      await sleep(SHEET_SETTLE_MS);
+    };
+    await open();
+    const opened = await isOpen();
+    const handle = await frame.evaluate((selector) => {
+      const node = document.querySelector(selector);
+      const rect = node.getBoundingClientRect();
+      return { height: Math.round(rect.height), label: node.getAttribute("aria-label"), tag: node.tagName.toLowerCase() };
+    }, spec.handle);
+    let tapClosed = null;
+    if (spec.tapCloses) {
+      await frame.locator(spec.handle).click();
+      await sleep(SURFACE_SETTLE_MS);
+      tapClosed = !(await isOpen());
+      await open();
+    }
+    await drag(SHEET_HANDLE_SHORT_DRAG_PX);
+    const shortDragStayed = await isOpen();
+    const translateCleared = await frame.evaluate(
+      (selector) => !Array.from(document.querySelectorAll(`${selector}, ${selector} *`)).some((node) => node.style?.translate),
+      spec.sheet,
+    );
+    await drag(SHEET_HANDLE_LONG_DRAG_PX);
+    const dragClosed = !(await isOpen());
+    if (!dragClosed) {
+      await pressEscape(frame);
+    }
+    results.push({ id: spec.id, opened, handle, tapClosed, shortDragStayed, translateCleared, dragClosed });
+  }
+  return results;
+}
+
+function phoneSheetHandleFailures(run) {
+  if (!run.sheetHandles) {
+    return [];
+  }
+  const failures = [];
+  for (const result of run.sheetHandles) {
+    const spec = SHEET_HANDLES.find((candidate) => candidate.id === result.id);
+    const label = `${run.engine}/${run.profile}/${result.id}-handle`;
+    if (!result.opened) {
+      failures.push(`${label}: the sheet did not open from ${spec.opener}. Got ${JSON.stringify(result)}`);
+      continue;
+    }
+    if (spec.tapCloses && (result.handle.tag !== "button" || result.handle.label !== "Close" || result.handle.height < MIN_TARGET_PX || result.tapClosed !== true)) {
+      failures.push(`${label}: the handle must be a 44 px Close button that closes on tap. Got ${JSON.stringify(result)}`);
+    }
+    if (!result.shortDragStayed || !result.translateCleared) {
+      failures.push(`${label}: a short drag must snap the sheet back. Got ${JSON.stringify(result)}`);
+    }
+    if (!result.dragClosed) {
+      failures.push(`${label}: dragging the handle toward the sheet's origin must close it. Got ${JSON.stringify(result)}`);
+    }
   }
   return failures;
 }
@@ -1291,7 +1381,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {

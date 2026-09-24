@@ -179,6 +179,7 @@
   <p id="notification-center-empty" class="notification-center-empty" hidden>
     No recent notifications on this device
   </p>
+  <button id="notification-center-handle" class="sheet-handle" type="button" aria-label="Close"></button>
 </aside>
 
 <aside
@@ -306,6 +307,7 @@
       <span class="control-centre-row-detail">Open</span>
     </button>
   </div>
+  <button id="control-centre-handle" class="sheet-handle" type="button" aria-label="Close"></button>
 </aside>
 
 <!-- Assistant Space: the room the Shelf morph reveals. Home GUI owns the place
@@ -488,6 +490,7 @@
       aria-label="Search results"
       hidden
     ></div>
+    <button id="spotlight-handle" class="sheet-handle" type="button" aria-label="Close"></button>
   </div>
 </section>
 
@@ -549,6 +552,7 @@
   <div class="taskbar-inner">
     <aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
       <div class="launcher-popover" role="dialog" aria-label="Home launcher">
+        <div id="launcher-handle" class="sheet-handle launcher-handle" aria-hidden="true"></div>
         <div class="launcher-header">
           <div class="launcher-search-wrap" hidden>
             <input

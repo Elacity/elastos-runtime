@@ -5213,6 +5213,11 @@ body.assistant-space-active #inbox-rail {
   color: rgba(22, 23, 27, 0.72);
 }
 
+/* Sheet grab handles are a phone affordance (shell-sheet-handle.js). */
+.sheet-handle {
+  display: none;
+}
+
 .launcher-empty {
   margin: 18px 4px 0;
   color: var(--soft);
@@ -6081,6 +6086,53 @@ body.assistant-space-active #inbox-rail {
 
   .spotlight-detail {
     font-size: 13px;
+  }
+
+  /* Grab handles: a 36 × 5 pill. On the bar sheets it sits at the thumb end
+     and is also the 44 px Close button; Control Centre scrolls as a whole, so
+     its handle sticks to the bottom over the rows. */
+  .sheet-handle {
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    width: 100%;
+    height: var(--el-touch-target);
+    padding: 0;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--soft);
+    cursor: grab;
+    touch-action: none;
+  }
+
+  .sheet-handle::before {
+    content: "";
+    width: 36px;
+    height: 5px;
+    border-radius: 3px;
+    background: currentColor;
+    opacity: 0.7;
+  }
+
+  .sheet-handle:focus-visible {
+    outline: 2px solid var(--el-accent, #4f7fff);
+    outline-offset: -4px;
+  }
+
+  .control-centre {
+    padding-bottom: 0;
+  }
+
+  .control-centre .sheet-handle {
+    position: sticky;
+    bottom: 0;
+    background: var(--menu-fill);
+  }
+
+  .launcher-handle {
+    height: 20px;
+    cursor: grab;
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen.

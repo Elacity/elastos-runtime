@@ -16,6 +16,7 @@ import {
   dismissWithMotion,
   prepareSurfaceOpen,
 } from "./shell-motion.js?v=home-20260813a";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20260813a";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything
@@ -380,6 +381,12 @@ export function bindSpotlight() {
   }
   spotlightInput.addEventListener("input", () => {
     runSearch(spotlightInput.value);
+  });
+  bindSheetHandle(document.querySelector("#spotlight-handle"), {
+    sheet: spotlight.querySelector(".spotlight-panel"),
+    direction: SHEET_DRAG_UP,
+    close: () => hideSpotlight(),
+    tapCloses: true,
   });
   spotlight.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {

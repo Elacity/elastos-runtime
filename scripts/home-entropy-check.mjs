@@ -12582,6 +12582,32 @@ assert(
     "Bar sheets are non-modal dialogs (the bar and Dock stay live while one is open): Control Centre, Notification Centre and Spotlight carry role=dialog with aria-modal=false, and each bar opener announces a dialog popup, what it controls and whether it is open",
   );
 
+  const sheetHandle = read("capsules/home-gui/browser/shell-sheet-handle.js");
+  const sheetHandleImport = (direction) =>
+    `import { bindSheetHandle, ${direction} } from "./shell-sheet-handle.js?v=home-20260813a";`;
+  const closeHandle = (id) => homeGuiTemplateHtml.includes(`<button id="${id}" class="sheet-handle" type="button" aria-label="Close"></button>`);
+  const bindsHandle = (source, id, direction, close, tapCloses) =>
+    source.includes(sheetHandleImport(direction)) &&
+    new RegExp(`bindSheetHandle\\(document\\.querySelector\\("#${id}"\\), \\{[^}]*direction: ${direction},\\n\\s+close: \\(\\) => ${close}\\(\\),${tapCloses ? "\\n\\s+tapCloses: true," : "\\n\\s+\\}\\);"}`).test(source);
+  assert(
+    sheetHandle.includes("export const SHEET_DISMISS_DRAG_PX = 48;") &&
+      sheetHandle.includes("sheet.style.translate = `0 ${sheetDragOffset(direction, deltaY)}px`;") &&
+      closeHandle("control-centre-handle") &&
+      closeHandle("notification-center-handle") &&
+      closeHandle("spotlight-handle") &&
+      homeGuiTemplateHtml.includes('<div id="launcher-handle" class="sheet-handle launcher-handle" aria-hidden="true"></div>') &&
+      bindsHandle(read("capsules/home-gui/browser/shell-control-centre.js"), "control-centre-handle", "SHEET_DRAG_UP", "hideControlCentre", true) &&
+      bindsHandle(read("capsules/home-gui/browser/shell-notifications.js"), "notification-center-handle", "SHEET_DRAG_UP", "hideNotificationCenter", true) &&
+      bindsHandle(shellSpotlight, "spotlight-handle", "SHEET_DRAG_UP", "hideSpotlight", true) &&
+      bindsHandle(shellSurface, "launcher-handle", "SHEET_DRAG_DOWN", "hideLauncher", false) &&
+      homeGuiStyle.includes(".sheet-handle {\n  display: none;\n}") &&
+      phoneRule("  .sheet-handle {\n    display: grid;\n    place-items: center;\n    flex: 0 0 auto;\n    width: 100%;\n    height: var(--el-touch-target);") &&
+      phoneRule("  .control-centre .sheet-handle {\n    position: sticky;\n    bottom: 0;") &&
+      justfile.includes("node --test scripts/home-sheet-handle.test.mjs") &&
+      phoneSmoke.includes("...phoneSheetHandleFailures(run)"),
+    "Phone sheet handles: Control Centre, Notification Centre and Spotlight end in a 44 px Close handle (tap closes, a 48 px drag up closes, shorter snaps back); the launcher, closed by the Dock's Apps button, gets a drag-down grabber only; hidden off phone, unit-tested in verify and probed by the phone smoke",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&
