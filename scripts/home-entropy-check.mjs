@@ -1975,13 +1975,13 @@ assert(
     homeGuiStyle.includes(".taskbar .launcher[hidden] {") &&
     homeGuiStyle.includes(".launcher {\n  position: static;") &&
     !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
-    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,\n  .launcher-header,\n  .launcher-scroll,\n  .taskbar.is-launcher-face .launcher-header,\n  .taskbar.is-launcher-face .launcher-scroll,\n  .taskbar {\n    transition: none;") &&
     homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
-    homeGuiStyle.includes(".launcher-popover {\n    height: min(48vh, 380px);") &&
-    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: min(48vh, 380px);") &&
+    homeGuiStyle.includes(".launcher-popover {\n    height: var(--phone-launcher-h);") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: var(--phone-launcher-h);") &&
     !homeGuiStyle.includes("launcher-fly-icon") &&
     !homeGuiStyle.includes("data-launcher-morphing"),
-  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched narrow launcher heights",
+  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched phone launcher heights",
 );
 assert(
   /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
@@ -12521,6 +12521,16 @@ assert(
       phoneRule("  .notification-center-section,\n  .notification-center-item-time {\n    font-size: 12px;") &&
       (shellBaseline[1].match(/    notifications: \{ targets: 0, text: 0 \},/g) || []).length === 2,
     "Notification Centre phone sheet: calendar, section heading and times read at 12 px or more and Clear history is a 44 px target, held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
+  );
+
+  assert(
+    phoneRule("    --phone-launcher-h: calc(100dvh - var(--stage-top) - 8px - var(--taskbar-h) - var(--taskbar-offset) - env(safe-area-inset-bottom, 0px));") &&
+      phoneRule("  .launcher-header-btn {\n    width: var(--el-touch-target);\n    height: var(--el-touch-target);") &&
+      phoneRule('  .launcher[data-view="grid"] .launcher-card-title {\n    display: -webkit-box;\n    -webkit-box-orient: vertical;\n    -webkit-line-clamp: 2;') &&
+      !homeGuiStyle.includes("min(48vh, 380px)") &&
+      read("capsules/home-gui/browser/shell-surface.js").includes("function shouldFocusLauncherSearch() {\n  // Typed search lives in Spotlight; the launcher is browse-only.\n  return false;\n}") &&
+      (shellBaseline[1].match(/    launcher: \{ targets: 0, text: 0 \},/g) || []).length === 2,
+    "Launcher phone sheet: the Apps face fills the stage from 8 px under the bar to the Dock, grid names wrap to two lines, the view toggle is 44 px, and opening never focuses a field (no keyboard jump), held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
   );
 
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");

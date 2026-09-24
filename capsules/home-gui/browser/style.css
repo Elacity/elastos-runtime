@@ -4528,6 +4528,8 @@ body.dragging-target {
   .launcher,
   .launcher-header,
   .launcher-scroll,
+  .taskbar.is-launcher-face .launcher-header,
+  .taskbar.is-launcher-face .launcher-scroll,
   .taskbar {
     transition: none;
   }
@@ -6017,9 +6019,34 @@ body.assistant-space-active #inbox-rail {
     font-size: 12px;
   }
 
+  /* The Apps face fills the stage: the pill grows from the Dock row to 8 px
+     under the bar (the pill floats --taskbar-offset above the safe area). */
+  :root {
+    --phone-launcher-h: calc(100dvh - var(--stage-top) - 8px - var(--taskbar-h) - var(--taskbar-offset) - env(safe-area-inset-bottom, 0px));
+  }
+
   .launcher-popover {
-    height: min(48vh, 380px);
+    height: var(--phone-launcher-h);
     margin-bottom: 0;
+  }
+
+  .launcher-header {
+    padding: 4px 4px 4px 16px;
+  }
+
+  .launcher-header-btn {
+    width: var(--el-touch-target);
+    height: var(--el-touch-target);
+    border-radius: 12px;
+  }
+
+  /* Grid names wrap to two lines instead of cutting off after one. */
+  .launcher[data-view="grid"] .launcher-card-title {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen.
@@ -6357,7 +6384,7 @@ body.assistant-space-active #inbox-rail {
   }
 
   .taskbar.is-launcher-face .launcher {
-    max-height: min(48vh, 380px);
+    max-height: var(--phone-launcher-h);
   }
 
   .dock-tooltip {

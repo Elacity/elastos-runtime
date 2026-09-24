@@ -88,7 +88,7 @@ const PROFILES = [
 const BASELINE = {
   "phone-portrait": {
     desktop: { targets: 1, text: 1 },
-    launcher: { targets: 2, text: 1 },
+    launcher: { targets: 0, text: 0 },
     spotlight: { targets: 1, text: 1 },
     "control-centre": { targets: 0, text: 0 },
     notifications: { targets: 0, text: 0 },
@@ -98,7 +98,7 @@ const BASELINE = {
   },
   "phone-landscape": {
     desktop: { targets: 1, text: 1 },
-    launcher: { targets: 2, text: 1 },
+    launcher: { targets: 0, text: 0 },
     spotlight: { targets: 1, text: 1 },
     "control-centre": { targets: 0, text: 0 },
     notifications: { targets: 0, text: 0 },
