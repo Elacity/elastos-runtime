@@ -269,6 +269,16 @@ would be; no `image-set()` variant.
   section heading and times 12 px, Clear history a 44 px target.
 - Reduced motion stops the launcher's opening fade, blur and scale as well
   as its height change.
+- Grab handles (`shell-sheet-handle.js`): Control Centre, Notification Centre
+  and Spotlight end in a 44 px Close handle at the thumb end; a tap closes, a
+  48 px drag up closes, a shorter drag snaps back. The launcher grows from
+  the Dock and its Apps button already closes it, so it gets a drag-down
+  grabber only. Every sheet also closes on Escape and on system back.
+- The bar sheets are non-modal dialogs (`role="dialog"`,
+  `aria-modal="false"`) because the bar and Dock stay live while one is
+  open; each bar opener announces the popup and whether it is open.
+  Spotlight keeps focus in its field. The shell document never scrolls, so
+  no scroll lock is needed behind a sheet.
 
 The smoke types a query to measure Spotlight's rows (`spotlight-results`)
 and, on portrait, raises the host keyboard inset to check the panel ends
