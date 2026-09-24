@@ -1,4 +1,5 @@
 import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
+import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20260813a";
 
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
@@ -521,6 +522,15 @@ export function initializeShellLayout(summary) {
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
     setupReminderDismissed: stored?.setupReminderDismissed === true,
   };
+  // The phone arrangement, once the person has made one (shell-phone-home.js).
+  const homeDock = normalizePhoneHomeIds(stored?.homeDock);
+  if (homeDock) {
+    shellState.shellLayoutState.homeDock = homeDock;
+  }
+  const homePages = normalizePhoneHomePages(stored?.homePages);
+  if (homePages) {
+    shellState.shellLayoutState.homePages = homePages;
+  }
 
   let changed =
     !stored ||

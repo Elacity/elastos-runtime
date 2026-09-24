@@ -545,7 +545,22 @@
       aria-multiselectable="false"
       tabindex="0"
     ></section>
-    <nav id="phone-home" class="phone-home" aria-label="Apps"></nav>
+    <nav id="phone-home" class="phone-home" aria-label="Home screen">
+      <div id="phone-home-pages" class="phone-home-pages"></div>
+      <div
+        id="phone-home-dots"
+        class="phone-home-dots"
+        role="slider"
+        tabindex="0"
+        aria-label="Home screen page"
+        aria-valuemin="1"
+        aria-valuemax="1"
+        aria-valuenow="1"
+      ></div>
+      <div class="phone-home-editbar">
+        <button id="phone-home-done" class="phone-home-done" type="button">Done</button>
+      </div>
+    </nav>
   </section>
 </main>
 
@@ -766,6 +781,16 @@
     <span class="app-glyph phone-home-icon" aria-hidden="true"></span>
     <span class="phone-home-title"></span>
   </button>
+</template>
+
+<template id="phone-home-assistant-page-template">
+  <section class="phone-home-page phone-home-assistant-page" aria-label="Assistant">
+    <button class="phone-home-assistant-open" type="button">
+      <span class="app-glyph phone-home-assistant-icon" aria-hidden="true"></span>
+      <span class="phone-home-assistant-title">Assistant</span>
+      <span class="phone-home-assistant-hint">Ask on this machine</span>
+    </button>
+  </section>
 </template>
 
 <template id="window-error-template">

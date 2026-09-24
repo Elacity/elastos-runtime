@@ -12529,28 +12529,73 @@ assert(
   const phoneHomeModule = read("capsules/home-gui/browser/shell-phone-home.js");
   assert(
     phoneHomeModule.includes("export const PHONE_DOCK_SLOTS = 4;") &&
-      phoneHomeModule.includes("  return pins.slice(0, PHONE_DOCK_SLOTS);") &&
-      phoneHomeModule.includes('const DOCK_TILE_TARGETS = ["assistant"];') &&
+      phoneHomeModule.includes("  return dock.slice(0, PHONE_DOCK_SLOTS);") &&
+      phoneHomeModule.includes("  for (const id of normalizePhoneHomeIds(storedDock) || pins) {") &&
+      phoneHomeModule.includes('export const PHONE_ASSISTANT_TARGET = "assistant";') &&
       phoneHomeModule.includes("  const onHome = targets.filter((app) => !inDock.has(app.target));") &&
-      homeGuiTemplateHtml.includes('<nav id="phone-home" class="phone-home" aria-label="Apps"></nav>') &&
+      homeGuiTemplateHtml.includes('<nav id="phone-home" class="phone-home" aria-label="Home screen">') &&
       shellSurface.includes("  syncDesktopFirstRunHint();\n  renderPhoneHome(summary);\n}") &&
       shellSurface.includes("  renderTaskbar(shellState.currentSummary);\n  renderPhoneHome(shellState.currentSummary);\n  refreshLauncherIfVisible();") &&
-      shellSurface.includes('    attachTargetIconInteractions(button, app.target, "home");') &&
-      shellSurface.includes('  if (target.source !== "home" || shelfPins(shellState.currentSummary).length < PHONE_DOCK_SLOTS) {') &&
-      shellSurface.includes('    entry.dataset.phoneDock = phoneDockIds.has(app.target) ? "slot" : "off";') &&
+      shellSurface.includes('      attachTargetIconInteractions(button, app.target, "home");') &&
+      shellSurface.includes("  for (const targetId of phone ? phoneDockIds(summary) : visibleTaskbarTargets(summary)) {") &&
+      shellSurface.includes('    entry.dataset.phoneDock = phone ? "slot" : "off";') &&
       shellSurface.includes('  // On the phone the Bin is a Library place, not a Dock tile.\n  entry.dataset.phoneDock = "off";') &&
-      shellSurface.includes('  if (isPhone()) {\n    return [{ action: "change-wallpaper", label: "Change Wallpaper…" }];\n  }') &&
+      shellSurface.includes('  if (isPhone()) {\n    return [\n      { action: "edit-home-screen", label: "Edit Home Screen" },\n      { action: "change-wallpaper", label: "Change Wallpaper…" },\n    ];\n  }') &&
       homeGuiStyle.includes("/* The phone Home screen; the phone layer below shows it. */\n.phone-home {\n  display: none;\n}") &&
       phoneRule('  .desktop-shortcuts,\n  .desktop-first-run-hint,\n  .taskbar-item-launcher,\n  .taskbar-sortable > .taskbar-separator,\n  .taskbar-entry[data-phone-dock="off"] {\n    display: none;\n  }') &&
       phoneRule("  .phone-home {\n    position: fixed;\n    top: var(--stage-top);\n    right: 0;\n    bottom: var(--stage-bottom);\n    left: 0;") &&
-      phoneRule("    grid-template-columns: repeat(4, minmax(0, 1fr));") &&
+      phoneRule("    --phone-home-cols: 4;") &&
+      phoneRule("    grid-template-columns: repeat(var(--phone-home-cols), minmax(0, 1fr));") &&
       phoneRule("  .phone-home-icon {\n    width: 60px;\n    height: 60px;") &&
       !homeGuiStyle.includes("--phone-launcher-h") &&
       !homeGuiTemplateHtml.includes('id="launcher-handle"') &&
       justfile.includes("node --test scripts/home-phone-home.test.mjs") &&
       phoneSmoke.includes("...phoneHomeFailures(run)") &&
       phoneSmoke.includes('    id: "launcher",\n    // The phone Home is the app grid; the Apps sheet exists off the phone.\n    phone: false,'),
-    "Phone Home screen: the resting screen is a 4-column app grid between the bar and the Dock; the Dock holds the first 4 Shelf pins beside the Assistant and an app is in the Dock or on the grid, never both; the Apps button, desktop files and the Dock's Bin and running apps stand down on the phone (Library has the Desktop and the Bin), and there is no phone Apps sheet; unit-tested in verify and probed by the phone smoke",
+    "Phone Home screen: the resting screen is a 4-column app grid between the bar and the Dock; until the phone is arranged the Dock holds the first 4 Shelf pins beside the Assistant, and an app is in the Dock or on the grid, never both; the Apps button, desktop files and the Dock's Bin and running apps stand down on the phone (Library has the Desktop and the Bin), and there is no phone Apps sheet; unit-tested in verify and probed by the phone smoke",
+  );
+
+  // Pages, edit mode and the Assistant page: the phone arrangement is the
+  // person's own (homeDock, homePages beside the desktop Shelf, cleaned by
+  // the server like the Shelf), pages turn by native scroll snap with the
+  // dots as their twin, and settling left of page 1 enters the Agent Space.
+  const phoneHomePager = read("capsules/home-gui/browser/shell-phone-home-pager.js");
+  const phoneHomeEdit = read("capsules/home-gui/browser/shell-phone-home-edit.js");
+  const homeStateServer = read("elastos/crates/elastos-server/src/api/gateway_home_system.rs");
+  const homeStateServerTests = read("elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs");
+  assert(
+    phoneHomeModule.includes("      next[at + 1].unshift(next[at].pop());") &&
+      phoneHomeModule.includes("  if (next.length === dock.length && next.length >= PHONE_DOCK_SLOTS) {\n    return null;\n  }") &&
+      phoneHomeModule.includes("      pages[pages.length - 1].push(...unplaced);") &&
+      homeGuiCore.includes("  const homeDock = normalizePhoneHomeIds(stored?.homeDock);") &&
+      homeGuiCore.includes("  const homePages = normalizePhoneHomePages(stored?.homePages);") &&
+      shellSurface.includes("    layout.homeDock = nextDock;\n    layout.homePages = removePhoneHomeTarget(phoneHomePageIds, targetId);") &&
+      shellSurface.includes("    layout.homePages = movePhoneHomeTarget(phoneHomePageIds, targetId, to.page, to.index, phoneHomePerPage());") &&
+      !/function dropOnPhoneHome[\s\S]*?layout\.taskbar =[\s\S]*?\n}\n/.test(shellSurface) &&
+      shellSurface.includes('  if (source === "taskbar" && isPhone()) {\n    return;\n  }') &&
+      shellSurface.includes("function openPhoneHomeAgent() {\n  setActiveStage(agentStageId());\n}") &&
+      shellSurface.includes('  if (action === "edit-home-screen") {\n    enterPhoneHomeEdit();') &&
+      shellSurface.includes('    items.push({ action: "remove-phone-dock", label: "Remove from Dock" });') &&
+      shellSurface.includes('    items.push({ action: "add-phone-dock", label: "Add to Dock" });') &&
+      phoneHomePager.includes("  hooks.openAgent();") &&
+      phoneHomePager.includes('    if (!agentOpening || !document.body.classList.contains("assistant-space-active")) {') &&
+      phoneHomePager.includes('  const columns = Math.round(read("--phone-home-cols"));') &&
+      phoneHomePager.includes('  dotsEl.addEventListener("keydown", onDotsKey);') &&
+      homeGuiTemplateHtml.includes('        role="slider"\n        tabindex="0"\n        aria-label="Home screen page"') &&
+      homeGuiTemplateHtml.includes('<button id="phone-home-done" class="phone-home-done" type="button">Done</button>') &&
+      phoneHomeEdit.includes('import { LONG_PRESS_DRIFT_PX, LONG_PRESS_MS } from "./shell-touch.js?v=home-20260813a";') &&
+      phoneHomeEdit.includes("    }, { passive: false });") &&
+      phoneHomeEdit.includes('    if (editing && event.key === "Escape") {') &&
+      phoneHomeEdit.includes("  if (!tileAt(event.target) && !event.target.closest?.(\".taskbar\")) {\n    exitPhoneHomeEdit();") &&
+      phoneRule("    scroll-snap-type: x mandatory;") &&
+      phoneRule("    scroll-snap-stop: always;") &&
+      phoneRule('  body.phone-home-editing .phone-home-app,\n  body.phone-home-editing .taskbar-entry[data-phone-dock="slot"] > .taskbar-item {\n    touch-action: none;\n  }') &&
+      phoneRule("    body.phone-home-editing .phone-home-icon,\n    body.phone-home-editing .taskbar-entry[data-phone-dock=\"slot\"] .taskbar-item-icon {\n      animation: none;") &&
+      homeStateServer.includes('    if let Some(dock) = layout_object.get_mut("homeDock") {') &&
+      homeStateServer.includes('    if let Some(pages) = layout_object.get_mut("homePages") {\n        *pages = sanitize_home_target_pages(pages.take(), known_targets);') &&
+      homeStateServerTests.includes('    assert_eq!(json["layout"]["homePages"], json!([["system"], ["people"]]));') &&
+      phoneSmoke.includes("...phoneHomeEditFailures(run)"),
+    "Phone Home pages and edit mode: the phone's Dock and pages are its own (homeDock, homePages; the desktop Shelf never moves), the server drops unknown apps from them as it does the Shelf's, pages turn by native scroll snap with the dots as an adjustable twin, hold-and-move or Edit Home Screen rearranges the grid and the Dock (edge turns the page, a full Dock takes no newcomer, Done or Escape ends it, reduced motion stops the jiggle), and settling left of page 1 opens the Assistant; unit-tested, server-tested and probed by the phone smoke in both engines",
   );
 
   assert(

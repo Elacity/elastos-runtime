@@ -899,6 +899,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let linkProbe = null;
   let touchMenuProbe = null;
   let homeProbe = null;
+  let homeEditProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -949,6 +950,9 @@ async function runProfile(browser, engineId, profile, origin) {
       sheetHandleProbe = await probeSheetHandles(page, frame);
       touchMenuProbe = await probeTouchMenu(page, frame, dir);
     }
+    if (profile.id.startsWith("phone")) {
+      homeEditProbe = await probePhoneHomeEdit(page, frame, dir);
+    }
     for (const [target] of FIRST_PARTY_APPS) {
       if (target === "assistant") {
         // The Assistant opens as the face, measured above, never as a window.
@@ -974,7 +978,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, home: homeProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, home: homeProbe, homeEdit: homeEditProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -1150,7 +1154,7 @@ async function probePhoneHome(frame) {
         .filter((node) => shown(node) && !node.querySelector(".taskbar-item[data-target]")).length,
       launcherToggleShown: shown(document.querySelector("#launcher-toggle")),
       desktopShortcutsShown: Array.from(document.querySelectorAll(".desktop-shortcut")).some(shown),
-      columns: getComputedStyle(grid).gridTemplateColumns.split(" ").length,
+      columns: getComputedStyle(grid.querySelector(".phone-home-page[data-page]")).gridTemplateColumns.split(" ").length,
       gridTop: Math.round(grid.getBoundingClientRect().top),
       toolbarBottom: Math.round(toolbar.bottom),
       lastAppBottom: lastApp ? Math.round(lastApp.bottom) : null,
@@ -1187,6 +1191,186 @@ function phoneHomeFailures(run) {
   const wantColumns = run.profile === "phone-landscape" ? 6 : 4;
   if (home.columns !== wantColumns) {
     failures.push(`${label}: the Home grid must be ${wantColumns} columns. Got ${JSON.stringify(home)}`);
+  }
+  return failures;
+}
+
+// Home pages and edit mode, played as a thumb would: hold a grid app until
+// its menu opens, move it (edit mode takes over), push it against the right
+// edge until the page turns, drop it there; move a Dock app onto the grid and
+// back; Done; turn back with the dots; swipe right past page 1 into the
+// Assistant, which hands back page 1 when it closes.
+const EDGE_TURN_WAIT_MS = 2500;
+const PAGE_SETTLE_WAIT_MS = 400;
+const ASSISTANT_OPEN_WAIT_MS = 1800;
+
+async function probePhoneHomeEdit(page, frame, dir) {
+  const read = () => frame.evaluate(() => {
+    const pages = document.querySelector("#phone-home-pages");
+    const gridPages = Array.from(pages.querySelectorAll(":scope > .phone-home-page[data-page]"));
+    const hasAssistantPage = Boolean(pages.querySelector(":scope > .phone-home-assistant-page"));
+    const current = Math.round(pages.scrollLeft / pages.clientWidth) - (hasAssistantPage ? 1 : 0);
+    const dots = document.querySelector("#phone-home-dots");
+    return {
+      pages: gridPages.map((node) => Array.from(node.querySelectorAll(".phone-home-app")).map((tile) => tile.dataset.target)),
+      dock: Array.from(document.querySelectorAll('.taskbar-entry[data-phone-dock="slot"] > .taskbar-item')).map((node) => node.dataset.target),
+      hasAssistantPage,
+      current,
+      dots: dots.children.length,
+      dotsShown: dots.dataset.single === "false",
+      editing: document.body.classList.contains("phone-home-editing"),
+      menuOpen: !document.querySelector("#desktop-context-menu").hidden,
+      ghost: Boolean(document.querySelector(".phone-home-ghost")),
+      doneShown: document.querySelector("#phone-home-done").getClientRects().length > 0,
+      assistantOpen: document.body.classList.contains("assistant-space-active"),
+      windows: document.querySelectorAll(".window").length,
+    };
+  });
+  // One synthetic touch pointer, dispatched at the pressed tile the way a
+  // browser targets a captured touch.
+  const pointer = (type, selector, at) => frame.evaluate(({ type, selector, at }) => {
+    if (selector) {
+      window.__smokeTile = document.querySelector(selector);
+    }
+    const tile = window.__smokeTile;
+    const box = tile.getBoundingClientRect();
+    const x = at === "centre" ? box.x + box.width / 2 : at.x;
+    const y = at === "centre" ? box.y + box.height / 2 : at.y;
+    tile.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, composed: true,
+      pointerId: 43, pointerType: "touch", isPrimary: true, clientX: x, clientY: y,
+    }));
+    return { x, y };
+  }, { type, selector, at });
+  const spot = (selector, dx = 0, dy = 0) => frame.evaluate(({ selector, dx, dy }) => {
+    const box = document.querySelector(selector).getBoundingClientRect();
+    return { x: box.x + box.width / 2 + dx, y: box.y + box.height / 2 + dy };
+  }, { selector, dx, dy });
+  const pageMiddle = () => spot("#phone-home-pages", 0, 0);
+
+  const before = await read();
+  const firstPage = before.pages[before.current] || [];
+  const dragged = firstPage[0];
+  const tileSelector = (target) => `.phone-home-app[data-target="${target}"]`;
+
+  // Hold, then move: the menu gives way to edit mode.
+  const start = await pointer("pointerdown", tileSelector(dragged), "centre");
+  await sleep(LONG_PRESS_HOLD_MS);
+  const held = await read();
+  await pointer("pointermove", null, { x: start.x + 24, y: start.y });
+  const lifted = await read();
+
+  // Against the right edge until the page turns, then drop on that page.
+  const edge = await frame.evaluate(() => window.innerWidth - 6);
+  await pointer("pointermove", null, { x: edge, y: start.y });
+  const turnedFrom = lifted.current;
+  let turned = lifted;
+  for (let waited = 0; waited < EDGE_TURN_WAIT_MS && turned.current === turnedFrom; waited += 100) {
+    await sleep(100);
+    turned = await read();
+  }
+  await pointer("pointermove", null, await pageMiddle());
+  await sleep(PAGE_SETTLE_WAIT_MS);
+  await pointer("pointerup", null, await pageMiddle());
+  await sleep(PAGE_SETTLE_WAIT_MS);
+  const dropped = await read();
+  await screenshot(page, dir, "home-edit");
+
+  // A tap in edit mode opens nothing.
+  await frame.evaluate((selector) => document.querySelector(selector).click(), tileSelector(dragged));
+  await sleep(SURFACE_SETTLE_MS);
+  const tapped = await read();
+
+  // A Dock app onto the grid, then back into the Dock.
+  const dockApp = dropped.dock[0];
+  const dockSelector = `.taskbar-entry[data-phone-dock="slot"] > .taskbar-item[data-target="${dockApp}"]`;
+  const dockStart = await pointer("pointerdown", dockSelector, "centre");
+  await pointer("pointermove", null, { x: dockStart.x, y: dockStart.y - 30 });
+  await pointer("pointermove", null, await pageMiddle());
+  await pointer("pointerup", null, await pageMiddle());
+  await sleep(PAGE_SETTLE_WAIT_MS);
+  const dockOut = await read();
+  const backStart = await pointer("pointerdown", tileSelector(dockApp), "centre");
+  await pointer("pointermove", null, { x: backStart.x, y: backStart.y + 20 });
+  const dockSpot = await spot(".taskbar-sortable");
+  await pointer("pointermove", null, dockSpot);
+  await pointer("pointerup", null, dockSpot);
+  await sleep(PAGE_SETTLE_WAIT_MS);
+  const dockIn = await read();
+
+  await frame.locator("#phone-home-done").click();
+  await sleep(SURFACE_SETTLE_MS);
+  const done = await read();
+
+  // The dots turn back to page 1.
+  const firstDot = await spot("#phone-home-dots .phone-home-dot");
+  await frame.evaluate(({ x, y }) => {
+    document.querySelector("#phone-home-dots").dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
+  }, firstDot);
+  await sleep(PAGE_SETTLE_WAIT_MS);
+  const dotted = await read();
+
+  // Swipe right past page 1: the Assistant opens; page 1 is back behind it.
+  await frame.evaluate(() => document.querySelector("#phone-home-pages").scrollTo({ left: 0 }));
+  await sleep(ASSISTANT_OPEN_WAIT_MS);
+  const assistant = await read();
+  await screenshot(page, dir, "home-assistant");
+  await pressEscape(frame);
+  await sleep(SHEET_SETTLE_MS);
+  const closed = await read();
+  return { dragged, dockApp, before, held, lifted, turned, dropped, tapped, dockOut, dockIn, done, dotted, assistant, closed };
+}
+
+function phoneHomeEditFailures(run) {
+  if (!run.homeEdit) {
+    return [];
+  }
+  const { dragged, dockApp, before, held, lifted, turned, dropped, tapped, dockOut, dockIn, done, dotted, assistant, closed } = run.homeEdit;
+  const label = `${run.engine}/${run.profile}/home-edit`;
+  const failures = [];
+  const pageOf = (state, target) => state.pages.findIndex((page) => page.includes(target));
+  const everyAppOnce = (state) => {
+    const placed = [...state.pages.flat(), ...state.dock];
+    return new Set(placed).size === placed.length;
+  };
+  if (!before.hasAssistantPage || before.current !== 0) {
+    failures.push(`${label}: the Home must open on page 1 with the Assistant page to its left. Got ${JSON.stringify(before)}`);
+  }
+  if (!held.menuOpen || held.editing) {
+    failures.push(`${label}: holding a grid app must open its menu first. Got ${JSON.stringify(held)}`);
+  }
+  if (lifted.menuOpen || !lifted.editing || !lifted.ghost || !lifted.doneShown) {
+    failures.push(`${label}: moving a held app must close the menu and pick the app up in edit mode, with Done showing. Got ${JSON.stringify(lifted)}`);
+  }
+  if (turned.current !== lifted.current + 1) {
+    failures.push(`${label}: holding an app against the right edge must turn the page. Got ${JSON.stringify(turned)}`);
+  }
+  if (pageOf(dropped, dragged) !== turned.current || !dropped.editing || dropped.ghost || !everyAppOnce(dropped)) {
+    failures.push(`${label}: the app must land on the page it was dropped on, still in edit mode, every app placed once. Got ${JSON.stringify(dropped)}`);
+  }
+  if (dropped.pages.length < 2 || !dropped.dotsShown || dropped.dots !== dropped.pages.length) {
+    failures.push(`${label}: two pages must show one dot each. Got ${JSON.stringify(dropped)}`);
+  }
+  if (tapped.windows !== dropped.windows) {
+    failures.push(`${label}: a tap in edit mode must not open an app. Got ${JSON.stringify(tapped)}`);
+  }
+  if (dockOut.dock.includes(dockApp) || pageOf(dockOut, dockApp) < 0 || !everyAppOnce(dockOut)) {
+    failures.push(`${label}: a Dock app dragged onto the grid must leave the Dock for the grid. Got ${JSON.stringify(dockOut)}`);
+  }
+  if (!dockIn.dock.includes(dockApp) || pageOf(dockIn, dockApp) >= 0 || !everyAppOnce(dockIn)) {
+    failures.push(`${label}: a grid app dragged onto the Dock must leave the grid for the Dock. Got ${JSON.stringify(dockIn)}`);
+  }
+  if (done.editing || done.doneShown || pageOf(done, dragged) !== pageOf(dropped, dragged)) {
+    failures.push(`${label}: Done must end edit mode and keep the arrangement. Got ${JSON.stringify(done)}`);
+  }
+  if (dotted.current !== 0) {
+    failures.push(`${label}: the first dot must turn back to page 1. Got ${JSON.stringify(dotted)}`);
+  }
+  if (!assistant.assistantOpen || assistant.current !== 0) {
+    failures.push(`${label}: swiping right past page 1 must open the Assistant and leave page 1 behind it. Got ${JSON.stringify(assistant)}`);
+  }
+  if (closed.assistantOpen || closed.current !== 0) {
+    failures.push(`${label}: closing the Assistant must land on page 1. Got ${JSON.stringify(closed)}`);
   }
   return failures;
 }
@@ -1660,7 +1844,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run), ...phoneHomeEditFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {
