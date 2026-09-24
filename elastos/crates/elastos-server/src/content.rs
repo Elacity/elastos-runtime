@@ -4663,13 +4663,45 @@ impl ContentProvider {
         &self,
         cid: &str,
     ) -> Option<Result<SignedAvailabilityReceipt, ProviderError>> {
-        match self.latest_receipts() {
-            Ok(receipts) => receipts
-                .into_iter()
-                .find(|receipt| receipt.payload.cid == cid)
-                .map(Ok),
-            Err(err) => Some(Err(err)),
-        }
+        (|| {
+            let path = self.receipts_path();
+            if !path.exists() {
+                return Ok(None);
+            }
+            let file = std::fs::File::open(path)?;
+            let mut latest = None;
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let envelope: Value = serde_json::from_str(&line).map_err(|err| {
+                    ProviderError::Provider(format!("content receipt ledger decode failed: {err}"))
+                })?;
+                let row_cid = envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("cid"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "content receipt ledger decode failed: missing payload CID".into(),
+                        )
+                    })?;
+                if row_cid != cid {
+                    continue;
+                }
+                let receipt: SignedAvailabilityReceipt =
+                    serde_json::from_str(&line).map_err(|err| {
+                        ProviderError::Provider(format!(
+                            "content receipt ledger decode failed: {err}"
+                        ))
+                    })?;
+                verify_signed_receipt(&receipt)?;
+                latest = Some(receipt);
+            }
+            Ok(latest)
+        })()
+        .transpose()
     }
 
     fn latest_receipts(&self) -> Result<Vec<SignedAvailabilityReceipt>, ProviderError> {
@@ -9170,6 +9202,91 @@ mod tests {
 
     const TEST_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
+    fn signed_test_availability_receipt(cid: &str, legacy: bool) -> Value {
+        let (signing_key, _) = elastos_runtime::signature::generate_keypair();
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
+        let receipt = AvailabilityReceipt {
+            schema: AVAILABILITY_RECEIPT_SCHEMA.to_string(),
+            cid: cid.to_string(),
+            uri: format!("elastos://{cid}"),
+            object_did: None,
+            publisher_did: signer_did.clone(),
+            provider: "ipfs-provider".to_string(),
+            policy: "local_pin".to_string(),
+            status: "local_pinned".to_string(),
+            replicas: 1,
+            peer_selection: local_peer_selection_json(),
+            quota: local_quota_json(),
+            repair_worker: repair_worker_json(false),
+            storage_market: default_content_storage_market_json(),
+            repair_graph: default_content_repair_graph_json(),
+            abuse_controls: default_content_abuse_controls_json(),
+            accounting: default_content_accounting_json(),
+            checked_at: 1,
+        };
+        let mut payload = serde_json::to_value(receipt).unwrap();
+        if legacy {
+            let payload = payload.as_object_mut().unwrap();
+            payload.remove("peer_selection");
+            payload.remove("quota");
+            payload.remove("repair_worker");
+        }
+        let (signature, signed_did) = crate::crypto::domain_separated_sign(
+            &signing_key,
+            AVAILABILITY_RECEIPT_DOMAIN,
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+        );
+        assert_eq!(signed_did, signer_did);
+        let envelope =
+            json!({"payload": payload, "signature": signature, "signer_did": signer_did});
+        crate::crypto::verify_signed_json_envelope_against_dids(
+            &serde_json::to_vec(&envelope).unwrap(),
+            AVAILABILITY_RECEIPT_DOMAIN,
+            &[signed_did],
+        )
+        .unwrap();
+        envelope
+    }
+
+    async fn content_with_bounded_local_index(
+        index: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        Arc<ProviderRegistry>,
+        Arc<MockAvailabilityProvider>,
+        Arc<ContentProvider>,
+    ) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let content = Arc::new(ContentProvider::new(
+            data_dir.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        let ipfs = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(index),
+                "_runtime_complete_metadata": {
+                    "schema": "elastos.provider.complete-metadata/v1",
+                    "cid": TEST_CID,
+                    "path": CONTENT_OBJECT_MANIFEST_PATH,
+                    "max_bytes": 65536,
+                    "actual_bytes": index.len(),
+                    "completed": true,
+                }
+            }))),
+        });
+        registry
+            .register_sub_provider("content", content.clone())
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("ipfs", ipfs.clone())
+            .await
+            .unwrap();
+        (data_dir, registry, ipfs, content)
+    }
+
     struct MockIpfsProvider {
         add_count: Mutex<usize>,
         added_files: Mutex<Vec<String>>,
@@ -11742,6 +11859,94 @@ mod tests {
             "read_next"
         );
         assert_eq!(cat["_runtime_invocation"]["abi"]["cancel_supported"], true);
+    }
+
+    #[tokio::test]
+    async fn content_fetch_ignores_unrelated_signed_old_receipt() {
+        let index = b"{\"signed_index\":true}";
+        let (_data_dir, _registry, ipfs, content) = content_with_bounded_local_index(index).await;
+        let old_cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdj";
+        append_jsonl(
+            &content.receipts_path(),
+            &signed_test_availability_receipt(old_cid, true),
+        )
+        .unwrap();
+        append_jsonl(
+            &content.receipts_path(),
+            &signed_test_availability_receipt(TEST_CID, false),
+        )
+        .unwrap();
+        let response = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_test_stream_payload(&response["data"]["stream"]),
+            index
+        );
+        assert_eq!(response["data"]["availability"]["status"], "local_pinned");
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+
+        let dashboard_error = content
+            .send_raw(&json!({"op": "status"}))
+            .await
+            .expect_err("the dashboard must report its incompatible old ledger");
+        assert!(dashboard_error
+            .to_string()
+            .contains("receipt ledger decode failed"));
+    }
+
+    #[tokio::test]
+    async fn content_fetch_rejects_matching_signed_receipt_corruption() {
+        let (_data_dir, _registry, ipfs, content) = content_with_bounded_local_index(b"{}").await;
+        let mut receipt = signed_test_availability_receipt(TEST_CID, false);
+        receipt["payload"]["status"] = json!("tampered");
+        append_jsonl(&content.receipts_path(), &receipt).unwrap();
+
+        let error = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream",
+            }))
+            .await
+            .expect_err("matching corrupt receipt must fail closed");
+        assert!(error.to_string().contains("receipt verification failed"));
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn content_fetch_rejects_matching_signed_old_receipt() {
+        let (_data_dir, _registry, ipfs, content) = content_with_bounded_local_index(b"{}").await;
+        append_jsonl(
+            &content.receipts_path(),
+            &signed_test_availability_receipt(TEST_CID, true),
+        )
+        .unwrap();
+
+        let error = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream",
+            }))
+            .await
+            .expect_err("a matching old receipt needs an explicit schema decision");
+        assert!(error.to_string().contains("missing field `peer_selection`"));
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]
