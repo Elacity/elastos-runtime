@@ -1097,6 +1097,16 @@ async fn setup_server_infrastructure_impl(
                             .await;
                             match startup {
                                 Ok(()) => {
+                                    #[cfg(unix)]
+                                    if let Err(error) = api::complete_admitted_model_startup(
+                                        &data_dir,
+                                        &provider_registry,
+                                        worker.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(%error, "model startup activation receipt pending");
+                                    }
                                     tracing::info!("model-provider capsule from {}", path.display())
                                 }
                                 Err(_) => {

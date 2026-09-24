@@ -2713,6 +2713,48 @@ pub async fn settle_pending_model_startup(
     finish_model_retirement(data_dir)
 }
 
+/// Record that the registered model slot exposes the startup admission.
+pub async fn complete_admitted_model_startup(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    worker: Option<&std::fs::File>,
+) -> anyhow::Result<()> {
+    if worker.is_none() {
+        return Ok(());
+    }
+    let offers = registry.local_model_offers().await?;
+    let inventory = Inventory::open(data_dir, false)?;
+    let mut state = inventory.load()?;
+    let mut ready = BTreeSet::new();
+    for owner in state
+        .records
+        .iter()
+        .filter(|r| r.state == PreparationState::Admitted && r.operation_id == r.admission_id)
+    {
+        let Some(activation) = &owner.activation else {
+            continue;
+        };
+        if offers.iter().any(|offer| *offer == activation.summary()) {
+            activation.check_root(data_dir, owner)?;
+            ready.insert(owner.operation_id.clone());
+        }
+    }
+    let mut changed = false;
+    for record in &mut state.records {
+        if record.state == PreparationState::Admitted
+            && record.activation_pending
+            && ready.contains(&record.admission_id)
+        {
+            record.activation_pending = false;
+            changed = true;
+        }
+    }
+    if changed {
+        inventory.save(&state)?;
+    }
+    Ok(())
+}
+
 async fn append_admitted_model_offers_locked(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
@@ -4235,6 +4277,48 @@ mod tests {
             hold: AtomicBool,
             entered: tokio::sync::Notify,
             release: tokio::sync::Notify,
+        }
+
+        #[tokio::test]
+        async fn model_startup_clears_pending_after_live_offer_registration() {
+            let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
+            let _engine = install_engine(root.path());
+            admit(root.path(), &record);
+            let worker = Inventory::open(root.path(), false)
+                .unwrap()
+                .worker_lock()
+                .unwrap();
+            let mut config = crate::api::model_provider_bridge_config(root.path()).unwrap();
+            append_admitted_model_offers_locked(root.path(), &registry, &mut config, &worker)
+                .await
+                .unwrap();
+            assert!(
+                load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending
+            );
+            let model = Arc::new(ModelActivationFixture::default());
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            complete_admitted_model_startup(root.path(), &registry, Some(&worker))
+                .await
+                .unwrap();
+            assert!(
+                load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending
+            );
+            *model.configured.lock().unwrap() = Some(serde_json::to_value(config).unwrap());
+            complete_admitted_model_startup(root.path(), &registry, Some(&worker))
+                .await
+                .unwrap();
+            assert!(
+                !load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending
+            );
         }
 
         #[async_trait::async_trait]
