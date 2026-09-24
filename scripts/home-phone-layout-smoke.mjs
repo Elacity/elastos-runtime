@@ -1132,12 +1132,12 @@ const EXPECTED_CAPSULE_FORM_FACTOR = {
 const CAPSULE_TARGET_BASELINE = {
   "phone-portrait": {
     library: 0, documents: 0, marketplace: 0, system: 0, people: 0, services: 0,
-    wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 4,
+    wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 0,
     assistant: 0,
   },
   "phone-landscape": {
     library: 0, documents: 0, marketplace: 0, system: 0, people: 0, services: 0,
-    wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 4,
+    wallet: 0, inbox: 0, "archive-manager": 0, "elacity-player": 0, browser: 0,
     assistant: 0,
   },
 };

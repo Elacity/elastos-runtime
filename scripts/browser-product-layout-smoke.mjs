@@ -180,6 +180,28 @@ async function assertScenario(page, width, height, screenshotPath, { phone = fal
   if (phone) {
     assert(result.firstControl.left <= 12, "Browser phone toolbar must start at the leading edge", result);
     assert(result.address.height >= 44 && result.addressFont === "16px", "Browser phone address must be a 44 px, 16 px field", result);
+    const targets = await page.evaluate(() => {
+      const status = document.querySelector("#browser-status");
+      const message = document.createElement("span");
+      message.className = "browser-status-message";
+      message.textContent = "Browser Engine is not running";
+      const copy = document.createElement("button");
+      copy.className = "browser-status-copy";
+      copy.type = "button";
+      copy.textContent = "Copy";
+      status.replaceChildren(message, copy);
+      status.dataset.copyable = "true";
+      const size = (node) => {
+        const rect = node.getBoundingClientRect();
+        return { label: node.getAttribute("aria-label") || node.textContent.trim(), width: Math.round(rect.width), height: Math.round(rect.height) };
+      };
+      return [...document.querySelectorAll(".browser-chrome button"), copy].map(size);
+    });
+    assert(
+      targets.every((target) => target.width >= 44 && target.height >= 44),
+      "Browser phone controls and the status Copy action must be 44 px targets",
+      targets,
+    );
   }
   await page.screenshot({ path: screenshotPath, fullPage: false });
 }

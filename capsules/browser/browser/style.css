@@ -479,14 +479,19 @@ body[data-loading="true"] .browser-address {
   padding: 6px max(8px, env(safe-area-inset-right, 0px)) 6px max(8px, env(safe-area-inset-left, 0px));
 }
 
+/* The groups draw their stroke inside (no padding) so 44 px buttons keep the
+   pill 44 px tall. */
 :root[data-el-form-factor="phone"] .browser-nav-group,
 :root[data-el-form-factor="phone"] .browser-util-group {
   min-height: var(--el-touch-target);
+  padding: 0;
+  border: 0;
+  box-shadow: inset 0 0 0 1px var(--chrome-pill-stroke);
 }
 
 :root[data-el-form-factor="phone"] .browser-nav-button {
-  width: 40px;
-  height: 40px;
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
   font-size: 16px;
 }
 
@@ -503,4 +508,20 @@ body[data-loading="true"] .browser-address {
 
 :root[data-el-form-factor="phone"] .browser-settings-panel {
   top: 60px;
+}
+
+/* A sticky status reads as a snackbar: Copy is a 44 px text action as tall as
+   the pill instead of a small chip. */
+:root[data-el-form-factor="phone"] .browser-status[data-copyable="true"] {
+  padding-block: 0;
+  padding-right: 4px;
+}
+
+:root[data-el-form-factor="phone"] .browser-status-copy {
+  min-height: var(--el-touch-target);
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
 }

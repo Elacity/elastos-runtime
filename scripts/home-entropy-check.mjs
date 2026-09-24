@@ -12635,8 +12635,13 @@ assert(
   assert(
     read("capsules/browser/browser/style.css").includes(':root[data-el-form-factor="phone"] .browser-chrome {\n  min-height: 56px;') &&
       read("scripts/browser-product-layout-smoke.mjs").includes('"Browser phone toolbar must start at the leading edge"') &&
+      read("capsules/browser/browser/style.css").includes(':root[data-el-form-factor="phone"] .browser-nav-button {\n  width: var(--el-touch-target);\n  height: var(--el-touch-target);') &&
+      read("capsules/browser/browser/style.css").includes(':root[data-el-form-factor="phone"] .browser-status-copy {\n  min-height: var(--el-touch-target);') &&
+      read("scripts/browser-product-layout-smoke.mjs").includes('"Browser phone controls and the status Copy action must be 44 px targets",') &&
+      /"elacity-player": 0, browser: 0,/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
+      /"elacity-player": 0, browser: 0,/.test(capsuleRatchet[1].split('"phone-landscape"')[1]) &&
       justfile.includes("node scripts/browser-product-layout-smoke.mjs"),
-    "Browser phone: the navigation row spans the stage with 44 px controls, asserted by the layout smoke in the browser lane",
+    "Browser phone: the navigation row spans the stage with 44 px controls and a sticky status's Copy is a 44 px snackbar action, asserted by the layout smoke in the browser lane and held at 0 small targets by the phone smoke",
   );
 }
 assertProviderOperationEnumsRejectUnknownFields();
