@@ -1976,12 +1976,9 @@ assert(
     homeGuiStyle.includes(".launcher {\n  position: static;") &&
     !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
     homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,\n  .launcher-header,\n  .launcher-scroll,\n  .taskbar.is-launcher-face .launcher,\n  .taskbar.is-launcher-face .launcher-header,\n  .taskbar.is-launcher-face .launcher-scroll,\n  .taskbar {\n    transition: none;") &&
-    homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
-    homeGuiStyle.includes(".launcher-popover {\n    height: var(--phone-launcher-h);") &&
-    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: var(--phone-launcher-h);") &&
     !homeGuiStyle.includes("launcher-fly-icon") &&
     !homeGuiStyle.includes("data-launcher-morphing"),
-  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched phone launcher heights",
+  "Home launcher styles must keep one material Shelf face, narrow bounds and reduced motion (the phone has the Home grid instead)",
 );
 assert(
   /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
@@ -12414,11 +12411,10 @@ assert(
     homeGuiStyle.includes("--phone-dock-glyph-scale: 1.15;") &&
       homeGuiStyle.includes("  :root {\n    --shelf-face-ms: 1100ms;\n  }") &&
       homeGuiStyle.includes("  --shelf-face-ms: 950ms;") &&
-      homeGuiStyle.includes("  .taskbar-icon-launcher {\n    background-size: calc(var(--phone-dock-glyph-scale) * 100%);") &&
       homeGuiStyle.includes("  .taskbar-item-assistant .taskbar-item-icon.assistant-mark {\n    transform: scale(var(--phone-dock-glyph-scale));") &&
-      homeGuiStyle.includes("  .taskbar-item-launcher,\n  .taskbar-item-assistant {\n    flex-shrink: 0;\n  }\n\n  .taskbar-sortable {\n    min-width: 0;") &&
+      homeGuiStyle.includes("  .taskbar-item-assistant {\n    flex-shrink: 0;\n  }\n\n  .taskbar-sortable {\n    min-width: 0;") &&
       homeGuiStyle.includes("  .control-centre,\n  .notification-center {\n    left: max(8px, env(safe-area-inset-left, 0px));\n    right: max(8px, env(safe-area-inset-right, 0px));\n    width: auto;"),
-    "Home phone Dock and sheets: launcher and Assistant tiles never shrink, plate-free glyphs scale 1.15x to stay lighter than the plates (the Assistant only with its plate-free mark), Apps and Assistant morphs run 1100 ms on phone (950 ms desktop), Control Centre and Notifications span the stage with even margins",
+    "Home phone Dock and sheets: the Assistant tile never shrinks, its plate-free mark scales 1.15x to stay lighter than the plates, the Assistant morph runs 1100 ms on phone (950 ms desktop), Control Centre and Notifications span the stage with even margins",
   );
 
   assert(
@@ -12549,10 +12545,12 @@ assert(
       phoneRule("  .phone-home {\n    position: fixed;\n    top: var(--stage-top);\n    right: 0;\n    bottom: var(--stage-bottom);\n    left: 0;") &&
       phoneRule("    grid-template-columns: repeat(4, minmax(0, 1fr));") &&
       phoneRule("  .phone-home-icon {\n    width: 60px;\n    height: 60px;") &&
+      !homeGuiStyle.includes("--phone-launcher-h") &&
+      !homeGuiTemplateHtml.includes('id="launcher-handle"') &&
       justfile.includes("node --test scripts/home-phone-home.test.mjs") &&
       phoneSmoke.includes("...phoneHomeFailures(run)") &&
       phoneSmoke.includes('    id: "launcher",\n    // The phone Home is the app grid; the Apps sheet exists off the phone.\n    phone: false,'),
-    "Phone Home screen: the resting screen is a 4-column app grid between the bar and the Dock; the Dock holds the first 4 Shelf pins beside the Assistant and an app is in the Dock or on the grid, never both; the Apps button, desktop files and the Dock's Bin and running apps stand down on the phone (Library has the Desktop and the Bin); unit-tested in verify and probed by the phone smoke",
+    "Phone Home screen: the resting screen is a 4-column app grid between the bar and the Dock; the Dock holds the first 4 Shelf pins beside the Assistant and an app is in the Dock or on the grid, never both; the Apps button, desktop files and the Dock's Bin and running apps stand down on the phone (Library has the Desktop and the Bin), and there is no phone Apps sheet; unit-tested in verify and probed by the phone smoke",
   );
 
   assert(
@@ -12617,17 +12615,15 @@ assert(
       closeHandle("control-centre-handle") &&
       closeHandle("notification-center-handle") &&
       closeHandle("spotlight-handle") &&
-      homeGuiTemplateHtml.includes('<div id="launcher-handle" class="sheet-handle launcher-handle" aria-hidden="true"></div>') &&
       bindsHandle(read("capsules/home-gui/browser/shell-control-centre.js"), "control-centre-handle", "SHEET_DRAG_UP", "hideControlCentre", true) &&
       bindsHandle(read("capsules/home-gui/browser/shell-notifications.js"), "notification-center-handle", "SHEET_DRAG_UP", "hideNotificationCenter", true) &&
       bindsHandle(shellSpotlight, "spotlight-handle", "SHEET_DRAG_UP", "hideSpotlight", true) &&
-      bindsHandle(shellSurface, "launcher-handle", "SHEET_DRAG_DOWN", "hideLauncher", false) &&
       homeGuiStyle.includes(".sheet-handle {\n  display: none;\n}") &&
       phoneRule("  .sheet-handle {\n    display: grid;\n    place-items: center;\n    flex: 0 0 auto;\n    width: 100%;\n    height: var(--el-touch-target);") &&
       phoneRule("  .control-centre .sheet-handle {\n    position: sticky;\n    bottom: 0;") &&
       justfile.includes("node --test scripts/home-sheet-handle.test.mjs") &&
       phoneSmoke.includes("...phoneSheetHandleFailures(run)"),
-    "Phone sheet handles: Control Centre, Notification Centre and Spotlight end in a 44 px Close handle (tap closes, a 48 px drag up closes, shorter snaps back); the launcher, closed by the Dock's Apps button, gets a drag-down grabber only; hidden off phone, unit-tested in verify and probed by the phone smoke",
+    "Phone sheet handles: Control Centre, Notification Centre and Spotlight end in a 44 px Close handle (tap closes, a 48 px drag up closes, shorter snaps back); hidden off phone, unit-tested in verify and probed by the phone smoke",
   );
 
   // Unreachable gateway on the phone bar: only the dot shows; the words stay

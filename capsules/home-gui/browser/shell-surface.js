@@ -88,7 +88,6 @@ import {
 import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
 import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260813a";
 import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
-import { bindSheetHandle, SHEET_DRAG_DOWN } from "./shell-sheet-handle.js?v=home-20260813a";
 import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
 import { PHONE_DOCK_SLOTS, phoneDockTargetIds, phoneHomeTargets } from "./shell-phone-home.js?v=home-20260813a";
 
@@ -3054,11 +3053,6 @@ export function bindShellSurfaceDom(options = {}) {
     }
   });
   desktopContextMenu?.addEventListener("keydown", handleContextMenuKeydown);
-  bindSheetHandle(document.querySelector("#launcher-handle"), {
-    sheet: launcher?.querySelector(".launcher-popover"),
-    direction: SHEET_DRAG_DOWN,
-    close: () => hideLauncher(),
-  });
   bindAssistantFace({
     easeDockPillWidth,
     targetById,

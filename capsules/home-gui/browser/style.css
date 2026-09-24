@@ -6048,36 +6048,6 @@ body.assistant-space-active #inbox-rail {
     font-size: 12px;
   }
 
-  /* The Apps face fills the stage: the pill grows from the Dock row to 8 px
-     under the bar (the pill floats --taskbar-offset above the safe area). */
-  :root {
-    --phone-launcher-h: calc(100dvh - var(--stage-top) - 8px - var(--taskbar-h) - var(--taskbar-offset) - env(safe-area-inset-bottom, 0px));
-  }
-
-  .launcher-popover {
-    height: var(--phone-launcher-h);
-    margin-bottom: 0;
-  }
-
-  .launcher-header {
-    padding: 4px 4px 4px 16px;
-  }
-
-  .launcher-header-btn {
-    width: var(--el-touch-target);
-    height: var(--el-touch-target);
-    border-radius: 12px;
-  }
-
-  /* Grid names wrap to two lines instead of cutting off after one. */
-  .launcher[data-view="grid"] .launcher-card-title {
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
   /* Spotlight hangs 8 px under the bar and grows down to the Dock or the
      soft keyboard (--stage-bottom carries both), so no result sits under it. */
   .spotlight {
@@ -6151,11 +6121,6 @@ body.assistant-space-active #inbox-rail {
     position: sticky;
     bottom: 0;
     background: var(--menu-fill);
-  }
-
-  .launcher-handle {
-    height: 20px;
-    cursor: grab;
   }
 
   /* Menus (right-click or long-press) rise as a bottom sheet over a dimmed
@@ -6536,11 +6501,6 @@ body.assistant-space-active #inbox-rail {
     padding-right: 8px;
   }
 
-  .taskbar.is-launcher-face {
-    width: calc(100vw - 20px);
-    max-width: calc(100vw - 20px);
-  }
-
   .taskbar.is-assistant-face {
     width: var(--assistant-face-w, calc(100vw - 20px));
     max-width: calc(100vw - 20px);
@@ -6573,9 +6533,8 @@ body.assistant-space-active #inbox-rail {
     scroll-snap-align: center;
   }
 
-  /* The fixed glyphs keep full tiles; only the scrolling app row gives way
-     when the pill reaches its width limit. */
-  .taskbar-item-launcher,
+  /* The Assistant keeps a full tile; only the app row gives way when the
+     pill reaches its width limit. */
   .taskbar-item-assistant {
     flex-shrink: 0;
   }
@@ -6584,27 +6543,21 @@ body.assistant-space-active #inbox-rail {
     min-width: 0;
   }
 
-  /* Plate-free glyphs (the Apps launcher; the Assistant when it wears its
-     .assistant-mark) fill 58.6% of their square; app plates fill 87.9% of
-     theirs (measured from the 256 px PNGs). 1.5× would match the plates'
-     height exactly, which reads too heavy beside them on a phone; 1.15× keeps
-     the glyphs visibly lighter than the plates. A plate raster in the Assistant slot
-     already fills its square and takes no scale. The launcher glyph is a
-     background (its .taskbar-icon transform is reserved for magnification);
-     the Assistant scales its icon node so the mark's own layer animation is
+  /* The Assistant's plate-free .assistant-mark fills 58.6% of its square;
+     app plates fill 87.9% of theirs (measured from the 256 px PNGs). 1.5×
+     would match the plates' height exactly, which reads too heavy beside them
+     on a phone; 1.15× keeps the mark visibly lighter than the plates. A plate
+     raster in the Assistant slot already fills its square and takes no scale.
+     The Assistant scales its icon node so the mark's own layer animation is
      untouched. */
   :root {
     --phone-dock-glyph-scale: 1.15;
   }
 
-  /* The Apps and Assistant morphs read slightly rushed at desktop's 950 ms
-     when the pill grows into a phone-height sheet. */
+  /* The Assistant morph reads slightly rushed at desktop's 950 ms when the
+     pill grows into a phone-height face. */
   :root {
     --shelf-face-ms: 1100ms;
-  }
-
-  .taskbar-icon-launcher {
-    background-size: calc(var(--phone-dock-glyph-scale) * 100%);
   }
 
   .taskbar-item-assistant .taskbar-item-icon.assistant-mark {
@@ -6650,10 +6603,6 @@ body.assistant-space-active #inbox-rail {
 
   body.phone-dock-peek .phone-dock-scrim {
     display: block;
-  }
-
-  .taskbar.is-launcher-face .launcher {
-    max-height: var(--phone-launcher-h);
   }
 
   .dock-tooltip {

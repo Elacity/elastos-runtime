@@ -1,10 +1,9 @@
 /* Phone sheet grab handles. A sheet that drops from the bar (Control Centre,
-   Notification Centre, Spotlight) closes when its handle is dragged up; the
-   launcher, which grows from the Dock, closes when dragged down. The sheet
+   Notification Centre, Spotlight) closes when its handle is dragged up; a
+   sheet that rises from the bottom would close when dragged down. The sheet
    follows the finger toward dismissal only and snaps back if the drag stops
-   short. On the bar sheets the handle is a button, so a tap, Enter or Space
-   closes too; the launcher's grabber is drag-only because the Dock's Apps
-   button under it already toggles it. Hidden off phone. docs/HOME_MOBILE.md. */
+   short. With `tapCloses` the handle is a button, so a tap, Enter or Space
+   closes too. Hidden off phone. docs/HOME_MOBILE.md. */
 
 // A drag this far toward the sheet's origin dismisses it; shorter snaps back.
 export const SHEET_DISMISS_DRAG_PX = 48;
