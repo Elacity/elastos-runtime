@@ -5911,6 +5911,10 @@ body.assistant-space-active #inbox-rail {
     display: block;
   }
 
+  .control-centre-section.control-centre-quick-open {
+    display: flex;
+  }
+
   /* Status sheets span the phone with the same margin on both sides; a
      300–340 px card hung off the right edge left a ragged strip on the left. */
   .control-centre,
@@ -5919,6 +5923,75 @@ body.assistant-space-active #inbox-rail {
     right: max(8px, env(safe-area-inset-right, 0px));
     width: auto;
     transform-origin: top center;
+  }
+
+  /* Control Centre on the phone: 48 px rows with iOS-size switches, 12 px
+     section labels, 44 px appearance segments, and 44 px hit boxes around
+     28 px accent dots in one sliding row (nine do not fit across a phone). */
+  .control-centre-row {
+    min-height: 48px;
+    font-size: 16px;
+  }
+
+  .control-centre-label {
+    padding-top: 10px;
+    font-size: 12px;
+  }
+
+  .control-centre-segment-option {
+    min-height: var(--el-touch-target);
+    font-size: 14px;
+  }
+
+  .control-centre-switch {
+    width: 51px;
+    height: 31px;
+  }
+
+  .control-centre-switch::after {
+    width: 27px;
+    height: 27px;
+  }
+
+  .control-centre-row[aria-checked="true"] .control-centre-switch::after {
+    transform: translateX(20px);
+  }
+
+  .control-centre-accents {
+    flex-wrap: nowrap;
+    gap: 0;
+    padding: 0 calc(0.85rem - 8px);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .control-centre-accents .control-centre-accent-swatch {
+    flex: 0 0 var(--el-touch-target);
+    width: var(--el-touch-target);
+    height: var(--el-touch-target);
+    border: 8px solid transparent;
+    background-clip: padding-box;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+  }
+
+  .control-centre-accents .control-centre-accent-swatch:hover {
+    transform: none;
+  }
+
+  /* A negative offset draws the ring around the dot, not the hit box. */
+  .control-centre-accents .control-centre-accent-swatch[aria-checked="true"] {
+    outline: 2px solid currentColor;
+    outline-offset: -6px;
+  }
+
+  .control-centre-accents .control-centre-accent-swatch:focus-visible {
+    outline: 2px solid var(--el-accent, #4f7fff);
+    outline-offset: -6px;
+  }
+
+  .control-centre-accent-custom-hex input {
+    min-height: var(--el-touch-target);
+    font-size: 16px;
   }
 
   .launcher-popover {

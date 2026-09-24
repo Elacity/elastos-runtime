@@ -12497,6 +12497,23 @@ assert(
     "Capsule ratchet: the phone smoke fails when an app frame on a phone profile has more targets under 44 px than its pinned row",
   );
 
+  // M4: the shell's own sheets reach 0 targets under 44 px and 0 text under
+  // 12 px on the phone profiles, one sheet per commit.
+  const shellBaseline = phoneSmoke.match(/const BASELINE = \{([\s\S]*?)\n\};/);
+  const phoneBlockStart = homeGuiStyle.indexOf(phoneMediaList);
+  const phoneRule = (rule) => phoneBlockStart !== -1 && homeGuiStyle.indexOf(rule, phoneBlockStart) !== -1;
+  assert(
+    phoneRule("  .control-centre-section.control-centre-quick-open {\n    display: flex;") &&
+      phoneRule("  .control-centre-row {\n    min-height: 48px;\n    font-size: 16px;") &&
+      phoneRule("  .control-centre-label {\n    padding-top: 10px;\n    font-size: 12px;") &&
+      phoneRule("  .control-centre-segment-option {\n    min-height: var(--el-touch-target);") &&
+      phoneRule("  .control-centre-switch {\n    width: 51px;\n    height: 31px;") &&
+      phoneRule("  .control-centre-accents .control-centre-accent-swatch {\n    flex: 0 0 var(--el-touch-target);\n    width: var(--el-touch-target);\n    height: var(--el-touch-target);\n    border: 8px solid transparent;") &&
+      shellBaseline !== null &&
+      (shellBaseline[1].match(/"control-centre": \{ targets: 0, text: 0 \},/g) || []).length === 2,
+    "Control Centre phone sheet: 48 px rows with 51x31 switches, full-width Quick open rows, 12 px section labels, 44 px appearance segments and 44 px hit boxes around the accent dots, held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
+  );
+
   const assistantHarnessCss = read("capsules/assistant/browser/agent-harness.css");
   assert(
     assistantHarnessCss.includes(':root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {\n  height: var(--el-touch-target);') &&
