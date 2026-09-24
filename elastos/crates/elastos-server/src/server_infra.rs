@@ -1033,8 +1033,8 @@ async fn setup_server_infrastructure_impl(
                     let bridge_result =
                         provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
                             .await
-                            .map(|(bridge, sockets, config, listener)| {
-                                (bridge, Some(sockets), config, Some(listener))
+                            .map(|(bridge, sockets, vacant, config, listener)| {
+                                (bridge, Some((sockets, vacant)), config, Some(listener))
                             });
                     #[cfg(target_os = "linux")]
                     let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
@@ -1042,7 +1042,9 @@ async fn setup_server_infrastructure_impl(
                         model_config.clone(),
                     )
                     .await
-                    .map(|(bridge, sockets, config)| (bridge, Some(sockets), config, None::<()>));
+                    .map(|(bridge, sockets, vacant, config)| {
+                        (bridge, Some((sockets, vacant)), config, None::<()>)
+                    });
                     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     let bridge_result =
                         provider::ProviderBridge::spawn(&path, model_config.clone())
@@ -1052,8 +1054,10 @@ async fn setup_server_infrastructure_impl(
                         Ok((bridge, local_sockets, confined_config, hosted_listener)) => {
                             model_config = confined_config;
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
-                            if let Some(sockets) = local_sockets {
-                                provider_registry.set_local_model_sockets(sockets).await;
+                            if let Some((sockets, vacant)) = local_sockets {
+                                provider_registry
+                                    .set_local_model_sockets(sockets, vacant)
+                                    .await;
                                 #[cfg(target_os = "macos")]
                                 if let Some(socket) =
                                     model_config.extra["runtime_hosted_socket"].as_str()

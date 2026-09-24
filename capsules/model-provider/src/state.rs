@@ -26,7 +26,7 @@ pub struct ModelProviderState<A: AdapterExecutor> {
 }
 
 pub(crate) struct ConfigRefresh {
-    config: BridgeProviderConfig,
+    pub(crate) config: BridgeProviderConfig,
     offers: BTreeMap<String, ConfiguredOffer>,
     pub(crate) retire_offer: Option<String>,
 }
@@ -216,11 +216,13 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             let _ = value.remove("offers");
             let _ = value.remove("runtime_admitted_offers");
             let _ = value.remove("owner_reclaim");
+            let _ = value.remove("runtime_local_sockets");
         }
         if let Some(value) = new_identity.as_object_mut() {
             let _ = value.remove("offers");
             let _ = value.remove("runtime_admitted_offers");
             let _ = value.remove("owner_reclaim");
+            let _ = value.remove("runtime_local_sockets");
         }
         if old_identity != new_identity {
             return Err(ProviderFault::invalid_request(
@@ -237,6 +239,17 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .map_err(|_| ProviderFault::invalid_request("invalid model configuration"))?;
         let previous: ProviderInitExtra = serde_json::from_value(self.config.extra.clone())
             .map_err(|_| ProviderFault::internal("stored model configuration unavailable"))?;
+        for (id, socket) in &previous.runtime_local_sockets {
+            if extra
+                .runtime_local_sockets
+                .get(id)
+                .is_some_and(|next| next != socket)
+            {
+                return Err(ProviderFault::invalid_request(
+                    "model Runtime socket identity changed",
+                ));
+            }
+        }
         let old_admissions: BTreeMap<_, _> = previous
             .runtime_admitted_offers
             .iter()

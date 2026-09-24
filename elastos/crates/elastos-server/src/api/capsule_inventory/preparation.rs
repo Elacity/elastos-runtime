@@ -1159,7 +1159,12 @@ async fn activate_admitted_model(
         "model activation stopped"
     );
     registry.refresh_local_model_configuration(&config).await?;
-    set_activation_pending(data_dir, operation, false)
+    complete_admitted_model_startup(data_dir, registry, Some(worker)).await?;
+    ensure!(
+        !load_operation(data_dir, operation)?.activation_pending,
+        "model activation was not confirmed"
+    );
+    Ok(())
 }
 
 async fn preserve_active_model_offers(
@@ -2726,11 +2731,14 @@ pub async fn complete_admitted_model_startup(
     let inventory = Inventory::open(data_dir, false)?;
     let mut state = inventory.load()?;
     let mut ready = BTreeSet::new();
-    for owner in state
-        .records
-        .iter()
-        .filter(|r| r.state == PreparationState::Admitted && r.operation_id == r.admission_id)
-    {
+    for owner in state.records.iter().filter(|r| {
+        r.state == PreparationState::Admitted
+            && r.operation_id == r.admission_id
+            && state
+                .retirement
+                .as_ref()
+                .is_none_or(|retirement| retirement.admission_id != r.admission_id)
+    }) {
         let Some(activation) = &owner.activation else {
             continue;
         };
@@ -5243,6 +5251,11 @@ mod tests {
             assert_eq!(alias.admission_id, record.admission_id);
             assert_eq!(alias.reserved_bytes, 0);
             assert!(!alias.activation_pending);
+            assert!(
+                !load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending
+            );
             assert_eq!(model.calls.lock().unwrap().len(), 1);
             assert_eq!(hashes(), 4); // Reuse admission, then activation composer.
             for expected in [5, 6] {
@@ -5261,6 +5274,32 @@ mod tests {
                     .filter(|op| *op == "cat")
                     .count(),
                 reads
+            );
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut snapshot = inventory.load().unwrap();
+            for entry in &mut snapshot.records {
+                if entry.admission_id == record.admission_id {
+                    entry.activation_pending = true;
+                }
+            }
+            inventory.save(&snapshot).unwrap();
+            drop(inventory);
+            let worker = Inventory::open(root.path(), false)
+                .unwrap()
+                .worker_lock()
+                .unwrap();
+            complete_admitted_model_startup(root.path(), &registry, Some(&worker))
+                .await
+                .unwrap();
+            assert!(
+                !load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending
+            );
+            assert!(
+                !load_operation(root.path(), &alias.operation_id)
+                    .unwrap()
+                    .activation_pending
             );
         }
 
@@ -5347,7 +5386,12 @@ mod tests {
             );
             let offers = calls[0]["config"]["extra"]["offers"].as_array().unwrap();
             assert_eq!(offers.len(), 2);
-            assert_eq!(offers[0], operator);
+            let mut projected_operator = operator.clone();
+            projected_operator["adapter"]
+                .as_object_mut()
+                .unwrap()
+                .remove("bearer_token");
+            assert_eq!(offers[0], projected_operator);
             let projection = &calls[0]["config"]["extra"]["runtime_admitted_offers"];
             let expected = serde_json::json!([{"offer_id":offers[1]["id"]}]);
             assert_eq!(std::fs::read(&config_path).unwrap(), operator_bytes);

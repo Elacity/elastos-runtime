@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use base64::Engine as _;
 use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
@@ -648,7 +648,9 @@ pub struct ProviderRegistry {
     /// Optional Carrier transport for Runtime-mediated provider invocation.
     carrier_invoker: RwLock<Option<Arc<dyn ProviderCarrierInvoker>>>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    local_model_sockets: RwLock<Option<std::collections::BTreeMap<String, String>>>,
+    local_model_sockets: RwLock<Option<LocalModelSocketPool>>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    local_model_refresh: Mutex<()>,
     #[cfg(target_os = "macos")]
     hosted_model_socket: RwLock<Option<String>>,
 }
@@ -669,6 +671,12 @@ enum SubProviderRegistration {
 enum ProviderTargetVisibility {
     CapsuleResource,
     RuntimeOnly,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct LocalModelSocketPool {
+    assigned: std::collections::BTreeMap<String, String>,
+    vacant: Vec<String>,
 }
 
 impl SubProviderRegistration {
@@ -703,6 +711,8 @@ impl ProviderRegistry {
             carrier_invoker: RwLock::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             local_model_sockets: RwLock::new(None),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            local_model_refresh: Mutex::new(()),
             #[cfg(target_os = "macos")]
             hosted_model_socket: RwLock::new(None),
         }
@@ -713,8 +723,12 @@ impl ProviderRegistry {
     pub async fn set_local_model_sockets(
         &self,
         sockets: std::collections::BTreeMap<String, String>,
+        vacant: Vec<String>,
     ) {
-        *self.local_model_sockets.write().await = Some(sockets);
+        *self.local_model_sockets.write().await = Some(LocalModelSocketPool {
+            assigned: sockets,
+            vacant,
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -727,23 +741,50 @@ impl ProviderRegistry {
         &self,
         config: &mut super::BridgeProviderConfig,
     ) -> Result<(), ProviderError> {
-        let sockets = self.local_model_sockets.read().await;
-        let Some(sockets) = sockets.as_ref() else {
+        let pool = self.local_model_sockets.read().await;
+        let Some(pool) = pool.as_ref() else {
             return Ok(());
         };
         let offers = config.extra["offers"]
             .as_array()
             .ok_or_else(|| ProviderError::Provider("model offers unavailable".into()))?;
+        let mut ids = std::collections::BTreeSet::new();
         for offer in offers {
-            if offer["adapter"]["kind"] == "local_llama_cpp_text"
-                && offer["id"]
-                    .as_str()
-                    .is_none_or(|id| !sockets.contains_key(id))
-            {
-                return Err(ProviderError::Provider(
-                    "new local model requires Runtime restart".into(),
-                ));
+            if offer["adapter"]["kind"] == "local_llama_cpp_text" {
+                let id = offer["id"].as_str().ok_or_else(|| {
+                    ProviderError::Provider("local model offer id unavailable".into())
+                })?;
+                if !ids.insert(id.to_string()) {
+                    return Err(ProviderError::Provider(
+                        "duplicate local model offer".into(),
+                    ));
+                }
             }
+        }
+        let mut vacant = pool.vacant.clone();
+        vacant.extend(
+            pool.assigned
+                .iter()
+                .filter(|(id, _)| !ids.contains(*id))
+                .map(|(_, socket)| socket.clone()),
+        );
+        if ids
+            .iter()
+            .filter(|id| !pool.assigned.contains_key(*id))
+            .count()
+            > vacant.len()
+        {
+            return Err(ProviderError::Provider(
+                "local model socket capacity unavailable".into(),
+            ));
+        }
+        let mut sockets = std::collections::BTreeMap::new();
+        for id in ids {
+            let socket = match pool.assigned.get(&id) {
+                Some(socket) => socket.clone(),
+                None => vacant.pop().expect("capacity checked"),
+            };
+            sockets.insert(id, socket);
         }
         config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
         #[cfg(target_os = "macos")]
@@ -1240,6 +1281,14 @@ impl ProviderRegistry {
         config: &super::BridgeProviderConfig,
     ) -> Result<(), ProviderError> {
         let unavailable = || ProviderError::Provider("model activation pending".into());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let _refresh = self.local_model_refresh.lock().await;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let config = {
+            let mut config = config.clone();
+            self.apply_local_model_sockets(&mut config).await?;
+            config
+        };
         // Retain registration ownership through dispatch; unregister cannot
         // replace this slot while its configuration request is in flight.
         let slots = self.sub_providers.read().await;
@@ -1283,6 +1332,27 @@ impl ProviderRegistry {
             || data["offers_ready"].as_u64().is_none_or(|n| n > 64)
         {
             return Err(unavailable());
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut pool = self.local_model_sockets.write().await;
+            if let Some(pool) = pool.as_mut() {
+                let sockets: std::collections::BTreeMap<String, String> =
+                    serde_json::from_value(config.extra["runtime_local_sockets"].clone())
+                        .map_err(|_| unavailable())?;
+                let used = sockets
+                    .values()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let all = pool
+                    .assigned
+                    .values()
+                    .chain(pool.vacant.iter())
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                pool.vacant = all.difference(&used).cloned().collect();
+                pool.assigned = sockets;
+            }
         }
         Ok(())
     }
@@ -2497,15 +2567,18 @@ impl ProviderRegistry {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
-    async fn confined_model_refresh_keeps_sockets_and_requires_restart_for_new_local_offer() {
+    async fn confined_model_refresh_assigns_predeclared_socket_to_new_local_offer() {
         let registry = ProviderRegistry::new();
         registry
-            .set_local_model_sockets(std::collections::BTreeMap::from([(
-                "local-a".to_string(),
-                "/tmp/elastos-model-fixture.sock".to_string(),
-            )]))
+            .set_local_model_sockets(
+                std::collections::BTreeMap::from([(
+                    "local-a".to_string(),
+                    "/tmp/elastos-model-fixture.sock".to_string(),
+                )]),
+                vec!["/tmp/elastos-model-spare.sock".to_string()],
+            )
             .await;
         let mut config = super::super::BridgeProviderConfig {
             extra: serde_json::json!({"offers":[
@@ -2526,10 +2599,66 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"id":"local-b","adapter":{"kind":"local_llama_cpp_text"}}));
+        registry
+            .apply_local_model_sockets(&mut config)
+            .await
+            .unwrap();
+        assert_eq!(
+            config.extra["runtime_local_sockets"]["local-b"],
+            "/tmp/elastos-model-spare.sock"
+        );
+        let first = config.extra["runtime_local_sockets"].clone();
+        registry
+            .apply_local_model_sockets(&mut config)
+            .await
+            .unwrap();
+        assert_eq!(config.extra["runtime_local_sockets"], first);
+        config.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"local-c","adapter":{"kind":"local_llama_cpp_text"}}));
         assert!(registry
             .apply_local_model_sockets(&mut config)
             .await
             .is_err());
+        config.extra["offers"].as_array_mut().unwrap().pop();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        *provider.response.lock().await =
+            Some(serde_json::json!({"status":"error", "message":"init refused"}));
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        assert!(registry
+            .refresh_local_model_configuration(&config)
+            .await
+            .is_err());
+        let pool = registry.local_model_sockets.read().await;
+        assert_eq!(pool.as_ref().unwrap().assigned.len(), 1);
+        assert_eq!(pool.as_ref().unwrap().vacant.len(), 1);
+        drop(pool);
+        *provider.response.lock().await = Some(serde_json::json!({"status":"ok", "data":{
+            "provider":"model-provider", "protocol_version":"elastos.model-provider/v1", "offers_ready":2
+        }}));
+        registry
+            .refresh_local_model_configuration(&config)
+            .await
+            .unwrap();
+        let pool = registry.local_model_sockets.read().await;
+        assert_eq!(pool.as_ref().unwrap().assigned.len(), 2);
+        assert!(pool.as_ref().unwrap().vacant.is_empty());
+        drop(pool);
+        config.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|offer| offer["id"] == "local-a" || offer["id"] == "hosted");
+        registry
+            .refresh_local_model_configuration(&config)
+            .await
+            .unwrap();
+        let pool = registry.local_model_sockets.read().await;
+        assert_eq!(pool.as_ref().unwrap().assigned.len(), 1);
+        assert_eq!(pool.as_ref().unwrap().vacant.len(), 1);
     }
     use std::time::Duration;
     use tokio::sync::{Mutex, Notify};

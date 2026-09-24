@@ -781,7 +781,7 @@ fn operator_hosted_end_path(data_dir: &Path) -> PathBuf {
 fn operator_hosted_ended(data_dir: &Path) -> bool {
     match std::fs::symlink_metadata(operator_hosted_end_path(data_dir)) {
         Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
 }
@@ -898,32 +898,30 @@ pub(crate) fn operator_hosted_offer_ready(data_dir: &Path, offer_id: &str) -> bo
         .and_then(|offers| {
             offers.into_iter().find(|offer| {
                 let adapter = &offer["adapter"];
-                let configured = match (
-                    offer["operation"].as_str(),
-                    adapter["kind"].as_str(),
-                    adapter["hosted"]["backend_provider_label"].as_str(),
-                    adapter["api_url"].as_str(),
-                ) {
+                let configured = matches!(
+                    (
+                        offer["operation"].as_str(),
+                        adapter["kind"].as_str(),
+                        adapter["hosted"]["backend_provider_label"].as_str(),
+                        adapter["api_url"].as_str(),
+                    ),
                     (
                         Some("text.generate"),
                         Some("open_ai_compatible_text"),
                         Some("OpenRouter"),
                         Some(OPENROUTER_CHAT_URL),
-                    ) => true,
-                    (
+                    ) | (
                         Some("text.generate"),
                         Some("open_ai_compatible_text"),
                         Some("Venice"),
                         Some(VENICE_CHAT_URL),
-                    ) => true,
-                    (
+                    ) | (
                         Some("decision.evaluate"),
                         Some("open_router_decisions"),
                         Some("OpenRouter"),
                         Some(OPENROUTER_DECISIONS_URL),
-                    ) => true,
-                    _ => false,
-                };
+                    )
+                );
                 offer["id"] == offer_id && offer["enabled"] != false && configured
             })
         })

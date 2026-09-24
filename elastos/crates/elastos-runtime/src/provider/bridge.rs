@@ -35,6 +35,8 @@ const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Timeout for provider shutdown (5 seconds)
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_LOCAL_MODEL_SLOTS: usize = 64;
 #[cfg(target_os = "macos")]
 const HOSTED_RUN_BINDING_TTL: std::time::Duration = std::time::Duration::from_secs(7200);
 #[cfg(target_os = "macos")]
@@ -288,6 +290,7 @@ impl ProviderBridge {
         (
             Self,
             BTreeMap<String, String>,
+            Vec<String>,
             ProviderConfig,
             tokio::net::UnixListener,
         ),
@@ -299,6 +302,7 @@ impl ProviderBridge {
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| BridgeError::InitFailed("model offers unavailable".into()))?;
         let mut sockets = BTreeMap::new();
+        let mut vacant_sockets = Vec::new();
         let mut brokers = BrokerTasks::default();
         let provider_pid = Arc::new(AtomicU32::new(0));
         let provider_birth = Arc::new(AtomicU64::new(0));
@@ -309,19 +313,27 @@ impl ProviderBridge {
         // Seatbelt resolves /var to /private/var before comparing literal paths.
         let ipc_path = std::fs::canonicalize(ipc_dir.path()).map_err(BridgeError::Spawn)?;
         let mut policy = String::from("(version 1)\n(allow default)\n(deny network-outbound)\n");
-        for offer in offers {
-            if offer
-                .pointer("/adapter/kind")
-                .and_then(serde_json::Value::as_str)
-                != Some("local_llama_cpp_text")
-            {
-                continue;
-            }
-            let id = offer
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))?;
-            let index = sockets.len();
+        let local_ids = offers
+            .iter()
+            .filter(|offer| {
+                offer
+                    .pointer("/adapter/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("local_llama_cpp_text")
+            })
+            .map(|offer| {
+                offer
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if local_ids.len() > MAX_LOCAL_MODEL_SLOTS {
+            return Err(BridgeError::InitFailed(
+                "too many local model offers".into(),
+            ));
+        }
+        for index in 0..MAX_LOCAL_MODEL_SLOTS {
             let socket = ipc_path.join(format!("{index}.sock"));
             let engine_socket = ipc_path.join(format!("{index}.engine.sock"));
             let socket = socket
@@ -341,8 +353,12 @@ impl ProviderBridge {
                     "engine socket path too long".into(),
                 ));
             }
-            if sockets.insert(id.to_string(), socket.clone()).is_some() {
-                return Err(BridgeError::InitFailed("duplicate local offer id".into()));
+            if let Some(id) = local_ids.get(index) {
+                if sockets.insert((*id).to_string(), socket.clone()).is_some() {
+                    return Err(BridgeError::InitFailed("duplicate local offer id".into()));
+                }
+            } else {
+                vacant_sockets.push(socket.clone());
             }
             policy.push_str(&format!(
                 "(allow network-outbound (literal \"{socket}\"))\n"
@@ -409,7 +425,7 @@ impl ProviderBridge {
         *bridge._local_brokers.lock().await = brokers;
         bridge._local_provider_pid = provider_pid;
         bridge._local_provider_birth = provider_birth;
-        Ok((bridge, sockets, config, hosted_listener))
+        Ok((bridge, sockets, vacant_sockets, config, hosted_listener))
     }
 
     /// Start a Linux model provider with private local Unix routes and a
@@ -418,7 +434,7 @@ impl ProviderBridge {
     pub async fn spawn_confined_model_linux(
         binary_path: &Path,
         mut config: ProviderConfig,
-    ) -> Result<(Self, BTreeMap<String, String>, ProviderConfig), BridgeError> {
+    ) -> Result<(Self, BTreeMap<String, String>, Vec<String>, ProviderConfig), BridgeError> {
         let offers = config
             .extra
             .get("offers")
@@ -430,22 +446,31 @@ impl ProviderBridge {
             .map_err(BridgeError::Spawn)?;
         let ipc_path = std::fs::canonicalize(ipc_dir.path()).map_err(BridgeError::Spawn)?;
         let mut sockets = BTreeMap::new();
+        let mut vacant_sockets = Vec::new();
         let mut brokers = BrokerTasks::default();
         let provider_pid = Arc::new(AtomicU32::new(0));
         let provider_birth = Arc::new(AtomicU64::new(0));
-        for offer in offers {
-            if offer
-                .pointer("/adapter/kind")
-                .and_then(serde_json::Value::as_str)
-                != Some("local_llama_cpp_text")
-            {
-                continue;
-            }
-            let id = offer
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))?;
-            let index = sockets.len();
+        let local_ids = offers
+            .iter()
+            .filter(|offer| {
+                offer
+                    .pointer("/adapter/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("local_llama_cpp_text")
+            })
+            .map(|offer| {
+                offer
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| BridgeError::InitFailed("local offer id unavailable".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if local_ids.len() > MAX_LOCAL_MODEL_SLOTS {
+            return Err(BridgeError::InitFailed(
+                "too many local model offers".into(),
+            ));
+        }
+        for index in 0..MAX_LOCAL_MODEL_SLOTS {
             let socket = ipc_path.join(format!("{index}.sock"));
             let engine_socket = ipc_path.join(format!("{index}.engine.sock"));
             let socket = socket
@@ -455,8 +480,12 @@ impl ProviderBridge {
             if socket.len() >= 104 || engine_socket.as_os_str().len() >= 104 {
                 return Err(BridgeError::InitFailed("local socket path too long".into()));
             }
-            if sockets.insert(id.to_string(), socket.clone()).is_some() {
-                return Err(BridgeError::InitFailed("duplicate local offer id".into()));
+            if let Some(id) = local_ids.get(index) {
+                if sockets.insert((*id).to_string(), socket.clone()).is_some() {
+                    return Err(BridgeError::InitFailed("duplicate local offer id".into()));
+                }
+            } else {
+                vacant_sockets.push(socket.clone());
             }
             brokers.0.push(
                 super::local_model_broker::start(
@@ -501,7 +530,7 @@ impl ProviderBridge {
         *bridge._local_brokers.lock().await = brokers;
         bridge._local_provider_pid = provider_pid;
         bridge._local_provider_birth = provider_birth;
-        Ok((bridge, sockets, config))
+        Ok((bridge, sockets, vacant_sockets, config))
     }
 
     #[cfg(target_os = "macos")]
@@ -2075,7 +2104,7 @@ for line in sys.stdin:
             }),
             ..Default::default()
         };
-        let (bridge, sockets, confined_config, _hosted_listener) =
+        let (bridge, sockets, vacant, confined_config, _hosted_listener) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
                 .unwrap();
@@ -2083,6 +2112,7 @@ for line in sys.stdin:
             confined_config.extra["runtime_local_sockets"]["fixture-local"],
             sockets["fixture-local"]
         );
+        assert_eq!(vacant.len(), MAX_LOCAL_MODEL_SLOTS - 1);
         let response = bridge
             .request(ProviderRequest::Exists {
                 path: "network-probe".into(),
@@ -2119,12 +2149,12 @@ for line in sys.stdin:
             serde_json::from_value(fixture["provider_config"].clone()).unwrap();
         let offer_id = fixture["offer_id"].as_str().unwrap();
         #[cfg(target_os = "macos")]
-        let (bridge, sockets, _, _hosted_listener) =
+        let (bridge, sockets, _, _, _hosted_listener) =
             ProviderBridge::spawn_confined_model(binary, config)
                 .await
                 .unwrap();
         #[cfg(target_os = "linux")]
-        let (bridge, sockets, _) = ProviderBridge::spawn_confined_model_linux(binary, config)
+        let (bridge, sockets, _, _) = ProviderBridge::spawn_confined_model_linux(binary, config)
             .await
             .unwrap();
         let socket = sockets[offer_id].clone();

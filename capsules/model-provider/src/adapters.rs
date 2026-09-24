@@ -601,6 +601,10 @@ impl LiveAdapterExecutor {
         self.local_llama.close_offer(offer_id).await
     }
 
+    pub(crate) async fn update_local_model_sockets(&self, sockets: BTreeMap<String, String>) {
+        self.local_llama.update_runtime_sockets(sockets).await;
+    }
+
     #[cfg(test)]
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
         Self::new_with_local_sockets(runtime, updates, BTreeMap::new())

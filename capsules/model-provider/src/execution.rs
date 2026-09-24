@@ -143,6 +143,11 @@ impl ProviderCoordinator {
                     let execution_owned = provider.adapters().retains_execution().await;
                     let workers = provider.adapters().retained_worker_ids();
                     let refresh = provider.plan_refresh(init.config, execution_owned, &workers)?;
+                    let runtime_sockets =
+                        serde_json::from_value::<ProviderInitExtra>(refresh.config.extra.clone())
+                            .map_err(|_| {
+                            ProviderFault::invalid_request("invalid model provider init config")
+                        })?;
                     provider.begin_retirement(&refresh);
                     if let Some(id) = &refresh.retire_offer {
                         provider
@@ -155,6 +160,10 @@ impl ProviderCoordinator {
                                 )
                             })?;
                     }
+                    provider
+                        .adapters()
+                        .update_local_model_sockets(runtime_sockets.runtime_local_sockets)
+                        .await;
                     provider.apply_refresh(refresh);
                     return self.status_response();
                 }
@@ -920,6 +929,39 @@ mod tests {
             json!({"op":"offers_list"}),
         );
         assert_eq!(actual["data"]["offers"].as_array().unwrap().len(), 2);
+        provider.shutdown_on_eof();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_refresh_accepts_new_runtime_socket_for_local_offer() {
+        let root = temp_root("refresh-local-socket");
+        let (offer, _, root) = local_llama_offer(&root, "healthy");
+        let mut provider = ProviderCoordinatorHandle::start();
+        init_provider(&provider, &root, vec![]);
+        let mut added = init_request(&root, vec![offer.clone()]);
+        added.value["config"]["extra"]["runtime_local_sockets"] =
+            json!({offer.id.clone(): "/tmp/model-broker.sock"});
+        let response = provider.request(added).unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["data"]["offers_ready"], 1);
+        assert_eq!(
+            send_request(
+                &provider,
+                ProviderOperation::OffersList,
+                json!({"op":"offers_list"})
+            )["data"]["offers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut changed_request = init_request(&root, vec![offer.clone()]);
+        changed_request.value["config"]["extra"]["runtime_local_sockets"] =
+            json!({offer.id: "/tmp/other-broker.sock"});
+        let changed = provider.request(changed_request).unwrap();
+        assert_eq!(changed["status"], "error");
+        assert_eq!(changed["message"], "model Runtime socket identity changed");
         provider.shutdown_on_eof();
     }
 

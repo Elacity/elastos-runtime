@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(test))]
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -33,7 +33,7 @@ pub(crate) enum LocalLlamaFault {
 #[derive(Clone, Default)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
-    runtime_sockets: Arc<BTreeMap<String, String>>,
+    runtime_sockets: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +75,12 @@ impl LocalLlamaEngines {
     pub(crate) fn with_runtime_sockets(sockets: BTreeMap<String, String>) -> Self {
         Self {
             engines: Arc::new(Mutex::new(BTreeMap::new())),
-            runtime_sockets: Arc::new(sockets),
+            runtime_sockets: Arc::new(RwLock::new(sockets)),
         }
+    }
+
+    pub(crate) async fn update_runtime_sockets(&self, sockets: BTreeMap<String, String>) {
+        *self.runtime_sockets.write().await = sockets;
     }
 
     pub(crate) async fn retains_artifacts(&self) -> bool {
@@ -126,13 +130,11 @@ impl LocalLlamaEngines {
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
-        let (target, broker_socket) = if self.runtime_sockets.is_empty() {
+        let sockets = self.runtime_sockets.read().await;
+        let (target, broker_socket) = if sockets.is_empty() {
             (EngineTarget::Tcp(reserve_loopback_port()?), None)
         } else {
-            let broker = self
-                .runtime_sockets
-                .get(offer_id)
-                .ok_or(LocalLlamaFault::Failed)?;
+            let broker = sockets.get(offer_id).ok_or(LocalLlamaFault::Failed)?;
             let prefix = broker
                 .strip_suffix(".sock")
                 .ok_or(LocalLlamaFault::Failed)?;
@@ -141,6 +143,7 @@ impl LocalLlamaEngines {
                 Some(broker.clone()),
             )
         };
+        drop(sockets);
         if let EngineTarget::Unix(path) = &target {
             remove_stale_engine_socket(path)?;
         }
