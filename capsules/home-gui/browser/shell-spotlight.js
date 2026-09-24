@@ -218,9 +218,19 @@ function renderResults() {
     detail.className = "spotlight-detail";
     detail.textContent = item.detail;
     row.append(glyph, title, detail);
+    let pressedBy = "";
     row.addEventListener("pointerdown", (event) => {
       event.preventDefault();
-      activateResult(index);
+      pressedBy = event.pointerType;
+      // A finger landing on a row may be starting a scroll; touch opens on click.
+      if (pressedBy !== "touch") {
+        activateResult(index);
+      }
+    });
+    row.addEventListener("click", () => {
+      if (pressedBy === "touch") {
+        activateResult(index);
+      }
     });
     row.addEventListener("pointerenter", () => {
       setSelection(index);
