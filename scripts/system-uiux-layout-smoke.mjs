@@ -345,6 +345,8 @@ async function assertPhoneTitleRow(page, screenshotPath) {
       titleCenter: Math.round(title.top + title.height / 2),
       titleLeft: Math.round(title.left),
       toggleRight: Math.round(toggle.right),
+      sharedIcon: getComputedStyle(document.querySelector(".sidebar-toggle"), "::before").maskImage !== "none",
+      hamburgerHidden: getComputedStyle(document.querySelector(".sidebar-toggle-button")).display === "none",
     };
   });
   await frame.locator("body").screenshot({ path: screenshotPath });
@@ -356,6 +358,11 @@ async function assertPhoneTitleRow(page, screenshotPath) {
   assert(
     Math.abs(row.toggleCenter - row.titleCenter) <= 2 && row.titleLeft >= row.toggleRight - 6,
     "System phone menu button must share the page title's line",
+    row,
+  );
+  assert(
+    row.sharedIcon && row.hamburgerHidden,
+    "System phone menu button must draw the shared drawer icon, as the other capsules do",
     row,
   );
   await assertPhoneDrawer(page, frame, {

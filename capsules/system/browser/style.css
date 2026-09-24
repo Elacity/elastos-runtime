@@ -1891,26 +1891,14 @@ code {
 }
 
 :root[data-el-form-factor="phone"] .sidebar-toggle {
-  display: block !important;
+  display: inline-grid !important;
   left: max(4px, env(safe-area-inset-left, 0px));
   top: 4px;
-  width: var(--system-phone-menu);
-  height: var(--system-phone-menu);
-  padding: 0;
-  border-radius: 12px;
 }
 
+/* The shared drawer toggle draws the sidebar icon every other capsule uses. */
 :root[data-el-form-factor="phone"] .sidebar-toggle .sidebar-toggle-button {
-  margin: 0 auto;
-}
-
-:root[data-el-form-factor="phone"] .sidebar-toggle:active {
-  background: var(--el-lift);
-}
-
-:root[data-el-form-factor="phone"] .sidebar-toggle:focus-visible {
-  outline: 2px solid var(--el-focus);
-  outline-offset: -2px;
+  display: none;
 }
 
 :root[data-el-form-factor="phone"] .settings-sidebar {

@@ -12598,7 +12598,10 @@ assert(
 
   assert(
     systemStyle.includes(":root[data-el-form-factor=\"phone\"] .settings-content h1,\n:root[data-el-form-factor=\"phone\"] .settings-content h1.pc2-section-title {\n  min-height: var(--system-phone-title-line);\n  margin-left: calc(var(--system-phone-menu) - 8px);") &&
-      systemStyle.includes(":root[data-el-form-factor=\"phone\"] .sidebar-toggle {\n  display: block !important;") &&
+      systemStyle.includes(":root[data-el-form-factor=\"phone\"] .sidebar-toggle {\n  display: inline-grid !important;") &&
+      systemStyle.includes(":root[data-el-form-factor=\"phone\"] .sidebar-toggle .sidebar-toggle-button {\n  display: none;") &&
+      system.includes('<button class="sidebar-toggle el-drawer-toggle hidden-lg hidden-xl hidden-md" type="button"') &&
+      read("scripts/system-uiux-layout-smoke.mjs").includes('"System phone menu button must draw the shared drawer icon, as the other capsules do",') &&
       systemStyle.includes(":root[data-el-form-factor=\"phone\"] .settings-sidebar {\n  display: flex;") &&
       system.includes('<script src="./elastos-drawer.js"></script>') &&
       system.includes('<aside id="system-sidebar" class="settings-sidebar disable-user-select disable-context-menu" aria-label="System sections" data-el-drawer>') &&
@@ -12609,7 +12612,7 @@ assert(
       read("scripts/system-uiux-layout-smoke.mjs").includes('"System phone menu button must share the page title\'s line",') &&
       read("scripts/system-uiux-layout-smoke.mjs").includes('    drawer: "#system-sidebar",') &&
       justfile.includes("node scripts/system-uiux-layout-smoke.mjs"),
-    "System phone: the menu button sits on the leading edge on the page title's line at every phone width and leads the shared push drawer (every section closes it; System's own overlay toggle stands down on phone), asserted by the UI/UX smoke in the browser lane",
+    "System phone: the menu button (the shared drawer icon, as in every other capsule) sits on the leading edge on the page title's line at every phone width and leads the shared push drawer (every section closes it; System's own overlay toggle stands down on phone), asserted by the UI/UX smoke in the browser lane",
   );
 
   assert(
