@@ -251,6 +251,39 @@ would be; no `image-set()` variant.
   (Chromium) or nothing pushed (WebKit), the Home frame alive either way, and
   rotation to landscape and back with the window still filling the stage.
 
+## Sheets (M4)
+
+- Launcher: the Apps face grows from the Dock row to 8 px under the bar
+  (`--phone-launcher-h`), grid names wrap to two lines and the grid/list
+  toggle is 44 px. It is browse-only: opening never focuses a field, so the
+  keyboard does not jump up; typed search is Spotlight's.
+- Spotlight hangs 8 px under the bar and grows only to the Dock or the soft
+  keyboard (`--stage-bottom` carries `--keyboard-inset`). Result rows are
+  48 px with 16 px names and 12 px section headings. A finger landing on a
+  row opens it on click, not on press, so scrolling the results never
+  launches an app; a mouse still opens on press.
+- Control Centre: 48 px rows, 12 px labels, 51 × 31 switches, 44 px segment
+  options and accent swatches (the swatch paints 28 px inside a transparent
+  border), Quick open shown.
+- Notification Centre: calendar weekdays 12 px, days 34 px at 15 px,
+  section heading and times 12 px, Clear history a 44 px target.
+- Reduced motion stops the launcher's opening fade, blur and scale as well
+  as its height change.
+
+The smoke types a query to measure Spotlight's rows (`spotlight-results`)
+and, on portrait, raises the host keyboard inset to check the panel ends
+above it.
+
+### After M4 (sheets), 2026-09-24
+
+Identical in Chromium and WebKit on the phone profiles; every shell surface
+is gated at these numbers.
+
+| Surface | Portrait targets < 44 / text < 12 | Landscape |
+| --- | --- | --- |
+| desktop, launcher, Spotlight (empty and with results), Control Centre, Notification Centre, Mission Control, Assistant face | 0 / 0 | 0 / 0 |
+| any window | 1 / 0 (the 24 px Dock handle) | 1 / 0 |
+
 ### After M2–M3 (bar, Dock, title bar), 2026-09-23
 
 Identical in Chromium and WebKit. The only remaining window target is the
