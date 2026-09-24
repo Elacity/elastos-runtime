@@ -1737,15 +1737,27 @@
       flex: 0 0 auto;
     }
 
+    /* Each segment is a full 44 px target with its pill painted inside the
+       padding; drop-shadow follows the painted pill where box-shadow would
+       ring the whole target. */
     :root[data-el-form-factor="phone"] .window-navbar-layout-toggle {
-      margin: 0 2px;
-      border-radius: 10px;
+      margin: 0;
+      padding: 0;
+      gap: 0;
+      border-radius: 12px;
     }
 
     :root[data-el-form-factor="phone"] .layout-toggle-segment {
-      width: 38px;
-      height: 36px;
-      border-radius: 8px;
+      width: var(--el-touch-target);
+      height: var(--el-touch-target);
+      padding: 4px;
+      border-radius: 12px;
+      background-clip: content-box;
+    }
+
+    :root[data-el-form-factor="phone"] .layout-toggle-segment-active {
+      box-shadow: none;
+      filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.24));
     }
 
     :root[data-el-form-factor="phone"] .shell[data-search-open="true"] .toolbar-left,

@@ -447,7 +447,7 @@ async function run() {
       const rect = (node) => node.getBoundingClientRect();
       const places = document.getElementById("places");
       const chips = [...places.querySelectorAll(".place")].map(rect);
-      const controls = [...document.querySelectorAll(".toolbar .navbar-btn")]
+      const controls = [...document.querySelectorAll(".toolbar .navbar-btn, .toolbar .layout-toggle-segment")]
         .filter((node) => getComputedStyle(node).display !== "none")
         .map((node) => ({ id: node.id, width: Math.round(rect(node).width), height: Math.round(rect(node).height) }));
       return {
