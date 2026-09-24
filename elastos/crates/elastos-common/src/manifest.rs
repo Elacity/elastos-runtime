@@ -741,7 +741,7 @@ impl ProviderCapabilitySchema {
         for action in &self.actions {
             if !matches!(
                 action.as_str(),
-                "read" | "write" | "execute" | "delete" | "message" | "admin"
+                "read" | "write" | "execute" | "delete" | "message" | "admin" | "buy"
             ) {
                 return Err(format!(
                     "unsupported provider authority action \"{}\"",

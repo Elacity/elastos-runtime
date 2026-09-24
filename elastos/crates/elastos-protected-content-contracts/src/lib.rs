@@ -5,6 +5,7 @@
 //! content keys, or expose capsule workflows.
 
 mod canonical;
+mod creator_mint_wire;
 mod custody_envelope;
 mod custody_epoch;
 mod custody_pool;
@@ -28,6 +29,12 @@ mod authority_tests;
 mod test_support;
 
 pub use canonical::{CanonicalContract, ContractError};
+pub use creator_mint_wire::{
+    ProtectedContentCreatorMintSourceV1, ProtectedContentCreatorMintV1,
+    ProtectedContentMintReceiptV1, ProtectedContentPayTokenV1,
+    PROTECTED_CONTENT_CREATOR_MINT_SCHEMA_V1, PROTECTED_CONTENT_CREATOR_MINT_SOURCE_SCHEMA_V1,
+    PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA_V1,
+};
 pub use custody_envelope::{
     CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, NodeCustodyPublicKeyV1,
     PqHybridSealedShareV1, ShareCoordinateV1, CONTENT_KEY_COMMITMENT_DOMAIN_V1,

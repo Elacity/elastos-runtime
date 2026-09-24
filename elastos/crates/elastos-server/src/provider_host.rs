@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use elastos_runtime::provider::ProviderRegistry;
+use elastos_runtime::provider::{
+    ProviderInvocation, ProviderInvocationTransport, ProviderRegistry, ProviderTransfer,
+};
 
 use crate::server_infra;
 
@@ -160,7 +162,7 @@ impl ProviderPlane {
                 .await
             }
             ProviderPlane::Ipfs => {
-                server_infra::register_ipfs_provider_plane(registry, binary_path).await
+                server_infra::register_ipfs_provider_plane(registry, binary_path, data_dir).await
             }
             ProviderPlane::Chain => {
                 server_infra::register_chain_provider_plane(registry, binary_path, data_dir).await
@@ -244,6 +246,12 @@ impl ProviderHostPlan {
             .iter()
             .map(|hosted| hosted.plane.provider_name())
             .collect()
+    }
+
+    fn hosts_ipfs_plane(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|hosted| hosted.plane == ProviderPlane::Ipfs)
     }
 
     fn ready_receipt_path(&self) -> PathBuf {
@@ -396,12 +404,19 @@ pub(crate) async fn compose(plan: &ProviderHostPlan) -> anyhow::Result<ProviderH
         "provider host plane registered"
     );
 
+    let ipfs_identity = if plan.hosts_ipfs_plane() {
+        ensure_ipfs_started(&registry).await
+    } else {
+        None
+    };
+
     let receipt_path = plan.ready_receipt_path();
     write_ready_receipt(
         &receipt_path,
         &did,
         &carrier_bound.to_string(),
         &plan.provider_names(),
+        ipfs_identity.as_ref(),
     )?;
 
     Ok(ProviderHost {
@@ -444,12 +459,104 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
         .context("failed to await SIGINT")
 }
 
+/// Bring this host's kubo up and report its libp2p identity for the receipt.
+///
+/// Deliberately two things at once.
+///
+/// The receipt half: the deployment has no other way to learn a node's kubo
+/// peer id, and it needs every node's id to build the other nodes' peering
+/// lists (`ipfs-peering.json`, and `node peer add --ipfs-peer-id`).
+///
+/// The eager-start half: kubo is otherwise started lazily, on first use. A
+/// protected-content mint publishes a fresh CID and immediately requires
+/// remote replicas to pin it — but a kubo spawned seconds earlier has no DHT
+/// provider record out yet and no peer that has ever met it, so the remote
+/// pin hangs instead of resolving. Peering only protects connections that
+/// exist, so the connections have to exist before the first publish, not
+/// after it. Calling `ensure_started` here moves kubo's cold start to
+/// provider-host startup, minutes ahead of any mint.
+///
+/// Non-fatal by design: a node with no working kubo is still a usable custody
+/// committee member, and failing the whole host here would take its custody
+/// and chain planes down with it. The receipt then simply carries no `ipfs`
+/// block, which the deployment reads as "this node contributes no peer id".
+async fn ensure_ipfs_started(registry: &Arc<ProviderRegistry>) -> Option<serde_json::Value> {
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "provider-host".to_string(),
+            target: "ipfs".to_string(),
+            op: "ensure_started".to_string(),
+            request: serde_json::json!({ "op": "ensure_started" }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await;
+
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(
+                "ipfs plane did not start eagerly; this node publishes no kubo peer id and its \
+                 first content operation pays the kubo cold start: {err}"
+            );
+            return None;
+        }
+    };
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        tracing::warn!(
+            code = response
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            "ipfs plane refused ensure_started; this node publishes no kubo peer id: {}",
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no message")
+        );
+        return None;
+    }
+
+    // `ensure_started` never reports success with a null identity, so an
+    // absent peer id here is protocol drift rather than a cold daemon.
+    let data = response.get("data");
+    let peer_id = data
+        .and_then(|data| data.get("peer_id"))
+        .and_then(serde_json::Value::as_str);
+    let Some(peer_id) = peer_id.filter(|peer_id| !peer_id.is_empty()) else {
+        tracing::warn!(
+            "ipfs plane reported ready without a peer id; omitting the receipt's ipfs block"
+        );
+        return None;
+    };
+    let swarm_addrs = data
+        .and_then(|data| data.get("swarm_addrs"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+
+    tracing::info!(
+        peer_id = %peer_id,
+        "ipfs plane started eagerly; kubo identity published in the readiness receipt"
+    );
+    Some(serde_json::json!({
+        "peer_id": peer_id,
+        "swarm_addrs": swarm_addrs,
+    }))
+}
+
 /// Publish the owner-only readiness receipt peers' operators poll for.
+///
+/// `ipfs` is additive: everything that reads this file keys off `did`,
+/// `carrier_bound` and the exact `providers` array, so a node whose kubo did
+/// not come up writes the same receipt it always did, one key shorter.
 fn write_ready_receipt(
     path: &Path,
     did: &str,
     carrier_bound: &str,
     providers: &[&'static str],
+    ipfs: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!("provider host readiness receipt has no parent directory")
@@ -459,12 +566,18 @@ fn write_ready_receipt(
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to restrict {}", parent.display()))?;
 
-    let receipt = serde_json::json!({
+    let mut receipt = serde_json::json!({
         "did": did,
         "carrier_bound": carrier_bound,
         "providers": providers,
         "started_at": elastos_server::auth::now_ts(),
     });
+    if let Some(ipfs) = ipfs {
+        receipt
+            .as_object_mut()
+            .expect("the receipt is built as a JSON object")
+            .insert("ipfs".to_string(), ipfs.clone());
+    }
     let bytes = serde_json::to_vec_pretty(&receipt)
         .context("failed to encode provider host readiness receipt")?;
 
@@ -553,12 +666,20 @@ mod tests {
     fn the_ready_receipt_is_owner_only_and_overwrites_a_stale_one() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(READY_RECEIPT_RELATIVE_PATH);
-        write_ready_receipt(&path, "did:key:zStale", "0.0.0.0:4433", &["ipfs-provider"]).unwrap();
+        write_ready_receipt(
+            &path,
+            "did:key:zStale",
+            "0.0.0.0:4433",
+            &["ipfs-provider"],
+            None,
+        )
+        .unwrap();
         write_ready_receipt(
             &path,
             "did:key:zFresh",
             "0.0.0.0:4433",
             &["custody-provider", "ipfs-provider"],
+            None,
         )
         .unwrap();
 
@@ -569,6 +690,8 @@ mod tests {
             receipt["providers"],
             serde_json::json!(["custody-provider", "ipfs-provider"])
         );
+        // A node whose kubo did not come up writes the receipt it always did.
+        assert!(receipt.get("ipfs").is_none(), "{receipt}");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -581,5 +704,66 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn the_kubo_identity_is_additive_and_leaves_the_providers_array_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(READY_RECEIPT_RELATIVE_PATH);
+        write_ready_receipt(
+            &path,
+            "did:key:zNode",
+            "0.0.0.0:4433",
+            &["custody-provider", "ipfs-provider"],
+            Some(&serde_json::json!({
+                "peer_id": "12D3KooWExample",
+                "swarm_addrs": ["/ip4/172.18.0.2/tcp/4001/p2p/12D3KooWExample"],
+            })),
+        )
+        .unwrap();
+
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // The deployment reads this array by exact equality; the kubo block
+        // must never leak into it.
+        assert_eq!(
+            receipt["providers"],
+            serde_json::json!(["custody-provider", "ipfs-provider"])
+        );
+        assert_eq!(receipt["ipfs"]["peer_id"], "12D3KooWExample");
+        assert_eq!(
+            receipt["ipfs"]["swarm_addrs"],
+            serde_json::json!(["/ip4/172.18.0.2/tcp/4001/p2p/12D3KooWExample"])
+        );
+    }
+
+    #[test]
+    fn only_a_plan_that_hosts_the_ipfs_plane_reports_a_kubo_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let custody_only = ProviderHostPlan {
+            data_dir: temp.path().to_path_buf(),
+            providers: vec![HostedProvider {
+                plane: ProviderPlane::Custody,
+                binary_path: PathBuf::from("/opt/elastos/bin/custody-provider"),
+            }],
+            carrier_addr: None,
+        };
+        assert!(!custody_only.hosts_ipfs_plane());
+
+        let storage = ProviderHostPlan {
+            data_dir: temp.path().to_path_buf(),
+            providers: vec![
+                HostedProvider {
+                    plane: ProviderPlane::Custody,
+                    binary_path: PathBuf::from("/opt/elastos/bin/custody-provider"),
+                },
+                HostedProvider {
+                    plane: ProviderPlane::Ipfs,
+                    binary_path: PathBuf::from("/opt/elastos/bin/ipfs-provider"),
+                },
+            ],
+            carrier_addr: None,
+        };
+        assert!(storage.hosts_ipfs_plane());
     }
 }

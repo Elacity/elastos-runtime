@@ -649,6 +649,15 @@ pub(crate) enum NodePeerCommand {
         /// Allow this DID to request a safe operator action on this runtime
         #[arg(long = "allow")]
         allow: Vec<String>,
+        /// Provider targets this peer hosts (comma-separated, repeatable), e.g. custody,chain
+        #[arg(long = "provides", value_delimiter = ',')]
+        provides: Vec<String>,
+        /// kubo libp2p PeerID of this peer's IPFS node
+        #[arg(long = "ipfs-peer-id")]
+        ipfs_peer_id: Option<String>,
+        /// Dialable kubo swarm multiaddr for this peer (repeatable)
+        #[arg(long = "ipfs-addr")]
+        ipfs_addr: Vec<String>,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,

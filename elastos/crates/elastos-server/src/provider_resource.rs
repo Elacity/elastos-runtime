@@ -157,7 +157,7 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
             "runs_create" | "runs_cancel" => Some(Action::Execute),
             _ => None,
         },
-        "object" => object_op_required_action(op),
+        "object" => object_operation_action(op),
         "operator-drive-adapter" => match op {
             "status" | "metadata_index" | "read_bytes" => Some(Action::Read),
             "write_bytes" => Some(Action::Write),
@@ -243,12 +243,22 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
             Some(Action::Read)
         }
         "add_bytes" | "add_path" | "add_directory" | "pin" => Some(Action::Write),
+        // Brings the node's kubo daemon up (or adopts a running one) and
+        // reports its libp2p identity. Write rather than Execute: it changes
+        // node state, and Write is already in this capsule's declared action
+        // set, so mapping it here grants no new class of authority (the
+        // manifest declares the method `risk: write` for the same reason).
+        // The provider host calls it at startup so peering is established
+        // long before a publish needs replicas -- a kubo first started at
+        // publish time cannot be found by peers that have never met it, and
+        // the resulting pin has no timeout.
+        "ensure_started" => Some(Action::Write),
         "unpin" => Some(Action::Delete),
         _ => None,
     }
 }
 
-fn object_op_required_action(op: &str) -> Option<Action> {
+fn object_operation_action(op: &str) -> Option<Action> {
     match op {
         "roots"
         | "list"
@@ -262,8 +272,15 @@ fn object_op_required_action(op: &str) -> Option<Action> {
         | "read_viewer"
         | "close_viewer" => Some(Action::Read),
         "import_runtime_custody" => Some(Action::Write),
+        // Rebuilding an owned copy writes a file and spends nothing. What
+        // makes it safe is the chain read at its door, not the authority it
+        // asks for here.
+        "download_owned_copy" => Some(Action::Write),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
-        | "unpublish" | "repair" | "share" | "buy" => Some(Action::Write),
+        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        // `buy` spends the user's money: it must never be satisfied by a
+        // capsule that only holds generic object write authority.
+        "buy" => Some(Action::Buy),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }
@@ -363,6 +380,7 @@ fn ipfs_resource(op: &str) -> Result<String, String> {
             "download_directory",
             "pin",
             "unpin",
+            "ensure_started",
             "health",
             "status",
         ],
@@ -397,6 +415,7 @@ fn object_resource(op: &str) -> Result<String, String> {
             "list_runtime_custody",
             "import_runtime_custody",
             "buy",
+            "download_owned_copy",
             "open_viewer",
             "read_viewer",
             "close_viewer",
@@ -724,12 +743,29 @@ mod tests {
             let authority = manifest
                 .authority
                 .unwrap_or_else(|| panic!("{scheme} provider manifest must declare authority"));
-            for capability in authority.capabilities {
-                for operation in capability.operations {
+            for capability in &authority.capabilities {
+                for operation in &capability.operations {
+                    let action = provider_operation_action(scheme, operation);
                     assert!(
-                        provider_operation_action(scheme, &operation).is_some(),
+                        action.is_some(),
                         "{scheme}/{operation} in {} must have a canonical Runtime action",
                         path.display()
+                    );
+                    let action = action.unwrap();
+                    // The manifest's own declared `actions` must cover every
+                    // action its `operations` actually require -- otherwise a
+                    // narrower action (e.g. `buy`) can silently ride on a
+                    // broader one already listed there (e.g. `write`), which
+                    // is exactly how `buy` used to be an alias for `write`.
+                    assert!(
+                        capability
+                            .actions
+                            .iter()
+                            .any(|declared| declared == action.to_string().as_str()),
+                        "{scheme}/{operation} in {} requires action `{action}`, but the \
+                         manifest's declared actions {:?} do not include it",
+                        path.display(),
+                        capability.actions
                     );
                 }
             }
@@ -1438,5 +1474,15 @@ mod tests {
             .unwrap(),
             "elastos://chain/esc-mainnet/broadcast_transaction"
         );
+    }
+
+    #[test]
+    fn buy_requires_its_own_action() {
+        // The real "does the manifest's declared `actions` list cover `buy`"
+        // check lives in `first_party_provider_authority_operations_have_action_mapping`
+        // below, against the actual `capsules/object-provider/capsule.json` --
+        // a check built from a fixture the test itself constructs cannot fail
+        // on a production regression (e.g. deleting `"buy"` from that file).
+        assert_eq!(object_operation_action("buy"), Some(Action::Buy));
     }
 }

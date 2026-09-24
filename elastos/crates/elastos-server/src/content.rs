@@ -27,6 +27,13 @@ const AVAILABILITY_RECEIPT_SCHEMA: &str = "elastos.content.availability.receipt/
 const AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.receipt.v1";
 const AVAILABILITY_DASHBOARD_SCHEMA: &str = "elastos.content.availability.dashboard/v1";
 const CONTENT_ADMISSION_DOMAIN: &str = "elastos.content.admission.v1";
+/// The policies a publisher sends when it asks one admitted peer to hold one
+/// copy on itself. `carrier_replica` asks for the copy; `carrier_block_graph_import`
+/// confirms one whose blocks the publisher has just delivered. Both are answered
+/// by that peer's own verified pin.
+/// See `ContentProvider::is_local_replica_request`.
+pub(crate) const LOCAL_REPLICA_AVAILABILITY_POLICIES: [&str; 2] =
+    ["carrier_replica", "carrier_block_graph_import"];
 const CONTENT_ACCOUNTING_SCHEMA: &str = "elastos.content.accounting/v1";
 const CONTENT_STORAGE_ACCOUNTING_LEDGER_SCHEMA: &str =
     "elastos.content.storage-accounting.ledger/v1";
@@ -3084,6 +3091,12 @@ impl ContentProvider {
                 "content publish exceeds the principal storage quota",
             ));
         }
+        // Writing bytes into the local store and replicating them across the
+        // availability plane are different orders of magnitude -- the first is
+        // local I/O, the second waits on other nodes -- so they are timed
+        // apart. A publish that takes minutes is almost always the second, and
+        // saying so should not require inferring it.
+        let started = std::time::Instant::now();
         let ipfs_response = self
             .invoke_provider(
                 &registry,
@@ -3094,24 +3107,46 @@ impl ContentProvider {
             )
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
+        tracing::debug!(
+            phase = "ipfs_add",
+            op = %ipfs_op,
+            bytes = accounting_observation.bytes.unwrap_or_default(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "content publish phase"
+        );
         let local_outcome = AvailabilityOutcome::local_publish(pin);
         let outcome = if pin {
-            self.ensure_network_availability(
-                &registry,
-                &cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: object_did.as_deref(),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation,
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome)
+            let started = std::time::Instant::now();
+            let ensured = self
+                .ensure_network_availability(
+                    &registry,
+                    &cid,
+                    request,
+                    &local_outcome,
+                    AvailabilityRequestContext {
+                        object_did: object_did.as_deref(),
+                        publisher_did: publisher_did.as_deref(),
+                        accounting_observation,
+                    },
+                )
+                .await?
+                .unwrap_or(local_outcome);
+            tracing::debug!(
+                phase = "availability_ensure",
+                status = %ensured.status,
+                replicas = ensured.replicas,
+                elapsed_ms = started.elapsed().as_millis(),
+                "content publish phase"
+            );
+            ensured
         } else {
             local_outcome
         };
+        // The tail after availability. Measured at ~14 s for a 29 KB object
+        // while a Mainline DHT put_mutable timed out on the same millisecond,
+        // which is a coincidence worth either proving or discarding: the work
+        // here is local file writes and should be immeasurable.
+        let tail_started = std::time::Instant::now();
         let receipt = self.write_receipt(ReceiptInput {
             cid: cid.clone(),
             object_did,
@@ -3133,7 +3168,18 @@ impl ContentProvider {
                 storage_quota,
             ),
         })?;
+        let receipt_ms = tail_started.elapsed().as_millis();
         let repair_task = self.record_repair_task(&receipt, &outcome, requirements, false)?;
+        tracing::debug!(
+            phase = "publish_tail",
+            receipt_ms,
+            repair_task_ms = tail_started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(receipt_ms),
+            total_ms = tail_started.elapsed().as_millis(),
+            "content publish phase"
+        );
 
         Ok(provider_ok(json!({
             "cid": cid,
@@ -3695,6 +3741,24 @@ impl ContentProvider {
             .await
     }
 
+    /// Distinguishes the two facts an availability request can ask for.
+    ///
+    /// The publisher asking this admitted peer for one copy on itself is
+    /// answered completely by a verified local pin, and the publisher counts
+    /// this node as one distinct peer. That covers `carrier_replica`, and
+    /// `carrier_block_graph_import` for a graph whose blocks the publisher has
+    /// just delivered.
+    ///
+    /// Every other policy is this node asking the network for placement, which
+    /// still goes to the configured availability provider under its requested
+    /// requirements.
+    fn is_local_replica_request(request: &Value) -> bool {
+        request
+            .get("availability_policy")
+            .and_then(|value| value.as_str())
+            .is_some_and(|policy| LOCAL_REPLICA_AVAILABILITY_POLICIES.contains(&policy))
+    }
+
     async fn repair(&self, request: &Value) -> Result<Value, ProviderError> {
         self.pin_for_availability(request, "local_repair_pin", "local_repair_failed", false)
             .await
@@ -3777,23 +3841,24 @@ impl ContentProvider {
             .transpose()?
             .map(|receipt| content_accounting_observation_from_value(&receipt.payload.accounting))
             .unwrap_or_default();
-        let outcome = if local_outcome.status == "local_pinned" {
-            self.ensure_network_availability(
-                &registry,
-                cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: object_did.as_deref(),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation,
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome)
-        } else {
-            local_outcome
-        };
+        let outcome =
+            if local_outcome.status == "local_pinned" && !Self::is_local_replica_request(request) {
+                self.ensure_network_availability(
+                    &registry,
+                    cid,
+                    request,
+                    &local_outcome,
+                    AvailabilityRequestContext {
+                        object_did: object_did.as_deref(),
+                        publisher_did: publisher_did.as_deref(),
+                        accounting_observation,
+                    },
+                )
+                .await?
+                .unwrap_or(local_outcome)
+            } else {
+                local_outcome
+            };
 
         let receipt = self.write_receipt(ReceiptInput {
             cid: cid.to_string(),
@@ -10289,6 +10354,75 @@ mod tests {
 
         let requests = availability.requests.lock().await;
         assert_eq!(requests.len(), 2);
+    }
+
+    /// A `carrier_replica` ensure asks this peer for exactly one copy on
+    /// itself. The publisher admitted it and counts it as one distinct peer,
+    /// so its own verified local pin is the whole requested placement.
+    ///
+    /// Before this, a successful local pin was still forwarded to the
+    /// configured external placement service. On the custody hosts that target
+    /// is the Compose default `https://replica.invalid/ensure`, so a pin that
+    /// had already succeeded came back `repair_needed` and the publisher
+    /// re-imported the entire object it had just placed.
+    #[tokio::test]
+    async fn carrier_replica_ensure_proves_the_local_pin_without_external_placement() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "availability": {
+                    "status": "repair_needed",
+                    "provider": "availability-provider",
+                    "policy": "network_default",
+                    "replicas": 0,
+                    "reason": "https://replica.invalid/ensure is unreachable",
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+
+        // Both policies mean the same thing to this peer: the publisher has
+        // handed it the object and wants it held. `carrier_block_graph_import`
+        // is the arbitrary-DAG path, where the blocks arrived immediately
+        // before this call.
+        // Listed literally rather than read from the production constant, so
+        // dropping a policy from that constant fails here instead of quietly
+        // shrinking what this test covers.
+        for policy in ["carrier_replica", "carrier_block_graph_import"] {
+            let response = content
+                .send_raw(&json!({
+                    "op": "ensure",
+                    "cid": TEST_CID,
+                    "availability_policy": policy,
+                    "availability_requirements": {
+                        "min_replicas": 1,
+                        "max_replicas": 1,
+                        "require_live_multi_peer_proof": false,
+                    },
+                }))
+                .await
+                .unwrap();
+
+            assert_eq!(response["status"], "ok", "policy {policy}");
+            assert_eq!(
+                response["data"]["availability"]["status"], "local_pinned",
+                "policy {policy}"
+            );
+            assert_eq!(
+                response["data"]["availability"]["replicas"], 1,
+                "policy {policy}"
+            );
+            assert!(
+                ipfs.pinned.lock().await.iter().any(|cid| cid == TEST_CID),
+                "the local replica must be really pinned before it is claimed ({policy})"
+            );
+            assert!(
+                availability.requests.lock().await.is_empty(),
+                "one local copy must not depend on an unrelated external \
+                 placement service ({policy})"
+            );
+        }
     }
 
     #[tokio::test]

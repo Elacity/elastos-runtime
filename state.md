@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-09-04 UTC
+Last updated: 2026-09-16 UTC
 
 This file records public-safe current truth for released 0.7.0 and active
 development work. Private operator paths, credentials, target identities, and
@@ -313,6 +313,176 @@ a plain Linux Docker Engine in a VM) is green: three distinct DID-keyed
 descriptors, composition generated and verified, three Carrier dial proofs,
 provision and preflight `ok: true`, clean teardown.
 
+### 0.7.1 follow-up: source-verified, not installed-proven
+
+Verified on `feat/protected-content-0.7.1-followup` on 2026-09-14, in source
+only, on the ten commits above `25ab205e`. The per-item record is in
+[TASKS.md](TASKS.md#protected-content-071-follow-up-42-48-49); the plan and
+per-task briefs are in
+[docs/audits/2026-09-08-protected-content-0.7.1-followup-plan.md](docs/audits/2026-09-08-protected-content-0.7.1-followup-plan.md).
+
+Source gate on that head:
+
+- `just verify` passes every step except two that fail for reasons predating
+  this work (below). `git diff --check` is clean. `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -D warnings`, the whole workspace
+  suite, every own-workspace capsule suite, and the `browser-local-exit`
+  workspace are green.
+- `just verify-ci` passes: both the `test-capsules` and the `test-elastos`
+  container replicas are green on cold caches. One `test-elastos` run died
+  with a container EOF when the local Docker daemon crashed; the rerun after
+  restarting it is green, and nothing in the tree was touched between the two.
+- `node scripts/home-entropy-check.mjs` reports only standing-docs release
+  snapshots inside the local, git-ignored, untracked `.remember/` folder. The
+  check walks the filesystem and does not skip that directory. With the folder
+  moved aside the whole check passes, and a fresh CI checkout has no such
+  folder, so the CI `source-gate` leg is unaffected. Nothing tracked is at
+  fault.
+- `node scripts/carrier-dependency-generation-check.mjs` fails with
+  `expected one elastos-identity 0.6.0 package, found 0`. The crate takes the
+  workspace version, which became 0.7.0 at the release-preparation commit, and
+  the check still pins 0.6.0. No manifest on this branch touches it. It is not
+  part of the CI `source-gate`, `lint`, `test-elastos` or `test-capsules` jobs.
+- `cargo clippy --all-targets -D warnings` in `capsules/media-provider` fails
+  on a `manual_saturating_arithmetic` lint at an expression this branch never
+  edited. No recipe and no CI job runs clippy on that workspace, so it does not
+  gate anything today.
+
+Not proven, and not claimable from the above:
+
+- The installed journeys were never run. Three remain: Creator to Library to
+  Player; Creator to Marketplace to Reader; and audio playback. Each needs an
+  installed home from `scripts/setup-source-home.sh` with funded creator and
+  buyer principals and the three-node custody composition, driven the way
+  `scripts/protected-content-installed-e2e-proof.sh` drives the media journey.
+  What to look for: the Creator form completing upload, protect and list in
+  one flow; the mint journal carrying the object content identity for the
+  non-media case; Library and Marketplace launching the viewer the kind calls
+  for without the creator choosing; a 2-of-3 release settling; the reader
+  drawing every kind it claims and saying so plainly when it cannot; and the
+  player presenting an audio rendition with working transport controls.
+- Protected audio has no thumbnail. The player's precedence is image track,
+  then poster, then controls alone, but no Runtime path populates
+  `thumbnail_uri`, so audio always lands on the controls-only frame. The
+  precedence logic is right; the source for a poster does not exist yet.
+- CENC media is AES-128-CTR with no per-sample authentication tag. The CENC
+  standard defines no authenticated scheme, so tamper-evidence on the media
+  path is the staged segment's SHA-256 and byte-length check, run before any
+  keystream is applied, not the cipher. This matters for any future
+  frontend-only client that fetches segments over a network instead of reading
+  Runtime-staged bytes: it must carry that check itself or it has no integrity
+  protection. The object path is AES-256-GCM and does not have this shape.
+  [docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md](docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md)
+  records it in full with the tests that pin it, and
+  [docs/PROTECTED_CONTENT.md](docs/PROTECTED_CONTENT.md) repeats it where the
+  `pssh` box is described.
+
+### 0.7.1 follow-up, second slice: mint-path repairs
+
+Verified on `feat/protected-content-0.7.1-followup` on 2026-09-15, in source
+only, on one commit above `58686dd4`
+(PR [#62](https://github.com/Elacity/elastos-runtime/pull/62), unpushed at the
+time of writing). The starting condition was that a mint could not be completed
+from the Creator at all, and that when it failed it said almost nothing: 23 call
+sites shared one "Runtime custody creator mint is unavailable", five of them
+inside the wallet resolver logging nothing.
+
+Source gate on that head: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -D warnings`, the whole workspace suite
+(3178 passed, 0 failed), every own-workspace capsule suite (21 of 21), the CI
+`source-gate` scripts and the three capsule browser suites all pass locally.
+
+What the slice changes:
+
+- The creator mint accepts a connector-linked external wallet as the
+  transaction default. `signing_available` was always the real precondition and
+  already discriminates a linked external account from an unlinked one; the
+  proof-type half of the gate shut out wallets that could in fact sign. An
+  unlinked external account still fails closed.
+- The creator tail raises exactly one wallet effect. The second
+  `setApprovalForAll`, and the `isApprovedForAll` probe that read any
+  undecodable answer as "not approved" and so re-raised it on every mint, are
+  gone. This is scoped to minting: an operator approval remains the mechanism
+  for secondary trading, and a resale surface will need its own.
+- A mint keeps the account it started with, and now says so. The publish
+  request is identified by principal, object and storage rather than by wallet,
+  so a retry after switching wallets reaches the recorded account. With terms
+  recorded and nothing raised, Runtime refuses and names both accounts; once an
+  effect is raised it finishes on the account that raised it, because refusing
+  there would strand a transaction in flight; a settled mint is never refused.
+- A publish that finds the mint already settled is reported as a replay, with
+  when it settled, the transaction that settled it and the account that minted
+  it, instead of a fresh success. This is the defect that let a mint settled
+  ninety minutes earlier on a since-abandoned wallet read as work just done.
+- Custody nodes take `--role <storage|custody>`, so key-share custody no longer
+  conscripts a node as a ciphertext replica. Kubo peering is built from the
+  operator peer store unioned with an optional `ipfs-peering.json`, and kubo is
+  started eagerly on both the custody node and the client gateway rather than
+  on first use.
+- Failures and waits answer as typed data: which wallet-default precondition
+  failed, wallet drift, whether an outstanding approval needs a person or only
+  the chain, an approval that can never complete, and publish progress
+  projected from the mint journal.
+- `create_owner_only_directory` creates its path recursively. The journal store
+  lives two levels down and `ExclusiveFileLock::acquire` creates only one, so
+  the first journal operation on any data dir lacking `protected-content/`
+  failed, surfacing as "mint intent is unavailable".
+
+Proven beyond source, and worth recording because the rest of the custody work
+rested on it: the peering mesh was verified by block transfer, not by
+inspection. A block published on the client gateway was fetched by all three
+custody nodes, one of them in 0.18s and without ever having been explicitly
+dialed, with the full mesh established.
+
+Not proven, and not claimable from the above:
+
+- No installed journey was run for this slice. The mint path is source-verified
+  only.
+- `custody-harness-smoke` was not run. Its path filter matches these changes so
+  CI will run it; locally it stops any live `custody-host` compose project,
+  which was in use. Its two failure modes were audited statically instead: an
+  absent host kubo identity fails soft, and the stricter provider assertion
+  matches what a live ready receipt reports.
+- The listing a mint publishes is source-verified only. The token URI now names
+  the metadata directory rather than a file inside it, the folder carries the
+  Elacity documents the marketplace indexes, and a creator-named royalty split
+  reaches the chain in `ROYALTY_SHARE` units. None of it has been seen on Base:
+  what proves it is the `cast` sequence in
+  [TASKS.md](TASKS.md#protected-content-071-follow-up-42-48-49), which needs a
+  funded mint and an agreed spending limit.
+- A declined wallet approval leaves the mint unrecoverable. The failure is
+  reported accurately; `discard_creator_state` refuses the `EffectRaised` stage,
+  so the object cannot be minted again.
+
+The listing metadata, added in the same slice:
+
+- A mint's token URI resolves to the metadata DIRECTORY. It named
+  `metadata.json` inside it, and the Operative appends its own suffixes
+  (`uri(id)` is `base + "/{id}.json"`, `metadataURI()` is
+  `base + "/contract.json"`), so on-chain the derived URIs were
+  `…/metadata.json/0000…0001.json` — verified against Base, where the deployed
+  Operative uses the 64-hex token filename rather than the decimal one the
+  `drm-contracts` copy of `OperativeCommon.sol` builds. `v3-drm-protocol` is
+  the source that matches the chain.
+- The directory carries the Elacity documents an indexer reads. The runtime's
+  own document moved to `manifest.json` because `metadata.json` is the name the
+  token URI resolves to; the portable-listing verifier reads `manifest.json`
+  first and accepts the older single-file layout, so listings published before
+  the rename still verify.
+- Royalties reach the chain as `ROYALTY_SHARE` units. A creator surface shows
+  all 1000 units of the sale, the protocol owner's 50 are minted by the
+  contracts and fixed, and a publish carries the creator's 950 split across
+  named payees. The split is recorded in the mint journal, not taken from the
+  request, because a retry re-encodes the chain call from the recorded terms.
+  No journal format change was needed: the creator state is JSON inside the
+  binary record, so a defaulted field decodes every existing record.
+
+Configuration note: the local chain configuration moved off the Anvil Base fork
+to real Base mainnet, because the RPC previously in use could not serve
+`eth_getTransactionReceipt` for mined transactions and stalled every mint.
+Anders has since approved Base mainnet for the bounded J5 acceptance journey;
+the proof driver and its receipt labels still assume the fork.
+
 ## PR15 Extraction Ledger
 
 PR #15 / `feat/dkms-esp-port` is source evidence, not a merge target. The
@@ -328,9 +498,12 @@ integrated source adapted these useful parts to the typed Runtime path:
 - `e148218b`: applicable CI lessons remain in the focused source and platform
   gates.
 
-Current video opens in `elacity-player`. Document and 3D viewers remain later
-typed-viewer scope. External cryptographic review remains open before public
-dKMS or production confidentiality claims. Global listing discovery and public
+Protected video and audio open in `elacity-player`; pictures, documents,
+text, 3D models, books and comics open in `elacity-reader`. External
+cryptographic review remains open before public
+dKMS or production confidentiality claims; the suite card, threat model, build
+card and committed golden vectors a reviewer needs are in
+`docs/PROTECTED_CONTENT_CRYPTO_REVIEW.md`. Global listing discovery and public
 custody governance remain later work. The shared listing link, portable import,
 buyer Runtime rights admission, and exact two-Runtime 2-of-3 source journey are
 complete. The atomic authority cutover is complete. The remaining installed

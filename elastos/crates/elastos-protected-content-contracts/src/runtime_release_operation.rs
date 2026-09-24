@@ -638,8 +638,6 @@ mod tests {
     use k256::ecdsa::SigningKey as WalletSigningKey;
     use sha3::Digest as _;
 
-    use elastos_auth::ethereum_signed_message_hash;
-
     use super::*;
     use crate::test_support::{digest, NOW};
     use crate::{
@@ -802,9 +800,7 @@ mod tests {
         .unwrap();
         let wallet_key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
         let (wallet_signature, recovery_id) = wallet_key
-            .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                &rights_request.canonical_bytes().unwrap(),
-            ))
+            .sign_prehash_recoverable(&rights_request.signing_hash().unwrap())
             .unwrap();
         let mut wallet_signature_bytes = wallet_signature.to_bytes().to_vec();
         wallet_signature_bytes.push(recovery_id.to_byte());
@@ -870,9 +866,12 @@ mod tests {
         let authenticated = operation
             .verify(operation.statement().runtime_operation_issuer(), NOW + 3)
             .unwrap();
+        // Moved 2026-09-22 with the readable signing format: this hash covers
+        // the signed rights request, whose signature bytes changed when the
+        // wallet began signing readable text instead of canonical bytes.
         assert_eq!(
             encode(authenticated.operation_hash().as_bytes()),
-            "6ec73c02497537d7acc571a76a903455e01b5b134edf22464a66daae04a93fec"
+            "2ee287b35e150a48130aaa96886f09670d07c56fa314729c729294a94cc1337f"
         );
         assert_eq!(
             authenticated.rights_request_hash(),

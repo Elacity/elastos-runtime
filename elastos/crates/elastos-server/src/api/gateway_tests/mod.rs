@@ -813,6 +813,7 @@ include!("support_runtime.rs");
 mod browser_profile;
 mod browser_reconciliation;
 mod collaboration_presence;
+mod creator_channels;
 mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]
@@ -822,6 +823,7 @@ mod home_agent;
 mod home_system;
 mod inspect;
 mod library;
+mod market_directory;
 mod marketplace;
 mod model;
 mod recovery;

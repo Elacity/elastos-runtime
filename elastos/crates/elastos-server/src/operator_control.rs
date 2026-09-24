@@ -38,6 +38,10 @@ pub const OPERATOR_ACTION_ROOM_APPROVE: &str = "room.approve";
 pub const OPERATOR_ACTION_ROOM_DENY: &str = "room.deny";
 pub const OPERATOR_ACTION_ROOM_OPEN: &str = "room.open";
 
+/// Provider target name for the content plane (kubo). A peer that declares
+/// its capabilities and omits this one does not store content.
+pub const OPERATOR_PROVIDES_IPFS: &str = "ipfs";
+
 const OPERATOR_CONFIG_SCHEMA: &str = "elastos.operator-control/v1";
 const OPERATOR_REQUEST_DOMAIN: &str = "elastos.operator.request.v1";
 const OPERATOR_RESPONSE_DOMAIN: &str = "elastos.operator.response.v1";
@@ -73,6 +77,50 @@ pub struct OperatorPeer {
     pub connect_ticket: String,
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Provider target names this peer actually hosts, spelled the way the
+    /// provider host reports them (`custody`, `ipfs`, `availability`,
+    /// `chain`, `content`). Empty means "not declared": callers must treat
+    /// that as unknown, never as "hosts nothing", so records written before
+    /// this field existed keep their previous behaviour.
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// The peer's kubo node, when it runs one. Carried here so peering can be
+    /// arranged by libp2p identity rather than inferred from the Carrier DID,
+    /// which is a different key space.
+    #[serde(default)]
+    pub ipfs_peer: Option<OperatorPeerIpfs>,
+}
+
+impl OperatorPeer {
+    /// Whether this peer may be asked to hold a content replica.
+    ///
+    /// A custody node's only role is key-share custody and release: it has no
+    /// content plane worth pinning to, and conscripting it as a replica makes
+    /// key custody a failure point for content availability. So a peer that
+    /// declares its capabilities and does not list the content target is not
+    /// a storage candidate.
+    ///
+    /// An empty `provides` means the record predates capability declaration,
+    /// not that the peer stores nothing. Those peers stay eligible on purpose:
+    /// every deployment registered before this field existed must keep
+    /// behaving exactly as it did.
+    pub fn hosts_content_storage(&self) -> bool {
+        self.provides.is_empty()
+            || self
+                .provides
+                .iter()
+                .any(|target| target == OPERATOR_PROVIDES_IPFS)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct OperatorPeerIpfs {
+    /// kubo libp2p PeerID (`12D3Koo…` / `Qm…`, base58btc).
+    pub id: String,
+    /// Dialable swarm multiaddrs. May be empty: peering by ID alone is valid
+    /// and is all a node behind a Docker bridge can honestly advertise.
+    #[serde(default)]
+    pub addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -326,6 +374,10 @@ pub fn load_operator_control(data_dir: &Path) -> Result<OperatorControlConfig> {
     }
     for peer in &mut config.peers {
         peer.allow = normalize_actions(&peer.allow)?;
+        peer.provides = normalize_provides(&peer.provides)?;
+        if let Some(ipfs_peer) = peer.ipfs_peer.as_mut() {
+            *ipfs_peer = normalize_ipfs_peer(ipfs_peer)?;
+        }
     }
     config.peers.sort_by(|a, b| a.did.cmp(&b.did));
     Ok(config)
@@ -347,6 +399,10 @@ pub fn save_operator_control(data_dir: &Path, config: &OperatorControlConfig) ->
 pub fn upsert_peer(data_dir: &Path, mut peer: OperatorPeer) -> Result<OperatorPeer> {
     validate_peer_did(&peer.did)?;
     peer.allow = normalize_actions(&peer.allow)?;
+    peer.provides = normalize_provides(&peer.provides)?;
+    if let Some(ipfs_peer) = peer.ipfs_peer.as_mut() {
+        *ipfs_peer = normalize_ipfs_peer(ipfs_peer)?;
+    }
 
     let mut config = load_operator_control(data_dir)?;
     if let Some(existing) = config.peers.iter_mut().find(|entry| entry.did == peer.did) {
@@ -358,6 +414,15 @@ pub fn upsert_peer(data_dir: &Path, mut peer: OperatorPeer) -> Result<OperatorPe
         }
         if !peer.allow.is_empty() {
             existing.allow = peer.allow.clone();
+        }
+        // Same "omitted means unchanged" rule the other fields follow, so a
+        // re-add that only refreshes the ticket cannot silently erase the
+        // capability declaration this peer was registered with.
+        if !peer.provides.is_empty() {
+            existing.provides = peer.provides.clone();
+        }
+        if peer.ipfs_peer.is_some() {
+            existing.ipfs_peer = peer.ipfs_peer.clone();
         }
         peer = existing.clone();
     } else {
@@ -689,6 +754,57 @@ fn normalize_actions(actions: &[String]) -> Result<Vec<String>> {
     }
     normalized.sort();
     Ok(normalized)
+}
+
+/// Provider target names are an open set (the provider host owns the
+/// vocabulary), so this only enforces that every entry is a real name: a
+/// blank entry would silently widen or narrow a capability check depending on
+/// how the reader treats it, which is exactly the ambiguity to reject.
+fn normalize_provides(provides: &[String]) -> Result<Vec<String>> {
+    let mut normalized: Vec<String> = Vec::new();
+    for target in provides {
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("operator peer 'provides' entries must not be empty or whitespace");
+        }
+        if !normalized.iter().any(|entry| entry == trimmed) {
+            normalized.push(trimmed.to_string());
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+/// A kubo PeerID is base58btc, so anything outside `[A-Za-z0-9]` is either a
+/// typo or a multiaddr pasted into the wrong flag. Reject it here rather than
+/// write it to disk and let a peering call fail far from the mistake.
+fn normalize_ipfs_peer(ipfs_peer: &OperatorPeerIpfs) -> Result<OperatorPeerIpfs> {
+    let id = ipfs_peer.id.trim();
+    if id.is_empty() {
+        anyhow::bail!("operator peer 'ipfs_peer.id' must not be empty");
+    }
+    if !id.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        anyhow::bail!(
+            "invalid kubo peer id '{}': expected a base58btc PeerID (alphanumeric only)",
+            id
+        );
+    }
+
+    let mut addrs: Vec<String> = Vec::new();
+    for addr in &ipfs_peer.addrs {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("operator peer 'ipfs_peer.addrs' entries must not be empty");
+        }
+        if !addrs.iter().any(|entry| entry == trimmed) {
+            addrs.push(trimmed.to_string());
+        }
+    }
+
+    Ok(OperatorPeerIpfs {
+        id: id.to_string(),
+        addrs,
+    })
 }
 
 fn validate_peer_did(did: &str) -> Result<()> {
@@ -1768,6 +1884,7 @@ mod tests {
                 label: "jetson".to_string(),
                 connect_ticket: "ticket-a".to_string(),
                 allow: vec![OPERATOR_ACTION_STATUS_READ.to_string()],
+                ..OperatorPeer::default()
             },
         )
         .unwrap();
@@ -1779,6 +1896,7 @@ mod tests {
                 label: String::new(),
                 connect_ticket: String::new(),
                 allow: vec![OPERATOR_ACTION_UPDATE_CHECK.to_string()],
+                ..OperatorPeer::default()
             },
         )
         .unwrap();
@@ -1788,6 +1906,142 @@ mod tests {
             updated.allow,
             vec![OPERATOR_ACTION_UPDATE_CHECK.to_string()]
         );
+    }
+
+    #[test]
+    fn operator_peer_without_capability_fields_still_deserialises() {
+        // Every operator-control.json written before `provides`/`ipfs_peer`
+        // existed must keep loading unchanged.
+        let peer: OperatorPeer = serde_json::from_str(
+            r#"{"did":"did:key:z6Mkexample","label":"jetson","connect_ticket":"ticket-a","allow":[]}"#,
+        )
+        .unwrap();
+        assert!(peer.provides.is_empty());
+        assert!(peer.ipfs_peer.is_none());
+        assert!(peer.hosts_content_storage());
+
+        let round_tripped: OperatorPeer =
+            serde_json::from_str(&serde_json::to_string(&peer).unwrap()).unwrap();
+        assert_eq!(round_tripped.did, peer.did);
+        assert_eq!(round_tripped.connect_ticket, peer.connect_ticket);
+        assert!(round_tripped.provides.is_empty());
+        assert!(round_tripped.ipfs_peer.is_none());
+    }
+
+    #[test]
+    fn operator_peer_capability_fields_round_trip() {
+        let peer = OperatorPeer {
+            did: "did:key:z6Mkexample".to_string(),
+            provides: vec!["custody".to_string(), "ipfs".to_string()],
+            ipfs_peer: Some(OperatorPeerIpfs {
+                id: "12D3KooWExample".to_string(),
+                addrs: vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+            }),
+            ..OperatorPeer::default()
+        };
+
+        let round_tripped: OperatorPeer =
+            serde_json::from_str(&serde_json::to_string(&peer).unwrap()).unwrap();
+        assert_eq!(round_tripped.provides, peer.provides);
+        assert_eq!(round_tripped.ipfs_peer, peer.ipfs_peer);
+        assert!(round_tripped.hosts_content_storage());
+    }
+
+    #[test]
+    fn hosts_content_storage_excludes_custody_only_peers() {
+        let custody_only = OperatorPeer {
+            provides: vec!["custody".to_string(), "chain".to_string()],
+            ..OperatorPeer::default()
+        };
+        assert!(!custody_only.hosts_content_storage());
+
+        let full_node = OperatorPeer {
+            provides: vec![
+                "custody".to_string(),
+                "ipfs".to_string(),
+                "availability".to_string(),
+                "chain".to_string(),
+            ],
+            ..OperatorPeer::default()
+        };
+        assert!(full_node.hosts_content_storage());
+
+        // Legacy record: capability unknown, stays eligible.
+        assert!(OperatorPeer::default().hosts_content_storage());
+    }
+
+    #[test]
+    fn upsert_peer_rejects_malformed_capability_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, _) = generate_keypair();
+        let did = elastos_identity::encode_signing_key_did(&sk);
+
+        let err = upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did: did.clone(),
+                ipfs_peer: Some(OperatorPeerIpfs {
+                    id: "/ip4/10.0.0.2/tcp/4001".to_string(),
+                    addrs: Vec::new(),
+                }),
+                ..OperatorPeer::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid kubo peer id"));
+
+        let err = upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did: did.clone(),
+                provides: vec!["custody".to_string(), "   ".to_string()],
+                ..OperatorPeer::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+
+        // Neither rejected write may have landed on disk.
+        assert!(load_operator_control(dir.path()).unwrap().peers.is_empty());
+    }
+
+    #[test]
+    fn upsert_peer_keeps_capabilities_when_a_later_add_omits_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, _) = generate_keypair();
+        let did = elastos_identity::encode_signing_key_did(&sk);
+
+        upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did: did.clone(),
+                provides: vec!["custody".to_string(), "chain".to_string()],
+                ipfs_peer: Some(OperatorPeerIpfs {
+                    id: "12D3KooWExample".to_string(),
+                    addrs: Vec::new(),
+                }),
+                ..OperatorPeer::default()
+            },
+        )
+        .unwrap();
+
+        let updated = upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did,
+                connect_ticket: "ticket-b".to_string(),
+                ..OperatorPeer::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.connect_ticket, "ticket-b");
+        assert_eq!(updated.provides, vec!["chain", "custody"]);
+        assert_eq!(
+            updated.ipfs_peer.as_ref().map(|peer| peer.id.as_str()),
+            Some("12D3KooWExample")
+        );
+        assert!(!updated.hosts_content_storage());
     }
 
     #[test]
@@ -1803,6 +2057,7 @@ mod tests {
                 label: "jetson".to_string(),
                 connect_ticket: "ticket-a".to_string(),
                 allow: vec![OPERATOR_ACTION_STATUS_READ.to_string()],
+                ..OperatorPeer::default()
             },
         )
         .unwrap();
@@ -1929,6 +2184,7 @@ mod tests {
                 label: "node2".to_string(),
                 connect_ticket: ticket2,
                 allow: Vec::new(),
+                ..OperatorPeer::default()
             },
         )
         .unwrap();
@@ -1939,6 +2195,7 @@ mod tests {
                 label: "node1".to_string(),
                 connect_ticket: String::new(),
                 allow: vec![OPERATOR_ACTION_STATUS_READ.to_string()],
+                ..OperatorPeer::default()
             },
         )
         .unwrap();

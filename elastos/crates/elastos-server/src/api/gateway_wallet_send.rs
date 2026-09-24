@@ -264,6 +264,6 @@ pub(in crate::api::gateway) async fn wallet_chain_provider_data(
     })
 }
 
-pub(in crate::api::gateway) fn is_managed_wallet_proof_type(proof_type: &str) -> bool {
+pub(crate) fn is_managed_wallet_proof_type(proof_type: &str) -> bool {
     matches!(proof_type, "managed_evm" | "managed_btc_p2wpkh")
 }

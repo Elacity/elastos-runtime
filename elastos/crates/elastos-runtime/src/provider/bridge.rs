@@ -18,6 +18,10 @@ use super::registry::{
 
 /// Timeout for provider requests (30 seconds)
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Above this, a provider call is slow enough to be worth a DEBUG line even
+/// when it succeeded: it is the kind of thing someone asking "where did the
+/// time go" needs, and it is rare enough not to drown the log.
+const SLOW_PROVIDER_REQUEST_MS: u64 = 1_000;
 /// How often a still-pending raw provider request is named at warn.
 const PENDING_REQUEST_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -174,6 +178,25 @@ struct ProviderIo {
     reader: Box<dyn AsyncBufRead + Unpin + Send>,
 }
 
+/// Lifecycle state of the child process (if any) behind a `ProviderBridge`.
+///
+/// Single source of truth for shutdown: previously the bridge tracked
+/// `child: Mutex<Option<Child>>` alongside a separate `shutdown_completed`
+/// flag, and the two could disagree (e.g. a reaped child leaving `None`
+/// while the flag was still unset). Collapsing both into one state removes
+/// that possibility.
+enum ChildState {
+    /// No child process was ever spawned (bridge built via `from_io`); the
+    /// protocol shutdown still must be delivered to stop the provider.
+    Attached,
+    /// A child process is running and owned by this bridge.
+    Spawned(Child),
+    /// Shutdown has completed: the protocol shutdown was delivered exactly
+    /// once, and any child has been reaped. Later `shutdown()` calls are
+    /// idempotent no-ops.
+    ShutDown,
+}
+
 /// Bridge to a provider capsule process.
 ///
 /// Manages serial request/response communication over stdin/stdout.
@@ -181,11 +204,7 @@ struct ProviderIo {
 /// them one at a time).
 pub struct ProviderBridge {
     io: Arc<Mutex<ProviderIo>>,
-    child: Mutex<Option<Child>>,
-    /// True once a shutdown attempt has completed (child reaped, or the
-    /// protocol shutdown was delivered on a childless bridge). Later
-    /// shutdown() calls are idempotent no-ops.
-    shutdown_completed: std::sync::atomic::AtomicBool,
+    child: Mutex<ChildState>,
     /// Timeout applied to each shutdown settle stage (protocol request,
     /// child wait, force reap). Tests inject a short value.
     shutdown_timeout: std::time::Duration,
@@ -205,11 +224,13 @@ impl ProviderBridge {
     }
 
     async fn terminate_child_for_init_failure(
-        child_mutex: &Mutex<Option<Child>>,
+        child_mutex: &Mutex<ChildState>,
         shutdown_timeout: std::time::Duration,
     ) {
-        let mut child_guard = child_mutex.lock().await;
-        let Some(mut child) = child_guard.take() else {
+        let mut state_guard = child_mutex.lock().await;
+        let ChildState::Spawned(mut child) =
+            std::mem::replace(&mut *state_guard, ChildState::ShutDown)
+        else {
             return;
         };
 
@@ -246,7 +267,7 @@ impl ProviderBridge {
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                let child = Mutex::new(Some(child));
+                let child = Mutex::new(ChildState::Spawned(child));
                 Self::terminate_child_for_init_failure(&child, shutdown_timeout).await;
                 return Err(BridgeError::InitFailed(
                     "spawned provider missing piped stdin".to_string(),
@@ -256,7 +277,7 @@ impl ProviderBridge {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                let child = Mutex::new(Some(child));
+                let child = Mutex::new(ChildState::Spawned(child));
                 Self::terminate_child_for_init_failure(&child, shutdown_timeout).await;
                 return Err(BridgeError::InitFailed(
                     "spawned provider missing piped stdout".to_string(),
@@ -269,8 +290,7 @@ impl ProviderBridge {
                 writer: Box::new(stdin),
                 reader: Box::new(tokio::io::BufReader::new(stdout)),
             })),
-            child: Mutex::new(Some(child)),
-            shutdown_completed: std::sync::atomic::AtomicBool::new(false),
+            child: Mutex::new(ChildState::Spawned(child)),
             shutdown_timeout,
         };
 
@@ -328,8 +348,7 @@ impl ProviderBridge {
                 writer: Box::new(writer),
                 reader: Box::new(reader),
             })),
-            child: Mutex::new(None),
-            shutdown_completed: std::sync::atomic::AtomicBool::new(false),
+            child: Mutex::new(ChildState::Attached),
             shutdown_timeout: SHUTDOWN_TIMEOUT,
         }
     }
@@ -403,11 +422,27 @@ impl ProviderBridge {
                 }
             });
             let mut io = io.lock().await;
-            tracing::debug!(
-                op = %op,
-                lock_wait_ms = started.elapsed().as_millis() as u64,
-                "provider request sent"
-            );
+            // Give frequent polling operations their own filter without hiding
+            // mint diagnostics or the long-wait warnings above.
+            let polling = matches!(op.as_str(), "events" | "wallet_contract");
+            // TRACE: everything this line carries, the settled line below
+            // repeats with the outcome and the duration attached. Two lines per
+            // request doubles the cost of every polled wait and tells a reader
+            // nothing the second line does not.
+            if polling {
+                tracing::trace!(
+                    target: "elastos_runtime::provider::bridge::polling",
+                    op = %op,
+                    lock_wait_ms = started.elapsed().as_millis() as u64,
+                    "provider request sent"
+                );
+            } else {
+                tracing::trace!(
+                    op = %op,
+                    lock_wait_ms = started.elapsed().as_millis() as u64,
+                    "provider request sent"
+                );
+            }
             let result: Result<String, BridgeError> = async {
                 io.writer
                     .write_all(json.as_bytes())
@@ -429,52 +464,40 @@ impl ProviderBridge {
             }
             .await;
             let _ = stop_tx.send(());
-            tracing::debug!(
-                op = %op,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                ok = result.is_ok(),
-                "provider request settled"
-            );
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let ok = result.is_ok();
+            // A request that succeeded quickly is noise. The long waits here
+            // are polled, so the same op settles every few seconds for minutes
+            // and buries the calls that happened once. Worth DEBUG is a call
+            // that failed, or one slow enough to explain where the time went --
+            // which is exactly what a reader chasing a stalled mint is looking
+            // for. The rest stays at TRACE for whoever wants the transcript.
+            let noteworthy = !ok || elapsed_ms >= SLOW_PROVIDER_REQUEST_MS;
+            match (polling, noteworthy) {
+                (true, true) => tracing::debug!(
+                    target: "elastos_runtime::provider::bridge::polling",
+                    op = %op, elapsed_ms, ok, "provider request settled"
+                ),
+                (true, false) => tracing::trace!(
+                    target: "elastos_runtime::provider::bridge::polling",
+                    op = %op, elapsed_ms, ok, "provider request settled"
+                ),
+                (false, true) => {
+                    tracing::debug!(op = %op, elapsed_ms, ok, "provider request settled");
+                }
+                (false, false) => {
+                    tracing::trace!(op = %op, elapsed_ms, ok, "provider request settled");
+                }
+            }
             result
         })
         .await
         .map_err(|err| BridgeError::TaskJoin(err.to_string()))?
     }
 
-    /// Gracefully shut down the provider.
-    pub async fn shutdown(&self) -> Result<(), BridgeError> {
-        let mut child_guard = self.child.lock().await;
-        let Some(child) = child_guard.as_mut() else {
-            if self
-                .shutdown_completed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                // The child was already reaped (or the protocol shutdown was
-                // already delivered): shutdown is idempotent.
-                return Ok(());
-            }
-            // Never had a child process: the transport is the only handle on
-            // the provider, so the protocol shutdown must still be delivered
-            // for an attached provider to stop cleanly.
-            let result = tokio::time::timeout(
-                self.shutdown_timeout,
-                self.request_raw(ProviderRequest::Shutdown),
-            )
-            .await
-            .map_err(|_| BridgeError::Timeout)
-            .and_then(|result| result)
-            .and_then(|response| match response {
-                ProviderResponse::Ok { .. } => Ok(()),
-                ProviderResponse::Error { code, message } => {
-                    Err(BridgeError::Provider { code, message })
-                }
-            });
-            self.shutdown_completed
-                .store(true, std::sync::atomic::Ordering::Release);
-            return result;
-        };
-
-        let shutdown_result = tokio::time::timeout(
+    /// Deliver the protocol `Shutdown` request and interpret the response.
+    async fn deliver_protocol_shutdown(&self) -> Result<(), BridgeError> {
+        tokio::time::timeout(
             self.shutdown_timeout,
             self.request_raw(ProviderRequest::Shutdown),
         )
@@ -486,40 +509,89 @@ impl ProviderBridge {
             ProviderResponse::Error { code, message } => {
                 Err(BridgeError::Provider { code, message })
             }
-        });
+        })
+    }
 
-        let protocol_error = shutdown_result.err();
-        match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                child_guard.take();
-                self.shutdown_completed
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if let Some(error) = protocol_error {
-                    Err(error)
-                } else if status.success() {
-                    Ok(())
-                } else {
-                    Err(BridgeError::ProcessExited)
+    /// Gracefully shut down the provider.
+    ///
+    /// Idempotent: the protocol shutdown is delivered exactly once, on the
+    /// call that observes `Attached` or `Spawned`. Every later call finds
+    /// `ShutDown` and returns immediately. A `Spawned` reap failure leaves
+    /// the state as `Spawned` (not `ShutDown`) so a later call retries it.
+    pub async fn shutdown(&self) -> Result<(), BridgeError> {
+        let mut state_guard = self.child.lock().await;
+        let prior_state = std::mem::replace(&mut *state_guard, ChildState::ShutDown);
+        match prior_state {
+            ChildState::ShutDown => {
+                // Already shut down: state_guard already holds ShutDown
+                // (mem::replace above put it there); this is a no-op.
+                Ok(())
+            }
+            ChildState::Attached => {
+                // Never had a child process: the transport is the only
+                // handle on the provider, so the protocol shutdown must
+                // still be delivered for an attached provider to stop
+                // cleanly.
+                let result = self.deliver_protocol_shutdown().await;
+                tracing::debug!(
+                    from = "Attached",
+                    to = "ShutDown",
+                    "provider child state transition"
+                );
+                result
+            }
+            ChildState::Spawned(mut child) => {
+                let protocol_error = self.deliver_protocol_shutdown().await.err();
+                match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
+                    Ok(Ok(status)) => {
+                        tracing::debug!(
+                            from = "Spawned",
+                            to = "ShutDown",
+                            "provider child state transition"
+                        );
+                        if let Some(error) = protocol_error {
+                            Err(error)
+                        } else if status.success() {
+                            Ok(())
+                        } else {
+                            Err(BridgeError::ProcessExited)
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        match Self::force_child_reap(&mut child, self.shutdown_timeout).await {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    from = "Spawned",
+                                    to = "ShutDown",
+                                    "provider child state transition"
+                                );
+                                Err(protocol_error.unwrap_or(BridgeError::Io(error)))
+                            }
+                            Err(reap_error) => {
+                                // Reap failed: leave the child in place so a
+                                // later shutdown() call can retry.
+                                *state_guard = ChildState::Spawned(child);
+                                Err(reap_error)
+                            }
+                        }
+                    }
+                    Err(_) => match Self::force_child_reap(&mut child, self.shutdown_timeout).await
+                    {
+                        Ok(()) => {
+                            tracing::debug!(
+                                from = "Spawned",
+                                to = "ShutDown",
+                                "provider child state transition"
+                            );
+                            Err(protocol_error.unwrap_or(BridgeError::Timeout))
+                        }
+                        Err(reap_error) => {
+                            *state_guard = ChildState::Spawned(child);
+                            Err(reap_error)
+                        }
+                    },
                 }
             }
-            Ok(Err(error)) => match Self::force_child_reap(child, self.shutdown_timeout).await {
-                Ok(()) => {
-                    child_guard.take();
-                    self.shutdown_completed
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(protocol_error.unwrap_or(BridgeError::Io(error)))
-                }
-                Err(reap_error) => Err(reap_error),
-            },
-            Err(_) => match Self::force_child_reap(child, self.shutdown_timeout).await {
-                Ok(()) => {
-                    child_guard.take();
-                    self.shutdown_completed
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(protocol_error.unwrap_or(BridgeError::Timeout))
-                }
-                Err(reap_error) => Err(reap_error),
-            },
         }
     }
 }
@@ -979,6 +1051,27 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(BridgeError::ProcessExited)));
+    }
+
+    #[tokio::test]
+    async fn attached_bridge_shutdown_delivers_protocol_shutdown_once_and_is_idempotent() {
+        let (client_reader, server_writer) = tokio::io::duplex(4096);
+        let (server_reader, client_writer) = tokio::io::duplex(4096);
+        let bridge =
+            ProviderBridge::from_io(tokio::io::BufReader::new(client_reader), client_writer);
+        let server = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(server_reader).lines();
+            let first = lines.next_line().await.unwrap().unwrap();
+            let mut writer = server_writer;
+            // Matches the real wire protocol: ProviderResponse::Ok tagged by
+            // "status" (bridge.rs:88-99), not the sketch's ad hoc {"id","ok"}.
+            writer.write_all(b"{\"status\":\"ok\"}\n").await.unwrap();
+            first
+        });
+        bridge.shutdown().await.unwrap();
+        bridge.shutdown().await.unwrap(); // idempotent
+        assert!(server.await.unwrap().contains("\"shutdown\""));
+        assert!(matches!(*bridge.child.lock().await, ChildState::ShutDown));
     }
 
     #[cfg(unix)]

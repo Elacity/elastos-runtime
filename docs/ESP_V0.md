@@ -177,9 +177,12 @@ In scope for ESP v0:
 
 Out of scope for this branch:
 
-- dDRM, DKMS, content-market, creator, marketplace, standing grants, shell
-  marketplace, Three.js/vendor assets, reach/egress enforcement, and any second
-  framework shell.
+- dDRM, DKMS, content-market, creator, ESP capsule-side marketplace purchase
+  orchestration, standing grants, shell marketplace, Three.js/vendor assets,
+  reach/egress enforcement, and any second framework shell. Marketplace
+  already exercises `object://…/buy` and `import_runtime_custody` through the
+  gateway provider proxy today; only capsule-side orchestration of that flow
+  is out of scope for ESP v0.
 - Svelte or other framework UI. If a future visual shell needs components, the
   first implementation path is plain ES modules or native Web Components inside
   a shell/app capsule. Svelte is allowed only as an optional capsule-local compiler. It is never an ESP protocol dependency or trusted runtime surface.
@@ -194,6 +197,9 @@ Current claim boundary:
 - SSE ESP projection streams are not product-ready; ESP v0 is the current
   initialize descriptor plus tested HTTP route/fact projections.
 - Shell marketplace is not implemented.
+- Marketplace exercises `object://…/buy` and `import_runtime_custody` through
+  the gateway provider proxy today; ESP capsule-side purchase orchestration
+  remains out of scope.
 - Full second-shell product UX is not complete. The browser-facing `home-cli`
   terminal shell is implemented and machine-tested, but its current commit
   still needs operator-profile evidence; no additional framework shell is

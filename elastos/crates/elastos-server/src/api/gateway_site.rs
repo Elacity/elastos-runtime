@@ -238,6 +238,84 @@ pub(super) async fn serve_cid_root(
     serve_directory_root(&state, &cid).await
 }
 
+/// Published CID content is embeddable by a capsule page.
+///
+/// A capsule runs under `Cross-Origin-Embedder-Policy: require-corp` in an
+/// opaque origin, so every subresource it loads must say it may be embedded.
+/// Without this the fetch succeeds and the browser throws the bytes away:
+/// `ERR_BLOCKED_BY_RESPONSE.NotSameOriginAfterDefaultedToSameOriginByCoep`,
+/// a 200 that renders nothing. Capsule assets already answer `cross-origin`
+/// for the same reason, and this content is public by construction.
+const CID_CONTENT_CORP: &str = "cross-origin";
+
+/// Published CID content is also readable by a capsule's own `fetch`.
+///
+/// `Cross-Origin-Resource-Policy` lets a capsule EMBED this content -- an
+/// `<img>`, which is a no-cors request. Reading it with `fetch`, as the shelf
+/// does for an item's metadata document, is a CORS request from an opaque
+/// origin, and without this it fails before any status is seen: not a 404 a
+/// caller can act on, but a network error it cannot tell from a missing file.
+///
+/// `null` is the capsule origin, the same value the capsule's own assets are
+/// served with.
+const CID_CONTENT_ORIGIN: &str = "null";
+
+/// What a bare CID's bytes actually are.
+///
+/// A CID carries no name, so this route answered `application/octet-stream`
+/// for everything -- which a browser treats as a file to save rather than a
+/// picture to show, and which made every channel cover arrive in the
+/// downloads tray instead of on the card.
+///
+/// Decided from the bytes' own magic number, never from anything a caller
+/// said. Only a short list, and deliberately no `text/html` or `image/svg+xml`
+/// from an unnamed blob: both are documents that can carry script, and this
+/// origin is the one the Home's own pages are served from. A named path inside
+/// a CID bundle is a different case, handled by `content_type` and by the
+/// publishing flow that put a name there.
+pub(super) fn sniffed_cid_content_type(bytes: &[u8]) -> &'static str {
+    const UNKNOWN: &str = "application/octet-stream";
+    if bytes.len() < 12 {
+        return UNKNOWN;
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return "image/png";
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return "image/x-icon";
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf";
+    }
+    // ISO base media: `ftyp` at offset 4, with the brand deciding which.
+    if &bytes[4..8] == b"ftyp" {
+        return match &bytes[8..11] {
+            b"M4A" => "audio/mp4",
+            b"qt " => "video/quicktime",
+            _ => "video/mp4",
+        };
+    }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return "video/webm";
+    }
+    if bytes.starts_with(b"OggS") {
+        return "audio/ogg";
+    }
+    if bytes.starts_with(b"ID3") || bytes.starts_with(&[0xff, 0xfb]) {
+        return "audio/mpeg";
+    }
+    UNKNOWN
+}
+
 pub(super) async fn serve_ipfs_cid_root(
     State(state): State<GatewayState>,
     Path(cid): Path<String>,
@@ -250,7 +328,11 @@ pub(super) async fn serve_ipfs_cid_root(
     if let Ok(bytes) = tokio::fs::read(&raw_cache).await {
         return (
             StatusCode::OK,
-            [("content-type", "application/octet-stream")],
+            [
+                ("content-type", sniffed_cid_content_type(&bytes)),
+                ("cross-origin-resource-policy", CID_CONTENT_CORP),
+                ("access-control-allow-origin", CID_CONTENT_ORIGIN),
+            ],
             bytes,
         )
             .into_response();
@@ -267,7 +349,11 @@ pub(super) async fn serve_ipfs_cid_root(
             let _ = tokio::fs::write(&raw_cache, &bytes).await;
             (
                 StatusCode::OK,
-                [("content-type", "application/octet-stream")],
+                [
+                    ("content-type", sniffed_cid_content_type(&bytes)),
+                    ("cross-origin-resource-policy", CID_CONTENT_CORP),
+                    ("access-control-allow-origin", CID_CONTENT_ORIGIN),
+                ],
                 bytes,
             )
                 .into_response()
@@ -301,7 +387,16 @@ async fn serve_cid_path_result(
         if canonical_requested.starts_with(&canonical_cid_dir) {
             if let Ok(bytes) = tokio::fs::read(&requested).await {
                 let ct = content_type(file_path);
-                return Ok((StatusCode::OK, [("content-type", ct)], bytes).into_response());
+                return Ok((
+                    StatusCode::OK,
+                    [
+                        ("content-type", ct),
+                        ("cross-origin-resource-policy", CID_CONTENT_CORP),
+                        ("access-control-allow-origin", CID_CONTENT_ORIGIN),
+                    ],
+                    bytes,
+                )
+                    .into_response());
             }
         }
     }
@@ -315,7 +410,16 @@ async fn serve_cid_path_result(
             }
             let _ = tokio::fs::write(&cache_path, &bytes).await;
             let ct = content_type(file_path);
-            Ok((StatusCode::OK, [("content-type", ct)], bytes).into_response())
+            Ok((
+                StatusCode::OK,
+                [
+                    ("content-type", ct),
+                    ("cross-origin-resource-policy", CID_CONTENT_CORP),
+                    ("access-control-allow-origin", CID_CONTENT_ORIGIN),
+                ],
+                bytes,
+            )
+                .into_response())
         }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
@@ -454,10 +558,18 @@ pub(super) async fn serve_cid_file(
 
     match serve_cid_path_result(&state, &cid, &file_path).await {
         Ok(response) => response,
-        Err(StatusCode::BAD_REQUEST) => {
-            (StatusCode::BAD_REQUEST, "Invalid file path").into_response()
-        }
-        Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+        Err(StatusCode::BAD_REQUEST) => (
+            StatusCode::BAD_REQUEST,
+            [("access-control-allow-origin", CID_CONTENT_ORIGIN)],
+            "Invalid file path",
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [("access-control-allow-origin", CID_CONTENT_ORIGIN)],
+            "File not found",
+        )
+            .into_response(),
     }
 }
 

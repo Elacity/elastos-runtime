@@ -349,6 +349,15 @@ button {
   box-shadow: none;
 }
 
+/* `hidden` must win over the rule below it. An author `display: block` beats
+   the browser's own `[hidden] { display: none }`, so an icon the fallback had
+   already given up on stayed on screen as a broken-image placeholder next to
+   the glyph that replaced it. */
+.app-icon-img[hidden],
+.app-icon-glyph[hidden] {
+  display: none;
+}
+
 .app-icon-img {
   display: block;
   width: 100%;
@@ -896,4 +905,805 @@ button {
   .requirements-grid {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* Add a listing. The control sits above the shelf it adds to and uses the
+   same input and pill shapes as the rest of the surface. */
+
+.store-import-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.store-import-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.store-import-input {
+  flex: 1 1 260px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 12px;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  font-family: inherit;
+  font-size: 13px;
+  letter-spacing: 0;
+}
+
+.store-import-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.store-import-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+/* What a purchase is waiting for, beside the item's own facts. */
+.store-row-buy-note {
+  color: var(--text-secondary);
+}
+
+/* The three Media surfaces. A tab is a destination within a destination, so
+   it borrows the sidebar's selected treatment rather than inventing a second
+   vocabulary for the same idea. */
+.media-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.media-tabs.hidden {
+  display: none;
+}
+
+.media-tab {
+  padding: 6px 14px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.media-tab:hover {
+  color: var(--text-primary);
+  background: var(--el-lift);
+}
+
+.media-tab.selected {
+  color: var(--el-accent);
+  background: var(--el-lift-strong);
+  font-weight: 600;
+}
+
+.media-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The control that answers an empty surface, under the sentence explaining
+   it: an approval to give, or a failed read to try again. */
+.store-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: -8px;
+  padding-bottom: 24px;
+}
+
+/* What a row says instead of offering a control: a state, not a button. */
+.store-row-state {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+/* The shelf: one card per item, after `media-studio.html`.
+   Two shapes share it -- a video fills its frame, a document stands a page at
+   the foot of the card -- because a cover cropped to 16:9 loses the one thing
+   a document's cover is: its title.
+   The design's letter-spacing is not carried over: this capsule holds every
+   declaration at 0, and the product smoke enforces it. */
+.store-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+  gap: 18px;
+}
+
+.store-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--el-lift);
+  overflow: hidden;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.store-card:hover,
+.store-card:focus-within {
+  border-color: var(--el-accent);
+  box-shadow: 0 0 0 1px var(--el-accent), 0 16px 40px rgba(0, 0, 0, 0.45);
+  transform: translateY(-2px);
+}
+
+/* Nothing left to sell: legible, and no longer inviting. */
+.store-card[data-state="soldout"] {
+  opacity: 0.72;
+}
+
+.store-card[data-state="soldout"]:hover {
+  border-color: var(--border);
+  box-shadow: none;
+  transform: none;
+}
+
+.store-card-thumb {
+  position: relative;
+  overflow: hidden;
+  background: var(--el-lift-strong);
+}
+
+.store-card-video .store-card-thumb {
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+}
+
+.store-card-doc .store-card-thumb {
+  height: 236px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-top: 22px;
+}
+
+.store-card-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.4s ease;
+}
+
+.store-card:hover .store-card-img {
+  transform: scale(1.03);
+}
+
+.store-card-page {
+  width: 150px;
+  height: 196px;
+  object-fit: cover;
+  object-position: top;
+  border-radius: 4px 4px 0 0;
+  box-shadow: 0 -2px 18px rgba(0, 0, 0, 0.45);
+  background: #fff;
+  transition: transform 0.4s ease;
+}
+
+.store-card:hover .store-card-page {
+  transform: scale(1.03);
+}
+
+/* A document with no cover is still a document: a page with its title on it
+   says more than a generic glyph, and says it in the shape of the thing. */
+.store-card-page-fallback {
+  display: block;
+  width: 150px;
+  height: 196px;
+  padding: 16px 14px;
+  border-radius: 4px 4px 0 0;
+  background: #fff;
+  color: #111;
+  box-shadow: 0 -2px 18px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.store-card-page-fallback b {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.2;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.store-card-page-fallback i {
+  display: block;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 2px;
+  background: #d9dadf;
+}
+
+.store-card-page-fallback i:nth-of-type(1) {
+  margin-top: 14px;
+}
+
+.store-card-page-fallback i:nth-of-type(2) {
+  width: 86%;
+}
+
+.store-card-page-fallback i:nth-of-type(3) {
+  width: 92%;
+}
+
+.store-card-page-fallback i:nth-of-type(4) {
+  width: 64%;
+}
+
+.store-card-img[hidden],
+.store-card-page[hidden],
+.store-card-glyph[hidden],
+.store-card-page-fallback[hidden] {
+  display: none;
+}
+
+.store-card-glyph {
+  color: var(--text-muted);
+}
+
+.store-card-glyph svg {
+  width: 40px;
+  height: 40px;
+}
+
+.store-card-tag {
+  position: absolute;
+  top: 12px;
+  padding: 4px 9px;
+  border-radius: 7px;
+  color: #fff;
+  background: rgba(10, 11, 14, 0.75);
+  backdrop-filter: blur(6px);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+
+.store-card-tag-left {
+  left: 12px;
+}
+
+.store-card-tag-right {
+  right: 12px;
+}
+
+.store-card-tag-own {
+  color: #c3cdff;
+}
+
+.store-card-tag-owned {
+  color: #7fd6a8;
+}
+
+.store-card-tag-gone {
+  color: #ffb4a8;
+}
+
+/* Offered on hover, and only on something this person can actually open. */
+.store-card-play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 56px;
+  height: 56px;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--bg-page, #0f1014);
+  background: #fff;
+  opacity: 0;
+  transform: scale(0.9);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  cursor: pointer;
+}
+
+.store-card:hover .store-card-play,
+.store-card-play:focus-visible {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.store-card-play svg {
+  width: 20px;
+  height: 20px;
+  margin-left: 2px;
+}
+
+.store-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 16px 12px;
+  min-width: 0;
+}
+
+.store-card-doc .store-card-body {
+  padding: 14px 14px 8px;
+}
+
+.store-card-title {
+  color: var(--text-primary);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.store-card-doc .store-card-title {
+  font-size: 14px;
+  line-height: 1.3;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.store-card-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.store-card-progress:empty {
+  display: none;
+}
+
+.store-card-progress {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.store-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: auto 16px 0;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+
+.store-card-doc .store-card-foot {
+  margin: auto 14px 0;
+  padding: 8px 0 12px;
+  border-top: 0;
+}
+
+.store-card-price-block {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.store-card-price {
+  color: var(--text-primary);
+  font-family: var(--el-font-mono);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.store-card-doc .store-card-price {
+  font-size: 14px;
+}
+
+.store-card-price small {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.store-card-price-owned {
+  color: #7fd6a8;
+  font-family: inherit;
+}
+
+.store-card-price-sold {
+  color: var(--text-muted);
+}
+
+.store-card-stock {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.store-card-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.store-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.store-pill-primary {
+  color: var(--el-accent-ink);
+  background: var(--el-accent);
+}
+
+.store-pill-primary:hover {
+  filter: brightness(1.08);
+  background: var(--el-accent);
+}
+
+.store-icon-btn {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border: 0;
+  border-radius: 9px;
+  color: var(--text-secondary);
+  background: var(--el-lift-strong);
+  cursor: pointer;
+}
+
+.store-icon-btn:hover {
+  color: var(--text-primary);
+}
+
+.store-icon-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.store-icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* The end of a section: a place to put something new, the height of the cards
+   beside it so the row stays a row. */
+.store-card-add {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 300px;
+  padding: 16px;
+  border: 1.5px dashed var(--border-strong, var(--border));
+  border-radius: 16px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.store-card-add-glyph {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  background: var(--el-lift-strong);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.store-card-add-title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.store-card-add-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.store-section-count {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+/* Media's own head: which surface, and the one control that adds to it.
+   After `media-studio.html`; the design's letter-spacing is not carried over
+   because this capsule holds every declaration at 0. */
+.media-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 0 0 18px;
+}
+
+.media-head.hidden,
+.toolbar.hidden {
+  display: none;
+}
+
+.segmented {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-input);
+}
+
+.segmented button {
+  height: 36px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.segmented button:hover {
+  color: var(--text-primary);
+}
+
+.segmented button[aria-selected="true"] {
+  color: var(--text-primary);
+  background: var(--el-lift-strong);
+  font-weight: 600;
+}
+
+.segmented button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.add-form {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.add-form.hidden {
+  display: none;
+}
+
+.add-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.add-input {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 380px;
+  max-width: 100%;
+  height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-input);
+}
+
+.add-input:focus-within {
+  border-color: var(--el-accent);
+}
+
+.add-input input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 14px;
+  letter-spacing: 0;
+  outline: none;
+}
+
+.add-input-icon {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--text-muted);
+  border-radius: 6px 2px 6px 2px;
+}
+
+.add-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.store-pill-lg {
+  height: 44px;
+  padding: 0 20px;
+  border-radius: 12px;
+  font-size: 15px;
+}
+
+/* Filter by kind, and the order they arrive in. */
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 0 0 20px;
+}
+
+.chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.chip:hover {
+  border-color: var(--text-muted);
+  color: var(--text-primary);
+}
+
+.chip[aria-pressed="true"] {
+  color: var(--bg-page, #0f1014);
+  background: var(--text-primary);
+  border-color: var(--text-primary);
+  font-weight: 600;
+}
+
+.chip:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.chip .n {
+  margin-left: 4px;
+  opacity: 0.7;
+}
+
+.select {
+  appearance: none;
+  height: 36px;
+  padding: 0 30px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-family: inherit;
+  font-size: 13px;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* A frame and a page want different room. */
+.store-card-grid-wide {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.store-card-grid-page {
+  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+}
+
+.store-card-meta-mono {
+  font-family: var(--el-font-mono);
+}
+
+.store-card-add-button {
+  font-family: inherit;
+  background: transparent;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.store-card-add-button:hover {
+  border-color: var(--el-accent);
+  background: var(--el-accent-faint);
+}
+
+.store-card-add-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The toolbar's own controls sit together at its right edge. */
+.media-studio .toolbar > label,
+.media-studio .toolbar > #media-refresh {
+  flex: 0 0 auto;
+}
+
+.media-studio .toolbar {
+  gap: 8px;
+}
+
+.media-studio .chips {
+  flex: 1 1 auto;
+}
+
+/* A cover on its way. The frame carries the design's own shimmer until the
+   image lands, so a card is never a blank rectangle while it loads. */
+.media-studio .thumb-pending {
+  background: linear-gradient(90deg, #1b1d23 0%, #23252d 50%, #1b1d23 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+
+.media-studio .thumb img[data-cover="pending"] {
+  opacity: 0;
+}
+
+.media-studio .thumb img {
+  transition: opacity 0.18s ease;
 }

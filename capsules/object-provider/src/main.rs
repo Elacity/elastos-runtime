@@ -105,8 +105,17 @@ fn main() {
         };
         let is_shutdown = request.get("op").and_then(Value::as_str) == Some("shutdown");
         let response = provider.handle(request);
-        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-        stdout.flush().unwrap();
+        // A closed pipe means the Runtime that spawned this capsule is gone.
+        // There is nobody left to answer and nothing left to do, so leave the
+        // way every other capsule leaves -- quietly. Panicking here prints a
+        // backtrace as the last thing in the log, which reads as the cause of
+        // whatever went wrong when it is only the consequence of a shutdown
+        // that already happened.
+        if writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).is_err()
+            || stdout.flush().is_err()
+        {
+            break;
+        }
         if is_shutdown {
             break;
         }

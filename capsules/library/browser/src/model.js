@@ -159,8 +159,21 @@ export function canPreviewObject(object) {
   return !!previewKind(object);
 }
 
-export function isRuntimeCustodyProtectableVideo(object) {
+// A type the publish side cannot place. It refuses these before any listing
+// work rather than sealing something no viewer could ever open, so Library
+// must not offer the action for them either.
+const UNPLACEABLE_PROTECTED_CONTENT_MIME = "application/octet-stream";
+
+// Which protected item a file becomes once it is listed: "media" is the
+// transcoded audio/video rendition, "object" is everything else.
+export function protectedContentKindFor(mime) {
+  const value = String(mime || "");
+  return value.startsWith("video/") || value.startsWith("audio/") ? "media" : "object";
+}
+
+export function isRuntimeCustodyProtectable(object) {
   const capabilities = Array.isArray(object?.capabilities) ? object.capabilities : null;
+  const mime = String(object?.mime || "");
   return !!(
     object &&
     !isDirectory(object) &&
@@ -169,9 +182,27 @@ export function isRuntimeCustodyProtectableVideo(object) {
     !object.published &&
     !object?.metadata?.readonly &&
     !object?.metadata?.protected_content &&
-    String(object.mime || "").startsWith("video/") &&
+    mime !== "" &&
+    mime !== UNPLACEABLE_PROTECTED_CONTENT_MIME &&
     capabilities?.includes("publish")
   );
+}
+
+// A minted item is a `.ddrm` capsule, so its own mime says "application/json"
+// and tells us nothing about what it protects. The gateway records the asset's
+// real mime on the protected-content identity; prefer that, and fall back to
+// the object's own mime for anything published before capsules existed.
+export function assetMimeForProtectedContent(object) {
+  const recorded = object?.metadata?.protected_content?.asset_mime;
+  return typeof recorded === "string" && recorded.trim() !== ""
+    ? recorded
+    : String(object?.mime || "");
+}
+
+export function viewerForProtectedContent(object) {
+  return protectedContentKindFor(assetMimeForProtectedContent(object)) === "media"
+    ? "elacity-player"
+    : "elacity-reader";
 }
 
 const MAX_UINT256 = (1n << 256n) - 1n;

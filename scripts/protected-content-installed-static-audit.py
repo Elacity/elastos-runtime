@@ -50,6 +50,15 @@ ROLE_REQUIRED = {
         "custody-provider",
         "protected-content-decrypt-provider",
     ),
+    # A custody-host container hosts one of two provider sets, chosen by
+    # entrypoint.sh's `--role`. Both are expressed here because both ship:
+    # demanding the storage set of a custody-only node would fail a correct
+    # deployment, and demanding only the custody set of a storage node would
+    # let a broken one pass.
+    #
+    #   --role storage  (deploy/custody-host/docker-compose.yml's default,
+    #                   because a mint needs remote replicas and these are
+    #                   the only peers the harness has)
     "custody-host": (
         "custody-provider",
         "availability-provider",
@@ -58,7 +67,18 @@ ROLE_REQUIRED = {
         # rights evidence, so the chain plane is part of the slim role.
         "chain-provider",
     ),
+    #   --role custody  (entrypoint.sh's own default: custody IS the role.
+    #                   Key-share custody and release never reads ciphertext,
+    #                   so such a node runs no kubo and must never become a
+    #                   content-availability failure point.)
+    "custody-host-custody-only": (
+        "custody-provider",
+        "chain-provider",
+    ),
 }
+# Roles served by the deploy/custody-host container image. Slim shard-holders:
+# they never compose the 2-of-3 pool, but they do settle releases.
+CUSTODY_HOST_ROLES = ("custody-host", "custody-host-custody-only")
 ACTIVE_PROOF_PREREQUISITES = (
     "runtime_config_acceptance",
     "signed_custody_validation",
@@ -538,12 +558,14 @@ def audit_media(data_root, findings):
 def audit_operator_config(data_root, role, findings):
     protected = data_root / "protected-content"
     facts = {}
-    # custody-host is a slim shard-holder container: it never composes the
+    # A custody-host is a slim shard-holder container: it never composes the
     # 2-of-3 custody pool, so custody-composition.json is not provisioned
     # onto it and must not be demanded. It DOES settle every release through
     # its own chain rights evidence, so the chain config is required there
-    # too (synced from /shared by its entrypoint).
-    if role == "custody-host":
+    # too (synced from /shared by its entrypoint). Both --role variants are
+    # identical in this respect: the storage role adds content planes, not
+    # operator configuration.
+    if role in CUSTODY_HOST_ROLES:
         requirements = ((protected / "chain-provider.json", "chain_config"),)
     else:
         requirements = (
@@ -555,7 +577,7 @@ def audit_operator_config(data_root, role, findings):
         facts[name] = present
         if not present:
             findings.config(name)
-    if role in ("custody-node", "custody-host"):
+    if role == "custody-node" or role in CUSTODY_HOST_ROLES:
         state = owner_only(protected / "custody-provider/inactive", directory=True)
         facts["custody_state"] = state
         if not state:

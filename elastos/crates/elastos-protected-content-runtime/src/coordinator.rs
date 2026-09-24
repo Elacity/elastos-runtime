@@ -23,10 +23,44 @@ use crate::{
     RuntimeReleaseTerminalResult,
 };
 
+/// Why a provider call did not yield an exact result, classified by whether the
+/// provider can have had a durable effect.
+///
+/// A caller holding a journal has to decide, on failure, whether to record a
+/// terminal abort. That decision turns on one question — could the provider have
+/// acted? — and only some failures answer it. A custody node that refuses
+/// *before* its durable write and one that fails *after* it can return the same
+/// transport-level shape, so a variant here claims "without effect" only where
+/// the provider contract guarantees the refusal precedes any write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RuntimeProviderCallError {
+    /// The call never left this Runtime: the request could not be encoded. No
+    /// provider saw it, so none can have acted on it.
+    #[error("provider call was not dispatched")]
+    NotDispatched,
+    /// The provider answered and refused with a code its contract emits only
+    /// before any durable write. The effect is provably absent.
+    #[error("provider refused the request without acting")]
+    RefusedWithoutEffect,
+    /// The call left this Runtime and no usable answer came back, or the answer
+    /// carries a code that spans both acted and did-not-act paths. The effect is
+    /// unknown and must never be assumed absent.
     #[error("provider call did not return an exact result")]
     NoExactResult,
+}
+
+impl RuntimeProviderCallError {
+    /// Whether this failure proves the provider did not act.
+    ///
+    /// `false` means unknown, never "it acted". A caller may only skip a
+    /// terminal abort when this is `true`.
+    #[must_use]
+    pub const fn proves_no_effect(self) -> bool {
+        match self {
+            Self::NotDispatched | Self::RefusedWithoutEffect => true,
+            Self::NoExactResult => false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -850,7 +884,6 @@ mod tests {
     use std::sync::Mutex;
 
     use ed25519_dalek::{Signer as _, SigningKey};
-    use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
         ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
         CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1,
@@ -896,9 +929,10 @@ mod tests {
         read_viewer_media_part, RuntimeContentAvailabilityRequirement, RuntimeDecryptProvider,
         RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome, RuntimeMintDraft,
         RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintNodeReceipt,
-        RuntimeMintSelectedNode, RuntimeOpenError, RuntimeOpenViewerSessionInput,
-        RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
-        RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
+        RuntimeMintSelectedNode, RuntimeOpenError, RuntimeOpenViewerContentV1,
+        RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent,
+        RuntimePurchaseEffectAuthority, RuntimeVerifiedContentAvailability,
+        RuntimeVerifiedContentIdentityRootV1, RuntimeVerifiedPurchaseEffect,
     };
 
     const NOW: u64 = 2_000_000_000;
@@ -1280,9 +1314,7 @@ mod tests {
             )
             .unwrap();
             let (signature, recovery_id) = wallet_key(wallet_seed)
-                .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                    &request.canonical_bytes().unwrap(),
-                ))
+                .sign_prehash_recoverable(&request.signing_hash().unwrap())
                 .unwrap();
             let mut signature_bytes = signature.to_bytes().to_vec();
             signature_bytes.push(recovery_id.to_byte());
@@ -3134,7 +3166,7 @@ mod tests {
             NOW + 11,
             digest(0x7e),
             mint.draft().encrypted_content().clone(),
-            mint.draft().media_identity().media_manifest_root(),
+            RuntimeVerifiedContentIdentityRootV1::for_media(mint.draft().media_identity().unwrap()),
         )
         .unwrap()
     }
@@ -3336,6 +3368,17 @@ mod tests {
             )
             .map_err(|_| RuntimeProviderCallError::NoExactResult)
         }
+
+        // This fake is media-only (see the hardcoded `clear_init`/`clear_segment`
+        // fields above); no test in this module exercises the object viewer
+        // path, so this arm fails closed rather than fabricating a plaintext
+        // chunk response.
+        async fn read_viewer_object_chunk(
+            &self,
+            _request: &DecryptProviderRequestV1,
+        ) -> Result<DecryptProviderResponseV1, RuntimeProviderCallError> {
+            Err(RuntimeProviderCallError::NoExactResult)
+        }
     }
 
     #[tokio::test]
@@ -3430,8 +3473,10 @@ mod tests {
                 signed_runtime_release_operation: &allowed,
                 expected_terminal_issuer: terminal.statement().issuer(),
                 content_key_commitment: envelope.manifest().content_key_commitment(),
-                media_identity: available.draft().media_identity(),
-                protected_init_segment: &protected_init,
+                content: RuntimeOpenViewerContentV1::Media {
+                    media_identity: available.draft().media_identity().unwrap(),
+                    protected_init_segment: &protected_init,
+                },
                 signed_node_contributions: &contributions,
                 signed_terminal_receipt: &terminal,
                 now_unix_seconds: NOW + 10,

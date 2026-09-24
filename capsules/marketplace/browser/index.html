@@ -6,9 +6,35 @@
   <title>Apps · ElastOS</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
-  <link rel="stylesheet" href="marketplace.css?v=marketplace-20260826a">
+  <link rel="stylesheet" href="marketplace.css?v=marketplace-20260923a">
+  <link rel="stylesheet" href="media-studio.css?v=marketplace-20260923a">
 </head>
 <body>
+  <!-- The design's own icon sprite, from `media-studio.html`, so the shelf
+       draws the icons it was drawn with rather than approximations. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-search"   viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-discover" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14"/></symbol>
+    <symbol id="i-media"    viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9.5 5 2.5-5 2.5z"/></symbol>
+    <symbol id="i-box"      viewBox="0 0 24 24"><path d="M12 3 20 7.5v9L12 21 4 16.5v-9z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></symbol>
+    <symbol id="i-viewer"   viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></symbol>
+    <symbol id="i-file"     viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+    <symbol id="i-server"   viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="7" rx="2"/><rect x="4" y="13" width="16" height="7" rx="2"/><path d="M8 7.5h.01M8 16.5h.01"/></symbol>
+    <symbol id="i-grid"     viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></symbol>
+    <symbol id="i-shop"     viewBox="0 0 24 24"><path d="M4 9h16l-1.5-5h-13z"/><path d="M5 9v11h14V9"/><path d="M10 20v-5h4v5"/></symbol>
+    <symbol id="i-share"    viewBox="0 0 24 24"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></symbol>
+    <symbol id="i-plus"     viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-link"     viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></symbol>
+    <!-- An image is looked at rather than played; the design's sprite has no
+         eye, so this one is drawn in its style. -->
+    <!-- Drawn in the sprite's style; the design has no refresh glyph. -->
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3.2"/></symbol>
+    <symbol id="i-play"     viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
+    <symbol id="i-more"     viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></symbol>
+  </svg>
+
   <div class="store-shell">
     <aside id="store-sidebar" class="store-sidebar" aria-label="Apps">
       <div class="store-product-name">Apps</div>
@@ -70,6 +96,56 @@
 
     <main id="store-main" class="store-main">
       <h1 id="store-title" class="store-title">Discover</h1>
+      <!-- Media is three surfaces behind one title: the items this Home can
+           open, the channels that publish them, and the ones it listed
+           itself. They load separately, because one being unreachable must
+           not hide the others. -->
+      <div id="media-head" class="page-head media-head hidden">
+        <nav id="media-tabs" class="segmented" role="tablist" aria-label="Media views">
+          <button role="tab" aria-selected="true" type="button" data-media-tab="explore">Explore</button>
+          <button role="tab" aria-selected="false" type="button" data-media-tab="shops">Shops</button>
+          <button role="tab" aria-selected="false" type="button" data-media-tab="mine">My listings</button>
+        </nav>
+        <!-- Items listed on another Home reach this one by their link. The
+             control lives in the page rather than in the rendered shelf so
+             that a refresh finishing mid-typing cannot empty the field. -->
+        <form id="import-listing" class="add-form hidden" autocomplete="off">
+          <div class="add-field">
+            <label class="add-input" for="import-listing-uri">
+              <svg class="icon" style="width:16px;height:16px" aria-hidden="true"><use href="#i-link"/></svg>
+              <span class="sr-only">Listing link</span>
+              <input
+                id="import-listing-uri"
+                type="text"
+                name="listing_uri"
+                inputmode="url"
+                placeholder="Paste an elastos:// link to add a listing"
+                spellcheck="false"
+                autocomplete="off"
+                aria-describedby="import-listing-hint"
+              >
+            </label>
+            <p id="import-listing-hint" class="add-hint">Paste the link the creator gave you.</p>
+          </div>
+          <button id="import-listing-submit" class="btn btn-primary btn-lg" type="submit">Add listing</button>
+        </form>
+      </div>
+      <div id="media-toolbar" class="toolbar hidden">
+        <div id="media-chips" class="chips" role="group" aria-label="Filter by type"></div>
+        <button id="media-refresh" class="btn btn-icon" type="button" data-action="refresh-media"
+                title="Read the market again" aria-label="Refresh">
+          <svg class="icon" style="width:16px;height:16px" aria-hidden="true"><use href="#i-refresh"/></svg>
+        </button>
+        <label class="toolbar-sort">
+          <span class="sr-only">Sort</span>
+          <select id="media-sort" class="select">
+            <option value="newest">Newest first</option>
+            <option value="price-asc">Price: low to high</option>
+            <option value="price-desc">Price: high to low</option>
+            <option value="title">Title A–Z</option>
+          </select>
+        </label>
+      </div>
       <section id="loading-state" class="store-loading" aria-label="Loading"></section>
       <section id="load-error" class="store-error hidden" aria-live="polite"></section>
       <div id="store-sections" class="store-sections"></div>
@@ -82,6 +158,6 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="marketplace.js?v=marketplace-20260826a"></script>
+  <script type="module" src="marketplace.js?v=marketplace-20260923a"></script>
 </body>
 </html>

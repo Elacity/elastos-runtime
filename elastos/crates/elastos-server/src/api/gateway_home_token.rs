@@ -464,6 +464,22 @@ pub(in crate::api) fn require_home_runtime_wallet_authority(
     runtime_wallet_authority(&required)
 }
 
+/// The Wallet authority carried by an app capsule's own launch token.
+///
+/// Same rule as every other authority here: it comes from a verified launch
+/// token for one of the named capsules, never from the shape of a route. It
+/// exists because a creator capsule already mints this authority to publish --
+/// this only lets a read-only surface ask the same question without widening
+/// what the capsule may do.
+pub(in crate::api) fn require_app_runtime_wallet_authority(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let required = require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)?;
+    runtime_wallet_authority(&required)
+}
+
 pub(in crate::api) fn runtime_wallet_authority(
     required: &RequiredHomeLaunchToken,
 ) -> anyhow::Result<RuntimeWalletAuthority> {

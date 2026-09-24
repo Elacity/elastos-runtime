@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260802a";
+const moduleVersion = "home-20260909a";
 const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;

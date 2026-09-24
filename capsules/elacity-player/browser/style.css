@@ -53,11 +53,26 @@ body {
   object-fit: contain;
 }
 
+/* A rendition with no image track AND no poster draws no picture at all: the
+   frame shrinks to its controls and sits centred instead of stretching over the
+   whole viewport. A poster keeps the full frame so it has somewhere to show. */
+#player-video.audio-only {
+  height: auto;
+  min-height: 54px;
+  max-width: min(640px, calc(100vw - 32px));
+  margin: calc(50vh - 27px) auto 0;
+}
+
 .player-overlay {
   position: absolute;
   inset: 0;
   display: grid;
-  place-items: center;
+  /* The overlay carries its sentence and, when asking again could work, one
+     control under it. Centring the content rather than the cells keeps the two
+     together instead of pushing them to opposite ends of the frame. */
+  align-content: center;
+  justify-items: center;
+  gap: 14px;
   padding: 24px;
   text-align: center;
   background: rgba(0, 0, 0, 0.52);
@@ -74,6 +89,27 @@ body {
   color: #f4f7fb;
   font-size: 1rem;
   line-height: 1.5;
+}
+
+/* The one control the overlay ever offers: ask again. */
+.player-action {
+  padding: 8px 18px;
+  border: 1px solid rgba(214, 222, 240, 0.28);
+  border-radius: 999px;
+  background: rgba(244, 247, 251, 0.1);
+  color: #f4f7fb;
+  font: inherit;
+  font-size: 0.9375rem;
+  cursor: pointer;
+}
+
+.player-action:hover {
+  background: rgba(244, 247, 251, 0.18);
+}
+
+.player-action:focus-visible {
+  outline: 2px solid #8ab4ff;
+  outline-offset: 2px;
 }
 
 @media (max-width: 720px) {

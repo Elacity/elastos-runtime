@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -178,19 +179,61 @@ function assertProtectedPrincipalRootAccessor(source, needle, helper, label) {
   );
 }
 
+// Names skipped everywhere, whether or not git ignores them: the git dir
+// itself, runtime state, and agent-harness context that some clones track.
+const ALWAYS_SKIPPED_NAMES = new Set([
+  ".git",
+  ".elastos",
+  ".superpowers",
+  "superpowers",
+  ".claude",
+  "target",
+  "node_modules",
+]);
+
+// Everything git ignores, resolved once. A CI checkout is clean, so this set
+// is empty there and the walks below see exactly the tracked tree; a working
+// clone accumulates untracked harness litter (.remember/, .vscode/, editor
+// overrides) that must not be judged as repository source of truth. Deriving
+// the skip set from git instead of a hand-maintained denylist keeps the two
+// environments identical as new tooling appears.
+let ignoredPathsCache = null;
+
+function ignoredPaths() {
+  if (ignoredPathsCache) {
+    return ignoredPathsCache;
+  }
+  ignoredPathsCache = new Set();
+  try {
+    const listing = execFileSync(
+      "git",
+      ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+      { cwd: repoRootPath, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    for (const line of listing.split("\n")) {
+      const path = line.trim().replace(/\/$/, "");
+      if (path) {
+        ignoredPathsCache.add(path);
+      }
+    }
+  } catch {
+    // No git, or not a work tree: fall back to ALWAYS_SKIPPED_NAMES alone.
+  }
+  return ignoredPathsCache;
+}
+
+function isSkipped(dir, name) {
+  if (ALWAYS_SKIPPED_NAMES.has(name)) {
+    return true;
+  }
+  return ignoredPaths().has(relativeToRepo(resolve(dir, name)));
+}
+
 function listMarkdownFiles(dir = repoRootPath) {
   const entries = readdirSync(dir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (
-      entry.name === ".git" ||
-      entry.name === ".elastos" ||
-      entry.name === ".superpowers" ||
-      entry.name === "superpowers" ||
-      entry.name === ".claude" ||
-      entry.name === "target" ||
-      entry.name === "node_modules"
-    ) {
+    if (isSkipped(dir, entry.name)) {
       continue;
     }
     const full = resolve(dir, entry.name);
@@ -207,15 +250,7 @@ function listTextFiles(dir) {
   const entries = readdirSync(dir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (
-      entry.name === ".git" ||
-      entry.name === ".elastos" ||
-      entry.name === ".superpowers" ||
-      entry.name === "superpowers" ||
-      entry.name === ".claude" ||
-      entry.name === "target" ||
-      entry.name === "node_modules"
-    ) {
+    if (isSkipped(dir, entry.name)) {
       continue;
     }
     const full = resolve(dir, entry.name);
@@ -1846,7 +1881,7 @@ const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
 const homeGuiAssetVersion = "home-20260813a";
-const homeShellHostAssetVersion = "home-20260802a";
+const homeShellHostAssetVersion = "home-20260909a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2287,9 +2322,15 @@ assert(
   "Home must allow Browser to route file chooser requests into Library through an explicit source gate",
 );
 assert(
+  shellJs.includes('creator: new Set(["library"])'),
+  "Home must allow Creator to route users into Library after a listing",
+);
+assert(
   shellJs.includes('"gba-emulator": new Set(["library"])') &&
-    shellJs.includes('library: new Set(["archive-manager", "documents", "gba-emulator", "library"])'),
-  "Home must allow GBA to open Library and Library to return compatible ROMs while keeping both directions source-gated",
+    shellJs.includes(
+      'library: new Set(["archive-manager", "documents", "elacity-player", "elacity-reader", "gba-emulator", "library"])',
+    ),
+  "Home must allow GBA to open Library, Library to return compatible ROMs, and Library to open protected items in Elacity Player or Elacity Reader, all source-gated",
 );
 assert(
   shellIndex.includes(`home-shell-host.js?v=${homeShellHostAssetVersion}`),
@@ -4726,7 +4767,7 @@ const protectedHomeDependencies = new Set([
   "media-provider",
   "protected-content-decrypt-provider",
 ]);
-const protectedHomeSurface = ["library", "marketplace", "elacity-player"];
+const protectedHomeSurface = ["library", "marketplace", "elacity-player", "elacity-reader"];
 for (const [profileName, profile] of Object.entries(components.profiles)) {
   const profileList = profile.components || [];
   const profileComponents = new Set(profileList);
@@ -4739,6 +4780,141 @@ for (const [profileName, profile] of Object.entries(components.profiles)) {
     }
   }
 }
+// Elacity Reader carries the two libraries it draws with inside its own tree.
+// Each file is pinned by its own digest in the notes beside it, and the digest
+// is checked against the bytes here rather than taken on trust, so a swapped
+// library fails this check instead of shipping.
+const elacityReaderManifest = JSON.parse(read("capsules/elacity-reader/capsule.json"));
+assert(
+  elacityReaderManifest.name === "elacity-reader" &&
+    elacityReaderManifest.role === "viewer" &&
+    elacityReaderManifest.icon === "browser/icons" &&
+    elacityReaderManifest.entrypoint === "browser/index.html" &&
+    // No graphics allocation is asked for: the runtime reads this field for a
+    // machine's own hardware, and a page that draws in three dimensions gets
+    // that from the frame it runs in, exactly as the emulator capsule does.
+    elacityReaderManifest.resources?.gpu === false &&
+    fileExists("capsules/elacity-reader/browser/icons/icon.svg") &&
+    fileExists("capsules/elacity-reader/browser/icons/icon-32.png") &&
+    fileExists("capsules/elacity-reader/browser/icons/icon-64.png") &&
+    fileExists("capsules/elacity-reader/browser/icons/icon-128.png") &&
+    fileExists("capsules/elacity-reader/browser/icons/icon-256.png"),
+  "Elacity Reader must stay a viewer capsule with capsule-owned icons and no graphics allocation",
+);
+const elacityReaderPdfjsVersion = "4.10.38";
+const elacityReaderThreeVersion = "0.160.0";
+const elacityReaderCarriedLibraries = [
+  {
+    readme: "capsules/elacity-reader/browser/vendor/pdfjs/README.md",
+    package: "pdfjs-dist",
+    version: elacityReaderPdfjsVersion,
+    license: "Apache-2.0",
+    integrity:
+      "sha512-/Y3fcFrXEAsMjJXeL9J8+ZG9U01LbuWaYypvDW2ycW1jL269L3js3DVBjDJ0Up9Np1uqDXsDrRihHANhZOlwdQ==",
+    shasum: "3ee698003790dc266cc8b55c0e662ccb9ae18f53",
+    files: [
+      ["capsules/elacity-reader/browser/vendor/pdfjs/LICENSE", "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"],
+      ["capsules/elacity-reader/browser/vendor/pdfjs/pdf.min.mjs", "27fc2a057a00f92a4334ad06e17dbd7259912954e9fb7f76400bcca5fd190a9c"],
+      ["capsules/elacity-reader/browser/vendor/pdfjs/pdf.worker.min.mjs", "1baa1844c89c80a5b2797c916e75ab29254be46d8e9cb53cb6364d7aad84be36"],
+    ],
+  },
+  {
+    readme: "capsules/elacity-reader/browser/vendor/three/README.md",
+    package: "three",
+    version: elacityReaderThreeVersion,
+    license: "MIT",
+    integrity:
+      "sha512-DLU8lc0zNIPkM7rH5/e1Ks1Z8tWCGRq6g8mPowdDJpw1CFBJMU7UoJjC6PefXW7z//SSl0b2+GCw14LB+uDhng==",
+    shasum: "cd1e4dbd01aee0719280a9086d75545db52b7a8f",
+    files: [
+      ["capsules/elacity-reader/browser/vendor/three/LICENSE", "852e0e8699169bf9f6fdc6bda3e682d078dcbc738b5d33e74df594721bff271d"],
+      ["capsules/elacity-reader/browser/vendor/three/three.module.js", "76dea8151bc9352aef3528b4262e249b2604f62543828328db978d060d61a495"],
+      ["capsules/elacity-reader/browser/vendor/three/controls/OrbitControls.js", "5a44a9e86a2a0fb11933eed69bc2cd33c76a496854c1aed6ed776efa87d7b064"],
+      ["capsules/elacity-reader/browser/vendor/three/loaders/GLTFLoader.js", "d073b438e6a07e1359741dd5d6c76c953420cc0d4fd84eb1bdde94315540e6a3"],
+      ["capsules/elacity-reader/browser/vendor/three/loaders/OBJLoader.js", "022e0334f837c60506276e136faf3e54b21b20aea672eed4a0c50651d4fc0a5d"],
+      ["capsules/elacity-reader/browser/vendor/three/loaders/STLLoader.js", "896d006a48b8f125385a485ccae154dadee801a953f0b45ceffe7ddd8a29ca93"],
+      ["capsules/elacity-reader/browser/vendor/three/utils/BufferGeometryUtils.js", "9be041e96308775d00e2695cc607645b9a9b64fd7c0e759dd8f7c00a8d92becb"],
+    ],
+  },
+];
+for (const library of elacityReaderCarriedLibraries) {
+  const notes = read(library.readme);
+  assert(
+    notes.includes(`npm package: \`${library.package}\``) &&
+      notes.includes(`version: \`${library.version}\``) &&
+      notes.includes(`license: ${library.license}`) &&
+      notes.includes(library.integrity) &&
+      notes.includes(library.shasum) &&
+      notes.includes("Verification command:"),
+    `${library.package} notes must pin the package, version, license, npm integrity, npm shasum and a runnable verification command`,
+  );
+  for (const [path, digest] of library.files) {
+    assert(
+      notes.includes(digest),
+      `${library.package} notes must carry the digest recorded for ${path}`,
+    );
+    assert(
+      createHash("sha256").update(readBytes(path)).digest("hex") === digest,
+      `${path} must match the digest its notes record`,
+    );
+  }
+}
+const elacityReaderIndex = read("capsules/elacity-reader/browser/index.html");
+const elacityReaderImportMap = elacityReaderIndex.match(
+  /<script type="importmap">([\s\S]*?)<\/script>/,
+)?.[1];
+assert(
+  typeof elacityReaderImportMap === "string" &&
+    elacityReaderIndex.includes(
+      `sha256-${createHash("sha256").update(elacityReaderImportMap).digest("base64")}`,
+    ) &&
+    elacityReaderImportMap.includes(
+      `./vendor/three/three.module.js?v=three-${elacityReaderThreeVersion}`,
+    ),
+  "Elacity Reader must admit its one inline name map by the exact digest of that map and nothing else",
+);
+assert(
+  elacityReaderIndex.includes("worker-src 'none'") &&
+    elacityReaderIndex.includes("frame-src 'none'") &&
+    elacityReaderIndex.includes("child-src 'none'") &&
+    elacityReaderIndex.includes("object-src 'none'") &&
+    elacityReaderIndex.includes("base-uri 'none'") &&
+    elacityReaderIndex.includes("form-action 'none'") &&
+    elacityReaderIndex.includes("media-src 'none'") &&
+    elacityReaderIndex.includes("img-src 'self' data: blob:") &&
+    elacityReaderIndex.includes("connect-src 'self'") &&
+    elacityReaderIndex.includes("style-src 'self'") &&
+    !elacityReaderIndex.includes("unsafe-inline") &&
+    !elacityReaderIndex.includes("unsafe-eval") &&
+    !elacityReaderIndex.includes("<iframe"),
+  "Elacity Reader page rules must stay closed: no background thread, no nested frame, no inline anything",
+);
+const elacityReaderRender = read("capsules/elacity-reader/browser/render.js");
+assert(
+  elacityReaderRender.includes(`const PDFJS_VERSION = "pdfjs-${elacityReaderPdfjsVersion}"`) &&
+    elacityReaderRender.includes(`const THREE_VERSION = "three-${elacityReaderThreeVersion}"`) &&
+    elacityReaderRender.includes("globalThis.pdfjsWorker = { WorkerMessageHandler }") &&
+    !elacityReaderRender.includes("new Worker(") &&
+    !elacityReaderRender.includes("srcdoc") &&
+    !elacityReaderRender.includes("innerHTML") &&
+    !elacityReaderRender.includes("outerHTML"),
+  "Elacity Reader must draw a document on the page thread and never turn a chapter back into markup",
+);
+const elacityReaderEpub = read("capsules/elacity-reader/browser/epub.js");
+assert(
+  !elacityReaderEpub.includes("innerHTML") &&
+    !elacityReaderEpub.includes("outerHTML") &&
+    !elacityReaderEpub.includes("srcdoc") &&
+    !elacityReaderEpub.includes("image/svg+xml"),
+  "Elacity Reader must rebuild a chapter as nodes and never mint a source over a drawing",
+);
+const marketplaceManifest = JSON.parse(read("capsules/marketplace/capsule.json"));
+assert(
+  marketplaceManifest.interfaces.some((iface) =>
+    iface.methods.some((m) => m.resource === "elastos://object/*" && m.operation === "buy" && m.approval === "user"),
+  ),
+  "Marketplace must declare the protected-content buy affordance it exercises",
+);
 for (const provider of protectedRuntimeProviders) {
   assert(
     publishReleaseSupportEntries.filter((component) => component === provider).length === 1,
@@ -5650,8 +5826,13 @@ assert(
     inbox.includes("inspect-approve-request:") &&
     inbox.includes("inspect-deny-request:") &&
     inbox.includes('entry.kind !== "inspect_action_request"') &&
-    inbox.includes("wallet-price-http-approve:") &&
-    inbox.includes("wallet-price-http-deny:") &&
+    // Matched by SHAPE rather than by naming each request: every
+    // "<what>-http-approve:<source>" pairs with "<what>-http-deny:<source>",
+    // and the Inbox derives one from the other. Naming them one at a time is
+    // why the creator's channel-list request first arrived with nothing to
+    // press but "Open".
+    inbox.includes('actionId.includes("-http-approve:")') &&
+    inbox.includes('actionId.replace("-http-approve:", "-http-deny:")') &&
     gatewayApi.includes("append_runtime_capability_notifications") &&
     gatewayApi.includes("/api/capability/pending") &&
     gatewayTests.includes(
