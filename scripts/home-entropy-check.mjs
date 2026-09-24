@@ -12524,13 +12524,35 @@ assert(
   );
 
   assert(
-    phoneRule("    --phone-launcher-h: calc(100dvh - var(--stage-top) - 8px - var(--taskbar-h) - var(--taskbar-offset) - env(safe-area-inset-bottom, 0px));") &&
-      phoneRule("  .launcher-header-btn {\n    width: var(--el-touch-target);\n    height: var(--el-touch-target);") &&
-      phoneRule('  .launcher[data-view="grid"] .launcher-card-title {\n    display: -webkit-box;\n    -webkit-box-orient: vertical;\n    -webkit-line-clamp: 2;') &&
-      !homeGuiStyle.includes("min(48vh, 380px)") &&
-      read("capsules/home-gui/browser/shell-surface.js").includes("function shouldFocusLauncherSearch() {\n  // Typed search lives in Spotlight; the launcher is browse-only.\n  return false;\n}") &&
-      (shellBaseline[1].match(/    launcher: \{ targets: 0, text: 0 \},/g) || []).length === 2,
-    "Launcher phone sheet: the Apps face fills the stage from 8 px under the bar to the Dock, grid names wrap to two lines, the view toggle is 44 px, and opening never focuses a field (no keyboard jump), held at 0 small targets and 0 small text on both phone profiles by the phone smoke",
+    read("capsules/home-gui/browser/shell-surface.js").includes("function shouldFocusLauncherSearch() {\n  // Typed search lives in Spotlight; the launcher is browse-only.\n  return false;\n}"),
+    "Launcher: browse-only; opening never focuses a field (no keyboard jump on a touch tablet), typed search is Spotlight's",
+  );
+
+  // The phone Home is the app grid, as on every phone OS; the desktop, its
+  // files and the Apps sheet are the tablet and desktop presentation.
+  const phoneHomeModule = read("capsules/home-gui/browser/shell-phone-home.js");
+  assert(
+    phoneHomeModule.includes("export const PHONE_DOCK_SLOTS = 4;") &&
+      phoneHomeModule.includes("  return pins.slice(0, PHONE_DOCK_SLOTS);") &&
+      phoneHomeModule.includes('const DOCK_TILE_TARGETS = ["assistant"];') &&
+      phoneHomeModule.includes("  const onHome = targets.filter((app) => !inDock.has(app.target));") &&
+      homeGuiTemplateHtml.includes('<nav id="phone-home" class="phone-home" aria-label="Apps"></nav>') &&
+      shellSurface.includes("  syncDesktopFirstRunHint();\n  renderPhoneHome(summary);\n}") &&
+      shellSurface.includes("  renderTaskbar(shellState.currentSummary);\n  renderPhoneHome(shellState.currentSummary);\n  refreshLauncherIfVisible();") &&
+      shellSurface.includes('    attachTargetIconInteractions(button, app.target, "home");') &&
+      shellSurface.includes('  if (target.source !== "home" || shelfPins(shellState.currentSummary).length < PHONE_DOCK_SLOTS) {') &&
+      shellSurface.includes('    entry.dataset.phoneDock = phoneDockIds.has(app.target) ? "slot" : "off";') &&
+      shellSurface.includes('  // On the phone the Bin is a Library place, not a Dock tile.\n  entry.dataset.phoneDock = "off";') &&
+      shellSurface.includes('  if (isPhone()) {\n    return [{ action: "change-wallpaper", label: "Change Wallpaper…" }];\n  }') &&
+      homeGuiStyle.includes("/* The phone Home screen; the phone layer below shows it. */\n.phone-home {\n  display: none;\n}") &&
+      phoneRule('  .desktop-shortcuts,\n  .desktop-first-run-hint,\n  .taskbar-item-launcher,\n  .taskbar-sortable > .taskbar-separator,\n  .taskbar-entry[data-phone-dock="off"] {\n    display: none;\n  }') &&
+      phoneRule("  .phone-home {\n    position: fixed;\n    top: var(--stage-top);\n    right: 0;\n    bottom: var(--stage-bottom);\n    left: 0;") &&
+      phoneRule("    grid-template-columns: repeat(4, minmax(0, 1fr));") &&
+      phoneRule("  .phone-home-icon {\n    width: 60px;\n    height: 60px;") &&
+      justfile.includes("node --test scripts/home-phone-home.test.mjs") &&
+      phoneSmoke.includes("...phoneHomeFailures(run)") &&
+      phoneSmoke.includes('    id: "launcher",\n    // The phone Home is the app grid; the Apps sheet exists off the phone.\n    phone: false,'),
+    "Phone Home screen: the resting screen is a 4-column app grid between the bar and the Dock; the Dock holds the first 4 Shelf pins beside the Assistant and an app is in the Dock or on the grid, never both; the Apps button, desktop files and the Dock's Bin and running apps stand down on the phone (Library has the Desktop and the Bin); unit-tested in verify and probed by the phone smoke",
   );
 
   assert(

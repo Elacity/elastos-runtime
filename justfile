@@ -177,6 +177,7 @@ verify:
     node --test scripts/home-sheet-handle.test.mjs
     node --test scripts/home-link-status.test.mjs
     node --test scripts/home-touch-long-press.test.mjs
+    node --test scripts/home-phone-home.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     ./scripts/browser-local-exit-orphan-cleanup-smoke.sh

@@ -90,6 +90,7 @@ import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260813a";
 import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
 import { bindSheetHandle, SHEET_DRAG_DOWN } from "./shell-sheet-handle.js?v=home-20260813a";
 import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
+import { PHONE_DOCK_SLOTS, phoneDockTargetIds, phoneHomeTargets } from "./shell-phone-home.js?v=home-20260813a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -146,6 +147,30 @@ export function renderDesktop(summary) {
   syncDesktopIconsVisibility();
   updateDesktopSelectionState();
   syncDesktopFirstRunHint();
+  renderPhoneHome(summary);
+}
+
+function shelfPins(summary) {
+  return shellState.shellLayoutState.taskbar.filter((targetId) => Boolean(targetById(summary, targetId)));
+}
+
+// Rendered at every size; only the phone stylesheet shows it.
+function renderPhoneHome(summary) {
+  const grid = document.querySelector("#phone-home");
+  const template = document.querySelector("#phone-home-item-template");
+  if (!grid || !template) {
+    return;
+  }
+  grid.replaceChildren();
+  for (const app of phoneHomeTargets(allVisibleTargets(summary), shelfPins(summary))) {
+    const button = template.content.firstElementChild.cloneNode(true);
+    button.dataset.target = app.target;
+    button.setAttribute("aria-label", `Open ${app.title}`);
+    mountGlyph(button.querySelector(".phone-home-icon"), app.target);
+    button.querySelector(".phone-home-title").textContent = app.title;
+    attachTargetIconInteractions(button, app.target, "home");
+    grid.appendChild(button);
+  }
 }
 
 /* First-contact teaching (session-only): after the desktop stopped carrying
@@ -540,6 +565,8 @@ export function renderTaskbar(summary) {
 function renderTaskbarEntries(summary) {
   taskbarTargets.replaceChildren();
   const pinnedIds = new Set(shellState.shellLayoutState.taskbar);
+  // The phone Dock shows only these; the rest of the Shelf is on the Home grid.
+  const phoneDockIds = new Set(phoneDockTargetIds(shelfPins(summary)));
   const notificationCounts = notificationCountsBySourceApp(summary);
   let separatorInserted = false;
   for (const targetId of visibleTaskbarTargets(summary)) {
@@ -561,6 +588,7 @@ function renderTaskbarEntries(summary) {
     const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
     const button = entry.querySelector(".taskbar-item");
     const openCount = browserWindowCount(app.target);
+    entry.dataset.phoneDock = phoneDockIds.has(app.target) ? "slot" : "off";
     button.dataset.target = app.target;
     button.dataset.label = app.title;
     mountGlyph(button.querySelector(".taskbar-item-icon"), app.target);
@@ -596,6 +624,8 @@ function appendTaskbarTrash(summary) {
   const entryId = desktopObjectEntryId(trashObject);
   const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
   const button = entry.querySelector(".taskbar-item");
+  // On the phone the Bin is a Library place, not a Dock tile.
+  entry.dataset.phoneDock = "off";
   const empty = trashObject.metadata?.empty !== false;
   button.dataset.label = "Bin";
   button.setAttribute("aria-label", empty ? "Bin. Empty." : "Bin. Contains items.");
@@ -648,6 +678,7 @@ function commitTaskbarLayoutChange() {
     return;
   }
   renderTaskbar(shellState.currentSummary);
+  renderPhoneHome(shellState.currentSummary);
   refreshLauncherIfVisible();
 }
 
@@ -2052,6 +2083,10 @@ function contextMenuItems(target) {
       { action: "clear-desktop-selection", label: "Deselect All" },
     ];
   }
+  // The phone Home is the app grid; desktop files live in Library there.
+  if (isPhone()) {
+    return [{ action: "change-wallpaper", label: "Change Wallpaper…" }];
+  }
   const iconsVisible = shellState.shellLayoutState.desktopIconsVisible !== false;
   const items = [
     { action: "new-folder", label: "New Folder" },
@@ -2140,7 +2175,11 @@ function targetContextMenuItems(target) {
   if (target.source === "desktop" || target.source === "launcher") {
     items.push(desktopPinMenuItem(target.targetId));
   }
-  items.push(taskbarPinMenuItem(target.targetId));
+  // From the Home grid, pinning is offered only while the phone Dock has room
+  // for it; a full Dock would leave the app on the grid.
+  if (target.source !== "home" || shelfPins(shellState.currentSummary).length < PHONE_DOCK_SLOTS) {
+    items.push(taskbarPinMenuItem(target.targetId));
+  }
   appendTargetGroupManagementItems(items, openWindows);
   return items;
 }

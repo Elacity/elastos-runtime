@@ -88,7 +88,6 @@ const PROFILES = [
 const BASELINE = {
   "phone-portrait": {
     desktop: { targets: 0, text: 0 },
-    launcher: { targets: 0, text: 0 },
     "context-menu": { targets: 0, text: 0 },
     spotlight: { targets: 0, text: 0 },
     "spotlight-results": { targets: 0, text: 0 },
@@ -101,7 +100,6 @@ const BASELINE = {
   },
   "phone-landscape": {
     desktop: { targets: 0, text: 0 },
-    launcher: { targets: 0, text: 0 },
     "context-menu": { targets: 0, text: 0 },
     spotlight: { targets: 0, text: 0 },
     "spotlight-results": { targets: 0, text: 0 },
@@ -676,11 +674,11 @@ const SPOTLIGHT_PROBE_QUERY = "e";
 const LONG_PRESS_HOLD_MS = 700;
 
 // Playwright cannot hold a finger down, so this plays the browser: a touch
-// pointerdown on the first visible Dock app, a hold, then the pointerup and
-// the click a release produces. Returns the app the tile opens.
-async function longPressDockApp(frame) {
-  const target = await frame.evaluate(() => {
-    const tile = Array.from(document.querySelectorAll(".taskbar-item[data-target]")).find((node) => {
+// pointerdown on the first visible match, a hold, then the pointerup and the
+// click a release produces. Returns the app the icon opens.
+async function longPressApp(frame, selector) {
+  const target = await frame.evaluate((selector) => {
+    const tile = Array.from(document.querySelectorAll(selector)).find((node) => {
       if (node.id === "launcher-toggle" || node.id === "assistant-toggle") return false;
       const box = node.getBoundingClientRect();
       return box.width > 0 && box.left >= 0 && box.right <= window.innerWidth;
@@ -702,11 +700,13 @@ async function longPressDockApp(frame) {
       tile.dispatchEvent(new MouseEvent("click", init));
     };
     return tile.dataset.target;
-  });
+  }, selector);
   await sleep(LONG_PRESS_HOLD_MS);
   await frame.evaluate(() => window.__smokeReleaseLongPress());
   return target;
 }
+
+const longPressDockApp = (frame) => longPressApp(frame, ".taskbar-item[data-target]");
 
 // Each surface: how to open it, how long it takes to settle, how to close it.
 const SHELL_SURFACES = [
@@ -718,6 +718,8 @@ const SHELL_SURFACES = [
   },
   {
     id: "launcher",
+    // The phone Home is the app grid; the Apps sheet exists off the phone.
+    phone: false,
     open: (frame) => frame.locator("#launcher-toggle").click(),
     settle: SHEET_SETTLE_MS,
     close: pressEscape,
@@ -792,10 +794,14 @@ async function measureCapsuleFrame(page, target) {
   };
 }
 
+// The Dock tile, else the phone Home grid icon, else the launcher card.
 async function openWindow(frame, target) {
-  const dockButton = frame.locator(`.taskbar-item[data-target="${target}"]`);
+  const dockButton = frame.locator(`.taskbar-item[data-target="${target}"]:visible`);
+  const homeButton = frame.locator(`.phone-home-app[data-target="${target}"]:visible`);
   if (await dockButton.count()) {
     await dockButton.first().click();
+  } else if (await homeButton.count()) {
+    await homeButton.first().click();
   } else {
     await frame.locator("#launcher-toggle").click();
     await sleep(SHEET_SETTLE_MS);
@@ -869,7 +875,7 @@ async function bootHome(context, origin) {
     throw new Error(`${error.message}\nhost state: ${JSON.stringify(hostState, null, 2)}\nconsole: ${JSON.stringify(consoleErrors.slice(-5), null, 2)}`);
   }
   const frame = homeGuiFrame(page);
-  await waitFor(() => frame.locator("#launcher-toggle").isVisible(), BOOT_TIMEOUT_MS, "Home GUI dock");
+  await waitFor(() => frame.locator(".taskbar").isVisible(), BOOT_TIMEOUT_MS, "Home GUI dock");
   await sleep(SHEET_SETTLE_MS);
   return { page, frame };
 }
@@ -892,6 +898,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let sheetHandleProbe = null;
   let linkProbe = null;
   let touchMenuProbe = null;
+  let homeProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -912,6 +919,9 @@ async function runProfile(browser, engineId, profile, origin) {
     }
     const { page, frame } = booted;
     for (const surface of SHELL_SURFACES) {
+      if (surface.phone === false && profile.id.startsWith("phone")) {
+        continue;
+      }
       await surface.open(frame);
       await sleep(surface.settle);
       const shellSurface = await measure(frame, surface.id);
@@ -921,6 +931,9 @@ async function runProfile(browser, engineId, profile, origin) {
       }
       surfaces.push(shellSurface);
       await screenshot(page, dir, surface.id);
+      if (surface.id === "desktop" && profile.id.startsWith("phone")) {
+        homeProbe = await probePhoneHome(frame);
+      }
       if (surface.id === "assistant-face" && profile.id.startsWith("phone")) {
         keyboardProbe = await probeKeyboardInset(page, frame);
       }
@@ -961,7 +974,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, home: homeProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -1112,6 +1125,72 @@ function phoneLinkFailures(run) {
   return failures;
 }
 
+// Phone Home screen: the resting screen is the app grid. Every app is either
+// in the Dock (at most PHONE_DOCK_SLOTS Shelf pins, beside the Assistant) or
+// on the grid, never both; the Apps button, desktop files and the Dock's Bin
+// and running apps stand down; the grid sits between the bar and the Dock.
+const PHONE_DOCK_SLOTS = 4;
+
+async function probePhoneHome(frame) {
+  return frame.evaluate(() => {
+    const shown = (node) => Boolean(node) && node.getClientRects().length > 0;
+    const grid = document.querySelector("#phone-home");
+    const dock = document.querySelector(".taskbar").getBoundingClientRect();
+    const toolbar = document.querySelector(".toolbar").getBoundingClientRect();
+    const gridApps = Array.from(document.querySelectorAll(".phone-home-app")).filter(shown);
+    const lastApp = gridApps.at(-1)?.getBoundingClientRect();
+    return {
+      gridShown: shown(grid),
+      gridApps: gridApps.map((node) => node.dataset.target),
+      dockApps: Array.from(document.querySelectorAll(".taskbar-sortable .taskbar-item[data-target]"))
+        .filter(shown)
+        .map((node) => node.dataset.target),
+      assistantTile: shown(document.querySelector("#assistant-toggle")),
+      otherDockTiles: Array.from(document.querySelectorAll(".taskbar-sortable .taskbar-entry"))
+        .filter((node) => shown(node) && !node.querySelector(".taskbar-item[data-target]")).length,
+      launcherToggleShown: shown(document.querySelector("#launcher-toggle")),
+      desktopShortcutsShown: Array.from(document.querySelectorAll(".desktop-shortcut")).some(shown),
+      columns: getComputedStyle(grid).gridTemplateColumns.split(" ").length,
+      gridTop: Math.round(grid.getBoundingClientRect().top),
+      toolbarBottom: Math.round(toolbar.bottom),
+      lastAppBottom: lastApp ? Math.round(lastApp.bottom) : null,
+      dockTop: Math.round(dock.top),
+    };
+  });
+}
+
+function phoneHomeFailures(run) {
+  if (!run.home) {
+    return [];
+  }
+  const home = run.home;
+  const label = `${run.engine}/${run.profile}/home`;
+  const failures = [];
+  const expected = FIRST_PARTY_APPS.map(([target]) => target);
+  const inDock = [...home.dockApps, ...(home.assistantTile ? ["assistant"] : [])];
+  const placed = [...home.gridApps, ...inDock];
+  if (!home.gridShown || expected.some((target) => !placed.includes(target))) {
+    failures.push(`${label}: every app must be on the Home grid or in the Dock. Got ${JSON.stringify(home)}`);
+  }
+  if (home.gridApps.some((target) => inDock.includes(target))) {
+    failures.push(`${label}: an app in the Dock must not also be on the Home grid. Got ${JSON.stringify(home)}`);
+  }
+  if (home.dockApps.length > PHONE_DOCK_SLOTS || home.otherDockTiles > 0 || home.launcherToggleShown) {
+    failures.push(`${label}: the phone Dock holds at most ${PHONE_DOCK_SLOTS} apps beside the Assistant, with no Apps button, Bin or running apps. Got ${JSON.stringify(home)}`);
+  }
+  if (home.desktopShortcutsShown) {
+    failures.push(`${label}: desktop files must not show on the phone Home. Got ${JSON.stringify(home)}`);
+  }
+  if (home.gridTop < home.toolbarBottom || home.lastAppBottom === null || home.lastAppBottom > home.dockTop) {
+    failures.push(`${label}: the Home grid must sit between the bar and the Dock. Got ${JSON.stringify(home)}`);
+  }
+  const wantColumns = run.profile === "phone-landscape" ? 6 : 4;
+  if (home.columns !== wantColumns) {
+    failures.push(`${label}: the Home grid must be ${wantColumns} columns. Got ${JSON.stringify(home)}`);
+  }
+  return failures;
+}
+
 // Touch menus on a portrait phone: a long-press on a Dock app opens its menu
 // as a full-width bottom sheet with thumb-size rows and does not launch the
 // app; a tap beside the sheet only dismisses it (the click-driven Control
@@ -1156,7 +1235,21 @@ async function probeTouchMenu(page, frame, dir) {
   if (dismissed.menuOpen || dismissed.controlCentreOpen) {
     await pressEscape(frame);
   }
-  return { target, windowsBefore, windowsAfterPress, opened, dismissed };
+  // The same hold on a Home grid icon opens that app's menu and launches nothing.
+  const homeTarget = await longPressApp(frame, ".phone-home-app");
+  await sleep(SURFACE_SETTLE_MS);
+  const home = await frame.evaluate(() => {
+    const menu = document.querySelector("#desktop-context-menu");
+    return {
+      open: !menu.hidden,
+      sheet: menu.classList.contains("context-menu-sheet"),
+      title: menu.querySelector(".context-menu-title")?.textContent || "",
+      items: Array.from(menu.querySelectorAll(".context-menu-item")).map((row) => row.textContent),
+      windows: document.querySelectorAll(".window").length,
+    };
+  });
+  await pressEscape(frame);
+  return { target, windowsBefore, windowsAfterPress, opened, dismissed, homeTarget, home };
 }
 
 function phoneTouchMenuFailures(run) {
@@ -1185,19 +1278,22 @@ function phoneTouchMenuFailures(run) {
   if (dismissed.menuOpen || dismissed.controlCentreOpen) {
     failures.push(`${label}: a tap beside the menu sheet must only dismiss it. Got ${JSON.stringify(dismissed)}`);
   }
+  const { home } = run.touchMenu;
+  if (!home.open || !home.sheet || !home.title || home.items[0] !== `Open ${home.title}` || home.windows !== windowsBefore) {
+    failures.push(`${label}: a long-press on a Home grid app must open its named menu sheet and launch nothing. Got ${JSON.stringify(run.touchMenu)}`);
+  }
   return failures;
 }
 
 // Sheet grab handles on a portrait phone: each bar sheet's handle is a 44 px
 // Close (a tap closes), a short drag snaps the sheet back, and a long drag
-// toward its origin closes it (up for bar sheets, down for the launcher).
+// toward its origin (up) closes it.
 const SHEET_HANDLE_SHORT_DRAG_PX = 20;
 const SHEET_HANDLE_LONG_DRAG_PX = 90;
 const SHEET_HANDLES = [
   { id: "control-centre", opener: "#toolbar-control-centre", sheet: "#control-centre", handle: "#control-centre-handle", dragSign: -1, tapCloses: true },
   { id: "notifications", opener: "#clock", sheet: "#notification-center", handle: "#notification-center-handle", dragSign: -1, tapCloses: true },
   { id: "spotlight", opener: "#toolbar-spotlight", sheet: "#spotlight", handle: "#spotlight-handle", dragSign: -1, tapCloses: true },
-  { id: "launcher", opener: "#launcher-toggle", sheet: "#launcher", handle: "#launcher-handle", dragSign: 1, tapCloses: false },
 ];
 
 async function probeSheetHandles(page, frame) {
@@ -1564,7 +1660,7 @@ try {
       for (const profile of PROFILES) {
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
     } finally {

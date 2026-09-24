@@ -2057,6 +2057,11 @@ body[data-home-link="reconnecting"] .notification-center-link {
   display: none;
 }
 
+/* The phone Home screen; the phone layer below shows it. */
+.phone-home {
+  display: none;
+}
+
 .desktop-marquee {
   position: absolute;
   z-index: 40;
@@ -6431,6 +6436,94 @@ body.assistant-space-active #inbox-rail {
     .window.window-enter {
       animation: none;
     }
+  }
+
+  /* Home screen (shell-phone-home.js): the app grid is the resting screen.
+     Desktop files and the first-run hint stand down (Library has the Desktop
+     and the Bin), the Apps button goes (the grid is the apps), and the Dock
+     keeps only its phone slots: no Bin, no running apps (the switcher has
+     them). */
+  .desktop-shortcuts,
+  .desktop-first-run-hint,
+  .taskbar-item-launcher,
+  .taskbar-sortable > .taskbar-separator,
+  .taskbar-entry[data-phone-dock="off"] {
+    display: none;
+  }
+
+  .phone-home {
+    position: fixed;
+    top: var(--stage-top);
+    right: 0;
+    bottom: var(--stage-bottom);
+    left: 0;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-auto-rows: max-content;
+    align-content: start;
+    gap: 20px 4px;
+    padding: 20px max(12px, env(safe-area-inset-right, 0px)) 12px max(12px, env(safe-area-inset-left, 0px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+  }
+
+  .phone-home::-webkit-scrollbar {
+    display: none;
+  }
+
+  @media (orientation: landscape) {
+    .phone-home {
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      padding-top: 12px;
+    }
+  }
+
+  .phone-home-app {
+    display: grid;
+    grid-template-rows: 60px auto;
+    justify-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #fff;
+    -webkit-touch-callout: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .phone-home-icon {
+    width: 60px;
+    height: 60px;
+    border-radius: 14px;
+  }
+
+  .phone-home-app:focus-visible {
+    outline: none;
+  }
+
+  .phone-home-app:focus-visible .phone-home-icon {
+    outline: 2px solid var(--el-accent, #4f7fff);
+    outline-offset: 3px;
+  }
+
+  /* Names wrap to two lines over the wallpaper, white in both themes as the
+     desktop's icon labels are. */
+  .phone-home-title {
+    width: 100%;
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.25;
+    text-align: center;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+    overflow-wrap: anywhere;
   }
 
   /* Dock: fixed bottom row, horizontally scrollable, no magnification (the
