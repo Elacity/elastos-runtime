@@ -12514,8 +12514,15 @@ assert(
     peopleStyle.includes(':root[data-el-form-factor="phone"] button,\n:root[data-el-form-factor="phone"] .profile-form input {\n  min-height: var(--el-touch-target);\n}') &&
       peopleStyle.includes(':root[data-el-form-factor="phone"] .profile-form input {\n  font-size: 16px;') &&
       /people: 0, services/.test(capsuleRatchet[1].split('"phone-landscape"')[0]) &&
-      /people: 0, services/.test(capsuleRatchet[1].split('"phone-landscape"')[1]),
-    "People on the phone stage: every button and the profile field are 44 px touch targets, the field is 16 px so iOS does not zoom, and the phone smoke holds People at 0 small targets",
+      /people: 0, services/.test(capsuleRatchet[1].split('"phone-landscape"')[1]) &&
+      peopleStyle.includes('  .people-shell {\n    grid-template-columns: 1fr;\n    grid-template-rows: auto minmax(0, 1fr);') &&
+      peopleStyle.includes(':root[data-el-form-factor="phone"] .people-shell {\n  display: block;') &&
+      read("capsules/people/browser/index.html").includes('<aside id="people-sidebar" class="people-sidebar" aria-label="People sections" data-el-drawer>') &&
+      read("capsules/people/browser/index.html").includes('<button type="button" class="el-drawer-toggle" data-el-drawer-toggle="people-sidebar" aria-label="Show sections"></button>') &&
+      read("capsules/people/browser/index.html").includes('<section class="people-main" data-el-drawer-room="people-sidebar">') &&
+      read("scripts/people-product-layout-smoke.mjs").includes('"People phone: content must start at the top with the drawer toggle leading the page title",') &&
+      read("scripts/people-product-layout-smoke.mjs").includes('    drawer: "#people-sidebar",'),
+    "People on the phone stage: the sections are the shared push drawer with its toggle leading the page title (narrow windows keep the section row at its own height, not half the spare height), every button and the profile field are 44 px touch targets, the field is 16 px so iOS does not zoom, asserted by the layout smoke and held at 0 small targets by the phone smoke",
   );
 
   // Phone push drawer: one shared module (inert when closed, a tap on the
@@ -12527,7 +12534,7 @@ assert(
       sharedDrawer.includes('.observe(document.documentElement, { attributes: true, attributeFilter: ["data-el-form-factor"] });') &&
       sharedUi.includes("  --el-drawer-w: min(300px, 82vw);") &&
       sharedUi.includes(':root[data-el-form-factor="phone"] [data-el-drawer-room][data-el-drawer-state="open"] {') &&
-      vendorUi.includes('for target_dir in marketplace/browser documents/browser system/browser; do\n  drawer_target="capsules/$target_dir/elastos-drawer.js"') &&
+      vendorUi.includes('for target_dir in marketplace/browser documents/browser system/browser people/browser; do\n  drawer_target="capsules/$target_dir/elastos-drawer.js"') &&
       phoneDrawerAssert.includes("export async function assertPhoneDrawer(page, target, { label, drawer, room, closeTarget, screenshot }) {") &&
       phoneDrawerAssert.includes("check(closed.drawerRight <= 0 && closed.drawerInert && closed.roomLeft === 0 && closed.roomTop === 0,"),
     "Phone push drawer: shared elastos-drawer.js (inert when closed, tap on the pushed view closes and is swallowed, follows the size class) with shared tokens, vendored only to capsules whose sidebar uses it, asserted by scripts/lib/phone-drawer-assert.mjs",
