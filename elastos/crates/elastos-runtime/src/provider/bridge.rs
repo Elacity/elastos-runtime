@@ -44,6 +44,313 @@ const HOSTED_RUN_BINDING_TTL: std::time::Duration = std::time::Duration::from_se
 // entries immediately; an unpolled completion remains until the two-hour TTL.
 const MAX_HOSTED_RUN_BINDINGS: usize = 4096;
 
+#[cfg(target_os = "macos")]
+fn seatbelt_path(path: &Path) -> Result<String, BridgeError> {
+    let value = path
+        .to_str()
+        .filter(|value| !value.chars().any(char::is_control))
+        .ok_or_else(|| BridgeError::InitFailed("invalid model sandbox path".into()))?;
+    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(target_os = "macos")]
+fn model_journal_for_sandbox(config: &ProviderConfig) -> Result<std::path::PathBuf, BridgeError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let base = Path::new(&config.base_path);
+    if !base.is_absolute() || std::fs::canonicalize(base).ok().as_deref() != Some(base) {
+        return Err(BridgeError::InitFailed("invalid model Runtime root".into()));
+    }
+    let journal = base.join("providers/model-provider/journal");
+    if config.extra["journal_dir"].as_str() != journal.to_str() {
+        return Err(BridgeError::InitFailed("invalid model journal root".into()));
+    }
+    let mut current = base.to_path_buf();
+    for part in ["providers", "model-provider", "journal"] {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(BridgeError::InitFailed("unsafe model journal root".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(BridgeError::Spawn)?;
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700))
+                    .map_err(BridgeError::Spawn)?;
+            }
+            Err(error) => return Err(BridgeError::Spawn(error)),
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(BridgeError::Spawn)?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(BridgeError::InitFailed(
+                "unsafe model journal permissions".into(),
+            ));
+        }
+    }
+    Ok(journal)
+}
+
+#[cfg(target_os = "macos")]
+fn model_engine_receipt_entries(
+    base: &Path,
+    engine: &Path,
+) -> Result<(std::path::PathBuf, Vec<serde_json::Value>), BridgeError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let prefix = base.join("libexec/llama.cpp");
+    let relative = engine
+        .strip_prefix(&prefix)
+        .map_err(|_| BridgeError::InitFailed("model engine bundle is unavailable".into()))?;
+    let mut parts = relative.components();
+    let (Some(std::path::Component::Normal(version)), Some(std::path::Component::Normal(platform))) =
+        (parts.next(), parts.next())
+    else {
+        return Err(BridgeError::InitFailed(
+            "model engine bundle is unavailable".into(),
+        ));
+    };
+    if !parts.all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return Err(BridgeError::InitFailed(
+            "model engine bundle is unavailable".into(),
+        ));
+    }
+    let bundle = prefix.join(version).join(platform);
+    let receipt = bundle.join(".elastos-engine.json");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&receipt)
+        .map_err(BridgeError::Spawn)?;
+    let before = file.metadata().map_err(BridgeError::Spawn)?;
+    if !before.is_file()
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.nlink() != 1
+        || before.permissions().mode() & 0o7777 != 0o400
+        || before.len() > 256 * 1024
+    {
+        return Err(BridgeError::InitFailed(
+            "unsafe model engine receipt".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BridgeError::Spawn)?;
+    let after = file.metadata().map_err(BridgeError::Spawn)?;
+    if bytes.len() > 256 * 1024
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || std::fs::symlink_metadata(&receipt)
+            .map_err(BridgeError::Spawn)?
+            .ino()
+            != after.ino()
+    {
+        return Err(BridgeError::InitFailed(
+            "changed model engine receipt".into(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| BridgeError::InitFailed("invalid model engine receipt".into()))?;
+    if value["schema"] != "elastos.local-model-engine/v2" {
+        return Err(BridgeError::InitFailed(
+            "invalid model engine receipt".into(),
+        ));
+    }
+    let entries = value["entries"]
+        .as_array()
+        .filter(|entries| entries.len() <= 1024)
+        .ok_or_else(|| BridgeError::InitFailed("invalid model engine receipt".into()))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in entries {
+        let path = entry["path"]
+            .as_str()
+            .ok_or_else(|| BridgeError::InitFailed("invalid model engine receipt".into()))?;
+        if path.is_empty()
+            || !Path::new(path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            || !seen.insert(path)
+        {
+            return Err(BridgeError::InitFailed(
+                "invalid model engine receipt".into(),
+            ));
+        }
+    }
+    Ok((bundle, entries.clone()))
+}
+
+#[cfg(target_os = "macos")]
+fn model_engine_receipt_file_matches(
+    path: &Path,
+    entry: &serde_json::Value,
+) -> Result<bool, BridgeError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    if entry["type"] != "file"
+        || !std::fs::symlink_metadata(path)
+            .map_err(BridgeError::Spawn)?
+            .is_file()
+    {
+        return Ok(false);
+    }
+    let mut file = std::fs::File::open(path).map_err(BridgeError::Spawn)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(BridgeError::Spawn)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let expected = format!("sha256:{:x}", digest.finalize());
+    Ok(entry["sha256"].as_str() == Some(expected.as_str()))
+}
+
+#[cfg(target_os = "macos")]
+fn model_file_policy(
+    binary_path: &Path,
+    config: &ProviderConfig,
+    journal: &Path,
+) -> Result<String, BridgeError> {
+    let base = Path::new(&config.base_path);
+    let mut files = std::collections::BTreeSet::new();
+    let mut metadata_paths = base
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect::<std::collections::BTreeSet<_>>();
+    files.insert(binary_path.to_path_buf());
+    for offer in config.extra["offers"]
+        .as_array()
+        .ok_or_else(|| BridgeError::InitFailed("model offers unavailable".into()))?
+    {
+        if offer
+            .pointer("/adapter/kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("local_llama_cpp_text")
+        {
+            continue;
+        }
+        let engine = Path::new(
+            offer
+                .pointer("/adapter/engine/path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BridgeError::InitFailed("model engine path unavailable".into()))?,
+        );
+        let model = Path::new(
+            offer
+                .pointer("/adapter/model/path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BridgeError::InitFailed("model weights path unavailable".into()))?,
+        );
+        for path in [engine, model] {
+            if !path.starts_with(base)
+                || std::fs::canonicalize(path).ok().as_deref() != Some(path)
+                || !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+            {
+                return Err(BridgeError::InitFailed("unsafe model artifact path".into()));
+            }
+            files.insert(path.to_path_buf());
+            metadata_paths.extend(path.ancestors().skip(1).map(Path::to_path_buf));
+        }
+        let engine_dir = engine
+            .parent()
+            .ok_or_else(|| BridgeError::InitFailed("model engine directory unavailable".into()))?;
+        let mut dylibs = Vec::new();
+        for entry in std::fs::read_dir(engine_dir).map_err(BridgeError::Spawn)? {
+            let path = entry.map_err(BridgeError::Spawn)?.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("dylib") {
+                dylibs.push(path);
+            }
+        }
+        let receipt = if dylibs.is_empty() {
+            None
+        } else {
+            Some(model_engine_receipt_entries(base, engine)?)
+        };
+        for path in dylibs {
+            let (bundle, receipt_entries) = receipt.as_ref().unwrap();
+            let name = path
+                .strip_prefix(bundle)
+                .ok()
+                .and_then(|path| path.to_str())
+                .ok_or_else(|| BridgeError::InitFailed("invalid model engine file".into()))?;
+            let matching = receipt_entries
+                .iter()
+                .filter(|entry| entry["path"].as_str() == Some(name))
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(BridgeError::InitFailed("unlisted model engine file".into()));
+            }
+            let entry = matching[0];
+            let metadata = std::fs::symlink_metadata(&path).map_err(BridgeError::Spawn)?;
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).map_err(BridgeError::Spawn)?;
+                if entry["type"] != "symlink"
+                    || entry["target"].as_str() != target.to_str()
+                    || target.components().count() != 1
+                    || !target
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err(BridgeError::InitFailed("changed model engine file".into()));
+                }
+            } else if !model_engine_receipt_file_matches(&path, entry)? {
+                return Err(BridgeError::InitFailed("changed model engine file".into()));
+            }
+            let canonical = std::fs::canonicalize(&path).map_err(BridgeError::Spawn)?;
+            if !canonical.starts_with(engine_dir)
+                || !std::fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file())
+            {
+                return Err(BridgeError::InitFailed("unsafe model engine file".into()));
+            }
+            if metadata.file_type().is_symlink() {
+                let target = canonical
+                    .strip_prefix(bundle)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .ok_or_else(|| BridgeError::InitFailed("unsafe model engine file".into()))?;
+                let matching = receipt_entries
+                    .iter()
+                    .filter(|entry| entry["path"].as_str() == Some(target))
+                    .collect::<Vec<_>>();
+                if matching.len() != 1
+                    || !model_engine_receipt_file_matches(&canonical, matching[0])?
+                {
+                    return Err(BridgeError::InitFailed("changed model engine file".into()));
+                }
+            }
+            files.insert(path);
+            files.insert(canonical);
+        }
+    }
+    let mut policy = String::from(
+        "(version 1)\n(allow default)\n(deny network-outbound)\n(deny file-read*)\n(deny file-write*)\n(allow file-read* (literal \"/\") (subpath \"/System\") (subpath \"/usr/lib\") (literal \"/dev/urandom\") (literal \"/dev/null\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
+    );
+    metadata_paths.remove(Path::new("/"));
+    for ancestor in metadata_paths {
+        policy.push_str(&format!(
+            "(allow file-read-metadata (literal \"{}\"))\n",
+            seatbelt_path(&ancestor)?
+        ));
+    }
+    for path in files {
+        policy.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            seatbelt_path(&path)?
+        ));
+    }
+    let journal = seatbelt_path(journal)?;
+    policy.push_str(&format!(
+        "(allow file-read* (subpath \"{journal}\"))\n(allow file-write* (subpath \"{journal}\"))\n"
+    ));
+    Ok(policy)
+}
+
 // === Wire protocol types (mirror capsules/localhost-provider/src/main.rs) ===
 
 /// Request from runtime to provider capsule
@@ -315,7 +622,8 @@ impl ProviderBridge {
             .map_err(BridgeError::Spawn)?;
         // Seatbelt resolves /var to /private/var before comparing literal paths.
         let ipc_path = std::fs::canonicalize(ipc_dir.path()).map_err(BridgeError::Spawn)?;
-        let mut policy = String::from("(version 1)\n(allow default)\n(deny network-outbound)\n");
+        let journal = model_journal_for_sandbox(&config)?;
+        let mut policy = model_file_policy(binary_path, &config, &journal)?;
         let local_ids = offers
             .iter()
             .filter(|offer| {
@@ -365,6 +673,10 @@ impl ProviderBridge {
             }
             policy.push_str(&format!(
                 "(allow network-outbound (literal \"{socket}\"))\n"
+            ));
+            policy.push_str(&format!(
+                "(allow file-write* (literal \"{}\"))\n",
+                seatbelt_path(Path::new(&engine_socket))?
             ));
             brokers.0.push(
                 super::local_model_broker::start(
@@ -2421,71 +2733,91 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn test_confined_model_child_and_descendant_cannot_open_external_socket() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temp = TempDir::new().unwrap();
         let unrelated = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let unrelated_port = unrelated.local_addr().unwrap().port();
-        let script = write_provider_script(
-            &temp,
-            "network-probe.py",
-            r#"#!/usr/bin/python3
-import json
-import socket
-import subprocess
-import sys
-
-def external_errno():
-    with socket.socket() as connection:
-        connection.settimeout(1)
-        return connection.connect_ex(('203.0.113.1', 443))
-
-def local_errno(port):
-    with socket.socket() as connection:
-        connection.settimeout(1)
-        return connection.connect_ex(('127.0.0.1', port))
-
-def unix_errno(path):
-    with socket.socket(socket.AF_UNIX) as connection:
-        connection.settimeout(1)
-        return connection.connect_ex(path)
-
-for line in sys.stdin:
-    request = json.loads(line)
-    if request['op'] == 'init':
-        extra = request['config']['extra']
-        allowed_socket = extra['runtime_local_sockets']['fixture-local']
-        other_socket = allowed_socket + '.other'
-        unrelated_port = extra['probe_unrelated_port']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'exists':
-        with socket.socket(socket.AF_UNIX) as other_listener:
-            other_listener.bind(other_socket)
-            other_listener.listen(8)
-            direct = external_errno()
-            unrelated = local_errno(unrelated_port)
-            other = unix_errno(other_socket)
-            selected = unix_errno(allowed_socket)
-            descendant = list(map(int, subprocess.check_output([
-                '/usr/bin/python3', '-c',
-                'import socket,sys; out=[];\nfor family,address in [(socket.AF_INET,("203.0.113.1",443)),(socket.AF_INET,("127.0.0.1",int(sys.argv[1]))),(socket.AF_UNIX,sys.argv[2]),(socket.AF_UNIX,sys.argv[3])]:\n s=socket.socket(family);s.settimeout(1);out.append(s.connect_ex(address));s.close()\nprint(*out)',
-                str(unrelated_port), other_socket, allowed_socket
-            ]).split()))
-        print(json.dumps({'status':'ok','data':{
-            'direct_errno': direct, 'descendant_errno': descendant[0],
-            'unrelated_errno': unrelated, 'descendant_unrelated_errno': descendant[1],
-            'other_socket_errno': other, 'descendant_other_socket_errno': descendant[2],
-            'selected_socket_errno': selected, 'descendant_selected_socket_errno': descendant[3]}}), flush=True)
-    elif request['op'] == 'shutdown':
-        print('{"status":"ok"}', flush=True)
-        break
-"#,
-        );
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("model-seatbelt-probe.c");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/fixtures/model_seatbelt_probe.c"),
+        )
+        .unwrap();
+        let engine_dir = base.join("libexec/llama.cpp/fixture/darwin-arm64");
+        let model_dir = base.join("models");
+        std::fs::create_dir_all(&engine_dir).unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let script = engine_dir.join("model-seatbelt-probe");
+        assert!(std::process::Command::new("/usr/bin/clang")
+            .args(["-O2", "-Wall", "-Wextra", "-o"])
+            .arg(&script)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
+        let listed_library = engine_dir.join("libfixture.dylib");
+        std::fs::write(&listed_library, b"listed fixture library").unwrap();
+        let receipt_path = engine_dir.join(".elastos-engine.json");
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"elastos.local-model-engine/v2",
+                "entries":[{"path":"libfixture.dylib", "type":"file",
+                    "sha256":format!("sha256:{:x}", Sha256::digest(b"listed fixture library"))}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let model = model_dir.join("model.gguf");
+        std::fs::write(&model, b"synthetic model").unwrap();
+        let canary = base.join("canary");
+        std::fs::write(&canary, b"synthetic canary").unwrap();
+        let journal = base.join("providers/model-provider/journal");
         let config = ProviderConfig {
+            base_path: base.to_string_lossy().into_owned(),
             extra: serde_json::json!({
-                "offers": [{"id":"fixture-local", "adapter":{"kind":"local_llama_cpp_text"}}],
-                "probe_unrelated_port": unrelated_port,
+                "journal_dir": journal,
+                "offers": [{"id":"fixture-local", "adapter":{
+                    "kind":"local_llama_cpp_text",
+                    "engine":{"path":script}, "model":{"path":model}
+                }}],
             }),
             ..Default::default()
         };
+        let policy_config = config.clone();
+        let rust_source = base.join("model-canonicalize-probe.rs");
+        let rust_probe = base.join("model-canonicalize-probe");
+        std::fs::write(
+            &rust_source,
+            include_str!("../../tests/fixtures/model_canonicalize_probe.rs"),
+        )
+        .unwrap();
+        assert!(std::process::Command::new("rustc")
+            .arg(&rust_source)
+            .arg("-o")
+            .arg(&rust_probe)
+            .status()
+            .unwrap()
+            .success());
+        let mut profile = model_file_policy(&script, &config, &journal).unwrap();
+        profile.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            seatbelt_path(&rust_probe).unwrap()
+        ));
+        let profile_path = base.join("model-canonicalize-probe.sb");
+        std::fs::write(&profile_path, profile).unwrap();
+        let canonicalized = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg(&rust_probe)
+            .args([&base, &script, &model])
+            .status()
+            .unwrap();
+        assert!(canonicalized.success());
         let (bridge, sockets, vacant, confined_config, _hosted_listener) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
@@ -2495,9 +2827,20 @@ for line in sys.stdin:
             sockets["fixture-local"]
         );
         assert_eq!(vacant.len(), MAX_LOCAL_MODEL_SLOTS - 1);
+        let other_socket = format!("{}.other", sockets["fixture-local"]);
+        let _other_listener = std::os::unix::net::UnixListener::bind(&other_socket).unwrap();
         let response = bridge
             .request(ProviderRequest::Exists {
-                path: "network-probe".into(),
+                path: format!(
+                    "{}|{}|{}|{}|{}|{}|{}",
+                    sockets["fixture-local"],
+                    unrelated_port,
+                    other_socket,
+                    model.display(),
+                    canary.display(),
+                    journal.display(),
+                    base.display()
+                ),
                 token: String::new(),
             })
             .await
@@ -2513,8 +2856,33 @@ for line in sys.stdin:
         assert_eq!(data["descendant_other_socket_errno"], libc::EPERM);
         assert_eq!(data["selected_socket_errno"], 0);
         assert_eq!(data["descendant_selected_socket_errno"], 0);
+        assert_eq!(data["system_read_errno"], libc::EPERM);
+        assert_eq!(data["descendant_system_read_errno"], libc::EPERM);
+        assert_eq!(data["model_read_errno"], 0);
+        assert_eq!(data["canary_read_errno"], libc::EPERM);
+        assert_eq!(data["descendant_canary_read_errno"], libc::EPERM);
+        assert_eq!(data["model_write_errno"], libc::EPERM);
+        assert_eq!(data["descendant_model_write_errno"], libc::EPERM);
+        assert_eq!(data["model_link_errno"], libc::EPERM);
+        assert_eq!(data["descendant_model_link_errno"], libc::EPERM);
+        assert_eq!(data["model_rename_errno"], libc::EPERM);
+        assert_eq!(data["descendant_model_rename_errno"], libc::EPERM);
+        assert_eq!(data["journal_alias_create_errno"], 0);
+        assert_eq!(data["journal_alias_write_errno"], libc::EPERM);
+        assert_eq!(data["journal_write_errno"], 0);
+        assert_eq!(data["base_canonical_errno"], 0);
+        assert_eq!(data["inherited_writable_regular_fds"], 0);
         bridge.shutdown().await.unwrap();
         assert!(!Path::new(&sockets["fixture-local"]).exists());
+        std::fs::write(&listed_library, b"changed fixture library").unwrap();
+        assert!(model_file_policy(&script, &policy_config, &journal).is_err());
+        std::fs::write(&listed_library, b"listed fixture library").unwrap();
+        std::fs::write(
+            engine_dir.join("unlisted.dylib"),
+            b"unlisted fixture library",
+        )
+        .unwrap();
+        assert!(model_file_policy(&script, &policy_config, &journal).is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
