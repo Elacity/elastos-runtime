@@ -438,7 +438,13 @@ async fn handle(
         Ok(destination) => destination,
         Err(_) => return deny(&mut stream).await,
     };
-    if !bridge.confined_model_run_matches(&request.offer_id, &request.run_id, &request.request_id) {
+    if !bridge.confined_model_effect_matches(
+        &request.offer_id,
+        &request.run_id,
+        &request.request_id,
+        &request.effect,
+        &request.body,
+    ) {
         return deny(&mut stream).await;
     }
     if !fixture_destination_allowed(data_dir, &destination.url, &destination.grant_url)
@@ -642,6 +648,19 @@ fn resolve_effect(data_dir: &Path, request: &EffectRequest) -> anyhow::Result<De
             let body: serde_json::Value = serde_json::from_slice(&request.body)?;
             if body["model"] != adapter["model"] {
                 anyhow::bail!("hosted model differs from offer");
+            }
+            if request.effect == "text" || request.effect == "responses" {
+                let limit = offer["policy"]["inline_output_bytes_limit"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("hosted output policy unavailable"))?;
+                let field = if request.effect == "text" {
+                    "max_tokens"
+                } else {
+                    "max_output_tokens"
+                };
+                if body[field].as_u64() != Some((limit / 4).max(1)) {
+                    anyhow::bail!("hosted output cap differs from offer");
+                }
             }
             let mut url = adapter["api_url"]
                 .as_str()
@@ -2921,6 +2940,7 @@ mod tests {
                 "input_modalities":["text/plain"],
                 "output_modalities":["text/plain"],
                 "enabled":true,
+                "policy":{"inline_output_bytes_limit":128},
                 "adapter":{
                     "kind":"open_ai_compatible_text",
                     "api_url":"https://openrouter.ai/api/v1/chat/completions",
@@ -2956,7 +2976,9 @@ mod tests {
             request_id: "fixture-request".into(),
             job_id: None,
             method: reqwest::Method::POST,
-            body: br#"{"model":"wrong/model","model":"fixture/model","messages":[]}"#.to_vec(),
+            body:
+                br#"{"model":"wrong/model","model":"fixture/model","messages":[],"max_tokens":32}"#
+                    .to_vec(),
         };
         let destination = resolve_effect(dir.path(), &request).unwrap();
         assert_eq!(destination.url.as_str(), path);
@@ -3071,6 +3093,225 @@ mod tests {
         other.effect = "text".into();
         other.offer_id = "model:hosted-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
         assert!(current_grant(dir.path(), &other, &destination).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_broker_rejects_changed_prompt_for_active_run() {
+        use elastos_model_contract::{
+            model_input_hash, model_run_id, RuntimeCreateBinding, RUNTIME_CREATE_BINDING_SCHEMA,
+        };
+        use elastos_runtime::provider::bridge::{
+            ProviderConfig, ProviderRequest, ProviderResponse,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/openrouter/api/v1/chat/completions");
+        let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let request_id = "fixture-bound-request";
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"authorized text"});
+        let binding = RuntimeCreateBinding {
+            schema: RUNTIME_CREATE_BINDING_SCHEMA.into(),
+            principal_id: "principal:fixture".into(),
+            session_id: "session:fixture".into(),
+            capsule_id: "assistant".into(),
+            grant_id: "grant:fixture".into(),
+            request_id: request_id.into(),
+            offer_id: offer_id.into(),
+            operation: "text.generate".into(),
+            input_hash: model_input_hash(&input).unwrap(),
+        };
+        let run_id = model_run_id(&binding);
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![json!({
+                "id":offer_id,"title":"Fixture","operation":"text.generate",
+                "input_modalities":["text/plain"],"output_modalities":["text/plain"],"enabled":true,
+                "policy":{"inline_output_bytes_limit":128},
+                "adapter":{
+                    "kind":"open_ai_compatible_text",
+                    "api_url":"https://openrouter.ai/api/v1/chat/completions",
+                    "api_key":"fixture-secret","model":"fixture/model",
+                    "hosted":{
+                        "backend_provider_label":"OpenRouter","selection_mode":"pinned",
+                        "privacy_policy_ref":"fixture:privacy:v1","terms_ref":"fixture:terms:v1",
+                        "upstream_routing_fallback_assertion":"operator_asserted_disabled"
+                    }
+                }
+            })],
+        )
+        .unwrap();
+        let root = dir.path().join("providers/model-provider");
+        write_private(
+            &root.join("validate-fixtures.json"),
+            json!({
+                "openrouter_models_url":format!("http://127.0.0.1:{port}/models"),
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/venice-models"),
+                "openrouter_chat_url":url,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let altered = EffectRequest {
+            offer_id: offer_id.into(),
+            effect: "text".into(),
+            run_id: run_id.clone(),
+            request_id: request_id.into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: serde_json::to_vec(
+                &json!({"model":"fixture/model","stream":true,"max_tokens":32,
+                "messages":[{"role":"user","content":"changed text"}]}),
+            )
+            .unwrap(),
+        };
+        let destination = resolve_effect(dir.path(), &altered).unwrap();
+        approve_fixture(
+            dir.path(),
+            offer_id,
+            "text",
+            "POST",
+            &destination,
+            &proof,
+            Some((&run_id, request_id)),
+        );
+
+        let script = dir.path().join("synthetic-provider.py");
+        fs::write(&script, r#"#!/usr/bin/python3
+import json, socket, sys
+extra = None
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['op'] == 'init':
+        extra = request['config']['extra']
+        print('{"status":"ok"}', flush=True)
+    elif request['op'] == 'runs_create':
+        print('{"status":"ok"}', flush=True)
+    elif request['op'] == 'exists':
+        prompt = 'changed text' if request['path'] == 'altered' else 'authorized text'
+        body = json.dumps({'model':'fixture/model','stream':True,'max_tokens':32,
+                           'messages':[{'role':'user','content':prompt}]}).encode()
+        if request['path'] in ('raised-cap', 'missing-cap'):
+            payload = json.loads(body)
+            if request['path'] == 'raised-cap':
+                payload['max_tokens'] = 33
+            else:
+                del payload['max_tokens']
+            body = json.dumps(payload).encode()
+        headers = ('POST /v1/hosted-effect HTTP/1.1\r\nHost: runtime.invalid\r\n'
+                   'Content-Type: application/json\r\nContent-Length: %d\r\n'
+                   'X-Elastos-Offer-Id: %s\r\nX-Elastos-Effect: text\r\n'
+                   'X-Elastos-Run-Id: %s\r\nX-Elastos-Request-Id: %s\r\n\r\n') % (
+                   len(body), extra['fixture_offer_id'], extra['fixture_run_id'], extra['fixture_request_id'])
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(extra['runtime_hosted_socket'])
+            client.sendall(headers.encode() + body)
+            status = client.recv(1024).split(b'\r\n', 1)[0].decode()
+        print(json.dumps({'status':'ok','data':{'http_status':status}}), flush=True)
+    elif request['op'] == 'shutdown':
+        print('{"status":"ok"}', flush=True)
+        break
+"#).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = ProviderConfig {
+            extra: json!({
+                "offers":[], "fixture_offer_id":offer_id, "fixture_run_id":run_id,
+                "fixture_request_id":request_id,
+            }),
+            ..Default::default()
+        };
+        let (bridge, _, _, _, hosted_listener) =
+            ProviderBridge::spawn_confined_model(&script, config)
+                .await
+                .unwrap();
+        let bridge = Arc::new(bridge);
+        start(hosted_listener, bridge.clone(), dir.path().to_path_buf()).unwrap();
+        bridge
+            .send_raw(&json!({"op":"runs_create","offer_id":offer_id,
+            "operation":"text.generate","input":input,"runtime_binding":binding}))
+            .await
+            .unwrap();
+
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink_task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = sink.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                observed_tx.send(bytes).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            }
+        });
+        let probe = |path: &str| ProviderRequest::Exists {
+            path: path.into(),
+            token: String::new(),
+        };
+        let changed = bridge.request(probe("altered")).await.unwrap();
+        let ProviderResponse::Ok {
+            data: Some(changed),
+        } = changed
+        else {
+            panic!("missing changed response")
+        };
+        assert_eq!(changed["http_status"], "HTTP/1.1 403 Forbidden");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), observed_rx.recv())
+                .await
+                .is_err()
+        );
+        for path in ["raised-cap", "missing-cap"] {
+            let rejected = bridge.request(probe(path)).await.unwrap();
+            let ProviderResponse::Ok {
+                data: Some(rejected),
+            } = rejected
+            else {
+                panic!("missing cap response")
+            };
+            assert_eq!(rejected["http_status"], "HTTP/1.1 403 Forbidden");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), observed_rx.recv())
+                    .await
+                    .is_err()
+            );
+        }
+        let valid = bridge.request(probe("authorized")).await.unwrap();
+        let ProviderResponse::Ok { data: Some(valid) } = valid else {
+            panic!("missing valid response")
+        };
+        assert_eq!(valid["http_status"], "HTTP/1.1 200 OK");
+        let bytes = tokio::time::timeout(Duration::from_secs(1), observed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("authorized text"));
+        sink_task.abort();
+        bridge.shutdown().await.unwrap();
     }
 
     #[tokio::test]
