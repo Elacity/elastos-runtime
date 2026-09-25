@@ -1,5 +1,48 @@
 # State
 
+## SEC1 Mac confinement and hosted End source checkpoint, 25 September 2026 UTC
+
+Four local commits on `feat/0.7.1-model-assistant-closeout` separate the current
+source work: `c0f91075` confines the macOS model child, `1825dc4b` coordinates
+hosted End with final send admission, `8ac5ad8f` removes Runtime's
+`egress_contract` marker from the native provider Init copy, and `2d6a6cf9`
+updates three stale test assertions. Runtime keeps the saved marker for exact
+connection authority. No public or human Home artifact changed in this work.
+
+The Mac child policy passed its native child and descendant regression and one
+isolated provider → guard → pinned-engine SmolLM2 reply. A diagnostic guard and
+engine denied one unrelated owner-only file canary. This proves the tested path,
+not full-lifetime inherited-descriptor custody, independent same-user writer
+protection, or immediate new-Get Use during an old run. The hosted End source
+passed 24 egress tests, four Inbox tests and one System test. A held validation
+on the isolated signed-in Home made End wait about 20 seconds; a fresh check
+after End caused zero new upstream requests. A held Assistant effect-send End
+remains untested. A canceled, expired or failed End can still interrupt an
+admitted send before the End decision commits. Independent read-only review
+found no new P1 blocker and kept that availability case open for a regression
+and installed acceptance.
+
+The isolated Home saved a named unpaid TLS fixture offer but could not activate
+it with its earlier installed Runtime SHA-256 `04b79d2b`. A direct call to its
+installed provider rejected Init with the saved Runtime marker and accepted
+Init when only that marker was omitted. The projection regression failed before
+the repair and passed after it; 21 related tests passed. A release build from
+the recorded dirty source inputs produced Runtime SHA-256 `4b25266c`; this
+candidate is still **uninstalled**. The signed-in isolated Home continues to
+run `04b79d2b`. The serial `just verify` passed before the projection edit,
+including workspace tests, Clippy and command audit. After that edit, focused
+confinement, egress, Inbox, System and projection tests, formatting, diff and
+Home entropy checks passed. Source proof does not establish current installed
+activation or concurrent effect-send End behavior. The next bounded proof is a fresh build from the committed source, then a
+target-scoped install on that isolated Home with built/installed/running parity,
+ordinary activation and one held Assistant `/chat` with concurrent End.
+
+Private receipts: `.audit/sec1-mac-child-policy-isolated-reply.private.md`,
+`.audit/sec1-concurrent-end-source-repair.private.md`,
+`.audit/sec1-end-fresh-home/receipt.private.md`, and
+`.audit/sec1-source-closeout/receipt.private.md`. The public seed, separate
+holder, human Homes, keys, pins and data retain their prior state.
+
 ## SEC1 hosted End/send race assessment, 25 September 2026 UTC
 
 Read-only source review confirmed a concurrent authority gap in hosted
