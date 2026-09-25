@@ -1,5 +1,26 @@
 # State
 
+## SEC1 Mac diagnostic engine-child check, 25 September 2026 UTC
+
+The isolated Runtime broker ran the original copied model provider through
+its guard with a diagnostic engine entry point. That child required `EPERM`
+for read and write-only opens of one unrelated owner-only canary, found no
+inherited writable regular descriptor numbered 3–255, then executed a
+byte-identical copy of the pinned engine. A short SmolLM2 run completed with
+prepared, dispatched, text_delta and output events. Running the same wrapper
+without Seatbelt under the same account exited at the canary-read check; direct
+unconfined read and write-only opens succeeded. The canary bytes stayed fixed.
+Independent review accepted this narrow engine-child probe. The private
+`.audit/sec1-mac-engine-descendant-denial.private.md` receipt has SHA-256
+`cb1cca6a4f63b56e75cac237a74d347195937d0e9a2fc95469db3b0f7ce245f3`.
+
+The diagnostic marker has no cryptographic PID/run binding. The check covers
+one path and one entry point; it excludes read-only descriptors, sockets,
+pipes, directories and FDs above 255. Full-lifetime custody, other file/socket
+denials, signed-in installed Home behavior and Linux/public isolation remain
+open. The dirty source, original provider and engine, public and human Homes,
+holders, keys and pins stayed unchanged.
+
 ## SEC1 Mac actual guard canary check, 25 September 2026 UTC
 
 An isolated diagnostic copy of the model provider ran its ordinary re-exec
