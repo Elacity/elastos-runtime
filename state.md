@@ -1,5 +1,21 @@
 # State
 
+## SEC1 hosted End/send race assessment, 25 September 2026 UTC
+
+Read-only source review confirmed a concurrent authority gap in hosted
+validation and model effects. Each path checks owner approval before its
+outbound send, while Inbox and System End update approval through separate
+locks. End can commit between that check and a new network request. The
+existing monitors limit work already in flight; sequential post-End tests do
+not prove zero new dispatch under a concurrent End. The effect path allows a
+3605-second request, so a short response-header deadline would change its
+behavior. A repair must coordinate final admission and every End path, cancel
+unresolved sends promptly, and preserve unrelated offers and honest job
+settlement. Independent read-only review confirmed this scope. No code or
+installed Home changed. The private assessment is
+`.audit/sec1-concurrent-end-race-assessment.private.md`, SHA-256
+`661de856f95ff0f8e20c4e96a32ad94f0d5c19c6feef4695c2466962635f9642`.
+
 ## SEC1 active-run model addition assessment, 25 September 2026 UTC
 
 Read-only source review found that the current Mac model provider receives
