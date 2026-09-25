@@ -1,5 +1,51 @@
 # State
 
+## SEC1 Mac child policy candidate stopped at Init, 25 September 2026 UTC
+
+An uncommitted source candidate replaced the Mac model child's broad file
+authority with exact model and engine paths, a narrow journal, and the approved
+broker socket. Native synthetic child and hosted-broker tests passed. An
+isolated real provider with copied, hash-matched SmolLM2 and pinned engine
+bytes then rejected Init with `base_path is unavailable`, before guard or
+engine launch. The provider maps a failed Runtime-base canonicalization to
+that message. A separate Seatbelt stat check failed on the base and succeeded
+with an exact base-path read grant; the provider's OS error was not captured.
+This is a source-policy candidate failure, not a completed model load.
+
+Independent review also found that the candidate permits broad reads under
+`/usr`, selects engine libraries by directory scan, and tests inherited
+writable descriptors only in a synthetic child over descriptors 3–255. The
+converted network fixture lost descendant checks. Keep the candidate dirty
+and uninstalled while the next owner captures the exact Init denial, narrows
+system reads, restores descendant coverage, and proves provider → guard →
+engine load and denial on that chain. Active-run provider rollover and
+immediate post-Get Use are separate gates. The isolated provider was reaped;
+public and human Homes, holders and keys stayed unchanged. The ignored private
+receipt `.audit/sec1-mac-child-policy-init-stop.private.md` binds exact hashes
+and proof limits.
+
+## SEC1 Mac child threat boundary, 25 September 2026 UTC
+
+Read-only source review found the Mac model child currently starts with
+`(allow default)` and only narrows outbound network access. Its guard and engine
+inherit that file authority. A compromised child can therefore attempt file
+reads and writes under its account; the earlier hardlink and in-place writer
+probes were synthetic parent actions, not an observed installed child attack.
+The inspected Runtime broker accepts only narrow HTTP methods, and the normal
+provider target path rejects model Init. No inspected broker route supplies a
+model-file mutation effect.
+
+The next J3/SEC1 proof is child containment: deny unrelated reads and writes,
+including truncate, link/rename and alias paths, and audit inherited writable
+descriptors in the actual provider → guard → engine chain. Preserve authorized
+model load, narrow journal writes and approved broker sockets. A controlled
+provider-generation rollover must keep an old run and allow immediate Use of a
+newly admitted model. A separate unconfined same-user writer and a compromised
+Runtime/account are wider threats; the synthetic descriptor test does not
+establish that whole-account protection. Other installed provider processes
+need their own isolation audit before a release claim. No source or installed
+repair was made in this review.
+
 ## SEC1 Mac descriptor custody test, 25 September 2026 UTC
 
 In a synthetic Seatbelt test, the child kept reading the original verified
