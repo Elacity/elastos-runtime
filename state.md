@@ -1,5 +1,22 @@
 # State
 
+## SEC1 active-run model addition assessment, 25 September 2026 UTC
+
+Read-only source review found that the current Mac model provider receives
+literal Seatbelt file grants for the engines and weights known at spawn. Its
+in-place Init cannot grant read access to a model admitted later. The provider
+deliberately rejects a new local offer while an old run or warm engine holds
+execution. Removing that gate alone would advertise a model the child cannot
+read. A separate confined provider generation must keep the old run and its
+journal owner alive while Runtime routes a new offer to a new policy. Current
+single-slot unregister shuts down the old provider, and a second process on
+the same journal could mark its nonterminal run settlement unknown. Independent
+read-only review confirmed this design boundary. The private
+`.audit/sec1-active-provider-generation-assessment.private.md` receipt has
+SHA-256 `682531e91df1c29a68fc03ac9f82e3dac9c9b9e8142a7fb3b2ca2c27b95e3fa8`.
+No source repair, build or installed proof was made; active-old-run immediate
+Get → Use remains open.
+
 ## SEC1 Mac diagnostic engine-child check, 25 September 2026 UTC
 
 The isolated Runtime broker ran the original copied model provider through
