@@ -3281,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_bridge_config_passes_raw_operator_offers_without_nested_validation() {
+    fn model_provider_bridge_config_preserves_operator_offers_without_inline_key() {
         let tempdir = TempDir::new().unwrap();
         let raw = serde_json::json!({
             "offers": [
@@ -3332,7 +3332,13 @@ mod tests {
 
         let config = model_provider_bridge_config(tempdir.path()).unwrap();
 
-        assert_eq!(config.extra["offers"], raw["offers"]);
+        let mut expected = raw["offers"].clone();
+        expected[0]["adapter"]
+            .as_object_mut()
+            .unwrap()
+            .remove("api_key");
+        assert_eq!(config.extra["offers"], expected);
+        assert!(!config.extra.to_string().contains("super-secret"));
     }
 
     #[test]
