@@ -990,6 +990,43 @@ impl Provider for MockChainProvider {
                     }
                 }))
             }
+            // R50: the item-keyed twin answers as the KID-keyed read does,
+            // without an "unbound" answer (`hasAccess` has none).
+            Some("resolve_protected_content_item_access") => {
+                let fixture = mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .clone();
+                if matches!(
+                    fixture.access_mode,
+                    MockProtectedContentPurchaseAccessMode::Error
+                        | MockProtectedContentPurchaseAccessMode::Unbound
+                ) {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "stale_protected_content_purchase_access_observation",
+                        "message": "mock protected-content item access is unavailable"
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-item-access/v1",
+                        "request_id": required_test_str(request, "request_id")?,
+                        "network": required_test_str(request, "network")?,
+                        "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
+                        "wallet": required_test_str(request, "wallet")?.to_ascii_lowercase(),
+                        "ledger": required_test_str(request, "ledger")?.to_ascii_lowercase(),
+                        "token_id": required_test_str(request, "token_id")?.to_ascii_lowercase(),
+                        "has_access": fixture.access_mode
+                            == MockProtectedContentPurchaseAccessMode::Allow,
+                        "finalized_block_number": 44,
+                        "finalized_block_hash": format!("0x{}", hex::encode([0x44; 32])),
+                        "finalized_block_timestamp": crate::auth::now_ts().saturating_sub(5),
+                        "observed_at": crate::auth::now_ts(),
+                    }
+                }))
+            }
             Some("resolve_protected_content_purchase_access") => {
                 let fixture = mock_protected_content_purchase_fixture()
                     .lock()

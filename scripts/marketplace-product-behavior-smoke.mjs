@@ -17,6 +17,9 @@ const js = readFileSync(resolve("capsules/marketplace/browser/marketplace.js"), 
 const listingJs = readFileSync(resolve("capsules/marketplace/browser/src/listing.js"), "utf8");
 const listingTests = readFileSync(resolve("capsules/marketplace/browser/src/listing.test.mjs"), "utf8");
 const css = readFileSync(resolve("capsules/marketplace/browser/marketplace.css"), "utf8");
+const marketListingJs = readFileSync(resolve("capsules/marketplace/browser/src/market-listing.js"), "utf8");
+const marketListingTests = readFileSync(resolve("capsules/marketplace/browser/src/market-listing.test.mjs"), "utf8");
+const layoutSmoke = readFileSync(resolve("scripts/marketplace-product-layout-smoke.mjs"), "utf8");
 const vendorScript = readFileSync(resolve("scripts/vendor-ui-tokens.sh"), "utf8");
 
 const letterSpacingValues = [...css.matchAll(/letter-spacing:\s*([^;]+);/g)].map((match) => match[1].trim());
@@ -142,7 +145,7 @@ assert(
     // rebuild. The sentence carrying it has changed twice -- an early return,
     // then a branch, now the card's own state -- so the rule is asserted
     // rather than the spelling.
-    && /const secondary = state === "mine" \|\| state === "owned"/.test(js)
+    && /const secondary = !listing\.catalogOnly && \(state === "mine" \|\| state === "owned"\)/.test(js)
     && /data-action="download-copy"/.test(js),
   "Marketplace must let a person rebuild a copy they own, and offer it only on copies they own.",
 );
@@ -166,10 +169,16 @@ assert(
   "Marketplace must give the person who listed an item the link others add it by.",
 );
 assert(
-  // A listing published on another Home reaches this one by its link. The
-  // app checks the link's shape and Runtime verifies everything that matters.
-  js.includes('postObjectProvider("import_runtime_custody", { listing_uri: listingUri })')
-    && js.includes("listingUriFromInput(value)")
+  // A shared asset link reaches Runtime as a `token_uri` start. The app
+  // checks the link's shape before asking anything, and `legacy_listing:
+  // true` keeps reaching the old import path -- unchanged, and still with
+  // the shape Runtime has always required of it.
+  js.includes("async function readMarketListing(start) {")
+    && js.includes('postObjectProvider("import_runtime_custody", { listing_uri: legacyListingUriFromLink(link) })')
+    && js.includes("function marketLinkFromInput(value) {")
+    && js.includes("function legacyListingUriFromLink(link) {")
+    && js.includes("const MARKET_LINK_URI = ")
+    && js.includes("result.legacy")
     && html.includes('id="import-listing-uri"')
     && html.includes('id="import-listing"')
     && listingJs.includes("export function listingUriFromInput(value) {")
@@ -177,6 +186,106 @@ assert(
     && listingTests.includes("a listing link is accepted in the shapes Runtime publishes")
     && listingTests.includes("a listing link that is not one is refused before Runtime is asked"),
   "Marketplace must let a person add a listing another Home published, and check the link's shape before asking Runtime.",
+);
+assert(
+  // Buy and read are separate workflows (shared-context.md D1): the offer
+  // sheet reads a `ListingObject` and buys through `buy_offer`, never
+  // through the mint-keyed `buy` op, and it never learns this Home's account
+  // (D14) -- Explore's own Buy sends the chain's own key only.
+  js.includes('from "./src/market-listing.js";')
+    && js.includes("function openOfferSheet(listing, { properties = false, returnFocus = null } = {}) {")
+    && js.includes("function renderOfferSheetContent(listing, options = {}) {")
+    && js.includes("async function buyOffer(listing, offer) {")
+    && js.includes('postObjectProvider("buy_offer", body)')
+    && js.includes("parseBuyOfferAnswer(")
+    && js.includes("marketItemKey(listing.item)")
+    && js.includes('data-action="buy-listing"')
+    && js.includes("async function buyCatalogItem(ledger, tokenId) {")
+    && js.includes("{ item: { ledger, token_id: tokenId } }")
+    && js.includes("The seller changed the terms. Review and confirm.")
+    && js.includes("Not yet verified to open here")
+    && js.includes("Opens on ela.city"),
+  "Marketplace must buy a market listing -- from a link or from Explore -- through the offer sheet and buy_offer, never through a mint or an account.",
+);
+assert(
+  // A bought item is labelled by what this Home holds: only a copy with a
+  // mint of this Home's own is "In your library"; every other bought item
+  // is "Purchased" and offers Details, the item's properties read from its
+  // own listing. The layout smoke drives all three variants in a browser.
+  js.includes("function ownedHolding(listing) {")
+    && js.includes('return ownedHolding(listing) === "library" ? "In your library" : "Purchased";')
+    && js.includes('data-action="item-details"')
+    && js.includes("async function showCatalogDetails(ledger, tokenId) {")
+    && js.includes("function itemPropertiesSection(listing) {")
+    && !js.includes("Owned — preparing")
+    && layoutSmoke.includes("Details on a foreign bought item shows its properties and where it opens, with no offers, no download and no full address")
+    && layoutSmoke.includes("A bought market item with no copy here yet says Purchased, keeps its seller, and offers Download copy and Details -- never Buy"),
+  "Marketplace must label a bought item by what this Home holds and offer its properties through Details.",
+);
+assert(
+  // What the offer sheet says is decided by typed answers, never by guesses:
+  // the item this Home holds or listed is not offered again, a purchase
+  // already under way holds every other seller's Buy, and the completion
+  // toast promises only as much as adoption delivered. The layout smoke
+  // drives each of these in a browser; this pins the pieces it relies on.
+  js.includes("function offerSheetOwnershipCopy(accessState) {")
+    && js.includes('const OFFER_IN_PROGRESS_COPY = "Another purchase of this item is in progress";')
+    && js.includes('outcome.kind === "attempt_in_progress"')
+    && js.includes("recordedOfferAttempts.set(key, { offer: outcome.current });")
+    && js.includes("function offerCompletionMessage(adoption) {")
+    && js.includes('"Bought. It opens on ela.city."')
+    && js.includes('"Bought. Use Download copy to add it to your Library here."')
+    // Nothing adopts a pending purchase by itself, so no copy promises it.
+    && !js.includes("It will appear in your Library once")
+    && js.includes('class="offer-sheet-status" role="status"')
+    && js.includes("restoreOfferSheetFocus(focusMark);")
+    && js.includes("This offer is no longer available")
+    && js.includes("showToast(`${OFFER_IN_PROGRESS_COPY}.`, false);")
+    && js.includes("recordedOfferAttempts.delete(marketItemKey(listing.item));")
+    && layoutSmoke.includes("The purchase confirmation must open with focus on Cancel, not on Buy")
+    && marketListingJs.includes('const BUY_OFFER_OFFER_CODES = ["terms_changed", "attempt_in_progress"];')
+    && marketListingTests.includes("attempt_in_progress carries the recorded offer, validated like one")
+    && layoutSmoke.includes("attempt_in_progress must mark the recorded seller's row and hold every other row's Buy")
+    && layoutSmoke.includes('"/api/apps/marketplace/listing"]'),
+  "Marketplace's offer sheet must honour access_state, attempt_in_progress and adoption, and its browser smoke must drive them.",
+);
+assert(
+  // R46: a purchase rests on the chain's terms alone, so a listing whose
+  // readability is `unknown` and whose kid is null still sells, says nothing
+  // about where it opens, names no kid, and its catalog row reads as "not
+  // learned yet". R48: a Buy refused as unavailable says the market could
+  // not be reached; "The purchase did not finish." stays for a real failure.
+  marketListingJs.includes('export const MARKET_READABILITY_STATES = ["verified", "unverified", "foreign", "unknown"];')
+    && marketListingJs.includes('const BUY_OFFER_UNAVAILABLE_MESSAGE = "Runtime custody purchase is unavailable";')
+    && marketListingTests.includes("readability unknown (R46) parses, with a null kid, and keeps its offers to buy")
+    && marketListingTests.includes("a buy_offer refused as unavailable is its own kind, not a failed purchase (R48)")
+    && marketListingTests.includes("marketItemClaim leaves kid out when the listing's kid is null (R46)")
+    && js.includes('const MARKET_UNREACHABLE_COPY = "The market couldn’t be reached. Try again.";')
+    && js.includes('if (outcome.kind === "unavailable") {')
+    && js.includes("showToast(MARKET_UNREACHABLE_COPY, true);")
+    && js.includes('"The purchase did not finish."')
+    && js.includes('if (listing.asset.readability === "unknown") {\n      marketAssetReadability.delete(key);')
+    && layoutSmoke.includes("An item of unknown readability must say nothing about where it opens and keep every Buy enabled")
+    && layoutSmoke.includes("A Buy of an item whose kid is null must name no kid, and a Buy refused as unavailable must stay pressable"),
+  "Marketplace must sell an item of unknown readability, name no null kid, and word an unreachable market apart from a failed purchase.",
+);
+assert(
+  // R44: a purchase Runtime recorded keeps a Continue row on its recorded
+  // terms even when its seller no longer lists the item. R45: a bought item
+  // whose adoption is pending has a control that spends nothing -- Download
+  // copy, which names the item and lets Runtime rerun adoption.
+  js.includes("const offers = offersWithRecordedAttempt(listing.offers, inProgress?.recorded);")
+    && marketListingJs.includes("export function offersWithRecordedAttempt(offers, recorded) {")
+    && marketListingJs.includes("export function marketItemClaim(item) {")
+    && marketListingTests.includes("a recorded attempt whose seller is no longer listed gets its own row, on the recorded terms")
+    && js.includes("async function downloadMarketCopy(item) {")
+    && js.includes('postObjectProvider("download_owned_copy", { item: marketItemClaim(item) })')
+    && js.includes('data-action="download-market-copy"')
+    && js.includes("item: marketItemClaim(listing.item),")
+    && layoutSmoke.includes("A recorded purchase whose seller no longer lists the item must still offer Continue on its recorded terms")
+    && layoutSmoke.includes("Download copy on a held sheet must name the item, pay nothing, and reload media and catalog")
+    && layoutSmoke.includes("A bought market item with no copy here yet says Purchased, keeps its seller, and offers Download copy and Details -- never Buy"),
+  "Marketplace must keep a recorded purchase resumable and give a pending adoption a Download copy that never pays, and its browser smoke must drive both.",
 );
 assert(
   // The wallet asks for a signature, not for a decision, and it arrives after

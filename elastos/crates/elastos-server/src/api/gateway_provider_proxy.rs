@@ -197,7 +197,7 @@ fn creator_mint_chain_error(error: (StatusCode, String), line: u32) -> anyhow::E
 /// An app decides what to offer from `buy_progress`, which `provider_error_from`
 /// projects onto the error envelope; the message stays what it was, because the
 /// installed proof driver and the gateway tests match on it.
-fn runtime_custody_buy_progress(
+pub(super) fn runtime_custody_buy_progress(
     progress: crate::protected_content_runtime::RuntimeCustodyBuyProgress,
     line: u32,
 ) -> anyhow::Error {
@@ -322,6 +322,12 @@ macro_rules! purchase_unavailable_missing {
     };
 }
 
+// The buy-side refusal helpers, shared with `gateway_marketplace_buy`.
+pub(super) use purchase_denied;
+pub(super) use purchase_denied_missing;
+pub(super) use purchase_unavailable;
+pub(super) use purchase_unavailable_missing;
+
 macro_rules! creator_mint_unavailable_missing {
     () => {
         || {
@@ -374,39 +380,39 @@ pub(crate) struct ResolvedProtectedContentVerifiedListing {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentPurchase {
-    schema: String,
-    network: String,
-    purchase_quantity: String,
-    verified_listing: ResolvedProtectedContentPurchaseListing,
-    steps: Vec<ResolvedProtectedContentPurchaseStep>,
+pub(super) struct ResolvedProtectedContentPurchase {
+    pub(super) schema: String,
+    pub(super) network: String,
+    pub(super) purchase_quantity: String,
+    pub(super) verified_listing: ResolvedProtectedContentPurchaseListing,
+    pub(super) steps: Vec<ResolvedProtectedContentPurchaseStep>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentPurchaseListing {
-    chain_id: u64,
-    seller: String,
-    ledger: String,
-    token_id: String,
-    operative: String,
-    available_quantity: String,
-    price: String,
-    pay_token: String,
+pub(super) struct ResolvedProtectedContentPurchaseListing {
+    pub(super) chain_id: u64,
+    pub(super) seller: String,
+    pub(super) ledger: String,
+    pub(super) token_id: String,
+    pub(super) operative: String,
+    pub(super) available_quantity: String,
+    pub(super) price: String,
+    pub(super) pay_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    payment_processor: Option<String>,
+    pub(super) payment_processor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolvedProtectedContentPurchaseStep {
-    stage: String,
-    to: String,
-    value: String,
-    data: String,
+pub(super) struct ResolvedProtectedContentPurchaseStep {
+    pub(super) stage: String,
+    pub(super) to: String,
+    pub(super) value: String,
+    pub(super) data: String,
 }
 
-type ResolvedProtectedContentPurchaseAccess =
+pub(in crate::api::gateway) type ResolvedProtectedContentPurchaseAccess =
     crate::protected_content_runtime::RuntimeCustodyPurchaseAccessEvidenceRecord;
 
 /// Writer twin of `protected_content_runtime`'s `RuntimePortableMetadata`
@@ -434,14 +440,14 @@ struct RuntimeCustodyCreatorMetadata<'a> {
 }
 
 #[derive(Clone)]
-struct RuntimeCustodyCreatorAccount {
-    account_id: String,
-    address: String,
+pub(in crate::api::gateway) struct RuntimeCustodyCreatorAccount {
+    pub(super) account_id: String,
+    pub(super) address: String,
     /// Not an authority decision -- `signing_available` already made that. This
     /// only lets a pending answer say whose turn it is: an external signer's
     /// outstanding approval is waiting on the person, a managed one is not.
-    external_signer: bool,
-    connector_id: Option<String>,
+    pub(super) external_signer: bool,
+    pub(super) connector_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1770,6 +1776,10 @@ pub(super) async fn gateway_provider_proxy(
             "list_runtime_custody" | "buy" | "download_owned_copy" => {
                 &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID]
             }
+            // A market purchase is the Marketplace's own surface: the page
+            // that showed the buyer the offer is the only one that may ask to
+            // buy it on those terms.
+            "buy_offer" => &[MARKETPLACE_CAPSULE_ID],
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -2074,6 +2084,7 @@ pub(super) async fn gateway_provider_proxy(
     {
         let wallet_authority = if (op == "publish" && request.get("protection").is_some())
             || op == "buy"
+            || op == "buy_offer"
             || op == "download_owned_copy"
         {
             match runtime_wallet_authority(&required) {
@@ -2254,7 +2265,7 @@ async fn resolve_runtime_custody_creator_account(
     })
 }
 
-async fn resolve_runtime_custody_wallet_default_account(
+pub(in crate::api::gateway) async fn resolve_runtime_custody_wallet_default_account(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     chain_namespace: &str,
@@ -2378,7 +2389,7 @@ async fn resolve_runtime_custody_wallet_default_account(
     })
 }
 
-async fn resolve_runtime_custody_buyer_account(
+pub(in crate::api::gateway) async fn resolve_runtime_custody_buyer_account(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     chain_namespace: &str,
@@ -2392,7 +2403,7 @@ async fn resolve_runtime_custody_buyer_account(
     .await
 }
 
-async fn resolve_runtime_custody_creator_mint_source(
+pub(in crate::api::gateway) async fn resolve_runtime_custody_creator_mint_source(
     state: &GatewayState,
 ) -> anyhow::Result<ResolvedProtectedContentCreatorMintSource> {
     let response = wallet_chain_provider_data(
@@ -2694,7 +2705,7 @@ fn runtime_custody_buy_terminal_response(
     })
 }
 
-fn runtime_custody_purchase_stage_record(
+pub(super) fn runtime_custody_purchase_stage_record(
     stage: &str,
     request: &RuntimeTransactionRequest,
 ) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord> {
@@ -2713,59 +2724,112 @@ fn runtime_custody_purchase_stage_record(
     )
 }
 
-fn runtime_custody_purchase_transaction_request(
+/// What the stable request hash binds besides the offer. A listing-package
+/// buy binds its package digest and mint id exactly as today; a market buy
+/// binds the asset URI instead.
+pub(crate) enum RuntimePurchaseBinding<'a> {
+    ListingPackage {
+        listing_sha256: &'a str,
+        mint_id: elastos_protected_content_contracts::Digest32,
+    },
+    /// `attempt_id` is the recorded attempt's own identity (R23): a retry
+    /// after a reverted buy, even at identical terms, hashes to a new effect.
+    Market {
+        asset_uri: &'a str,
+        attempt_id: &'a str,
+    },
+}
+
+/// Merges `extra`'s entries into `target` in place. Both are always JSON
+/// objects here; a mismatch is a programmer error the caller already ruled
+/// out, so it is silently a no-op rather than a panic.
+fn merge_json_object(target: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(target_obj), serde_json::Value::Object(extra_obj)) =
+        (target.as_object_mut(), extra)
+    {
+        target_obj.extend(extra_obj);
+    }
+}
+
+pub(super) fn runtime_custody_purchase_transaction_request(
     principal_id: &str,
     buyer_account: &RuntimeCustodyCreatorAccount,
-    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
-    listing_sha256: &str,
-    mint_id: elastos_protected_content_contracts::Digest32,
+    item: &crate::protected_content_market::RuntimeMarketItem,
+    offer: &crate::protected_content_market::RuntimeMarketOffer,
+    binding: &RuntimePurchaseBinding<'_>,
     stage: &ResolvedProtectedContentPurchaseStep,
 ) -> anyhow::Result<RuntimeTransactionRequest> {
-    let stable_request = serde_json::json!({
-        "domain": "elastos.protected-content.purchase-request/v1",
+    let (domain, binding_stable_fields, binding_metadata_fields) = match binding {
+        RuntimePurchaseBinding::ListingPackage {
+            listing_sha256,
+            mint_id,
+        } => {
+            let mint_id_hex = hex::encode(mint_id.as_bytes());
+            (
+                "elastos.protected-content.purchase-request/v1",
+                serde_json::json!({
+                    "listing_sha256": listing_sha256,
+                    "mint_id": mint_id_hex,
+                }),
+                serde_json::json!({
+                    "mint_id": mint_id_hex,
+                    "listing_sha256": listing_sha256,
+                }),
+            )
+        }
+        RuntimePurchaseBinding::Market {
+            asset_uri,
+            attempt_id,
+        } => (
+            "elastos.protected-content.market-purchase-request/v1",
+            serde_json::json!({ "asset_uri": asset_uri, "attempt_id": attempt_id }),
+            serde_json::json!({ "asset_uri": asset_uri }),
+        ),
+    };
+    let mut stable_request = serde_json::json!({
+        "domain": domain,
         "effect_id": "",
         "wallet_account_id": buyer_account.account_id,
         "address": buyer_account.address,
-        "chain_namespace": listing.chain_namespace,
-        "network": listing.network,
+        "chain_namespace": item.chain_namespace,
+        "network": item.network,
         "to": stage.to,
         "value": stage.value,
         "data": stage.data,
-        "listing_sha256": listing_sha256,
-        "mint_id": hex::encode(mint_id.as_bytes()),
-        "seller": listing.seller_address,
-        "ledger": listing.ledger,
-        "token_id": listing.token_id,
-        "operative": listing.operative,
-        "price": listing.price,
-        "pay_token": listing.pay_token,
+        "seller": offer.seller,
+        "ledger": item.ledger,
+        "token_id": item.token_id,
+        "operative": item.operative,
+        "price": offer.price,
+        "pay_token": offer.pay_token,
         "purchase_quantity": "0x1",
         "stage": stage.stage,
     });
+    merge_json_object(&mut stable_request, binding_stable_fields);
     let request_sha256 = runtime_transaction_request_sha256(&stable_request)?;
+    let mut metadata = serde_json::json!({
+        "product_operation": format!("protected_content_purchase_{}", stage.stage),
+        "seller": offer.seller,
+        "ledger": item.ledger,
+        "token_id": item.token_id,
+        "price": offer.price,
+        "pay_token": offer.pay_token,
+        "purchase_quantity": "0x1",
+    });
+    merge_json_object(&mut metadata, binding_metadata_fields);
     let mut request = RuntimeTransactionRequest {
         source: NATIVE_TRANSACTION_SOURCE,
         effect_id: String::new(),
         request_sha256,
         account_id: buyer_account.account_id.clone(),
         address: buyer_account.address.clone(),
-        chain_namespace: listing.chain_namespace.clone(),
-        network: listing.network.clone(),
+        chain_namespace: item.chain_namespace.clone(),
+        network: item.network.clone(),
         to: stage.to.clone(),
         value: stage.value.clone(),
         data: stage.data.clone(),
         approval_reason: "Buy protected content access".to_string(),
-        metadata: serde_json::json!({
-            "product_operation": format!("protected_content_purchase_{}", stage.stage),
-            "mint_id": hex::encode(mint_id.as_bytes()),
-            "listing_sha256": listing_sha256,
-            "seller": listing.seller_address,
-            "ledger": listing.ledger,
-            "token_id": listing.token_id,
-            "price": listing.price,
-            "pay_token": listing.pay_token,
-            "purchase_quantity": "0x1",
-        }),
+        metadata,
     };
     let request_binding = transaction_request_binding(&request);
     request.effect_id = exact_runtime_transaction_effect_id(
@@ -2777,21 +2841,21 @@ fn runtime_custody_purchase_transaction_request(
     Ok(request)
 }
 
-fn validate_runtime_custody_purchase_stage_request(
+pub(super) fn validate_runtime_custody_purchase_stage_request(
     principal_id: &str,
     buyer_account: &RuntimeCustodyCreatorAccount,
-    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
-    listing_sha256: &str,
-    mint_id: elastos_protected_content_contracts::Digest32,
+    item: &crate::protected_content_market::RuntimeMarketItem,
+    offer: &crate::protected_content_market::RuntimeMarketOffer,
+    binding: &RuntimePurchaseBinding<'_>,
     stage: &crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord,
     expected_stage: &str,
 ) -> anyhow::Result<RuntimeTransactionRequest> {
     let request = runtime_custody_purchase_transaction_request(
         principal_id,
         buyer_account,
-        listing,
-        listing_sha256,
-        mint_id,
+        item,
+        offer,
+        binding,
         &ResolvedProtectedContentPurchaseStep {
             stage: stage.stage.clone(),
             to: stage.to.clone(),
@@ -2875,59 +2939,92 @@ fn validate_runtime_custody_purchase_record_identity(
 
 async fn resolve_runtime_custody_purchase_plan(
     state: &GatewayState,
-    listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
+    item: &crate::protected_content_market::RuntimeMarketItem,
+    offer: &crate::protected_content_market::RuntimeMarketOffer,
 ) -> anyhow::Result<ResolvedProtectedContentPurchase> {
-    let response = wallet_chain_provider_data(
-        state,
-        serde_json::json!({
-            "op": "resolve_protected_content_purchase",
-            "seller": listing.seller_address,
-            "chain_namespace": listing.chain_namespace,
-            "network": listing.network,
-            "ledger": listing.ledger,
-            "token_id": listing.token_id,
-        }),
-    )
-    .await
-    .map_err(purchase_unavailable!())?;
-    let resolved: ResolvedProtectedContentPurchase =
-        serde_json::from_value(response).map_err(purchase_unavailable!())?;
-    let expected_chain_id = runtime_custody_purchase_chain_id(&listing.chain_namespace)?;
-    if resolved.schema != "elastos.chain.protected-content-purchase/v1"
-        || resolved.network != listing.network
-        || resolved.purchase_quantity != "0x1"
-        || resolved.verified_listing.chain_id != expected_chain_id
-        || !resolved
-            .verified_listing
-            .seller
-            .eq_ignore_ascii_case(&listing.seller_address)
-        || !resolved
-            .verified_listing
-            .ledger
-            .eq_ignore_ascii_case(&listing.ledger)
-        || !resolved
-            .verified_listing
-            .token_id
-            .eq_ignore_ascii_case(&listing.token_id)
-        || !resolved
-            .verified_listing
-            .operative
-            .eq_ignore_ascii_case(&listing.operative)
-        || resolved.verified_listing.price != listing.price
+    let resolved = read_runtime_custody_purchase_plan(state, item, &offer.seller)
+        .await?
+        .ok_or_else(purchase_unavailable_missing!())?;
+    if resolved.verified_listing.price != offer.price
         || !resolved
             .verified_listing
             .pay_token
-            .eq_ignore_ascii_case(&listing.pay_token)
+            .eq_ignore_ascii_case(&offer.pay_token)
         || resolved
             .verified_listing
             .payment_processor
             .as_deref()
             .map(str::to_ascii_lowercase)
-            != listing
+            != offer
                 .payment_processor
                 .as_deref()
                 .map(str::to_ascii_lowercase)
         || resolved.verified_listing.available_quantity == "0x0"
+    {
+        return Err(purchase_denied_missing!()());
+    }
+    Ok(resolved)
+}
+
+/// The chain's current plan for buying one copy of `item` from `seller`,
+/// checked to be about exactly that item and seller, but NOT compared with
+/// any terms: each caller decides what a difference in terms means. The
+/// listing-package path refuses it; the market path answers `terms_changed`.
+///
+/// `Ok(None)` is the chain saying the seller has no copy to sell -- the offer
+/// is sold out or was never there (a `listings` read of zeros).
+pub(super) async fn read_runtime_custody_purchase_plan(
+    state: &GatewayState,
+    item: &crate::protected_content_market::RuntimeMarketItem,
+    seller: &str,
+) -> anyhow::Result<Option<ResolvedProtectedContentPurchase>> {
+    let response = match wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_purchase",
+            "seller": seller,
+            "chain_namespace": item.chain_namespace,
+            "network": item.network,
+            "ledger": item.ledger,
+            "token_id": item.token_id,
+        }),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err((status, message))
+            if status == StatusCode::BAD_REQUEST
+                && message.split(':').next().unwrap_or_default().trim()
+                    == "protected_content_verified_listing_unavailable" =>
+        {
+            tracing::debug!(%seller, "protected-content purchase: the offer has no copy to sell");
+            return Ok(None);
+        }
+        Err(error) => return Err(purchase_unavailable!()(error)),
+    };
+    let resolved: ResolvedProtectedContentPurchase =
+        serde_json::from_value(response).map_err(purchase_unavailable!())?;
+    let expected_chain_id = runtime_custody_purchase_chain_id(&item.chain_namespace)?;
+    if resolved.schema != "elastos.chain.protected-content-purchase/v1"
+        || resolved.network != item.network
+        || resolved.purchase_quantity != "0x1"
+        || resolved.verified_listing.chain_id != expected_chain_id
+        || !resolved
+            .verified_listing
+            .seller
+            .eq_ignore_ascii_case(seller)
+        || !resolved
+            .verified_listing
+            .ledger
+            .eq_ignore_ascii_case(&item.ledger)
+        || !resolved
+            .verified_listing
+            .token_id
+            .eq_ignore_ascii_case(&item.token_id)
+        || !resolved
+            .verified_listing
+            .operative
+            .eq_ignore_ascii_case(&item.operative)
     {
         return Err(purchase_denied_missing!()());
     }
@@ -2945,14 +3042,152 @@ async fn resolve_runtime_custody_purchase_plan(
             },
         )?;
     }
-    Ok(resolved)
+    Ok(Some(resolved))
 }
 
-async fn resolve_runtime_custody_purchase_access(
+pub(in crate::api::gateway) async fn resolve_runtime_custody_purchase_access(
     state: &GatewayState,
     listing: &crate::protected_content_runtime::RuntimePortableListingPackage,
     buyer_account: &RuntimeCustodyCreatorAccount,
     content_access_id_hex: &str,
+    request_id: &str,
+) -> anyhow::Result<Option<ResolvedProtectedContentPurchaseAccess>> {
+    match runtime_custody_access_on_chain(
+        state,
+        &listing.network,
+        &listing.chain_namespace,
+        content_access_id_hex,
+        buyer_account,
+        request_id,
+    )
+    .await
+    {
+        // Every caller of this function treats a chain that could not answer
+        // as "no access yet" and decides for itself what that means, so the
+        // unanswered case keeps being folded here, at this boundary, rather
+        // than inside the shared read.
+        Err(error) => match error.downcast_ref::<RuntimeCustodyAccessUnanswered>() {
+            Some(unanswered) => {
+                tracing::debug!(
+                    %request_id,
+                    status = unanswered.status.as_u16(),
+                    error = %unanswered.message,
+                    "protected-content purchase access resolution failed closed"
+                );
+                Ok(None)
+            }
+            None => Err(error),
+        },
+        answered => answered,
+    }
+}
+
+/// Whether `buyer_account` holds access to the item `kid` names, on
+/// `network` of `chain_namespace` -- both as the item names them -- as the
+/// chain answers it at finalized.
+///
+/// `Ok(None)` only for a real "no access": the chain answered and said no.
+/// A chain that could not answer is an error here -- a caller showing a state
+/// must be able to say "unknown" rather than "available" -- and an unbound
+/// KID is the purchase-unbound error, exactly as for a listing's purchase.
+pub(in crate::api::gateway) async fn resolve_runtime_custody_item_access(
+    state: &GatewayState,
+    chain_namespace: &str,
+    network: &str,
+    kid: &str,
+    buyer_account: &RuntimeCustodyCreatorAccount,
+    request_id: &str,
+) -> anyhow::Result<Option<ResolvedProtectedContentPurchaseAccess>> {
+    runtime_custody_access_on_chain(
+        state,
+        network,
+        chain_namespace,
+        kid,
+        buyer_account,
+        request_id,
+    )
+    .await
+}
+
+/// Whether `buyer_account` holds access to `item` itself -- asked by the item
+/// (`AuthorityGateway.hasAccess(accessor, ledger, tokenId)`, R50), so it
+/// needs no KID -- corroborated exactly like the KID-keyed read and at the
+/// same block (`latest`, pinned and agreed across sources).
+///
+/// `Ok(None)` only for a real "no access". A chain that could not answer is
+/// `RuntimeCustodyAccessUnanswered`, as for the KID-keyed read.
+pub(in crate::api::gateway) async fn resolve_runtime_market_item_access(
+    state: &GatewayState,
+    item: &crate::protected_content_market::RuntimeMarketItem,
+    buyer_account: &RuntimeCustodyCreatorAccount,
+    request_id: &str,
+) -> anyhow::Result<Option<ResolvedProtectedContentPurchaseAccess>> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_item_access",
+            "request_id": request_id,
+            "network": item.network,
+            "wallet": buyer_account.address,
+            "ledger": item.ledger,
+            "token_id": item.token_id,
+            "block": "latest",
+        }),
+    )
+    .await
+    .map_err(|(status, message)| {
+        anyhow::Error::new(RuntimeCustodyAccessUnanswered { status, message })
+    })?;
+    let access: ResolvedProtectedContentPurchaseAccess =
+        serde_json::from_value(response).map_err(purchase_unavailable!())?;
+    if access.schema != "elastos.chain.protected-content-item-access/v1"
+        || access.request_id != request_id
+        || access.network != item.network
+        || access.chain_id != runtime_custody_purchase_chain_id(&item.chain_namespace)?
+        || !access.wallet.eq_ignore_ascii_case(&buyer_account.address)
+        || access.content_access_id.is_some()
+        || !access
+            .ledger
+            .as_deref()
+            .is_some_and(|ledger| ledger.eq_ignore_ascii_case(&item.ledger))
+        || !access
+            .token_id
+            .as_deref()
+            .is_some_and(|token_id| token_id.eq_ignore_ascii_case(&item.token_id))
+    {
+        return Err(purchase_unavailable_missing!()());
+    }
+    Ok(access.has_access.then_some(access))
+}
+
+/// The chain provider could not answer an access question at all. Distinct
+/// from an answer of "no", which is `Ok(None)`.
+#[derive(Debug)]
+pub(super) struct RuntimeCustodyAccessUnanswered {
+    pub(super) status: StatusCode,
+    pub(super) message: String,
+}
+
+impl std::fmt::Display for RuntimeCustodyAccessUnanswered {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "protected-content access could not be read: {}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for RuntimeCustodyAccessUnanswered {}
+
+/// The one read both access questions share. `chain_namespace` is the chain
+/// the answer must be on, as the package or the item names it.
+async fn runtime_custody_access_on_chain(
+    state: &GatewayState,
+    network: &str,
+    chain_namespace: &str,
+    content_access_id_hex: &str,
+    buyer_account: &RuntimeCustodyCreatorAccount,
     request_id: &str,
 ) -> anyhow::Result<Option<ResolvedProtectedContentPurchaseAccess>> {
     let response = wallet_chain_provider_data(
@@ -2960,7 +3195,7 @@ async fn resolve_runtime_custody_purchase_access(
         serde_json::json!({
             "op": "resolve_protected_content_purchase_access",
             "request_id": request_id,
-            "network": listing.network,
+            "network": network,
             "wallet": buyer_account.address,
             "content_access_id": content_access_id_hex,
         }),
@@ -2979,25 +3214,25 @@ async fn resolve_runtime_custody_purchase_access(
                     crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNBOUND_MESSAGE
                 );
             }
-            tracing::debug!(
-                %request_id,
-                status = status.as_u16(),
-                error = %message,
-                "protected-content purchase access resolution failed closed"
-            );
-            return Ok(None);
+            return Err(anyhow::Error::new(RuntimeCustodyAccessUnanswered {
+                status,
+                message,
+            }));
         }
     };
     let access: ResolvedProtectedContentPurchaseAccess =
         serde_json::from_value(response).map_err(purchase_unavailable!())?;
     if access.schema != "elastos.chain.protected-content-purchase-access/v1"
         || access.request_id != request_id
-        || access.network != listing.network
-        || access.chain_id != runtime_custody_purchase_chain_id(&listing.chain_namespace)?
+        || access.network != network
+        || access.chain_id != runtime_custody_purchase_chain_id(chain_namespace)?
         || !access.wallet.eq_ignore_ascii_case(&buyer_account.address)
         || !access
             .content_access_id
-            .eq_ignore_ascii_case(content_access_id_hex)
+            .as_deref()
+            .is_some_and(|answered| answered.eq_ignore_ascii_case(content_access_id_hex))
+        || access.ledger.is_some()
+        || access.token_id.is_some()
     {
         return Err(purchase_unavailable_missing!()());
     }
@@ -3010,7 +3245,7 @@ async fn resolve_runtime_custody_purchase_access(
 /// for "the person has not answered the Wallet", "the chain has not confirmed
 /// it" and, after the Wallet gained its lapsed-request path, nothing else --
 /// three situations a buyer needs told apart, collapsed into one absence.
-enum RuntimeCustodyPurchaseStageOutcome {
+pub(super) enum RuntimeCustodyPurchaseStageOutcome {
     /// Confirmed on the chain, with the evidence the purchase record keeps.
     Confirmed(Box<RuntimeTransactionCompletion>),
     /// The Wallet holds the approval for this stage.
@@ -3021,7 +3256,7 @@ enum RuntimeCustodyPurchaseStageOutcome {
     Declined,
 }
 
-async fn complete_runtime_custody_purchase_stage(
+pub(super) async fn complete_runtime_custody_purchase_stage(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     request: &RuntimeTransactionRequest,
@@ -3103,7 +3338,7 @@ async fn complete_runtime_custody_purchase_stage(
 /// that arm; everything else is a wait or a refusal that names the stage it
 /// belongs to, so a buyer is told which approval is outstanding rather than
 /// that something is pending.
-fn runtime_custody_buy_stage_answer(
+pub(super) fn runtime_custody_buy_stage_answer(
     outcome: RuntimeCustodyPurchaseStageOutcome,
     stage: crate::protected_content_runtime::RuntimeCustodyBuyStage,
     buyer_account: &RuntimeCustodyCreatorAccount,
@@ -3143,7 +3378,7 @@ fn runtime_custody_buy_stage_answer(
 /// panicking on it rather than defaulting to "nothing confirmed yet" matters,
 /// because `None` here is exactly the value that would re-enable re-driving
 /// an already-confirmed (or already-complete) stage.
-fn pending_stages(
+pub(super) fn pending_stages(
     progress: &crate::protected_content_runtime::RuntimeCustodyPurchaseProgress,
 ) -> (
     Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage>,
@@ -3164,7 +3399,7 @@ fn pending_stages(
 /// transaction completion, or `None` if the completion has no validated
 /// Chain outcome attached yet (the caller must treat that the same as
 /// pending -- `RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE`/`purchase_unavailable_missing!`).
-fn confirmed_stage(
+pub(super) fn confirmed_stage(
     completion: RuntimeTransactionCompletion,
 ) -> Option<crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage> {
     let outcome = completion.validated_chain_outcome?;
@@ -3975,12 +4210,29 @@ pub(crate) async fn runtime_custody_publish_object_via_gateway(
 /// neither offers a way to ask again: a write that failed, a file since
 /// deleted, or a Home that has never held the copy all end in the same place,
 /// with a person who owns something they cannot see.
+///
+/// A copy bought on the market is named by its item, since until it is
+/// adopted there is no mint for it on this Home. Adoption is retried here
+/// (D10), and the adopted mint then takes exactly the path every other copy
+/// takes.
 pub(crate) async fn runtime_custody_download_owned_copy_via_gateway(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     registry: Arc<ProviderRegistry>,
-    input: crate::protected_content_runtime::RuntimeCustodyBuyInput,
+    input: crate::protected_content_runtime::RuntimeCustodyDownloadInput,
 ) -> anyhow::Result<serde_json::Value> {
+    let crate::protected_content_runtime::RuntimeCustodyDownloadInput { principal_id, copy } =
+        input;
+    let mint_id = match copy {
+        crate::protected_content_runtime::RuntimeCustodyOwnedCopy::Mint(mint_id) => mint_id,
+        crate::protected_content_runtime::RuntimeCustodyOwnedCopy::MarketItem(item) => {
+            runtime_custody_market_copy_mint(state, &registry, &principal_id, &item).await?
+        }
+    };
+    let input = crate::protected_content_runtime::RuntimeCustodyBuyInput {
+        principal_id,
+        mint_id,
+    };
     let mint_id = hex::decode(&input.mint_id)
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
@@ -4045,6 +4297,40 @@ pub(crate) async fn runtime_custody_download_owned_copy_via_gateway(
     }))
 }
 
+/// The mint a completed market purchase of `item` was adopted as, adopting it
+/// first when that has not happened yet. A market item this principal has
+/// not completed a purchase of is theirs to download no more than any other.
+async fn runtime_custody_market_copy_mint(
+    state: &GatewayState,
+    registry: &Arc<ProviderRegistry>,
+    principal_id: &str,
+    item: &crate::protected_content_market::RuntimeMarketBuyItemClaim,
+) -> anyhow::Result<String> {
+    let purchase = crate::protected_content_market::load_completed_runtime_market_purchase_by_key(
+        &state.data_dir,
+        principal_id,
+        &item.chain_namespace,
+        &item.ledger,
+        &item.token_id,
+    )?
+    .ok_or_else(download_denied_missing!())?;
+    match adopt_runtime_market_purchase(state, registry, principal_id, &purchase)
+        .await
+        .map_err(download_unavailable!())?
+    {
+        crate::protected_content_market::AdoptionOutcome::Adopted { mint_id } => Ok(mint_id),
+        crate::protected_content_market::AdoptionOutcome::Foreign
+        | crate::protected_content_market::AdoptionOutcome::Mismatch => {
+            tracing::debug!("runtime custody download: a foreign asset has no copy here");
+            Err(download_unavailable_missing!()())
+        }
+        crate::protected_content_market::AdoptionOutcome::NotYet(reason) => {
+            tracing::debug!(%reason, "runtime custody download: adoption is not possible yet");
+            Err(download_unavailable_missing!()())
+        }
+    }
+}
+
 pub(crate) async fn runtime_custody_buy_via_gateway(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
@@ -4069,6 +4355,14 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     if listing.mint_id != input.mint_id {
         return Err(purchase_denied_missing!()());
     }
+    let (item, offer) = crate::protected_content_market::market_terms_from_package(
+        listing,
+        &listing.content_access_id,
+    );
+    let binding = RuntimePurchaseBinding::ListingPackage {
+        listing_sha256: &listing_sha256,
+        mint_id,
+    };
     let localhost_root = crate::auth::principal_localhost_root(&input.principal_id);
     let profile = crate::collaboration_profile_authority::load_profile_authority(
         &state.data_dir,
@@ -4109,6 +4403,23 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         }
         Some(buyer_account)
     } else {
+        // R29, early: a market purchase already holds this item. Checked again,
+        // under the lock, when the purchase is recorded below.
+        if let Some(market_purchase) =
+            crate::protected_content_market::load_runtime_market_purchase_by_key(
+                &state.data_dir,
+                &input.principal_id,
+                &item.chain_namespace,
+                &item.ledger,
+                &item.token_id,
+            )
+            .map_err(purchase_unavailable!())?
+        {
+            return Err(runtime_listing_market_purchase_refusal(
+                &market_purchase,
+                line!(),
+            ));
+        }
         None
     };
     let (draft, fresh_availability) =
@@ -4145,16 +4456,16 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             let buyer_account =
                 resolve_runtime_custody_buyer_account(state, authority, &listing.chain_namespace)
                     .await?;
-            let purchase_plan = resolve_runtime_custody_purchase_plan(state, listing).await?;
+            let purchase_plan = resolve_runtime_custody_purchase_plan(state, &item, &offer).await?;
             let mut steps = purchase_plan.steps.iter();
             let approval_request = match purchase_plan.steps.as_slice() {
                 [approval, buy] if approval.stage == "approval" && buy.stage == "buy" => {
                     Some(runtime_custody_purchase_transaction_request(
                         &input.principal_id,
                         &buyer_account,
-                        listing,
-                        &listing_sha256,
-                        mint_id,
+                        &item,
+                        &offer,
+                        &binding,
                         approval,
                     )?)
                 }
@@ -4167,9 +4478,9 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             let buy_request = runtime_custody_purchase_transaction_request(
                 &input.principal_id,
                 &buyer_account,
-                listing,
-                &listing_sha256,
-                mint_id,
+                &item,
+                &offer,
+                &binding,
                 buy_step,
             )?;
             let purchase = crate::protected_content_runtime::RuntimeCustodyPurchaseRecord {
@@ -4209,10 +4520,20 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 created_at: now,
                 updated_at: now,
             };
-            crate::protected_content_runtime::persist_runtime_custody_purchase(
-                &state.data_dir,
-                &purchase,
-            )?;
+            // R29: one purchase per item, whichever path started it. Recorded
+            // under the market-purchase lock, so a market attempt for the same
+            // item cannot be recorded between this check and this write.
+            if let Some(market_purchase) =
+                crate::protected_content_market::create_runtime_listing_purchase_unless_market(
+                    &state.data_dir,
+                    &purchase,
+                )?
+            {
+                return Err(runtime_listing_market_purchase_refusal(
+                    &market_purchase,
+                    line!(),
+                ));
+            }
             (purchase, buyer_account)
         }
         _ => return Err(purchase_denied_missing!()()),
@@ -4225,9 +4546,9 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
             validate_runtime_custody_purchase_stage_request(
                 &input.principal_id,
                 &buyer_account,
-                listing,
-                &listing_sha256,
-                mint_id,
+                &item,
+                &offer,
+                &binding,
                 stage,
                 "approval",
             )
@@ -4236,9 +4557,9 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     let buy_request = validate_runtime_custody_purchase_stage_request(
         &input.principal_id,
         &buyer_account,
-        listing,
-        &listing_sha256,
-        mint_id,
+        &item,
+        &offer,
+        &binding,
         &purchase.acquisition_stage,
         "buy",
     )?;
@@ -4269,11 +4590,18 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         let approval_completion = match approval_completion {
             RuntimeCustodyPurchaseStageOutcome::Confirmed(completion) => *completion,
             outcome => {
-                purchase.updated_at = crate::auth::now_ts();
-                crate::protected_content_runtime::persist_runtime_custody_purchase(
-                    &state.data_dir,
-                    &purchase,
-                )?;
+                // A declined effect is never re-raised or broadcast: the
+                // attempt is over without payment and retired (R41), so it
+                // blocks no later purchase of this item on either path.
+                if matches!(outcome, RuntimeCustodyPurchaseStageOutcome::Declined) {
+                    retire_runtime_listing_attempt(state, &purchase)?;
+                } else {
+                    purchase.updated_at = crate::auth::now_ts();
+                    crate::protected_content_runtime::persist_runtime_custody_purchase(
+                        &state.data_dir,
+                        &purchase,
+                    )?;
+                }
                 return Err(runtime_custody_buy_stage_answer(
                     outcome,
                     crate::protected_content_runtime::RuntimeCustodyBuyStage::AllowanceApproval,
@@ -4308,11 +4636,15 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
         let buy_completion = match buy_completion {
             RuntimeCustodyPurchaseStageOutcome::Confirmed(completion) => *completion,
             outcome => {
-                purchase.updated_at = crate::auth::now_ts();
-                crate::protected_content_runtime::persist_runtime_custody_purchase(
-                    &state.data_dir,
-                    &purchase,
-                )?;
+                if matches!(outcome, RuntimeCustodyPurchaseStageOutcome::Declined) {
+                    retire_runtime_listing_attempt(state, &purchase)?;
+                } else {
+                    purchase.updated_at = crate::auth::now_ts();
+                    crate::protected_content_runtime::persist_runtime_custody_purchase(
+                        &state.data_dir,
+                        &purchase,
+                    )?;
+                }
                 return Err(runtime_custody_buy_stage_answer(
                     outcome,
                     crate::protected_content_runtime::RuntimeCustodyBuyStage::PurchaseApproval,
@@ -4321,6 +4653,9 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 ));
             }
         };
+        if runtime_market_receipt_reverted(buy_completion.receipt.as_ref()) {
+            return Err(runtime_listing_buy_reverted(state, &purchase));
+        }
         let Some(confirmed_buy) = confirmed_stage(buy_completion) else {
             return Err(purchase_unavailable_missing!()());
         };
@@ -4386,6 +4721,17 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     )
     .await?;
     let Some(access) = access else {
+        // No grant yet. A buy the chain mined and reverted never grants one:
+        // ask its receipt (the authoritative signal) before waiting on it.
+        if runtime_market_buy_mined_reverted(
+            state,
+            &listing.network,
+            &confirmed_buy.chain_transaction,
+        )
+        .await
+        {
+            return Err(runtime_listing_buy_reverted(state, &purchase));
+        }
         purchase.updated_at = crate::auth::now_ts();
         crate::protected_content_runtime::persist_runtime_custody_purchase(
             &state.data_dir,
@@ -4406,7 +4752,7 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
                 chain_transaction: confirmed_buy.chain_transaction,
                 wallet_binding: confirmed_buy.wallet_binding,
                 chain_observation: confirmed_buy.chain_observation,
-                access_evidence: access,
+                access_evidence: Some(access),
                 confirmed_at: confirmed_buy.confirmed_at,
                 acquired_at: crate::auth::now_ts(),
             },
@@ -4425,6 +4771,45 @@ pub(crate) async fn runtime_custody_buy_via_gateway(
     purchase.updated_at = crate::auth::now_ts();
     crate::protected_content_runtime::persist_runtime_custody_purchase(&state.data_dir, &purchase)?;
     Ok(runtime_custody_buy_terminal_response(&purchase))
+}
+
+/// Retire a listing-package attempt that is provably over without payment
+/// (R41): its Wallet approval was declined, or its buy was mined and
+/// reverted. R29 refuses a market purchase of an item while a listing
+/// purchase of it is recorded, so a dead attempt left recorded would block
+/// the item on both paths for good. Only this attempt is removed, under the
+/// market-purchase lock; a newer one is left as it is. A revert known only
+/// from the node's words proves nothing and never reaches here (R22).
+fn retire_runtime_listing_attempt(
+    state: &GatewayState,
+    purchase: &crate::protected_content_runtime::RuntimeCustodyPurchaseRecord,
+) -> anyhow::Result<()> {
+    let retired =
+        crate::protected_content_market::retire_runtime_listing_purchase(&state.data_dir, purchase)
+            .map_err(purchase_unavailable!())?;
+    tracing::debug!(
+        effect_id = %purchase.acquisition_stage.effect_id,
+        retired,
+        "runtime custody purchase: attempt over without payment"
+    );
+    Ok(())
+}
+
+/// A listing-package buy the chain mined and reverted: its effect is spent
+/// and paid nothing. The attempt is retired and the answer is the plain
+/// failure; a record that could not be retired says so instead.
+fn runtime_listing_buy_reverted(
+    state: &GatewayState,
+    purchase: &crate::protected_content_runtime::RuntimeCustodyPurchaseRecord,
+) -> anyhow::Error {
+    tracing::warn!(
+        effect_id = %purchase.acquisition_stage.effect_id,
+        "runtime custody purchase: the buy transaction was mined and reverted"
+    );
+    match retire_runtime_listing_attempt(state, purchase) {
+        Ok(()) => purchase_unavailable_missing!()(),
+        Err(error) => error,
+    }
 }
 
 /// Refuse a new attempt that would re-term a mint already on record, and say
@@ -4898,7 +5283,7 @@ fn runtime_custody_portable_package_digest(
 ///
 /// Best effort: the asset is owned whether or not a file could be written for
 /// it, and the owner keeps it either way. `None` when nothing was filed.
-async fn write_runtime_custody_owned_capsule(
+pub(super) async fn write_runtime_custody_owned_capsule(
     state: &GatewayState,
     registry: &ProviderRegistry,
     package: &crate::protected_content_runtime::RuntimePortableListingPackage,
@@ -5190,7 +5575,7 @@ async fn repair_runtime_custody_minted_owned_copy(
                 chain_transaction: settled.outcome.transaction_hash.clone(),
                 wallet_binding: settled.outcome.binding.clone(),
                 chain_observation: settled.outcome.chain_observation.clone(),
-                access_evidence: access,
+                access_evidence: Some(access),
                 confirmed_at: settled.outcome.confirmed_at,
                 acquired_at: now,
             },
@@ -5325,7 +5710,7 @@ async fn record_runtime_custody_minted_owned_copy(
                 chain_transaction: confirmed.chain_transaction,
                 wallet_binding: confirmed.wallet_binding,
                 chain_observation: confirmed.chain_observation,
-                access_evidence: access,
+                access_evidence: Some(access),
                 confirmed_at: confirmed.confirmed_at,
                 acquired_at: now,
             },
@@ -5626,6 +6011,7 @@ fn library_operation_needs_runtime_coordinator(op: &str) -> bool {
             | "list_runtime_custody"
             | "import_runtime_custody"
             | "buy"
+            | "buy_offer"
             | "download_owned_copy"
             | "open_viewer"
             | "read_viewer"
@@ -6175,5 +6561,162 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.to_string(), RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
         }
+    }
+
+    fn test_purchase_buyer_account() -> RuntimeCustodyCreatorAccount {
+        RuntimeCustodyCreatorAccount {
+            account_id: "wallet:eip155:8453:0x00000000000000000000000000000000000000bb".to_string(),
+            address: "0x00000000000000000000000000000000000000bb".to_string(),
+            external_signer: false,
+            connector_id: None,
+        }
+    }
+
+    fn test_purchase_listing_package(
+    ) -> crate::protected_content_runtime::RuntimePortableListingPackage {
+        crate::protected_content_runtime::RuntimePortableListingPackage {
+            schema: "elastos.library.runtime-custody-portable-listing/v1".to_string(),
+            mint_id: "0".repeat(64),
+            content_id: "content:fixture".to_string(),
+            content_cid: "bafyfixturecontent".to_string(),
+            metadata_cid: "bafyfixturemetadata".to_string(),
+            token_uri: "ipfs://bafyfixturemetadata".to_string(),
+            publisher_profile_did: "did:key:z6MkFixture".to_string(),
+            display_name: "Demo".to_string(),
+            media_identity_base64: Some("ZGVtbw==".to_string()),
+            content_identity_base64: None,
+            content_access_id: format!("0x{}", "00".repeat(32)),
+            key_envelope_identity_base64: "ZGVtbw==".to_string(),
+            rights_policy_identity_base64: "ZGVtbw==".to_string(),
+            content_key_commitment_base64: "ZGVtbw==".to_string(),
+            seller_address: "0x0000000000000000000000000000000000000044".to_string(),
+            chain_namespace: "eip155:8453".to_string(),
+            network: "base".to_string(),
+            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            token_id: "0x3".to_string(),
+            operative: "0x0000000000000000000000000000000000000033".to_string(),
+            quantity: "0x1".to_string(),
+            price: "0x5".to_string(),
+            pay_token: "0x0000000000000000000000000000000000000055".to_string(),
+            payment_processor: None,
+            mint_transaction_hash: Some(format!("0x{}", "00".repeat(32))),
+            published_at: Some(1),
+        }
+    }
+
+    fn test_purchase_buy_stage() -> ResolvedProtectedContentPurchaseStep {
+        ResolvedProtectedContentPurchaseStep {
+            stage: "buy".to_string(),
+            to: "0x0000000000000000000000000000000000000099".to_string(),
+            value: "0x0".to_string(),
+            data: "0xabcdef".to_string(),
+        }
+    }
+
+    /// Guards `request_sha256` stability for the `ListingPackage` binding
+    /// across the Task 4 refactor: the hash below was captured by running
+    /// the pre-refactor `runtime_custody_purchase_transaction_request`
+    /// (listing + listing_sha256 + mint_id signature) against this exact
+    /// fixture. If this test ever needs a new literal, every in-flight
+    /// purchase's `request_sha256` has silently changed underneath it.
+    #[test]
+    fn purchase_request_hash_is_unchanged_for_listing_packages() {
+        let buyer_account = test_purchase_buyer_account();
+        let listing = test_purchase_listing_package();
+        let (item, offer) = crate::protected_content_market::market_terms_from_package(
+            &listing,
+            &listing.content_access_id,
+        );
+        let listing_sha256 = format!("sha256:{}", "cc".repeat(32));
+        let mint_id = elastos_protected_content_contracts::Digest32::new([0x99; 32]);
+        let stage = test_purchase_buy_stage();
+        let request = runtime_custody_purchase_transaction_request(
+            "did:key:z6Mkbuyerprincipal11111111111111111111111111111111",
+            &buyer_account,
+            &item,
+            &offer,
+            &RuntimePurchaseBinding::ListingPackage {
+                listing_sha256: &listing_sha256,
+                mint_id,
+            },
+            &stage,
+        )
+        .unwrap();
+        assert_eq!(
+            request.request_sha256,
+            "d8d0abc7e0bbca17ecce84efe8140ae6c434060fe01cd5fc1f967e83c42450c3"
+        );
+        // Q-M10: the effect it names is pinned too -- a changed effect id is a
+        // second effect for a purchase already in flight.
+        assert_eq!(request.effect_id, "transaction-effect:sha256:b372d80079ffff8a7b8f2c25c4a05dd7de156d9c48cd81d5d15f71be95ee048c");
+    }
+
+    #[test]
+    fn purchase_request_binds_asset_uri_for_a_market_buy() {
+        let buyer_account = test_purchase_buyer_account();
+        let listing = test_purchase_listing_package();
+        let (item, offer) = crate::protected_content_market::market_terms_from_package(
+            &listing,
+            &listing.content_access_id,
+        );
+        let stage = test_purchase_buy_stage();
+        let asset_uri = "elastos://bafyfixturemetadata";
+        let request = runtime_custody_purchase_transaction_request(
+            "did:key:z6Mkbuyerprincipal11111111111111111111111111111111",
+            &buyer_account,
+            &item,
+            &offer,
+            &RuntimePurchaseBinding::Market {
+                asset_uri,
+                attempt_id: "0123456789abcdef0123456789abcdef",
+            },
+            &stage,
+        )
+        .unwrap();
+        // A market buy binds a different domain and `asset_uri` in place of
+        // `listing_sha256` / `mint_id`, so it must hash to a different value
+        // than the listing-package request built from the very same terms.
+        assert_ne!(
+            request.request_sha256,
+            "d8d0abc7e0bbca17ecce84efe8140ae6c434060fe01cd5fc1f967e83c42450c3"
+        );
+        let other_uri_request = runtime_custody_purchase_transaction_request(
+            "did:key:z6Mkbuyerprincipal11111111111111111111111111111111",
+            &buyer_account,
+            &item,
+            &offer,
+            &RuntimePurchaseBinding::Market {
+                asset_uri: "elastos://someotherfolder",
+                attempt_id: "0123456789abcdef0123456789abcdef",
+            },
+            &stage,
+        )
+        .unwrap();
+        assert_ne!(request.request_sha256, other_uri_request.request_sha256);
+        // R23: the attempt is part of what the hash binds. The same terms,
+        // item and asset under another attempt are another effect; the same
+        // attempt again is the same effect.
+        let market_request = |attempt_id: &str| {
+            runtime_custody_purchase_transaction_request(
+                "did:key:z6Mkbuyerprincipal11111111111111111111111111111111",
+                &buyer_account,
+                &item,
+                &offer,
+                &RuntimePurchaseBinding::Market {
+                    asset_uri,
+                    attempt_id,
+                },
+                &stage,
+            )
+            .unwrap()
+        };
+        let same = market_request("0123456789abcdef0123456789abcdef");
+        assert_eq!(same.request_sha256, request.request_sha256);
+        assert_eq!(same.effect_id, request.effect_id);
+        let retry = market_request("fedcba9876543210fedcba9876543210");
+        assert_ne!(retry.request_sha256, request.request_sha256);
+        assert_ne!(retry.effect_id, request.effect_id);
+        // The Wallet is shown the asset, never the attempt's identity.
+        assert!(retry.metadata.get("attempt_id").is_none());
     }
 }

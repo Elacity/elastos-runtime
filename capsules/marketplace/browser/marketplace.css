@@ -497,9 +497,13 @@ button {
   transition: opacity 0.16s ease, visibility 0.16s ease;
 }
 
+/* Visible at once when opened (only the fade is animated), so the modal's
+   first control can take focus in the same task that opens it. Closing
+   still keeps it visible through the fade. */
 .modal-overlay.active {
   opacity: 1;
   visibility: visible;
+  transition: opacity 0.16s ease;
 }
 
 .app-detail-modal {
@@ -688,6 +692,104 @@ button {
 
 .modal-btn.secondary:hover {
   background: var(--bg-hover);
+}
+
+/* The offer sheet: one row per live offer on a market listing, whether it
+   arrived from a pasted link or from a Buy on an Explore card. */
+.offer-list {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.offer-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--bg-elev);
+}
+
+.offer-row-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.offer-row-seller {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.offer-row-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.offer-row-price {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.offer-row-action {
+  flex: 0 0 auto;
+}
+
+.offer-row-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  letter-spacing: 0;
+}
+
+/* The row Runtime says the terms moved under: never auto-retried, only ever
+   shown again for a person to confirm. */
+.offer-row-changed {
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.offer-terms-note {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* A seller's control that cannot act right now: it keeps focus through a
+   repaint (so it is aria-disabled, not disabled) and looks inert. */
+.offer-row .modal-btn[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* The purchase Runtime recorded for this item, which Continue resumes. */
+.offer-row-in-progress {
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.offer-row-gone .offer-row-seller,
+.offer-row-gone .offer-row-meta {
+  color: var(--text-muted);
+}
+
+.offer-truncated-note {
+  margin-top: 8px;
+}
+
+.btn[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .store-loading {
@@ -1015,6 +1117,45 @@ button {
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0;
+}
+
+/* A bought row's state shares the action slot with its Download copy; on a
+   narrow card the two wrap rather than push past the card's edge. */
+.card-actions:has(> .store-row-state),
+.card-actions:has(> [data-action="item-details"]) {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* A bought item's properties in the item sheet: a label and its value per
+   line. Long values are already shortened; anything longer still wraps. */
+.item-properties-list {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+}
+
+.item-property {
+  display: grid;
+  grid-template-columns: minmax(96px, 30%) minmax(0, 1fr);
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--bg-elev);
+}
+
+.item-property dt {
+  color: var(--text-muted);
+  font-size: 13px;
+  letter-spacing: 0;
+}
+
+.item-property dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 /* The shelf: one card per item, after `media-studio.html`.

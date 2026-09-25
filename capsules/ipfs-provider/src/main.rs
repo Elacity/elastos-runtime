@@ -499,7 +499,7 @@ impl IpfsProvider {
     fn fetch_bytes(&mut self, arg: &str) -> Result<Vec<u8>, String> {
         let mut failures = Vec::new();
 
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => failures.push(err),
@@ -636,6 +636,10 @@ impl IpfsProvider {
 
     // ── Ensure Kubo is running ──────────────────────────────────────
 
+    /// Every Kubo use goes through here, never past it on `state == Ready`:
+    /// the idle watcher stops Kubo from another thread and only removes the
+    /// coord file, so `Ready` can outlive the daemon. The liveness check
+    /// below is what notices that and starts Kubo again.
     fn ensure_kubo(&mut self) -> Result<(), String> {
         if self.state == KuboState::Ready {
             // Verify still alive
@@ -1058,7 +1062,7 @@ impl IpfsProvider {
 
     fn ls(&mut self, cid: &str) -> Response {
         // Try Kubo first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1128,7 +1132,7 @@ impl IpfsProvider {
 
             let arg = format!("{}/{}", cid, file_path);
 
-            let bytes = if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+            let bytes = if self.ensure_kubo().is_ok() {
                 let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
                 match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
                     Ok(resp) if resp.status() == 200 => {
@@ -1536,7 +1540,7 @@ impl IpfsProvider {
 
     fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
         // Try Kubo API first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
