@@ -10276,13 +10276,15 @@ async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_sign
     std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
     let service = bob.discovery_service.clone();
     service.sync_services_mailboxes_once(right.path(), 0).await;
-    assert!(bob
-        .peer_provider
-        .state
-        .provider_requests
-        .lock()
-        .await
-        .is_empty());
+    let initial_peer_calls = bob.peer_provider.state.provider_requests.lock().await;
+    assert!(
+        initial_peer_calls.iter().all(|call| matches!(
+            call["op"].as_str(),
+            Some("get_ticket" | "gossip_join" | "gossip_join_peers" | "gossip_recv")
+        )),
+        "an empty mailbox may poll but must not send: {initial_peer_calls:?}"
+    );
+    drop(initial_peer_calls);
     assert!(
         services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
             ["requests"]
