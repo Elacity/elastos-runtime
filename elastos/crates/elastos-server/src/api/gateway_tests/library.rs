@@ -7950,6 +7950,164 @@ async fn test_runtime_custody_buy_completion_projects_outcome_under_the_approval
     );
 }
 
+/// A settled buy's terminal facts, as a completed purchase records them.
+pub(super) fn completed_market_terminal_for_test(
+) -> crate::protected_content_runtime::RuntimeCustodyTerminalPurchaseRecord {
+    let now = crate::auth::now_ts();
+    crate::protected_content_runtime::RuntimeCustodyTerminalPurchaseRecord {
+        chain_transaction: format!("0x{}", hex::encode([0xaa; 32])),
+        wallet_binding: elastos_wallet_contract::ValidatedChainOutcomeBindingV1::ManagedSigned {
+            signed_transaction_sha256: format!("sha256:{}", hex::encode([0xab; 32])),
+        },
+        chain_observation: json!({ "schema": "elastos.chain.broadcast_receipt/v1" }),
+        access_evidence: Some(
+            crate::protected_content_runtime::RuntimeCustodyPurchaseAccessEvidenceRecord {
+                schema: "elastos.chain.protected-content-purchase-access/v1".to_string(),
+                request_id: "purchase-access:test".to_string(),
+                network: "base-mainnet".to_string(),
+                chain_id: 8453,
+                wallet: MOCK_MANAGED_EVM_ADDRESS.to_ascii_lowercase(),
+                content_access_id: Some(format!("0x{}", "00".repeat(16))),
+                ledger: None,
+                token_id: None,
+                has_access: true,
+                finalized_block_number: 44,
+                finalized_block_hash: format!("0x{}", hex::encode([0xad; 32])),
+                finalized_block_timestamp: now,
+                observed_at: now,
+            },
+        ),
+        confirmed_at: now,
+        acquired_at: now,
+    }
+}
+
+/// R29 (SM-I2), the `buy` half: one purchase per item across both paths. A
+/// market purchase of the item under way refuses a listing-package buy before
+/// any Wallet request or purchase record; a completed one is `already_owned`.
+#[tokio::test]
+async fn test_runtime_custody_buy_refuses_an_item_a_market_purchase_holds() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-market-held",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x94, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    let listing = seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let kid = crate::protected_content_market::normalize_runtime_market_kid(
+        &listing.package.content_access_id,
+    )
+    .unwrap();
+    let (item, offer) =
+        crate::protected_content_market::market_terms_from_package(&listing.package, &kid);
+    let mut market = crate::protected_content_market::RuntimeMarketPurchaseRecord {
+        schema: crate::protected_content_market::RUNTIME_MARKET_PURCHASE_SCHEMA_V1.to_string(),
+        principal_id: authority.principal_id.clone(),
+        account_id: wallet_account_id.clone(),
+        address: MOCK_MANAGED_EVM_ADDRESS.to_ascii_lowercase(),
+        item: item.clone(),
+        asset_uri: format!("elastos://{}", listing.package.metadata_cid),
+        offer: crate::protected_content_market::RuntimeMarketOffer {
+            quantity: "0x1".to_string(),
+            ..offer
+        },
+        attempt_id: "0123456789abcdef0123456789abcdef".to_string(),
+        approval_stage: None,
+        acquisition_stage: crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord {
+            stage: "buy".to_string(),
+            effect_id: "runtime-effect:33333333333333333333333333333333".to_string(),
+            approval_request_id: "wallet-request:33333333333333333333333333333333".to_string(),
+            request_sha256: format!("sha256:{}", "77".repeat(32)),
+            chain_namespace: item.chain_namespace.clone(),
+            network: item.network.clone(),
+            to: MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase(),
+            value: "0x0".to_string(),
+            data: "0x".to_string(),
+        },
+        progress: crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_approval: None,
+            confirmed_buy: None,
+        },
+        adopted_mint_id: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    crate::protected_content_market::persist_runtime_market_purchase(dir.path(), &market).unwrap();
+    let app = gateway_router(state);
+    let buy_body = json!({ "mint_id": hex::encode(facts.mint_id.as_bytes()) });
+
+    let (status, payload) = post_library(app.clone(), &token, "buy", buy_body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error", "{payload}");
+    assert_eq!(payload["code"], "attempt_in_progress", "{payload}");
+    assert_eq!(
+        payload["current"]["seller"], market.offer.seller,
+        "{payload}"
+    );
+    assert!(wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .is_none());
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_purchase(
+            dir.path(),
+            &authority.principal_id,
+            facts.mint_id,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // A market purchase that completed: this person owns the item.
+    market.progress = crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete {
+        terminal: completed_market_terminal_for_test(),
+    };
+    crate::protected_content_market::persist_runtime_market_purchase(dir.path(), &market).unwrap();
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (_, payload) = post_library(app, &token, "buy", buy_body).await;
+    assert_eq!(payload["code"], "already_owned", "{payload}");
+    assert!(wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .is_none());
+}
+
 #[tokio::test]
 async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplicate_plan() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
@@ -9154,6 +9312,32 @@ enum RuntimePortableListingMismatch {
     Links,
     Cid,
     Publisher,
+    /// The package states none of the facts a published package states (no
+    /// mint transaction, no publication time), as only an adopted one may.
+    UnpublishedFacts,
+}
+
+/// `MockContentProvider`, remembering every request it was sent.
+struct RecordingMockContentProvider(std::sync::Mutex<Vec<Value>>);
+
+#[async_trait::async_trait]
+impl Provider for RecordingMockContentProvider {
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        MockContentProvider.handle(request).await
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["content"]
+    }
+
+    fn name(&self) -> &'static str {
+        "recording-mock-content-provider"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        self.0.lock().unwrap().push(request.clone());
+        MockContentProvider.send_raw(request).await
+    }
 }
 
 #[cfg(unix)]
@@ -9240,6 +9424,10 @@ async fn run_runtime_custody_portable_listing_import(
         portable_package.content_key_commitment_base64 =
             base64::engine::general_purpose::STANDARD.encode([0x7d; 32]);
     }
+    if mismatch == RuntimePortableListingMismatch::UnpublishedFacts {
+        portable_package.mint_transaction_hash = None;
+        portable_package.published_at = None;
+    }
     let mut links = vec![
         crate::content::ContentObjectLink {
             rel: "encrypted-content".to_string(),
@@ -9279,8 +9467,11 @@ async fn run_runtime_custody_portable_listing_import(
     .unwrap();
     let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
     let registry = state.provider_registry.as_ref().unwrap().clone();
+    let content = std::sync::Arc::new(RecordingMockContentProvider(std::sync::Mutex::new(
+        Vec::new(),
+    )));
     registry
-        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .register_sub_provider("content", content.clone())
         .await
         .unwrap();
     let buyer = passkey_authority_with_profile_role_credential(
@@ -9325,6 +9516,19 @@ async fn run_runtime_custody_portable_listing_import(
 
     assert_eq!(status, StatusCode::OK);
     let listing_path = runtime_custody_listing_path_for_test(dir.path(), facts.mint_id);
+    if mismatch == RuntimePortableListingMismatch::UnpublishedFacts {
+        // T8-M4: the origin's facts are checked before any network
+        // verification -- nothing beyond the listing's own folder is read.
+        let elsewhere = content
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["cid"] != RUNTIME_PORTABLE_LISTING_TEST_CID)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(elsewhere.is_empty(), "{elsewhere:#?}");
+    }
     if mismatch != RuntimePortableListingMismatch::None {
         assert_eq!(imported["status"], "error", "{imported}");
         assert!(!listing_path.exists());
@@ -9508,6 +9712,7 @@ async fn test_runtime_custody_import_rejects_manifest_and_package_mismatch() {
         RuntimePortableListingMismatch::Links,
         RuntimePortableListingMismatch::Cid,
         RuntimePortableListingMismatch::Publisher,
+        RuntimePortableListingMismatch::UnpublishedFacts,
     ] {
         run_runtime_custody_portable_listing_import(mismatch, false, false).await;
     }
@@ -11125,6 +11330,1099 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
         .path()
         .join("protected-content/runtime-mint")
         .exists());
+}
+
+// --- Read after a buy: adoption from the shared document (D10) -------------
+
+/// What the creator Home left behind for a buyer: the shared content plane
+/// (IPFS, as both Homes see it), the custody process fixture both Homes use,
+/// and the package the creator recorded -- which the buyer never receives.
+struct TwoRuntimeMarketAsset {
+    _runtime_a: tempfile::TempDir,
+    shared_content: TwoRuntimeContentStore,
+    process_fixture: crate::protected_content_runtime::tests::RuntimeCustodyProcessProviderFixture,
+    package: crate::protected_content_runtime::RuntimePortableListingPackage,
+}
+
+/// The creator half of `test_runtime_custody_two_runtime_portable_listing_gateway_journey`:
+/// Runtime A mints and publishes. Nothing is shared with a buyer but the
+/// content plane and the chain.
+async fn publish_two_runtime_market_asset() -> TwoRuntimeMarketAsset {
+    let shared_content = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let runtime_a = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(runtime_a.path(), 0x5a);
+    let content_a = TwoRuntimeContentProvider::new(0x5a, shared_content.clone());
+    let (state_a, wallet_a) = wallet_chain_test_state_with_observer(runtime_a.path()).await;
+    let registry_a = state_a.provider_registry.as_ref().unwrap().clone();
+    registry_a
+        .register_sub_provider("content", content_a)
+        .await
+        .unwrap();
+    registry_a
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                runtime_a.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry_a),
+            )),
+        )
+        .await
+        .unwrap();
+    let process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        runtime_a.path(),
+        &registry_a,
+    )
+    .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        runtime_a.path(),
+        &registry_a,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        runtime_a.path(),
+        "market-asset-creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-market-asset-creator",
+    );
+    let creator_token = app_token_for_authority(runtime_a.path(), LIBRARY_CAPSULE_ID, &creator);
+    let creator_account = wallet_a
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_a.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account,
+        10,
+    )
+    .await;
+    let app_a = gateway_router(state_a);
+    let creator_uri = format!(
+        "{}/Documents/market-asset-proof.mp4",
+        crate::auth::principal_localhost_root(&creator.principal_id)
+    );
+    write_library_bytes(&app_a, &creator_token, &creator_uri, b"media").await;
+    let publish_body = json!({
+        "uri": creator_uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "channel": "0x0000000000000000000000000000000000000022",
+            "copies": "0x1",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_AMOUNT,
+        },
+    });
+    let (_, pending) = post_library(
+        app_a.clone(),
+        &creator_token,
+        "publish",
+        publish_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let _ = wallet_a
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let (_, published) = post_library(app_a, &creator_token, "publish", publish_body).await;
+    assert_eq!(published["status"], "ok", "{published}");
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(
+            published["data"]["content_security"]["mint_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap(),
+    );
+    let package =
+        crate::protected_content_runtime::load_runtime_custody_listing(runtime_a.path(), mint_id)
+            .unwrap()
+            .unwrap()
+            .package;
+    TwoRuntimeMarketAsset {
+        _runtime_a: runtime_a,
+        shared_content,
+        process_fixture,
+        package,
+    }
+}
+
+/// The market as a buyer's chain states it for this one item: the item's
+/// operative and token URI, and the KID bound to it. Everything else --
+/// the offer, the Wallet effects, access -- is the shared mock's.
+struct AdoptionMarketChain {
+    ledger: String,
+    token_id: String,
+    operative: String,
+    token_uri: String,
+    kid: String,
+    /// Every transaction receipt reads as mined and reverted (`status` 0x0).
+    revert_receipts: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Provider for AdoptionMarketChain {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw requests only".into()))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["elastos"]
+    }
+
+    fn name(&self) -> &'static str {
+        "adoption-market-chain"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let network = request.get("network").cloned().unwrap_or(Value::Null);
+        match request.get("op").and_then(Value::as_str) {
+            Some("resolve_protected_content_item")
+                if request["ledger"] == self.ledger.as_str()
+                    && request["token_id"] == self.token_id.as_str() =>
+            {
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-item/v1",
+                        "network": network,
+                        "chain_id": 8453,
+                        "ledger": self.ledger,
+                        "token_id": self.token_id,
+                        "operative": self.operative,
+                        "token_uri": self.token_uri,
+                        "finalized_block_number": 44,
+                    }
+                }))
+            }
+            Some("resolve_protected_content_kid_binding")
+                if request["content_access_id"] == self.kid.as_str() =>
+            {
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-kid-binding/v1",
+                        "network": network,
+                        "chain_id": 8453,
+                        "content_access_id": self.kid,
+                        "ledger": self.ledger,
+                        "token_id": self.token_id,
+                        "finalized_block_number": 44,
+                    }
+                }))
+            }
+            Some("receipt")
+                if self
+                    .revert_receipts
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                let mut answer = MockChainProvider.send_raw(request).await?;
+                if let Some(receipt) = answer.pointer_mut("/data/receipt") {
+                    if receipt.is_object() {
+                        receipt["status"] = json!("0x0");
+                    }
+                }
+                Ok(answer)
+            }
+            _ => MockChainProvider.send_raw(request).await,
+        }
+    }
+}
+
+/// The buyer's content plane. Its `ensure` writes a receipt bound to the
+/// publisher the request names, and `status` answers that latest receipt,
+/// exactly as `ContentProvider::ensure` does (`effective_publisher_did`,
+/// `write_receipt`). The shared two-Runtime mock always answers with the
+/// publisher the object was first published under.
+struct PublisherBindingContentProvider {
+    inner: std::sync::Arc<TwoRuntimeContentProvider>,
+    /// `cid` -> the publisher its latest `ensure` named.
+    ensured: std::sync::Mutex<BTreeMap<String, String>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for PublisherBindingContentProvider {
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        self.inner.handle(request).await
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["content"]
+    }
+
+    fn name(&self) -> &'static str {
+        "publisher-binding-content-provider"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let mut answer = self.inner.send_raw(request).await?;
+        let op = request.get("op").and_then(Value::as_str);
+        let cid = request
+            .get("cid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if op == Some("ensure") {
+            if let Some(publisher_did) = request.get("publisher_did").and_then(Value::as_str) {
+                self.ensured
+                    .lock()
+                    .unwrap()
+                    .insert(cid.clone(), publisher_did.to_string());
+            }
+        }
+        let bound = self.ensured.lock().unwrap().get(&cid).cloned();
+        if let (Some("ensure" | "status"), Some(publisher_did)) = (op, bound) {
+            let mut receipt: crate::content::SignedAvailabilityReceipt =
+                serde_json::from_value(answer["data"]["receipt"].clone())
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            receipt.payload.publisher_did = publisher_did;
+            let payload_bytes =
+                serde_json::to_string(&serde_json::to_value(&receipt.payload).unwrap()).unwrap();
+            let (signature, signer_did) = crate::crypto::domain_separated_sign(
+                &self.inner.signing_key,
+                "elastos.content.availability.receipt.v1",
+                payload_bytes.as_bytes(),
+            );
+            receipt.signature = signature;
+            receipt.signer_did = signer_did;
+            answer["data"]["receipt"] = serde_json::to_value(receipt).unwrap();
+        }
+        Ok(answer)
+    }
+}
+
+/// A buyer Home that has never seen the creator's listing: its own data dir,
+/// device key and Wallet; the shared content plane; the market chain above.
+struct AdoptionBuyer {
+    runtime: tempfile::TempDir,
+    app: axum::Router,
+    content: std::sync::Arc<TwoRuntimeContentProvider>,
+    wallet: std::sync::Arc<RecordingWalletProvider>,
+    buyer: TestPasskeyAuthority,
+    market_token: String,
+    library_token: String,
+    revert_receipts: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn adoption_buyer(asset: &TwoRuntimeMarketAsset) -> AdoptionBuyer {
+    let runtime = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(runtime.path(), 0x5b);
+    seed_test_browser_capsules(runtime.path());
+    let content = TwoRuntimeContentProvider::new(0x5b, asset.shared_content.clone());
+    let wallet = std::sync::Arc::new(RecordingWalletProvider::new(MockWalletProvider::default()));
+    let registry = std::sync::Arc::new(ProviderRegistry::new());
+    let revert_receipts = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    registry
+        .register_sub_provider("wallet", wallet.clone())
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "chain",
+            std::sync::Arc::new(AdoptionMarketChain {
+                revert_receipts: revert_receipts.clone(),
+                ledger: asset.package.ledger.clone(),
+                token_id: asset.package.token_id.clone(),
+                operative: asset.package.operative.clone(),
+                token_uri: format!(
+                    "ipfs://{}/0000000000000000000000000000000000000000000000000000000000000001.json",
+                    asset.package.metadata_cid
+                ),
+                kid: asset.package.content_access_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "content",
+            std::sync::Arc::new(PublisherBindingContentProvider {
+                inner: content.clone(),
+                ensured: std::sync::Mutex::new(BTreeMap::new()),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                runtime.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+    crate::protected_content_runtime::tests::attach_runtime_custody_process_providers_for_buyer_runtime(
+        &asset.process_fixture,
+        runtime.path(),
+        &registry,
+    )
+    .await;
+    let buyer = passkey_authority_with_profile_role_credential(
+        runtime.path(),
+        "market-asset-buyer",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-market-asset-buyer",
+    );
+    let buyer_account = wallet
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&buyer.principal_id, 2)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet.provider,
+        &buyer.principal_id,
+        "eip155:8453",
+        &buyer_account,
+        10,
+    )
+    .await;
+    let market_token = app_token_for_authority(runtime.path(), MARKETPLACE_CAPSULE_ID, &buyer);
+    let library_token = app_token_for_authority(runtime.path(), LIBRARY_CAPSULE_ID, &buyer);
+    let state = GatewayState {
+        provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
+        identity_manager: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cache_dir: runtime.path().to_path_buf(),
+        data_dir: runtime.path().to_path_buf(),
+    };
+    AdoptionBuyer {
+        app: gateway_router(state),
+        runtime,
+        content,
+        wallet,
+        buyer,
+        market_token,
+        library_token,
+        revert_receipts,
+    }
+}
+
+/// Exactly what the Marketplace page sends for the creator's own offer.
+fn adoption_buy_offer_body(
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+) -> Value {
+    json!({
+        "item": {
+            "chain_namespace": package.chain_namespace,
+            "network": package.network,
+            "ledger": package.ledger,
+            "token_id": package.token_id,
+            "kid": package.content_access_id,
+        },
+        "asset_uri": format!("elastos://{}", package.metadata_cid),
+        "seller": package.seller_address,
+        "agreed": {
+            "price": package.price,
+            "pay_token": package.pay_token,
+            "quantity": "0x1",
+        },
+    })
+}
+
+/// Buy the asset on the market and answer the completion. The chain says
+/// "no access" until the buy settles, then "access".
+async fn complete_adoption_market_purchase(
+    buyer: &AdoptionBuyer,
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+) -> Value {
+    set_mock_protected_content_purchase_access_denied();
+    let (_, pending) = post_library(
+        buyer.app.clone(),
+        &buyer.market_token,
+        "buy_offer",
+        adoption_buy_offer_body(package),
+    )
+    .await;
+    assert_eq!(
+        pending["buy_progress"]["stage"], "purchase_approval",
+        "{pending}"
+    );
+    let _ = buyer
+        .wallet
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    let (_, complete) = post_library(
+        buyer.app.clone(),
+        &buyer.market_token,
+        "buy_offer",
+        adoption_buy_offer_body(package),
+    )
+    .await;
+    assert_eq!(complete["status"], "ok", "{complete}");
+    complete["data"].clone()
+}
+
+/// Review focus 5 and D10: an asset bought on the market opens through the
+/// existing open path, unchanged, fed only by what every marketplace reads.
+/// The creator's ElastOS-only `manifest.json` is deleted before the buyer
+/// ever looks, so nothing ElastOS-only can be what made it open.
+#[tokio::test]
+async fn adopted_listing_opens_through_the_existing_viewer_path() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+
+    let asset = publish_two_runtime_market_asset().await;
+    let package = asset.package.clone();
+    let removed = asset
+        .shared_content
+        .lock()
+        .unwrap()
+        .get_mut(&package.metadata_cid)
+        .expect("the creator published its metadata folder")
+        .remove("manifest.json");
+    assert!(
+        removed.is_some(),
+        "the folder carried a manifest.json to delete"
+    );
+
+    let buyer = adoption_buyer(&asset).await;
+    let complete = complete_adoption_market_purchase(&buyer, &package).await;
+    assert_eq!(
+        complete["schema"],
+        "elastos.marketplace.buy-offer-complete/v1"
+    );
+    assert_eq!(complete["adoption"], "adopted", "{complete}");
+
+    // The mint was computed from the rebuilt draft; it is the creator's own.
+    let market = crate::protected_content_market::load_completed_runtime_market_purchase_by_key(
+        buyer.runtime.path(),
+        &buyer.buyer.principal_id,
+        &package.chain_namespace,
+        &package.ledger,
+        &package.token_id,
+    )
+    .unwrap()
+    .expect("the market purchase is complete");
+    assert_eq!(
+        market.adopted_mint_id.as_deref(),
+        Some(package.mint_id.as_str())
+    );
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&package.mint_id).unwrap().try_into().unwrap(),
+    );
+    let listing = crate::protected_content_runtime::load_runtime_custody_listing(
+        buyer.runtime.path(),
+        mint_id,
+    )
+    .unwrap()
+    .expect("adoption recorded a listing");
+    assert_eq!(
+        listing.origin,
+        crate::protected_content_runtime::RuntimeCustodyListingOrigin::Asset {
+            asset_uri: format!("elastos://{}", package.metadata_cid),
+        }
+    );
+    assert_eq!(listing.package.mint_transaction_hash, None);
+    assert_eq!(listing.package.published_at, None);
+    assert!(listing
+        .package
+        .publisher_profile_did
+        .starts_with("did:pkh:eip155:8453:0x"));
+    assert_eq!(listing.package.content_id, package.content_id);
+    assert_eq!(listing.package.content_cid, package.content_cid);
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        buyer.runtime.path(),
+        &buyer.buyer.principal_id,
+        mint_id,
+    )
+    .unwrap()
+    .expect("adoption recorded a purchase");
+    assert_eq!(
+        purchase.acquisition,
+        crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Market
+    );
+    assert_eq!(purchase.listing_sha256, listing.portable_package_digest());
+    assert!(purchase.capsule_uri.is_some(), "the owned .ddrm was filed");
+
+    // The unchanged open path.
+    let player_token = projection_launch_token_for_authority_context(
+        buyer.runtime.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer.buyer,
+    );
+    let (_, opened) = post_library(
+        buyer.app.clone(),
+        &player_token,
+        "open_viewer",
+        json!({"mint_id": package.mint_id}),
+    )
+    .await;
+    assert_eq!(opened["status"], "ok", "{opened}");
+    let viewer_handle = opened["data"]["viewer_session_handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (clear_init, clear_segments) =
+        crate::protected_content_runtime::tests::runtime_custody_gateway_media_output_for_test();
+    let (_, init) = post_library(
+        buyer.app.clone(),
+        &player_token,
+        "read_viewer",
+        json!({"mint_id": package.mint_id, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(init["status"], "ok", "{init}");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(init["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        clear_init
+    );
+    let (_, segment) = post_library(
+        buyer.app.clone(),
+        &player_token,
+        "read_viewer",
+        json!({
+            "mint_id": package.mint_id,
+            "viewer_session_handle": viewer_handle,
+            "segment_index": 0,
+        }),
+    )
+    .await;
+    assert_eq!(segment["status"], "ok", "{segment}");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(segment["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        clear_segments[0]
+    );
+    let (_, closed) = post_library(
+        buyer.app.clone(),
+        &player_token,
+        "close_viewer",
+        json!({"mint_id": package.mint_id, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(closed["status"], "ok", "{closed}");
+
+    // Nothing ElastOS-only was ever asked for.
+    let manifest_reads = buyer
+        .content
+        .requests()
+        .into_iter()
+        .filter(|request| request["path"] == "manifest.json")
+        .count();
+    assert_eq!(manifest_reads, 0);
+
+    // A second press is the same completed purchase, still adopted, and the
+    // item can be downloaded by its item alone.
+    let (_, again) = post_library(
+        buyer.app.clone(),
+        &buyer.market_token,
+        "buy_offer",
+        adoption_buy_offer_body(&package),
+    )
+    .await;
+    assert_eq!(again["data"], complete);
+    let (_, downloaded) = post_library(
+        buyer.app.clone(),
+        &buyer.library_token,
+        "download_owned_copy",
+        json!({"item": adoption_buy_offer_body(&package)["item"]}),
+    )
+    .await;
+    assert_eq!(downloaded["status"], "ok", "{downloaded}");
+    assert_eq!(downloaded["data"]["mint_id"], package.mint_id);
+    assert_eq!(downloaded["data"]["acquisition"], "market");
+    assert_eq!(
+        downloaded["data"]["capsule_uri"],
+        json!(purchase.capsule_uri)
+    );
+    crate::protected_content_runtime::tests::assert_no_unresolved_runtime_custody_release_for_test(
+        buyer.runtime.path(),
+    );
+}
+
+/// R39 (T8-I1): a Home that already holds a listing of the mint -- imported
+/// from the creator's published package -- on exactly the terms the market
+/// purchase paid binds the purchase to that listing, instead of leaving the
+/// purchase unopenable. The listing is not overwritten, and it opens.
+#[tokio::test]
+async fn adoption_binds_to_a_listing_already_held_on_the_same_terms() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+
+    let asset = publish_two_runtime_market_asset().await;
+    let package = asset.package.clone();
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&package.mint_id).unwrap().try_into().unwrap(),
+    );
+    let creator_record = crate::protected_content_runtime::load_runtime_custody_listing(
+        asset._runtime_a.path(),
+        mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    let crate::protected_content_runtime::RuntimeCustodyListingOrigin::LocalCreator {
+        listing_uri,
+        package_sha256,
+        ..
+    } = creator_record.origin.clone()
+    else {
+        panic!("the creator's own listing is LocalCreator");
+    };
+    let imported = crate::protected_content_runtime::RuntimeCustodyListingRecord {
+        origin: crate::protected_content_runtime::RuntimeCustodyListingOrigin::Imported {
+            listing_uri,
+            package_sha256,
+        },
+        ..creator_record
+    };
+    imported.validate().unwrap();
+
+    let buyer = adoption_buyer(&asset).await;
+    crate::protected_content_runtime::persist_runtime_custody_listing(
+        buyer.runtime.path(),
+        &imported,
+    )
+    .unwrap();
+    let complete = complete_adoption_market_purchase(&buyer, &package).await;
+    assert_eq!(complete["adoption"], "adopted", "{complete}");
+
+    let held = crate::protected_content_runtime::load_runtime_custody_listing(
+        buyer.runtime.path(),
+        mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(held.origin, imported.origin, "the held listing is kept");
+    assert_eq!(held.package, imported.package);
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        buyer.runtime.path(),
+        &buyer.buyer.principal_id,
+        mint_id,
+    )
+    .unwrap()
+    .expect("the purchase is bound to the held listing");
+    assert_eq!(purchase.listing_sha256, imported.portable_package_digest());
+    assert_eq!(
+        purchase.acquisition,
+        crate::protected_content_runtime::RuntimeCustodyAcquisitionV1::Market
+    );
+
+    let player_token = projection_launch_token_for_authority_context(
+        buyer.runtime.path(),
+        ELACITY_PLAYER_CAPSULE_ID_FOR_TEST,
+        &buyer.buyer,
+    );
+    let (_, opened) = post_library(
+        buyer.app.clone(),
+        &player_token,
+        "open_viewer",
+        json!({"mint_id": package.mint_id}),
+    )
+    .await;
+    assert_eq!(opened["status"], "ok", "{opened}");
+    let viewer_handle = opened["data"]["viewer_session_handle"].clone();
+    let (_, closed) = post_library(
+        buyer.app.clone(),
+        &player_token,
+        "close_viewer",
+        json!({"mint_id": package.mint_id, "viewer_session_handle": viewer_handle}),
+    )
+    .await;
+    assert_eq!(closed["status"], "ok", "{closed}");
+}
+
+/// A buyer Home holding an imported copy of the creator's listing, so the
+/// Library `buy` (the listing-package path) can buy the same item that
+/// Marketplace `buy_offer` names.
+async fn buyer_holding_an_imported_listing(
+    asset: &TwoRuntimeMarketAsset,
+) -> (AdoptionBuyer, elastos_protected_content_contracts::Digest32) {
+    let mint_id = elastos_protected_content_contracts::Digest32::new(
+        hex::decode(&asset.package.mint_id)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let creator_record = crate::protected_content_runtime::load_runtime_custody_listing(
+        asset._runtime_a.path(),
+        mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    let crate::protected_content_runtime::RuntimeCustodyListingOrigin::LocalCreator {
+        listing_uri,
+        package_sha256,
+        ..
+    } = creator_record.origin.clone()
+    else {
+        panic!("the creator's own listing is LocalCreator");
+    };
+    let imported = crate::protected_content_runtime::RuntimeCustodyListingRecord {
+        origin: crate::protected_content_runtime::RuntimeCustodyListingOrigin::Imported {
+            listing_uri,
+            package_sha256,
+        },
+        ..creator_record
+    };
+    imported.validate().unwrap();
+    let buyer = adoption_buyer(asset).await;
+    crate::protected_content_runtime::persist_runtime_custody_listing(
+        buyer.runtime.path(),
+        &imported,
+    )
+    .unwrap();
+    (buyer, mint_id)
+}
+
+/// Start a Library `buy` of the imported item: its first press records the
+/// listing-package purchase and raises the Wallet request.
+async fn start_library_buy(
+    buyer: &AdoptionBuyer,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) -> crate::protected_content_runtime::RuntimeCustodyPurchaseRecord {
+    let (_, pending) = post_library(
+        buyer.app.clone(),
+        &buyer.library_token,
+        "buy",
+        json!({"mint_id": hex::encode(mint_id.as_bytes())}),
+    )
+    .await;
+    assert_eq!(
+        pending["buy_progress"]["stage"], "purchase_approval",
+        "{pending}"
+    );
+    crate::protected_content_runtime::load_runtime_custody_purchase(
+        buyer.runtime.path(),
+        &buyer.buyer.principal_id,
+        mint_id,
+    )
+    .unwrap()
+    .expect("the first press records the purchase")
+}
+
+/// Marketplace's first press for the same item: a fresh attempt, and a fresh
+/// Wallet request.
+async fn assert_market_buy_starts(
+    buyer: &AdoptionBuyer,
+    package: &crate::protected_content_runtime::RuntimePortableListingPackage,
+) {
+    let (_, market) = post_library(
+        buyer.app.clone(),
+        &buyer.market_token,
+        "buy_offer",
+        adoption_buy_offer_body(package),
+    )
+    .await;
+    assert_eq!(
+        market["buy_progress"]["stage"], "purchase_approval",
+        "{market}"
+    );
+    assert!(
+        crate::protected_content_market::load_runtime_market_purchase_by_key(
+            buyer.runtime.path(),
+            &buyer.buyer.principal_id,
+            &package.chain_namespace,
+            &package.ledger,
+            &package.token_id,
+        )
+        .unwrap()
+        .is_some()
+    );
+}
+
+/// R41 (NEW-I1): a Library `buy` the person declined is over -- nothing was
+/// signed, so nothing can be paid -- and its record is retired, exactly as a
+/// declined market attempt is (R25). The same item can then be bought from
+/// Marketplace: R29 refuses only a purchase that is still under way.
+#[tokio::test]
+async fn declined_library_buy_does_not_block_a_market_purchase() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    set_mock_protected_content_purchase_access_denied();
+
+    let asset = publish_two_runtime_market_asset().await;
+    let package = asset.package.clone();
+    let (buyer, mint_id) = buyer_holding_an_imported_listing(&asset).await;
+    start_library_buy(&buyer, mint_id).await;
+    {
+        let mut approvals = buyer.wallet.provider.approvals.lock().await;
+        let approval = approvals
+            .iter_mut()
+            .rev()
+            .find(|approval| approval["intent"] == "transaction_intent")
+            .unwrap();
+        approval["status"] = json!("rejected");
+    }
+    let (_, declined) = post_library(
+        buyer.app.clone(),
+        &buyer.library_token,
+        "buy",
+        json!({"mint_id": package.mint_id}),
+    )
+    .await;
+    assert_eq!(declined["buy_progress"]["stage"], "declined", "{declined}");
+    assert_eq!(declined["buy_progress"]["resumable"], false, "{declined}");
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_purchase(
+            buyer.runtime.path(),
+            &buyer.buyer.principal_id,
+            mint_id,
+        )
+        .unwrap()
+        .is_none(),
+        "a declined listing purchase is retired"
+    );
+
+    assert_market_buy_starts(&buyer, &package).await;
+}
+
+/// R41: a Library `buy` the chain mined and reverted is a spent effect that
+/// paid nothing. Its record is retired (R21's discipline on the listing
+/// path), so the item can be bought from Marketplace.
+#[tokio::test]
+async fn reverted_library_buy_does_not_block_a_market_purchase() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    set_mock_protected_content_purchase_access_denied();
+
+    let asset = publish_two_runtime_market_asset().await;
+    let package = asset.package.clone();
+    let (buyer, mint_id) = buyer_holding_an_imported_listing(&asset).await;
+    start_library_buy(&buyer, mint_id).await;
+    let _ = buyer
+        .wallet
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    buyer
+        .revert_receipts
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, reverted) = post_library(
+        buyer.app.clone(),
+        &buyer.library_token,
+        "buy",
+        json!({"mint_id": package.mint_id}),
+    )
+    .await;
+    assert_eq!(reverted["status"], "error", "{reverted}");
+    assert_eq!(reverted["code"], "library_error", "{reverted}");
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_purchase(
+            buyer.runtime.path(),
+            &buyer.buyer.principal_id,
+            mint_id,
+        )
+        .unwrap()
+        .is_none(),
+        "a reverted listing purchase is retired"
+    );
+
+    buyer
+        .revert_receipts
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_market_buy_starts(&buyer, &package).await;
+}
+
+/// T8-M3: a shared document carrying a well-formed, decodable key envelope
+/// that belongs to ANOTHER asset is not adopted: the purchase stays complete,
+/// adoption is `pending`, and no read-side record is written.
+#[tokio::test]
+async fn adoption_refuses_a_decodable_envelope_from_another_asset() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+
+    let other = publish_two_runtime_market_asset().await;
+    let asset = publish_two_runtime_market_asset().await;
+    let package = asset.package.clone();
+    assert_ne!(
+        other.package.key_envelope_identity_base64,
+        package.key_envelope_identity_base64
+    );
+    {
+        let mut shared = asset.shared_content.lock().unwrap();
+        let folder = shared.get_mut(&package.metadata_cid).unwrap();
+        let mut document: Value =
+            serde_json::from_slice(folder.get("metadata.json").unwrap()).unwrap();
+        document["asset"]["protections"][0]["key_envelope_identity_base64"] =
+            json!(other.package.key_envelope_identity_base64);
+        folder.insert(
+            "metadata.json".to_string(),
+            serde_json::to_vec(&document).unwrap(),
+        );
+    }
+    let buyer = adoption_buyer(&asset).await;
+    let complete = complete_adoption_market_purchase(&buyer, &package).await;
+    assert_eq!(complete["adoption"], "pending", "{complete}");
+    let root = buyer
+        .runtime
+        .path()
+        .join("protected-content/runtime-listings");
+    assert_eq!(
+        std::fs::read_dir(root).map_or(0, |entries| entries.count()),
+        0,
+        "no listing for an envelope that is not this asset's"
+    );
+    let purchases = buyer
+        .runtime
+        .path()
+        .join("protected-content/runtime-purchases");
+    let purchase_files = std::fs::read_dir(&purchases)
+        .map(|dirs| {
+            dirs.flatten()
+                .flat_map(|dir| {
+                    std::fs::read_dir(dir.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                })
+                .filter(|file| file.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(purchase_files, 0, "no read-side purchase record either");
+}
+
+/// A shared document whose identities do not verify is not adopted: the
+/// purchase stays complete, and no read-side record is written. Once the
+/// document is right again, the next press adopts it.
+#[tokio::test]
+async fn adoption_refuses_identities_that_do_not_verify() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+
+    let asset = publish_two_runtime_market_asset().await;
+    let package = asset.package.clone();
+    let original = asset
+        .shared_content
+        .lock()
+        .unwrap()
+        .get(&package.metadata_cid)
+        .unwrap()
+        .get("metadata.json")
+        .unwrap()
+        .clone();
+    let publish_tampered = |tamper: &dyn Fn(&mut Value)| {
+        let mut document: Value = serde_json::from_slice(&original).unwrap();
+        tamper(&mut document);
+        asset
+            .shared_content
+            .lock()
+            .unwrap()
+            .get_mut(&package.metadata_cid)
+            .unwrap()
+            .insert(
+                "metadata.json".to_string(),
+                serde_json::to_vec(&document).unwrap(),
+            );
+    };
+    let listings = |buyer: &AdoptionBuyer| {
+        let root = buyer
+            .runtime
+            .path()
+            .join("protected-content/runtime-listings");
+        std::fs::read_dir(root).map_or(0, |entries| entries.count())
+    };
+
+    // 1. The content identity, tampered by one bit. The identity is bound to
+    // its own ciphertext digest, so it no longer decodes as one.
+    publish_tampered(&|document| {
+        let identity = document["asset"]["protections"][0]["content_identity_base64"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(identity)
+            .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        document["asset"]["protections"][0]["content_identity_base64"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+    });
+    let buyer = adoption_buyer(&asset).await;
+    let complete = complete_adoption_market_purchase(&buyer, &package).await;
+    assert_eq!(complete["adoption"], "pending", "{complete}");
+    let market = crate::protected_content_market::load_completed_runtime_market_purchase_by_key(
+        buyer.runtime.path(),
+        &buyer.buyer.principal_id,
+        &package.chain_namespace,
+        &package.ledger,
+        &package.token_id,
+    )
+    .unwrap()
+    .expect("the purchase is complete whatever adoption says");
+    assert_eq!(market.adopted_mint_id, None);
+    assert_eq!(
+        listings(&buyer),
+        0,
+        "no listing for an identity that does not decode"
+    );
+
+    // 2. Well-formed identities that do not verify: the document's content
+    // is another published object than the one its identities describe. Only
+    // verifying the content against the identity refuses this.
+    publish_tampered(&|document| {
+        document["media"]["uri"] = json!(format!("ipfs://{}", package.metadata_cid));
+    });
+    let (_, again) = post_library(
+        buyer.app.clone(),
+        &buyer.market_token,
+        "buy_offer",
+        adoption_buy_offer_body(&package),
+    )
+    .await;
+    assert_eq!(again["status"], "ok", "{again}");
+    assert_eq!(again["data"]["adoption"], "pending", "{again}");
+    assert_eq!(
+        listings(&buyer),
+        0,
+        "no listing for content that does not verify"
+    );
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_purchase(
+            buyer.runtime.path(),
+            &buyer.buyer.principal_id,
+            elastos_protected_content_contracts::Digest32::new(
+                hex::decode(&package.mint_id).unwrap().try_into().unwrap(),
+            ),
+        )
+        .unwrap()
+        .is_none(),
+        "no read-side purchase record either"
+    );
+
+    // The document restored, the next press adopts.
+    publish_tampered(&|_| {});
+    let (_, again) = post_library(
+        buyer.app.clone(),
+        &buyer.market_token,
+        "buy_offer",
+        adoption_buy_offer_body(&package),
+    )
+    .await;
+    assert_eq!(again["data"]["adoption"], "adopted", "{again}");
+    assert_eq!(listings(&buyer), 1);
 }
 
 #[tokio::test]

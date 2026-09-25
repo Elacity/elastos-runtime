@@ -379,6 +379,16 @@ enum ObjectProviderRequest {
         principal_id: String,
         mint_id: String,
     },
+    /// Buy one copy of a live market offer on the terms the buyer agreed to.
+    /// The wire is exactly §5.2 (R20); `item`, `asset_uri` and `seller` are
+    /// claims the purchase re-derives before trusting any of them.
+    BuyOffer {
+        principal_id: String,
+        item: crate::protected_content_market::RuntimeMarketBuyItemClaim,
+        asset_uri: String,
+        seller: String,
+        agreed: crate::protected_content_market::RuntimeMarketAgreedTerms,
+    },
     /// Rebuild the local copy of an item this principal owns.
     ///
     /// A `.ddrm` capsule is made out of public material: the metadata document
@@ -388,9 +398,16 @@ enum ObjectProviderRequest {
     /// Buying and minting both write it as a side effect; this is how a person
     /// asks for it on its own, when that write never happened, when the file
     /// was deleted, or when they hold the token on a Home that never held it.
+    ///
+    /// Exactly one of `mint_id` and `item`: a copy bought on the market is
+    /// named by its item (§5.2's shape), since until it is adopted there is
+    /// no mint for it on this Home.
     DownloadOwnedCopy {
         principal_id: String,
-        mint_id: String,
+        #[serde(default)]
+        mint_id: Option<String>,
+        #[serde(default)]
+        item: Option<crate::protected_content_market::RuntimeMarketBuyItemClaim>,
     },
     OpenViewer {
         principal_id: String,
@@ -454,6 +471,14 @@ enum ObjectProviderRequest {
         #[serde(default)]
         grant_id: Option<String>,
     },
+}
+
+impl ObjectProviderRequest {
+    /// A buy the Marketplace page asks for (`buy`, `buy_offer`): its answers
+    /// must never carry this Home's account (D14, R31).
+    fn is_marketplace_buy(&self) -> bool {
+        matches!(self, Self::Buy { .. } | Self::BuyOffer { .. })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +688,7 @@ impl Provider for ObjectProvider {
         };
 
         let data_dir = self.data_dir.clone();
+        let marketplace_buy = request.is_marketplace_buy();
         let result = match request {
             ObjectProviderRequest::Publish {
                 principal_id,
@@ -720,6 +746,7 @@ impl Provider for ObjectProvider {
             | ObjectProviderRequest::ImportRuntimeCustody { .. }
             | ObjectProviderRequest::DiscardProtection { .. }
             | ObjectProviderRequest::Buy { .. }
+            | ObjectProviderRequest::BuyOffer { .. }
             | ObjectProviderRequest::DownloadOwnedCopy { .. }
             | ObjectProviderRequest::OpenViewer { .. }
             | ObjectProviderRequest::ReadViewer { .. }
@@ -749,7 +776,7 @@ impl Provider for ObjectProvider {
 
         Ok(match result {
             Ok(data) => provider_ok(data),
-            Err(err) => provider_error_from("library_error", &err),
+            Err(err) => marketplace_buy_error_from(marketplace_buy, &err),
         })
     }
 }
@@ -774,6 +801,7 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
         | ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::BuyOffer { .. }
         | ObjectProviderRequest::DownloadOwnedCopy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -964,6 +992,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
     };
 
     let data_dir = data_dir.to_path_buf();
+    let marketplace_buy = request.is_marketplace_buy();
     if library_request_touches_webspace(&request) {
         let result = handle_library_webspace_request(&data_dir, &registry, request).await;
         return match result {
@@ -1014,6 +1043,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::DiscardProtection { .. }
         | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::BuyOffer { .. }
         | ObjectProviderRequest::DownloadOwnedCopy { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
@@ -1035,7 +1065,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
 
     match result {
         Ok(data) => provider_ok(data),
-        Err(err) => provider_error_from("library_error", &err),
+        Err(err) => marketplace_buy_error_from(marketplace_buy, &err),
     }
 }
 
@@ -1846,6 +1876,7 @@ fn handle_library_request(
         | ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::BuyOffer { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
         | ObjectProviderRequest::CloseViewer { .. } => {
@@ -1870,7 +1901,7 @@ async fn handle_runtime_custody_library_request(
     // three viewer operations on every other route rather than bind a session
     // to a caller-chosen actor. Note this cannot key off `gateway_authority`:
     // the proxy passes `None` there for viewer ops, since it only builds a
-    // Wallet authority for protected `publish` and `buy`.
+    // Wallet authority for protected `publish`, `buy` and `buy_offer`.
     if matches!(
         request,
         ObjectProviderRequest::OpenViewer { .. }
@@ -1905,19 +1936,31 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::DownloadOwnedCopy {
             principal_id,
             mint_id,
+            item,
         } => {
             let Some((state, authority)) = gateway_authority else {
                 anyhow::bail!(
                     crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE
                 );
             };
+            let copy = match (mint_id, item) {
+                (Some(mint_id), None) => {
+                    crate::protected_content_runtime::RuntimeCustodyOwnedCopy::Mint(mint_id)
+                }
+                (None, Some(item)) => {
+                    crate::protected_content_runtime::RuntimeCustodyOwnedCopy::MarketItem(item)
+                }
+                _ => anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_DOWNLOAD_DENIED_MESSAGE
+                ),
+            };
             crate::api::gateway::runtime_custody_download_owned_copy_via_gateway(
                 state,
                 authority,
                 registry,
-                crate::protected_content_runtime::RuntimeCustodyBuyInput {
+                crate::protected_content_runtime::RuntimeCustodyDownloadInput {
                     principal_id,
-                    mint_id,
+                    copy,
                 },
             )
             .await
@@ -1938,6 +1981,32 @@ async fn handle_runtime_custody_library_request(
                 crate::protected_content_runtime::RuntimeCustodyBuyInput {
                     principal_id,
                     mint_id,
+                },
+            )
+            .await
+        }
+        ObjectProviderRequest::BuyOffer {
+            principal_id,
+            item,
+            asset_uri,
+            seller,
+            agreed,
+        } => {
+            let Some((state, authority)) = gateway_authority else {
+                anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+                );
+            };
+            crate::api::gateway::runtime_custody_buy_offer_via_gateway(
+                state,
+                authority,
+                registry,
+                crate::protected_content_market::RuntimeMarketBuyInput {
+                    principal_id,
+                    item,
+                    asset_uri,
+                    seller,
+                    agreed,
                 },
             )
             .await
@@ -3525,6 +3594,7 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         | ObjectProviderRequest::ListRuntimeCustody { .. }
         | ObjectProviderRequest::ImportRuntimeCustody { .. }
         | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::BuyOffer { .. }
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
         | ObjectProviderRequest::CloseViewer { .. } => false,
@@ -7456,8 +7526,13 @@ fn provider_error(code: &str, message: &str) -> Value {
 /// English to decide what to offer is how a recoverable state once reached a
 /// dead end in the apps.
 fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
+    provider_error_with_detail(code, error, bounded_error_detail(error_cause_chain(error)))
+}
+
+/// [`provider_error_from`] with `detail` already built, so a caller that has
+/// to rewrite the cause chain does so before it is bounded (R42).
+fn provider_error_with_detail(code: &str, error: &anyhow::Error, detail: String) -> Value {
     let mut response = provider_error(code, &error.to_string());
-    let detail = anyhow_error_detail(error);
     if !detail.is_empty() {
         response["detail"] = Value::String(detail);
     }
@@ -7497,6 +7572,12 @@ fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
     {
         response["buy_progress"] = progress.as_json();
     }
+    // A market buy refused before anything was raised (§5.3). Its typed code
+    // replaces the generic one: `code` is the field Marketplace branches on,
+    // and `terms_changed` carries the offer the buyer has to decide on anew.
+    if let Some(refusal) = error.downcast_ref::<crate::api::gateway::RuntimeMarketBuyRefusal>() {
+        refusal.project_onto(&mut response);
+    }
     // The opposite of pending: an approval that is finished and did not
     // succeed. Its own key, so an app polling for completion can tell "stop
     // waiting" from "keep waiting" without reading either sentence.
@@ -7516,15 +7597,74 @@ fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
     response
 }
 
-fn anyhow_error_detail(error: &anyhow::Error) -> String {
-    let mut detail = error
+/// The error envelope for any object request; for a Marketplace buy (`buy`,
+/// `buy_offer`) with every account address taken out of the text (R31).
+fn marketplace_buy_error_from(marketplace_buy: bool, error: &anyhow::Error) -> Value {
+    if !marketplace_buy {
+        return provider_error_from("library_error", error);
+    }
+    // R42: the whole cause chain is redacted before it is bounded, so the
+    // bound can never cut an address into a run too short to be recognised.
+    let detail = bounded_error_detail(redact_evm_address_runs(&error_cause_chain(error)));
+    let mut response = provider_error_with_detail("library_error", error, detail);
+    redact_account_addresses(&mut response);
+    response
+}
+
+/// D14 for a Marketplace buy (R31): the page never learns this Home's account.
+/// A node's own sentence can name it ("insufficient funds ... address 0x…"),
+/// and `detail` carries such sentences, so every `0x` + 40-hex run in `message`
+/// and `detail` becomes `0x…`. Typed fields (`code`, `current`,
+/// `buy_progress`) are left exactly as they are: they are built to carry no
+/// account, and `current` names a seller the page was already shown.
+fn redact_account_addresses(response: &mut Value) {
+    for key in ["message", "detail"] {
+        if let Some(Value::String(text)) = response.get_mut(key) {
+            *text = redact_evm_address_runs(text);
+        }
+    }
+}
+
+/// Replace every `0x` followed by at least 40 hex digits with `0x…`.
+fn redact_evm_address_runs(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let is_prefix = bytes[index] == b'0' && matches!(bytes.get(index + 1), Some(b'x' | b'X'));
+        if is_prefix {
+            let digits = bytes[index + 2..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_hexdigit())
+                .count();
+            if digits >= 40 {
+                out.push_str("0x\u{2026}");
+                index += 2 + digits;
+                continue;
+            }
+        }
+        let ch = text[index..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// The cause chain beneath the outermost error, outermost first.
+fn error_cause_chain(error: &anyhow::Error) -> String {
+    error
         .chain()
         .skip(1)
         .map(|cause| cause.to_string())
         .collect::<Vec<_>>()
-        .join(" <- ");
-    if detail.len() > 1024 {
-        detail.truncate(1024);
+        .join(" <- ")
+}
+
+/// `detail` bounded to 1024 bytes, cut on a character boundary.
+fn bounded_error_detail(mut detail: String) -> String {
+    const MAX_DETAIL_BYTES: usize = 1024;
+    if detail.len() > MAX_DETAIL_BYTES {
+        detail.truncate(detail.floor_char_boundary(MAX_DETAIL_BYTES));
     }
     detail
 }
@@ -7593,6 +7733,67 @@ mod tests {
             super::viewer_ids_for_name("bundle.zip"),
             vec!["archive-manager"]
         );
+    }
+
+    #[test]
+    fn marketplace_buy_errors_redact_every_account_address() {
+        let address = "0x19E7e376E7C213B7E7e7e46cc70A5dD086DAff2A";
+        let error = anyhow::anyhow!("insufficient funds: address {address} have 0")
+            .context("Runtime custody purchase is unavailable");
+        let redacted = super::marketplace_buy_error_from(true, &error);
+        assert_eq!(
+            redacted["detail"],
+            "insufficient funds: address 0x\u{2026} have 0"
+        );
+        assert_eq!(
+            redacted["message"],
+            "Runtime custody purchase is unavailable"
+        );
+        // Another op's envelope is left exactly as it was.
+        let plain = super::marketplace_buy_error_from(false, &error);
+        assert!(plain["detail"].as_str().unwrap().contains(address));
+        // Short hex (a quantity, a code) is not an address; a longer run (a
+        // transaction hash) is redacted all the same.
+        assert_eq!(
+            super::redact_evm_address_runs("value 0x2710 code 0x3 é"),
+            "value 0x2710 code 0x3 é"
+        );
+        assert_eq!(
+            super::redact_evm_address_runs(&format!("tx 0x{} done", "ab".repeat(32))),
+            "tx 0x\u{2026} done"
+        );
+    }
+
+    /// R42 (m1): the bound on `detail` never cuts an address into a run too
+    /// short to be recognised. The whole cause chain is redacted first, and
+    /// only then bounded.
+    #[test]
+    fn marketplace_buy_errors_redact_an_address_the_detail_bound_would_cut() {
+        let address = "0x19E7e376E7C213B7E7e7e46cc70A5dD086DAff2A";
+        for pad in [1000, 1010, 1020, 1023] {
+            let error = anyhow::anyhow!("{} {address} have 0", "n".repeat(pad))
+                .context("Runtime custody purchase is unavailable");
+            let redacted = super::marketplace_buy_error_from(true, &error);
+            let detail = redacted["detail"].as_str().unwrap();
+            assert!(detail.len() <= 1024, "pad {pad}: {} bytes", detail.len());
+            assert!(
+                !detail.contains("0x19"),
+                "pad {pad}: part of the address survived: {detail:?}"
+            );
+        }
+    }
+
+    /// The bound on `detail` lands on a character boundary, whatever the text.
+    #[test]
+    fn error_detail_bound_keeps_multibyte_text_whole() {
+        // One ASCII byte first, so byte 1024 falls inside a two-byte 'é'.
+        let error = anyhow::anyhow!("a{}", "é".repeat(700)).context("outer");
+        for marketplace_buy in [false, true] {
+            let value = super::marketplace_buy_error_from(marketplace_buy, &error);
+            let detail = value["detail"].as_str().unwrap();
+            assert!(detail.len() <= 1024);
+            assert!(detail.chars().skip(1).all(|ch| ch == 'é'));
+        }
     }
 
     #[test]

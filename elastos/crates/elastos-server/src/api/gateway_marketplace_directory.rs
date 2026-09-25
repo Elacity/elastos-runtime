@@ -128,6 +128,7 @@ pub(in crate::api::gateway) async fn market_channels_response(
         }
         Err(err) => {
             let note = err.to_string();
+            tracing::warn!(error = %format!("{err:#}"), "marketplace channels fetch failed");
             if let Some(context) = context {
                 let _ = MARKET_DIRECTORY.append_fetch_audit(
                     data_dir,
@@ -286,17 +287,20 @@ pub(in crate::api::gateway) async fn marketplace_catalog_items(
     // Prices arrive in token units and every other price on this Home is in
     // base units, so the table that says how to convert is read first. It is
     // local configuration; an index being reachable does not make it so.
-    let pay_tokens: Vec<(String, u8)> = runtime_custody_pay_token_table(&state)
+    // The same source names the chain the index answers for, which is the
+    // chain this Home's holdings are joined on.
+    let source = resolve_runtime_custody_creator_mint_source(&state)
         .await
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|token| {
-            Some((
-                token.get("address")?.as_str()?.to_ascii_lowercase(),
-                u8::try_from(token.get("decimals")?.as_u64()?).ok()?,
-            ))
+        .map_err(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "market catalog: market source unreadable");
         })
+        .ok();
+    let pay_tokens: Vec<(String, u8)> = source
+        .iter()
+        .flat_map(|source| source.pay_tokens.iter())
+        .map(|token| (token.address.to_ascii_lowercase(), token.decimals))
         .collect();
+    let chain_namespace = source.as_ref().map(|source| source.chain_namespace.clone());
     let now = now_ts();
     let fetch_request_id = format!("{MARKETPLACE_DIRECTORY_HTTP_REQUEST_ID}:catalog:{now}");
     let _ = MARKET_DIRECTORY.append_fetch_audit(
@@ -308,23 +312,12 @@ pub(in crate::api::gateway) async fn marketplace_catalog_items(
     );
     match fetch_market_catalog(&state.data_dir, &pay_tokens).await {
         Ok(mut items) => {
-            // What this Home already holds, joined on the names the chain
-            // uses. Done here because the channel an item lives on is not
-            // published to a surface, so a surface could not make this join.
-            let held = crate::protected_content_runtime::runtime_custody_listing_chain_index(
+            mark_held_market_catalog_items(
                 &state.data_dir,
                 &context.principal_id,
-            )
-            .unwrap_or_default();
-            for item in &mut items {
-                if let Some(local) = held
-                    .iter()
-                    .find(|entry| entry.ledger == item.ledger && entry.token_id == item.token_id)
-                {
-                    item.mint_id = local.mint_id.clone();
-                    item.access_state = local.access_state.clone();
-                }
-            }
+                chain_namespace.as_deref(),
+                &mut items,
+            );
             let _ = MARKET_DIRECTORY.append_fetch_audit(
                 &state.data_dir,
                 &context,
@@ -345,7 +338,7 @@ pub(in crate::api::gateway) async fn marketplace_catalog_items(
             // Said in the log as well as audited. The audit chain stores an
             // event id and a hash, so a reason recorded only there cannot be
             // read back when someone asks why a shelf is empty.
-            tracing::warn!(%note, "marketplace catalog fetch failed");
+            tracing::warn!(error = %format!("{error:#}"), "marketplace catalog fetch failed");
             let _ = MARKET_DIRECTORY.append_fetch_audit(
                 &state.data_dir,
                 &context,
@@ -359,14 +352,66 @@ pub(in crate::api::gateway) async fn marketplace_catalog_items(
             }
             // An index that cannot be read leaves Explore with this Home's own
             // items and a reason, never an error that stops the app.
-            Json(serde_json::json!({
-                "asOf": now,
-                "unavailable": true,
-                "needsApproval": needs_approval,
-                "items": [],
-                "note": note,
-            }))
+            Json(market_catalog_unavailable_answer(
+                now,
+                needs_approval,
+                &note,
+            ))
             .into_response()
+        }
+    }
+}
+
+/// What this Home already holds, joined onto the index's rows on the names
+/// the chain uses. Done here because the channel an item lives on is not
+/// published to a surface, so a surface could not make this join.
+///
+/// A listing this Home holds answers first, with its mint. An item this
+/// person completed a market purchase of is `purchased` too, even when no
+/// listing exists for it -- a foreign asset, or one whose adoption has not
+/// finished yet: they own it either way.
+///
+/// The index answers for one chain -- the market source's -- so only what this
+/// Home holds on that chain is joined (T8-M2): the same ledger and token id on
+/// another chain is another item. `None` when the market source could not be
+/// read; then the chain is not known and nothing is claimed about it.
+pub(in crate::api::gateway) fn mark_held_market_catalog_items(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    chain_namespace: Option<&str>,
+    items: &mut [MarketCatalogItem],
+) {
+    let Some(chain_namespace) = chain_namespace else {
+        tracing::warn!("market catalog: the market chain is unknown; nothing is marked held");
+        return;
+    };
+    let held = crate::protected_content_runtime::runtime_custody_listing_chain_index(
+        data_dir,
+        principal_id,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "market catalog could not read local listings");
+        Vec::new()
+    });
+    let bought =
+        crate::protected_content_market::completed_runtime_market_purchases(data_dir, principal_id);
+    for item in items.iter_mut() {
+        if let Some(local) = held.iter().find(|entry| {
+            entry.chain_namespace == chain_namespace
+                && entry.ledger.eq_ignore_ascii_case(&item.ledger)
+                && entry.token_id.eq_ignore_ascii_case(&item.token_id)
+        }) {
+            item.mint_id = local.mint_id.clone();
+            item.access_state = local.access_state.clone();
+        }
+        if item.access_state == "available"
+            && bought.iter().any(|record| {
+                record.item.chain_namespace == chain_namespace
+                    && record.item.ledger.eq_ignore_ascii_case(&item.ledger)
+                    && record.item.token_id.eq_ignore_ascii_case(&item.token_id)
+            })
+        {
+            item.access_state = "purchased".to_string();
         }
     }
 }
@@ -375,17 +420,52 @@ pub(in crate::api::gateway) async fn fetch_market_catalog(
     data_dir: &FsPath,
     pay_tokens: &[(String, u8)],
 ) -> anyhow::Result<Vec<MarketCatalogItem>> {
+    fetch_market_catalog_at(
+        data_dir,
+        pay_tokens,
+        &MARKET_DIRECTORY.endpoint(),
+        OnchainDirectoryTimeouts::DEFAULT,
+    )
+    .await
+}
+
+/// `fetch_market_catalog` from `endpoint`, each request bounded by
+/// `timeouts`.
+pub(in crate::api::gateway) async fn fetch_market_catalog_at(
+    data_dir: &FsPath,
+    pay_tokens: &[(String, u8)],
+    endpoint: &str,
+    timeouts: OnchainDirectoryTimeouts,
+) -> anyhow::Result<Vec<MarketCatalogItem>> {
     MARKET_DIRECTORY.validate_source(data_dir)?;
     let payload = MARKET_DIRECTORY
-        .post_graphql(
+        .post_graphql_at(
+            endpoint,
             MARKET_CATALOG_QUERY,
             serde_json::json!({
                 "query": market_catalog_query_input(),
                 "filters": { "limit": MARKET_CATALOG_PAGE_LIMIT, "offset": 0 },
             }),
+            timeouts,
         )
         .await?;
     market_catalog_from_payload(&payload, pay_tokens)
+}
+
+/// The catalog's answer when the index could not be read: no items and the
+/// reason, never an error that stops the app.
+pub(in crate::api::gateway) fn market_catalog_unavailable_answer(
+    now: u64,
+    needs_approval: bool,
+    note: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "asOf": now,
+        "unavailable": true,
+        "needsApproval": needs_approval,
+        "items": [],
+        "note": note,
+    })
 }
 
 /// The catalog: what anyone has minted, as this Home can show it.
@@ -893,7 +973,9 @@ fn bounded_directory_text(value: Option<&serde_json::Value>) -> String {
     text.chars().take(MARKET_DIRECTORY_MAX_TEXT_CHARS).collect()
 }
 
-const MARKET_DIRECTORY_MAX_TEXT_CHARS: usize = 256;
+/// The bound every text shown on a market card is held to, index or shared
+/// document alike, in Unicode scalar values.
+pub(in crate::api::gateway) const MARKET_DIRECTORY_MAX_TEXT_CHARS: usize = 256;
 const MARKET_DIRECTORY_MAX_CATEGORIES: usize = 8;
 
 /// `0x` + 40 lowercase hex. Local to this module: it screens an address the

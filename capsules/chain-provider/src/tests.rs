@@ -1,5 +1,5 @@
-use crate::backends::interpret_evm_rpc_batch;
 use super::*;
+use crate::backends::{interpret_evm_rpc_batch, rate_limit_cooldown_log, rate_limit_retry_log};
 
 /// The channel the creator-mint fixtures publish into. A mint now names its
 /// channel, so the tests name one too rather than leaning on a configured
@@ -31,6 +31,7 @@ use sha3::Digest as _;
 use x_wing::kem::{Decapsulator as _, KeyExport as _};
 use x_wing::TryKeyInit as _;
 
+mod rate_limit;
 mod support;
 
 use support::*;
@@ -780,6 +781,30 @@ fn finalized_block_json_at(number: &str, hash: &str, timestamp: u64) -> Value {
         "hash": hash,
         "timestamp": format!("0x{:x}", timestamp),
     })
+}
+
+/// ABI-encodes a single `string` return value the way `eth_call` would:
+/// offset word `0x20`, then the length word, then the UTF-8 bytes
+/// right-padded to a multiple of 32 bytes.
+fn abi_encoded_string_for_test(value: &str) -> Value {
+    let bytes = value.as_bytes();
+    let mut out = format!("0x{:0>64x}", 0x20);
+    out.push_str(&format!("{:0>64x}", bytes.len()));
+    out.push_str(&encode_hex(bytes));
+    let padding = (32 - (bytes.len() % 32)) % 32;
+    out.push_str(&"0".repeat(padding * 2));
+    json!(out)
+}
+
+/// ABI-encodes a single `address[]` return value: offset word `0x20`, the
+/// length word, then each address right-aligned in its own 32-byte word.
+fn abi_encoded_address_array_for_test(addresses: &[&str]) -> Value {
+    let mut out = format!("0x{:0>64x}", 0x20);
+    out.push_str(&format!("{:0>64x}", addresses.len()));
+    for address in addresses {
+        out.push_str(&format!("{:0>64}", address.trim_start_matches("0x")));
+    }
+    json!(out)
 }
 
 #[test]
@@ -3416,19 +3441,17 @@ fn resolve_protected_content_creator_mint_prices_in_the_token_that_was_chosen() 
     let access_id = [0x41; 16];
     let creator = "0x0000000000000000000000000000000000000011";
     let configured = "0x0000000000000000000000000000000000000033";
-    let request = |pay_token: Option<&str>| {
-        Request::ResolveProtectedContentCreatorMint {
-            creator: creator.to_string(),
-            token_uri: "ipfs://protected-content".to_string(),
-            content_access_id: format!("0x{}", encode_hex(&access_id)),
-            copies: "0x7".to_string(),
-            price: "0x5".to_string(),
-            royalties: Vec::new(),
-            op_type_code: 1,
-            reseller_cut: None,
-            ledger: Some(CONFIGURED_TEST_LEDGER.to_string()),
-            pay_token: pay_token.map(str::to_string),
-        }
+    let request = |pay_token: Option<&str>| Request::ResolveProtectedContentCreatorMint {
+        creator: creator.to_string(),
+        token_uri: "ipfs://protected-content".to_string(),
+        content_access_id: format!("0x{}", encode_hex(&access_id)),
+        copies: "0x7".to_string(),
+        price: "0x5".to_string(),
+        royalties: Vec::new(),
+        op_type_code: 1,
+        reseller_cut: None,
+        ledger: Some(CONFIGURED_TEST_LEDGER.to_string()),
+        pay_token: pay_token.map(str::to_string),
     };
     // Naming no token takes the source's first offered one, and states what a
     // price in it means.
@@ -3448,9 +3471,7 @@ fn resolve_protected_content_creator_mint_prices_in_the_token_that_was_chosen() 
     // in it has unknown meaning.
     let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
     assert_eq!(
-        error_code(provider.handle(request(Some(
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-        )))),
+        error_code(provider.handle(request(Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")))),
         "invalid_protected_content_creator_mint_request"
     );
 }
@@ -5162,6 +5183,1335 @@ fn resolve_protected_content_verified_listing_rejects_noncanonical_address_word(
 }
 
 #[test]
+fn resolve_protected_content_item_reads_operative_and_token_uri() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let token_uri =
+        "ipfs://bafyfolder/0000000000000000000000000000000000000000000000000000000000000001.json";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": operative, "data": encode_operative_token_uri_call().unwrap() },
+                at
+            ]),
+            abi_encoded_string_for_test(token_uri),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    let item = ok_data(provider.handle(Request::ResolveProtectedContentItem {
+        network: "esc-local".to_string(),
+        ledger: ledger.to_string(),
+        token_id: "0x3".to_string(),
+    }));
+    assert_eq!(item["schema"], PROTECTED_CONTENT_ITEM_SCHEMA);
+    assert_eq!(item["operative"], operative);
+    assert_eq!(item["token_uri"], token_uri);
+    assert_eq!(item["token_id"], "0x3");
+}
+
+#[test]
+fn resolve_protected_content_item_rejects_an_unbound_item() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at
+            ]),
+            json!(format!("0x{:0>64}", "")),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentItem {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        })),
+        "unbound_protected_content_item"
+    );
+}
+
+#[test]
+fn resolve_protected_content_item_rejects_conflicting_sources() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let sequence_a = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": operative, "data": encode_operative_token_uri_call().unwrap() },
+                at.clone()
+            ]),
+            abi_encoded_string_for_test("ipfs://bafyfolder/one.json"),
+        ),
+    ];
+    let sequence_b = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": operative, "data": encode_operative_token_uri_call().unwrap() },
+                at
+            ]),
+            abi_encoded_string_for_test("ipfs://bafyfolder/other.json"),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence_a),
+            spawn_rpc_sequence_asserting_server(sequence_b),
+        ]),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentItem {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        })),
+        "conflicting_protected_content_item_observations"
+    );
+}
+
+#[test]
+fn resolve_protected_content_kid_binding_reads_ip_reference() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let store = "0x00000000000000000000000000000000000000cc";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let kid = "0x0123456789abcdef0123456789abcdef";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_cstore_call().unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", store.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": store, "data": encode_ip_reference_call(kid).unwrap() },
+                at
+            ]),
+            json!(format!(
+                "0x{:0>64}{:0>64}",
+                ledger.trim_start_matches("0x"),
+                "3"
+            )),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    let binding = ok_data(provider.handle(Request::ResolveProtectedContentKidBinding {
+        network: "esc-local".to_string(),
+        content_access_id: kid.to_string(),
+    }));
+    assert_eq!(binding["schema"], PROTECTED_CONTENT_KID_BINDING_SCHEMA);
+    assert_eq!(binding["ledger"], ledger);
+    assert_eq!(binding["token_id"], "0x3");
+}
+
+#[test]
+fn resolve_protected_content_kid_binding_rejects_an_unbound_kid() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let store = "0x00000000000000000000000000000000000000cc";
+    let kid = "0x0123456789abcdef0123456789abcdef";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_cstore_call().unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", store.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": store, "data": encode_ip_reference_call(kid).unwrap() },
+                at
+            ]),
+            json!(format!("0x{:0>64}{:0>64}", "", "")),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentKidBinding {
+            network: "esc-local".to_string(),
+            content_access_id: kid.to_string(),
+        })),
+        "unbound_protected_content_kid"
+    );
+}
+
+#[test]
+fn resolve_protected_content_item_offers_reads_every_seller() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let seller1 = "0x0000000000000000000000000000000000000011";
+    let seller2 = "0x0000000000000000000000000000000000000099";
+    let pay_token = "0x0000000000000000000000000000000000000033";
+    let payment_processor = "0x00000000000000000000000000000000000000bb";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                at.clone()
+            ]),
+            // Sellers are returned out of order to prove the resolver sorts
+            // them ascending before it decides which to read.
+            abi_encoded_address_array_for_test(&[seller2, seller1]),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller1).unwrap() },
+                at.clone()
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000007",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000033"
+            )),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller2).unwrap() },
+                at.clone()
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "0000000000000000000000000000000000000000000000000000000000000009",
+                "0000000000000000000000000000000000000000000000000000000000000033"
+            )),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": operative, "data": encode_operatives_payment_processor_call().unwrap() },
+                at
+            ]),
+            json!(format!(
+                "0x{:0>64}",
+                payment_processor.trim_start_matches("0x")
+            )),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    let offers = ok_data(provider.handle(Request::ResolveProtectedContentItemOffers {
+        network: "esc-local".to_string(),
+        ledger: ledger.to_string(),
+        token_id: "0x3".to_string(),
+    }));
+    assert_eq!(offers["schema"], PROTECTED_CONTENT_ITEM_OFFERS_SCHEMA);
+    assert_eq!(offers["operative"], operative);
+    assert_eq!(offers["truncated"], false);
+    let offers_array = offers["offers"].as_array().unwrap();
+    assert_eq!(offers_array.len(), 1);
+    assert_eq!(offers_array[0]["seller"], seller1);
+    assert_eq!(offers_array[0]["quantity"], "0x7");
+    assert_eq!(offers_array[0]["price"], "0x5");
+    assert_eq!(offers_array[0]["pay_token"], pay_token);
+    assert_eq!(offers_array[0]["payment_processor"], payment_processor);
+}
+
+#[test]
+fn resolve_protected_content_item_offers_truncates_beyond_the_cap() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let sellers: Vec<String> = (1..=33).map(|n: u32| format!("0x{n:040x}")).collect();
+    let sellers_str: Vec<&str> = sellers.iter().map(String::as_str).collect();
+    let mut reversed = sellers_str.clone();
+    reversed.reverse();
+    let mut sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                at.clone()
+            ]),
+            // Out of order, same as above -- and one more than the cap.
+            abi_encoded_address_array_for_test(&reversed),
+        ),
+    ];
+    for seller in &sellers_str[..32] {
+        sequence.push((
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+                at.clone()
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+        ));
+    }
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    let offers = ok_data(provider.handle(Request::ResolveProtectedContentItemOffers {
+        network: "esc-local".to_string(),
+        ledger: ledger.to_string(),
+        token_id: "0x3".to_string(),
+    }));
+    assert_eq!(offers["truncated"], true);
+    let offers_array = offers["offers"].as_array().unwrap();
+    assert_eq!(offers_array.len(), 32);
+    assert_eq!(offers_array[0]["seller"], sellers_str[0]);
+    assert_eq!(offers_array[31]["seller"], sellers_str[31]);
+}
+
+#[test]
+fn resolve_protected_content_item_offers_rejects_conflicting_sources() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let seller = "0x0000000000000000000000000000000000000011";
+    let sequence_a = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                at.clone()
+            ]),
+            abi_encoded_address_array_for_test(&[seller]),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+                at.clone()
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000007",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+        ),
+    ];
+    let sequence_b = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                at.clone()
+            ]),
+            abi_encoded_address_array_for_test(&[seller]),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+                at
+            ]),
+            json!(concat!(
+                "0x",
+                // Disagrees on price with source A.
+                "0000000000000000000000000000000000000000000000000000000000000007",
+                "0000000000000000000000000000000000000000000000000000000000000009",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence_a),
+            spawn_rpc_sequence_asserting_server(sequence_b),
+        ]),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentItemOffers {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        })),
+        "conflicting_protected_content_item_offers_observations"
+    );
+}
+
+/// R32 / SM-I5: sources may legitimately disagree on the finalized head by
+/// a block or more; the item read pins every source to the lowest finalized
+/// block (the same algorithm the rights read uses -- see
+/// `pin_to_lowest_finalized`) instead of demanding the sources' finalized
+/// heads match exactly.
+#[test]
+fn resolve_protected_content_item_pins_lagging_sources_to_the_lowest_finalized_block() {
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let token_uri =
+        "ipfs://bafyfolder/0000000000000000000000000000000000000000000000000000000000000001.json";
+    let older_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let newer_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let operative_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let token_uri_call = |hash: &str| {
+        json!([
+            { "to": operative, "data": encode_operative_token_uri_call().unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let operative_word = json!(format!("0x{:0>64}", operative.trim_start_matches("0x")));
+    // Source A already finalized block 0x2b; after pinning it must confirm
+    // 0x2a is canonical under the older hash and answer both calls there.
+    let ahead_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2b", newer_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(newer_hash),
+            operative_word.clone(),
+        ),
+        (
+            "eth_call",
+            token_uri_call(newer_hash),
+            abi_encoded_string_for_test(token_uri),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        (
+            "eth_call",
+            token_uri_call(older_hash),
+            abi_encoded_string_for_test(token_uri),
+        ),
+    ];
+    // Source B still finalizes 0x2a; pinned to its own head, it re-confirms
+    // the block and re-answers both calls there.
+    let behind_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        (
+            "eth_call",
+            token_uri_call(older_hash),
+            abi_encoded_string_for_test(token_uri),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", operative_call(older_hash), operative_word),
+        (
+            "eth_call",
+            token_uri_call(older_hash),
+            abi_encoded_string_for_test(token_uri),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(ahead_sequence),
+            spawn_rpc_sequence_asserting_server(behind_sequence),
+        ]),
+    );
+    let item = ok_data(provider.handle(Request::ResolveProtectedContentItem {
+        network: "esc-local".to_string(),
+        ledger: ledger.to_string(),
+        token_id: "0x3".to_string(),
+    }));
+    assert_eq!(item["operative"], operative);
+    assert_eq!(item["token_uri"], token_uri);
+    assert_eq!(item["finalized_block_number"], json!(0x2a));
+}
+
+/// Pinning to the lowest finalized block does not launder a real
+/// disagreement: if the two sources' data differs once re-evaluated at the
+/// same pinned block, it is still a conflict.
+#[test]
+fn resolve_protected_content_item_rejects_conflicting_data_at_the_pinned_block() {
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let older_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let newer_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let operative_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let token_uri_call = |hash: &str| {
+        json!([
+            { "to": operative, "data": encode_operative_token_uri_call().unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let operative_word = json!(format!("0x{:0>64}", operative.trim_start_matches("0x")));
+    let ahead_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2b", newer_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(newer_hash),
+            operative_word.clone(),
+        ),
+        (
+            "eth_call",
+            token_uri_call(newer_hash),
+            abi_encoded_string_for_test("ipfs://bafyfolder/initial-a.json"),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        (
+            "eth_call",
+            token_uri_call(older_hash),
+            // Disagrees with source B's re-pinned answer below.
+            abi_encoded_string_for_test("ipfs://bafyfolder/repinned-a.json"),
+        ),
+    ];
+    let behind_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        (
+            "eth_call",
+            token_uri_call(older_hash),
+            abi_encoded_string_for_test("ipfs://bafyfolder/initial-b.json"),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", operative_call(older_hash), operative_word),
+        (
+            "eth_call",
+            token_uri_call(older_hash),
+            abi_encoded_string_for_test("ipfs://bafyfolder/repinned-b.json"),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(ahead_sequence),
+            spawn_rpc_sequence_asserting_server(behind_sequence),
+        ]),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentItem {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        })),
+        "conflicting_protected_content_item_observations"
+    );
+}
+
+/// R32 applied to the kid-binding read: same lag-tolerant pinning, proven
+/// independently of the item read to show the algorithm is reused rather
+/// than copied and reimplemented per op.
+#[test]
+fn resolve_protected_content_kid_binding_pins_lagging_sources_to_the_lowest_finalized_block() {
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let store = "0x00000000000000000000000000000000000000cc";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let kid = "0x0123456789abcdef0123456789abcdef";
+    let older_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let newer_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let cstore_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_cstore_call().unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let ip_reference_call = |hash: &str| {
+        json!([
+            { "to": store, "data": encode_ip_reference_call(kid).unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let cstore_word = json!(format!("0x{:0>64}", store.trim_start_matches("0x")));
+    let ip_reference_word = json!(format!(
+        "0x{:0>64}{:0>64}",
+        ledger.trim_start_matches("0x"),
+        "3"
+    ));
+    let ahead_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2b", newer_hash),
+        ),
+        ("eth_call", cstore_call(newer_hash), cstore_word.clone()),
+        (
+            "eth_call",
+            ip_reference_call(newer_hash),
+            ip_reference_word.clone(),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", cstore_call(older_hash), cstore_word.clone()),
+        (
+            "eth_call",
+            ip_reference_call(older_hash),
+            ip_reference_word.clone(),
+        ),
+    ];
+    let behind_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", cstore_call(older_hash), cstore_word.clone()),
+        (
+            "eth_call",
+            ip_reference_call(older_hash),
+            ip_reference_word.clone(),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", cstore_call(older_hash), cstore_word),
+        ("eth_call", ip_reference_call(older_hash), ip_reference_word),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(ahead_sequence),
+            spawn_rpc_sequence_asserting_server(behind_sequence),
+        ]),
+    );
+    let binding = ok_data(provider.handle(Request::ResolveProtectedContentKidBinding {
+        network: "esc-local".to_string(),
+        content_access_id: kid.to_string(),
+    }));
+    assert_eq!(binding["ledger"], ledger);
+    assert_eq!(binding["token_id"], "0x3");
+    assert_eq!(binding["finalized_block_number"], json!(0x2a));
+}
+
+/// R32 applied to the item-offers read.
+#[test]
+fn resolve_protected_content_item_offers_pins_lagging_sources_to_the_lowest_finalized_block() {
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let seller = "0x0000000000000000000000000000000000000011";
+    let older_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let newer_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let operative_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let sellers_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let listing_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let operative_word = json!(format!("0x{:0>64}", operative.trim_start_matches("0x")));
+    let sellers_word = abi_encoded_address_array_for_test(&[seller]);
+    let listing_word = json!(concat!(
+        "0x",
+        "0000000000000000000000000000000000000000000000000000000000000007",
+        "0000000000000000000000000000000000000000000000000000000000000005",
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ));
+    let ahead_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2b", newer_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(newer_hash),
+            operative_word.clone(),
+        ),
+        ("eth_call", sellers_call(newer_hash), sellers_word.clone()),
+        ("eth_call", listing_call(newer_hash), listing_word.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        ("eth_call", sellers_call(older_hash), sellers_word.clone()),
+        ("eth_call", listing_call(older_hash), listing_word.clone()),
+    ];
+    let behind_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        ("eth_call", sellers_call(older_hash), sellers_word.clone()),
+        ("eth_call", listing_call(older_hash), listing_word.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", operative_call(older_hash), operative_word),
+        ("eth_call", sellers_call(older_hash), sellers_word),
+        ("eth_call", listing_call(older_hash), listing_word),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(ahead_sequence),
+            spawn_rpc_sequence_asserting_server(behind_sequence),
+        ]),
+    );
+    let offers = ok_data(provider.handle(Request::ResolveProtectedContentItemOffers {
+        network: "esc-local".to_string(),
+        ledger: ledger.to_string(),
+        token_id: "0x3".to_string(),
+    }));
+    assert_eq!(offers["finalized_block_number"], json!(0x2a));
+    let offers_array = offers["offers"].as_array().unwrap();
+    assert_eq!(offers_array.len(), 1);
+    assert_eq!(offers_array[0]["seller"], seller);
+}
+
+/// ERC-20 flag fix: a sold-out listing's `pay_token` must not be the reason
+/// `paymentProcessor()` gets called. The mock sequence has no trailing call
+/// for it -- if the fix regresses, the request has nothing left to answer
+/// that extra call and fails instead of succeeding with an empty offer set.
+#[test]
+fn resolve_protected_content_item_offers_skips_payment_processor_for_a_sold_out_erc20_listing() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let seller = "0x0000000000000000000000000000000000000011";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                at.clone()
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                at.clone()
+            ]),
+            abi_encoded_address_array_for_test(&[seller]),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+                at
+            ]),
+            // Sold out (quantity 0x0) with a nonzero (ERC-20) pay_token.
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000033"
+            )),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    let offers = ok_data(provider.handle(Request::ResolveProtectedContentItemOffers {
+        network: "esc-local".to_string(),
+        ledger: ledger.to_string(),
+        token_id: "0x3".to_string(),
+    }));
+    assert_eq!(offers["offers"].as_array().unwrap().len(), 0);
+}
+
+/// cstore zero-check: a zero cstore means the authority gateway has no
+/// protected-content store bound on this network at all. No ipReference
+/// call belongs in the mock sequence -- calling it on the zero address is
+/// exactly the bug this guard exists to prevent.
+#[test]
+fn resolve_protected_content_kid_binding_rejects_a_zero_cstore() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let kid = "0x0123456789abcdef0123456789abcdef";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2c", finalized_hash),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": gateway, "data": encode_authority_gateway_cstore_call().unwrap() },
+                at
+            ]),
+            json!(format!("0x{:0>64}", "")),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentKidBinding {
+            network: "esc-local".to_string(),
+            content_access_id: kid.to_string(),
+        })),
+        "unbound_protected_content_store"
+    );
+}
+
+/// R36 / PS-I4: chain-provider is the producer of the typed `Resolved...`
+/// wire shapes the server test deserializes; this writes one real answer of
+/// each of the three ops (plus a truncated item_offers) to the fixture, to
+/// hold the eventual server-side structs to what Runtime really sends.
+#[test]
+fn chain_market_ops_writes_the_server_fixture() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let at = json!({ "blockHash": finalized_hash, "requireCanonical": true });
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let store = "0x00000000000000000000000000000000000000cc";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let kid = "0x0123456789abcdef0123456789abcdef";
+
+    let item = {
+        let token_uri = "ipfs://bafyfolder/0000000000000000000000000000000000000000000000000000000000000001.json";
+        let sequence = vec![
+            ("eth_chainId", json!([]), json!("0x14")),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                finalized_block_json("0x2c", finalized_hash),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                    at.clone()
+                ]),
+                json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": operative, "data": encode_operative_token_uri_call().unwrap() },
+                    at.clone()
+                ]),
+                abi_encoded_string_for_test(token_uri),
+            ),
+        ];
+        let mut provider = provider_with_rights_rpc_policies_and_purchase(
+            "http://127.0.0.1:9".to_string(),
+            "0x12345678",
+            json!([]),
+            protected_content_market_source(vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ]),
+        );
+        ok_data(provider.handle(Request::ResolveProtectedContentItem {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        }))
+    };
+
+    let kid_binding = {
+        let sequence = vec![
+            ("eth_chainId", json!([]), json!("0x14")),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                finalized_block_json("0x2c", finalized_hash),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_cstore_call().unwrap() },
+                    at.clone()
+                ]),
+                json!(format!("0x{:0>64}", store.trim_start_matches("0x"))),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": store, "data": encode_ip_reference_call(kid).unwrap() },
+                    at.clone()
+                ]),
+                json!(format!(
+                    "0x{:0>64}{:0>64}",
+                    ledger.trim_start_matches("0x"),
+                    "3"
+                )),
+            ),
+        ];
+        let mut provider = provider_with_rights_rpc_policies_and_purchase(
+            "http://127.0.0.1:9".to_string(),
+            "0x12345678",
+            json!([]),
+            protected_content_market_source(vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ]),
+        );
+        ok_data(provider.handle(Request::ResolveProtectedContentKidBinding {
+            network: "esc-local".to_string(),
+            content_access_id: kid.to_string(),
+        }))
+    };
+
+    // One ERC-20 offer, one native offer.
+    let item_offers = {
+        let native_seller = "0x0000000000000000000000000000000000000011";
+        let erc20_seller = "0x0000000000000000000000000000000000000099";
+        let payment_processor = "0x00000000000000000000000000000000000000bb";
+        let sequence = vec![
+            ("eth_chainId", json!([]), json!("0x14")),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                finalized_block_json("0x2c", finalized_hash),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                    at.clone()
+                ]),
+                json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                    at.clone()
+                ]),
+                abi_encoded_address_array_for_test(&[native_seller, erc20_seller]),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_listing_call(operative, native_seller).unwrap() },
+                    at.clone()
+                ]),
+                json!(concat!(
+                    "0x",
+                    "0000000000000000000000000000000000000000000000000000000000000007",
+                    "0000000000000000000000000000000000000000000000000000000000000005",
+                    "0000000000000000000000000000000000000000000000000000000000000000"
+                )),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_listing_call(operative, erc20_seller).unwrap() },
+                    at.clone()
+                ]),
+                json!(concat!(
+                    "0x",
+                    "0000000000000000000000000000000000000000000000000000000000000009",
+                    "0000000000000000000000000000000000000000000000000000000000000006",
+                    "0000000000000000000000000000000000000000000000000000000000000033"
+                )),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": operative, "data": encode_operatives_payment_processor_call().unwrap() },
+                    at.clone()
+                ]),
+                json!(format!(
+                    "0x{:0>64}",
+                    payment_processor.trim_start_matches("0x")
+                )),
+            ),
+        ];
+        let mut provider = provider_with_rights_rpc_policies_and_purchase(
+            "http://127.0.0.1:9".to_string(),
+            "0x12345678",
+            json!([]),
+            protected_content_market_source(vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ]),
+        );
+        ok_data(provider.handle(Request::ResolveProtectedContentItemOffers {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        }))
+    };
+
+    // 33 sellers, one more than the cap.
+    let item_offers_truncated = {
+        let sellers: Vec<String> = (1..=33).map(|n: u32| format!("0x{n:040x}")).collect();
+        let sellers_str: Vec<&str> = sellers.iter().map(String::as_str).collect();
+        let mut reversed = sellers_str.clone();
+        reversed.reverse();
+        let mut sequence = vec![
+            ("eth_chainId", json!([]), json!("0x14")),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                finalized_block_json("0x2c", finalized_hash),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x3").unwrap() },
+                    at.clone()
+                ]),
+                json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+            ),
+            (
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_sellers_of_call(operative).unwrap() },
+                    at.clone()
+                ]),
+                abi_encoded_address_array_for_test(&reversed),
+            ),
+        ];
+        for seller in &sellers_str[..32] {
+            sequence.push((
+                "eth_call",
+                json!([
+                    { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+                    at.clone()
+                ]),
+                json!(concat!(
+                    "0x",
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "0000000000000000000000000000000000000000000000000000000000000000"
+                )),
+            ));
+        }
+        let mut provider = provider_with_rights_rpc_policies_and_purchase(
+            "http://127.0.0.1:9".to_string(),
+            "0x12345678",
+            json!([]),
+            protected_content_market_source(vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ]),
+        );
+        ok_data(provider.handle(Request::ResolveProtectedContentItemOffers {
+            network: "esc-local".to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x3".to_string(),
+        }))
+    };
+
+    let fixture = json!({
+        "item": item,
+        "kid_binding": kid_binding,
+        "item_offers": item_offers,
+        "item_offers_truncated": item_offers_truncated,
+    });
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../elastos/crates/elastos-server/src/api/gateway_tests/fixtures/chain-market-ops.json",
+    );
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes = serde_json::to_vec_pretty(&fixture).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).unwrap();
+}
+
+#[test]
 fn resolve_protected_content_purchase_returns_exact_network_target_value_and_data() {
     let finalized_hash = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     let operative = "0x0000000000000000000000000000000000000044";
@@ -5686,6 +7036,245 @@ fn resolve_protected_content_purchase_access_rejects_stale_or_future_finalized_o
             "stale_protected_content_purchase_access_observation"
         );
     }
+}
+
+/// R50: `AuthorityGateway.hasAccess(address accessor, address ledger, uint256
+/// tokenId)` -- the item-keyed twin of `hasAccessByContentId`, answered by the
+/// same `_checkUserAccess`. The selector is the reviewed signature's.
+#[test]
+fn authority_gateway_has_access_selector_and_encoding_match_the_abi() {
+    let selector = &sha3::Keccak256::digest(b"hasAccess(address,address,uint256)")[..4];
+    assert_eq!(
+        format!("0x{}", encode_hex(selector)),
+        AUTHORITY_GATEWAY_HAS_ACCESS_SELECTOR
+    );
+    assert_eq!(AUTHORITY_GATEWAY_HAS_ACCESS_SELECTOR, "0xcf56b4eb");
+    assert_eq!(
+        encode_authority_gateway_has_access_call(
+            "0x0000000000000000000000000000000000000007",
+            "0x0000000000000000000000000000000000000022",
+            "0x3",
+        )
+        .unwrap(),
+        concat!(
+            "0xcf56b4eb",
+            "0000000000000000000000000000000000000000000000000000000000000007",
+            "0000000000000000000000000000000000000000000000000000000000000022",
+            "0000000000000000000000000000000000000000000000000000000000000003"
+        )
+    );
+}
+
+fn item_access_sequence(
+    tag: &'static str,
+    block_hash: &str,
+    block_timestamp: u64,
+    wallet: &str,
+    has_access: bool,
+) -> Vec<(&'static str, Value, Value)> {
+    let expected_data = encode_authority_gateway_has_access_call(
+        wallet,
+        "0x0000000000000000000000000000000000000022",
+        "0x3",
+    )
+    .unwrap();
+    vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!([tag, false]),
+            json!({
+                "number": "0x2c",
+                "hash": block_hash,
+                "timestamp": format!("0x{:x}", block_timestamp),
+            }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x0000000000000000000000000000000000000001",
+                    "data": expected_data
+                },
+                {
+                    "blockHash": block_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(has_access),
+        ),
+    ]
+}
+
+fn item_access_request(block: ProtectedContentAccessBlock) -> Request {
+    Request::ResolveProtectedContentItemAccess {
+        request_id: "item-access:exact".to_string(),
+        network: "esc-local".to_string(),
+        wallet: "0x0000000000000000000000000000000000000007".to_string(),
+        ledger: "0x0000000000000000000000000000000000000022".to_string(),
+        token_id: "0x03".to_string(),
+        block,
+    }
+}
+
+/// R50: the item-keyed access read is corroborated by the view policy's
+/// sources, exactly like the content-id read, and answers the item it was
+/// asked about -- never the sources, the contract or the selector.
+#[test]
+fn resolve_protected_content_item_access_reads_the_head_by_item_and_hides_topology() {
+    let wallet = "0x0000000000000000000000000000000000000007";
+    let hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let sequence = item_access_sequence("latest", hash, RIGHTS_EVIDENCE_NOW - 5, wallet, true);
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
+    let data = ok_data(provider.handle(item_access_request(ProtectedContentAccessBlock::Latest)));
+    let rendered = serde_json::to_string(&data).unwrap();
+    assert_eq!(
+        data,
+        json!({
+            "schema": PROTECTED_CONTENT_ITEM_ACCESS_SCHEMA,
+            "request_id": "item-access:exact",
+            "network": "esc-local",
+            "chain_id": 20,
+            "wallet": wallet,
+            "ledger": "0x0000000000000000000000000000000000000022",
+            "token_id": "0x3",
+            "has_access": true,
+            "finalized_block_number": 44,
+            "finalized_block_hash": hash,
+            "finalized_block_timestamp": RIGHTS_EVIDENCE_NOW - 5,
+            "observed_at": RIGHTS_EVIDENCE_NOW,
+        })
+    );
+    assert!(!rendered.contains("http://127.0.0.1:9"));
+    assert!(!rendered.contains("\"contract\""));
+    assert!(!rendered.contains("\"selector\""));
+}
+
+/// R50: the finalized variant asks every source for its `finalized` block --
+/// the mock answers that tag and nothing else -- and a denial is an answer.
+#[test]
+fn resolve_protected_content_item_access_finalized_variant_reads_the_finalized_block() {
+    let wallet = "0x0000000000000000000000000000000000000007";
+    let hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let sequence =
+        item_access_sequence("finalized", hash, RIGHTS_EVIDENCE_NOW - 900, wallet, false);
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
+    let data =
+        ok_data(provider.handle(item_access_request(ProtectedContentAccessBlock::Finalized)));
+    assert_eq!(data["has_access"], false);
+    assert_eq!(data["finalized_block_hash"], hash);
+}
+
+/// R50: `hasAccess(accessor, ledger, tokenId)` has no "unbound" answer. A
+/// source whose call reverts -- even with the content-id path's
+/// `UnboundContentId` -- observed nothing, so two reverting sources are too
+/// few observations, never a denial.
+#[test]
+fn resolve_protected_content_item_access_treats_a_revert_as_no_observation() {
+    let wallet = "0x0000000000000000000000000000000000000007";
+    let hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut sequence: Vec<(&'static str, Value, RpcReply)> =
+        item_access_sequence("latest", hash, RIGHTS_EVIDENCE_NOW - 5, wallet, true)
+            .into_iter()
+            .map(|(method, params, result)| (method, params, RpcReply::Result(result)))
+            .collect();
+    sequence[2].2 = RpcReply::Error(unbound_content_id_error(&content_access_id(0x51)));
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(sequence.clone()),
+                spawn_rpc_sequence_asserting_server_with_replies(sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(provider.handle(item_access_request(ProtectedContentAccessBlock::Latest))),
+        "insufficient_rights_observations"
+    );
+}
+
+#[test]
+fn resolve_protected_content_item_access_rejects_a_bad_request_before_any_read() {
+    let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
+    for (wallet, ledger, token_id) in [
+        ("0x07", "0x0000000000000000000000000000000000000022", "0x3"),
+        (
+            "0x0000000000000000000000000000000000000007",
+            "ledger",
+            "0x3",
+        ),
+        (
+            "0x0000000000000000000000000000000000000007",
+            "0x0000000000000000000000000000000000000022",
+            "3",
+        ),
+    ] {
+        assert_eq!(
+            error_code(provider.handle(Request::ResolveProtectedContentItemAccess {
+                request_id: "item-access:bad".to_string(),
+                network: "esc-local".to_string(),
+                wallet: wallet.to_string(),
+                ledger: ledger.to_string(),
+                token_id: token_id.to_string(),
+                block: ProtectedContentAccessBlock::Latest,
+            })),
+            "invalid_protected_content_item_access_request"
+        );
+    }
+}
+
+#[test]
+fn resolve_protected_content_item_access_request_names_its_block() {
+    let request: Request = serde_json::from_value(json!({
+        "op": "resolve_protected_content_item_access",
+        "request_id": "r",
+        "network": "esc-local",
+        "wallet": "0x0000000000000000000000000000000000000007",
+        "ledger": "0x0000000000000000000000000000000000000022",
+        "token_id": "0x3",
+        "block": "finalized",
+    }))
+    .unwrap();
+    assert!(matches!(
+        request,
+        Request::ResolveProtectedContentItemAccess {
+            block: ProtectedContentAccessBlock::Finalized,
+            ..
+        }
+    ));
+    assert!(serde_json::from_value::<Request>(json!({
+        "op": "resolve_protected_content_item_access",
+        "request_id": "r",
+        "network": "esc-local",
+        "wallet": "0x0000000000000000000000000000000000000007",
+        "ledger": "0x0000000000000000000000000000000000000022",
+        "token_id": "0x3",
+        "block": "safe",
+    }))
+    .is_err());
 }
 
 #[test]
@@ -6597,4 +8186,105 @@ fn evm_rpc_batch_tells_a_refusal_from_an_answer() {
     ]);
     let answers = interpret_evm_rpc_batch(&stray, 2).unwrap();
     assert_eq!(answers, vec![Some(json!("0x1")), None]);
+}
+
+/// Installed failure (2026-09-25): independent RPC providers finalize at
+/// different heights, and the purchase's verified-listing read compared the
+/// raw observations -- block included -- so every Buy "disagreed on the
+/// finalized tuple". It now pins every source to the lowest finalized block
+/// first (R32), like the other market reads.
+#[test]
+fn resolve_protected_content_verified_listing_pins_lagging_sources_to_the_lowest_finalized_block() {
+    let gateway = "0x00000000000000000000000000000000000000aa";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let seller = "0x0000000000000000000000000000000000000011";
+    let older_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let newer_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let operative_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_operative_call(ledger, "0x03").unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let listing_call = |hash: &str| {
+        json!([
+            { "to": gateway, "data": encode_authority_gateway_listing_call(operative, seller).unwrap() },
+            { "blockHash": hash, "requireCanonical": true }
+        ])
+    };
+    let operative_word = json!(format!("0x{:0>64}", operative.trim_start_matches("0x")));
+    // Native offer: no payment processor read.
+    let listing_word = json!(concat!(
+        "0x",
+        "0000000000000000000000000000000000000000000000000000000000000007",
+        "0000000000000000000000000000000000000000000000000000000000000005",
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ));
+    let ahead_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2b", newer_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(newer_hash),
+            operative_word.clone(),
+        ),
+        ("eth_call", listing_call(newer_hash), listing_word.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        ("eth_call", listing_call(older_hash), listing_word.clone()),
+    ];
+    let behind_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        (
+            "eth_call",
+            operative_call(older_hash),
+            operative_word.clone(),
+        ),
+        ("eth_call", listing_call(older_hash), listing_word.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            finalized_block_json("0x2a", older_hash),
+        ),
+        ("eth_call", operative_call(older_hash), operative_word),
+        ("eth_call", listing_call(older_hash), listing_word),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(ahead_sequence),
+            spawn_rpc_sequence_asserting_server(behind_sequence),
+        ]),
+    );
+    let listing = ok_data(
+        provider.handle(Request::ResolveProtectedContentVerifiedListing {
+            network: "esc-local".to_string(),
+            seller: seller.to_string(),
+            ledger: ledger.to_string(),
+            token_id: "0x03".to_string(),
+        }),
+    );
+    assert_eq!(listing["operative"], operative);
+    assert_eq!(listing["quantity"], "0x7");
+    assert_eq!(listing["price"], "0x5");
 }

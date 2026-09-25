@@ -6,11 +6,22 @@ import {
   MAX_RUNTIME_CUSTODY_LISTINGS,
   RUNTIME_CUSTODY_MINT_ID,
   buyOutcomeFromAnswer,
-  listingUriFromInput,
   parseRuntimeCustodyListings,
   uint256Decimal,
   viewerForListing,
 } from "./src/listing.js";
+// The market listing contract (Runtime's `elastos.marketplace.listing/v1`)
+// and the `buy_offer` answer contract, read exactly as `src/market-listing.js`
+// and its test pin them against Runtime's producer. Buy is a separate
+// workflow from open (shared-context.md D1): these never touch a mint.
+import {
+  MAX_MARKET_OFFERS,
+  marketItemClaim,
+  marketItemKey,
+  offersWithRecordedAttempt,
+  parseBuyOfferAnswer,
+  parseMarketListing,
+} from "./src/market-listing.js";
 
 (function () {
   const params = new URLSearchParams(window.location.search);
@@ -53,10 +64,13 @@ import {
     catalog: [],
     catalogLoading: false,
     catalogLoaded: false,
-    catalogUnavailable: false,
+    // Explore shows the market only once the market has answered: with its
+    // items, or with a request for approval. Until then it is loading, and a
+    // market that could not be reached is said to be one.
+    catalogReady: false,
+    catalogFailed: false,
     catalogNeedsApproval: false,
     catalogAwaitingApproval: false,
-    catalogNote: "",
     mediaRefreshing: false,
     // Which kind the chips are filtering to, and the order items arrive in.
     exploreFilter: "all",
@@ -92,8 +106,53 @@ import {
   const pendingDownloads = new Set();
   let importInFlight = false;
   const BUY_POLL_MS = 4000;
+  // A first market read that fails is asked once more, after this long, and
+  // then the page waits for the person. One retry per page open.
+  const CATALOG_RETRY_MS = 2000;
+  let catalogRetryUsed = false;
+  // Which market read is the latest. An older read that lands after a newer
+  // one started (a refresh during the first load) changes nothing.
+  let catalogReadSeq = 0;
   const BUY_POLL_BUDGET_MS = 15 * 60 * 1000;
   let detailPreviousFocus = null;
+
+  // A market purchase's poll state, keyed by `marketItemKey(listing.item)` --
+  // the same discipline `pendingMediaBuys` keeps for a mint, applied to the
+  // chain's own key because a market item has no mint until it is adopted.
+  // One buy runs per item at a time, so each entry also names which seller
+  // it is for -- `{seller, kind, stage, awaitsPerson, connectorId}` -- read
+  // fresh at render time exactly as `mediaActionButton` reads
+  // `pendingMediaBuys`, rather than threaded through as a render option.
+  // This is also what lets the sheet redraw correctly when it is reopened
+  // for an item whose buy is still running in the background.
+  const pendingOfferBuys = new Map();
+  // A purchase of an item Runtime answered is already in progress on terms
+  // recorded earlier (`attempt_in_progress`), keyed like `pendingOfferBuys`:
+  // `{offer}`, the recorded offer, or `{offer: null}` when that purchase
+  // runs through another path and names no seller here. It lasts for this
+  // page's life, and clears on any other answer for the item.
+  const recordedOfferAttempts = new Map();
+  // Which ledger:tokenId requests are already in flight, so a second Buy
+  // press on the same Explore card cannot start a second `/listing` read.
+  const catalogListingLoading = new Set();
+  // What the last `ListingObject` this page actually read said about an
+  // item's readability, keyed by `<ledger>|<token_id>` (lowercase) since a
+  // catalog row has no chain namespace to complete `marketItemKey` with.
+  // Never a guess from the index: only ever what Runtime answered.
+  const marketAssetReadability = new Map();
+  // The item that same `ListingObject` named, under the same key, so a
+  // catalog row (which knows only ledger and token id) can name the whole
+  // item when it asks Runtime for its copy.
+  const marketAssetItems = new Map();
+  // Which market items' copies are being fetched now, keyed like
+  // `marketAssetReadability`, so a second press asks nothing more.
+  const pendingMarketDownloads = new Set();
+  // The listing the offer sheet is currently showing, so a click on one of
+  // its rows knows which offer it is buying.
+  let currentOfferListing = null;
+  // True while the sheet shows an item's properties (Details) rather than
+  // its offers. Kept for the life of one opening, so a repaint keeps it.
+  let currentOfferSheetProperties = false;
   let homeChromeReady = false;
   let lastHomeMenuManifestSignature = "";
 
@@ -195,6 +254,12 @@ import {
   // A title longer than this is not a title. Bounded because it comes from a
   // document published by whoever minted the item.
   const MAX_LISTING_TITLE_CHARS = 120;
+  // A shared link names the asset only (shared-context.md D3): the folder
+  // CID, under either scheme a person might paste it with. No path, no
+  // query, no seller -- the same shape `market-listing.js`'s own `ASSET_URI`
+  // accepts, checked here before Runtime is asked anything.
+  const NATIVE_PAY_TOKEN = "0x0000000000000000000000000000000000000000";
+  const MARKET_LINK_URI = /^(?:elastos|ipfs):\/\/(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{45,95})$/;
 
   boot();
 
@@ -448,36 +513,73 @@ import {
   // arrives is therefore the same kind of thing the shelf already renders,
   // with one difference that matters: an item with no `mintId` is one this
   // Home holds nothing for, so it can be bought and cannot be opened.
-  async function loadCatalogItems() {
+  //
+  // `retryOnce` is for the read a page makes by itself when Explore opens: a
+  // market that fails to answer is asked once more after CATALOG_RETRY_MS,
+  // and Explore keeps its loading state through the wait. A read a person
+  // asked for (refresh, Try again) is made once.
+  async function loadCatalogItems({ retryOnce = false } = {}) {
+    const read = ++catalogReadSeq;
+    const current = () => read === catalogReadSeq;
     state.catalogLoading = true;
+    state.catalogFailed = false;
     renderSurfaceState();
     try {
-      const response = await fetch("/api/apps/marketplace/items", {
-        headers: { accept: "application/json", "x-elastos-home-token": homeToken },
-      });
-      const answer = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(catalogErrorMessage(response, answer));
+      let answered = await readCatalogOnce(current);
+      if (!answered && retryOnce && !catalogRetryUsed && current()) {
+        catalogRetryUsed = true;
+        await new Promise((resolveWait) => setTimeout(resolveWait, CATALOG_RETRY_MS));
+        if (current()) {
+          answered = await readCatalogOnce(current);
+        }
       }
-      state.catalog = (Array.isArray(answer.items) ? answer.items : [])
-        .map(catalogItemFromAnswer)
-        .filter(Boolean);
-      state.catalogUnavailable = answer.unavailable === true;
-      state.catalogNeedsApproval = answer.needsApproval === true;
-      state.catalogLoaded = true;
-    } catch (error) {
-      // An index that cannot be read leaves Explore with this Home's own
-      // items: a thinner shelf, not a broken one.
-      state.catalog = [];
-      state.catalogUnavailable = true;
-      state.catalogNote = publicError(error.message, "Couldn’t reach the market.");
+      if (current()) {
+        state.catalogFailed = !answered;
+      }
     } finally {
       // Attempted either way. Without this a failure is retried on every
       // paint, and a paint follows every retry -- which is a loop that asks
       // an outside service as fast as the page can draw.
-      state.catalogLoaded = true;
-      state.catalogLoading = false;
+      if (current()) {
+        state.catalogLoaded = true;
+        state.catalogLoading = false;
+      }
     }
+  }
+
+  // One read of the market. True when the market answered -- with items, or
+  // with a request for approval -- and false when it could not be reached.
+  // A read that is no longer the latest leaves the state alone.
+  async function readCatalogOnce(current) {
+    let answer = null;
+    try {
+      const response = await fetch("/api/apps/marketplace/items", {
+        headers: { accept: "application/json", "x-elastos-home-token": homeToken },
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && !(payload.unavailable === true && payload.needsApproval !== true)) {
+        answer = payload;
+      }
+    } catch {
+      answer = null;
+    }
+    if (!current()) {
+      return answer !== null;
+    }
+    if (!answer) {
+      // An unreachable market is not an empty one, and this Home's own items
+      // are not the market: Explore says the market could not be read.
+      state.catalog = [];
+      state.catalogReady = false;
+      state.catalogNeedsApproval = false;
+      return false;
+    }
+    state.catalog = (Array.isArray(answer.items) ? answer.items : [])
+      .map(catalogItemFromAnswer)
+      .filter(Boolean);
+    state.catalogNeedsApproval = answer.needsApproval === true;
+    state.catalogReady = true;
+    return true;
   }
 
   // One catalog item, in the shape the card already reads.
@@ -497,6 +599,11 @@ import {
       // listing for it; then it answers to that listing's mint like any other.
       mintId: String(entry && entry.mintId || ""),
       catalogId: `${ledger}:${tokenId}`,
+      // The chain's own key (shared-context.md D2), kept apart from
+      // `catalogId` so a Buy on this card can send exactly this and nothing
+      // else -- never an account, never a mint this Home may not hold.
+      ledger,
+      tokenId,
       displayName: String(entry && entry.displayName || "").slice(0, 256),
       mimeType: catalogMimeType(String(entry && entry.contentCategory || "")),
       codecs: "",
@@ -941,10 +1048,10 @@ import {
     }
     const mine = state.mediaListings.filter((listing) => listing.accessState === "creator").length;
     const total = exploreSourceItems().length;
-    if (state.catalogUnavailable && state.mediaTab === "explore") {
-      // The important half: the market was not read, and what is on screen is
-      // this Home's own shelf rather than the market being empty.
-      return `Market unavailable — showing ${total} of your own.`;
+    if (state.catalogFailed && state.mediaTab === "explore") {
+      // The important half: the market was not read, which is not the same
+      // as a market with nothing in it.
+      return "Couldn’t reach the market.";
     }
     return `${total} ${total === 1 ? "item" : "items"} · ${mine} yours.`;
   }
@@ -965,7 +1072,7 @@ import {
       loadShopsData().then(render);
     }
     if (state.mediaTab === "explore" && !state.catalogLoaded && !state.catalogLoading) {
-      loadCatalogItems().then(render);
+      loadCatalogItems({ retryOnce: true }).then(render);
     }
   }
 
@@ -1328,6 +1435,10 @@ import {
   }
 
   function renderExploreSections() {
+    if (state.mediaTab === "explore" && !state.catalogReady) {
+      renderMarketPending();
+      return;
+    }
     const listings = filteredMediaListings();
     const notice = shelfNotice();
     if (!listings.length) {
@@ -1434,10 +1545,39 @@ import {
     `;
   }
 
-  // When the market could not be read, Explore is this Home's own shelf --
-  // which looks exactly like a market with nothing in it unless it says so.
-  // It is a note above the items rather than an error in place of them,
-  // because the items are real and this is about what is missing beside them.
+  // Explore before the market has answered: loading while a read is in
+  // flight (the automatic retry included), and a plain statement with a way
+  // to ask again once it could not be reached. This Home's own items stay in
+  // My listings meanwhile; standing alone here they would read as the market.
+  function renderMarketPending() {
+    renderExploreChips(new Map(), 0);
+    if (state.catalogFailed && !state.catalogLoading) {
+      els.storeSections.innerHTML = `
+        <div class="market-unreachable" role="status">
+          ${emptyState(
+            "Couldn’t reach the market.",
+            "Other people’s items could not be read just now. Your own items are in My listings.",
+            icons.media,
+          )}
+        </div>
+        <div class="store-empty-actions">
+          <button type="button" class="store-pill" data-action="retry-market">Try again</button>
+        </div>
+      `;
+      bindAppActions(els.storeSections);
+      return;
+    }
+    els.storeSections.innerHTML = `
+      <p class="sr-only" role="status">Loading the market…</p>
+      <section class="section" aria-hidden="true">
+        <div class="grid videos">${skeletonCards("video", EXPLORE_ROW_LIMIT)}</div>
+      </section>
+    `;
+  }
+
+  // A market that needs approval answers with nothing, and Explore keeps
+  // this Home's own items -- which look exactly like a market with nothing
+  // else in it unless it says so.
   function marketNotice() {
     if (state.mediaTab !== "explore" || !state.catalogLoaded) {
       return "";
@@ -1448,9 +1588,6 @@ import {
           Other people’s items need your approval. Approve “Marketplace requests the channel list” in your Inbox, then refresh.
         </p>
       `;
-    }
-    if (state.catalogUnavailable) {
-      return `<p class="store-inline-note">Couldn’t reach the market. Showing your own items.</p>`;
     }
     return "";
   }
@@ -1531,12 +1668,46 @@ import {
       return { label: "Listed by you", tone: "own" };
     }
     if (listing.accessState === "purchased") {
-      return { label: "In your library", tone: "owned" };
+      return { label: ownedLabel(listing), tone: "owned" };
     }
     if (isSoldOut(listing)) {
       return { label: "Sold out", tone: "gone" };
     }
     return null;
+  }
+
+  // What this Home actually holds of an item it bought. Only a row with a
+  // mint of this Home's own -- its own listing, or an adopted purchase -- has
+  // a copy in the Library. A bought market item without one is `pending`
+  // when it can open here (Download copy adopts it), `foreign` when it opens
+  // only on ela.city, and `unlearned` until this page reads its listing.
+  function ownedHolding(listing) {
+    if (listing.accessState !== "purchased") {
+      return "";
+    }
+    if (!listing.catalogOnly) {
+      return "library";
+    }
+    const readability = marketAssetReadability.get(catalogLedgerKey(listing));
+    if (readability === "verified" || readability === "unverified") {
+      return "pending";
+    }
+    return readability === "foreign" ? "foreign" : "unlearned";
+  }
+
+  // "In your library" is a promise that the Library shows the item, so only
+  // a copy this Home holds wears it. Every other bought item is "Purchased".
+  function ownedLabel(listing) {
+    return ownedHolding(listing) === "library" ? "In your library" : "Purchased";
+  }
+
+  // Who listed the item, shortened. A seller is a public chain fact; the
+  // buyer's own account never reaches this page.
+  function sellerByline(listing) {
+    if (listing.accessState === "creator") {
+      return "by you";
+    }
+    return listing.sellerAddress ? `by ${abbreviateAddress(listing.sellerAddress)}` : "";
   }
 
   // Nothing left to sell. Read from the quantity Runtime published, as a
@@ -1610,11 +1781,11 @@ import {
           ${thumb}
           <div class="page-fallback app-icon-glyph"${cover ? " hidden" : ""}><b>${escapeHtml(title)}</b><i></i><i></i><i></i><i></i></div>
           <span class="tag left">${escapeHtml(formatBadge(listing))}</span>
-          ${statusTag(state)}
+          ${statusTag(state, listing)}
         </div>
         <div class="card-body">
           <h3 class="card-title" title="${escapeAttr(title)}">${escapeHtml(title)}</h3>
-          <div class="card-meta">${state === "owned" ? "In your library" : `${stock}${seller}`}</div>
+          <div class="card-meta">${state === "owned" ? escapeHtml(sellerByline(listing) || ownedLabel(listing)) : `${stock}${seller}`}</div>
           <div class="card-progress">${buyStateNoteMarkup(listing)}</div>
         </div>
         <div class="card-foot">
@@ -1628,7 +1799,9 @@ import {
       : "";
     // An image is looked at, not played, so the control over it says so.
     const previewIcon = exploreGroupId(listing) === "images" ? "i-eye" : "i-play";
-    const play = state !== "soldout" && listing.accessState !== "available"
+    // Only a mint this Home holds opens here; a bought market item without
+    // one has nothing for the play control to open.
+    const play = state !== "soldout" && listing.accessState !== "available" && !listing.catalogOnly
       ? `<button class="play" type="button" data-action="open-media" data-mint="${mint}" aria-label="Open ${escapeAttr(title)}">${spriteIcon(previewIcon, "fill", "width:22px;height:22px")}</button>`
       : "";
     return `
@@ -1637,7 +1810,7 @@ import {
         ${thumb}
         <div class="video-fallback app-icon-glyph"${cover ? " hidden" : ""}>${spriteIcon("i-media")}</div>
         <span class="tag left">${escapeHtml(formatBadge(listing))}</span>
-        ${statusTag(state)}
+        ${statusTag(state, listing)}
         ${play}
       </div>
       <div class="card-body">
@@ -1646,7 +1819,7 @@ import {
         <div class="card-progress">${buyStateNoteMarkup(listing)}</div>
       </div>
       <div class="card-foot">
-        <div>${priceBlock(listing, state)}<div class="stock">${state === "owned" ? "Purchased" : stock}</div></div>
+        <div>${priceBlock(listing, state)}${state === "owned" ? "" : `<div class="stock">${stock}</div>`}</div>
         <div class="card-actions">${cardActions(listing, state)}</div>
       </div>
     </article>`;
@@ -1662,17 +1835,18 @@ import {
   // An item known only to the index has no file name -- its `name` IS the
   // title -- so the line would echo the title and say nothing. It says who is
   // selling it and how many are left instead, which is what a card about
-  // someone else's item is otherwise missing.
+  // someone else's item is otherwise missing. A bought item keeps who listed
+  // it and drops the stock: how many are left is a buyer's question, and
+  // this person already bought.
   function mediaCardSubtitle(listing, title) {
     const fileName = listing.displayName;
     if (fileName && fileName !== title) {
       return listing.codecs ? `${fileName} · ${listing.codecs}` : fileName;
     }
-    const seller = listing.accessState === "creator"
-      ? "by you"
-      : listing.sellerAddress
-        ? `by ${abbreviateAddress(listing.sellerAddress)}`
-        : "";
+    const seller = sellerByline(listing);
+    if (listing.accessState === "purchased") {
+      return seller || ownedLabel(listing);
+    }
     const stock = `${uint256Decimal(listing.quantity)} available`;
     return seller ? `${stock} · ${seller}` : stock;
   }
@@ -1688,12 +1862,12 @@ import {
     return isSoldOut(listing) ? "soldout" : "default";
   }
 
-  function statusTag(state) {
+  function statusTag(state, listing) {
     if (state === "mine") {
       return `<span class="tag right mine">Listed by you</span>`;
     }
     if (state === "owned") {
-      return `<span class="tag right owned">In your library</span>`;
+      return `<span class="tag right owned">${escapeHtml(ownedLabel(listing))}</span>`;
     }
     if (state === "soldout") {
       return `<span class="tag right sold">Sold out</span>`;
@@ -1703,7 +1877,7 @@ import {
 
   function priceBlock(listing, state) {
     if (state === "owned") {
-      return `<div class="price owned">✓ In your library</div>`;
+      return `<div class="price owned">✓ ${escapeHtml(ownedLabel(listing))}</div>`;
     }
     const money = formatMoney(listing);
     return `<div class="price${state === "soldout" ? " sold" : ""}" title="${escapeAttr(money.title)}">${escapeHtml(money.value)}${money.unit ? ` <small>${escapeHtml(money.unit)}</small>` : ""}</div>`;
@@ -1717,14 +1891,20 @@ import {
   // through a float, which is why this shifts a decimal point by hand rather
   // than dividing.
   //
-  // A token this Home does not know is shown in base units. That is useless
-  // to read and honest, which is the right way round: inventing decimals
-  // would turn an unknown price into a confident wrong one.
+  // A token this Home does not know is shown in base units, and its address
+  // is named in the title. That is useless to read and honest, which is the
+  // right way round: inventing decimals would turn an unknown price into a
+  // confident wrong one. The native token (the zero address) is the one
+  // exception, because its decimals are the chain's, not a contract's.
   function formatMoney(listing) {
     const full = uint256Decimal(listing.price);
-    const token = payTokens.get(String(listing.payToken || "").toLowerCase());
+    const payToken = String(listing.payToken || "").toLowerCase();
+    // The zero address is the chain's native token: 18 decimals whether or
+    // not this Home's table lists it, named by the table when it does.
+    const token = payTokens.get(payToken)
+      || (payToken === NATIVE_PAY_TOKEN ? { symbol: "native", decimals: 18 } : null);
     if (!token) {
-      return { value: compactUnits(full), unit: "units", title: `${full} base units` };
+      return { value: compactUnits(full), unit: "units", title: `${full} base units of ${payToken}` };
     }
     const exact = trimZeros(shiftDecimal(full, token.decimals));
     const shown = readableAmount(exact);
@@ -1795,7 +1975,10 @@ import {
     if (state === "soldout") {
       return `<button class="btn btn-ghost ${size}" type="button" disabled>Sold out</button>`;
     }
-    const secondary = state === "mine" || state === "owned"
+    // Share and Download both answer to a mint this Home holds. A catalog
+    // item known only to the index has none, so it offers neither -- only
+    // the Buy that reaches it through the market path below.
+    const secondary = !listing.catalogOnly && (state === "mine" || state === "owned")
       ? cardSecondaryActions(listing, state, size, overflow)
       : "";
     return `${secondary}${mediaActionButton(listing, size)}`;
@@ -2055,6 +2238,11 @@ import {
   }
 
   function mediaActionButton(listing, size = "") {
+    // A catalog item has no mint to buy or resume against: it reaches a
+    // purchase through the market path, one offer sheet at a time.
+    if (listing.catalogOnly) {
+      return catalogActionButton(listing, size);
+    }
     const mint = escapeAttr(listing.mintId);
     const buyState = listing.accessState === "available" ? pendingMediaBuys.get(listing.mintId) : null;
     // A purchase Runtime is still holding, from a visit this page does not
@@ -2085,6 +2273,69 @@ import {
     const action = listing.accessState === "available" ? "buy-media" : "open-media";
     const label = listing.accessState === "available" ? "Buy" : "Open";
     return `<button class="btn btn-primary ${size}" type="button" data-action="${escapeAttr(action)}" data-mint="${mint}">${label}</button>`;
+  }
+
+  // A catalog item's control: the chain's own key, never a mint, and never an
+  // account. `purchased`/`creator` reuse the state a market purchase now
+  // reports (Task 8); a foreign asset never gets a local mint to open through,
+  // so its card says where it does open instead of offering a dead control.
+  // A row whose readability this page has not learned yet neither guesses
+  // "Open" nor stays silent -- it offers to find out first. A bought row also
+  // offers Details: what the item is, read from its own listing, which is
+  // all a person can see of an item that has no copy on this Home.
+  function catalogActionButton(listing, size) {
+    if (listing.accessState === "purchased" || listing.accessState === "creator") {
+      const readability = marketAssetReadability.get(catalogLedgerKey(listing));
+      const details = listing.accessState === "purchased" ? itemDetailsButton(listing, size) : "";
+      if (readability === "foreign") {
+        return `<span class="store-row-state">Opens on ela.city</span>${details}`;
+      }
+      if (readability === "verified" || readability === "unverified") {
+        // Bought on the market, and not yet adopted onto this Home's shelf:
+        // there is nothing here to open yet. Adoption runs again only when
+        // something asks for the copy, so a bought row offers Download copy,
+        // which reruns adoption and never pays (R45).
+        if (listing.accessState === "creator") {
+          return `<span class="store-row-state">You listed this</span>`;
+        }
+        return `${marketDownloadButton(listing, size)}${details}`;
+      }
+      return `<button class="btn btn-ghost ${size}" type="button" data-action="open-listing" data-ledger="${escapeAttr(listing.ledger)}" data-token="${escapeAttr(listing.tokenId)}">Open</button>${details}`;
+    }
+    const loading = catalogListingLoading.has(`${listing.ledger}|${listing.tokenId}`)
+      ? ' aria-busy="true" aria-disabled="true"'
+      : "";
+    return `<button class="btn btn-primary ${size}" type="button" data-action="buy-listing" data-ledger="${escapeAttr(listing.ledger)}" data-token="${escapeAttr(listing.tokenId)}"${loading}>Buy</button>`;
+  }
+
+  // Details for a bought market item, named by the chain's own key. It reads
+  // the item's listing and shows its properties in the item sheet.
+  function itemDetailsButton(listing, size) {
+    const busy = catalogListingLoading.has(`${listing.ledger}|${listing.tokenId}`)
+      ? ' aria-busy="true" aria-disabled="true"'
+      : "";
+    return `<button class="btn btn-ghost ${size}" type="button" data-action="item-details" data-ledger="${escapeAttr(listing.ledger)}" data-token="${escapeAttr(listing.tokenId)}"${busy}>Details</button>`;
+  }
+
+  // Download copy for a bought market item on a catalog row, named by the
+  // chain's own key. Only an item this page read a listing for can be named
+  // whole, so a row without one shows its state alone.
+  function marketDownloadButton(listing, size) {
+    const key = catalogLedgerKey(listing);
+    if (!marketAssetItems.has(key)) {
+      return "";
+    }
+    const busy = pendingMarketDownloads.has(key) ? ' aria-busy="true" aria-disabled="true"' : "";
+    return `<button class="btn btn-ghost ${size}" type="button" data-action="download-market-copy" data-ledger="${escapeAttr(listing.ledger)}" data-token="${escapeAttr(listing.tokenId)}"${busy}>Download copy</button>`;
+  }
+
+  // `<ledger>|<token_id>`, lowercase, the same identity for a catalog row and
+  // for the `item` of a `ListingObject` this page fetched for it -- the only
+  // two shapes this key is ever built from.
+  function catalogLedgerKey(item) {
+    const ledger = String((item && (item.ledger ?? "")) || "").toLowerCase();
+    const tokenId = String((item && (item.tokenId ?? item.token_id ?? "")) || "").toLowerCase();
+    return `${ledger}|${tokenId}`;
   }
 
   // What the row says while a purchase settles. Each stage is a different fact
@@ -2221,9 +2472,9 @@ import {
     `;
     bindAppActions(els.detailContent);
     els.detailModal.classList.add("active");
-    const focusTarget = els.detailContent.querySelector(".modal-btn.primary")
-      || els.detailContent.querySelector("[data-action='close-detail']");
-    focusTarget?.focus();
+    // Opens on Close, never on Open: a key still held from the row must not
+    // launch the app.
+    els.detailContent.querySelector("[data-action='close-detail']")?.focus();
   }
 
   // What a purchase costs, who is selling it, and what happens next. The
@@ -2269,7 +2520,9 @@ import {
     `;
     bindAppActions(els.detailContent);
     els.detailModal.classList.add("active");
-    els.detailContent.querySelector(".modal-btn.primary")?.focus();
+    // Opens on Cancel, never on Buy: an Enter (or a held key's repeat) from
+    // the card's own Buy must not confirm a spend.
+    els.detailContent.querySelector(".modal-footer [data-action='close-detail']")?.focus();
   }
 
   // The link a listing lives at, for the person who listed it to pass on.
@@ -2316,8 +2569,665 @@ import {
     field?.select();
   }
 
+  // --- Offer sheet: buy a market listing, from a link or from Explore ------
+  //
+  // One sheet, reusing `#detail-modal` / `.modal-overlay` exactly as every
+  // other modal here does, for a `ListingObject` reached from either
+  // starting point (task-9-brief, task-10-brief): a pasted link, or an
+  // Explore card's own `(ledger, token_id)`. Readability is advisory
+  // (shared-context.md D8) -- shown, never a gate.
+
+  // `verified` needs no note, and `unknown` (R46) has nothing true to say
+  // about where the item opens, so both say nothing; Buy stays enabled.
+  function offerSheetReadabilityCopy(readability) {
+    if (readability === "unverified") {
+      return "Not yet verified to open here";
+    }
+    if (readability === "foreign") {
+      return "Opens on ela.city";
+    }
+    return "";
+  }
+
+  function offerSheetIcon(listing) {
+    if (listing.asset.coverCid) {
+      const route = `/ipfs/${encodeURIComponent(listing.asset.coverCid)}`;
+      return `<span class="app-icon app-icon-raster modal-icon-size"><img class="app-icon-img" src="${escapeAttr(route)}" alt="" draggable="false"><span class="app-icon-glyph" hidden>${icons.media}</span></span>`;
+    }
+    return `<span class="app-icon gradient-blue modal-icon-size" aria-hidden="true">${icons.media}</span>`;
+  }
+
+  // What the pasted link or the Explore item's `/listing` read answered.
+  // `legacy: true` tells the caller to fall back to today's
+  // `import_runtime_custody` path unchanged; otherwise a parsed listing, or
+  // this throws.
+  async function readMarketListing(start) {
+    const answer = await requestMarketListing(start);
+    if (answer && typeof answer === "object" && answer.legacy_listing === true) {
+      return { legacy: true };
+    }
+    const parsed = parseMarketListing(answer);
+    if (!parsed.ok) {
+      throw new Error("That listing could not be read.");
+    }
+    return { legacy: false, listing: parsed.listing };
+  }
+
+  async function requestMarketListing(start) {
+    const response = await fetch("/api/apps/marketplace/listing", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        "x-elastos-home-token": homeToken,
+      },
+      body: JSON.stringify({ start }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const code = data && typeof data === "object" ? String(data.code || "") : "";
+      throw new Error(marketListingErrorMessage(code));
+    }
+    return data;
+  }
+
+  function marketListingErrorMessage(code) {
+    if (code === "asset_mismatch") {
+      return "That link doesn’t match this item.";
+    }
+    if (code === "unbound") {
+      return "This isn’t an item this market can sell.";
+    }
+    if (code === "unavailable") {
+      return MARKET_UNREACHABLE_COPY;
+    }
+    return "That listing could not be loaded.";
+  }
+
+  // What this page actually learned the last time it read a `ListingObject`
+  // for this item -- never a guess from the catalog index, and never a
+  // purchase gate (D8). Feeds the Explore card's Open label once a market
+  // purchase completes. `unknown` (R46) means Runtime could not learn it this
+  // time, so the row goes back to "not learned yet" rather than keeping an
+  // older answer or reading `unknown` as one.
+  function noteMarketListingReadability(listing) {
+    const key = catalogLedgerKey(listing.item);
+    if (listing.asset.readability === "unknown") {
+      marketAssetReadability.delete(key);
+    } else {
+      marketAssetReadability.set(key, listing.asset.readability);
+    }
+    marketAssetItems.set(key, listing.item);
+  }
+
+  function openOfferSheet(listing, { properties = false, returnFocus = null } = {}) {
+    // A fresh listing read re-asks Runtime rather than trusting an earlier
+    // `attempt_in_progress`: if that purchase is still live, the next Buy is
+    // answered the same way again and raises nothing.
+    recordedOfferAttempts.delete(marketItemKey(listing.item));
+    detailPreviousFocus = returnFocus || document.activeElement;
+    currentOfferListing = listing;
+    currentOfferSheetProperties = properties;
+    renderOfferSheetContent(listing, {});
+    els.detailModal.classList.add("active");
+    // The sheet opens on its own Close, never on a Buy: the first key a
+    // person presses must not be the one that spends money.
+    els.detailContent.querySelector("[data-action='close-detail']")?.focus();
+  }
+
+  // The poll state for this item's offer, if a buy is running -- read fresh
+  // at render time (like `mediaActionButton` reads `pendingMediaBuys`)
+  // rather than threaded in as a render option. This is what lets the sheet
+  // show the right row as busy whether this call is a poll tick or a fresh
+  // reopen of a sheet whose buy kept running in the background.
+  function offerBuyStateFor(item, seller) {
+    const pending = pendingOfferBuys.get(marketItemKey(item));
+    return pending && pending.seller === seller ? pending : null;
+  }
+
+  // Which purchase of this item is already under way, if any: one this page
+  // is driving, or one Runtime answered `attempt_in_progress` for. Only one
+  // purchase of an item runs at a time, so every other seller's Buy waits.
+  // `{seller, recorded}`: `seller` is `null` when Runtime named none, and
+  // `recorded` is the offer Runtime recorded (what Continue sends).
+  function offerItemPurchaseInProgress(item) {
+    const key = marketItemKey(item);
+    const pending = pendingOfferBuys.get(key);
+    if (pending) {
+      return { seller: pending.seller, recorded: null };
+    }
+    const recorded = recordedOfferAttempts.get(key);
+    if (recorded) {
+      return { seller: recorded.offer ? recorded.offer.seller : null, recorded: recorded.offer };
+    }
+    return null;
+  }
+
+  // True only while the sheet on screen is showing this exact item. A
+  // background buy's poll tick must never repaint the modal once the person
+  // has closed it or moved on to another item's sheet -- gated here instead
+  // of trusting whichever `listing` object a loop closed over.
+  function offerSheetShowingItem(item) {
+    return Boolean(currentOfferListing)
+      && els.detailModal.classList.contains("active")
+      && marketItemKey(currentOfferListing.item) === marketItemKey(item);
+  }
+
+  // Repaints the sheet only if it is still open on this item, and always
+  // from `currentOfferListing` -- the listing actually on screen -- rather
+  // than a `listing` reference a background loop may be holding onto from
+  // before the sheet was closed and reopened.
+  function renderOfferSheetIfShowing(item, options = {}) {
+    if (offerSheetShowingItem(item)) {
+      renderOfferSheetContent(currentOfferListing, options);
+    }
+  }
+
+  const OFFER_IN_PROGRESS_COPY = "Another purchase of this item is in progress";
+  // Runtime could not reach the market or the chain: nothing was bought and
+  // pressing again is the whole remedy (R48). Said the same way for a
+  // listing read and for a Buy.
+  const MARKET_UNREACHABLE_COPY = "The market couldn’t be reached. Try again.";
+
+  // What the sheet says instead of offering to buy something this Home
+  // already holds or listed: `access_state` is Runtime's answer, and a Buy
+  // on either would only be refused.
+  function offerSheetOwnershipCopy(accessState) {
+    if (accessState === "purchased") {
+      return "You own this";
+    }
+    if (accessState === "creator") {
+      return "You listed this";
+    }
+    return "";
+  }
+
+  function renderOfferSheetContent(listing, options = {}) {
+    const focusMark = offerSheetFocusMark();
+    currentOfferListing = listing;
+    const changedFor = options.termsChangedFor || "";
+    const changedOffer = changedFor ? listing.offers.find((entry) => entry.seller === changedFor) : null;
+    // An item this Home bought shows what it is, not who else sells it:
+    // offers are for a person who does not own it yet. Details asks for the
+    // same view on any card.
+    const properties = currentOfferSheetProperties || listing.accessState === "purchased";
+    // The properties say where the item opens, so the header does not.
+    const readabilityCopy = properties ? "" : offerSheetReadabilityCopy(listing.asset.readability);
+    const ownership = offerSheetOwnershipCopy(listing.accessState);
+    const inProgress = ownership ? null : offerItemPurchaseInProgress(listing.item);
+    // A purchase Runtime recorded keeps its row even when its seller no
+    // longer lists the item (R44): Continue on its recorded terms is the
+    // only press that moves it on.
+    const offers = offersWithRecordedAttempt(listing.offers, inProgress?.recorded);
+    const download = listing.accessState === "purchased" && listing.asset.readability !== "foreign";
+    const downloading = download && pendingMarketDownloads.has(catalogLedgerKey(listing.item));
+    const notes = [];
+    if (ownership) {
+      notes.push(`${ownership}.`);
+    }
+    if (inProgress && !offers.some((entry) => entry.seller === inProgress.seller)) {
+      notes.push(`${OFFER_IN_PROGRESS_COPY}.`);
+    }
+    if (changedOffer) {
+      notes.push(changedOffer._gone
+        ? "This offer is no longer available."
+        : "The seller changed the terms. Review and confirm.");
+    }
+    els.detailContent.innerHTML = `
+      <header class="modal-header">
+        ${offerSheetIcon(listing)}
+        <div class="modal-title-section">
+          <div class="modal-title">${escapeHtml(listing.asset.title || "Protected item")}</div>
+          ${readabilityCopy ? `<div class="modal-developer">${escapeHtml(readabilityCopy)}</div>` : ""}
+        </div>
+        <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
+      </header>
+      <div class="modal-body">
+        <div class="offer-sheet-status" role="status">${notes
+          .map((note) => `<p class="store-inline-note offer-terms-note">${escapeHtml(note)}</p>`)
+          .join("")}</div>
+        ${properties ? itemPropertiesSection(listing) : `<section class="modal-section">
+          <div class="modal-section-title">Offers</div>
+          <ul class="offer-list">
+            ${offers.length
+              ? offers.map((offer) => renderOfferRow(offer, {
+                busy: offerBuyStateFor(listing.item, offer.seller),
+                highlighted: offer.seller === changedFor && !offer._gone,
+                owned: Boolean(ownership),
+                inProgress,
+              })).join("")
+              : `<li class="offer-row offer-row-empty">No live offers.</li>`}
+          </ul>
+          ${listing.offersTruncated
+            ? `<p class="store-inline-note offer-truncated-note">Showing the first ${MAX_MARKET_OFFERS} sellers.</p>`
+            : ""}
+        </section>`}
+      </div>
+      <footer class="modal-footer">
+        <div class="modal-footer-price"></div>
+        <div class="modal-footer-actions">
+          ${download
+            ? `<button class="modal-btn primary" type="button" data-action="download-market-copy"${downloading ? ' aria-busy="true" aria-disabled="true"' : ""}>Download copy</button>`
+            : ""}
+          <button class="modal-btn secondary" type="button" data-action="close-detail">Close</button>
+        </div>
+      </footer>
+    `;
+    bindAppActions(els.detailContent);
+    restoreOfferSheetFocus(focusMark);
+  }
+
+  // Where a bought item opens, in plain words. `unknown` has nothing true to
+  // say, so it says nothing.
+  function itemPropertiesOpensCopy(readability) {
+    if (readability === "foreign") {
+      return "Opens on ela.city";
+    }
+    if (readability === "verified" || readability === "unverified") {
+      return "Opens here";
+    }
+    return "";
+  }
+
+  // What an item is, from its own `ListingObject`, plus who listed it when
+  // this page's market row names them. Long values are shortened and keep
+  // their full form in the title. Every value is escaped here, once.
+  function itemPropertiesSection(listing) {
+    const row = state.catalog.find((entry) => catalogLedgerKey(entry) === catalogLedgerKey(listing.item));
+    const rows = [
+      ["Title", listing.asset.title || (row && row.displayName) || "Protected item"],
+      ["Description", listing.asset.description],
+      ["Listed by", row && row.sellerAddress, true],
+      ["Network", listing.item.network],
+      ["Ledger", listing.item.ledger, true],
+      ["Token ID", listing.item.tokenId, true],
+      ["Operative", listing.item.operative, true],
+      ["KID", listing.item.kid, true],
+      ["Media type", listing.asset.mimeType || listing.asset.category],
+      ["Opens", itemPropertiesOpensCopy(listing.asset.readability)],
+    ].filter(([, value]) => typeof value === "string" && value.length > 0);
+    return `
+        <section class="modal-section item-properties">
+          <div class="modal-section-title">Details</div>
+          <dl class="item-properties-list">
+            ${rows.map(([label, value, shorten]) => `
+            <div class="item-property">
+              <dt>${escapeHtml(label)}</dt>
+              <dd${shorten ? ` class="mono" title="${escapeAttr(value)}"` : ""}>${escapeHtml(shorten ? abbreviateAddress(value) : value)}</dd>
+            </div>`).join("")}
+          </dl>
+        </section>`;
+  }
+
+  // A repaint replaces every control in the sheet, and a poll repaints it
+  // every few seconds. Which control had focus is remembered by what it is
+  // -- the seller's row, or the action it takes -- so focus comes back to the
+  // same control rather than falling to the page behind the sheet.
+  function offerSheetFocusMark() {
+    const active = document.activeElement;
+    if (!active || !els.detailModal.classList.contains("active") || !els.detailContent.contains(active)) {
+      return null;
+    }
+    return {
+      seller: active.closest(".offer-row")?.dataset.seller || "",
+      action: active.dataset.action || "",
+    };
+  }
+
+  function restoreOfferSheetFocus(mark) {
+    if (!mark) {
+      return;
+    }
+    const byData = (selector, name, value) => [...els.detailContent.querySelectorAll(selector)]
+      .find((node) => node.dataset[name] === value);
+    const row = mark.seller ? byData(".offer-row", "seller", mark.seller) : null;
+    const target = row?.querySelector("button:not([disabled])")
+      || (mark.action ? byData("[data-action]", "action", mark.action) : null)
+      || els.detailContent.querySelector("[data-action='close-detail']");
+    target?.focus();
+  }
+
+  // One offer, as a row: who is selling, at what price and quantity, and
+  // what pressing the row does next. `offer` is always the listing's own
+  // live entry for this seller -- `applyTermsChanged` keeps it that way, so
+  // this never renders (or lets Buy resubmit) terms Runtime already
+  // rejected. An offer Runtime marked `_gone` (its `current` was `null`)
+  // keeps its row, without a Buy control and without the terms it no longer
+  // has, so a person can see what happened rather than watch it vanish.
+  //
+  // A control that cannot act right now is `aria-disabled`, not `disabled`:
+  // it keeps focus through a repaint, and it carries no `data-action`, so
+  // pressing it does nothing.
+  function renderOfferRow(offer, { busy, highlighted, owned, inProgress } = {}) {
+    const money = formatMoney(offer);
+    const sellerLabel = abbreviateAddress(offer.seller);
+    const seller = escapeAttr(offer.seller);
+    let meta = `${escapeHtml(uint256Decimal(offer.quantity))} available${highlighted ? " · new terms" : ""}`;
+    let action = "";
+    let rowClass = highlighted ? " offer-row-changed" : "";
+    if (offer._gone) {
+      meta = "This offer is no longer available";
+      rowClass = " offer-row-gone";
+    } else if (owned) {
+      action = "";
+    } else if (busy) {
+      action = busy.awaitsPerson
+        ? `<button class="modal-btn primary" type="button" data-action="open-wallet" data-seller="${seller}">Approve in wallet</button>`
+        : `<button class="modal-btn secondary" type="button" aria-disabled="true" aria-busy="true" data-seller="${seller}">${escapeHtml(buyStateLabel(busy))}</button>`;
+    } else if (inProgress && inProgress.seller === offer.seller) {
+      // The purchase Runtime recorded for this seller: Continue sends exactly
+      // the recorded terms, which is what lets Runtime resume it.
+      const recordedMoney = inProgress.recorded ? formatMoney(inProgress.recorded) : money;
+      meta = `Purchase in progress · ${escapeHtml(recordedMoney.value)}${recordedMoney.unit ? ` ${escapeHtml(recordedMoney.unit)}` : ""}`;
+      rowClass = " offer-row-in-progress";
+      action = `<button class="modal-btn primary" type="button" data-action="buy-offer" data-seller="${seller}" aria-label="${escapeAttr(`Continue the purchase from ${offer.seller}`)}">Continue</button>`;
+    } else if (inProgress) {
+      meta = OFFER_IN_PROGRESS_COPY;
+      action = `<button class="modal-btn secondary" type="button" aria-disabled="true" data-seller="${seller}" aria-label="${escapeAttr(`Buy from ${offer.seller}: ${OFFER_IN_PROGRESS_COPY}`)}">Buy</button>`;
+    } else {
+      action = `<button class="modal-btn primary" type="button" data-action="buy-offer" data-seller="${seller}" aria-label="${escapeAttr(`Buy from ${offer.seller} for ${money.title}`)}" title="${escapeAttr(`Buy from ${offer.seller}`)}">Buy</button>`;
+    }
+    const price = offer._gone
+      ? ""
+      : `${escapeHtml(money.value)}${money.unit ? ` <small>${escapeHtml(money.unit)}</small>` : ""}`;
+    return `
+      <li class="offer-row${rowClass}" data-seller="${seller}">
+        <div class="offer-row-text">
+          <div class="offer-row-seller" title="${seller}">${escapeHtml(sellerLabel)}</div>
+          <div class="offer-row-meta">${meta}</div>
+        </div>
+        <div class="offer-row-price" title="${escapeAttr(offer._gone ? "" : money.title)}">${price}</div>
+        ${action ? `<div class="offer-row-action">${action}</div>` : ""}
+      </li>
+    `;
+  }
+
+  // Replaces `seller`'s entry in `listing.offers` with the fresh terms
+  // Runtime just re-read (or drops it, marked `_gone`, when `current` is
+  // `null`), so the listing itself -- the one thing every render and every
+  // future Buy reads from -- never again shows or resubmits terms Runtime
+  // already refused.
+  function applyTermsChanged(listing, seller, current) {
+    const index = listing.offers.findIndex((entry) => entry.seller === seller);
+    if (index === -1) {
+      return;
+    }
+    listing.offers[index] = current === null ? { ...listing.offers[index], _gone: true } : current;
+  }
+
+  // `agreed.quantity` is always `"0x1"` in this slice (shared-context.md
+  // §5.2) -- never the seller's own available quantity, which is what the
+  // offer's `quantity` field actually names.
+  function buyOfferRequestBody(listing, offer) {
+    return {
+      item: marketItemClaim(listing.item),
+      asset_uri: listing.asset.uri,
+      seller: offer.seller,
+      agreed: { price: offer.price, pay_token: offer.payToken, quantity: "0x1" },
+    };
+  }
+
+  // What a finished market purchase says depends on how far adoption got:
+  // only an adopted item is in this Home's Library yet. Adoption runs again
+  // only when the copy is asked for, so a pending one names Download copy,
+  // the control that finishes it without paying again (R45).
+  function offerCompletionMessage(adoption) {
+    if (adoption === "foreign") {
+      return "Bought. It opens on ela.city.";
+    }
+    if (adoption === "pending") {
+      return "Bought. Use Download copy to add it to your Library here.";
+    }
+    return "Bought. The item is in your Library.";
+  }
+
+  function offerBareOutcomeMessage(kind) {
+    if (kind === "own_offer") {
+      return "You can’t buy your own offer.";
+    }
+    if (kind === "already_owned") {
+      return "You already own this.";
+    }
+    return "This listing no longer matches the item.";
+  }
+
+  // Mirrors `buyMedia`: the same poll budget, the same stages, resumed by
+  // pressing Buy again rather than by this loop retrying on its own. Unlike
+  // `buyMedia`, progress is shown in the sheet itself (one row per offer,
+  // Task 9), not on a card, and `terms_changed` re-renders the sheet with
+  // the fresh terms rather than ever retrying with the old ones. Every
+  // repaint goes through `renderOfferSheetIfShowing`, so a poll tick for one
+  // item can never overwrite the sheet once it is showing something else.
+  async function buyOffer(listing, offer) {
+    const key = marketItemKey(listing.item);
+    // One purchase of an item at a time: while one runs, or while Runtime
+    // holds one recorded for another seller, only that seller's row acts.
+    const inProgress = offerItemPurchaseInProgress(listing.item);
+    if (inProgress && (inProgress.recorded === null || inProgress.seller !== offer.seller)) {
+      return;
+    }
+    const body = buyOfferRequestBody(listing, offer);
+    pendingOfferBuys.set(key, { seller: offer.seller, kind: "wait", stage: "", awaitsPerson: false, connectorId: "" });
+    renderOfferSheetIfShowing(listing.item);
+    const deadline = Date.now() + BUY_POLL_BUDGET_MS;
+    for (;;) {
+      let outcome;
+      try {
+        const answer = await postObjectProvider("buy_offer", body);
+        outcome = parseBuyOfferAnswer(answer);
+      } catch (error) {
+        outcome = parseBuyOfferAnswer(error.answer);
+      }
+      // A running purchase keeps its recorded terms: a Continue row added
+      // for a seller that no longer lists the item must stay on the sheet
+      // while that purchase settles, or its progress would have no row.
+      if (outcome.kind !== "attempt_in_progress" && outcome.kind !== "wait") {
+        recordedOfferAttempts.delete(key);
+      }
+      if (outcome.kind === "attempt_in_progress") {
+        // Another purchase of this item is already under way on terms
+        // Runtime recorded earlier. Nothing was started for this press; the
+        // sheet now shows which seller that purchase is with, and holds
+        // every other seller's Buy until it is done.
+        pendingOfferBuys.delete(key);
+        recordedOfferAttempts.set(key, { offer: outcome.current });
+        renderOfferSheetIfShowing(listing.item);
+        // The in-sheet note is rebuilt on every paint; the toast is the
+        // persistent status region, so this is what gets announced.
+        showToast(`${OFFER_IN_PROGRESS_COPY}.`, false);
+        return;
+      }
+      if (outcome.kind === "complete") {
+        pendingOfferBuys.delete(key);
+        // What this listing said is now what the item's catalog row reads,
+        // so a pending adoption's row can offer Download copy at once.
+        noteMarketListingReadability(listing);
+        if (outcome.adoption === "foreign") {
+          marketAssetReadability.set(catalogLedgerKey(listing.item), "foreign");
+        }
+        showToast(offerCompletionMessage(outcome.adoption), false);
+        if (offerSheetShowingItem(listing.item)) {
+          closeDetail();
+        }
+        await Promise.all([loadMediaData(), state.catalogLoaded ? loadCatalogItems() : Promise.resolve()]);
+        render();
+        return;
+      }
+      if (outcome.kind === "terms_changed") {
+        pendingOfferBuys.delete(key);
+        applyTermsChanged(listing, offer.seller, outcome.current);
+        // The sheet may have been closed and reopened while this answer was
+        // on its way, onto a fresh listing object: the terms go there too,
+        // or the sheet would say "new terms" beside the old price.
+        if (offerSheetShowingItem(listing.item) && currentOfferListing !== listing) {
+          applyTermsChanged(currentOfferListing, offer.seller, outcome.current);
+        }
+        renderOfferSheetIfShowing(listing.item, { termsChangedFor: offer.seller });
+        showToast(
+          outcome.current === null
+            ? "This offer is no longer available."
+            : "The seller changed the terms. Review and confirm.",
+          false,
+        );
+        return;
+      }
+      if (outcome.kind === "own_offer" || outcome.kind === "already_owned" || outcome.kind === "asset_mismatch") {
+        pendingOfferBuys.delete(key);
+        showToast(offerBareOutcomeMessage(outcome.kind), true);
+        renderOfferSheetIfShowing(listing.item);
+        return;
+      }
+      if (outcome.kind === "unavailable") {
+        // Runtime could not reach the market or the chain (R48). Nothing
+        // was bought; the same Buy tries again.
+        pendingOfferBuys.delete(key);
+        showToast(MARKET_UNREACHABLE_COPY, true);
+        renderOfferSheetIfShowing(listing.item);
+        return;
+      }
+      if (outcome.kind === "wait") {
+        if (Date.now() > deadline) {
+          pendingOfferBuys.delete(key);
+          showToast("This purchase is still settling. Press Buy to pick it up again.", false);
+          renderOfferSheetIfShowing(listing.item);
+          return;
+        }
+        pendingOfferBuys.set(key, { seller: offer.seller, ...outcome });
+        renderOfferSheetIfShowing(listing.item);
+        await new Promise((resolve) => { window.setTimeout(resolve, BUY_POLL_MS); });
+        continue;
+      }
+      // failed -- a real failed purchase, including a declined approval,
+      // which is the person's own decision and nothing this loop retries on
+      // their behalf.
+      pendingOfferBuys.delete(key);
+      showToast(
+        outcome.stage === "declined" ? "You declined this in your wallet." : "The purchase did not finish.",
+        true,
+      );
+      renderOfferSheetIfShowing(listing.item);
+      return;
+    }
+  }
+
+  // Explore's own way in: the chain's own key, never an account
+  // (shared-context.md D14), reaching the same sheet a pasted link opens.
+  async function buyCatalogItem(ledger, tokenId) {
+    const key = `${ledger}|${tokenId}`;
+    if (catalogListingLoading.has(key)) {
+      return;
+    }
+    catalogListingLoading.add(key);
+    markCatalogListingBusy(ledger, tokenId, true);
+    try {
+      const result = await readMarketListing({ item: { ledger, token_id: tokenId } });
+      if (!result.legacy) {
+        noteMarketListingReadability(result.listing);
+      }
+      // The person moved on while the listing was read -- another sheet or
+      // detail is open now. This late answer must not replace it.
+      if (els.detailModal.classList.contains("active")) {
+        return;
+      }
+      if (result.legacy) {
+        showToast("That item could not be loaded.", true);
+        return;
+      }
+      openOfferSheet(result.listing);
+    } catch (error) {
+      showToast(publicError(error.message, "That item could not be loaded."), true);
+    } finally {
+      catalogListingLoading.delete(key);
+      markCatalogListingBusy(ledger, tokenId, false);
+    }
+  }
+
+  // An Explore Buy says it is working while its listing is read. The flag is
+  // set on whatever card controls are on screen now; `catalogActionButton`
+  // reads `catalogListingLoading` so a repaint in between keeps it.
+  function markCatalogListingBusy(ledger, tokenId, busy) {
+    for (const node of document.querySelectorAll('[data-action="buy-listing"]')) {
+      if (node.dataset.ledger !== ledger || node.dataset.token !== tokenId) {
+        continue;
+      }
+      if (busy) {
+        node.setAttribute("aria-busy", "true");
+        node.setAttribute("aria-disabled", "true");
+      } else {
+        node.removeAttribute("aria-busy");
+        node.removeAttribute("aria-disabled");
+      }
+    }
+  }
+
+  // Details on a bought Explore card: the item's own `ListingObject`, read by
+  // the chain's own key, shown as properties in the item sheet. What the read
+  // learns about readability also updates the card behind the sheet.
+  async function showCatalogDetails(ledger, tokenId) {
+    const key = `${ledger}|${tokenId}`;
+    if (catalogListingLoading.has(key)) {
+      return;
+    }
+    catalogListingLoading.add(key);
+    try {
+      const result = await readMarketListing({ item: { ledger, token_id: tokenId } });
+      if (result.legacy) {
+        showToast("That item could not be loaded.", true);
+        return;
+      }
+      noteMarketListingReadability(result.listing);
+      // The card now shows what the read learned. The repaint replaces the
+      // pressed control, so Close returns focus to its successor.
+      renderSections();
+      // The person moved on while the listing was read -- another sheet or
+      // detail is open now. This late answer must not replace it.
+      if (els.detailModal.classList.contains("active")) {
+        return;
+      }
+      const successor = [...document.querySelectorAll('[data-action="item-details"]')]
+        .find((node) => node.dataset.ledger === ledger && node.dataset.token === tokenId);
+      openOfferSheet(result.listing, { properties: true, returnFocus: successor || null });
+    } catch (error) {
+      showToast(publicError(error.message, "That item could not be loaded."), true);
+    } finally {
+      catalogListingLoading.delete(key);
+    }
+  }
+
+  // Task 10 fix round 1, minor: a `purchased`/`creator` catalog row whose
+  // readability this page has not yet learned neither guesses "Open" nor
+  // stays silent -- it reads the item's own `ListingObject` first, then
+  // shows the label that answer actually earns.
+  async function openCatalogPurchase(ledger, tokenId) {
+    const key = `${ledger}|${tokenId}`;
+    if (catalogListingLoading.has(key)) {
+      return;
+    }
+    catalogListingLoading.add(key);
+    try {
+      const result = await readMarketListing({ item: { ledger, token_id: tokenId } });
+      if (result.legacy) {
+        return;
+      }
+      noteMarketListingReadability(result.listing);
+      if (result.listing.asset.readability !== "foreign") {
+        // Verified, unverified or unknown: this Home's own open path takes it from
+        // here once adoption has written the mint (D10) -- reloading is
+        // what lets that merge happen; nothing here invents a way to open it.
+        await Promise.all([loadMediaData(), loadCatalogItems()]);
+      }
+      render();
+    } catch (error) {
+      showToast(publicError(error.message, "That item could not be loaded."), true);
+    } finally {
+      catalogListingLoading.delete(key);
+    }
+  }
+
   function closeDetail() {
     els.detailModal.classList.remove("active");
+    currentOfferListing = null;
+    currentOfferSheetProperties = false;
     const restore = detailPreviousFocus;
     detailPreviousFocus = null;
     if (restore && typeof restore.focus === "function" && document.contains(restore)) {
@@ -2463,13 +3373,16 @@ import {
     }, homeParentOrigin);
   }
 
-  // A listing published on another Home reaches this one by its link. This
-  // checks the link's shape and hands it to Runtime, which fetches the package
-  // and verifies its metadata, its chain record and its content before the
-  // item appears on the shelf. Nothing here decides that an item is genuine.
+  // A shared asset link reaches Runtime as a `token_uri` start (task-9-brief).
+  // `legacy_listing: true` is a listing link Runtime still recognises by the
+  // old path, and that path is unchanged: it fetches the package and
+  // verifies its metadata, its chain record and its content before the item
+  // appears on this Home's own shelf. Anything else is a live
+  // `ListingObject`, which opens the offer sheet instead -- nothing here
+  // decides that an item is genuine either way.
   async function importListing(value) {
-    const listingUri = listingUriFromInput(value);
-    if (!listingUri) {
+    const link = marketLinkFromInput(value);
+    if (!link) {
       showToast("That does not look like a listing link.", true);
       return;
     }
@@ -2480,10 +3393,17 @@ import {
     els.importSubmit.disabled = true;
     els.importSubmit.setAttribute("aria-busy", "true");
     try {
-      await postObjectProvider("import_runtime_custody", { listing_uri: listingUri });
+      const result = await readMarketListing({ token_uri: link });
+      if (result.legacy) {
+        await postObjectProvider("import_runtime_custody", { listing_uri: legacyListingUriFromLink(link) });
+        els.importInput.value = "";
+        showToast("Listing added.", false);
+        await loadMediaData();
+        return;
+      }
       els.importInput.value = "";
-      showToast("Listing added.", false);
-      await loadMediaData();
+      noteMarketListingReadability(result.listing);
+      openOfferSheet(result.listing);
     } catch (error) {
       showToast(publicError(error.message, "That listing could not be added."), true);
     } finally {
@@ -2492,6 +3412,23 @@ import {
       els.importSubmit.removeAttribute("aria-busy");
       render();
     }
+  }
+
+  // Only `elastos://` or `ipfs://` plus exactly a folder CID -- a shared link
+  // names the asset alone (shared-context.md D3), never a seller. The one
+  // path Runtime also accepts, `ipfs://<cid>/<file>` (a token URI names the
+  // file inside the folder), is cut back to its folder first. Checked before
+  // Runtime is asked anything.
+  function marketLinkFromInput(value) {
+    const text = String(value ?? "").trim().replace(/^(ipfs:\/\/[^/]+)\/[^/]+$/, "$1");
+    return MARKET_LINK_URI.test(text) ? text : "";
+  }
+
+  // The old import path only ever recognised `elastos://`. Both schemes name
+  // the same folder CID (D4), so this keeps sending that path exactly the
+  // link shape it has always required, whichever scheme a person pasted.
+  function legacyListingUriFromLink(link) {
+    return `elastos://${link.replace(/^(?:elastos|ipfs):\/\//, "")}`;
   }
 
   // A purchase is a sequence of waits, and re-issuing the identical buy is how
@@ -2567,6 +3504,34 @@ import {
     }
   }
 
+  // A bought market item's copy, asked for by its item. Runtime reruns
+  // adoption for a completed purchase and then fetches the copy exactly as
+  // `downloadOwnedCopy` does for a mint. It never pays, and it is refused
+  // for an item this principal has not completed a purchase of.
+  async function downloadMarketCopy(item) {
+    const key = catalogLedgerKey(item);
+    if (pendingMarketDownloads.has(key)) {
+      return;
+    }
+    pendingMarketDownloads.add(key);
+    render();
+    renderOfferSheetIfShowing(item);
+    try {
+      await postObjectProvider("download_owned_copy", { item: marketItemClaim(item) });
+      showToast("Downloaded. The copy is in your Library.", false);
+      if (offerSheetShowingItem(item)) {
+        closeDetail();
+      }
+      await Promise.all([loadMediaData(), state.catalogLoaded ? loadCatalogItems() : Promise.resolve()]);
+    } catch (error) {
+      showToast(publicError(error.message, "That copy could not be downloaded."), true);
+    } finally {
+      pendingMarketDownloads.delete(key);
+      render();
+      renderOfferSheetIfShowing(item);
+    }
+  }
+
   function setBuyState(mintId, outcome) {
     pendingMediaBuys.set(mintId, outcome);
     render();
@@ -2631,6 +3596,21 @@ import {
         }
         if (action === "refresh-media") {
           refreshMediaSurface(target);
+        }
+        if (action === "retry-market") {
+          if (state.catalogLoading) {
+            return;
+          }
+          const reading = loadCatalogItems();
+          renderSections();
+          reading.then(() => {
+            render();
+            // The button that was pressed is gone; focus goes to the one that
+            // replaced it, or to the tab this surface belongs to.
+            const next = els.storeSections.querySelector("[data-action='retry-market']")
+              || els.mediaTabs.querySelector("[data-media-tab='explore']");
+            next?.focus();
+          });
         }
         if (action === "card-menu") {
           // One menu open at a time, and the control says which state it is
@@ -2702,8 +3682,39 @@ import {
         if (action === "download-copy") {
           downloadOwnedCopy(target.dataset.mint);
         }
+        if (action === "download-market-copy") {
+          // The sheet names the item it is showing; a catalog row names the
+          // item this page read a listing for under its ledger and token id.
+          const item = els.detailContent.contains(target) && currentOfferListing
+            ? currentOfferListing.item
+            : marketAssetItems.get(catalogLedgerKey({ ledger: target.dataset.ledger, tokenId: target.dataset.token }));
+          if (item) {
+            downloadMarketCopy(item);
+          }
+        }
         if (action === "open-media") {
           openMedia(target.dataset.mint);
+        }
+        if (action === "buy-listing") {
+          buyCatalogItem(target.dataset.ledger, target.dataset.token);
+        }
+        if (action === "open-listing") {
+          openCatalogPurchase(target.dataset.ledger, target.dataset.token);
+        }
+        if (action === "item-details") {
+          showCatalogDetails(target.dataset.ledger, target.dataset.token);
+        }
+        if (action === "buy-offer" && currentOfferListing) {
+          const seller = target.dataset.seller;
+          // A purchase Runtime recorded for this seller continues on the
+          // recorded terms; anything else buys the row's live offer.
+          const inProgress = offerItemPurchaseInProgress(currentOfferListing.item);
+          const offer = inProgress?.recorded && inProgress.seller === seller
+            ? inProgress.recorded
+            : currentOfferListing.offers.find((entry) => entry.seller === seller && !entry._gone);
+          if (offer) {
+            buyOffer(currentOfferListing, offer);
+          }
         }
         if (action === "close-detail") {
           closeDetail();

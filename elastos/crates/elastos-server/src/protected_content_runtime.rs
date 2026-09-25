@@ -4443,7 +4443,63 @@ pub async fn publish_and_verify_protected_content_availability(
         media_identity,
         requirement,
         now_unix_seconds,
+        RuntimeManifestPublisherBinding::Exact,
     )
+}
+
+/// Which publisher a content object's manifest must name (D16, R40). Chosen
+/// by the caller, which knows the listing's origin; never inferred from the
+/// requirement's DID method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeManifestPublisherBinding {
+    /// The manifest names exactly the publisher the requirement expects: the
+    /// Runtime profile (`did:key`) the content was published under. Every
+    /// package this Runtime or another one published (`LocalCreator`,
+    /// `Imported`), and every publish.
+    Exact,
+    /// A listing adopted from a shared `metadata.json` (origin `Asset`) only.
+    /// Its publisher is a `did:pkh` taken from the document, and it is
+    /// ATTRIBUTION ONLY: it names the chain account the document states and
+    /// authorizes nothing. The content object's manifest names the Runtime
+    /// profile that published the bytes -- another namespace, with no mapping
+    /// to the `did:pkh` -- so the manifest must name a well-formed `did:key`;
+    /// the receipt, which the content plane binds to the publisher the
+    /// `ensure` names, is what agrees with the requirement, and the bytes are
+    /// bound by the content identity the document carries.
+    AdoptedAttribution,
+}
+
+impl RuntimeManifestPublisherBinding {
+    /// The binding a listing of this origin is verified under.
+    pub(crate) fn for_origin(origin: &RuntimeCustodyListingOrigin) -> Self {
+        match origin {
+            RuntimeCustodyListingOrigin::Asset { .. } => Self::AdoptedAttribution,
+            RuntimeCustodyListingOrigin::LocalCreator { .. }
+            | RuntimeCustodyListingOrigin::Imported { .. } => Self::Exact,
+        }
+    }
+}
+
+/// Whether a content object's own manifest names the publisher an
+/// availability requirement expects, under `binding` (R40).
+fn content_manifest_binds_publisher(
+    manifest: &crate::content::ContentObjectManifest,
+    requirement: &RuntimeContentAvailabilityRequirement,
+    binding: RuntimeManifestPublisherBinding,
+) -> bool {
+    let expected = requirement.expected_publisher_did();
+    match binding {
+        RuntimeManifestPublisherBinding::Exact => {
+            manifest.publisher_did.as_deref() == Some(expected)
+        }
+        RuntimeManifestPublisherBinding::AdoptedAttribution => {
+            parse_runtime_publisher_pkh(expected).is_some()
+                && manifest
+                    .publisher_did
+                    .as_deref()
+                    .is_some_and(|publisher| crate::crypto::decode_did_key(publisher).is_ok())
+        }
+    }
 }
 
 fn validate_protected_content_availability_requirement(
@@ -4861,6 +4917,7 @@ fn verify_protected_content_receipt(
     media_identity: &CencFmp4MediaIdentityV1,
     requirement: &RuntimeContentAvailabilityRequirement,
     now_unix_seconds: u64,
+    publisher_binding: RuntimeManifestPublisherBinding,
 ) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
     validate_protected_content_availability_requirement(requirement)?;
     cid::Cid::try_from(content_cid)
@@ -4887,7 +4944,7 @@ fn verify_protected_content_receipt(
                 .and_then(Value::as_bool)
                 != Some(true))
         || manifest.object_did.as_deref() != Some(requirement.expected_object_identity())
-        || manifest.publisher_did.as_deref() != Some(requirement.expected_publisher_did())
+        || !content_manifest_binds_publisher(manifest, requirement, publisher_binding)
     {
         anyhow::bail!("protected content availability receipt binding is invalid");
     }
@@ -4931,6 +4988,7 @@ fn verify_protected_content_object_receipt(
     object_identity: &ChunkedPayloadObjectIdentityV1,
     requirement: &RuntimeContentAvailabilityRequirement,
     now_unix_seconds: u64,
+    publisher_binding: RuntimeManifestPublisherBinding,
 ) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
     validate_protected_content_availability_requirement(requirement)?;
     cid::Cid::try_from(content_cid)
@@ -4957,7 +5015,7 @@ fn verify_protected_content_object_receipt(
                 .and_then(Value::as_bool)
                 != Some(true))
         || manifest.object_did.as_deref() != Some(requirement.expected_object_identity())
-        || manifest.publisher_did.as_deref() != Some(requirement.expected_publisher_did())
+        || !content_manifest_binds_publisher(manifest, requirement, publisher_binding)
     {
         anyhow::bail!("protected content availability receipt binding is invalid");
     }
@@ -5084,6 +5142,7 @@ pub async fn publish_and_verify_protected_content_object_availability(
         object_identity,
         requirement,
         now_unix_seconds,
+        RuntimeManifestPublisherBinding::Exact,
     )
 }
 
@@ -7353,8 +7412,16 @@ pub(crate) struct RuntimePortableListingPackage {
     pub(crate) pay_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) payment_processor: Option<String>,
-    pub(crate) mint_transaction_hash: String,
-    pub(crate) published_at: u64,
+    /// The mint's own transaction. Absent only on a listing adopted from an
+    /// asset's shared `metadata.json` (origin `Asset`): chain and document do
+    /// not state it, and a made-up hash would be a fabricated fact (D11).
+    /// Skipped when absent so every package that carries it keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mint_transaction_hash: Option<String>,
+    /// When the creator published it. Absent exactly when
+    /// `mint_transaction_hash` is, for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7369,6 +7436,10 @@ pub(crate) enum RuntimeCustodyListingOrigin {
         listing_uri: String,
         package_sha256: String,
     },
+    /// Adopted after a market purchase from the asset's shared
+    /// `metadata.json` (D10): no listing package was ever published for it,
+    /// so it names the asset it was built from and its digest is computed.
+    Asset { asset_uri: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7403,11 +7474,15 @@ impl RuntimeCustodyListingOrigin {
     /// published to, and an imported one keeps the URI it was fetched from.
     /// Either way it names the same package, so passing it on is how a listing
     /// travels between Homes.
+    ///
+    /// An adopted listing has no package of its own; the asset it was built
+    /// from is what travels instead.
     pub(crate) fn listing_uri(&self) -> &str {
         match self {
             Self::LocalCreator { listing_uri, .. } | Self::Imported { listing_uri, .. } => {
                 listing_uri
             }
+            Self::Asset { asset_uri } => asset_uri,
         }
     }
 }
@@ -7430,6 +7505,7 @@ impl RuntimeCustodyListingRecord {
                     package_sha256,
                     &self.package,
                 )?;
+                validate_runtime_published_package_facts(&self.package)?;
             }
             RuntimeCustodyListingOrigin::Imported {
                 listing_uri,
@@ -7440,6 +7516,10 @@ impl RuntimeCustodyListingRecord {
                     package_sha256,
                     &self.package,
                 )?;
+                validate_runtime_published_package_facts(&self.package)?;
+            }
+            RuntimeCustodyListingOrigin::Asset { asset_uri } => {
+                validate_runtime_adopted_package_facts(asset_uri, &self.package)?;
             }
         }
         if self.availability.checked_at == 0
@@ -7456,10 +7536,77 @@ impl RuntimeCustodyListingRecord {
     pub(crate) fn portable_package_digest(&self) -> String {
         let package_sha256 = match &self.origin {
             RuntimeCustodyListingOrigin::LocalCreator { package_sha256, .. }
-            | RuntimeCustodyListingOrigin::Imported { package_sha256, .. } => package_sha256,
+            | RuntimeCustodyListingOrigin::Imported { package_sha256, .. } => {
+                package_sha256.clone()
+            }
+            // Never published, so never stated: computed over the package the
+            // same way a published one's digest was, which is what a purchase
+            // record binds to.
+            RuntimeCustodyListingOrigin::Asset { .. } => {
+                runtime_portable_package_sha256(&self.package)
+            }
         };
         format!("sha256:{package_sha256}")
     }
+}
+
+/// `sha256` over a package's canonical bytes, bare hex.
+fn runtime_portable_package_sha256(package: &RuntimePortableListingPackage) -> String {
+    serde_json::to_vec(package)
+        .map(|bytes| hex::encode(sha2::Sha256::digest(bytes)))
+        .unwrap_or_default()
+}
+
+/// A package this Runtime or another one published (origins `LocalCreator`
+/// and `Imported`): the mint's transaction and publication time are facts it
+/// states, and its publisher is a Runtime profile, a `did:key`.
+fn validate_runtime_published_package_facts(
+    package: &RuntimePortableListingPackage,
+) -> anyhow::Result<()> {
+    if package.mint_transaction_hash.is_none() || package.published_at.is_none() {
+        anyhow::bail!("Runtime custody portable listing is invalid");
+    }
+    crate::crypto::decode_did_key(&package.publisher_profile_did)
+        .map(|_| ())
+        .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))
+}
+
+/// A package adopted from an asset's shared `metadata.json` (origin `Asset`,
+/// D11 and D16): it states neither fact the shared document lacks, its
+/// publisher is the document's `did:pkh` on the package's own chain, and the
+/// asset it names is the package's own metadata folder.
+fn validate_runtime_adopted_package_facts(
+    asset_uri: &str,
+    package: &RuntimePortableListingPackage,
+) -> anyhow::Result<()> {
+    if package.mint_transaction_hash.is_some()
+        || package.published_at.is_some()
+        || runtime_portable_listing_cid(asset_uri)? != package.metadata_cid
+    {
+        anyhow::bail!("Runtime custody portable listing is invalid");
+    }
+    let chain_id = package
+        .chain_namespace
+        .strip_prefix("eip155:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
+    match parse_runtime_publisher_pkh(&package.publisher_profile_did) {
+        Some((pkh_chain_id, _)) if pkh_chain_id == chain_id => Ok(()),
+        _ => anyhow::bail!("Runtime custody portable listing is invalid"),
+    }
+}
+
+/// `did:pkh:eip155:<chainId>:<address>` with a canonical decimal chain id and a
+/// lowercase `0x` + 40 hex address, as `(chain_id, address)`.
+pub(crate) fn parse_runtime_publisher_pkh(value: &str) -> Option<(u64, &str)> {
+    let rest = value.strip_prefix("did:pkh:eip155:")?;
+    let (chain_id, address) = rest.split_once(':')?;
+    let parsed = chain_id.parse::<u64>().ok()?;
+    if parsed.to_string() != chain_id {
+        return None;
+    }
+    validate_runtime_custody_evm_address(address).ok()?;
+    (address == address.to_ascii_lowercase()).then_some((parsed, address))
 }
 
 fn validate_runtime_portable_listing_origin(
@@ -7562,7 +7709,7 @@ impl RuntimePortableListingPackage {
         let legacy_file_uri = format!("{directory_uri}/metadata.json");
         if self.schema != RUNTIME_PORTABLE_LISTING_SCHEMA_V1
             || (self.token_uri != directory_uri && self.token_uri != legacy_file_uri)
-            || self.published_at == 0
+            || self.published_at == Some(0)
         {
             anyhow::bail!("Runtime custody portable listing is invalid");
         }
@@ -7584,11 +7731,16 @@ impl RuntimePortableListingPackage {
         if let Some(payment_processor) = &self.payment_processor {
             validate_runtime_custody_evm_address(payment_processor)?;
         }
-        let transaction_hash = decode_0x_hex(&self.mint_transaction_hash)
-            .filter(|bytes| bytes.len() == 32)
-            .ok_or_else(|| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
-        if self.mint_transaction_hash != format!("0x{}", hex::encode(transaction_hash)) {
-            anyhow::bail!("Runtime custody portable listing is invalid");
+        // Both facts are optional at this level; which origin may omit them
+        // is `RuntimeCustodyListingRecord::validate`'s to judge. What is
+        // present must still be canonical.
+        if let Some(mint_transaction_hash) = &self.mint_transaction_hash {
+            let transaction_hash = decode_0x_hex(mint_transaction_hash)
+                .filter(|bytes| bytes.len() == 32)
+                .ok_or_else(|| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
+            if *mint_transaction_hash != format!("0x{}", hex::encode(transaction_hash)) {
+                anyhow::bail!("Runtime custody portable listing is invalid");
+            }
         }
         // Exactly one identity field, dispatched on which one is present —
         // never a default, never a silently-ignored second field. A media
@@ -7684,8 +7836,15 @@ fn validate_runtime_custody_cid(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A publisher identity, typed by its DID method (D16): a Runtime profile's
+/// `did:key`, or the `did:pkh` an adopted package names. Which of the two a
+/// package may carry depends on its origin, which
+/// `RuntimeCustodyListingRecord::validate` knows and this does not.
 fn validate_runtime_custody_profile_did(value: &str) -> anyhow::Result<()> {
     validate_runtime_custody_public_text(value)?;
+    if parse_runtime_publisher_pkh(value).is_some() {
+        return Ok(());
+    }
     crate::crypto::decode_did_key(value)
         .map(|_| ())
         .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))
@@ -7813,10 +7972,16 @@ async fn verify_runtime_portable_chain(
             .filter(|_| response.get("status").and_then(Value::as_str) == Some("ok"))
             .ok_or_else(|| anyhow::anyhow!("Runtime custody portable listing is invalid"))
     };
+    // The one reader of the mint hash. Only an imported listing reaches here,
+    // and a published package always states it.
+    let mint_transaction_hash = package
+        .mint_transaction_hash
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody portable listing is invalid"))?;
     let receipt: crate::api::gateway::ResolvedProtectedContentMintReceipt = serde_json::from_value(
         resolve(json!({
             "op": "resolve_protected_content_mint_receipt", "network": package.network,
-            "hash": package.mint_transaction_hash, "creator": package.seller_address,
+            "hash": mint_transaction_hash, "creator": package.seller_address,
             "ledger": package.ledger, "token_uri": package.token_uri, "op_type_code": 1,
         }))
         .await?,
@@ -7859,6 +8024,36 @@ async fn verify_runtime_portable_content(
     package: &RuntimePortableListingPackage,
     decoded: &DecodedRuntimePortableAsset,
     now_unix_seconds: u64,
+    publisher_binding: RuntimeManifestPublisherBinding,
+) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
+    let (draft, availability) = rebuild_runtime_portable_content(
+        data_dir,
+        registry,
+        package,
+        decoded,
+        now_unix_seconds,
+        publisher_binding,
+    )
+    .await?;
+    if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
+        anyhow::bail!("Runtime custody portable listing is invalid");
+    }
+    Ok((draft, availability))
+}
+
+/// Everything [`verify_runtime_portable_content`] does except compare the
+/// rebuilt draft's `mint_id` with the package's: a fresh availability receipt,
+/// the published content verified against the package's identity, and the
+/// mint draft rebuilt from it. Adoption takes its `mint_id` from exactly this
+/// draft, because a package built from a shared document has no `mint_id` of
+/// its own to compare against.
+async fn rebuild_runtime_portable_content(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+    package: &RuntimePortableListingPackage,
+    decoded: &DecodedRuntimePortableAsset,
+    now_unix_seconds: u64,
+    publisher_binding: RuntimeManifestPublisherBinding,
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     match &decoded.content_identity {
         RuntimeContentIdentityV1::Media(media_identity) => {
@@ -7869,6 +8064,7 @@ async fn verify_runtime_portable_content(
                 decoded,
                 media_identity,
                 now_unix_seconds,
+                publisher_binding,
             )
             .await
         }
@@ -7880,6 +8076,7 @@ async fn verify_runtime_portable_content(
                 decoded,
                 object_identity,
                 now_unix_seconds,
+                publisher_binding,
             )
             .await
         }
@@ -7889,8 +8086,8 @@ async fn verify_runtime_portable_content(
 /// Object twin of [`verify_runtime_portable_media`]. Step for step the same
 /// sequence — re-observe availability, fetch and verify the published files
 /// against the listing's own identity, verify the receipt, resolve the
-/// custody composition's currently selected nodes, rebuild the mint draft and
-/// require it to hash back to the listing's `mint_id`. The media function is
+/// custody composition's currently selected nodes, and rebuild the mint draft (its
+/// `mint_id` is compared by the caller, `verify_runtime_portable_content`). The media function is
 /// untouched; only the three content-shaped steps differ (object manifest and
 /// `object.epc1` instead of `identity.bin` + `init.mp4` + segments, the object
 /// receipt twin, and `RuntimeMintDraft::new_from_identity` with an
@@ -7903,6 +8100,7 @@ async fn verify_runtime_portable_object(
     decoded: &DecodedRuntimePortableAsset,
     object_identity: &ChunkedPayloadObjectIdentityV1,
     now_unix_seconds: u64,
+    publisher_binding: RuntimeManifestPublisherBinding,
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     // Same clock discipline as the media path: a dead candidate's connect
     // timeouts can outlast the receipt's future-skew allowance.
@@ -7937,6 +8135,7 @@ async fn verify_runtime_portable_object(
         object_identity,
         &requirement,
         now_unix_seconds.max(crate::auth::now_ts()),
+        publisher_binding,
     )?;
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
@@ -7959,9 +8158,6 @@ async fn verify_runtime_portable_object(
         decoded.key_envelope.threshold(),
         selected.iter().map(|node| node.binding().clone()).collect(),
     )?;
-    if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
-        anyhow::bail!("Runtime custody portable listing is invalid");
-    }
     Ok((draft, availability))
 }
 
@@ -7973,6 +8169,7 @@ async fn verify_runtime_portable_media(
     decoded: &DecodedRuntimePortableAsset,
     media_identity: &CencFmp4MediaIdentityV1,
     now_unix_seconds: u64,
+    publisher_binding: RuntimeManifestPublisherBinding,
 ) -> anyhow::Result<(RuntimeMintDraft, RuntimeVerifiedContentAvailability)> {
     // The caller samples its clock before the fresh ensure; walking a dead
     // candidate's connect timeouts can take longer than the receipt's
@@ -8015,6 +8212,7 @@ async fn verify_runtime_portable_media(
         &requirement,
         // Re-sampled: the refresh above may have walked dead-candidate timeouts.
         now_unix_seconds.max(crate::auth::now_ts()),
+        publisher_binding,
     )?;
     let composition = load_runtime_custody_composition(data_dir, registry.clone())?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
@@ -8041,9 +8239,6 @@ async fn verify_runtime_portable_media(
         decoded.key_envelope.threshold(),
         selected.iter().map(|node| node.binding().clone()).collect(),
     )?;
-    if draft.mint_id() != parse_mint_id_hex(&package.mint_id)? {
-        anyhow::bail!("Runtime custody portable listing is invalid");
-    }
     Ok((draft, availability))
 }
 
@@ -8063,6 +8258,12 @@ pub(crate) async fn import_runtime_custody_listing(
         anyhow::bail!("Runtime custody portable listing is invalid");
     }
     let decoded = package.decode_and_validate()?;
+    // T8-M4: what an imported listing must state about itself is checked
+    // before anything is asked of the network: a package lacking a published
+    // package's facts is refused here, not after reading its folders.
+    let package_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    validate_runtime_portable_listing_origin(listing_uri, &package_sha256, &package)?;
+    validate_runtime_published_package_facts(&package)?;
     if manifest.schema != "elastos.content.object.manifest/v1"
         || manifest.kind != "protected-content-listing"
         || manifest.links.len() != 2
@@ -8087,6 +8288,7 @@ pub(crate) async fn import_runtime_custody_listing(
         &package,
         &decoded,
         crate::auth::now_ts(),
+        RuntimeManifestPublisherBinding::Exact,
     )
     .await?;
     let availability = RuntimeCustodyListingAvailabilitySummary {
@@ -8094,7 +8296,6 @@ pub(crate) async fn import_runtime_custody_listing(
         observed_replicas: verified_availability.observed_replicas(),
         receipt_digest: hex::encode(verified_availability.receipt_digest().as_bytes()),
     };
-    let package_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
     let expected = RuntimeCustodyListingRecord {
         schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
         origin: RuntimeCustodyListingOrigin::Imported {
@@ -8128,6 +8329,248 @@ pub(crate) async fn import_runtime_custody_listing(
     }))
 }
 
+/// Decode the `content_identity_base64` a shared document's ElastOS
+/// protection entry carries (`ProtectedContentIdentities`): the kind-prefixed
+/// `RuntimeContentIdentityV1` encoding for an object, or the bare
+/// `CencFmp4MediaIdentityV1` bytes for media.
+///
+/// Dispatched exactly as [`RuntimePortableListingPackage::decode_and_validate`]
+/// dispatches its two fields: the kind-prefixed form is tried first and
+/// accepted only when it is an `Object`; otherwise the bytes must be a bare
+/// media identity. A kind-prefixed `Media` is refused, as it is for a package:
+/// it would give one asset two encodings.
+pub(crate) fn decode_runtime_shared_content_identity(
+    encoded: &str,
+) -> anyhow::Result<RuntimeContentIdentityV1> {
+    let bytes =
+        decode_runtime_portable_base64(encoded, MAX_RUNTIME_PORTABLE_LISTING_BYTES as usize)?;
+    match RuntimeContentIdentityV1::from_canonical_bytes(&bytes) {
+        Ok(RuntimeContentIdentityV1::Object(object)) => {
+            return Ok(RuntimeContentIdentityV1::Object(object))
+        }
+        Ok(RuntimeContentIdentityV1::Media(_)) => {
+            anyhow::bail!("Runtime custody portable listing is invalid")
+        }
+        Err(_) => {}
+    }
+    CencFmp4MediaIdentityV1::from_canonical_bytes(&bytes)
+        .map(RuntimeContentIdentityV1::Media)
+        .map_err(|_| anyhow::anyhow!("Runtime custody portable listing is invalid"))
+}
+
+/// Why an adoption did not produce read-side records. Every one of these
+/// leaves the market purchase exactly as complete as it was.
+pub(crate) const RUNTIME_MARKET_ADOPTION_CONFLICT_MESSAGE: &str =
+    "another listing already records this mint";
+
+/// R39: whether `package` sells exactly what `purchase` paid for -- the same
+/// item (chain, network, ledger, token, operative, KID) from the same seller at
+/// the same price, pay token and processor. Addresses compare without regard
+/// to case; quantity is availability, not a term.
+fn runtime_listing_sells_on_market_terms(
+    package: &RuntimePortableListingPackage,
+    purchase: &crate::protected_content_market::RuntimeMarketPurchaseRecord,
+) -> bool {
+    let item = &purchase.item;
+    let offer = &purchase.offer;
+    let same_address = |left: Option<&str>, right: Option<&str>| match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    };
+    package.chain_namespace == item.chain_namespace
+        && package.network == item.network
+        && package.ledger.eq_ignore_ascii_case(&item.ledger)
+        && package.token_id.eq_ignore_ascii_case(&item.token_id)
+        && package.operative.eq_ignore_ascii_case(&item.operative)
+        && crate::protected_content_market::normalize_runtime_market_kid(&package.content_access_id)
+            .is_some_and(|kid| item.kid.as_deref() == Some(kid.as_str()))
+        && package.seller_address.eq_ignore_ascii_case(&offer.seller)
+        && package.price == offer.price
+        && package.pay_token.eq_ignore_ascii_case(&offer.pay_token)
+        && same_address(
+            package.payment_processor.as_deref(),
+            offer.payment_processor.as_deref(),
+        )
+}
+
+/// Adoption, steps 2-4 (D10): build the listing package a published listing
+/// would have carried from the shared document and the market purchase, run
+/// the content verification the open path runs, and record the listing
+/// (origin `Asset`) and a purchase record (acquisition `market`) that the
+/// unchanged open path then consumes.
+///
+/// `mint_id` is the rebuilt draft's, computed here and never read from any
+/// document. `verify_runtime_portable_metadata` (which reads the ElastOS-only
+/// `manifest.json`) and `verify_runtime_portable_chain` (whose facts the
+/// purchase already proved) are deliberately not run.
+///
+/// Nothing is written unless every check passed. Returns the listing record
+/// the purchase record is bound to: the adopted one, or (R39) the listing of
+/// the same mint this Home already held on the same terms.
+pub(crate) async fn adopt_runtime_market_listing(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+    profile_did: &str,
+    purchase: &crate::protected_content_market::RuntimeMarketPurchaseRecord,
+    dataset: &crate::protected_content_market::SharedReadDataset,
+) -> anyhow::Result<RuntimeCustodyListingRecord> {
+    let RuntimeCustodyPurchaseProgress::Complete { terminal } = &purchase.progress else {
+        anyhow::bail!("Runtime market purchase is not complete");
+    };
+    if purchase.item.kid.as_deref() != Some(dataset.kid.as_str()) {
+        anyhow::bail!("Runtime market purchase does not bind to this document");
+    }
+    // The open path asks the purchase record for the chain's access answer
+    // on this KID; a purchase whose KID was proven after it completed (R46)
+    // must have read it before anything is adopted.
+    if !terminal.access_evidence.as_ref().is_some_and(|evidence| {
+        evidence.has_access && evidence.content_access_id.as_deref() == Some(dataset.kid.as_str())
+    }) {
+        anyhow::bail!("Runtime market purchase has no access evidence for this document");
+    }
+    // A document whose stated type contradicts the identity it carries says
+    // two things about one asset; neither is adopted.
+    if !dataset.mime_type.is_empty() && dataset.mime_type != dataset.content_identity.content_type()
+    {
+        anyhow::bail!("the shared document's mimeType disagrees with its content identity");
+    }
+    let asset_uri = purchase.asset_uri.clone();
+    let folder_cid = runtime_portable_listing_cid(&asset_uri)?.to_string();
+    let (media_identity_base64, content_identity_base64) =
+        runtime_portable_identity_fields(&dataset.content_identity)?;
+    let mut package = RuntimePortableListingPackage {
+        schema: RUNTIME_PORTABLE_LISTING_SCHEMA_V1.to_string(),
+        // Filled in from the rebuilt draft below; a valid placeholder only so
+        // the package can be decoded first.
+        mint_id: "00".repeat(32),
+        content_id: runtime_protected_content_id(dataset.content_identity.encrypted_content())?,
+        content_cid: dataset.content_cid.clone(),
+        metadata_cid: folder_cid.clone(),
+        token_uri: format!("ipfs://{folder_cid}"),
+        publisher_profile_did: dataset.publisher_identity.clone(),
+        display_name: dataset.name.clone(),
+        media_identity_base64,
+        content_identity_base64,
+        content_access_id: dataset.kid.clone(),
+        key_envelope_identity_base64: dataset.key_envelope_identity_base64.clone(),
+        rights_policy_identity_base64: dataset.rights_policy_identity_base64.clone(),
+        content_key_commitment_base64: dataset.content_key_commitment_base64.clone(),
+        seller_address: purchase.offer.seller.to_ascii_lowercase(),
+        chain_namespace: purchase.item.chain_namespace.clone(),
+        network: purchase.item.network.clone(),
+        ledger: purchase.item.ledger.to_ascii_lowercase(),
+        token_id: purchase.item.token_id.to_ascii_lowercase(),
+        operative: purchase.item.operative.to_ascii_lowercase(),
+        quantity: "0x1".to_string(),
+        price: purchase.offer.price.clone(),
+        pay_token: purchase.offer.pay_token.to_ascii_lowercase(),
+        payment_processor: purchase
+            .offer
+            .payment_processor
+            .as_deref()
+            .map(str::to_ascii_lowercase),
+        mint_transaction_hash: None,
+        published_at: None,
+    };
+    let decoded = package.decode_and_validate()?;
+    let (draft, verified_availability) = rebuild_runtime_portable_content(
+        data_dir,
+        registry,
+        &package,
+        &decoded,
+        crate::auth::now_ts(),
+        RuntimeManifestPublisherBinding::AdoptedAttribution,
+    )
+    .await?;
+    package.mint_id = hex::encode(draft.mint_id().as_bytes());
+    let expected = RuntimeCustodyListingRecord {
+        schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
+        origin: RuntimeCustodyListingOrigin::Asset { asset_uri },
+        package,
+        availability: RuntimeCustodyListingAvailabilitySummary {
+            checked_at: verified_availability.checked_at(),
+            observed_replicas: verified_availability.observed_replicas(),
+            receipt_digest: hex::encode(verified_availability.receipt_digest().as_bytes()),
+        },
+    };
+    expected.validate()?;
+    // The listing the purchase record binds to: the adopted one, or (R39) a
+    // listing of this same mint this Home already holds on exactly the terms
+    // the purchase paid.
+    let expected = match load_runtime_custody_listing(data_dir, draft.mint_id())? {
+        Some(existing)
+            if existing.origin == expected.origin && existing.package == expected.package =>
+        {
+            if expected.availability.checked_at > existing.availability.checked_at {
+                persist_runtime_custody_listing(data_dir, &expected)?;
+            }
+            expected
+        }
+        // R39: this Home already holds a listing of this mint -- imported from
+        // its published package, say -- on the very terms this purchase paid.
+        // The purchase opens through it, bound to its own package digest;
+        // nothing is overwritten.
+        Some(existing) if runtime_listing_sells_on_market_terms(&existing.package, purchase) => {
+            existing.validate()?;
+            tracing::debug!(
+                mint_id = %existing.package.mint_id,
+                "runtime custody: market purchase bound to the listing already held for its mint"
+            );
+            existing
+        }
+        // One listing per mint on a Home. A listing this Home already holds
+        // on other terms -- another seller or price -- is never overwritten by
+        // a purchase that does not match it (per-purchase terms on the open
+        // path are a recorded follow-up).
+        Some(_) => anyhow::bail!(RUNTIME_MARKET_ADOPTION_CONFLICT_MESSAGE),
+        None => {
+            persist_runtime_custody_listing(data_dir, &expected)?;
+            expected
+        }
+    };
+    if load_runtime_custody_purchase(data_dir, &purchase.principal_id, draft.mint_id())?.is_none() {
+        let now = crate::auth::now_ts();
+        let record = RuntimeCustodyPurchaseRecord {
+            schema: RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+            principal_id: purchase.principal_id.clone(),
+            profile_did: profile_did.to_string(),
+            mint_id: expected.package.mint_id.clone(),
+            content_id: expected.package.content_id.clone(),
+            cid: expected.package.content_cid.clone(),
+            listing_sha256: expected.portable_package_digest(),
+            seller_address: expected.package.seller_address.clone(),
+            chain_namespace: expected.package.chain_namespace.clone(),
+            network: expected.package.network.clone(),
+            ledger: expected.package.ledger.clone(),
+            token_id: expected.package.token_id.clone(),
+            operative: expected.package.operative.clone(),
+            price: expected.package.price.clone(),
+            pay_token: expected.package.pay_token.clone(),
+            payment_processor: expected.package.payment_processor.clone(),
+            availability_receipt_digest: format!(
+                "sha256:{}",
+                hex::encode(verified_availability.receipt_digest().as_bytes())
+            ),
+            account_id: purchase.account_id.clone(),
+            address: purchase.address.clone(),
+            approval_stage: purchase.approval_stage.clone(),
+            acquisition_stage: purchase.acquisition_stage.clone(),
+            acquisition: RuntimeCustodyAcquisitionV1::Market,
+            capsule_uri: None,
+            progress: purchase.progress.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        persist_runtime_custody_purchase(data_dir, &record)?;
+    }
+    tracing::debug!(
+        mint_id = %expected.package.mint_id,
+        "runtime custody: market purchase adopted from the shared document"
+    );
+    Ok(expected)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCustodyPurchaseStageRecord {
@@ -8159,7 +8602,18 @@ pub(crate) struct RuntimeCustodyPurchaseAccessEvidenceRecord {
     pub(crate) network: String,
     pub(crate) chain_id: u64,
     pub(crate) wallet: String,
-    pub(crate) content_access_id: String,
+    /// The KID the access was asked with (`hasAccessByContentId`). Absent on
+    /// evidence asked by the item instead (R50), which names `ledger` and
+    /// `token_id`. Every record written before R50 has it, and serializes
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_access_id: Option<String>,
+    /// The item the access was asked about (`AuthorityGateway.hasAccess`,
+    /// R50): set, with `token_id`, only on item-keyed evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ledger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token_id: Option<String>,
     pub(crate) has_access: bool,
     pub(crate) finalized_block_number: u64,
     pub(crate) finalized_block_hash: String,
@@ -8173,7 +8627,14 @@ pub(crate) struct RuntimeCustodyTerminalPurchaseRecord {
     pub(crate) chain_transaction: String,
     pub(crate) wallet_binding: ValidatedChainOutcomeBindingV1,
     pub(crate) chain_observation: Value,
-    pub(crate) access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord,
+    /// The chain's corroborated `hasAccess` answer. Every listing-path
+    /// purchase carries it for the item's KID. A market purchase completed
+    /// while its KID was unknown carries it asked by the item instead (R50);
+    /// adoption, once it proves the KID, replaces it with the KID's answer.
+    /// Only KID-keyed evidence opens. Absent only on a market purchase that
+    /// completed on its mined receipt between R46 and R50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) access_evidence: Option<RuntimeCustodyPurchaseAccessEvidenceRecord>,
     pub(crate) confirmed_at: u64,
     /// When this principal came to hold the copy. Written as `acquired_at`;
     /// `bought_at` is how every record predating minted copies spells it, and a
@@ -8218,6 +8679,9 @@ pub(crate) enum RuntimeCustodyAcquisitionV1 {
     Bought,
     /// Minted by this principal: the copy was theirs from the first block.
     Minted,
+    /// Bought on the market from any live offer, and adopted from the asset's
+    /// shared `metadata.json` rather than from a published listing package.
+    Market,
 }
 
 impl RuntimeCustodyAcquisitionV1 {
@@ -8226,6 +8690,7 @@ impl RuntimeCustodyAcquisitionV1 {
         match self {
             Self::Bought => "bought",
             Self::Minted => "minted",
+            Self::Market => "market",
         }
     }
 }
@@ -8287,6 +8752,20 @@ pub(crate) struct RuntimeCustodyPurchaseRecord {
 pub(crate) struct RuntimeCustodyBuyInput {
     pub principal_id: String,
     pub mint_id: String,
+}
+
+/// Which owned copy a download names.
+pub(crate) enum RuntimeCustodyOwnedCopy {
+    /// A copy this Home holds a listing for.
+    Mint(String),
+    /// A copy bought on the market, named the way the chain names it: until
+    /// it is adopted there is no mint for it here to name.
+    MarketItem(crate::protected_content_market::RuntimeMarketBuyItemClaim),
+}
+
+pub(crate) struct RuntimeCustodyDownloadInput {
+    pub principal_id: String,
+    pub copy: RuntimeCustodyOwnedCopy,
 }
 
 pub(crate) struct RuntimeCustodyViewerOpenInput {
@@ -8717,6 +9196,14 @@ pub(crate) fn list_runtime_custody_listings(
         let record: RuntimeCustodyListingRecord = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("Runtime custody listing is invalid"))?;
         record.validate()?;
+        // A listing adopted after a market purchase was never published as a
+        // listing: it has no publication time and no package link to share,
+        // which every row of this shelf states. The item reaches its owner as
+        // the `.ddrm` adoption filed and through the market catalog, which
+        // reads `runtime_custody_listing_chain_index` and so still sees it.
+        if matches!(record.origin, RuntimeCustodyListingOrigin::Asset { .. }) {
+            continue;
+        }
         listings.push(runtime_custody_listing_summary(
             data_dir,
             principal_id,
@@ -8762,6 +9249,7 @@ pub(crate) fn runtime_custody_listing_chain_index(
         }
         let access_state = runtime_custody_listing_access_state(data_dir, principal_id, &record)?;
         index.push(RuntimeCustodyListingChainIdentity {
+            chain_namespace: record.package.chain_namespace.clone(),
             ledger: record.package.ledger.to_ascii_lowercase(),
             token_id: record.package.token_id.to_ascii_lowercase(),
             mint_id: record.package.mint_id.clone(),
@@ -8774,6 +9262,7 @@ pub(crate) fn runtime_custody_listing_chain_index(
 /// One asset this Home holds, named the way the chain names it.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeCustodyListingChainIdentity {
+    pub(crate) chain_namespace: String,
     pub(crate) ledger: String,
     pub(crate) token_id: String,
     pub(crate) mint_id: String,
@@ -8992,7 +9481,7 @@ fn validate_runtime_custody_public_text(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_runtime_custody_canonical_quantity(value: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_runtime_custody_canonical_quantity(value: &str) -> anyhow::Result<()> {
     let raw = value
         .strip_prefix("0x")
         .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
@@ -9010,7 +9499,7 @@ fn validate_runtime_custody_canonical_quantity(value: &str) -> anyhow::Result<()
     Ok(())
 }
 
-fn validate_runtime_custody_evm_address(value: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_runtime_custody_evm_address(value: &str) -> anyhow::Result<()> {
     let raw = value
         .strip_prefix("0x")
         .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is invalid"))?;
@@ -9043,6 +9532,7 @@ pub(crate) async fn verify_fresh_runtime_custody_availability(
         &listing.package,
         &decoded,
         now_unix_seconds,
+        RuntimeManifestPublisherBinding::for_origin(&listing.origin),
     )
     .await
     .map_err(|error| {
@@ -10239,8 +10729,8 @@ pub(crate) fn runtime_custody_creator_listing_package(
         price: terminal.price().to_string(),
         pay_token: terminal.pay_token().to_ascii_lowercase(),
         payment_processor: terminal.payment_processor().map(str::to_ascii_lowercase),
-        mint_transaction_hash: terminal.transaction_hash().to_ascii_lowercase(),
-        published_at: terminal.published_at(),
+        mint_transaction_hash: Some(terminal.transaction_hash().to_ascii_lowercase()),
+        published_at: Some(terminal.published_at()),
     })
 }
 
@@ -10280,7 +10770,7 @@ pub(crate) fn runtime_custody_capsule_document(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    serde_json::json!({
+    let mut capsule = serde_json::json!({
         "schema": RUNTIME_CUSTODY_CAPSULE_SCHEMA_V1,
         "authority": authority,
         "kid": package.content_access_id,
@@ -10293,11 +10783,16 @@ pub(crate) fn runtime_custody_capsule_document(
         "mintId": package.mint_id,
         "contentId": package.content_id,
         "contentCid": package.content_cid,
-        "mintTransactionHash": package.mint_transaction_hash,
         "acquisition": acquisition,
         "metadataUri": format!("ipfs://{}", package.metadata_cid),
         "metadata": metadata,
-    })
+    });
+    // An adopted copy knows no mint transaction (D11); it says nothing rather
+    // than stating one as `null`.
+    if let Some(mint_transaction_hash) = &package.mint_transaction_hash {
+        capsule["mintTransactionHash"] = Value::String(mint_transaction_hash.clone());
+    }
+    capsule
 }
 
 /// What the capsule protects, taken from the metadata document that describes
@@ -10362,32 +10857,55 @@ pub(crate) fn persist_runtime_custody_creator_listing(
 /// Opens a purchase-ledger record file for read, refusing symlinks,
 /// non-regular files, and hard-linked files — the same discipline
 /// `open_runtime_media_source_file` applies to media source input.
+///
+/// A refused file is "invalid"; a file that could not be opened or examined
+/// keeps its `io::Error` in the chain (R43), so a caller can tell a record
+/// that is not one from a record it could not read.
 #[cfg(unix)]
-fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
+pub(crate) fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let opened = options.open(path).ok().and_then(|file| {
-        let metadata = file.metadata().ok()?;
-        (metadata.is_file() && metadata.nlink() == 1).then_some(file)
-    });
-    let Some(file) = opened else {
-        tracing::warn!(path = %path.display(), "purchase ledger record rejected");
-        anyhow::bail!("Runtime custody purchase is invalid");
+    let file = match options.open(path) {
+        Ok(file) => file,
+        // O_NOFOLLOW answers a symlink with ELOOP: a refusal, not a failure.
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(runtime_record_file_rejected(path))
+        }
+        Err(error) => return Err(runtime_record_file_unreadable(path, error)),
     };
+    let metadata = file
+        .metadata()
+        .map_err(|error| runtime_record_file_unreadable(path, error))?;
+    if !(metadata.is_file() && metadata.nlink() == 1) {
+        return Err(runtime_record_file_rejected(path));
+    }
     Ok(file)
 }
 
 #[cfg(not(unix))]
-fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
-    let opened = fs::File::open(path).ok().and_then(|file| {
-        let metadata = file.metadata().ok()?;
-        metadata.is_file().then_some(file)
-    });
-    let Some(file) = opened else {
-        tracing::warn!(path = %path.display(), "purchase ledger record rejected");
-        anyhow::bail!("Runtime custody purchase is invalid");
-    };
+pub(crate) fn open_owner_only_runtime_record_file(path: &Path) -> anyhow::Result<fs::File> {
+    let file = fs::File::open(path).map_err(|error| runtime_record_file_unreadable(path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| runtime_record_file_unreadable(path, error))?;
+    if !metadata.is_file() {
+        return Err(runtime_record_file_rejected(path));
+    }
     Ok(file)
+}
+
+fn runtime_record_file_rejected(path: &Path) -> anyhow::Error {
+    tracing::warn!(path = %path.display(), "purchase ledger record rejected");
+    anyhow::anyhow!("Runtime custody purchase is invalid")
+}
+
+fn runtime_record_file_unreadable(path: &Path, error: std::io::Error) -> anyhow::Error {
+    tracing::warn!(
+        path = %path.display(),
+        %error,
+        "purchase ledger record could not be read"
+    );
+    anyhow::Error::new(error).context("Runtime custody purchase is invalid")
 }
 
 pub(crate) fn load_runtime_custody_purchase(
@@ -10407,6 +10925,68 @@ pub(crate) fn load_runtime_custody_purchase(
         anyhow::bail!("Runtime custody purchase is invalid");
     }
     Ok(Some(record))
+}
+
+/// This principal's listing-package purchase (`buy`) of the item the chain
+/// keys `(chain_namespace, ledger, token_id)` (D2), whatever its progress --
+/// the record a market purchase of the same item must not race (R29).
+///
+/// Purchases are filed by mint, so this reads each of the principal's
+/// records. One that does not parse or validate is skipped and logged: it is
+/// not a purchase this Home can stand behind, and one broken file must not
+/// stop every other purchase. One that cannot be READ is an error (R43): it
+/// may be a purchase under way, and the caller refuses rather than start a
+/// second one beside it.
+pub(crate) fn load_runtime_custody_purchase_for_chain_item(
+    data_dir: &Path,
+    principal_id: &str,
+    chain_namespace: &str,
+    ledger: &str,
+    token_id: &str,
+) -> anyhow::Result<Option<RuntimeCustodyPurchaseRecord>> {
+    let directory = runtime_purchase_lock_path(data_dir, principal_id)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody purchase is invalid"))?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(mint_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| parse_mint_id_hex(stem).ok())
+        else {
+            continue;
+        };
+        match load_runtime_custody_purchase(data_dir, principal_id, mint_id) {
+            Ok(Some(record))
+                if record.chain_namespace == chain_namespace
+                    && record.ledger.eq_ignore_ascii_case(ledger)
+                    && record.token_id.eq_ignore_ascii_case(token_id) =>
+            {
+                return Ok(Some(record));
+            }
+            Ok(_) => {}
+            Err(error) => match error.downcast_ref::<std::io::Error>() {
+                // Gone since the directory was listed: no purchase to find.
+                Some(io) if io.kind() == std::io::ErrorKind::NotFound => {}
+                Some(_) => return Err(error),
+                None => tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "purchase ledger record invalid; skipped"
+                ),
+            },
+        }
+    }
+    Ok(None)
 }
 
 fn validate_runtime_custody_viewer_asset(
@@ -10456,14 +11036,16 @@ fn validate_runtime_custody_viewer_asset(
     let RuntimeCustodyPurchaseProgress::Complete { terminal } = &purchase.progress else {
         anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
     };
-    if !terminal.access_evidence.has_access
-        || terminal.access_evidence.network != package.network
-        || terminal.access_evidence.chain_id != chain_id
-        || !terminal
-            .access_evidence
+    let Some(access_evidence) = terminal.access_evidence.as_ref() else {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    };
+    if !access_evidence.has_access
+        || access_evidence.network != package.network
+        || access_evidence.chain_id != chain_id
+        || !access_evidence
             .wallet
             .eq_ignore_ascii_case(&purchase.address)
-        || terminal.access_evidence.content_access_id != package.content_access_id
+        || access_evidence.content_access_id.as_deref() != Some(package.content_access_id.as_str())
     {
         anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
     }
@@ -10562,6 +11144,51 @@ pub(crate) fn persist_runtime_custody_purchase(
         ),
         &serde_json::to_vec(purchase)?,
     )
+}
+
+/// Remove `attempt`'s listing-package purchase record, under the purchase
+/// ledger lock, and only while the record on disk is still that attempt: a
+/// `Pending` purchase of the same mint with the same buy effect, created at
+/// the same moment. `Ok(false)` when the record is gone, complete, or another
+/// attempt -- which is then left exactly as it is.
+///
+/// Only for an attempt that is provably over without payment (R41). The
+/// caller holds the market-purchase lock around this, so the removal and
+/// R29's cross-path check never interleave.
+pub(crate) fn retire_runtime_custody_purchase_attempt(
+    data_dir: &Path,
+    attempt: &RuntimeCustodyPurchaseRecord,
+) -> anyhow::Result<bool> {
+    let mint_id = parse_mint_id_hex(&attempt.mint_id)?;
+    let lock_path = runtime_purchase_lock_path(data_dir, &attempt.principal_id);
+    #[cfg(unix)]
+    if let Some(parent) = lock_path.parent() {
+        ensure_owner_only_runtime_storage_parent(parent)?;
+    }
+    #[cfg(not(unix))]
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = ExclusiveFileLock::acquire(&lock_path)?;
+    #[cfg(test)]
+    let _lock_test_probe = RuntimePurchaseLockTestProbe::enter(lock_path.clone());
+    // The load refuses a symlink or a hard-linked file exactly as any read
+    // does, so a retirement can never be pointed at anything but this record.
+    match load_runtime_custody_purchase(data_dir, &attempt.principal_id, mint_id)? {
+        Some(current)
+            if matches!(
+                current.progress,
+                RuntimeCustodyPurchaseProgress::Pending { .. }
+            ) && current.acquisition_stage.effect_id == attempt.acquisition_stage.effect_id
+                && current.created_at == attempt.created_at => {}
+        _ => return Ok(false),
+    }
+    let path = runtime_purchase_path(data_dir, &attempt.principal_id, mint_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn load_runtime_custody_viewer_record(
@@ -11779,7 +12406,7 @@ fn runtime_storage_write_error(reason: String) -> anyhow::Error {
 }
 
 #[cfg(unix)]
-fn ensure_owner_only_runtime_storage_parent(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn ensure_owner_only_runtime_storage_parent(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     let mut missing = Vec::new();
@@ -11882,7 +12509,7 @@ fn runtime_storage_temp_path(path: &Path) -> anyhow::Result<PathBuf> {
     );
 }
 
-fn write_owner_only_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_owner_only_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
         ensure_owner_only_runtime_storage_parent(parent)?;

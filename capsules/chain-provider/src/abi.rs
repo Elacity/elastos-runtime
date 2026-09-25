@@ -17,6 +17,16 @@ pub(super) const CHANNEL_HAS_ROLE_SELECTOR: &str = "0x91d14854";
 pub(super) const CHANNEL_DEFAULT_ADMIN_ROLE_WORD: [u8; 32] = [0u8; 32];
 pub(super) const ACCESS_TOKEN_ID_HEX: &str = "0x1";
 pub(super) const PROTECTED_CONTENT_PURCHASE_QUANTITY_HEX: &str = "0x1";
+pub(super) const AUTHORITY_GATEWAY_CSTORE_SELECTOR: &str = "0xd36f509d";
+pub(super) const IP_TRACKER_IP_REFERENCE_SELECTOR: &str = "0x93d9f5ab";
+pub(super) const OPERATIVE_TOKEN_URI_SELECTOR: &str = "0xc87b56dd";
+pub(super) const AUTHORITY_GATEWAY_SELLERS_OF_SELECTOR: &str = "0x997eab2d";
+/// `AuthorityGateway.hasAccess(address accessor, address ledger, uint256
+/// tokenId)`: the item-keyed twin of `hasAccessByContentId`, answered by the
+/// same `_checkUserAccess` (R50). It needs no KID, so it answers for an item
+/// whose KID is unknown.
+pub(super) const AUTHORITY_GATEWAY_HAS_ACCESS_SELECTOR: &str = "0xcf56b4eb";
+pub(super) const EVM_ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProtectedContentAssetCreatedLog {
@@ -182,6 +192,22 @@ pub(super) fn encode_authority_gateway_operative_call(
     Ok(format!("0x{}", encode_hex(&bytes)))
 }
 
+pub(super) fn encode_authority_gateway_has_access_call(
+    accessor: &str,
+    ledger: &str,
+    token_id: &str,
+) -> Result<String, String> {
+    let mut bytes = decode_hex(
+        AUTHORITY_GATEWAY_HAS_ACCESS_SELECTOR,
+        Some(4),
+        "hasAccess selector",
+    )?;
+    bytes.extend_from_slice(&abi_word_address(accessor)?);
+    bytes.extend_from_slice(&abi_word_address(ledger)?);
+    bytes.extend_from_slice(&abi_word_hex_quantity(token_id, "token_id")?);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
 pub(super) fn encode_authority_gateway_listing_call(
     operative: &str,
     seller: &str,
@@ -198,6 +224,112 @@ pub(super) fn encode_authority_gateway_listing_call(
     )?);
     bytes.extend_from_slice(&abi_word_address(seller)?);
     Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+pub(super) fn encode_authority_gateway_cstore_call() -> Result<String, String> {
+    let bytes = decode_hex(
+        AUTHORITY_GATEWAY_CSTORE_SELECTOR,
+        Some(4),
+        "cstore selector",
+    )?;
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// `ipReference(bytes16)`: a bytes16 is LEFT-aligned in its word, which the
+/// existing `abi_word_bytes16` already does.
+pub(super) fn encode_ip_reference_call(content_access_id: &str) -> Result<String, String> {
+    let mut bytes = decode_hex(
+        IP_TRACKER_IP_REFERENCE_SELECTOR,
+        Some(4),
+        "ipReference selector",
+    )?;
+    let kid: [u8; 16] = decode_hex(content_access_id, Some(16), "content_access_id")?
+        .try_into()
+        .map_err(|_| "content_access_id must be 16 bytes".to_string())?;
+    bytes.extend_from_slice(&abi_word_bytes16(&kid));
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+pub(super) fn encode_operative_token_uri_call() -> Result<String, String> {
+    let mut bytes = decode_hex(OPERATIVE_TOKEN_URI_SELECTOR, Some(4), "tokenURI selector")?;
+    bytes.extend_from_slice(&abi_word_hex_quantity(
+        ACCESS_TOKEN_ID_HEX,
+        "access_token_id",
+    )?);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+pub(super) fn encode_authority_gateway_sellers_of_call(operative: &str) -> Result<String, String> {
+    let mut bytes = decode_hex(
+        AUTHORITY_GATEWAY_SELLERS_OF_SELECTOR,
+        Some(4),
+        "sellersOf selector",
+    )?;
+    bytes.extend_from_slice(&abi_word_address(operative)?);
+    bytes.extend_from_slice(&abi_word_hex_quantity(
+        ACCESS_TOKEN_ID_HEX,
+        "access_token_id",
+    )?);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// `(address channel, uint256 tokenId)`. `word_to_address` refuses a word
+/// with non-zero high bytes, exactly as `decode_evm_address_word` does.
+pub(super) fn decode_ip_reference(value: &Value) -> Result<(String, String), String> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| "ipReference result must be hex string".to_string())?;
+    let bytes = decode_hex(value, Some(64), "ipReference result")?;
+    Ok((
+        word_to_address(&bytes[0..32])?,
+        normalize_hex_quantity_bytes(&bytes[32..64]),
+    ))
+}
+
+/// A single ABI `string` return value: word 0 is the offset of the length
+/// word, which `decode_abi_string` then reads.
+pub(super) fn decode_evm_string(value: &Value, label: &str) -> Result<String, String> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("{label} result must be hex string"))?;
+    let bytes = decode_hex(value, None, label)?;
+    if bytes.len() < 64 {
+        return Err(format!("{label} result is too short for an ABI string"));
+    }
+    let offset = usize_from_word(&bytes[0..32], label)?;
+    decode_abi_string(&bytes, offset, label)
+}
+
+/// A single ABI `address[]` return value. The length is bounded before
+/// anything is allocated, so a hostile RPC cannot make this reserve memory.
+pub(super) fn decode_evm_address_array(value: &Value, label: &str) -> Result<Vec<String>, String> {
+    const MAX: usize = 1024;
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("{label} result must be hex string"))?;
+    let bytes = decode_hex(value, None, label)?;
+    if bytes.len() < 64 {
+        return Err(format!("{label} result is too short for an ABI array"));
+    }
+    let offset = usize_from_word(&bytes[0..32], label)?;
+    let len_end = offset
+        .checked_add(32)
+        .ok_or_else(|| format!("{label} offset overflows"))?;
+    if len_end > bytes.len() {
+        return Err(format!("{label} length word is out of bounds"));
+    }
+    let length = usize_from_word(&bytes[offset..len_end], label)?;
+    if length > MAX {
+        return Err(format!("{label} has more than {MAX} entries"));
+    }
+    let end = len_end + length * 32;
+    if end > bytes.len() {
+        return Err(format!("{label} entries are truncated"));
+    }
+    bytes[len_end..end]
+        .chunks_exact(32)
+        .map(word_to_address)
+        .collect()
 }
 
 pub(super) fn encode_operatives_payment_processor_call() -> Result<String, String> {

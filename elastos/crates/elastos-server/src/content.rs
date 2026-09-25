@@ -2635,6 +2635,32 @@ pub async fn fetch_bytes_via_provider(
     cid: &str,
     path: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
+    fetch_bytes_via_provider_in_range(registry, cid, path, None).await
+}
+
+/// Fetch at most `max_bytes + 1` bytes of a file: the range travels with the
+/// request, so the content plane answers no more than that, and a caller that
+/// gets more than `max_bytes` back knows the file is larger than it accepts
+/// without ever holding the rest of it (R30).
+pub async fn fetch_bytes_via_provider_capped(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let range = ProviderByteRange {
+        start: 0,
+        end: Some(u64::try_from(max_bytes).unwrap_or(u64::MAX)),
+    };
+    fetch_bytes_via_provider_in_range(registry, cid, path, Some(range)).await
+}
+
+async fn fetch_bytes_via_provider_in_range(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+    range: Option<ProviderByteRange>,
+) -> anyhow::Result<Vec<u8>> {
     let mut request = json!({
         "op": "fetch",
         "cid": cid,
@@ -2647,6 +2673,9 @@ pub async fn fetch_bytes_via_provider(
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         request["path"] = Value::String(path.to_string());
     }
+    if let Some(range) = range {
+        request["range"] = json!({ "start": range.start, "end": range.end });
+    }
 
     let mut session = registry
         .open_provider_stream(
@@ -2656,7 +2685,7 @@ pub async fn fetch_bytes_via_provider(
                 op: "fetch".to_string(),
                 request,
                 transfer: ProviderTransfer::Stream,
-                range: None,
+                range,
                 progress: Some(ProviderProgress {
                     request_id: format!("content-fetch:{cid}:{}", path.unwrap_or("root")),
                     expected_bytes: None,

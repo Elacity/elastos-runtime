@@ -812,6 +812,7 @@ include!("support_runtime.rs");
 
 mod browser_profile;
 mod browser_reconciliation;
+mod buy_offer;
 mod collaboration_presence;
 mod creator_channels;
 mod documents;
@@ -823,6 +824,7 @@ mod home_agent;
 mod home_system;
 mod inspect;
 mod library;
+mod listing_object;
 mod market_directory;
 mod marketplace;
 mod model;

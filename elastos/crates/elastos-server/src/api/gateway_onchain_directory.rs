@@ -134,29 +134,99 @@ impl OnchainDirectory {
             .unwrap_or_else(|| ONCHAIN_GRAPHQL_DEFAULT_URL.to_string())
     }
 
-    /// Asks one question, once. The caller has already established that it may
-    /// be asked; this performs no consent check of its own precisely so that
-    /// the check cannot be forgotten by being somewhere else.
+    /// Asks one question. The caller has already established that it may be
+    /// asked; this performs no consent check of its own precisely so that the
+    /// check cannot be forgotten by being somewhere else.
     pub(in crate::api::gateway) async fn post_graphql(
         &self,
         query: &str,
         variables: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
+        self.post_graphql_at(
+            &self.endpoint(),
+            query,
+            variables,
+            OnchainDirectoryTimeouts::DEFAULT,
+        )
+        .await
+    }
+
+    /// `post_graphql` against `endpoint`, each request bounded by `timeouts`.
+    pub(in crate::api::gateway) async fn post_graphql_at(
+        &self,
+        endpoint: &str,
+        query: &str,
+        variables: serde_json::Value,
+        timeouts: OnchainDirectoryTimeouts,
+    ) -> anyhow::Result<serde_json::Value> {
+        let body = serde_json::json!({ "query": query, "variables": variables });
+        let mut attempt = 1;
+        loop {
+            match self.post_graphql_once(endpoint, &body, timeouts).await {
+                Ok(payload) => return Ok(payload),
+                // A request that never connected or ran out of time is asked
+                // once more, on a fresh client: the first catalog read after
+                // a page load died this way on an installed Home (R49). An
+                // HTTP answer, error status included, is an answer.
+                Err(OnchainDirectoryFailure::Transport(error))
+                    if attempt < ONCHAIN_DIRECTORY_ATTEMPTS =>
+                {
+                    let error = anyhow::Error::from(error);
+                    tracing::warn!(
+                        subject = self.subject,
+                        attempt,
+                        error = %format!("{error:#}"),
+                        "directory request failed in transport; asking once more"
+                    );
+                    attempt += 1;
+                }
+                Err(failure) => {
+                    let error = failure.into_error();
+                    tracing::warn!(
+                        subject = self.subject,
+                        attempt,
+                        error = %format!("{error:#}"),
+                        "directory request failed"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// One request, on a client of its own.
+    async fn post_graphql_once(
+        &self,
+        endpoint: &str,
+        body: &serde_json::Value,
+        timeouts: OnchainDirectoryTimeouts,
+    ) -> Result<serde_json::Value, OnchainDirectoryFailure> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(ONCHAIN_DIRECTORY_TIMEOUT_SECS))
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.total)
             .user_agent(self.user_agent)
-            .build()?;
+            .build()
+            .map_err(|error| OnchainDirectoryFailure::Other(error.into()))?;
         let response = client
-            .post(self.endpoint())
-            .json(&serde_json::json!({ "query": query, "variables": variables }))
+            .post(endpoint)
+            .json(body)
             .send()
-            .await?;
+            .await
+            .map_err(OnchainDirectoryFailure::from_request)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("{} returned {}: {}", self.subject, status, body.trim());
+            return Err(OnchainDirectoryFailure::Other(anyhow::anyhow!(
+                "{} returned {}: {}",
+                self.subject,
+                status,
+                body.trim()
+            )));
         }
-        Ok(response.json::<serde_json::Value>().await?)
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(OnchainDirectoryFailure::from_request)
     }
 
     /// The `data.<field>.data` list from a GraphQL answer.
@@ -407,7 +477,54 @@ pub(in crate::api::gateway) struct OnchainDirectoryPolicy {
 /// on-chain state. Names the shape rather than whoever serves it, so an
 /// approval recorded today still means the same thing if the host changes.
 pub(in crate::api::gateway) const ONCHAIN_DIRECTORY_SOURCE_GRAPHQL: &str = "onchain_graphql";
-const ONCHAIN_DIRECTORY_TIMEOUT_SECS: u64 = 6;
+/// How long one directory request may take: to connect, and in all. The
+/// connect bound is separate so a connection that never opens is told apart
+/// from an index that is slow to answer (R49).
+#[derive(Debug, Clone, Copy)]
+pub(in crate::api::gateway) struct OnchainDirectoryTimeouts {
+    pub connect: Duration,
+    pub total: Duration,
+}
+
+impl OnchainDirectoryTimeouts {
+    /// `total` leaves room for the index's cold cache: measured on the
+    /// installed Home, the first catalog query after the index's cache
+    /// expires took 12.7 s to its first byte (warm: about 2 s). At 6 s every
+    /// first read after a quiet spell failed and only a refresh -- by then
+    /// warm -- answered.
+    pub(in crate::api::gateway) const DEFAULT: Self = Self {
+        connect: Duration::from_secs(4),
+        total: Duration::from_secs(20),
+    };
+}
+
+/// How many requests one directory question may take: the first, and one
+/// more after a transport failure.
+const ONCHAIN_DIRECTORY_ATTEMPTS: u32 = 2;
+
+/// Why one directory request failed: in transport -- it never connected, or
+/// ran out of time -- or anything else, an HTTP error status included.
+enum OnchainDirectoryFailure {
+    Transport(reqwest::Error),
+    Other(anyhow::Error),
+}
+
+impl OnchainDirectoryFailure {
+    fn from_request(error: reqwest::Error) -> Self {
+        if error.is_connect() || error.is_timeout() {
+            Self::Transport(error)
+        } else {
+            Self::Other(error.into())
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Transport(error) => error.into(),
+            Self::Other(error) => error,
+        }
+    }
+}
 /// How many complaint paths one log line carries. Enough to see which field
 /// and which rows; not so many that an index having a bad day fills the log.
 const ONCHAIN_DIRECTORY_LOGGED_ERRORS: usize = 5;

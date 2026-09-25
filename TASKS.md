@@ -131,6 +131,74 @@ records what is verified and what is not.
 
 Open:
 
+- [ ] Buy from any live offer, found by link or in Explore. Buying and
+  reading become two workflows: a purchase reads the item and every seller's
+  terms from the chain and answers `terms_changed` instead of charging at
+  terms the buyer did not see; opening keeps the existing read path, fed from
+  the shared Elacity `metadata.json` rather than an ElastOS-only document.
+  A listing is rebuildable from a `tokenURI`, a content id or
+  `(ledger, tokenId)`. Amends `PROTECTED_CONTENT.md` steps 7–8, done.
+  Design: [market buy](docs/audits/2026-09-24-protected-content-market-buy-design.md).
+  Branch `feat/protected-content-listing-buy`, stacked on PR #62. Source is
+  implemented and verified on the branch; open is installed proof only, and
+  needs funded principals: buy by shared link, buy after a seller changes
+  terms mid-flow, buy an item found only through the index (no prior link),
+  resale where two offers exist for the same item, a purchase of a
+  foreign (non-ElastOS-scheme) item, and a pending adoption finished with
+  Download copy. Installed 25 September on Base mainnet: an index-found
+  (Explore) ERC-20 buy of a foreign, Lit-custody item minted on
+  base.ela.city completed (`0x4d8ba231…71bc12`, access proven, adoption
+  `foreign`) — see the
+  [implementation report](docs/audits/2026-09-25-protected-content-market-buy-implementation-report.md).
+  Still open: shared-link buy, terms change mid-flow, two-offer resale, and
+  an ElastOS v1 item proving adoption, Download copy and playback.
+  - [ ] Follow-ups recorded from the final fix wave (R37), not required for
+    this slice:
+    - [ ] Share one stage driver between `buy` and `buy_offer` on the money
+      path, after the proof journeys land.
+    - [ ] Unify the duplicated text-bound helper.
+    - [ ] Replace text-matched chain errors with typed chain-provider error
+      codes.
+    - [ ] Add a chain-provider corroborate helper — also removing the three
+      `_at` variant duplicates — with source logging.
+    - [ ] Hint a buyer to wait for finality after a revert within the
+      finality lag, instead of a plain failure.
+    - [ ] Read the buy receipt at the finalized block instead of latest.
+    - [ ] Decode ERC-20 approval/buy calldata server-side instead of
+      trusting the chain-provider's steps.
+    - [ ] Adopt a market purchase when this Home already holds a listing of
+      the same mint on different terms. Adoption reuses an existing listing
+      only when its terms equal the purchase's (R39); with different terms
+      it stays `pending`. Supporting it needs per-purchase terms on the open
+      path.
+    - [ ] Cap the shared-document read inside `ipfs-provider`. The server
+      asks for a 256 KiB range and trims the answer (R30), but the provider's
+      `cat` still reads the whole file first; a true cap needs a range or
+      `max_bytes` on `cat`.
+    - [ ] Give content providers a typed not-found error. The listing tells
+      a missing `metadata.json` from an unreadable one by matching the
+      provider's error text, and probes `listing.json` only on not-found.
+    - [ ] Let the Marketplace capsule list adopted (`Asset`-origin) rows in
+      My listings, which today requires `published_at` — accept a null
+      `published_at` / origin `asset` row.
+    - [ ] Recommend a keyed RPC endpoint for production market and rights
+      reads. Public Base endpoints answer HTTP 429 under one Buy press; the
+      bounded retry and source cooldown (R47) spread the load, and a keyed
+      endpoint removes the limit itself.
+    - [ ] Reduce the chain reads per Buy by reusing the item read (operative
+      and `tokenURI`) across the listing, `buy_offer` and the purchase
+      builder's verified-listing read, instead of reading it again at each
+      step.
+    - [ ] Show the purchase transaction on a bought item's Details view.
+      The page does not receive it today; it needs a wire field.
+    - [ ] Ask the chain (item-keyed `hasAccess`) for a KID-less listing's
+      `access_state`; the Buy already does (R50), the listing badge does
+      not.
+    - [ ] Log a market-index failure once (the transport layer and the
+      catalog handler each log it today).
+    - [ ] Give `buy_offer`'s unavailable refusal a typed code. Marketplace
+      recognizes it today by the `library_error` code together with the
+      stable `Runtime custody purchase is unavailable` sentence (R48).
 - [ ] Let a mint recover from a declined wallet approval. A rejected or expired
   approval is reported accurately now instead of reading as "pending" forever,
   but it leaves the mint at `EffectRaised`, and `discard_creator_state` refuses

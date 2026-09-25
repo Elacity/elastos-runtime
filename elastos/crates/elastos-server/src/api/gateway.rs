@@ -72,8 +72,12 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_marketplace_buy.rs"]
+mod gateway_marketplace_buy;
 #[path = "gateway_marketplace_directory.rs"]
 mod gateway_marketplace_directory;
+#[path = "gateway_marketplace_listing.rs"]
+mod gateway_marketplace_listing;
 #[path = "gateway_onchain_directory.rs"]
 mod gateway_onchain_directory;
 #[path = "gateway_origin.rs"]
@@ -150,7 +154,12 @@ use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+use gateway_marketplace_buy::*;
+pub(crate) use gateway_marketplace_buy::{
+    runtime_custody_buy_offer_via_gateway, RuntimeMarketBuyRefusal,
+};
 use gateway_marketplace_directory::*;
+use gateway_marketplace_listing::*;
 use gateway_origin::*;
 use gateway_passkey_step_up::*;
 pub(super) use gateway_passkey_step_up::{
@@ -1071,6 +1080,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/marketplace/items",
             get(marketplace_catalog_items),
         )
+        .route("/api/apps/marketplace/listing", post(marketplace_listing))
         .route(
             "/api/apps/marketplace/pay-tokens",
             get(marketplace_pay_tokens),

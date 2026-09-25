@@ -1232,8 +1232,8 @@ fn runtime_custody_listing_record_for_test(
         price: "0x5".to_string(),
         pay_token: "0x0000000000000000000000000000000000000044".to_string(),
         payment_processor: Some("0x0000000000000000000000000000000000000055".to_string()),
-        mint_transaction_hash: format!("0x{}", hex::encode([0x68; 32])),
-        published_at,
+        mint_transaction_hash: Some(format!("0x{}", hex::encode([0x68; 32]))),
+        published_at: Some(published_at),
     };
     super::RuntimeCustodyListingRecord {
         schema: super::RUNTIME_LISTING_SCHEMA_V1.to_string(),
@@ -1271,6 +1271,9 @@ pub(crate) fn make_runtime_custody_listing_imported_without_creator_mint(
             listing_uri,
             package_sha256,
         } => (listing_uri.clone(), package_sha256.clone()),
+        super::RuntimeCustodyListingOrigin::Asset { .. } => {
+            panic!("an adopted listing has no published package to import")
+        }
     };
     listing.origin = super::RuntimeCustodyListingOrigin::Imported {
         listing_uri,
@@ -2544,19 +2547,21 @@ fn persist_runtime_custody_purchase_for_mint(
                 chain_transaction,
                 wallet_binding,
                 chain_observation,
-                access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord {
+                access_evidence: Some(RuntimeCustodyPurchaseAccessEvidenceRecord {
                     schema: "elastos.chain.protected-content-purchase-access/v1".to_string(),
                     request_id: "purchase-access:test".to_string(),
                     network: listing.package.network.clone(),
                     chain_id: 8453,
                     wallet: wallet_address_hex(wallet(7)),
-                    content_access_id: listing.package.content_access_id.clone(),
+                    content_access_id: Some(listing.package.content_access_id.clone()),
+                    ledger: None,
+                    token_id: None,
                     has_access: true,
                     finalized_block_number: 44,
                     finalized_block_hash: format!("0x{}", hex::encode([0xad; 32])),
                     finalized_block_timestamp: now,
                     observed_at: now,
-                },
+                }),
                 confirmed_at: now,
                 acquired_at: now,
             },
@@ -5582,19 +5587,21 @@ fn sample_purchase_record() -> (String, Digest32, RuntimeCustodyPurchaseRecord) 
                     "schema": "elastos.chain.broadcast_receipt/v1",
                     "network": "esc-mainnet",
                 }),
-                access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord {
+                access_evidence: Some(RuntimeCustodyPurchaseAccessEvidenceRecord {
                     schema: "elastos.chain.protected-content-purchase-access/v1".to_string(),
                     request_id: "purchase-access:fixture".to_string(),
                     network: "esc-mainnet".to_string(),
                     chain_id: 8453,
                     wallet: wallet_address_hex(wallet(7)),
-                    content_access_id: "content-access:fixture".to_string(),
+                    content_access_id: Some("content-access:fixture".to_string()),
+                    ledger: None,
+                    token_id: None,
                     has_access: true,
                     finalized_block_number: 44,
                     finalized_block_hash: format!("0x{}", hex::encode([0xad; 32])),
                     finalized_block_timestamp: 1,
                     observed_at: 1,
-                },
+                }),
                 confirmed_at: 1,
                 acquired_at: 1,
             },
@@ -14819,5 +14826,476 @@ fn a_listing_announces_the_kind_the_open_path_enforces() {
     assert_eq!(
         super::expected_runtime_custody_viewer_capsule(&object),
         super::ELACITY_READER_CAPSULE_ID
+    );
+}
+
+/// D11: making `mint_transaction_hash` and `published_at` optional moves no
+/// byte of any package that carries them. `package_sha256` and the listing CID
+/// are computed over exactly these bytes, so the digests below were taken from
+/// the fixtures BEFORE the fields became optional and must never change.
+#[test]
+fn existing_package_bytes_are_unchanged() {
+    let media = runtime_custody_listing_record_for_test(
+        Digest32::new([0x73; 32]),
+        "person:local:media-listing",
+        "media-listing",
+        NOW,
+    )
+    .package;
+    let (_, object) = object_listing_package_for_test(0x72);
+    for (label, package, expected) in [
+        (
+            "media",
+            &media,
+            "3409cf54dd74fa9ce8fa1b5490eea33fc0498f3b2589c08b37b46af2f73210e2",
+        ),
+        (
+            "object",
+            &object,
+            "806eef996d9f047985977766c9ddb8ee9b7a88f4b267c1cb90c37fabe9470182",
+        ),
+    ] {
+        let bytes = serde_json::to_vec(package).unwrap();
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&bytes)),
+            expected,
+            "{label} package bytes moved"
+        );
+        let round_trip: super::RuntimePortableListingPackage =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&round_trip).unwrap(), bytes);
+    }
+}
+
+// --- Read after a buy: the shared read dataset and adopted listings -------
+
+const SHARED_PUBLISHER: &str = "0xAB5028BDBB0826AD6F1885478E421DB677B0001A";
+
+/// The four identities a package carries, as the shared document states them.
+struct SharedIdentities {
+    kid: String,
+    content_type: String,
+    rights_policy: String,
+    key_envelope: String,
+    content_key_commitment: String,
+    content_identity: String,
+}
+
+impl SharedIdentities {
+    fn of_package(package: &super::RuntimePortableListingPackage, content_type: &str) -> Self {
+        Self {
+            kid: package.content_access_id.clone(),
+            content_type: content_type.to_string(),
+            rights_policy: package.rights_policy_identity_base64.clone(),
+            key_envelope: package.key_envelope_identity_base64.clone(),
+            content_key_commitment: package.content_key_commitment_base64.clone(),
+            content_identity: package
+                .media_identity_base64
+                .clone()
+                .or_else(|| package.content_identity_base64.clone())
+                .unwrap(),
+        }
+    }
+}
+
+/// The shared `metadata.json` exactly as this Runtime's producer writes it --
+/// never hand-written -- for the given identities.
+fn shared_metadata_from_producer(identities: &SharedIdentities) -> Value {
+    let inputs = crate::protected_content_elacity_metadata::ElacityMetadataInputs {
+        encrypted_content_cid: ContentAvailabilityTestProvider::CID,
+        content_type: &identities.content_type,
+        plaintext_bytes: 5,
+        kid_0x: &identities.kid,
+        publisher_address: SHARED_PUBLISHER,
+        chain_id: 8453,
+        ledger: "0x0000000000000000000000000000000000000022",
+        authority: "",
+        copies: 2,
+        price: "5",
+        image: "",
+        protection: crate::protected_content_elacity_metadata::runtime_custody_protection(
+            2,
+            3,
+            crate::protected_content_elacity_metadata::ProtectedContentIdentities {
+                rights_policy: &identities.rights_policy,
+                key_envelope: &identities.key_envelope,
+                content_key_commitment: &identities.content_key_commitment,
+                content_identity: &identities.content_identity,
+            },
+        ),
+        fallback_name: "shared-proof.mp4",
+        created_at: "2026-09-25T00:00:00Z",
+        access_method: elastos_protected_content_runtime::RuntimeMintAccessMethod::BuyOnce,
+        reseller_cut: None,
+    };
+    let files =
+        crate::protected_content_elacity_metadata::elacity_metadata_files(None, &inputs).unwrap();
+    assert_eq!(files[0].0, "metadata.json");
+    serde_json::from_slice(&files[0].1).unwrap()
+}
+
+fn media_listing_package_for_shared_test() -> super::RuntimePortableListingPackage {
+    runtime_custody_listing_record_for_test(
+        Digest32::new([0x74; 32]),
+        "person:local:shared",
+        "shared",
+        NOW,
+    )
+    .package
+}
+
+#[test]
+fn shared_read_dataset_reads_only_metadata_json() {
+    let media_package = media_listing_package_for_shared_test();
+    let media_document =
+        shared_metadata_from_producer(&SharedIdentities::of_package(&media_package, "video/mp4"));
+    let dataset = crate::protected_content_market::shared_read_dataset(&media_document)
+        .unwrap()
+        .expect("an ElastOS mint's shared document is adoptable");
+    assert_eq!(dataset.kid, media_package.content_access_id);
+    assert_eq!(dataset.content_cid, ContentAvailabilityTestProvider::CID);
+    assert_eq!(dataset.mime_type, "video/mp4");
+    assert_eq!(dataset.name, "shared-proof.mp4");
+    assert_eq!(
+        dataset.rights_policy_identity_base64,
+        media_package.rights_policy_identity_base64
+    );
+    assert_eq!(
+        dataset.key_envelope_identity_base64,
+        media_package.key_envelope_identity_base64
+    );
+    assert_eq!(
+        dataset.content_key_commitment_base64,
+        media_package.content_key_commitment_base64
+    );
+    assert_eq!(
+        dataset.content_identity,
+        media_package
+            .decode_and_validate()
+            .unwrap()
+            .content_identity
+    );
+    assert_eq!(
+        dataset.publisher_identity,
+        format!(
+            "did:pkh:eip155:8453:{}",
+            SHARED_PUBLISHER.to_ascii_lowercase()
+        )
+    );
+    // The identity maps back onto exactly the package's own field pair.
+    assert_eq!(
+        super::runtime_portable_identity_fields(&dataset.content_identity).unwrap(),
+        (media_package.media_identity_base64.clone(), None)
+    );
+
+    let (object_identity, object_package) = object_listing_package_for_test(0x75);
+    let object_document = shared_metadata_from_producer(&SharedIdentities::of_package(
+        &object_package,
+        "application/pdf",
+    ));
+    let dataset = crate::protected_content_market::shared_read_dataset(&object_document)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dataset.content_identity,
+        RuntimeContentIdentityV1::Object(object_identity)
+    );
+    assert_eq!(
+        super::runtime_portable_identity_fields(&dataset.content_identity).unwrap(),
+        (None, object_package.content_identity_base64.clone())
+    );
+
+    // A bare-hex KID (what ela.city writes) is the same KID (R9); a document
+    // whose KIDs disagree names none.
+    let mut bare = media_document.clone();
+    bare["kid"] = json!(media_package.content_access_id.trim_start_matches("0x"));
+    assert_eq!(
+        crate::protected_content_market::shared_read_dataset(&bare)
+            .unwrap()
+            .unwrap()
+            .kid,
+        media_package.content_access_id
+    );
+    let mut split = media_document;
+    split["properties"]["kid"] = json!(format!("0x{}", "ab".repeat(16)));
+    assert!(crate::protected_content_market::shared_read_dataset(&split).is_err());
+}
+
+#[test]
+fn shared_read_dataset_is_none_without_an_elastos_protection() {
+    // What an ela.city (Lit) mint writes: no `asset`, a bare-hex `kid`, and
+    // the protection named only in `media.protectionType`.
+    let lit = json!({
+        "name": "Tradingviewww",
+        "media": {
+            "uri": "ipfs://QmPczy2mXWn2eVeN4e7wsScLEaKgbrEu2BUBGrniNAThFN",
+            "contentType": "video",
+            "protectionType": ["cenc:lit-aes-gcm-v3"],
+        },
+        "properties": { "publisher": SHARED_PUBLISHER },
+        "kid": "facabcf1ea699570a8409db83779ae5c",
+    });
+    assert!(crate::protected_content_market::shared_read_dataset(&lit)
+        .unwrap()
+        .is_none());
+
+    // An ElastOS entry that cannot be adopted is ours, not foreign (R12).
+    let media_package = media_listing_package_for_shared_test();
+    let document =
+        shared_metadata_from_producer(&SharedIdentities::of_package(&media_package, "video/mp4"));
+    let mut v0 = document.clone();
+    v0["asset"]["protections"][0] = json!({
+        "protectionType": "cenc:elastos-pq-hybrid-threshold-v0",
+        "algorithm": "x",
+        "shares": [],
+    });
+    assert!(crate::protected_content_market::shared_read_dataset(&v0).is_err());
+    let mut missing = document;
+    missing["asset"]["protections"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("key_envelope_identity_base64");
+    assert!(crate::protected_content_market::shared_read_dataset(&missing).is_err());
+}
+
+#[test]
+fn shared_read_dataset_refuses_a_kind_prefixed_media_identity() {
+    let media_package = media_listing_package_for_shared_test();
+    let media = match media_package
+        .decode_and_validate()
+        .unwrap()
+        .content_identity
+    {
+        RuntimeContentIdentityV1::Media(media) => media,
+        RuntimeContentIdentityV1::Object(_) => panic!("the control package is media"),
+    };
+    let mut identities = SharedIdentities::of_package(&media_package, "video/mp4");
+    identities.content_identity = base64::engine::general_purpose::STANDARD.encode(
+        RuntimeContentIdentityV1::Media(media)
+            .canonical_bytes()
+            .unwrap(),
+    );
+    let document = shared_metadata_from_producer(&identities);
+    assert!(
+        crate::protected_content_market::shared_read_dataset(&document).is_err(),
+        "a media identity has exactly one encoding: the bare one"
+    );
+}
+
+/// An adopted record (origin `Asset`) of the fixture's own package.
+fn adopted_listing_record_for_test() -> super::RuntimeCustodyListingRecord {
+    let mut record = runtime_custody_listing_record_for_test(
+        Digest32::new([0x76; 32]),
+        "person:local:adopted",
+        "adopted",
+        NOW,
+    );
+    record.package.mint_transaction_hash = None;
+    record.package.published_at = None;
+    record.package.publisher_profile_did = format!(
+        "did:pkh:eip155:8453:{}",
+        SHARED_PUBLISHER.to_ascii_lowercase()
+    );
+    record.origin = super::RuntimeCustodyListingOrigin::Asset {
+        asset_uri: format!("elastos://{}", record.package.metadata_cid),
+    };
+    record
+}
+
+/// Re-states a published record's `package_sha256` over its current package,
+/// so a check that fails is the one under test and not the digest.
+fn restate_published_digest(record: &mut super::RuntimeCustodyListingRecord) {
+    let digest = hex::encode(sha2::Sha256::digest(
+        serde_json::to_vec(&record.package).unwrap(),
+    ));
+    match &mut record.origin {
+        super::RuntimeCustodyListingOrigin::LocalCreator { package_sha256, .. }
+        | super::RuntimeCustodyListingOrigin::Imported { package_sha256, .. } => {
+            *package_sha256 = digest;
+        }
+        super::RuntimeCustodyListingOrigin::Asset { .. } => {}
+    }
+}
+
+#[test]
+fn asset_origin_requires_absent_mint_hash_and_a_pkh_publisher() {
+    let adopted = adopted_listing_record_for_test();
+    adopted.validate().expect("an adopted record validates");
+    let bytes = serde_json::to_string(&adopted.package).unwrap();
+    assert!(!bytes.contains("mint_transaction_hash") && !bytes.contains("published_at"));
+    assert_eq!(
+        adopted.portable_package_digest(),
+        format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&adopted.package).unwrap()
+            ))
+        )
+    );
+
+    let refused = |label: &str, change: &dyn Fn(&mut super::RuntimeCustodyListingRecord)| {
+        let mut record = adopted_listing_record_for_test();
+        change(&mut record);
+        assert!(record.validate().is_err(), "{label}");
+    };
+    refused("an adopted record states a mint hash", &|record| {
+        record.package.mint_transaction_hash = Some(format!("0x{}", hex::encode([0x68; 32])));
+    });
+    refused("an adopted record states a publication time", &|record| {
+        record.package.published_at = Some(NOW);
+    });
+    refused("an adopted record names a did:key publisher", &|record| {
+        record.package.publisher_profile_did = derived_device_key_for_seed(0x66).1;
+    });
+    refused(
+        "an adopted record names another chain's publisher",
+        &|record| {
+            record.package.publisher_profile_did =
+                format!("did:pkh:eip155:1:{}", SHARED_PUBLISHER.to_ascii_lowercase());
+        },
+    );
+    refused(
+        "an adopted record names a mixed-case publisher",
+        &|record| {
+            record.package.publisher_profile_did =
+                format!("did:pkh:eip155:8453:{SHARED_PUBLISHER}");
+        },
+    );
+    refused("an adopted record names another folder", &|record| {
+        record.origin = super::RuntimeCustodyListingOrigin::Asset {
+            asset_uri: "elastos://QmcKGaG3CsCw93bc5JgDehrQTM7h1LMF1BQQiLXCvPvfz2".to_string(),
+        };
+    });
+
+    // The converse: every published origin keeps requiring both facts and a
+    // `did:key` publisher.
+    for origin in ["local_creator", "imported"] {
+        let published = || {
+            let mut record = runtime_custody_listing_record_for_test(
+                Digest32::new([0x77; 32]),
+                "person:local:published",
+                "published",
+                NOW,
+            );
+            if origin == "imported" {
+                record.origin = super::RuntimeCustodyListingOrigin::Imported {
+                    listing_uri: record.origin.listing_uri().to_string(),
+                    package_sha256: String::new(),
+                };
+                restate_published_digest(&mut record);
+            }
+            record
+        };
+        published()
+            .validate()
+            .expect("the control record validates");
+        for (label, change) in [
+            (
+                "no mint hash",
+                Box::new(|record: &mut super::RuntimeCustodyListingRecord| {
+                    record.package.mint_transaction_hash = None;
+                }) as Box<dyn Fn(&mut super::RuntimeCustodyListingRecord)>,
+            ),
+            (
+                "no publication time",
+                Box::new(|record: &mut super::RuntimeCustodyListingRecord| {
+                    record.package.published_at = None;
+                }),
+            ),
+            (
+                "a did:pkh publisher",
+                Box::new(|record: &mut super::RuntimeCustodyListingRecord| {
+                    record.package.publisher_profile_did = format!(
+                        "did:pkh:eip155:8453:{}",
+                        SHARED_PUBLISHER.to_ascii_lowercase()
+                    );
+                }),
+            ),
+        ] {
+            let mut record = published();
+            change(&mut record);
+            restate_published_digest(&mut record);
+            assert!(record.validate().is_err(), "{origin} with {label}");
+        }
+    }
+}
+
+/// R40 (T8-C3): the `did:pkh` publisher relaxation is an explicit choice made
+/// only for an adopted listing (origin `Asset`), never inferred from the
+/// requirement's DID method; and even there the manifest must name a real
+/// `did:key`, not merely something.
+#[test]
+fn manifest_publisher_binding_is_chosen_by_origin_and_requires_a_did_key() {
+    use super::{content_manifest_binds_publisher, RuntimeManifestPublisherBinding as Binding};
+    let did_key = derived_device_key_for_seed(0x66).1;
+    let pkh = "did:pkh:eip155:8453:0x00000000000000000000000000000000000000a4";
+    let requirement = |publisher: &str| {
+        RuntimeContentAvailabilityRequirement::new(
+            did_key.clone(),
+            "did:key:z6Mkhq7f4c4QAEgwRByrEsmGu3RJRYvpP5UGcWvqBjGW4YRe#content",
+            publisher,
+            super::PROTECTED_CONTENT_REPLICATION_POLICY,
+            super::PROTECTED_CONTENT_MIN_REPLICAS,
+            super::PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+            super::PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap()
+    };
+    let manifest = |publisher: Option<&str>| crate::content::ContentObjectManifest {
+        schema: "elastos.content.object.manifest/v1".to_string(),
+        kind: "directory".to_string(),
+        content_digest: String::new(),
+        files: Vec::new(),
+        links: Vec::new(),
+        object_did: None,
+        publisher_did: publisher.map(str::to_string),
+    };
+    // An adopted listing: the manifest names the Runtime profile that
+    // published the bytes, a well-formed did:key.
+    assert!(content_manifest_binds_publisher(
+        &manifest(Some(&did_key)),
+        &requirement(pkh),
+        Binding::AdoptedAttribution,
+    ));
+    for named in [Some("did:web:example.com"), Some("x"), Some(pkh), None] {
+        assert!(
+            !content_manifest_binds_publisher(
+                &manifest(named),
+                &requirement(pkh),
+                Binding::AdoptedAttribution,
+            ),
+            "{named:?} is not a publisher's did:key"
+        );
+    }
+    // The relaxation is never inferred from the requirement's method.
+    assert!(!content_manifest_binds_publisher(
+        &manifest(Some(&did_key)),
+        &requirement(pkh),
+        Binding::Exact,
+    ));
+    assert!(content_manifest_binds_publisher(
+        &manifest(Some(&did_key)),
+        &requirement(&did_key),
+        Binding::Exact,
+    ));
+    // And an adopted binding still needs the adopted (did:pkh) requirement.
+    assert!(!content_manifest_binds_publisher(
+        &manifest(Some(&did_key)),
+        &requirement(&did_key),
+        Binding::AdoptedAttribution,
+    ));
+    // Only origin `Asset` chooses it.
+    assert_eq!(
+        Binding::for_origin(&super::RuntimeCustodyListingOrigin::Asset {
+            asset_uri: "elastos://bafyfixture".to_string(),
+        }),
+        Binding::AdoptedAttribution
+    );
+    assert_eq!(
+        Binding::for_origin(&super::RuntimeCustodyListingOrigin::Imported {
+            listing_uri: "elastos://bafyfixture".to_string(),
+            package_sha256: "00".repeat(32),
+        }),
+        Binding::Exact
     );
 }

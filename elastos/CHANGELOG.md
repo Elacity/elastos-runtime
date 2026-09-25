@@ -46,8 +46,26 @@ All notable changes to the public ElastOS Runtime repository.
   documents, carrying the creator's title, description, cover, category and
   content flags. A creator-named royalty split reaches the chain in ERC-1155
   `ROYALTY_SHARE` units.
+- Buy any live offer, found by a shared link or in Explore, not only one
+  shared as a `listing.json` package. A `ListingObject` is rebuilt by the
+  Runtime from the chain and the asset's own metadata folder for a
+  `tokenURI`, a KID or `(ledger, tokenId)` alike, so the same verified path
+  covers an item minted here and one minted on ela.city or through the SDK.
 
 ### Fixed
+- A bought market item says what this Home holds of it. Only a copy in this
+  Home's Library reads "In your library"; a purchase whose copy is not here
+  yet, or that opens only on ela.city, reads "Purchased", and no bought card
+  shows a stock line. A Details control on those cards opens the item sheet
+  on the item's properties from its listing -- title, description, who listed
+  it, ledger, token ID, operative, KID, media type and where it opens --
+  instead of its offers.
+- Marketplace Explore opens on the market. It shows a loading state until
+  the market answers, asks once more on its own two seconds after a first
+  read that fails, and then says "Couldn’t reach the market." with a Try
+  again control. This Home's own items join the market's items on Explore
+  and stay in My listings; they no longer stand in for the market when it is
+  slow, which used to need a refresh before anyone else's items appeared.
 - A mint's on-chain token URI names the metadata directory rather than a file
   inside it. The Operative appends its own suffixes, so the previous URI
   produced `…/metadata.json/0000…0001.json` and resolved to nothing: the mint
@@ -90,6 +108,31 @@ All notable changes to the public ElastOS Runtime repository.
   `status`, and `shared_access` no longer project provider readiness; plain
   published content states that no key release applies, and protected content
   is published through Runtime custody publish rather than a share policy.
+- A market buy (`buy_offer`) no longer runs the read-side checks: no
+  availability receipt, content verification or custody draft rebuild
+  happens before money moves; those stay at open, where they always applied
+  (a buy of an imported listing package still runs them). A price or
+  pay-token change, or a sold-out offer, is now answered as `terms_changed`,
+  with the current terms (`null` once the offer is gone), rather than a
+  generic purchase denial. A press on other terms while an earlier attempt
+  for the item is in flight answers `attempt_in_progress`, and a buyer holds
+  at most one open purchase per item across `buy` and `buy_offer`.
+  A listing-package `buy` that the Wallet declined, or that the chain mined
+  and reverted, is retired, so it no longer blocks a later `buy_offer` for
+  the item. A Library `buy` of the same package is still refused again, as
+  before: its Wallet effect is fixed by the listing.
+- Marketplace keeps a recorded purchase resumable: Continue appears on the
+  recorded terms even when that seller no longer lists the item. A bought
+  item not yet on this Home's shelf offers Download copy, which asks Runtime
+  for the copy by its item, reruns adoption and never pays.
+- Marketplace sells an item whose shared metadata or KID binding Runtime
+  could not read: a listing may state readability `unknown` with a `null`
+  kid, the sheet keeps Buy enabled and says nothing about where the item
+  opens, a Buy names no kid, and a catalog row treats `unknown` as not yet
+  learned. A completed purchase may name a `null` kid. A Buy that Runtime
+  could not take to the market or the chain now says "The market couldn’t be
+  reached. Try again."; "The purchase did not finish." stays for a purchase
+  that failed.
 
 ## [0.7.0] - 2026-08-31
 
