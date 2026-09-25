@@ -4628,13 +4628,45 @@ impl ContentProvider {
         &self,
         cid: &str,
     ) -> Option<Result<SignedAvailabilityReceipt, ProviderError>> {
-        match self.latest_receipts() {
-            Ok(receipts) => receipts
-                .into_iter()
-                .find(|receipt| receipt.payload.cid == cid)
-                .map(Ok),
-            Err(err) => Some(Err(err)),
-        }
+        (|| {
+            let path = self.receipts_path();
+            if !path.exists() {
+                return Ok(None);
+            }
+            let file = std::fs::File::open(path)?;
+            let mut latest = None;
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let envelope: Value = serde_json::from_str(&line).map_err(|err| {
+                    ProviderError::Provider(format!("content receipt ledger decode failed: {err}"))
+                })?;
+                let row_cid = envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("cid"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "content receipt ledger decode failed: missing payload CID".into(),
+                        )
+                    })?;
+                if row_cid != cid {
+                    continue;
+                }
+                let receipt: SignedAvailabilityReceipt =
+                    serde_json::from_str(&line).map_err(|err| {
+                        ProviderError::Provider(format!(
+                            "content receipt ledger decode failed: {err}"
+                        ))
+                    })?;
+                verify_signed_receipt(&receipt)?;
+                latest = Some(receipt);
+            }
+            Ok(latest)
+        })()
+        .transpose()
     }
 
     fn latest_receipts(&self) -> Result<Vec<SignedAvailabilityReceipt>, ProviderError> {
