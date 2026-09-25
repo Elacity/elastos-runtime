@@ -7,7 +7,7 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../capsules/system/browser/system.js", import.meta.url), "utf8");
 const controller = source.slice(source.indexOf("function configureAiProvider() {"), source.indexOf("function configurePasskeyAccess() {"));
 
-function fixture(connections = [], guest = false) {
+function fixture(connections = [], guest = false, staged = []) {
   const nodes = new Map();
   const element = () => ({
     value: "", hidden: false, disabled: false, dataset: {}, selectedOptions: [], children: [], handlers: {},
@@ -22,8 +22,10 @@ function fixture(connections = [], guest = false) {
     if (!nodes.has(selector)) nodes.set(selector, element());
     return nodes.get(selector);
   };
-  const saved = new Map(), messages = [], attempts = [];
+  const saved = new Map(), messages = [], attempts = [], discarded = [];
+  let stagedConnections = staged.slice();
   let rejectActivation = true;
+  let consentPending = false;
   const context = vm.createContext({
     crypto: { randomUUID },
     document: { querySelector: node, querySelectorAll: () => [], createElement: element },
@@ -34,19 +36,32 @@ function fixture(connections = [], guest = false) {
     hostedProviderValidationError: () => "This Home could not check the key. Try again.",
     openCapsuleTarget: () => {},
     fetchJson: async (_url, init = {}) => {
+      if (init.method === "DELETE" && _url.endsWith("/staged")) {
+        const { id } = JSON.parse(init.body);
+        discarded.push(id);
+        stagedConnections = stagedConnections.filter(entry => entry.id !== id);
+        return { discarded: true };
+      }
       if (init.method !== "POST") {
         if (guest) throw new Error("request failed: 403 admin passkey required");
-        return { connections };
+        return { connections, staged_connections: stagedConnections };
       }
       const body = JSON.parse(init.body);
       attempts.push(body);
+      if (consentPending) {
+        if (!stagedConnections.some(entry => entry.id === body.id)) {
+          stagedConnections.push({ id: body.id, provider: body.provider, has_saved_model: false });
+        }
+        throw new Error("request failed: 400 Approve this hosted connection in Inbox, then check the key again.");
+      }
       saved.set(body.id, body);
       if (rejectActivation) throw new Error("request failed: 409 provider error: selection_unavailable: model offer is not available");
       return { connections: [] };
     },
   });
   vm.runInContext(`${controller}\nconfigureAiProvider();`, context);
-  return { node, saved, messages, attempts, activate: () => { rejectActivation = false; } };
+  return { node, saved, messages, attempts, discarded,
+    activate: () => { rejectActivation = false; }, pending: () => { consentPending = true; } };
 }
 
 test("guest setup does not keep an entered key or offer an unusable Add form", async () => {
@@ -102,23 +117,62 @@ test("hosted key feedback separates paused egress, Home authority, and provider 
   assert.equal(message("request failed: 403 admin passkey required"), "Sign in as the Home admin to check provider keys.");
   assert.equal(message("request failed: 403 home launch token expired"), "This Home could not check the key. Try again.");
   assert.equal(message("request failed: 400 invalid Venice key"), "The provider could not validate this key.");
+  assert.match(message("request failed: 400 The hosted connection request was denied. Try again after the decision window."), /was denied/);
+  assert.match(message("request failed: 400 Hosted access was denied or ended. Review Inbox."), /denied or ended/);
+  assert.match(message("request failed: 400 Hosted HTTPS was ended on this Home. Start a new connection check in Inbox."), /was ended/);
+  assert.match(message("request failed: 400 Runtime blocked this hosted route. Review the connection configuration."), /blocked this hosted route/);
+  assert.match(message("request failed: 400 Hosted HTTPS could not reach the host. Check the network and try again."), /network/);
   assert.equal(message("request failed: 502 Bad Gateway"), "This Home could not check the key. Try again.");
   assert(!source.includes('publicSystemError(error, "This key is invalid.")'));
 });
 
 test("Cancel after a failed Add restores provider choice and gives the next form a new identity", async () => {
   const f = fixture();
+  f.pending();
   f.node("#ai-provider-add").handlers.click();
   await f.node("#ai-provider-save").handlers.click();
   assert.equal(f.node("#ai-provider-kind").disabled, true);
   const firstId = f.attempts[0].id;
   f.node("#ai-provider-cancel").handlers.click();
+  assert.equal(f.node("#ai-provider-instances").children.length, 1);
   f.node("#ai-provider-add").handlers.click();
   assert.equal(f.node("#ai-provider-kind").disabled, false);
   f.node("#ai-provider-kind").value = "venice";
   await f.node("#ai-provider-save").handlers.click();
   assert.notEqual(f.attempts[1].id, firstId);
   assert.equal(f.attempts[1].provider, "venice");
+  f.node("#ai-provider-cancel").handlers.click();
+  const stagedCard = f.node("#ai-provider-instances").children[0];
+  await stagedCard.children[2].handlers.click();
+  assert.deepEqual(f.discarded, [firstId]);
+});
+
+test("staged key survives reload and Close; Discard clears only the staged setup", async () => {
+  const id = `model:hosted-${"a".repeat(32)}`;
+  const f = fixture([], false, [{ id, provider: "openrouter", has_saved_model: false }]);
+  await new Promise(setImmediate);
+  const card = f.node("#ai-provider-instances").children[0];
+  card.children[1].handlers.click();
+  assert.equal(f.node("#ai-provider-cancel").textContent, "Close; keep staged key");
+  f.node("#ai-provider-cancel").handlers.click();
+  assert.equal(f.discarded.length, 0);
+  assert.equal(f.node("#ai-provider-instances").children.length, 1);
+  await card.children[2].handlers.click();
+  assert.deepEqual(f.discarded, [id]);
+  assert.equal(f.node("#ai-provider-instances").children.length, 0);
+});
+
+test("discarding a staged key change keeps the saved model card", async () => {
+  const id = `model:hosted-${"b".repeat(32)}`;
+  const connection = { id, name: "Saved", provider: "openrouter", connected: true,
+    selected_model: "fixture/model", operation: "text.generate" };
+  const f = fixture([connection], false, [{ id, provider: "openrouter", has_saved_model: true }]);
+  await new Promise(setImmediate);
+  const stagedCard = f.node("#ai-provider-instances").children[1];
+  await stagedCard.children[2].handlers.click();
+  assert.deepEqual(f.discarded, [id]);
+  assert.equal(f.node("#ai-provider-instances").children.length, 1);
+  assert.match(f.messages.at(-1), /saved model key remains/);
 });
 
 test("Edit uses the existing identity with a blank key and explains server-side key retention", async () => {

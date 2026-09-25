@@ -721,6 +721,8 @@ function configureAiProvider() {
     validationEndButton.disabled = busy || !hasShellAccess();
     saveButton.disabled = busy || !hasShellAccess();
     cancelButton.disabled = busy;
+    cancelButton.textContent = latestStatus?.staged_connections?.some((entry) => entry.id === editingId)
+      ? "Close; keep staged key" : "Cancel";
     instancesNode.querySelectorAll("button").forEach((button) => {
       button.disabled = busy || !hasShellAccess() || button.dataset.egressPaused === "true";
     });
@@ -860,8 +862,9 @@ function configureAiProvider() {
       const state = document.createElement("span");
       state.className = "ai-provider-state";
       state.textContent = connection.egress_state === "operator_ready" ? "Hosted HTTPS active"
+        : connection.egress_state === "ready" ? "Hosted connection approved"
         : connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
-        : connection.egress_approval_state === "pending" ? "Hosted route needs Inbox review"
+        : connection.egress_approval_state === "pending" ? "Hosted connection needs Inbox review"
         : connection.egress_state === "paused" ? "External HTTPS paused"
         : connection.approval_state === "approved" ? "Assistant access approved"
         : connection.share_enabled ? "Shared" : "Private";
@@ -902,6 +905,47 @@ function configureAiProvider() {
       more.append(summary, identity, secondary);
       actions.append(useButton, replaceButton);
       card.append(title, detail, actions, more);
+      instancesNode.append(card);
+    }
+    for (const staged of Array.isArray(status?.staged_connections) ? status.staged_connections : []) {
+      if (!staged || !/^model:hosted-[0-9a-f]{32}$/i.test(staged.id || "")) continue;
+      const card = document.createElement("div");
+      card.className = "ai-provider-instance";
+      const detail = document.createElement("p");
+      detail.className = "pc2-card-sublabel";
+      detail.textContent = `${staged.provider} · ${staged.has_saved_model ? "Staged key change" : "Key check needed"}`;
+      const resume = document.createElement("button");
+      resume.className = "pc2-btn pc2-btn-secondary";
+      resume.type = "button";
+      resume.textContent = "Continue setup";
+      resume.addEventListener("click", () => {
+        const saved = connections.find((entry) => entry.id === staged.id);
+        showForm(saved || { id: staged.id, provider: String(staged.provider).toLowerCase() });
+        showState("This Home kept the staged key. Check it again, approve the connection in Inbox if asked, then choose a model.", "");
+      });
+      const discard = document.createElement("button");
+      discard.className = "pc2-btn pc2-btn-secondary";
+      discard.type = "button";
+      discard.textContent = "Discard staged key";
+      discard.addEventListener("click", async () => {
+        if (!hasShellAccess()) return;
+        discard.disabled = true;
+        showState("Finishing any current key check, then removing the staged key.", "");
+        try {
+          await fetchJson("/api/apps/system/ai-provider/staged", {
+            method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: staged.id }),
+          });
+          await refreshStatus();
+          showState(staged.has_saved_model
+            ? "Staged key removed. The saved model key remains. Check Inbox before its next request."
+            : "Staged key removed.", "success");
+        } catch (error) {
+          showState(publicSystemError(error, "This Home could not discard the staged key."), "error");
+          discard.disabled = false;
+        }
+      });
+      card.append(detail, resume, discard);
       instancesNode.append(card);
     }
   };
@@ -992,7 +1036,9 @@ function configureAiProvider() {
     latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
     document.querySelector("#ai-provider-egress-note").textContent = latestStatus.hosted_external_https === "operator_ready"
       ? "Owner-authorized HTTPS is active for configured hosted models. This Home stores keys and pays for requests. End hosted HTTPS here at any time."
-      : "External HTTPS is paused. Saved keys, models, and past results stay here.";
+      : latestStatus.hosted_external_https === "consent_required"
+        ? "This Home keeps provider keys. Approve each hosted connection in Inbox before its key check or model request."
+        : "External HTTPS is paused. Saved keys, models, and past results stay here.";
     renderInstances(latestStatus);
     renderLens(latestStatus);
     updateValidationEnd();
@@ -1033,10 +1079,12 @@ function configureAiProvider() {
     setBusy(true);
     showState("", "");
     try {
+      // Validation and Save use the same Runtime connection identity.
+      if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
       const result = await fetchJson("/api/apps/system/ai-provider/validate", {
         method: "POST",
         headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value, ...(editingId ? { id: editingId } : {}) }),
+        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value, id: editingId }),
       });
       fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
       showState("This key is valid.", "success");
@@ -1071,9 +1119,12 @@ function configureAiProvider() {
       await refreshStatus();
       showState("This hosted model is saved on this Home.", "success");
     } catch (error) {
+      await refreshStatus().catch(() => {});
       const activationPending = /selection_unavailable|model activation pending|model retirement pending/.test(String(error.message || error));
+      const consentPending = String(error.message || error).includes("Approve this hosted connection in Inbox");
       showState(activationPending
         ? "This model is saved. Activation is waiting for current model work to finish. Select Save to try again."
+        : consentPending ? "The key is stored on this Home. Approve this connection in Inbox, then select Save again."
         : publicSystemError(error, "This Home could not save that hosted model."), "error");
     } finally {
       setBusy(false);
@@ -3745,6 +3796,19 @@ function publicSystemError(value, fallback) {
 
 function hostedProviderValidationError(value) {
   const message = readText(value && value.message ? value.message : value);
+  if (message.includes("Approve this hosted connection in Inbox")) {
+    return "The key is stored on this Home. Approve this connection in Inbox, then select Check key and load models again.";
+  }
+  for (const detail of [
+    "The hosted connection request was denied. Try again after the decision window.",
+    "Hosted access was denied or ended. Review Inbox.",
+    "Hosted HTTPS was ended on this Home. Start a new connection check in Inbox.",
+    "Runtime blocked this hosted route. Review the connection configuration.",
+    "Hosted HTTPS could not reach the host. Check the network and try again.",
+    "This Home could not check the hosted connection. Try again.",
+  ]) {
+    if (message.includes(detail)) return detail;
+  }
   if (message.includes("Hosted external HTTPS is paused until Runtime network authority is available.")) {
     return "External HTTPS is paused on this Home. The key has not been checked.";
   }

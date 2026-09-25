@@ -1573,7 +1573,7 @@ async fn run_http_artifact_create_worker_inner(
     };
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(map_backend_http_status(response.status()));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     let value = read_bounded_json_response_async(response).await?;
     let job_id = value.get("job_id").and_then(Value::as_str).ok_or_else(|| {
@@ -1646,7 +1646,7 @@ async fn run_http_artifact_status_worker_inner(
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(map_backend_http_status(response.status()));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     let value = read_bounded_json_response_async(response).await?;
     parse_http_job_status_result(value, offer, state, poll_interval_ms)
@@ -1739,12 +1739,12 @@ async fn run_local_text_worker_inner(
             .unwrap_or(u64::MAX),
         local_socket.as_deref().or(task.hosted_socket.as_deref()),
     )?;
+    let runtime_socket = if private_endpoint {
+        None
+    } else {
+        task.hosted_socket.as_deref()
+    };
     let request = {
-        let runtime_socket = if private_endpoint {
-            None
-        } else {
-            task.hosted_socket.as_deref()
-        };
         let effect = if matches!(&task.backend, LocalTextBackend::OpenAiResponses { .. }) {
             "responses"
         } else {
@@ -1777,7 +1777,7 @@ async fn run_local_text_worker_inner(
         response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
     if !response.status().is_success() {
-        return Err(map_backend_http_status(response.status()));
+        return Err(map_effect_http_status(&response, runtime_socket));
     }
 
     let mut response = response;
@@ -1962,7 +1962,7 @@ async fn run_decision_worker(
         response = request.send() => response.map_err(map_reqwest_failure)?,
     };
     if !response.status().is_success() {
-        return Err(map_backend_http_status(response.status()));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     let value = tokio::select! {
         _ = cancel.changed() => return Ok(worker_settlement_unknown_result()),
@@ -2453,6 +2453,43 @@ fn map_backend_http_status(status: reqwest::StatusCode) -> AdapterFault {
     }
 }
 
+fn map_effect_http_status(
+    response: &reqwest::Response,
+    runtime_socket: Option<&str>,
+) -> AdapterFault {
+    if runtime_socket.is_some() && response.status() == reqwest::StatusCode::FORBIDDEN {
+        let state = response
+            .headers()
+            .get("x-elastos-hosted-access")
+            .and_then(|value| value.to_str().ok());
+        let (code, message) = match state {
+            Some("pending") => (
+                "hosted_access_pending",
+                "Hosted access is waiting for approval in Inbox.",
+            ),
+            Some("denied") => ("hosted_access_denied", "Hosted access was denied in Inbox."),
+            Some("ended") => (
+                "hosted_access_ended",
+                "Hosted access ended. Approve the new request in Inbox to use it again.",
+            ),
+            Some("refused") => (
+                "hosted_effect_refused",
+                "Runtime refused the hosted request before provider dispatch.",
+            ),
+            _ => return map_backend_http_status(response.status()),
+        };
+        return AdapterFault {
+            error: RunError {
+                class: ErrorClass::AccessRefused,
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+            detail: None,
+        };
+    }
+    map_backend_http_status(response.status())
+}
+
 async fn read_bounded_json_response_async(
     mut response: reqwest::Response,
 ) -> std::result::Result<Value, AdapterFault> {
@@ -2639,7 +2676,7 @@ async fn run_http_artifact_cancel_worker_inner(
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(map_backend_http_status(response.status()));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     if response.status() != reqwest::StatusCode::NO_CONTENT {
         let _ = read_bounded_json_response_async(response).await?;
@@ -3837,6 +3874,86 @@ mod tests {
         let fault = hosted_openai_status_fault("401 Unauthorized");
         assert_eq!(fault.error.class, ErrorClass::AuthenticationRejected);
         assert_eq!(fault.error.code, "authentication_rejected");
+    }
+
+    #[test]
+    fn hosted_runtime_refusal_keeps_owner_access_distinct_from_provider_403() {
+        use std::os::unix::net::UnixListener;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (marker, expected_code, expected_message) in [
+            (
+                Some("pending"),
+                "hosted_access_pending",
+                "waiting for approval",
+            ),
+            (Some("denied"), "hosted_access_denied", "was denied"),
+            (
+                Some("ended"),
+                "hosted_access_ended",
+                "Approve the new request",
+            ),
+            (Some("refused"), "hosted_effect_refused", "Runtime refused"),
+            (
+                None,
+                "authentication_rejected",
+                "backend rejected authentication",
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "elastos-hosted-refusal-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..count])
+                    .starts_with("POST /v1/hosted-effect "));
+                let header = marker
+                    .map(|state| format!("X-Elastos-Hosted-Access: {state}\r\n"))
+                    .unwrap_or_default();
+                write!(stream, "HTTP/1.1 403 Forbidden\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let (update_tx, mut update_rx) = mpsc::channel(1);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let mut task = LocalTextWorkerTask {
+                request_id: "fixture-request".into(),
+                hosted_socket: Some(path.to_string_lossy().into_owned()),
+                run_id: "run-hosted-refusal".into(),
+                generation: 1,
+                backend: LocalTextBackend::OpenAiCompatible {
+                    api_url: "https://example.invalid/chat".into(),
+                    api_key: None,
+                    model: "fixture-model".into(),
+                },
+                offer: openai_offer("https://example.invalid/chat"),
+                deadline_ms: now_ms().saturating_add(30_000),
+                prompt: "hello".into(),
+                cancel_rx,
+                updates: update_tx,
+            };
+            let fault = runtime
+                .block_on(run_local_text_worker_inner(&mut task))
+                .unwrap_err();
+            server.join().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(update_rx.try_recv().is_err());
+            assert_eq!(fault.error.code, expected_code);
+            assert!(fault.error.message.contains(expected_message));
+            assert_eq!(
+                fault.error.class,
+                if marker.is_some() {
+                    ErrorClass::AccessRefused
+                } else {
+                    ErrorClass::AuthenticationRejected
+                }
+            );
+        }
     }
 
     #[test]

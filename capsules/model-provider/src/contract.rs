@@ -142,6 +142,7 @@ pub enum ErrorClass {
     SelectionUnavailable,
     CredentialsUnavailable,
     AuthenticationRejected,
+    AccessRefused,
     RateLimited,
     ContextRejected,
     BackendTimeout,

@@ -782,6 +782,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(gateway_home_system_ai_provider::system_ai_provider_validate),
         )
         .route(
+            "/api/apps/system/ai-provider/staged",
+            delete(gateway_home_system_ai_provider::system_ai_provider_discard_staged),
+        )
+        .route(
             "/api/apps/system/approval-lens",
             post(gateway_home_system_ai_provider::system_approval_lens_select),
         )

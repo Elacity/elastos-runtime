@@ -664,7 +664,8 @@ fn hosted_offer(
         "selection_mode": "pinned",
         "privacy_policy_ref": provider.privacy_policy_ref(),
         "terms_ref": provider.terms_ref(),
-        "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+        "upstream_routing_fallback_assertion": "operator_asserted_disabled",
+        "egress_contract": "connection-v1"
     });
     if let Some(privacy) = privacy.map(str::trim).filter(|value| !value.is_empty()) {
         hosted["model_privacy"] = serde_json::Value::String(privacy.to_string());
@@ -693,6 +694,18 @@ fn hosted_offer(
             "hosted": hosted
         }
     })
+}
+
+pub(crate) fn offer_uses_connection_authority(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(load_model_provider_operator_offers(data_dir)?
+        .iter()
+        .any(|offer| {
+            is_same_hosted_instance(offer, offer_id)
+                && offer["adapter"]["hosted"]["egress_contract"] == "connection-v1"
+        }))
 }
 
 fn connection_from_offer(offer: &serde_json::Value) -> Option<AiProviderConnection> {
@@ -885,6 +898,133 @@ fn hosted_secret_path(data_dir: &Path, offer_id: &str) -> anyhow::Result<PathBuf
     Ok(model_provider_secrets_dir(data_dir).join(hosted_secret_file_name(offer_id)?))
 }
 
+fn staged_hosted_secret_path(data_dir: &Path, offer_id: &str) -> anyhow::Result<PathBuf> {
+    validate_hosted_instance_id(offer_id)?;
+    Ok(model_provider_secrets_dir(data_dir)
+        .join(format!("staged-{}", hosted_secret_file_name(offer_id)?)))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedHostedKey {
+    provider: String,
+    key: String,
+}
+
+pub(crate) fn staged_hosted_connections(data_dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let dir = model_provider_secrets_dir(data_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    validate_model_provider_private_directory(&dir, "model-provider secrets")?;
+    let mut result = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix("staged-model_hosted-") else {
+            continue;
+        };
+        let id = format!("model:hosted-{id}");
+        if validate_hosted_instance_id(&id).is_err() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let bytes = read_model_provider_private_file(
+            &entry.path(),
+            &metadata,
+            64 * 1024,
+            "staged hosted key",
+        )?;
+        let staged: StagedHostedKey = serde_json::from_slice(&bytes)?;
+        let provider = HostedAiProvider::parse(&staged.provider)?;
+        result.push((id, provider.as_str().to_string()));
+        anyhow::ensure!(result.len() <= 1024, "too many staged hosted connections");
+    }
+    result.sort();
+    Ok(result)
+}
+
+pub(crate) fn stage_hosted_key(
+    data_dir: &Path,
+    provider: HostedAiProvider,
+    offer_id: &str,
+    api_key: &str,
+) -> anyhow::Result<()> {
+    validate_hosted_instance_id(offer_id)?;
+    anyhow::ensure!(
+        !api_key.is_empty() && api_key.len() <= 8 * 1024,
+        "hosted key unavailable"
+    );
+    let offers = load_model_provider_operator_offers(data_dir)?;
+    if let Some(existing) = offers
+        .iter()
+        .find(|offer| is_same_hosted_instance(offer, offer_id))
+    {
+        anyhow::ensure!(
+            hosted_provider_from_offer(existing) == Some(provider),
+            "hosted instance provider does not match"
+        );
+    }
+    let dir = model_provider_secrets_dir(data_dir);
+    crate::auth::create_owner_only_dir_all(data_dir, &dir)?;
+    write_model_provider_config_atomic(
+        &staged_hosted_secret_path(data_dir, offer_id)?,
+        &serde_json::to_vec(&StagedHostedKey {
+            provider: provider.as_str().to_string(),
+            key: api_key.to_string(),
+        })?,
+    )
+}
+
+fn read_staged_hosted_key(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<Option<StagedHostedKey>> {
+    let path = staged_hosted_secret_path(data_dir, offer_id)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    validate_model_provider_private_directory(
+        &model_provider_secrets_dir(data_dir),
+        "model-provider secrets",
+    )?;
+    let bytes = read_model_provider_private_file(&path, &metadata, 64 * 1024, "staged hosted key")?;
+    let staged: StagedHostedKey = serde_json::from_slice(&bytes)?;
+    Ok(Some(staged))
+}
+
+#[cfg(test)]
+pub(crate) fn staged_hosted_key_present(data_dir: &Path, offer_id: &str) -> bool {
+    read_staged_hosted_key(data_dir, offer_id)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+fn clear_staged_hosted_key(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
+    match fs::remove_file(staged_hosted_secret_path(data_dir, offer_id)?) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub(crate) fn discard_staged_hosted_key(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    anyhow::ensure!(
+        read_staged_hosted_key(data_dir, offer_id)?.is_some(),
+        "staged hosted connection unavailable"
+    );
+    #[cfg(unix)]
+    super::model_provider_egress_decision::end_offer(data_dir, offer_id)?;
+    clear_staged_hosted_key(data_dir, offer_id)
+}
+
 fn write_hosted_secret(data_dir: &Path, offer_id: &str, api_key: &str) -> anyhow::Result<()> {
     let dir = model_provider_secrets_dir(data_dir);
     crate::auth::create_owner_only_dir_all(data_dir, &dir)?;
@@ -966,7 +1106,7 @@ pub(super) fn write_hosted_egress_grants(data_dir: &Path, bytes: &[u8]) -> anyho
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(super) fn read_hosted_egress_decisions(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let path = model_provider_root_dir(data_dir).join("egress-decisions.json");
     let metadata = match fs::symlink_metadata(&path) {
@@ -986,7 +1126,7 @@ pub(super) fn read_hosted_egress_decisions(data_dir: &Path) -> anyhow::Result<Op
         .map(Some)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(super) fn write_hosted_egress_decisions(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         bytes.len() <= 4 * 1024 * 1024,
@@ -1006,12 +1146,12 @@ pub(super) fn write_hosted_egress_decisions(data_dir: &Path, bytes: &[u8]) -> an
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn hosted_egress_history_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("egress-decision-history")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(super) fn archive_hosted_egress_decision(
     data_dir: &Path,
     file_name: &str,
@@ -1097,7 +1237,7 @@ pub(super) fn archive_hosted_egress_decision(
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(super) fn recent_hosted_egress_history(
     data_dir: &Path,
     limit: usize,
@@ -1180,6 +1320,13 @@ pub(crate) fn hosted_key_for_save(
     }
     let id = instance_id.ok_or_else(|| anyhow::anyhow!("hosted connection is required"))?;
     validate_hosted_instance_id(id)?;
+    if let Some(staged) = read_staged_hosted_key(data_dir, id)? {
+        anyhow::ensure!(
+            staged.provider == provider.as_str(),
+            "hosted instance provider does not match"
+        );
+        return Ok(staged.key);
+    }
     let offers = load_model_provider_operator_offers(data_dir)?;
     let existing = offers
         .iter()
@@ -1543,7 +1690,6 @@ pub(crate) async fn save_hosted_offer(
             }
             None => new_hosted_instance_id(),
         };
-        write_hosted_secret(data_dir, &offer_id, api_key)?;
         let share = existing_hosted_share(&current, &offer_id);
         let mut replacement = preserve_hosted_share(
             hosted_offer(provider, &offer_id, &name, model, privacy),
@@ -1556,6 +1702,7 @@ pub(crate) async fn save_hosted_offer(
                 replacement["adapter"]["expected_response_model"] = serde_json::json!(expected);
             }
         }
+        write_hosted_secret(data_dir, &offer_id, api_key)?;
         let mut offers = current;
         if let Some(index) = offers
             .iter()
@@ -1566,6 +1713,7 @@ pub(crate) async fn save_hosted_offer(
             offers.push(replacement);
         }
         persist_model_provider_operator_offers(data_dir, offers)?;
+        clear_staged_hosted_key(data_dir, &offer_id)?;
     }
     refresh_registered_model_provider(data_dir, registry)
         .await
@@ -1590,6 +1738,7 @@ pub(crate) async fn remove_hosted_offer(
             .collect::<Vec<_>>();
         persist_model_provider_operator_offers(data_dir, offers)?;
         delete_hosted_secret(data_dir, offer_id)?;
+        clear_staged_hosted_key(data_dir, offer_id)?;
     }
     refresh_registered_model_provider(data_dir, registry)
         .await
@@ -1921,6 +2070,79 @@ mod hosted_hint_tests {
         assert_eq!(preserved["share"]["processor"], "OpenRouter");
         assert_eq!(preserved["share"]["payer"], "this Home");
     }
+    #[tokio::test]
+    async fn staged_hosted_key_waits_for_save_and_preserves_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "model:hosted-0123456789abcdef0123456789abcdef";
+        super::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+        super::stage_hosted_key(dir.path(), HostedAiProvider::OpenRouter, id, "first-key").unwrap();
+        assert_eq!(
+            super::staged_hosted_connections(dir.path()).unwrap(),
+            vec![(id.to_string(), "openrouter".to_string())]
+        );
+        // A later System load can find the same staged identity without saving a model.
+        super::discard_staged_hosted_key(dir.path(), id).unwrap();
+        assert!(super::staged_hosted_connections(dir.path())
+            .unwrap()
+            .is_empty());
+        assert!(super::read_hosted_secret(dir.path(), id).unwrap().is_none());
+        super::stage_hosted_key(dir.path(), HostedAiProvider::OpenRouter, id, "first-key").unwrap();
+        assert_eq!(
+            super::hosted_key_for_save(dir.path(), HostedAiProvider::OpenRouter, Some(id), "")
+                .unwrap(),
+            "first-key"
+        );
+        assert!(super::read_hosted_secret(dir.path(), id).unwrap().is_none());
+        super::save_hosted_offer(
+            dir.path(),
+            None,
+            super::HostedOfferSave {
+                provider: HostedAiProvider::OpenRouter,
+                api_key: "first-key",
+                model: "fixture/model",
+                expected_response_model: None,
+                privacy: None,
+                name: "Fixture",
+                instance_id: Some(id),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!super::staged_hosted_key_present(dir.path(), id));
+        assert!(super::staged_hosted_connections(dir.path())
+            .unwrap()
+            .is_empty());
+        assert!(super::offer_uses_connection_authority(dir.path(), id).unwrap());
+        super::stage_hosted_key(dir.path(), HostedAiProvider::OpenRouter, id, "next-key").unwrap();
+        assert_eq!(
+            super::read_hosted_secret(dir.path(), id)
+                .unwrap()
+                .as_deref(),
+            Some("first-key")
+        );
+        assert_eq!(
+            super::hosted_key_for_save(dir.path(), HostedAiProvider::OpenRouter, Some(id), "")
+                .unwrap(),
+            "next-key"
+        );
+        assert!(super::stage_hosted_key(
+            dir.path(),
+            HostedAiProvider::Venice,
+            id,
+            "wrong-provider"
+        )
+        .is_err());
+        super::discard_staged_hosted_key(dir.path(), id).unwrap();
+        assert!(super::staged_hosted_connections(dir.path())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            super::hosted_key_for_save(dir.path(), HostedAiProvider::OpenRouter, Some(id), "")
+                .unwrap(),
+            "first-key"
+        );
+    }
+
     #[tokio::test]
     async fn editing_jev_preserves_evaluator_selection_and_other_instances() {
         let dir = tempfile::tempdir().unwrap();

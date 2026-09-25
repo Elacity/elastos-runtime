@@ -549,7 +549,7 @@ struct HomeAppearanceSummary {
 struct InboxSummaryResponse {
     app: HomeCapsuleIdentity,
     notifications: HomeNotificationsSummary,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     hosted_routes: Vec<super::model_provider_egress_decision::HostedRouteSummary>,
 }
 

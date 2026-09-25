@@ -918,7 +918,8 @@
         if (!route || !/^[a-zA-Z0-9:-]{1,128}$/.test(route.id || "")
           || !["pending", "approved", "denied", "ended", "expired"].includes(route.status)) continue;
         const status = route.status[0].toUpperCase() + route.status.slice(1);
-        const expires = Number.isSafeInteger(route.expires_at)
+        const expires = route.connection && route.expires_at === 0
+          ? "Until End or configuration change" : Number.isSafeInteger(route.expires_at)
           ? new Date(route.expires_at * 1000).toLocaleString() : "Unavailable";
         const actionId = route.status === "pending" ? `model-egress-approve:${route.id}`
           : route.status === "approved" ? `model-egress-end:${route.id}` : "";
@@ -926,8 +927,10 @@
           id: `external-http-request:${route.id}`,
           kind: route.status === "pending" ? "hosted_route_decision" : "hosted_route_history",
           source_app: String(route.offer_id || "").startsWith("validation:") ? "system" : "assistant",
-          title: `${route.provider || "Hosted model"} route · ${status}`,
-          body: `Provider: ${route.provider || "Hosted model"}\nRoute: ${route.method || ""} ${route.origin || ""}${route.path || ""}\nExact URL SHA-256: ${route.url_sha256 || ""}\nOrigin: ${route.origin || ""}\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nPurpose: ${route.purpose || ""}\nExpires: ${expires}`,
+          title: `${route.provider || "Hosted model"} ${route.connection ? "connection" : "route"} · ${status}`,
+          body: route.connection
+            ? `Provider: ${route.provider || "Hosted model"}\nApproved HTTPS origin: ${route.origin || ""}\nRuntime may check the key and send configured Assistant model prompts or Jev decisions to its pinned provider routes at this origin. Runtime checks each route and effect before dispatch. The key stays on this Home.\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nExpires: ${expires}`
+            : `Provider: ${route.provider || "Hosted model"}\nRoute: ${route.method || ""} ${route.origin || ""}${route.path || ""}\nExact URL SHA-256: ${route.url_sha256 || ""}\nOrigin: ${route.origin || ""}\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nPurpose: ${route.purpose || ""}\nExpires: ${expires}`,
           severity: route.status === "pending" ? "attention" : "info",
           read: true,
           created_at: route.requested_at,

@@ -24,7 +24,7 @@ use super::model_provider_config::{
     read_hosted_job_bindings, read_hosted_secret, write_hosted_egress_grants,
     write_hosted_job_bindings,
 };
-use super::model_provider_egress_decision::{self, EgressScope};
+use super::model_provider_egress_decision::{self, ActiveDecision, ConnectionScope, EgressScope};
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, allow(dead_code))]
@@ -166,6 +166,7 @@ fn configuration_id_with_fixture_ca(base: String, ca_pem: Option<&str>) -> Strin
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_validation(
     data_dir: &Path,
     endpoint: ValidationEndpoint,
@@ -174,7 +175,28 @@ pub(crate) async fn fetch_validation(
 ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
     tokio::time::timeout(
         Duration::from_secs(20),
-        fetch_validation_inner(data_dir, endpoint, api_key, owner_proof_binding_id),
+        fetch_validation_inner(data_dir, endpoint, api_key, owner_proof_binding_id, None),
+    )
+    .await?
+}
+
+#[cfg(not(test))]
+pub(crate) async fn fetch_validation_for_connection(
+    data_dir: &Path,
+    endpoint: ValidationEndpoint,
+    api_key: &str,
+    owner_proof_binding_id: &str,
+    connection_id: &str,
+) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_validation_inner(
+            data_dir,
+            endpoint,
+            api_key,
+            owner_proof_binding_id,
+            Some(connection_id),
+        ),
     )
     .await?
 }
@@ -184,6 +206,7 @@ async fn fetch_validation_inner(
     endpoint: ValidationEndpoint,
     api_key: &str,
     owner_proof_binding_id: &str,
+    connection_id: Option<&str>,
 ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
     if api_key.trim().is_empty() || api_key.len() > 8192 {
         anyhow::bail!("hosted validation key unavailable");
@@ -233,20 +256,29 @@ async fn fetch_validation_inner(
         "hosted validation destination unavailable"
     );
     anyhow::ensure!(
-        !(operator_hosted_ended(data_dir)
+        !(connection_id.is_none()
+            && operator_hosted_ended(data_dir)
             && public_validation_destination_allowed(endpoint, &destination)),
         "owner ended hosted HTTPS"
     );
-    let (offer_id, effect) = endpoint.grant_binding();
+    let (validation_offer_id, effect) = endpoint.grant_binding();
+    let operator_route = operator_hosted_validation_route(
+        data_dir,
+        validation_offer_id,
+        effect,
+        "GET",
+        &destination,
+    );
+    let offer_id = if operator_route {
+        validation_offer_id
+    } else {
+        connection_id.unwrap_or(validation_offer_id)
+    };
     let scope = egress_scope(offer_id, effect, "GET", &destination)?;
-    let operator_route =
-        operator_hosted_validation_route(data_dir, offer_id, effect, "GET", &destination);
     if !operator_route
-        && model_provider_egress_decision::active(data_dir, &scope, Some(owner_proof_binding_id))
-            .is_err()
+        && active_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id)).is_err()
     {
-        let _ =
-            model_provider_egress_decision::request(data_dir, &scope, Some(owner_proof_binding_id));
+        request_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id))?;
         anyhow::bail!("hosted egress requires an Inbox decision");
     }
     if !operator_route {
@@ -415,7 +447,9 @@ async fn handle(
     {
         return deny(&mut stream).await;
     }
-    if operator_hosted_ended(data_dir) && public_effect_destination_allowed(&request, &destination)
+    if operator_hosted_ended(data_dir)
+        && public_effect_destination_allowed(&request, &destination)
+        && !uses_connection_authority(data_dir, &request.offer_id, &request.effect).unwrap_or(false)
     {
         return deny(&mut stream).await;
     }
@@ -435,9 +469,19 @@ async fn handle(
         request.method.as_str(),
         &destination,
     );
-    if !operator_route && model_provider_egress_decision::active(data_dir, &scope, None).is_err() {
-        let _ = model_provider_egress_decision::request(data_dir, &scope, None);
-        return deny(&mut stream).await;
+    if !operator_route && active_decision(data_dir, &scope, &destination, None).is_err() {
+        let prior = refusal_state(data_dir, &scope, &destination).ok().flatten();
+        let requested = request_decision(data_dir, &scope, &destination, None);
+        let state = if prior == Some("ended") && requested.is_ok() {
+            Some("ended")
+        } else if requested.is_ok() {
+            Some("pending")
+        } else if prior == Some("denied") {
+            Some("denied")
+        } else {
+            None
+        };
+        return deny_access(&mut stream, state).await;
     }
     if !operator_route
         && create_grant_after_decision(
@@ -756,6 +800,151 @@ fn egress_scope(
     })
 }
 
+fn connection_scope(
+    scope: &EgressScope,
+    destination: &Destination,
+) -> anyhow::Result<ConnectionScope> {
+    let credential = destination
+        .credential
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("hosted connection key unavailable"))?;
+    let revision = hex::encode(Sha256::digest(serde_json::to_vec(&(
+        // Bump when Runtime expands the hosted route/effect allowlist.
+        "hosted-connection-policy-v1:validate_models,validate_access,text,responses,decisions",
+        scope.provider.as_str(),
+        scope.origin.as_str(),
+        credential,
+        destination.fixture_ca_pem.as_deref(),
+    ))?));
+    Ok(ConnectionScope {
+        version: 1,
+        offer_id: scope.offer_id.clone(),
+        provider: scope.provider.clone(),
+        origin: scope.origin.clone(),
+        revision,
+    })
+}
+
+pub(crate) fn saved_connection_state(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<&'static str> {
+    if !super::model_provider_config::offer_uses_connection_authority(data_dir, offer_id)? {
+        return model_provider_egress_decision::offer_state(data_dir, offer_id);
+    }
+    let offers = load_model_provider_operator_offers(data_dir)?;
+    let offer = offers
+        .iter()
+        .find(|offer| offer["id"] == offer_id)
+        .ok_or_else(|| anyhow::anyhow!("hosted offer unavailable"))?;
+    let adapter = &offer["adapter"];
+    let mut raw = adapter["api_url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("hosted URL unavailable"))?
+        .to_string();
+    let fixtures = load_hosted_validate_fixtures(data_dir)?;
+    if adapter["kind"] == "open_ai_compatible_text" {
+        if let Some(fixtures) = fixtures.as_ref() {
+            let fixture_url = match adapter["hosted"]["backend_provider_label"].as_str() {
+                Some("OpenRouter") => fixtures.openrouter_chat_url.as_ref(),
+                Some("Venice") => fixtures.venice_chat_url.as_ref(),
+                _ => None,
+            };
+            if let Some(fixture_url) = fixture_url {
+                raw = fixture_url.as_str().to_string();
+            }
+        }
+    }
+    let url = Url::parse(&raw)?;
+    let fixture_ca_pem = if url.scheme() == "https" && url.host_str() == Some("127.0.0.1") {
+        fixtures
+            .as_ref()
+            .and_then(|fixture| fixture.loopback_ca_pem.clone())
+    } else {
+        None
+    };
+    let credential = read_hosted_secret(data_dir, offer_id)?;
+    let destination = Destination {
+        url,
+        grant_url: raw,
+        credential,
+        job_backend_id: None,
+        provider: adapter["hosted"]["backend_provider_label"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("hosted provider unavailable"))?
+            .to_string(),
+        configuration_id: hex::encode(Sha256::digest(serde_json::to_vec(adapter)?)),
+        fixture_ca_pem,
+    };
+    let scope = egress_scope(offer_id, "text", "POST", &destination)?;
+    model_provider_egress_decision::connection_state(
+        data_dir,
+        &scope,
+        &connection_scope(&scope, &destination)?,
+    )
+}
+
+fn uses_connection_authority(
+    data_dir: &Path,
+    offer_id: &str,
+    effect: &str,
+) -> anyhow::Result<bool> {
+    if !offer_id.starts_with("model:hosted-") {
+        return Ok(false);
+    }
+    if matches!(effect, "validate_models" | "validate_access") {
+        return Ok(true);
+    }
+    super::model_provider_config::offer_uses_connection_authority(data_dir, offer_id)
+}
+
+fn active_decision(
+    data_dir: &Path,
+    scope: &EgressScope,
+    destination: &Destination,
+    proof: Option<&str>,
+) -> anyhow::Result<ActiveDecision> {
+    if uses_connection_authority(data_dir, &scope.offer_id, &scope.effect)? {
+        model_provider_egress_decision::active_connection(
+            data_dir,
+            scope,
+            &connection_scope(scope, destination)?,
+            proof,
+        )
+    } else {
+        model_provider_egress_decision::active(data_dir, scope, proof)
+    }
+}
+
+fn request_decision(
+    data_dir: &Path,
+    scope: &EgressScope,
+    destination: &Destination,
+    proof: Option<&str>,
+) -> anyhow::Result<String> {
+    if uses_connection_authority(data_dir, &scope.offer_id, &scope.effect)? {
+        model_provider_egress_decision::request_connection(
+            data_dir,
+            scope,
+            &connection_scope(scope, destination)?,
+            proof,
+        )
+    } else {
+        model_provider_egress_decision::request(data_dir, scope, proof)
+    }
+}
+
+fn refusal_state(
+    data_dir: &Path,
+    scope: &EgressScope,
+    destination: &Destination,
+) -> anyhow::Result<Option<&'static str>> {
+    let connection = uses_connection_authority(data_dir, &scope.offer_id, &scope.effect)?
+        .then(|| connection_scope(scope, destination))
+        .transpose()?;
+    model_provider_egress_decision::refusal_state(data_dir, scope, connection.as_ref())
+}
+
 // An explicit Mac owner installation can keep its configured public hosted
 // routes available while the permanent per-route consent flow is completed.
 // Runtime still selects every URL and credential; this never gives the
@@ -957,7 +1146,7 @@ fn create_grant_after_decision(
     run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
     let scope = egress_scope(offer_id, effect, method, destination)?;
-    let decision = model_provider_egress_decision::active(data_dir, &scope, current_admin_proof)?;
+    let decision = active_decision(data_dir, &scope, destination, current_admin_proof)?;
     let _guard = EGRESS_GRANTS
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1008,6 +1197,7 @@ fn current_grant_for(
     run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
     if operator_hosted_ended(data_dir)
+        && !uses_connection_authority(data_dir, offer_id, effect)?
         && (public_effect_route_allowed(effect, method, destination)
             || operator_validation_endpoint(
                 offer_id,
@@ -1025,7 +1215,7 @@ fn current_grant_for(
         return Ok(());
     }
     let scope = egress_scope(offer_id, effect, method, destination)?;
-    let decision = model_provider_egress_decision::active(data_dir, &scope, current_admin_proof)?;
+    let decision = active_decision(data_dir, &scope, destination, current_admin_proof)?;
     let file = grant_file(data_dir)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let host = destination
@@ -1650,8 +1840,18 @@ fn invalid_request() -> io::Error {
 
 async fn deny(stream: &mut UnixStream) -> io::Result<()> {
     stream
-        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .write_all(b"HTTP/1.1 403 Forbidden\r\nX-Elastos-Hosted-Access: refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await
+}
+
+async fn deny_access(stream: &mut UnixStream, state: Option<&str>) -> io::Result<()> {
+    let response = match state {
+        Some("pending") => b"HTTP/1.1 403 Forbidden\r\nX-Elastos-Hosted-Access: pending\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        Some("denied") => b"HTTP/1.1 403 Forbidden\r\nX-Elastos-Hosted-Access: denied\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        Some("ended") => b"HTTP/1.1 403 Forbidden\r\nX-Elastos-Hosted-Access: ended\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        _ => return deny(stream).await,
+    };
+    stream.write_all(response).await
 }
 
 async fn unavailable(stream: &mut UnixStream) -> io::Result<()> {
@@ -2014,6 +2214,337 @@ mod tests {
         assert!(
             model_provider_egress_decision::request(dir.path(), &rotated_scope, Some(&proof))
                 .is_err()
+        );
+    }
+
+    // One staged connection authorizes only its approved origin and revision.
+    #[test]
+    fn sec1_same_origin_effect_scopes_need_connection_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        let validation = validation_fixture(
+            "https://127.0.0.1:9999/models",
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        let text = Destination {
+            url: Url::parse("https://127.0.0.1:9999/chat").unwrap(),
+            grant_url: "https://127.0.0.1:9999/chat".into(),
+            credential: Some("fixture-key".into()),
+            job_backend_id: None,
+            provider: validation.provider.clone(),
+            configuration_id: validation.configuration_id.clone(),
+            fixture_ca_pem: None,
+        };
+        let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let validation_scope =
+            egress_scope(offer_id, "validate_models", "GET", &validation).unwrap();
+        let text_scope = egress_scope(offer_id, "text", "POST", &text).unwrap();
+        let connection = connection_scope(&validation_scope, &validation).unwrap();
+        let id = model_provider_egress_decision::request_connection(
+            dir.path(),
+            &validation_scope,
+            &connection,
+            Some(&proof),
+        )
+        .unwrap();
+        let retried = model_provider_egress_decision::request_connection(
+            dir.path(),
+            &validation_scope,
+            &connection,
+            Some(&proof),
+        )
+        .unwrap();
+        assert_eq!(retried, id);
+        model_provider_egress_decision::approve(dir.path(), &id, &proof).unwrap();
+        assert!(
+            model_provider_egress_decision::active_connection(
+                dir.path(),
+                &text_scope,
+                &connection_scope(&text_scope, &text).unwrap(),
+                Some(&proof),
+            )
+            .is_ok(),
+            "connection authority should cover distinct effects at its exact origin"
+        );
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![json!({
+                "id": offer_id,
+                "adapter": {"hosted": {"egress_contract": "connection-v1"}}
+            })],
+        )
+        .unwrap();
+        create_grant_after_decision(dir.path(), offer_id, "text", "POST", &text, None, None)
+            .unwrap();
+        current_grant_for(dir.path(), offer_id, "text", "POST", &text, None, None).unwrap();
+        let mut changed = text;
+        changed.credential = Some("rotated-key".into());
+        let changed_scope = egress_scope(offer_id, "text", "POST", &changed).unwrap();
+        assert!(model_provider_egress_decision::active_connection(
+            dir.path(),
+            &changed_scope,
+            &connection_scope(&changed_scope, &changed).unwrap(),
+            Some(&proof),
+        )
+        .is_err());
+        assert!(
+            current_grant_for(dir.path(), offer_id, "text", "POST", &changed, None, None).is_err()
+        );
+    }
+
+    // End preserves history; the next explicit request starts a new pending ID.
+    #[test]
+    fn sec1_end_allows_fresh_pending_for_same_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![],
+        )
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        let destination = validation_fixture(
+            "https://127.0.0.1:9999/models",
+            "fixture-key",
+            ValidationEndpoint::OpenRouterModels,
+        );
+        let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        super::super::model_provider_config::stage_hosted_key(
+            dir.path(),
+            crate::api::HostedAiProvider::OpenRouter,
+            offer_id,
+            "fixture-key",
+        )
+        .unwrap();
+        let scope = egress_scope(offer_id, "validate_models", "GET", &destination).unwrap();
+        let connection = connection_scope(&scope, &destination).unwrap();
+        let first = model_provider_egress_decision::request_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof),
+        )
+        .unwrap();
+        assert_eq!(
+            refusal_state(dir.path(), &scope, &destination).unwrap(),
+            Some("pending")
+        );
+        let staged = serde_json::to_value(
+            model_provider_egress_decision::staged_connections(dir.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged[0]["status"], "pending");
+        model_provider_egress_decision::approve(dir.path(), &first, &proof).unwrap();
+        let staged = serde_json::to_value(
+            model_provider_egress_decision::staged_connections(dir.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged[0]["status"], "approved");
+        create_grant_after_decision(
+            dir.path(),
+            offer_id,
+            "validate_models",
+            "GET",
+            &destination,
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+        current_grant_for(
+            dir.path(),
+            offer_id,
+            "validate_models",
+            "GET",
+            &destination,
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+        model_provider_egress_decision::end_decision(dir.path(), &first, &proof).unwrap();
+        assert_eq!(
+            refusal_state(dir.path(), &scope, &destination).unwrap(),
+            Some("ended")
+        );
+        assert!(current_grant_for(
+            dir.path(),
+            offer_id,
+            "validate_models",
+            "GET",
+            &destination,
+            Some(&proof),
+            None,
+        )
+        .is_err());
+        let staged = serde_json::to_value(
+            model_provider_egress_decision::staged_connections(dir.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged[0]["status"], "ended");
+        assert!(model_provider_egress_decision::active_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof)
+        )
+        .is_err());
+        let next = model_provider_egress_decision::request_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof),
+        )
+        .expect("next explicit attempt should create a pending Inbox decision");
+        assert_ne!(next, first);
+        assert_eq!(
+            refusal_state(dir.path(), &scope, &destination).unwrap(),
+            Some("pending")
+        );
+        let history = serde_json::to_value(
+            model_provider_egress_decision::inbox_history(dir.path()).unwrap(),
+        )
+        .unwrap();
+        let history = history.as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history
+            .iter()
+            .any(|entry| entry["id"] == first && entry["status"] == "ended"));
+        assert!(history
+            .iter()
+            .any(|entry| entry["id"] == next && entry["status"] == "pending"));
+        model_provider_egress_decision::deny(dir.path(), &next, &proof).unwrap();
+        assert_eq!(
+            refusal_state(dir.path(), &scope, &destination).unwrap(),
+            Some("denied")
+        );
+        assert!(model_provider_egress_decision::request_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn sec1_broker_refusal_header_is_only_on_owner_access_response() {
+        for (state, marker) in [
+            (Some("pending"), Some("X-Elastos-Hosted-Access: pending")),
+            (Some("denied"), Some("X-Elastos-Hosted-Access: denied")),
+            (Some("ended"), Some("X-Elastos-Hosted-Access: ended")),
+            (None, Some("X-Elastos-Hosted-Access: refused")),
+        ] {
+            let (mut broker, mut peer) = UnixStream::pair().unwrap();
+            deny_access(&mut broker, state).await.unwrap();
+            broker.shutdown().await.unwrap();
+            let mut response = String::new();
+            peer.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+            assert_eq!(
+                response.contains("X-Elastos-Hosted-Access:"),
+                marker.is_some()
+            );
+            if let Some(marker) = marker {
+                assert!(response.contains(marker));
+            }
+        }
+        let (mut broker, mut peer) = UnixStream::pair().unwrap();
+        write_response_head(
+            &mut broker,
+            reqwest::StatusCode::FORBIDDEN,
+            "application/json",
+        )
+        .await
+        .unwrap();
+        broker.shutdown().await.unwrap();
+        let mut response = String::new();
+        peer.read_to_string(&mut response).await.unwrap();
+        assert!(!response.contains("X-Elastos-Hosted-Access:"));
+    }
+
+    #[tokio::test]
+    async fn sec1_model_selection_keeps_connection_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let save = |model| super::super::model_provider_config::HostedOfferSave {
+            provider: crate::api::HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model,
+            expected_response_model: None,
+            privacy: None,
+            name: "Fixture",
+            instance_id: Some(offer_id),
+        };
+        super::super::model_provider_config::save_hosted_offer(
+            dir.path(),
+            None,
+            save("fixture/one"),
+        )
+        .await
+        .unwrap();
+        let proof = admin_proof(dir.path());
+        let destination = Destination {
+            url: Url::parse(OPENROUTER_CHAT_URL).unwrap(),
+            grant_url: OPENROUTER_CHAT_URL.into(),
+            credential: Some("fixture-key".into()),
+            job_backend_id: None,
+            provider: "OpenRouter".into(),
+            configuration_id: "a".repeat(64),
+            fixture_ca_pem: None,
+        };
+        let scope = egress_scope(offer_id, "text", "POST", &destination).unwrap();
+        let connection = connection_scope(&scope, &destination).unwrap();
+        let id = model_provider_egress_decision::request_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof),
+        )
+        .unwrap();
+        model_provider_egress_decision::approve(dir.path(), &id, &proof).unwrap();
+        assert_eq!(
+            saved_connection_state(dir.path(), offer_id).unwrap(),
+            "approved"
+        );
+        assert!(model_provider_egress_decision::active_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof),
+        )
+        .is_ok());
+        super::super::model_provider_config::save_hosted_offer(
+            dir.path(),
+            None,
+            save("fixture/two"),
+        )
+        .await
+        .unwrap();
+        assert!(model_provider_egress_decision::active_connection(
+            dir.path(),
+            &scope,
+            &connection,
+            Some(&proof),
+        )
+        .is_ok());
+        assert_eq!(
+            saved_connection_state(dir.path(), offer_id).unwrap(),
+            "approved"
+        );
+        let rotated = super::super::model_provider_config::HostedOfferSave {
+            api_key: "rotated-key",
+            ..save("fixture/two")
+        };
+        super::super::model_provider_config::save_hosted_offer(dir.path(), None, rotated)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved_connection_state(dir.path(), offer_id).unwrap(),
+            "none"
         );
     }
 
@@ -2453,6 +2984,7 @@ mod tests {
         let mut denial = String::new();
         denied_peer.read_to_string(&mut denial).await.unwrap();
         assert!(denial.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(denial.contains("X-Elastos-Hosted-Access: refused"));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), sink.accept())
                 .await
@@ -2468,6 +3000,7 @@ mod tests {
         let mut denial = String::new();
         denied_peer.read_to_string(&mut denial).await.unwrap();
         assert!(denial.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(denial.contains("X-Elastos-Hosted-Access: refused"));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), sink.accept())
                 .await
@@ -2478,7 +3011,7 @@ mod tests {
             let mut bytes = vec![0u8; 4096];
             let count = socket.read(&mut bytes).await.unwrap();
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
-            String::from_utf8_lossy(&bytes[..count]).to_string()
+            (sink, String::from_utf8_lossy(&bytes[..count]).to_string())
         });
         let (mut broker_side, mut provider_side) = UnixStream::pair().unwrap();
         forward(&mut broker_side, dir.path(), &request, &destination, || {
@@ -2490,7 +3023,7 @@ mod tests {
         let mut response = String::new();
         provider_side.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let observed = sink_task.await.unwrap();
+        let (sink, observed) = sink_task.await.unwrap();
         assert!(observed.starts_with("POST /openrouter/api/v1/chat/completions "));
         assert!(!observed.contains("wrong/model"));
         assert!(
@@ -2517,6 +3050,19 @@ mod tests {
         model_provider_egress_decision::end_offer(dir.path(), &request.offer_id).unwrap();
         assert!(current_grant(dir.path(), &request, &destination).is_err());
         assert!(current_grant(dir.path(), &continued, &destination).is_err());
+        let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
+        forward(&mut denied, dir.path(), &continued, &destination, || true)
+            .await
+            .unwrap();
+        denied.shutdown().await.unwrap();
+        let mut denial = String::new();
+        denied_peer.read_to_string(&mut denial).await.unwrap();
+        assert!(denial.contains("X-Elastos-Hosted-Access: refused"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
         let mut other = EffectRequest {
             effect: "decisions".into(),
             ..request
