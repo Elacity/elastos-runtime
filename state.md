@@ -1,5 +1,25 @@
 # State
 
+## SEC1 Mac actual guard canary check, 25 September 2026 UTC
+
+An isolated diagnostic copy of the model provider ran its ordinary re-exec
+guard before a SmolLM2 reply. The guard continued only when read and write-only
+opens of one unrelated owner-only canary both returned `EPERM`. The broker run
+completed with a nonempty terminal reply. The same user could open that
+canary for both modes outside the sandbox. A temporary exact canary-read
+allow rule changed the paired run to `backend_failed` after preparation and
+dispatch. This is strong causal evidence for read denial; the successful
+guard condition requires both denials. Source, diagnostic binary and test
+executable hashes were restored or matched after the experiment. Independent
+review found no blocker for this bounded claim.
+
+The diagnostic binary and fixture belong only to the isolated proof target.
+The normal provider did not execute the canary check. Engine-side canary
+denial, other paths, full inherited-descriptor custody and signed-in Home
+behavior remain open. The ignored receipt
+`.audit/sec1-mac-actual-guard-denial.private.md` records exact hashes,
+commands and proof limits. Public and human Homes were unchanged.
+
 ## SEC1 Mac isolated provider reply, 25 September 2026 UTC
 
 The dirty Mac child-policy candidate now completes one short SmolLM2 reply
