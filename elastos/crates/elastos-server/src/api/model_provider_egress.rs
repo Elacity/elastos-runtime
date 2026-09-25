@@ -2,12 +2,13 @@
 //! The provider names an offer and effect; Runtime selects the destination,
 //! checks current owner authority, and adds the stored credential.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use elastos_runtime::provider::ProviderBridge;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, OwnedRwLockWriteGuard, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -75,6 +76,97 @@ enum DestinationClass {
 type JobCreateKey = (String, String, String);
 static JOB_CREATES: OnceLock<Mutex<HashSet<JobCreateKey>>> = OnceLock::new();
 static EGRESS_GRANTS: OnceLock<Mutex<()>> = OnceLock::new();
+const OPERATOR_ADMISSION_KEY: &str = "\0operator-hosted";
+type AdmissionKey = (PathBuf, String);
+static ADMISSION_GATES: OnceLock<Mutex<HashMap<AdmissionKey, Weak<AdmissionGate>>>> =
+    OnceLock::new();
+
+struct AdmissionGate {
+    lock: Arc<RwLock<()>>,
+    ending: AtomicUsize,
+    changed: watch::Sender<u64>,
+}
+
+pub(crate) struct HostedEndGuard {
+    gate: Arc<AdmissionGate>,
+    _lock: OwnedRwLockWriteGuard<()>,
+}
+
+struct PendingEnd {
+    gate: Arc<AdmissionGate>,
+    active: bool,
+}
+
+impl Drop for PendingEnd {
+    fn drop(&mut self) {
+        if self.active {
+            self.gate.ending.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for HostedEndGuard {
+    fn drop(&mut self) {
+        self.gate.ending.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn admission_gate(data_dir: &Path, offer_id: &str) -> Arc<AdmissionGate> {
+    let gates = ADMISSION_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (data_dir.to_path_buf(), offer_id.to_string());
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let (changed, _) = watch::channel(0);
+    let gate = Arc::new(AdmissionGate {
+        lock: Arc::new(RwLock::new(())),
+        ending: AtomicUsize::new(0),
+        changed,
+    });
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+#[cfg(test)]
+pub(super) struct HeldAdmissionForTest {
+    _gate: Arc<AdmissionGate>,
+    _read: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+#[cfg(test)]
+pub(super) async fn hold_admission_for_test(
+    data_dir: &Path,
+    offer_id: &str,
+) -> HeldAdmissionForTest {
+    let gate = admission_gate(data_dir, offer_id);
+    let read = gate.lock.clone().read_owned().await;
+    HeldAdmissionForTest {
+        _gate: gate,
+        _read: read,
+    }
+}
+
+/// Signal admitted sends first; End commits only after they release admission.
+pub(crate) async fn begin_hosted_end(data_dir: &Path, offer_id: &str) -> HostedEndGuard {
+    let gate = admission_gate(data_dir, offer_id);
+    gate.ending.fetch_add(1, Ordering::AcqRel);
+    let mut pending = PendingEnd {
+        gate: gate.clone(),
+        active: true,
+    };
+    gate.changed
+        .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    let lock = gate.lock.clone().write_owned().await;
+    pending.active = false;
+    HostedEndGuard { gate, _lock: lock }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn begin_operator_hosted_end(data_dir: &Path) -> HostedEndGuard {
+    begin_hosted_end(data_dir, OPERATOR_ADMISSION_KEY).await
+}
 
 struct JobCreateReservation(JobCreateKey);
 
@@ -278,6 +370,9 @@ async fn fetch_validation_inner(
     if !operator_route
         && active_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id)).is_err()
     {
+        let _decision = model_provider_egress_decision::transition_gate()
+            .lock()
+            .await;
         request_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id))?;
         anyhow::bail!("hosted egress requires an Inbox decision");
     }
@@ -292,6 +387,28 @@ async fn fetch_validation_inner(
             None,
         )?;
     }
+    let operator_gate = operator_end_affects(data_dir, offer_id, effect, "GET", &destination)
+        .unwrap_or(true)
+        .then(|| admission_gate(data_dir, OPERATOR_ADMISSION_KEY));
+    let operator_admission = match &operator_gate {
+        Some(gate) => Some(gate.lock.read().await),
+        None => None,
+    };
+    let mut operator_ended = operator_gate.as_ref().map(|gate| gate.changed.subscribe());
+    if let Some(ended) = &mut operator_ended {
+        ended.borrow_and_update();
+    }
+    let gate = admission_gate(data_dir, offer_id);
+    let admission = gate.lock.read().await;
+    let mut ended = gate.changed.subscribe();
+    ended.borrow_and_update();
+    anyhow::ensure!(
+        gate.ending.load(Ordering::Acquire) == 0
+            && operator_gate
+                .as_ref()
+                .is_none_or(|gate| gate.ending.load(Ordering::Acquire) == 0),
+        "hosted access is ending"
+    );
     current_grant_for(
         data_dir,
         offer_id,
@@ -325,6 +442,15 @@ async fn fetch_validation_inner(
     let mut monitor = tokio::time::interval(Duration::from_millis(250));
     let mut response = loop {
         tokio::select! {
+            biased;
+            _ = ended.changed() => anyhow::bail!("hosted access ended during send"),
+            _ = async {
+                if let Some(ended) = &mut operator_ended {
+                    let _ = ended.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => anyhow::bail!("operator hosted access ended during send"),
             result = &mut send => break result?,
             _ = monitor.tick() => current_grant_for(
                 data_dir, offer_id, effect, "GET", &destination,
@@ -332,6 +458,8 @@ async fn fetch_validation_inner(
             )?,
         }
     };
+    drop(admission);
+    drop(operator_admission);
     if response.status().is_redirection() {
         anyhow::bail!("hosted validation redirect denied");
     }
@@ -476,6 +604,9 @@ async fn handle(
         &destination,
     );
     if !operator_route && active_decision(data_dir, &scope, &destination, None).is_err() {
+        let _decision = model_provider_egress_decision::transition_gate()
+            .lock()
+            .await;
         let prior = refusal_state(data_dir, &scope, &destination).ok().flatten();
         let requested = request_decision(data_dir, &scope, &destination, None);
         let state = if prior == Some("ended") && requested.is_ok() {
@@ -994,7 +1125,10 @@ fn operator_hosted_ended(data_dir: &Path) -> bool {
     }
 }
 
-pub(crate) fn end_operator_hosted_access(data_dir: &Path, offer_id: &str) -> anyhow::Result<bool> {
+pub(crate) fn operator_hosted_end_applicable(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<bool> {
     if !cfg!(target_os = "macos") || !operator_hosted_owner(data_dir) {
         return Ok(false);
     }
@@ -1003,6 +1137,13 @@ pub(crate) fn end_operator_hosted_access(data_dir: &Path, offer_id: &str) -> any
             .iter()
             .any(|offer| offer["id"] == offer_id)
     {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(crate) fn end_operator_hosted_access(data_dir: &Path, offer_id: &str) -> anyhow::Result<bool> {
+    if !operator_hosted_end_applicable(data_dir, offer_id)? {
         return Ok(false);
     }
     if operator_hosted_ended(data_dir) {
@@ -1216,15 +1357,7 @@ fn current_grant_for(
     run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
     if operator_hosted_ended(data_dir)
-        && !uses_connection_authority(data_dir, offer_id, effect)?
-        && (public_effect_route_allowed(effect, method, destination)
-            || operator_validation_endpoint(
-                offer_id,
-                effect,
-                method,
-                destination.provider.as_str(),
-            )
-            .is_some_and(|endpoint| public_validation_destination_allowed(endpoint, destination)))
+        && operator_end_affects(data_dir, offer_id, effect, method, destination)?
     {
         anyhow::bail!("owner ended hosted HTTPS");
     }
@@ -1274,6 +1407,24 @@ fn current_grant_for(
         "hosted egress owner unavailable"
     );
     Ok(())
+}
+
+fn operator_end_affects(
+    data_dir: &Path,
+    offer_id: &str,
+    effect: &str,
+    method: &str,
+    destination: &Destination,
+) -> anyhow::Result<bool> {
+    Ok(!uses_connection_authority(data_dir, offer_id, effect)?
+        && (public_effect_route_allowed(effect, method, destination)
+            || operator_validation_endpoint(
+                offer_id,
+                effect,
+                method,
+                destination.provider.as_str(),
+            )
+            .is_some_and(|endpoint| public_validation_destination_allowed(endpoint, destination))))
 }
 
 fn job_creates() -> &'static Mutex<HashSet<JobCreateKey>> {
@@ -1554,11 +1705,38 @@ async fn forward(
         Ok(client) => client,
         Err(_) => return deny(stream).await,
     };
-    if !run_authorized()
+    let operator_gate = operator_end_affects(
+        data_dir,
+        &request.offer_id,
+        &request.effect,
+        request.method.as_str(),
+        destination,
+    )
+    .unwrap_or(true)
+    .then(|| admission_gate(data_dir, OPERATOR_ADMISSION_KEY));
+    let operator_admission = match &operator_gate {
+        Some(gate) => Some(gate.lock.read().await),
+        None => None,
+    };
+    let mut operator_ended = operator_gate.as_ref().map(|gate| gate.changed.subscribe());
+    if let Some(ended) = &mut operator_ended {
+        ended.borrow_and_update();
+    }
+    let gate = admission_gate(data_dir, &request.offer_id);
+    let admission = gate.lock.read().await;
+    let mut ended = gate.changed.subscribe();
+    ended.borrow_and_update();
+    if gate.ending.load(Ordering::Acquire) != 0
+        || operator_gate
+            .as_ref()
+            .is_some_and(|gate| gate.ending.load(Ordering::Acquire) != 0)
+        || !run_authorized()
         || current_grant(data_dir, request, destination).is_err()
         || (matches!(request.effect.as_str(), "job_status" | "job_cancel")
             && current_job_binding(data_dir, request, backend_id).is_err())
     {
+        drop(admission);
+        drop(operator_admission);
         return deny(stream).await;
     }
     let mut outbound = client.request(request.method.clone(), url.clone());
@@ -1570,7 +1748,11 @@ async fn forward(
         // in the provider's raw body must not select a different upstream ID.
         let body: serde_json::Value = match serde_json::from_slice(&request.body) {
             Ok(body) => body,
-            Err(_) => return deny(stream).await,
+            Err(_) => {
+                drop(admission);
+                drop(operator_admission);
+                return deny(stream).await;
+            }
         };
         outbound = outbound
             .header("content-type", "application/json")
@@ -1579,10 +1761,27 @@ async fn forward(
     if request.effect == "job_create"
         && mark_job_create_attempt(data_dir, request, backend_id).is_err()
     {
+        drop(admission);
+        drop(operator_admission);
         return deny(stream).await;
     }
-    let mut response = match outbound.send().await {
-        Ok(response) if !response.status().is_redirection() => response,
+    let sent = tokio::select! {
+        biased;
+        _ = ended.changed() => None,
+        _ = async {
+            if let Some(ended) = &mut operator_ended {
+                let _ = ended.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => None,
+        result = outbound.send() => Some(result),
+    };
+    drop(admission);
+    drop(operator_admission);
+    let mut response = match sent {
+        None => return unavailable(stream).await,
+        Some(Ok(response)) if !response.status().is_redirection() => response,
         _ => return unavailable(stream).await,
     };
     let status = response.status();
@@ -1599,7 +1798,20 @@ async fn forward(
         .to_string();
     if request.effect == "job_create" && status.is_success() {
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
+        let mut monitor = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = ended.changed() => return unavailable(stream).await,
+                _ = monitor.tick() => {
+                    if !run_authorized() || current_grant(data_dir, request, destination).is_err() {
+                        return unavailable(stream).await;
+                    }
+                    continue;
+                }
+                chunk = response.chunk() => chunk.map_err(io::Error::other)?,
+            };
+            let Some(chunk) = chunk else { break };
             if body.len().saturating_add(chunk.len()) > MAX_BODY
                 || !run_authorized()
                 || current_grant(data_dir, request, destination).is_err()
@@ -1887,6 +2099,29 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
+    #[tokio::test]
+    async fn cancelled_end_releases_pending_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = admission_gate(dir.path(), "model:fixture");
+        let read = gate.lock.read().await;
+        let mut end = Box::pin(begin_hosted_end(dir.path(), "model:fixture"));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut end)
+            .await
+            .is_err());
+        assert_eq!(gate.ending.load(Ordering::Acquire), 1);
+        drop(end);
+        assert_eq!(gate.ending.load(Ordering::Acquire), 0);
+        drop(read);
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                begin_hosted_end(dir.path(), "model:fixture"),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
     #[test]
     fn operator_hosted_end_marker_stops_all_routes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1921,6 +2156,9 @@ mod tests {
                 configuration_id: "configuration".into(),
                 fixture_ca_pem: None,
             };
+            assert!(
+                operator_end_affects(dir.path(), offer_id, effect, method, &destination,).unwrap()
+            );
             let error = current_grant_for(
                 dir.path(),
                 offer_id,
@@ -3069,7 +3307,65 @@ mod tests {
         )
         .unwrap();
         current_grant(dir.path(), &continued, &destination).unwrap();
-        model_provider_egress_decision::end_offer(dir.path(), &request.offer_id).unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let slow_sink = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut first = [0u8; 1];
+            socket.read_exact(&mut first).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            drop(socket);
+            sink
+        });
+        let (mut slow, mut slow_peer) = UnixStream::pair().unwrap();
+        let slow_send = forward(&mut slow, dir.path(), &continued, &destination, || true);
+        let end_during_send = async {
+            accepted_rx.await.unwrap();
+            let end = tokio::time::timeout(
+                Duration::from_secs(1),
+                begin_hosted_end(dir.path(), &continued.offer_id),
+            )
+            .await
+            .expect("End must cancel an unresolved send promptly");
+            drop(end);
+        };
+        let (slow_result, ()) = tokio::join!(slow_send, end_during_send);
+        slow_result.unwrap();
+        slow.shutdown().await.unwrap();
+        let mut slow_response = String::new();
+        slow_peer.read_to_string(&mut slow_response).await.unwrap();
+        assert!(slow_response.starts_with("HTTP/1.1 502 Bad Gateway"));
+        release_tx.send(()).unwrap();
+        let sink = slow_sink.await.unwrap();
+        let end = begin_hosted_end(dir.path(), &continued.offer_id).await;
+        let (mut racing, mut racing_peer) = UnixStream::pair().unwrap();
+        {
+            let racing_send = forward(&mut racing, dir.path(), &continued, &destination, || true);
+            tokio::pin!(racing_send);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut racing_send)
+                    .await
+                    .is_err(),
+                "a send must wait while End owns admission"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                    .await
+                    .is_err(),
+                "End must prevent a new upstream request before its decision write"
+            );
+            model_provider_egress_decision::end_offer(dir.path(), &request.offer_id).unwrap();
+            drop(end);
+            racing_send.await.unwrap();
+        }
+        racing.shutdown().await.unwrap();
+        let mut racing_response = String::new();
+        racing_peer
+            .read_to_string(&mut racing_response)
+            .await
+            .unwrap();
+        assert!(racing_response.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(current_grant(dir.path(), &request, &destination).is_err());
         assert!(current_grant(dir.path(), &continued, &destination).is_err());
         let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
@@ -3115,7 +3411,6 @@ mod tests {
         use elastos_runtime::provider::bridge::{
             ProviderConfig, ProviderRequest, ProviderResponse,
         };
-        use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         let proof = admin_proof(dir.path());
@@ -3206,63 +3501,27 @@ mod tests {
             Some((&run_id, request_id)),
         );
 
-        let script = dir.path().join("synthetic-provider.py");
-        fs::write(&script, r#"#!/usr/bin/python3
-import json, socket, sys
-extra = None
-for line in sys.stdin:
-    request = json.loads(line)
-    if request['op'] == 'init':
-        extra = request['config']['extra']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'runs_create':
-        approved_input = request['input']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'exists':
-        messages = json.loads(json.dumps(approved_input.get('messages', [{'role':'user','content':approved_input.get('prompt')}])))
-        path = request['path']
-        if path == 'altered':
-            messages[-1]['content'] = 'changed text'
-        elif path == 'extra-message':
-            messages.append({'role':'user','content':'extra'})
-        elif path == 'extra-field':
-            messages[0]['name'] = 'hidden'
-        elif path == 'changed-role':
-            messages[0]['role'] = 'assistant'
-        elif path == 'swapped':
-            messages[0], messages[1] = messages[1], messages[0]
-        body = json.dumps({'model':'fixture/model','stream':True,'max_tokens':32,
-                           'messages':messages}).encode()
-        if request['path'] in ('raised-cap', 'missing-cap'):
-            payload = json.loads(body)
-            if request['path'] == 'raised-cap':
-                payload['max_tokens'] = 33
-            else:
-                del payload['max_tokens']
-            body = json.dumps(payload).encode()
-        headers = ('POST /v1/hosted-effect HTTP/1.1\r\nHost: runtime.invalid\r\n'
-                   'Content-Type: application/json\r\nContent-Length: %d\r\n'
-                   'X-Elastos-Offer-Id: %s\r\nX-Elastos-Effect: text\r\n'
-                   'X-Elastos-Run-Id: %s\r\nX-Elastos-Request-Id: %s\r\n\r\n') % (
-                   len(body), extra['fixture_offer_id'], extra['fixture_run_id'], extra['fixture_request_id'])
-        with socket.socket(socket.AF_UNIX) as client:
-            client.connect(extra['runtime_hosted_socket'])
-            client.sendall(headers.encode() + body)
-            status = client.recv(1024).split(b'\r\n', 1)[0].decode()
-        print(json.dumps({'status':'ok','data':{'http_status':status}}), flush=True)
-    elif request['op'] == 'shutdown':
-        print('{"status":"ok"}', flush=True)
-        break
-"#).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let source = base.join("hosted-effect-probe.c");
+        fs::write(
+            &source,
+            include_str!("../../tests/fixtures/hosted_effect_probe.c"),
+        )
+        .unwrap();
+        let script = base.join("hosted-effect-probe");
+        assert!(std::process::Command::new("/usr/bin/clang")
+            .args(["-O2", "-Wall", "-Wextra", "-o"])
+            .arg(&script)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
         let config = ProviderConfig {
-            extra: json!({
-                "offers":[], "fixture_offer_id":offer_id, "fixture_run_id":run_id,
-                "fixture_request_id":request_id,
-            }),
+            base_path: base.to_string_lossy().into_owned(),
+            extra: json!({"offers":[], "journal_dir":base.join("providers/model-provider/journal")}),
             ..Default::default()
         };
-        let (bridge, _, _, _, hosted_listener) =
+        let (bridge, _, _, confined_config, hosted_listener) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
                 .unwrap();
@@ -3305,9 +3564,35 @@ for line in sys.stdin:
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
             }
         });
-        let probe = |path: &str| ProviderRequest::Exists {
-            path: path.into(),
-            token: String::new(),
+        let hosted_socket = confined_config.extra["runtime_hosted_socket"]
+            .as_str()
+            .unwrap();
+        let probe = |kind: &str| {
+            let mut probe_messages = messages.clone();
+            let array = probe_messages.as_array_mut().unwrap();
+            match kind {
+                "altered" => array.last_mut().unwrap()["content"] = json!("changed text"),
+                "extra-message" => array.push(json!({"role":"user","content":"extra"})),
+                "extra-field" => array[0]["name"] = json!("hidden"),
+                "changed-role" => array[0]["role"] = json!("assistant"),
+                "swapped" => array.swap(0, 1),
+                _ => {}
+            }
+            let mut body = json!({"model":"fixture/model","stream":true,
+                "max_tokens":32,"messages":probe_messages});
+            if kind == "raised-cap" {
+                body["max_tokens"] = json!(33);
+            }
+            if kind == "missing-cap" {
+                body.as_object_mut().unwrap().remove("max_tokens");
+            }
+            ProviderRequest::Exists {
+                path: format!(
+                    "{hosted_socket}|{offer_id}|{run_id}|{request_id}|{}",
+                    hex::encode(serde_json::to_vec(&body).unwrap())
+                ),
+                token: String::new(),
+            }
         };
         let changed = bridge.request(probe("altered")).await.unwrap();
         let ProviderResponse::Ok {
@@ -3460,7 +3745,7 @@ for line in sys.stdin:
             let mut bytes = vec![0u8; 4096];
             let count = socket.read(&mut bytes).await.unwrap();
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
-            String::from_utf8_lossy(&bytes[..count]).to_string()
+            (sink, String::from_utf8_lossy(&bytes[..count]).to_string())
         });
         let (status, body) = fetch_validation(
             dir.path(),
@@ -3472,13 +3757,37 @@ for line in sys.stdin:
         .unwrap();
         assert_eq!(status, reqwest::StatusCode::OK);
         assert_eq!(body, br#"{"data":[]}"#);
-        let observed = sink_task.await.unwrap();
+        let (sink, observed) = sink_task.await.unwrap();
         assert!(observed.starts_with("GET /models "));
         assert!(
             observed.contains("authorization: Bearer fixture-key")
                 || observed.contains("Authorization: Bearer fixture-key")
         );
-        model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
+        let end = begin_hosted_end(dir.path(), "validation:openrouter").await;
+        {
+            let racing = fetch_validation(
+                dir.path(),
+                ValidationEndpoint::OpenRouterModels,
+                "fixture-key",
+                &proof,
+            );
+            tokio::pin!(racing);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut racing)
+                    .await
+                    .is_err(),
+                "validation must wait while End owns admission"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                    .await
+                    .is_err(),
+                "End must prevent a new validation request"
+            );
+            model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
+            drop(end);
+            assert!(racing.await.is_err());
+        }
         assert!(fetch_validation(
             dir.path(),
             ValidationEndpoint::OpenRouterModels,

@@ -472,6 +472,16 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        let _setup = super::gateway_home_system_ai_provider::hosted_setup_gate()
+            .lock()
+            .await;
+        let _decision = crate::api::model_provider_egress_decision::transition_gate()
+            .lock()
+            .await;
+        let offer_id = crate::api::model_provider_egress_decision::endable_decision_offer_id(
+            data_dir, request_id, proof,
+        )?;
+        let _end = crate::api::model_provider_egress::begin_hosted_end(data_dir, &offer_id).await;
         crate::api::model_provider_egress_decision::end_decision(data_dir, request_id, proof)?;
         let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
         return Ok(
@@ -487,6 +497,9 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        let _decision = crate::api::model_provider_egress_decision::transition_gate()
+            .lock()
+            .await;
         crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
         let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
         return Ok(
@@ -502,6 +515,9 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        let _decision = crate::api::model_provider_egress_decision::transition_gate()
+            .lock()
+            .await;
         crate::api::model_provider_egress_decision::deny(data_dir, request_id, proof)?;
         let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
         return Ok("Denied this hosted access.".to_string());

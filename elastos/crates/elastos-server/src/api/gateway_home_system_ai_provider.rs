@@ -10,13 +10,14 @@ use std::sync::OnceLock;
 
 use super::*;
 
-fn hosted_setup_gate() -> &'static tokio::sync::Mutex<()> {
+pub(super) fn hosted_setup_gate() -> &'static tokio::sync::Mutex<()> {
     static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 async fn discard_staged_setup(data_dir: &std::path::Path, id: &str) -> anyhow::Result<()> {
     let _guard = hosted_setup_gate().lock().await;
+    let _end = crate::api::model_provider_egress::begin_hosted_end(data_dir, id).await;
     crate::api::model_provider_config::discard_staged_hosted_key(data_dir, id)
 }
 
@@ -534,6 +535,23 @@ pub(super) async fn system_approval_lens_revoke(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
+    let _setup = hosted_setup_gate().lock().await;
+    #[cfg(target_os = "macos")]
+    let operator_applies = match crate::api::model_provider_egress::operator_hosted_end_applicable(
+        &state.data_dir,
+        &req.id,
+    ) {
+        Ok(applies) => applies,
+        Err(err) => return system_error_response(err),
+    };
+    #[cfg(target_os = "macos")]
+    let _operator_end = if operator_applies {
+        Some(crate::api::model_provider_egress::begin_operator_hosted_end(&state.data_dir).await)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let _end = crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &req.id).await;
     #[cfg(unix)]
     let ended_https =
         match crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &req.id) {
@@ -543,12 +561,16 @@ pub(super) async fn system_approval_lens_revoke(
     #[cfg(not(unix))]
     let ended_https = 0;
     #[cfg(target_os = "macos")]
-    let ended_operator = match crate::api::model_provider_egress::end_operator_hosted_access(
-        &state.data_dir,
-        &req.id,
-    ) {
-        Ok(ended) => ended,
-        Err(err) => return system_error_response(err),
+    let ended_operator = if operator_applies {
+        match crate::api::model_provider_egress::end_operator_hosted_access(
+            &state.data_dir,
+            &req.id,
+        ) {
+            Ok(ended) => ended,
+            Err(err) => return system_error_response(err),
+        }
+    } else {
+        false
     };
     #[cfg(not(target_os = "macos"))]
     let ended_operator = false;
@@ -867,6 +889,7 @@ pub(super) async fn system_ai_provider_delete(
     if let Err(err) = require_system_admin(&state.data_dir, &headers) {
         return system_error_response(err);
     }
+    let _setup = hosted_setup_gate().lock().await;
     let offer_id = match resolve_hosted_instance_id(
         &state.data_dir,
         req.id.as_deref(),
@@ -875,6 +898,9 @@ pub(super) async fn system_ai_provider_delete(
         Ok(offer_id) => offer_id,
         Err(err) => return system_error_response(err),
     };
+    #[cfg(unix)]
+    let _end =
+        crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &offer_id).await;
     #[cfg(unix)]
     if let Err(err) =
         crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &offer_id)
