@@ -38,6 +38,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
       - name: cargo fmt
         working-directory: elastos
         run: cargo fmt --all -- --check
