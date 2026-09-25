@@ -1,5 +1,22 @@
 # State
 
+## SEC1 Mac staging path test, 25 September 2026 UTC
+
+A synthetic Seatbelt staging root let one sandbox child read a file added after
+it started. It blocked direct and symlink reads of the owner-only canary, but a
+same-user parent hardlinked that canary into the allowed root and the child
+could read it. Replacing a previously allowed exact pathname with a hardlink
+also let the still-running child read different bytes. No contents were printed.
+This direct policy test shows that path permission alone does not preserve the
+verified model's byte identity against same-user replacement. It did not test
+Marketplace Get, the actual provider or an installed Home.
+
+The builder made no source or installed change. The next proof is protected
+custody or Runtime-verified file descriptors against the same rename/hardlink
+case, followed by a provider-generation swap that preserves an active old run
+and immediately serves a newly admitted model. Receipt:
+`.audit/sec1-mac-staging-feasibility.private.md`. SEC1 remains open.
+
 ## SEC1 Mac file boundary feasibility, 25 September 2026 UTC
 
 The isolated Seatbelt follow-up reproduced the synthetic same-user file read
