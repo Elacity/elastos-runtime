@@ -1,5 +1,25 @@
 # State
 
+## SEC1 Mac file boundary feasibility, 25 September 2026 UTC
+
+The isolated Seatbelt follow-up reproduced the synthetic same-user file read
+under the current allow-default policy. A deny-by-default prototype allowed one
+named synthetic file and blocked the canary. It was a direct policy test, not an
+installed model-provider test. Runtime starts the provider with one immutable
+policy, but Marketplace Get can admit a model later and refresh the running
+provider in place. A fixed list of files at launch cannot include that new
+verified model. Allowing the whole preparation directory would grant access to
+unrelated files. The independent reviewer confirmed this lifecycle conflict.
+
+The builder stopped before changing source or installing a test Home. The next
+design proof must preserve immediate Get → Use while giving the model child
+access only to verified model and engine files, its journal and its approved
+broker socket. Test a Runtime-owned verified staging root or controlled provider
+generation rollover with active runs before selecting one. The private receipt
+is `.audit/sec1-mac-file-boundary-stop.private.md`. The Mac file-read gap,
+installed consent proof, concurrent End/send race and public Linux isolation
+remain open.
+
 ## SEC1 Mac confinement stop, 25 September 2026 UTC
 
 The source tested was the clean local checkout `feat/0.7.1-model-assistant-closeout` at
