@@ -1,5 +1,33 @@
 # State
 
+## SEC1 Mac isolated provider reply, 25 September 2026 UTC
+
+The dirty Mac child-policy candidate now completes one short SmolLM2 reply
+through the isolated Runtime broker, original copied model provider, guard and
+pinned b10516 engine. The terminal journal contains prepared, dispatched,
+text_delta and output events. Its record SHA-256 is `635ce643bc14087ee219e62608d1d1d0e7df4ab497ccb71e0f08de5d9ae4378c`;
+the nonempty output SHA-256 is `15109fd56bed6f3840b20392b9a95f621e0c81a7f1eaef82dff55d8f944d2c1a`.
+The copied provider, engine and SmolLM2 GGUF hashes stayed fixed. The
+candidate remains uncommitted and uninstalled. The isolated Rust broker test
+is not a signed-in Home acceptance test.
+
+The first Init denial was ancestor metadata access during base-path
+canonicalization. Exact metadata grants for Runtime-validated base, engine
+and model path traversal advanced Init. A later guard spawn denial came from
+null stdio; an exact `/dev/null` write grant advanced the real chain. The
+candidate also narrows system reads and binds adjacent engine libraries to
+the protected engine receipt. Red/green source regressions, a synthetic child
+fixture and independent review cover these changes. The synthetic fixture
+checks descendant denial of unrelated file and socket access. One live
+`lsof` sample found zero writable regular descriptors in the guard and
+engine, but does not cover their full lifetime. Actual-chain descendant
+denial and complete inherited-descriptor custody remain open, followed by
+provider-generation rollover and immediate post-Get Use. Linux/public
+installed isolation and the separate same-user writer threat also remain
+open. Public and human Homes, holders, keys and pins were unchanged. The
+ignored receipt `.audit/sec1-mac-child-policy-isolated-reply.private.md`
+binds exact source/artifact hashes, commands and proof limits.
+
 ## Browser Engine private Share request source correction, 25 September 2026 UTC
 
 An isolated source regression now covers a connected Consumer requesting an
@@ -16,7 +44,7 @@ the signed-in Owner and Consumer Homes still run their prior installed bytes.
 The real pending request and human Share/approval state remain intact. An
 installed Browser Engine request journey remains open under J4/B08.
 
-## SEC1 Mac child policy candidate stopped at Init, 25 September 2026 UTC
+## Historical SEC1 Mac child policy Init stop, 25 September 2026 UTC
 
 An uncommitted source candidate replaced the Mac model child's broad file
 authority with exact model and engine paths, a narrow journal, and the approved
