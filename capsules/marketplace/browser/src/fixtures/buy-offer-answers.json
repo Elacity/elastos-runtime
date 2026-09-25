@@ -1,0 +1,117 @@
+{
+  "already_owned": {
+    "code": "already_owned",
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "asset_mismatch": {
+    "code": "asset_mismatch",
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "attempt_in_progress": {
+    "code": "attempt_in_progress",
+    "current": {
+      "pay_token": "0x0000000000000000000000000000000000000000",
+      "payment_processor": null,
+      "price": "0x2386f26fc10000",
+      "quantity": "0x1",
+      "seller": "0x34daf31b99b5a59ceb18e424dbc112fa6e5f3dc3"
+    },
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "attempt_in_progress_other_path": {
+    "code": "attempt_in_progress",
+    "current": null,
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "complete": {
+    "adoption": "pending",
+    "asset_uri": "elastos://QmcKGaG3CsCw93bc5JgDehrQTM7h1LMF1BQQiLXCvPvfz2",
+    "item": {
+      "chain_namespace": "eip155:8453",
+      "kid": "0xfacabcf1ea699570a8409db83779ae5c",
+      "ledger": "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+      "network": "base-mainnet",
+      "operative": "0xc0de393e925f1c1e620d347f18594d783c3104e7",
+      "token_id": "0x59e6d0307920cf2c216ea96905e05a4f453416e2d606e5dda8b84c82d5f10504"
+    },
+    "schema": "elastos.marketplace.buy-offer-complete/v1"
+  },
+  "complete_foreign": {
+    "adoption": "foreign",
+    "asset_uri": "elastos://QmcKGaG3CsCw93bc5JgDehrQTM7h1LMF1BQQiLXCvPvfz2",
+    "item": {
+      "chain_namespace": "eip155:8453",
+      "kid": "0xfacabcf1ea699570a8409db83779ae5c",
+      "ledger": "0x0ebac909d31ef0074495e752c0cf4ea49ba13c41",
+      "network": "base-mainnet",
+      "operative": "0xc0de393e925f1c1e620d347f18594d783c3104e7",
+      "token_id": "0x59e6d0307920cf2c216ea96905e05a4f453416e2d606e5dda8b84c82d5f10504"
+    },
+    "schema": "elastos.marketplace.buy-offer-complete/v1"
+  },
+  "declined": {
+    "buy_progress": {
+      "awaits_person": false,
+      "resumable": false,
+      "schema": "elastos.protected-content.buy-progress/v1",
+      "stage": "declined"
+    },
+    "code": "library_error",
+    "detail": "This purchase was declined in the wallet, so it did not go ahead",
+    "message": "Runtime custody purchase is unavailable",
+    "status": "error"
+  },
+  "own_offer": {
+    "code": "own_offer",
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "terms_changed_erc20": {
+    "code": "terms_changed",
+    "current": {
+      "pay_token": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+      "payment_processor": "0x00000000000000000000000000000000000000ff",
+      "price": "0xf4240",
+      "quantity": "0x2710",
+      "seller": "0xab5028bdbb0826ad6f1885478e421db677b0001a"
+    },
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "terms_changed_gone": {
+    "code": "terms_changed",
+    "current": null,
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "terms_changed_native": {
+    "code": "terms_changed",
+    "current": {
+      "pay_token": "0x0000000000000000000000000000000000000000",
+      "payment_processor": null,
+      "price": "0x2386f26fc10000",
+      "quantity": "0x1",
+      "seller": "0x34daf31b99b5a59ceb18e424dbc112fa6e5f3dc3"
+    },
+    "message": "Runtime custody purchase is denied before buy",
+    "status": "error"
+  },
+  "wait": {
+    "buy_progress": {
+      "awaits_person": false,
+      "connector_id": null,
+      "external_signer": false,
+      "resumable": true,
+      "schema": "elastos.protected-content.buy-progress/v1",
+      "stage": "purchase_approval"
+    },
+    "code": "library_error",
+    "detail": "The wallet approval is still completing; nothing else is needed",
+    "message": "Runtime custody purchase is pending exact Wallet or Chain settlement",
+    "status": "error"
+  }
+}

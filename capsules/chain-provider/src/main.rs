@@ -13,8 +13,10 @@ use elastos_protected_content_contracts::{
     MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod abi;
@@ -221,6 +223,12 @@ struct ChainProvider {
     node_supervisor: NodeSupervisorConfig,
     protected_content_runtime_issuer: Option<RuntimeOperationIssuerKeyV1>,
     now_unix_seconds: fn() -> u64,
+    /// How a rate-limited RPC request waits before its retry. Injected, like
+    /// the clock, so tests never wait.
+    sleep: fn(Duration),
+    /// Origins that still answered HTTP 429 after their retries, with the
+    /// Unix second their cooldown ends. Corroborated reads ask them last.
+    rate_limited_origins: Mutex<HashMap<String, u64>>,
 }
 
 impl ChainProvider {
@@ -249,6 +257,8 @@ impl ChainProvider {
             node_supervisor: NodeSupervisorConfig::default(),
             protected_content_runtime_issuer: None,
             now_unix_seconds: now_ts,
+            sleep: std::thread::sleep,
+            rate_limited_origins: Mutex::new(HashMap::new()),
         }
     }
 
@@ -368,6 +378,20 @@ impl ChainProvider {
                 token_id,
             } => self
                 .resolve_protected_content_verified_listing(&network, &seller, &ledger, &token_id),
+            Request::ResolveProtectedContentItem {
+                network,
+                ledger,
+                token_id,
+            } => self.resolve_protected_content_item(&network, &ledger, &token_id),
+            Request::ResolveProtectedContentKidBinding {
+                network,
+                content_access_id,
+            } => self.resolve_protected_content_kid_binding(&network, &content_access_id),
+            Request::ResolveProtectedContentItemOffers {
+                network,
+                ledger,
+                token_id,
+            } => self.resolve_protected_content_item_offers(&network, &ledger, &token_id),
             Request::ResolveProtectedContentPaymentProcessor { network, operative } => {
                 self.resolve_protected_content_payment_processor(&network, &operative)
             }
@@ -399,6 +423,21 @@ impl ChainProvider {
                 &network,
                 &wallet,
                 &content_access_id,
+            ),
+            Request::ResolveProtectedContentItemAccess {
+                request_id,
+                network,
+                wallet,
+                ledger,
+                token_id,
+                block,
+            } => self.resolve_protected_content_item_access(
+                &request_id,
+                &network,
+                &wallet,
+                &ledger,
+                &token_id,
+                block,
             ),
             Request::Proof {
                 network,
@@ -1133,7 +1172,7 @@ impl ChainProvider {
             ProtectedContentRightsCall {
                 contract: &method.contract,
                 data: &data,
-                expected_content_access_id: &policy.content_access_id(),
+                expected_content_access_id: Some(&policy.content_access_id()),
                 // Evidence that authorizes releasing a content key.
                 // Irreversible once released, so it rests only on finalized
                 // state.
@@ -1779,7 +1818,9 @@ impl ChainProvider {
                         // A source that will not answer a batch at all is asked
                         // singly rather than dropped: sources refusing batches
                         // would otherwise leave every card permanently unknown.
-                        Err(_) => self.protected_content_channel_calls_serially(&source_network, calls),
+                        Err(_) => {
+                            self.protected_content_channel_calls_serially(&source_network, calls)
+                        }
                     };
                     let offset = chunk * EVM_RPC_BATCH_MAX;
                     let mut guard = results.lock().unwrap_or_else(|err| err.into_inner());
@@ -1927,6 +1968,176 @@ impl ChainProvider {
             data["payment_processor"] = json!(payment_processor);
         }
         Response::ok(data)
+    }
+
+    /// An item's operative and `tokenURI`, from `(ledger, token_id)` alone --
+    /// the other common identifiers converge here through the binding check
+    /// in D15, not through a second read of this method.
+    fn resolve_protected_content_item(
+        &self,
+        network_id: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_protected_content_item_request", &err);
+        }
+        if let Err(err) = validate_hex_quantity(token_id, "token_id") {
+            return Response::error("invalid_protected_content_item_request", &err);
+        }
+        let ledger = normalize_evm_address(ledger);
+        let token_id = match normalize_hex_quantity(token_id, "token_id") {
+            Ok(value) => value,
+            Err(err) => return Response::error("invalid_protected_content_item_request", &err),
+        };
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        let item = match self.observe_protected_content_item(network, market, &ledger, &token_id) {
+            Ok(item) => item,
+            Err(response) => return response,
+        };
+        if item.operative == EVM_ZERO_ADDRESS {
+            return Response::error(
+                "unbound_protected_content_item",
+                "protected-content item has no bound operative",
+            );
+        }
+        let Some(token_uri) = item.token_uri else {
+            return Response::error(
+                "upstream_invalid_protected_content_item",
+                "protected-content item operative did not return a tokenURI",
+            );
+        };
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_ITEM_SCHEMA,
+            "network": network.id,
+            "chain_id": item.chain_id,
+            "ledger": ledger,
+            "token_id": token_id,
+            "operative": item.operative,
+            "token_uri": token_uri,
+            "finalized_block_number": item.finalized_block_number,
+        }))
+    }
+
+    /// A KID's binding to `(ledger, token_id)`, the other leg of the D15
+    /// binding triangle. `ipReference` of `(0x0, 0)` means the id is not
+    /// bound on chain -- not "pending", an answer in its own right.
+    fn resolve_protected_content_kid_binding(
+        &self,
+        network_id: &str,
+        content_access_id: &str,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_hex(content_access_id, Some(16), "content_access_id") {
+            return Response::error("invalid_protected_content_kid_binding_request", &err);
+        }
+        let content_access_id = content_access_id.to_ascii_lowercase();
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        let binding =
+            match self.observe_protected_content_kid_binding(network, market, &content_access_id) {
+                Ok(binding) => binding,
+                Err(response) => return response,
+            };
+        if binding.ledger == EVM_ZERO_ADDRESS && binding.token_id == "0x0" {
+            return Response::error(
+                "unbound_protected_content_kid",
+                "protected-content content access id is not bound on chain",
+            );
+        }
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_KID_BINDING_SCHEMA,
+            "network": network.id,
+            "chain_id": binding.chain_id,
+            "content_access_id": content_access_id,
+            "ledger": binding.ledger,
+            "token_id": binding.token_id,
+            "finalized_block_number": binding.finalized_block_number,
+        }))
+    }
+
+    /// Every live offer (every seller) for an item, at one finalized block,
+    /// corroborated across every configured source the same as a single
+    /// seller's verified listing.
+    fn resolve_protected_content_item_offers(
+        &self,
+        network_id: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_protected_content_item_offers_request", &err);
+        }
+        if let Err(err) = validate_hex_quantity(token_id, "token_id") {
+            return Response::error("invalid_protected_content_item_offers_request", &err);
+        }
+        let ledger = normalize_evm_address(ledger);
+        let token_id = match normalize_hex_quantity(token_id, "token_id") {
+            Ok(value) => value,
+            Err(err) => {
+                return Response::error("invalid_protected_content_item_offers_request", &err)
+            }
+        };
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        let offers =
+            match self.observe_protected_content_item_offers(network, market, &ledger, &token_id) {
+                Ok(offers) => offers,
+                Err(response) => return response,
+            };
+        if offers.operative == EVM_ZERO_ADDRESS {
+            return Response::error(
+                "unbound_protected_content_item",
+                "protected-content item has no bound operative",
+            );
+        }
+        let offers_json: Vec<Value> = offers
+            .offers
+            .iter()
+            .map(|offer| {
+                let mut offer_json = json!({
+                    "seller": offer.seller,
+                    "quantity": offer.quantity,
+                    "price": offer.price,
+                    "pay_token": offer.pay_token,
+                });
+                if offer.pay_token != EVM_ZERO_ADDRESS {
+                    if let Some(payment_processor) = &offers.payment_processor {
+                        offer_json["payment_processor"] = json!(payment_processor);
+                    }
+                }
+                offer_json
+            })
+            .collect();
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_ITEM_OFFERS_SCHEMA,
+            "network": network.id,
+            "chain_id": offers.chain_id,
+            "ledger": ledger,
+            "token_id": token_id,
+            "operative": offers.operative,
+            "finalized_block_number": offers.finalized_block_number,
+            "truncated": offers.truncated,
+            "offers": offers_json,
+        }))
     }
 
     fn resolve_protected_content_purchase(
@@ -2116,7 +2327,7 @@ impl ChainProvider {
             ProtectedContentRightsCall {
                 contract: &method.contract,
                 data: &data,
-                expected_content_access_id: &content_access_id,
+                expected_content_access_id: Some(&content_access_id),
                 // The upfront "is this copy theirs" check. The grant is
                 // readable at the block that carries the acquisition, so
                 // reading it at finality would deny a transaction the caller
@@ -2153,6 +2364,110 @@ impl ChainProvider {
             "chain_id": observation.chain_id,
             "wallet": normalize_evm_address(wallet),
             "content_access_id": format!("0x{}", encode_hex(content_access_id.as_bytes())),
+            "has_access": has_access,
+            "finalized_block_number": observation.finalized_block_number,
+            "finalized_block_hash": format!("0x{}", encode_hex(observation.finalized_block_hash.as_bytes())),
+            "finalized_block_timestamp": observation.finalized_block_timestamp,
+            "observed_at": now,
+        }))
+    }
+
+    /// R50: `resolve_protected_content_purchase_access`, asked by the item.
+    /// Same view-policy sources, same corroboration (R47 retry, fallback and
+    /// early stop included), same freshness bound; the call is
+    /// `AuthorityGateway.hasAccess(wallet, ledger, token_id)` on the rights
+    /// method's contract, so an item whose KID is unknown still has an
+    /// access answer.
+    fn resolve_protected_content_item_access(
+        &self,
+        request_id: &str,
+        network_id: &str,
+        wallet: &str,
+        ledger: &str,
+        token_id: &str,
+        block: ProtectedContentAccessBlock,
+    ) -> Response {
+        let invalid =
+            |err: &str| Response::error("invalid_protected_content_item_access_request", err);
+        if request_id.trim().is_empty() || request_id.len() > 256 {
+            return invalid("protected-content item access request identity is invalid");
+        }
+        if let Err(err) = validate_evm_address(wallet) {
+            return invalid(&err);
+        }
+        if let Err(err) = validate_evm_address(ledger) {
+            return invalid(&err);
+        }
+        let token_id = match validate_hex_quantity(token_id, "token_id")
+            .and_then(|()| normalize_hex_quantity(token_id, "token_id"))
+        {
+            Ok(value) => value,
+            Err(err) => return invalid(&err),
+        };
+        let wallet = normalize_evm_address(wallet);
+        let ledger = normalize_evm_address(ledger);
+        let (network, method, policy_source) = match self
+            .configured_protected_content_policy_source_for_network(
+                network_id,
+                ProtectedContentPolicyAction::View,
+            ) {
+            Ok(source) => source,
+            Err(response) => return response,
+        };
+        let Some(expected_chain_id) = network.chain_id else {
+            return Response::error(
+                "protected_content_purchase_access_not_configured",
+                "no configured protected-content purchase access source matches listing network",
+            );
+        };
+        let data = match encode_authority_gateway_has_access_call(&wallet, &ledger, &token_id) {
+            Ok(data) => data,
+            Err(err) => return invalid(&err),
+        };
+        let observation = match self.observe_protected_content_rights(
+            network,
+            &policy_source.evidence_rpc_urls,
+            expected_chain_id,
+            ProtectedContentRightsCall {
+                contract: &method.contract,
+                data: &data,
+                expected_content_access_id: None,
+                block: match block {
+                    ProtectedContentAccessBlock::Finalized => {
+                        ProtectedContentRightsBlock::Finalized
+                    }
+                    ProtectedContentAccessBlock::Latest => ProtectedContentRightsBlock::Head,
+                },
+            },
+        ) {
+            Ok(observation) => observation,
+            Err(response) => return response,
+        };
+        let ProtectedContentRightsObservationKind::HasAccess(has_access) = observation.outcome
+        else {
+            // Unreachable: an item-keyed call never decodes as unbound.
+            return Response::error(
+                "insufficient_rights_observations",
+                "protected-content evidence sources produced no item access answer",
+            );
+        };
+        let now = (self.now_unix_seconds)();
+        if let Err(err) = validate_finalized_observation_freshness(
+            observation.finalized_block_timestamp,
+            now,
+            PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS,
+            PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS,
+        ) {
+            return Response::error("stale_protected_content_purchase_access_observation", &err);
+        }
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_ITEM_ACCESS_SCHEMA,
+            "request_id": request_id,
+            "network": network.id,
+            "chain_id": observation.chain_id,
+            "wallet": wallet,
+            "ledger": ledger,
+            "token_id": token_id,
             "has_access": has_access,
             "finalized_block_number": observation.finalized_block_number,
             "finalized_block_hash": format!("0x{}", encode_hex(observation.finalized_block_hash.as_bytes())),
@@ -2823,30 +3138,29 @@ impl ChainProvider {
         ledger: &str,
         token_id: &str,
     ) -> Result<ProtectedContentVerifiedListingObservation, Response> {
-        let mut successful = Vec::new();
-        let mut first_error = None;
-        for rpc_url in &market.evidence_rpc_urls {
-            match self.observe_protected_content_verified_listing_source(
-                network, market, rpc_url, seller, ledger, token_id,
-            ) {
-                Ok(Some(observation)) => successful.push(observation),
-                Ok(None) => {}
-                Err(response) => {
-                    if first_error.is_none() {
-                        first_error = Some(response);
-                    }
-                }
-            }
-        }
-        if successful
+        let (observed, first_error) =
+            self.observe_corroborating_sources(&market.evidence_rpc_urls, |rpc_url| {
+                self.observe_protected_content_verified_listing_source(
+                    network, market, rpc_url, seller, ledger, token_id,
+                )
+            });
+        if observed
             .iter()
-            .any(|observation| observation.chain_id != network.chain_id.unwrap_or_default())
+            .any(|(_, observation)| observation.chain_id != network.chain_id.unwrap_or_default())
         {
             return Err(Response::error(
                 "conflicting_protected_content_verified_listing_observations",
                 "protected-content verified listing sources disagree with configured chain id",
             ));
         }
+        // R32: sources finalize at different heights, so every source is
+        // pinned to the lowest finalized block among them before the tuples
+        // are compared -- the same algorithm the other market reads use.
+        let successful = pin_to_lowest_finalized(&observed, |rpc_url, pin| {
+            self.observe_protected_content_verified_listing_source_at(
+                network, market, rpc_url, seller, ledger, token_id, pin,
+            )
+        });
         if successful.len() >= 2 {
             let reference = successful[0].clone();
             if successful[1..]
@@ -2902,16 +3216,84 @@ impl ChainProvider {
             Some(finalized) => finalized,
             None => return Ok(None),
         };
+        self.observe_protected_content_verified_listing_at_block(
+            &source_network,
+            market,
+            seller,
+            ledger,
+            token_id,
+            chain_id,
+            finalized.finalized_block_number,
+            finalized.finalized_block_hash,
+        )
+    }
+
+    /// Re-observes one source at a pinned finalized block (R32), so sources
+    /// whose finalized heads differ compare the same state instead of
+    /// "disagreeing" on the block itself. The pinned block must be canonical
+    /// on this source by hash.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_protected_content_verified_listing_source_at(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        seller: &str,
+        ledger: &str,
+        token_id: &str,
+        pin: &ProtectedContentVerifiedListingObservation,
+    ) -> Option<ProtectedContentVerifiedListingObservation> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let block = self
+            .evm_rpc(
+                &source_network,
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", pin.finalized_block_number), false]),
+            )
+            .ok()
+            .and_then(|value| evm_finalized_block(&value).ok())?;
+        if block.finalized_block_number != pin.finalized_block_number
+            || block.finalized_block_hash != pin.finalized_block_hash
+        {
+            return None;
+        }
+        self.observe_protected_content_verified_listing_at_block(
+            &source_network,
+            market,
+            seller,
+            ledger,
+            token_id,
+            pin.chain_id,
+            pin.finalized_block_number,
+            pin.finalized_block_hash,
+        )
+        .ok()
+        .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_protected_content_verified_listing_at_block(
+        &self,
+        source_network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        seller: &str,
+        ledger: &str,
+        token_id: &str,
+        chain_id: u64,
+        block_number: u64,
+        block_hash: Digest32,
+    ) -> Result<Option<ProtectedContentVerifiedListingObservation>, Response> {
         let operative_data = encode_authority_gateway_operative_call(ledger, token_id)
             .map_err(|err| Response::error("invalid_protected_content_purchase_request", &err))?;
         let operative_result = match self
             .evm_rpc(
-                &source_network,
+                source_network,
                 "eth_call",
                 json!([
                     { "to": market.authority_gateway_contract, "data": operative_data },
                     {
-                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "blockHash": format!("0x{}", encode_hex(block_hash.as_bytes())),
                         "requireCanonical": true,
                     }
                 ]),
@@ -2928,12 +3310,12 @@ impl ChainProvider {
             .map_err(|err| Response::error("invalid_protected_content_purchase_request", &err))?;
         let listing_result = match self
             .evm_rpc(
-                &source_network,
+                source_network,
                 "eth_call",
                 json!([
                     { "to": market.authority_gateway_contract, "data": listing_data },
                     {
-                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "blockHash": format!("0x{}", encode_hex(block_hash.as_bytes())),
                         "requireCanonical": true,
                     }
                 ]),
@@ -2954,12 +3336,12 @@ impl ChainProvider {
                 })?;
             let payment_processor_result = match self
                 .evm_rpc(
-                    &source_network,
+                    source_network,
                     "eth_call",
                     json!([
                         { "to": operative, "data": payment_processor_data },
                         {
-                            "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                            "blockHash": format!("0x{}", encode_hex(block_hash.as_bytes())),
                             "requireCanonical": true,
                         }
                     ]),
@@ -2981,14 +3363,893 @@ impl ChainProvider {
         };
         Ok(Some(ProtectedContentVerifiedListingObservation {
             chain_id,
-            finalized_block_number: finalized.finalized_block_number,
-            finalized_block_hash: finalized.finalized_block_hash,
+            finalized_block_number: block_number,
+            finalized_block_hash: block_hash,
             operative,
             quantity: listing.quantity,
             price: listing.price,
             pay_token: listing.pay_token,
             payment_processor,
         }))
+    }
+
+    /// Observes a corroborated read's sources one by one (R47): origins still
+    /// cooling after a persistent 429 are asked last, and asking stops once
+    /// two observations agree on the same finalized block hash and tuple.
+    /// Returns what was observed, by source, and the first hard error a
+    /// source raised. Chain-id, pinning and disagreement rules stay with the
+    /// caller and apply to everything observed.
+    fn observe_corroborating_sources<T, F>(
+        &self,
+        evidence_rpc_urls: &[String],
+        mut observe: F,
+    ) -> (Vec<(String, T)>, Option<Response>)
+    where
+        T: FinalizedObservation + PartialEq,
+        F: FnMut(&str) -> Result<Option<T>, Response>,
+    {
+        let mut observed = Vec::new();
+        let mut first_error = None;
+        for rpc_url in self.corroboration_order(evidence_rpc_urls) {
+            match observe(&rpc_url) {
+                Ok(Some(observation)) => observed.push((rpc_url, observation)),
+                Ok(None) => {}
+                Err(response) => {
+                    if first_error.is_none() {
+                        first_error = Some(response);
+                    }
+                }
+            }
+            if two_observations_agree(&observed) {
+                break;
+            }
+        }
+        (observed, first_error)
+    }
+
+    /// One market read's RPC call to one source. A failed call drops that
+    /// source from the read, so the reason is logged here -- read, step,
+    /// source host and the node's verdict -- instead of vanishing into an
+    /// "insufficient observations" answer that cannot say which call failed.
+    /// Only the host is logged: a configured RPC URL may carry an API key.
+    fn market_rpc(
+        &self,
+        network: &ChainNetwork,
+        read: &str,
+        step: &str,
+        method: &str,
+        params: Value,
+    ) -> Option<Value> {
+        match self.evm_rpc(network, method, params) {
+            Ok(value) => Some(value),
+            Err(Response::Error { code, message }) => {
+                eprintln!(
+                    "chain-provider: market source dropped read={read} step={step} source={} reason={code}: {message}",
+                    rpc_source_host(&network.rpc_url),
+                );
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn observe_protected_content_item(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        ledger: &str,
+        token_id: &str,
+    ) -> Result<ProtectedContentItemObservation, Response> {
+        let (observed, first_error) =
+            self.observe_corroborating_sources(&market.evidence_rpc_urls, |rpc_url| {
+                self.observe_protected_content_item_source(
+                    network, market, rpc_url, ledger, token_id,
+                )
+            });
+        if observed
+            .iter()
+            .any(|(_, observation)| observation.chain_id != network.chain_id.unwrap_or_default())
+        {
+            return Err(Response::error(
+                "conflicting_protected_content_item_observations",
+                "protected-content item sources disagree with configured chain id",
+            ));
+        }
+        // R32: independent sources legitimately lag each other by a block or
+        // more in what they consider finalized; pin every source to the
+        // lowest finalized block among them -- the same algorithm the rights
+        // read uses (see `pin_to_lowest_finalized`) -- instead of requiring
+        // every source's finalized head to match exactly.
+        let successful = pin_to_lowest_finalized(&observed, |rpc_url, pin| {
+            self.observe_protected_content_item_source_at(
+                network, market, rpc_url, ledger, token_id, pin,
+            )
+        });
+        if successful.len() >= 2 {
+            let reference = successful[0].clone();
+            if successful[1..]
+                .iter()
+                .any(|observation| *observation != reference)
+            {
+                return Err(Response::error(
+                    "conflicting_protected_content_item_observations",
+                    "protected-content item sources disagree on the finalized tuple",
+                ));
+            }
+            return Ok(reference);
+        }
+        if successful.is_empty() {
+            if let Some(response) = first_error {
+                return Err(response);
+            }
+        }
+        eprintln!(
+            "chain-provider: market read item short of sources configured={} observed={} agreeing_after_pin={}",
+            market.evidence_rpc_urls.len(),
+            observed.len(),
+            successful.len(),
+        );
+        Err(Response::error(
+            "insufficient_protected_content_item_observations",
+            "protected-content item sources produced fewer than two matching finalized tuples",
+        ))
+    }
+
+    fn observe_protected_content_item_source(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Result<Option<ProtectedContentItemObservation>, Response> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let chain_id = match self
+            .market_rpc(
+                &source_network,
+                "item",
+                "chain_id",
+                "eth_chainId",
+                json!([]),
+            )
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))
+        {
+            Some(chain_id) => chain_id,
+            None => return Ok(None),
+        };
+        let finalized = match self
+            .market_rpc(
+                &source_network,
+                "item",
+                "finalized_block",
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+            )
+            .and_then(|value| evm_finalized_block(&value).ok())
+        {
+            Some(finalized) => finalized,
+            None => return Ok(None),
+        };
+        let at = json!({
+            "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+            "requireCanonical": true,
+        });
+        let operative_data = encode_authority_gateway_operative_call(ledger, token_id)
+            .map_err(|err| Response::error("invalid_protected_content_item_request", &err))?;
+        let operative_result = match self.market_rpc(
+            &source_network,
+            "item",
+            "operative",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": operative_data },
+                at,
+            ]),
+        ) {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let operative = decode_evm_address_word(&operative_result, "operative")
+            .map_err(|err| Response::error("upstream_invalid_protected_content_item", &err))?;
+        if operative == EVM_ZERO_ADDRESS {
+            return Ok(Some(ProtectedContentItemObservation {
+                chain_id,
+                finalized_block_number: finalized.finalized_block_number,
+                finalized_block_hash: finalized.finalized_block_hash,
+                operative,
+                token_uri: None,
+            }));
+        }
+        let token_uri_data = encode_operative_token_uri_call()
+            .map_err(|err| Response::error("invalid_protected_content_item_request", &err))?;
+        let token_uri_result = match self
+            .market_rpc(
+                &source_network,
+                "item",
+                "token_uri",
+                "eth_call",
+                json!([
+                    { "to": operative, "data": token_uri_data },
+                    {
+                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "requireCanonical": true,
+                    },
+                ]),
+        )
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let token_uri = decode_evm_string(&token_uri_result, "tokenURI")
+            .map_err(|err| Response::error("upstream_invalid_protected_content_item", &err))?;
+        Ok(Some(ProtectedContentItemObservation {
+            chain_id,
+            finalized_block_number: finalized.finalized_block_number,
+            finalized_block_hash: finalized.finalized_block_hash,
+            operative,
+            token_uri: Some(token_uri),
+        }))
+    }
+
+    /// Re-observes one source at a pinned finalized block (R32): the block
+    /// must be canonical there by hash, and the item read is re-evaluated at
+    /// exactly that block. Mirrors `observe_protected_content_rights_source_at`.
+    fn observe_protected_content_item_source_at(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        ledger: &str,
+        token_id: &str,
+        pin: &ProtectedContentItemObservation,
+    ) -> Option<ProtectedContentItemObservation> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let block = self
+            .market_rpc(
+                &source_network,
+                "item",
+                "finalized_block",
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", pin.finalized_block_number), false]),
+            )
+            .and_then(|value| evm_finalized_block(&value).ok())?;
+        if block.finalized_block_number != pin.finalized_block_number
+            || block.finalized_block_hash != pin.finalized_block_hash
+        {
+            return None;
+        }
+        let at = json!({
+            "blockHash": format!("0x{}", encode_hex(pin.finalized_block_hash.as_bytes())),
+            "requireCanonical": true,
+        });
+        let operative_data = encode_authority_gateway_operative_call(ledger, token_id).ok()?;
+        let operative_result = self.market_rpc(
+            &source_network,
+            "item",
+            "operative",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": operative_data },
+                at.clone(),
+            ]),
+        )?;
+        let operative = decode_evm_address_word(&operative_result, "operative").ok()?;
+        if operative == EVM_ZERO_ADDRESS {
+            return Some(ProtectedContentItemObservation {
+                chain_id: pin.chain_id,
+                finalized_block_number: pin.finalized_block_number,
+                finalized_block_hash: pin.finalized_block_hash,
+                operative,
+                token_uri: None,
+            });
+        }
+        let token_uri_data = encode_operative_token_uri_call().ok()?;
+        let token_uri_result = self.market_rpc(
+            &source_network,
+            "item",
+            "token_uri",
+            "eth_call",
+            json!([
+                { "to": operative, "data": token_uri_data },
+                at,
+            ]),
+        )?;
+        let token_uri = decode_evm_string(&token_uri_result, "tokenURI").ok()?;
+        Some(ProtectedContentItemObservation {
+            chain_id: pin.chain_id,
+            finalized_block_number: pin.finalized_block_number,
+            finalized_block_hash: pin.finalized_block_hash,
+            operative,
+            token_uri: Some(token_uri),
+        })
+    }
+
+    fn observe_protected_content_kid_binding(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        content_access_id: &str,
+    ) -> Result<ProtectedContentKidBindingObservation, Response> {
+        let (observed, first_error) =
+            self.observe_corroborating_sources(&market.evidence_rpc_urls, |rpc_url| {
+                self.observe_protected_content_kid_binding_source(
+                    network,
+                    market,
+                    rpc_url,
+                    content_access_id,
+                )
+            });
+        if observed
+            .iter()
+            .any(|(_, observation)| observation.chain_id != network.chain_id.unwrap_or_default())
+        {
+            return Err(Response::error(
+                "conflicting_protected_content_kid_binding_observations",
+                "protected-content kid binding sources disagree with configured chain id",
+            ));
+        }
+        // R32: pin every source to the lowest finalized block among them,
+        // reusing the algorithm the rights read uses.
+        let successful = pin_to_lowest_finalized(&observed, |rpc_url, pin| {
+            self.observe_protected_content_kid_binding_source_at(
+                network,
+                market,
+                rpc_url,
+                content_access_id,
+                pin,
+            )
+        });
+        if successful.len() >= 2 {
+            let reference = successful[0].clone();
+            if successful[1..]
+                .iter()
+                .any(|observation| *observation != reference)
+            {
+                return Err(Response::error(
+                    "conflicting_protected_content_kid_binding_observations",
+                    "protected-content kid binding sources disagree on the finalized tuple",
+                ));
+            }
+            return Ok(reference);
+        }
+        if successful.is_empty() {
+            if let Some(response) = first_error {
+                return Err(response);
+            }
+        }
+        eprintln!(
+            "chain-provider: market read kid_binding short of sources configured={} observed={} agreeing_after_pin={}",
+            market.evidence_rpc_urls.len(),
+            observed.len(),
+            successful.len(),
+        );
+        Err(Response::error(
+            "insufficient_protected_content_kid_binding_observations",
+            "protected-content kid binding sources produced fewer than two matching finalized tuples",
+        ))
+    }
+
+    fn observe_protected_content_kid_binding_source(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        content_access_id: &str,
+    ) -> Result<Option<ProtectedContentKidBindingObservation>, Response> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let chain_id = match self
+            .market_rpc(
+                &source_network,
+                "kid_binding",
+                "chain_id",
+                "eth_chainId",
+                json!([]),
+            )
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))
+        {
+            Some(chain_id) => chain_id,
+            None => return Ok(None),
+        };
+        let finalized = match self
+            .market_rpc(
+                &source_network,
+                "kid_binding",
+                "finalized_block",
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+            )
+            .and_then(|value| evm_finalized_block(&value).ok())
+        {
+            Some(finalized) => finalized,
+            None => return Ok(None),
+        };
+        let at = json!({
+            "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+            "requireCanonical": true,
+        });
+        let cstore_data = encode_authority_gateway_cstore_call().map_err(|err| {
+            Response::error("invalid_protected_content_kid_binding_request", &err)
+        })?;
+        let cstore_result = match self.market_rpc(
+            &source_network,
+            "kid_binding",
+            "cstore",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": cstore_data },
+                at.clone(),
+            ]),
+        ) {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let cstore = decode_evm_address_word(&cstore_result, "cstore").map_err(|err| {
+            Response::error("upstream_invalid_protected_content_kid_binding", &err)
+        })?;
+        // Cheap guard: a zero cstore means the authority gateway has no
+        // protected-content store bound for this network at all. Calling
+        // ipReference on the zero address would just revert (or worse,
+        // silently answer nothing) -- this fails fast with a named error
+        // instead of surfacing an opaque upstream decode failure.
+        if cstore == EVM_ZERO_ADDRESS {
+            return Err(Response::error(
+                "unbound_protected_content_store",
+                "authority gateway has no protected-content store bound for this network",
+            ));
+        }
+        let ip_reference_data = encode_ip_reference_call(content_access_id).map_err(|err| {
+            Response::error("invalid_protected_content_kid_binding_request", &err)
+        })?;
+        let ip_reference_result = match self.market_rpc(
+            &source_network,
+            "kid_binding",
+            "ip_reference",
+            "eth_call",
+            json!([
+                { "to": cstore, "data": ip_reference_data },
+                at,
+            ]),
+        ) {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let (ledger, token_id) = decode_ip_reference(&ip_reference_result).map_err(|err| {
+            Response::error("upstream_invalid_protected_content_kid_binding", &err)
+        })?;
+        Ok(Some(ProtectedContentKidBindingObservation {
+            chain_id,
+            finalized_block_number: finalized.finalized_block_number,
+            finalized_block_hash: finalized.finalized_block_hash,
+            ledger,
+            token_id,
+        }))
+    }
+
+    /// Re-observes one source at a pinned finalized block (R32). Mirrors
+    /// `observe_protected_content_rights_source_at`.
+    fn observe_protected_content_kid_binding_source_at(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        content_access_id: &str,
+        pin: &ProtectedContentKidBindingObservation,
+    ) -> Option<ProtectedContentKidBindingObservation> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let block = self
+            .market_rpc(
+                &source_network,
+                "kid_binding",
+                "finalized_block",
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", pin.finalized_block_number), false]),
+            )
+            .and_then(|value| evm_finalized_block(&value).ok())?;
+        if block.finalized_block_number != pin.finalized_block_number
+            || block.finalized_block_hash != pin.finalized_block_hash
+        {
+            return None;
+        }
+        let at = json!({
+            "blockHash": format!("0x{}", encode_hex(pin.finalized_block_hash.as_bytes())),
+            "requireCanonical": true,
+        });
+        let cstore_data = encode_authority_gateway_cstore_call().ok()?;
+        let cstore_result = self.market_rpc(
+            &source_network,
+            "kid_binding",
+            "cstore",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": cstore_data },
+                at.clone(),
+            ]),
+        )?;
+        let cstore = decode_evm_address_word(&cstore_result, "cstore").ok()?;
+        if cstore == EVM_ZERO_ADDRESS {
+            return None;
+        }
+        let ip_reference_data = encode_ip_reference_call(content_access_id).ok()?;
+        let ip_reference_result = self.market_rpc(
+            &source_network,
+            "kid_binding",
+            "ip_reference",
+            "eth_call",
+            json!([
+                { "to": cstore, "data": ip_reference_data },
+                at,
+            ]),
+        )?;
+        let (ledger, token_id) = decode_ip_reference(&ip_reference_result).ok()?;
+        Some(ProtectedContentKidBindingObservation {
+            chain_id: pin.chain_id,
+            finalized_block_number: pin.finalized_block_number,
+            finalized_block_hash: pin.finalized_block_hash,
+            ledger,
+            token_id,
+        })
+    }
+
+    fn observe_protected_content_item_offers(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        ledger: &str,
+        token_id: &str,
+    ) -> Result<ProtectedContentItemOffersObservation, Response> {
+        let (observed, first_error) =
+            self.observe_corroborating_sources(&market.evidence_rpc_urls, |rpc_url| {
+                self.observe_protected_content_item_offers_source(
+                    network, market, rpc_url, ledger, token_id,
+                )
+            });
+        if observed
+            .iter()
+            .any(|(_, observation)| observation.chain_id != network.chain_id.unwrap_or_default())
+        {
+            return Err(Response::error(
+                "conflicting_protected_content_item_offers_observations",
+                "protected-content item offers sources disagree with configured chain id",
+            ));
+        }
+        // R32: pin every source to the lowest finalized block among them,
+        // reusing the algorithm the rights read uses.
+        let successful = pin_to_lowest_finalized(&observed, |rpc_url, pin| {
+            self.observe_protected_content_item_offers_source_at(
+                network, market, rpc_url, ledger, token_id, pin,
+            )
+        });
+        if successful.len() >= 2 {
+            let reference = successful[0].clone();
+            if successful[1..]
+                .iter()
+                .any(|observation| *observation != reference)
+            {
+                return Err(Response::error(
+                    "conflicting_protected_content_item_offers_observations",
+                    "protected-content item offers sources disagree on the finalized tuple",
+                ));
+            }
+            return Ok(reference);
+        }
+        if successful.is_empty() {
+            if let Some(response) = first_error {
+                return Err(response);
+            }
+        }
+        eprintln!(
+            "chain-provider: market read item_offers short of sources configured={} observed={} agreeing_after_pin={}",
+            market.evidence_rpc_urls.len(),
+            observed.len(),
+            successful.len(),
+        );
+        Err(Response::error(
+            "insufficient_protected_content_item_offers_observations",
+            "protected-content item offers sources produced fewer than two matching finalized tuples",
+        ))
+    }
+
+    fn observe_protected_content_item_offers_source(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Result<Option<ProtectedContentItemOffersObservation>, Response> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let chain_id = match self
+            .market_rpc(
+                &source_network,
+                "item_offers",
+                "chain_id",
+                "eth_chainId",
+                json!([]),
+            )
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))
+        {
+            Some(chain_id) => chain_id,
+            None => return Ok(None),
+        };
+        let finalized = match self
+            .market_rpc(
+                &source_network,
+                "item_offers",
+                "finalized_block",
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+            )
+            .and_then(|value| evm_finalized_block(&value).ok())
+        {
+            Some(finalized) => finalized,
+            None => return Ok(None),
+        };
+        let at = || {
+            json!({
+                "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                "requireCanonical": true,
+            })
+        };
+        let operative_data =
+            encode_authority_gateway_operative_call(ledger, token_id).map_err(|err| {
+                Response::error("invalid_protected_content_item_offers_request", &err)
+            })?;
+        let operative_result = match self.market_rpc(
+            &source_network,
+            "item_offers",
+            "operative",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": operative_data },
+                at(),
+            ]),
+        ) {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let operative = decode_evm_address_word(&operative_result, "operative").map_err(|err| {
+            Response::error("upstream_invalid_protected_content_item_offers", &err)
+        })?;
+        if operative == EVM_ZERO_ADDRESS {
+            return Ok(Some(ProtectedContentItemOffersObservation {
+                chain_id,
+                finalized_block_number: finalized.finalized_block_number,
+                finalized_block_hash: finalized.finalized_block_hash,
+                operative,
+                truncated: false,
+                offers: Vec::new(),
+                payment_processor: None,
+            }));
+        }
+        let sellers_data = encode_authority_gateway_sellers_of_call(&operative).map_err(|err| {
+            Response::error("invalid_protected_content_item_offers_request", &err)
+        })?;
+        let sellers_result = match self.market_rpc(
+            &source_network,
+            "item_offers",
+            "sellers",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": sellers_data },
+                at(),
+            ]),
+        ) {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let mut sellers =
+            decode_evm_address_array(&sellers_result, "sellersOf").map_err(|err| {
+                Response::error("upstream_invalid_protected_content_item_offers", &err)
+            })?;
+        sellers.sort();
+        let truncated = sellers.len() > PROTECTED_CONTENT_OFFERS_MAX;
+        sellers.truncate(PROTECTED_CONTENT_OFFERS_MAX);
+        let mut offers = Vec::new();
+        let mut any_erc20_pay_token = false;
+        for seller in &sellers {
+            let listing_data =
+                encode_authority_gateway_listing_call(&operative, seller).map_err(|err| {
+                    Response::error("invalid_protected_content_item_offers_request", &err)
+                })?;
+            let listing_result = match self.market_rpc(
+                &source_network,
+                "item_offers",
+                "listing",
+                "eth_call",
+                json!([
+                    { "to": market.authority_gateway_contract, "data": listing_data },
+                    at(),
+                ]),
+            ) {
+                Some(result) => result,
+                None => return Ok(None),
+            };
+            let listing = decode_protected_content_listing(&listing_result).map_err(|err| {
+                Response::error("upstream_invalid_protected_content_item_offers", &err)
+            })?;
+            // ERC-20 flag fix: a sold-out listing is not a live offer, so it
+            // must not be the reason `paymentProcessor()` gets called -- a
+            // sold-out ERC-20 listing with every other offer native or gone
+            // should trigger no processor read at all.
+            if listing.quantity == "0x0" {
+                continue;
+            }
+            if listing.pay_token != EVM_ZERO_ADDRESS {
+                any_erc20_pay_token = true;
+            }
+            offers.push(ProtectedContentItemOfferObservation {
+                seller: seller.clone(),
+                quantity: listing.quantity,
+                price: listing.price,
+                pay_token: listing.pay_token,
+            });
+        }
+        let payment_processor = if any_erc20_pay_token {
+            let payment_processor_data =
+                encode_operatives_payment_processor_call().map_err(|err| {
+                    Response::error("invalid_protected_content_item_offers_request", &err)
+                })?;
+            let payment_processor_result = match self.market_rpc(
+                &source_network,
+                "item_offers",
+                "payment_processor",
+                "eth_call",
+                json!([
+                    { "to": operative, "data": payment_processor_data },
+                    at(),
+                ]),
+            ) {
+                Some(result) => result,
+                None => return Ok(None),
+            };
+            Some(
+                decode_evm_address_word(&payment_processor_result, "paymentProcessor").map_err(
+                    |err| Response::error("upstream_invalid_protected_content_item_offers", &err),
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(ProtectedContentItemOffersObservation {
+            chain_id,
+            finalized_block_number: finalized.finalized_block_number,
+            finalized_block_hash: finalized.finalized_block_hash,
+            operative,
+            truncated,
+            offers,
+            payment_processor,
+        }))
+    }
+
+    /// Re-observes one source at a pinned finalized block (R32). Mirrors
+    /// `observe_protected_content_rights_source_at`.
+    fn observe_protected_content_item_offers_source_at(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        ledger: &str,
+        token_id: &str,
+        pin: &ProtectedContentItemOffersObservation,
+    ) -> Option<ProtectedContentItemOffersObservation> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let block = self
+            .market_rpc(
+                &source_network,
+                "item_offers",
+                "finalized_block",
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", pin.finalized_block_number), false]),
+            )
+            .and_then(|value| evm_finalized_block(&value).ok())?;
+        if block.finalized_block_number != pin.finalized_block_number
+            || block.finalized_block_hash != pin.finalized_block_hash
+        {
+            return None;
+        }
+        let at = || {
+            json!({
+                "blockHash": format!("0x{}", encode_hex(pin.finalized_block_hash.as_bytes())),
+                "requireCanonical": true,
+            })
+        };
+        let operative_data = encode_authority_gateway_operative_call(ledger, token_id).ok()?;
+        let operative_result = self.market_rpc(
+            &source_network,
+            "item_offers",
+            "operative",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": operative_data },
+                at(),
+            ]),
+        )?;
+        let operative = decode_evm_address_word(&operative_result, "operative").ok()?;
+        if operative == EVM_ZERO_ADDRESS {
+            return Some(ProtectedContentItemOffersObservation {
+                chain_id: pin.chain_id,
+                finalized_block_number: pin.finalized_block_number,
+                finalized_block_hash: pin.finalized_block_hash,
+                operative,
+                truncated: false,
+                offers: Vec::new(),
+                payment_processor: None,
+            });
+        }
+        let sellers_data = encode_authority_gateway_sellers_of_call(&operative).ok()?;
+        let sellers_result = self.market_rpc(
+            &source_network,
+            "item_offers",
+            "sellers",
+            "eth_call",
+            json!([
+                { "to": market.authority_gateway_contract, "data": sellers_data },
+                at(),
+            ]),
+        )?;
+        let mut sellers = decode_evm_address_array(&sellers_result, "sellersOf").ok()?;
+        sellers.sort();
+        let truncated = sellers.len() > PROTECTED_CONTENT_OFFERS_MAX;
+        sellers.truncate(PROTECTED_CONTENT_OFFERS_MAX);
+        let mut offers = Vec::new();
+        let mut any_erc20_pay_token = false;
+        for seller in &sellers {
+            let listing_data = encode_authority_gateway_listing_call(&operative, seller).ok()?;
+            let listing_result = self.market_rpc(
+                &source_network,
+                "item_offers",
+                "listing",
+                "eth_call",
+                json!([
+                    { "to": market.authority_gateway_contract, "data": listing_data },
+                    at(),
+                ]),
+            )?;
+            let listing = decode_protected_content_listing(&listing_result).ok()?;
+            if listing.quantity == "0x0" {
+                continue;
+            }
+            if listing.pay_token != EVM_ZERO_ADDRESS {
+                any_erc20_pay_token = true;
+            }
+            offers.push(ProtectedContentItemOfferObservation {
+                seller: seller.clone(),
+                quantity: listing.quantity,
+                price: listing.price,
+                pay_token: listing.pay_token,
+            });
+        }
+        let payment_processor = if any_erc20_pay_token {
+            let payment_processor_data = encode_operatives_payment_processor_call().ok()?;
+            let payment_processor_result = self.market_rpc(
+                &source_network,
+                "item_offers",
+                "payment_processor",
+                "eth_call",
+                json!([
+                    { "to": operative, "data": payment_processor_data },
+                    at(),
+                ]),
+            )?;
+            Some(decode_evm_address_word(&payment_processor_result, "paymentProcessor").ok()?)
+        } else {
+            None
+        };
+        Some(ProtectedContentItemOffersObservation {
+            chain_id: pin.chain_id,
+            finalized_block_number: pin.finalized_block_number,
+            finalized_block_hash: pin.finalized_block_hash,
+            operative,
+            truncated,
+            offers,
+            payment_processor,
+        })
     }
 
     fn observe_protected_content_rights(
@@ -2999,28 +4260,19 @@ impl ChainProvider {
         call: ProtectedContentRightsCall<'_>,
     ) -> Result<ProtectedContentRightsObservation, Response> {
         let started = Instant::now();
-        let mut observed: Vec<(&String, ProtectedContentRightsObservation)> = Vec::new();
-        for rpc_url in evidence_rpc_urls {
-            if let Some(observation) =
-                self.observe_protected_content_rights_source(network, rpc_url, call)
-            {
-                observed.push((rpc_url, observation));
-            }
-        }
-        let mut successful: Vec<ProtectedContentRightsObservation> = observed
+        let (observed, _) = self.observe_corroborating_sources(evidence_rpc_urls, |rpc_url| {
+            Ok(self.observe_protected_content_rights_source(network, rpc_url, call))
+        });
+        if observed
             .iter()
-            .map(|(_, observation)| *observation)
-            .collect();
-        if successful
-            .iter()
-            .any(|observation| observation.chain_id != expected_chain_id)
+            .any(|(_, observation)| observation.chain_id != expected_chain_id)
         {
             return Err(Response::error(
                 "conflicting_rights_observations",
                 "protected-content evidence sources disagree with configured chain policy",
             ));
         }
-        if successful.len() < 2 {
+        if observed.len() < 2 {
             return Err(Response::error(
                 "insufficient_rights_observations",
                 "protected-content evidence sources produced fewer than two matching finalized observations",
@@ -3028,35 +4280,20 @@ impl ChainProvider {
         }
         // Independent sources legitimately lag each other by a block or more
         // in what they consider finalized (finality is monotone, so the
-        // lowest finalized head is final on every source). When the heads
-        // differ, pin every source to that lowest finalized block: the
-        // block must be canonical there by hash, and the rights call is
-        // re-evaluated at exactly that block, so the corroboration compares
-        // the same finalized state everywhere instead of racing finality.
-        let heads_agree = successful[1..].iter().all(|observation| {
-            observation.finalized_block_number == successful[0].finalized_block_number
-                && observation.finalized_block_hash == successful[0].finalized_block_hash
+        // lowest finalized head is final on every source). `pin_to_lowest_finalized`
+        // pins every source to that lowest finalized block -- the block must
+        // be canonical there by hash -- and the rights call is re-evaluated
+        // at exactly that block, so the corroboration compares the same
+        // finalized state everywhere instead of racing finality. R32 reuses
+        // this same algorithm for the item / kid-binding / item-offers reads.
+        let successful = pin_to_lowest_finalized(&observed, |rpc_url, pin| {
+            self.observe_protected_content_rights_source_at(network, rpc_url, call, pin)
         });
-        if !heads_agree {
-            let pin = *successful
-                .iter()
-                .min_by_key(|observation| observation.finalized_block_number)
-                .expect("at least two observations");
-            let mut pinned = Vec::with_capacity(observed.len());
-            for (rpc_url, _) in &observed {
-                if let Some(repinned) =
-                    self.observe_protected_content_rights_source_at(network, rpc_url, call, &pin)
-                {
-                    pinned.push(repinned);
-                }
-            }
-            successful = pinned;
-            if successful.len() < 2 {
-                return Err(Response::error(
-                    "insufficient_rights_observations",
-                    "protected-content evidence sources produced fewer than two matching finalized observations",
-                ));
-            }
+        if successful.len() < 2 {
+            return Err(Response::error(
+                "insufficient_rights_observations",
+                "protected-content evidence sources produced fewer than two matching finalized observations",
+            ));
         }
         let reference = successful[0];
         if successful[1..]
@@ -3187,7 +4424,7 @@ impl ChainProvider {
         if let Some(error) = body.get("error") {
             return decode_protected_content_unbound_content_id(
                 error,
-                call.expected_content_access_id,
+                call.expected_content_access_id?,
             )
             .map(ProtectedContentRightsObservationKind::Unbound);
         }
@@ -3502,6 +4739,52 @@ struct ProtectedContentVerifiedListingObservation {
     payment_processor: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtectedContentItemObservation {
+    chain_id: u64,
+    finalized_block_number: u64,
+    finalized_block_hash: Digest32,
+    operative: String,
+    /// `None` only when `operative` is the zero address -- there is no
+    /// operative to ask for a `tokenURI`, and asking anyway would just
+    /// revert.
+    token_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtectedContentKidBindingObservation {
+    chain_id: u64,
+    finalized_block_number: u64,
+    finalized_block_hash: Digest32,
+    ledger: String,
+    token_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtectedContentItemOfferObservation {
+    seller: String,
+    quantity: String,
+    price: String,
+    pay_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtectedContentItemOffersObservation {
+    chain_id: u64,
+    finalized_block_number: u64,
+    finalized_block_hash: Digest32,
+    operative: String,
+    /// More than `PROTECTED_CONTENT_OFFERS_MAX` sellers existed; only the
+    /// first `PROTECTED_CONTENT_OFFERS_MAX` in ascending address order were
+    /// read.
+    truncated: bool,
+    /// Sold-out (`quantity == 0x0`) sellers are dropped already.
+    offers: Vec<ProtectedContentItemOfferObservation>,
+    /// The operative's `paymentProcessor()`, read once and only when some
+    /// read offer's `pay_token` was non-zero.
+    payment_processor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProtectedContentRightsObservation {
     chain_id: u64,
@@ -3509,6 +4792,119 @@ struct ProtectedContentRightsObservation {
     finalized_block_hash: Digest32,
     finalized_block_timestamp: u64,
     outcome: ProtectedContentRightsObservationKind,
+}
+
+/// A per-source answer to one of the protected-content chain reads, tagged
+/// with the finalized block it was read at. `pin_to_lowest_finalized` uses
+/// only this head to decide whether sources need re-pinning; it never looks
+/// at the rest of the observation.
+trait FinalizedObservation {
+    fn finalized_block_number(&self) -> u64;
+    fn finalized_block_hash(&self) -> Digest32;
+}
+
+impl FinalizedObservation for ProtectedContentRightsObservation {
+    fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
+    }
+    fn finalized_block_hash(&self) -> Digest32 {
+        self.finalized_block_hash
+    }
+}
+
+impl FinalizedObservation for ProtectedContentVerifiedListingObservation {
+    fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
+    }
+    fn finalized_block_hash(&self) -> Digest32 {
+        self.finalized_block_hash
+    }
+}
+
+impl FinalizedObservation for ProtectedContentItemObservation {
+    fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
+    }
+    fn finalized_block_hash(&self) -> Digest32 {
+        self.finalized_block_hash
+    }
+}
+
+impl FinalizedObservation for ProtectedContentKidBindingObservation {
+    fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
+    }
+    fn finalized_block_hash(&self) -> Digest32 {
+        self.finalized_block_hash
+    }
+}
+
+impl FinalizedObservation for ProtectedContentItemOffersObservation {
+    fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
+    }
+    fn finalized_block_hash(&self) -> Digest32 {
+        self.finalized_block_hash
+    }
+}
+
+/// R47: a corroborated read has what it needs once two observations agree on
+/// the same finalized block hash and the same tuple. Asking further sources
+/// then only multiplies load on public RPCs that rate-limit.
+fn two_observations_agree<T>(observed: &[(String, T)]) -> bool
+where
+    T: FinalizedObservation + PartialEq,
+{
+    observed.iter().enumerate().any(|(index, (_, first))| {
+        observed[index + 1..].iter().any(|(_, second)| {
+            first.finalized_block_hash() == second.finalized_block_hash() && first == second
+        })
+    })
+}
+
+/// R32 / SM-I5: independent evidence sources legitimately lag each other by
+/// a block or more in what they consider finalized (finality is monotone,
+/// so the lowest finalized head is final on every source). When the sources'
+/// finalized heads do not already agree, this pins every source to the
+/// lowest finalized block among them and asks `refetch_at` to re-observe
+/// each one there -- the block must be canonical there by hash -- so the
+/// corroboration that follows compares the same finalized state everywhere
+/// instead of requiring the sources to race finality into agreement.
+///
+/// Shared by the rights read and by the item / kid-binding / item-offers
+/// reads so the algorithm exists exactly once.
+fn pin_to_lowest_finalized<T, F>(observed: &[(String, T)], mut refetch_at: F) -> Vec<T>
+where
+    T: FinalizedObservation + Clone,
+    F: FnMut(&str, &T) -> Option<T>,
+{
+    let successful: Vec<T> = observed
+        .iter()
+        .map(|(_, observation)| observation.clone())
+        .collect();
+    if successful.len() < 2 {
+        return successful;
+    }
+    let reference = successful[0].clone();
+    let heads_agree = successful[1..].iter().all(|observation| {
+        observation.finalized_block_number() == reference.finalized_block_number()
+            && observation.finalized_block_hash() == reference.finalized_block_hash()
+    });
+    if heads_agree {
+        return successful;
+    }
+    let pin = successful
+        .iter()
+        .min_by_key(|observation| observation.finalized_block_number())
+        .cloned()
+        .expect("at least two observations");
+    let mut pinned = Vec::with_capacity(observed.len());
+    for (rpc_url, _) in observed {
+        if let Some(repinned) = refetch_at(rpc_url, &pin) {
+            pinned.push(repinned);
+        }
+    }
+    pinned
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3546,7 +4942,9 @@ enum ProtectedContentRightsBlock {
 struct ProtectedContentRightsCall<'a> {
     contract: &'a str,
     data: &'a str,
-    expected_content_access_id: &'a ContentAccessIdV1,
+    /// The KID a content-id call is about; `None` for an item-keyed call,
+    /// which has no "unbound" answer -- any error there observed nothing.
+    expected_content_access_id: Option<&'a ContentAccessIdV1>,
     block: ProtectedContentRightsBlock,
 }
 
@@ -3836,4 +5234,13 @@ fn main() {
     }
 
     eprintln!("chain-provider exiting");
+}
+
+/// The host of a configured RPC URL, for logs: never the path or query,
+/// which may carry an API key.
+fn rpc_source_host(rpc_url: &str) -> String {
+    reqwest::Url::parse(rpc_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unparseable".to_string())
 }

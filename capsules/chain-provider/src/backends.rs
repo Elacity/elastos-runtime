@@ -19,6 +19,64 @@ use super::*;
 /// answered and knew nothing.
 pub(super) const EVM_RPC_BATCH_MAX: usize = 3;
 
+/// How many more times a request answered HTTP 429 is sent (R47).
+const EVM_RPC_RATE_LIMIT_RETRIES: usize = 2;
+/// The waits before those retries when the source names no usable
+/// `Retry-After`.
+const EVM_RPC_RATE_LIMIT_BACKOFF: [Duration; EVM_RPC_RATE_LIMIT_RETRIES] =
+    [Duration::from_millis(250), Duration::from_millis(750)];
+/// The longest `Retry-After` honoured; a longer one uses the backoff above.
+const EVM_RPC_RATE_LIMIT_MAX_RETRY_AFTER_SECS: u64 = 2;
+/// How long an origin that stayed rate-limited is asked last.
+pub(super) const RATE_LIMITED_ORIGIN_COOLDOWN_SECS: u64 = 60;
+
+/// The wait before retry `retry` (0-based): the source's own `Retry-After`
+/// when it asks for at most two seconds, else the bounded backoff.
+fn rate_limit_wait(retry_after_secs: Option<u64>, retry: usize) -> Duration {
+    match retry_after_secs {
+        Some(secs) if secs <= EVM_RPC_RATE_LIMIT_MAX_RETRY_AFTER_SECS => Duration::from_secs(secs),
+        _ => EVM_RPC_RATE_LIMIT_BACKOFF[retry],
+    }
+}
+
+/// `Retry-After` in delta-seconds; the HTTP-date form counts as absent.
+fn retry_after_secs(response: &reqwest::blocking::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The key a cooldown is held under: scheme, host and port. Two paths on one
+/// origin share one rate limit.
+fn rpc_origin(rpc_url: &str) -> String {
+    reqwest::Url::parse(rpc_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| rpc_url.to_string())
+}
+
+/// The log line for one 429 retry. Only the host is named: a configured RPC
+/// URL may carry an API key in its path or query.
+pub(super) fn rate_limit_retry_log(rpc_url: &str, retry: usize, wait: Duration) -> String {
+    format!(
+        "chain-provider: rpc source rate limited source={} retry={retry} wait_ms={}",
+        rpc_source_host(rpc_url),
+        wait.as_millis(),
+    )
+}
+
+/// The log line for an origin put in cooldown. Host only, as above.
+pub(super) fn rate_limit_cooldown_log(rpc_url: &str) -> String {
+    format!(
+        "chain-provider: rpc source cooled source={} reason=http_429 cooldown_secs={RATE_LIMITED_ORIGIN_COOLDOWN_SECS}",
+        rpc_source_host(rpc_url),
+    )
+}
+
 /// Reads a batch answer, and decides whether it is an answer at all.
 ///
 /// Two refusals to tell apart, both seen from configured sources:
@@ -81,6 +139,76 @@ pub(super) struct MainchainTip {
 }
 
 impl ChainProvider {
+    /// The order a corroborated read asks its sources in: the configured
+    /// order, with origins still cooling after a persistent 429 moved last.
+    /// A cooled source stays in the list, so it still answers when nothing
+    /// else can.
+    pub(super) fn corroboration_order(&self, evidence_rpc_urls: &[String]) -> Vec<String> {
+        let now = (self.now_unix_seconds)();
+        let (ready, cooled): (Vec<String>, Vec<String>) = evidence_rpc_urls
+            .iter()
+            .cloned()
+            .partition(|rpc_url| !self.rpc_origin_cooling(rpc_url, now));
+        ready.into_iter().chain(cooled).collect()
+    }
+
+    fn rpc_origin_cooling(&self, rpc_url: &str, now: u64) -> bool {
+        let cooldowns = self
+            .rate_limited_origins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cooldowns
+            .get(&rpc_origin(rpc_url))
+            .is_some_and(|until| now < *until)
+    }
+
+    fn cool_rpc_origin(&self, rpc_url: &str) {
+        let until = (self.now_unix_seconds)().saturating_add(RATE_LIMITED_ORIGIN_COOLDOWN_SECS);
+        self.rate_limited_origins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(rpc_origin(rpc_url), until);
+        eprintln!("{}", rate_limit_cooldown_log(rpc_url));
+    }
+
+    /// Posts one JSON-RPC payload (single or batch). A 429 is retried at most
+    /// twice (R47); an origin still answering 429 after that is cooled. Every
+    /// other outcome returns at once, exactly as before.
+    fn post_evm_rpc(
+        &self,
+        rpc_url: &str,
+        payload: &Value,
+        unreachable: &str,
+    ) -> Result<reqwest::blocking::Response, Response> {
+        let mut retry = 0;
+        loop {
+            let response = self
+                .client
+                .post(rpc_url)
+                .json(payload)
+                .send()
+                .map_err(|_| Response::error("upstream_unreachable", unreachable))?;
+            let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if retry < EVM_RPC_RATE_LIMIT_RETRIES {
+                    let wait = rate_limit_wait(retry_after_secs(&response), retry);
+                    retry += 1;
+                    eprintln!("{}", rate_limit_retry_log(rpc_url, retry, wait));
+                    (self.sleep)(wait);
+                    continue;
+                }
+                self.cool_rpc_origin(rpc_url);
+            }
+            if !status.is_success() {
+                return Err(Response::error(
+                    "upstream_http_error",
+                    &format!("upstream returned HTTP {}", status.as_u16()),
+                ));
+            }
+            return Ok(response);
+        }
+    }
+
     pub(super) fn network_for_status(&self, network_id: &str) -> Result<&ChainNetwork, Response> {
         if let Err(err) = validate_network_id(network_id) {
             return Err(Response::error("invalid_network", &err));
@@ -236,24 +364,16 @@ impl ChainProvider {
         method: &str,
         params: Value,
     ) -> Result<Value, Response> {
-        let response = self
-            .client
-            .post(&network.rpc_url)
-            .json(&json!({
+        let response = self.post_evm_rpc(
+            &network.rpc_url,
+            &json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": method,
                 "params": params,
-            }))
-            .send()
-            .map_err(|_| Response::error("upstream_unreachable", "EVM RPC request failed"))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Response::error(
-                "upstream_http_error",
-                &format!("upstream returned HTTP {}", status.as_u16()),
-            ));
-        }
+            }),
+            "EVM RPC request failed",
+        )?;
         let body = response
             .json::<Value>()
             .map_err(|_| Response::error("upstream_invalid_json", "EVM RPC response malformed"))?;
@@ -311,7 +431,7 @@ impl ChainProvider {
                 "too many calls in one EVM RPC batch",
             ));
         }
-        let payload: Vec<Value> = calls
+        let payload: Value = calls
             .iter()
             .enumerate()
             .map(|(index, (method, params))| {
@@ -323,19 +443,8 @@ impl ChainProvider {
                 })
             })
             .collect();
-        let response = self
-            .client
-            .post(&network.rpc_url)
-            .json(&payload)
-            .send()
-            .map_err(|_| Response::error("upstream_unreachable", "EVM RPC batch request failed"))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Response::error(
-                "upstream_http_error",
-                &format!("upstream returned HTTP {}", status.as_u16()),
-            ));
-        }
+        let response =
+            self.post_evm_rpc(&network.rpc_url, &payload, "EVM RPC batch request failed")?;
         let body = response
             .json::<Value>()
             .map_err(|_| Response::error("upstream_invalid_json", "EVM RPC batch malformed"))?;

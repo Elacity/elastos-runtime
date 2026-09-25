@@ -648,3 +648,173 @@ fn test_market_catalog_reads_each_price_in_its_own_scale() {
     let items = market_catalog_from_payload(&row(json!([]), json!("not a price")), &usdc).unwrap();
     assert_eq!(items[0].price, "0");
 }
+
+/// What the directory test server does with one accepted connection.
+enum DirectoryReply {
+    /// Accept and never answer: the request times out, as the first catalog
+    /// read after a page load did on the installed Home (R49).
+    Stall,
+    /// Answer with this HTTP status and JSON body.
+    Answer(u16, &'static str),
+}
+
+/// A local GraphQL endpoint answering each accepted connection in turn, and
+/// how many connections it accepted.
+async fn spawn_directory_server(
+    replies: Vec<DirectoryReply>,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        let mut replies = replies.into_iter();
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let Some(DirectoryReply::Answer(status, body)) = replies.next() else {
+                held.push(stream);
+                continue;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{addr}/graphql"), accepted)
+}
+
+fn short_directory_timeouts() -> OnchainDirectoryTimeouts {
+    OnchainDirectoryTimeouts {
+        connect: std::time::Duration::from_millis(250),
+        total: std::time::Duration::from_millis(400),
+    }
+}
+
+const DIRECTORY_CATALOG_ANSWER: &str = r#"{"data":{"result":{"total":0,"data":[]}}}"#;
+
+fn approved_market_directory() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    MARKET_DIRECTORY
+        .store_policy(dir.path(), "principal-directory-test", 1)
+        .unwrap();
+    dir
+}
+
+/// R49: a read whose first request dies in transport -- here it times out,
+/// as the first catalog read after a page load did -- is asked once more with
+/// a fresh client, and the second answer is the catalog.
+#[tokio::test]
+async fn test_directory_retries_once_after_a_transport_error() {
+    let (endpoint, accepted) = spawn_directory_server(vec![
+        DirectoryReply::Stall,
+        DirectoryReply::Answer(200, DIRECTORY_CATALOG_ANSWER),
+    ])
+    .await;
+    let dir = approved_market_directory();
+    let items = fetch_market_catalog_at(dir.path(), &[], &endpoint, short_directory_timeouts())
+        .await
+        .expect("the retry answers");
+    assert!(items.is_empty());
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// R49: two transport failures in a row are the catalog's existing
+/// unavailable answer -- no items, a note, and no approval asked for -- and
+/// never a third request. A connection refused is a transport error too.
+#[tokio::test]
+async fn test_directory_is_unavailable_after_two_transport_errors() {
+    let (endpoint, accepted) =
+        spawn_directory_server(vec![DirectoryReply::Stall, DirectoryReply::Stall]).await;
+    let dir = approved_market_directory();
+    let error = fetch_market_catalog_at(dir.path(), &[], &endpoint, short_directory_timeouts())
+        .await
+        .expect_err("two transport errors");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let note = error.to_string();
+    let answer = market_catalog_unavailable_answer(
+        7,
+        MARKET_DIRECTORY.note_should_request_approval(&note),
+        &note,
+    );
+    assert_eq!(
+        answer,
+        json!({
+            "asOf": 7,
+            "unavailable": true,
+            "needsApproval": false,
+            "items": [],
+            "note": note,
+        })
+    );
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = format!("http://{}/graphql", closed.local_addr().unwrap());
+    drop(closed);
+    assert!(
+        fetch_market_catalog_at(dir.path(), &[], &refused, short_directory_timeouts())
+            .await
+            .is_err()
+    );
+}
+
+/// R49: an HTTP answer is an answer. A 4xx or 5xx is reported as it came,
+/// never asked again.
+#[tokio::test]
+async fn test_directory_does_not_retry_an_http_error_status() {
+    for status in [422u16, 503] {
+        let (endpoint, accepted) = spawn_directory_server(vec![
+            DirectoryReply::Answer(status, r#"{"errors":[{"message":"no"}]}"#),
+            DirectoryReply::Answer(200, DIRECTORY_CATALOG_ANSWER),
+        ])
+        .await;
+        let dir = approved_market_directory();
+        let error = fetch_market_catalog_at(dir.path(), &[], &endpoint, short_directory_timeouts())
+            .await
+            .expect_err("an error status is not retried into a success");
+        assert!(error.to_string().contains(&status.to_string()), "{error}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+/// R49: each request is bounded by a connect timeout of its own, apart from
+/// the whole request's, and at most two requests are made.
+#[test]
+fn test_directory_timeouts_separate_connect_from_total() {
+    assert_eq!(
+        OnchainDirectoryTimeouts::DEFAULT.connect,
+        std::time::Duration::from_secs(4)
+    );
+    assert_eq!(
+        OnchainDirectoryTimeouts::DEFAULT.total,
+        std::time::Duration::from_secs(20)
+    );
+}

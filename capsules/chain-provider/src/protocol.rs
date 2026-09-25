@@ -17,10 +17,30 @@ pub(super) const PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA: &str =
     "elastos.chain.protected-content-mint-receipt/v1";
 pub(super) const PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA: &str =
     "elastos.chain.protected-content-verified-listing/v1";
+pub(super) const PROTECTED_CONTENT_ITEM_SCHEMA: &str = "elastos.chain.protected-content-item/v1";
+pub(super) const PROTECTED_CONTENT_KID_BINDING_SCHEMA: &str =
+    "elastos.chain.protected-content-kid-binding/v1";
+pub(super) const PROTECTED_CONTENT_ITEM_OFFERS_SCHEMA: &str =
+    "elastos.chain.protected-content-item-offers/v1";
+pub(super) const PROTECTED_CONTENT_OFFERS_MAX: usize = 32;
 pub(super) const PROTECTED_CONTENT_PURCHASE_SCHEMA: &str =
     "elastos.chain.protected-content-purchase/v1";
 pub(super) const PROTECTED_CONTENT_PURCHASE_ACCESS_SCHEMA: &str =
     "elastos.chain.protected-content-purchase-access/v1";
+pub(super) const PROTECTED_CONTENT_ITEM_ACCESS_SCHEMA: &str =
+    "elastos.chain.protected-content-item-access/v1";
+
+/// The block an item-keyed access read is evaluated at: `latest` for the
+/// same reason the content-id purchase-access read reads the head (a grant is
+/// readable in the block that carries it), `finalized` where only state no
+/// reorg can take back will do. Either way every source is pinned to one
+/// common block and must agree there.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProtectedContentAccessBlock {
+    Finalized,
+    Latest,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -362,7 +382,6 @@ pub(super) enum Request {
         /// offered token, which is what a caller that does not choose means.
         #[serde(default)]
         pay_token: Option<String>,
-
     },
     ResolveProtectedContentMintReceipt {
         network: String,
@@ -375,6 +394,25 @@ pub(super) enum Request {
     ResolveProtectedContentVerifiedListing {
         network: String,
         seller: String,
+        ledger: String,
+        token_id: String,
+    },
+    /// An item's operative and `tokenURI`, so a `ListingObject` can be built
+    /// from any of the common identifiers in D15 without a seller in hand.
+    ResolveProtectedContentItem {
+        network: String,
+        ledger: String,
+        token_id: String,
+    },
+    /// A KID's on-chain binding to `(ledger, token_id)`, the other leg of the
+    /// D15 binding triangle.
+    ResolveProtectedContentKidBinding {
+        network: String,
+        content_access_id: String,
+    },
+    /// Every live offer (all sellers) for an item, at one finalized block.
+    ResolveProtectedContentItemOffers {
+        network: String,
         ledger: String,
         token_id: String,
     },
@@ -408,6 +446,17 @@ pub(super) enum Request {
         network: String,
         wallet: String,
         content_access_id: String,
+    },
+    /// R50: whether `wallet` holds access to the item `(ledger, token_id)`,
+    /// asked by the item (`AuthorityGateway.hasAccess`) rather than by its
+    /// KID, corroborated like the content-id read.
+    ResolveProtectedContentItemAccess {
+        request_id: String,
+        network: String,
+        wallet: String,
+        ledger: String,
+        token_id: String,
+        block: ProtectedContentAccessBlock,
     },
     Proof {
         network: String,
