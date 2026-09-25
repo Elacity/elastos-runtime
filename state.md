@@ -1,5 +1,54 @@
 # State
 
+## SEC1 Mac confinement stop, 25 September 2026 UTC
+
+The source tested was the clean local checkout `feat/0.7.1-model-assistant-closeout` at
+`9fb8360a4c5fbb0adbc559d277a354e79b7e1ff5` (tree
+`259ae2eb3a205c5f0f51d33fb8147c2d24507142`). On an isolated Mac,
+`sandbox-exec` with the Runtime's generated `(allow default)` and outbound
+network policy read a synthetic owner-only file in the isolated Home. The
+full 64 local socket allowances and hosted socket allowance still denied direct
+internet and an unrelated Unix socket while permitting the selected Unix socket.
+This is a same-user canary result, not a read of a real Home secret.
+
+Independent source review found a second boundary gap: Runtime recorded the
+hosted create input hash, but the broker matched only the active run/request
+identity and configured model when it forwarded JSON. A local unpaid Mac broker
+fixture then sent a changed prompt under a valid run and observed HTTP 200 at
+the loopback sink. Source changes now bind text, Responses and Decisions effect
+inputs to the Runtime create input; job create checks the complete input hash.
+The broker also requires the native adapter's exact output token cap from the
+stored offer policy. Before that cap check, the fixture sent a raised cap and
+observed HTTP 200. After the checks, changed prompt, raised cap and missing cap
+get HTTP 403 with zero sink requests, while the authorized prompt gets HTTP 200.
+The independent source reviewer found no remaining P1/P2 in this focused patch.
+This is source test evidence only. The isolated source-home build was interrupted
+after the canary result and before installation, so this attempt has no
+built-to-installed parity or signed-in Inbox proof. Private receipts are
+`.audit/sec1-mac-adversarial-stop.private.md` and
+`.audit/sec1-broker-effect-input-binding.private.md`. Hosted activation remains
+paused pending the Seatbelt file-read repair and isolated installed negative
+proof. The concurrent Inbox End/send race remains open separately.
+
+## SEC1 public seed isolation census, 25 September 2026 UTC
+
+A read-only check of the public 8090 Runtime found one four-process model chain:
+Runtime, model-provider, its local-llama guard, and llama-server. Their running
+and installed executable hashes match the retained public repair, provider and
+engine receipts. All four report `Seccomp=0`, `NoNewPrivs=0` and an unconfined
+AppArmor label, with the same mount/network/user namespaces and supplementary
+groups. The account with those groups connected to `/var/run/docker.sock` and
+closed it without an API request. This establishes matching-credential socket
+reachability; it does not show a model child using Docker or reading private data.
+The installed model-provider manifest says `type: microvm`, which does not by
+itself enforce isolation. The public base predates the newer feature-branch
+Linux socket filter, and that newer source is not installed there. Other model
+processes were outside this public descendant chain. The private read-only receipt is
+`.audit/sec1-public-seed-readonly-isolation.private.md`. Public artifacts and
+processes were left unchanged; an exact reviewed plan and approval are needed
+before a public repair. The local Home followed its redirect to HTTP 200; the
+host had 14.43% free disk and 12,750,156 KiB MemAvailable at the observation.
+
 ## Current model foundation, 24 September 2026 UTC
 
 Rows below retain dated diagnostic history. The latest public row supersedes

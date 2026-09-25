@@ -69,6 +69,12 @@ Runtime verifies authority before dispatch, and unknown operations fail closed.
 Gateways authenticate and route host projections; they do not reimplement
 provider policy.
 
+Before a release claims capsule isolation, inventory each shipped executable
+provider's declared execution type against its actual launch path and host
+enforcement. A signature proves package identity; the installed process boundary
+proves isolation. Resolve each mismatch or record a verified, scoped containment
+decision in the release gate.
+
 The normative authority rules live in [PRINCIPLES.md](PRINCIPLES.md),
 [ESP v0](docs/ESP_V0.md), and the
 [Capsule interface contract](docs/CAPSULE_INTERFACE_CONTRACT.md). Capsule
