@@ -30,6 +30,9 @@ const HOME_SERVICES_STATE_MAX_BYTES: usize = 32 * 1024;
 const HOME_SERVICES_REQUESTS_SCHEMA: &str = "elastos.services.requests/v1";
 const HOME_SERVICES_REQUESTS_MAX_BYTES: usize = 64 * 1024;
 const HOME_SERVICES_REQUESTS_TOPIC: &str = "__elastos_internal/service-requests-v1";
+const HOME_MODEL_CATALOG_TTL_SECS: u64 = 120;
+const HOME_MODEL_CATALOG_MAX_OFFERS: usize = 16;
+const HOME_MODEL_CATALOG_RESPONSE_COOLDOWN_SECS: u64 = 5;
 const HOME_SERVICES_REMOTE_EXIT_TICKET_MAX_BYTES: usize = 8192;
 const HOME_BROWSER_EXIT_LOCAL_OFFER_ID: &str = "local:provider:browser-exit";
 const HOME_BROWSER_EXIT_PEER_SERVICE_URI: &str = "elastos://peer/browser-exit";
@@ -214,6 +217,19 @@ struct HomeServicesSelectionState {
     remote_offer_ids: BTreeSet<String>,
     #[serde(default)]
     remote_offer_requests: BTreeMap<String, HomeServicesRemoteOfferRequestRecord>,
+    #[serde(default)]
+    model_catalog_requests: BTreeMap<String, HomeServicesModelCatalogRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct HomeServicesModelCatalogRecord {
+    request_id: String,
+    target_peer_id: String,
+    requested_at: u64,
+    responded_at: u64,
+    expires_at: u64,
+    #[serde(default)]
+    entries: Vec<HomeServicesModelCatalogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -237,6 +253,10 @@ struct HomeServicesRemoteOfferRequestRecord {
     service_uri: String,
     service_kind: String,
     service_display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_model_offer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_model_offer_revision: Option<String>,
     target_peer_id: String,
     created_at: u64,
     updated_at: u64,
@@ -261,6 +281,19 @@ struct HomeServicesRequestsState {
     updated_at: u64,
     #[serde(default)]
     requests: BTreeMap<String, HomeServiceAccessRequestRecord>,
+    #[serde(default)]
+    catalog_last_response_at: BTreeMap<String, u64>,
+    #[serde(default)]
+    pending_model_catalogs: BTreeMap<String, HomePendingModelCatalogRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HomePendingModelCatalogRequest {
+    request_id: String,
+    requester_peer_id: String,
+    requester_did: String,
+    requester_principal_id: String,
+    created_at: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -269,6 +302,10 @@ struct HomeServiceAccessRequestRecord {
     grant_scope: Option<String>,
     request_id: String,
     offer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_model_offer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_model_offer_revision: Option<String>,
     service_uri: String,
     service_kind: String,
     service_display_name: String,
@@ -287,6 +324,10 @@ struct HomeServiceAccessRequestRecord {
     authenticated_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    approved_offer_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    approved_offer_revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exit_max_active_streams: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,6 +347,12 @@ pub(super) struct ServicesOfferUpdateRequest {
     offer_id: String,
     section: String,
     selected: bool,
+    #[serde(default)]
+    terms_ack: Option<String>,
+    #[serde(default)]
+    model_offer_id: Option<String>,
+    #[serde(default)]
+    model_offer_revision: Option<String>,
 }
 
 enum ServicesPeerTransportBlocking {
@@ -2003,11 +2050,14 @@ pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SERVICES_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return home_error_response(err),
-        };
+    let context = match require_home_launch_token_binding(
+        &state.data_dir,
+        &headers,
+        &[SERVICES_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
+    ) {
+        Ok(binding) => binding.context,
+        Err(err) => return home_error_response(err),
+    };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
     let provider_registry = state.provider_registry.clone();
@@ -2053,6 +2103,15 @@ pub(super) async fn services_offer_update(
         };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
+    let _model_share_guard = if req.section.trim() == "mine" {
+        Some(
+            super::gateway_model_service::model_share_gate()
+                .write()
+                .await,
+        )
+    } else {
+        None
+    };
     match tokio::task::spawn_blocking(move || {
         let mutation_lock = home_services_mutation_lock(&data_dir)?;
         let _guard = mutation_lock
@@ -2071,6 +2130,48 @@ pub(super) async fn services_offer_update(
         }
         let mut services_state = home_services_selection_state(&data_dir, &context)?;
         match req.section.trim() {
+            "catalog" => {
+                anyhow::ensure!(
+                    req.selected,
+                    "service offer model catalog check is required"
+                );
+                let offer = home_state
+                    .services
+                    .remote_offers
+                    .iter()
+                    .find(|offer| offer.offer_id == offer_id)
+                    .ok_or_else(|| anyhow::anyhow!("service offer model is unavailable"))?;
+                let refresh = services_state
+                    .model_catalog_requests
+                    .get(offer_id)
+                    .is_none_or(|prior| now_ts().saturating_sub(prior.requested_at) >= 5);
+                if refresh {
+                    let query = home_services_request_model_catalog(
+                        &data_dir,
+                        &context,
+                        discovery_service.as_ref(),
+                        offer,
+                    )?;
+                    services_state
+                        .model_catalog_requests
+                        .retain(|id, catalog| id == offer_id || catalog.expires_at > now_ts());
+                    if !services_state.model_catalog_requests.contains_key(offer_id)
+                        && services_state.model_catalog_requests.len() >= 2
+                    {
+                        if let Some(oldest) = services_state
+                            .model_catalog_requests
+                            .iter()
+                            .min_by_key(|(_, catalog)| catalog.requested_at)
+                            .map(|(id, _)| id.clone())
+                        {
+                            services_state.model_catalog_requests.remove(&oldest);
+                        }
+                    }
+                    services_state
+                        .model_catalog_requests
+                        .insert(offer_id.to_string(), query);
+                }
+            }
             "mine" => {
                 if !home_state
                     .services
@@ -2080,7 +2181,15 @@ pub(super) async fn services_offer_update(
                 {
                     anyhow::bail!("service offer is not available in Mine");
                 }
-                if req.selected {
+                if crate::api::operator_has_hosted_offer(&data_dir, offer_id) {
+                    require_admin_principal(&data_dir, &context)?;
+                    crate::api::set_hosted_offer_share(
+                        &data_dir,
+                        offer_id,
+                        req.selected,
+                        req.terms_ack.as_deref(),
+                    )?;
+                } else if req.selected {
                     services_state.local_offer_ids.insert(offer_id.to_string());
                 } else {
                     services_state.local_offer_ids.remove(offer_id);
@@ -2104,19 +2213,67 @@ pub(super) async fn services_offer_update(
                         );
                     }
                 } else if req.selected {
+                    let exact_model = if offer.service_kind == super::MODEL_SERVICE_KIND {
+                        let id = req.model_offer_id.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("service offer requires one named model before access")
+                        })?;
+                        let revision = req.model_offer_revision.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("service offer requires a named model revision")
+                        })?;
+                        let catalog = services_state
+                            .model_catalog_requests
+                            .get(offer_id)
+                            .filter(|catalog| catalog.expires_at > now_ts())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("service offer catalog expired; check models again")
+                            })?;
+                        let contact = home_services_peer_contact_record_for_offer(
+                            &data_dir,
+                            &context,
+                            discovery_service.as_ref(),
+                            offer,
+                        )?;
+                        anyhow::ensure!(
+                            catalog.target_peer_id == contact.peer_id
+                                && catalog
+                                    .entries
+                                    .iter()
+                                    .any(|entry| { entry.id == id && entry.revision == revision }),
+                            "service offer named model is no longer in the signed catalog"
+                        );
+                        Some((id, revision))
+                    } else {
+                        anyhow::ensure!(
+                            req.model_offer_id.is_none() && req.model_offer_revision.is_none(),
+                            "named model applies only to model service"
+                        );
+                        None
+                    };
                     // A first request, or a fresh one after the earlier grant expired.
                     let expired_grant = services_state
                         .remote_offer_requests
                         .get(offer_id)
                         .is_some_and(|request| remote_offer_request_expired(request, now_ts()));
                     if offer.grant_required
-                        && (!services_state.remote_offer_ids.contains(offer_id) || expired_grant)
+                        && (!services_state.remote_offer_ids.contains(offer_id)
+                            || expired_grant
+                            || exact_model.is_some_and(|(id, revision)| {
+                                services_state
+                                    .remote_offer_requests
+                                    .get(offer_id)
+                                    .is_none_or(|prior| {
+                                        prior.requested_model_offer_id.as_deref() != Some(id)
+                                            || prior.requested_model_offer_revision.as_deref()
+                                                != Some(revision)
+                                    })
+                            }))
                     {
                         let sent = home_services_send_access_request(
                             &data_dir,
                             &context,
                             discovery_service.as_ref(),
                             offer,
+                            exact_model,
                         )
                         .map_err(|err| {
                             if profile_required_message(&err).is_some() {
@@ -2134,6 +2291,9 @@ pub(super) async fn services_offer_update(
                                 service_uri: offer.service_uri.clone(),
                                 service_kind: offer.service_kind.clone(),
                                 service_display_name: offer.display_name.clone(),
+                                requested_model_offer_id: exact_model.map(|(id, _)| id.to_string()),
+                                requested_model_offer_revision: exact_model
+                                    .map(|(_, revision)| revision.to_string()),
                                 target_peer_id: sent.target_peer_id,
                                 created_at: sent.created_at,
                                 updated_at: sent.created_at,
@@ -2152,7 +2312,7 @@ pub(super) async fn services_offer_update(
                     services_state.remote_offer_requests.remove(offer_id);
                 }
             }
-            _ => anyhow::bail!("service section must be mine or others"),
+            _ => anyhow::bail!("service section is invalid"),
         }
         services_state.updated_at = now_ts();
         home_save_services_selection_state(&data_dir, &context, &services_state)?;
@@ -2206,6 +2366,7 @@ fn home_services_default_selection_state(
         local_offer_ids: BTreeSet::new(),
         remote_offer_ids: BTreeSet::new(),
         remote_offer_requests: BTreeMap::new(),
+        model_catalog_requests: BTreeMap::new(),
     }
 }
 
@@ -2316,6 +2477,8 @@ fn home_services_default_requests_state(
         localhost_root: crate::auth::principal_localhost_root(&context.principal_id),
         updated_at: 0,
         requests: BTreeMap::new(),
+        catalog_last_response_at: BTreeMap::new(),
+        pending_model_catalogs: BTreeMap::new(),
     }
 }
 
@@ -2476,6 +2639,19 @@ fn home_services_local_model_shared(
         .contains(super::MODEL_LOCAL_OFFER))
 }
 
+pub(in crate::api::gateway) fn local_model_offer_is_shared(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+) -> bool {
+    let context = HomeLaunchTokenContext {
+        principal_id: principal_id.to_string(),
+        session_id: String::new(),
+        proof_binding_id: None,
+        grant_id: String::new(),
+    };
+    home_services_local_model_shared(data_dir, &context).unwrap_or(false)
+}
+
 fn home_services_local_engine_shared(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -2497,7 +2673,8 @@ fn home_services_request_shared(
     } else if request.service_kind == super::MODEL_SERVICE_KIND
         && request.service_uri == super::MODEL_SERVICE_URI
     {
-        home_services_local_model_shared(data_dir, context)
+        Ok(home_services_local_model_shared(data_dir, context)?
+            || crate::api::any_hosted_model_shared(data_dir))
     } else if request.service_kind == HOME_REMOTE_EXIT_SERVICE_KIND
         && request.service_uri == HOME_BROWSER_EXIT_PEER_SERVICE_URI
     {
@@ -2514,6 +2691,7 @@ fn home_services_send_access_request(
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     offer: &HomeServiceOfferSummary,
+    exact_model: Option<(&str, &str)>,
 ) -> anyhow::Result<HomeServiceAccessRequestSent> {
     if !home_services_supported_request(&offer.service_kind, &offer.service_uri) {
         anyhow::bail!("only Browser Engine, Exit and model service requests are supported");
@@ -2558,6 +2736,16 @@ fn home_services_send_access_request(
         "grant_scope": &offer.grant_scope,
         "created_at": created_at,
     });
+    if let Some((id, revision)) = exact_model {
+        anyhow::ensure!(
+            offer.service_kind == super::MODEL_SERVICE_KIND
+                && super::gateway_model_service::safe_id(id, 256)
+                && super::gateway_model_service::valid_offer_execution_revision(revision),
+            "invalid named model request"
+        );
+        payload["model_offer_id"] = serde_json::json!(id);
+        payload["model_offer_revision"] = serde_json::json!(revision);
+    }
     crate::carrier::sign_service_message(data_dir, &mut payload)?;
     let delivery = services_peer_provider_request_blocking(
         &runtime.transport,
@@ -2576,6 +2764,160 @@ fn home_services_send_access_request(
         target_peer_id: target_peer_id.to_string(),
         created_at,
     })
+}
+
+fn home_services_request_model_catalog(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    offer: &HomeServiceOfferSummary,
+) -> anyhow::Result<HomeServicesModelCatalogRecord> {
+    anyhow::ensure!(
+        offer.service_kind == super::MODEL_SERVICE_KIND
+            && offer.service_uri == super::MODEL_SERVICE_URI,
+        "model catalog requires a connected person's model service"
+    );
+    let contact =
+        home_services_peer_contact_record_for_offer(data_dir, context, discovery_service, offer)?;
+    let runtime = services_attach_peer_runtime_blocking(data_dir, discovery_service)?;
+    services_peer_gossip_join_blocking(&runtime, HOME_SERVICES_REQUESTS_TOPIC, "dht")?;
+    services_gossip_join_known_peers_blocking(
+        &runtime,
+        HOME_SERVICES_REQUESTS_TOPIC,
+        std::slice::from_ref(&contact.peer_id),
+    )?;
+    let request_id = home_services_new_access_request_id(&contact.peer_id)?;
+    let requested_at = now_ts();
+    let mut payload = serde_json::json!({
+        "schema":"elastos.model-offer-catalog-request/v1",
+        "kind":"model_offer_catalog_request",
+        "request_id":request_id,
+        "target_peer_id":contact.peer_id,
+        "requester_peer_id":runtime.peer_id,
+        "requester_did":home_services_local_device_did(data_dir)?,
+        "requester_principal_id":context.principal_id,
+        "created_at":requested_at,
+    });
+    crate::carrier::sign_service_message(data_dir, &mut payload)?;
+    let delivery = services_peer_provider_request_blocking(
+        &runtime.transport,
+        "gossip_send",
+        serde_json::json!({
+            "topic":HOME_SERVICES_REQUESTS_TOPIC,
+            "sender_id":runtime.peer_id,
+            "sender":"Services",
+            "message":payload.to_string(),
+            "ts":requested_at,
+        }),
+    )?;
+    home_services_require_remote_request_delivery(&delivery)?;
+    Ok(HomeServicesModelCatalogRecord {
+        request_id,
+        target_peer_id: contact.peer_id,
+        requested_at,
+        responded_at: 0,
+        expires_at: 0,
+        entries: Vec::new(),
+    })
+}
+
+fn home_services_send_model_catalog_response(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    runtime: &ServicesPeerRuntimeBlocking,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    request: &HomePendingModelCatalogRequest,
+) -> anyhow::Result<()> {
+    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    anyhow::ensure!(
+        contacts.contacts.values().any(|contact| {
+            contact.peer_id == request.requester_peer_id
+                && contact.did.as_deref() == Some(request.requester_did.as_str())
+        }),
+        "model catalog contact is unavailable"
+    );
+    let requester_peer_id = &request.requester_peer_id;
+    let requester_principal_id = &request.requester_principal_id;
+    let request_id = &request.request_id;
+    let created_at = request.created_at;
+    let now = now_ts();
+    anyhow::ensure!(
+        created_at > 0
+            && created_at <= now.saturating_add(30)
+            && now.saturating_sub(created_at) <= HOME_MODEL_CATALOG_TTL_SECS,
+        "model catalog request expired"
+    );
+    let listed = tokio::runtime::Handle::current().block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            registry.send_raw("model", &serde_json::json!({"op":"offers_list"})),
+        )
+        .await
+    })??;
+    let offers = super::gateway_model_service::shareable_offers_for_home(
+        &listed,
+        data_dir,
+        home_services_local_model_shared(data_dir, context)?,
+    );
+    let mut entries = Vec::new();
+    for offer in offers {
+        if offer["operation"] != "text.generate" {
+            continue;
+        }
+        let id = offer["id"]
+            .as_str()
+            .filter(|id| super::gateway_model_service::safe_id(id, 256))
+            .ok_or_else(|| anyhow::anyhow!("shared model id is invalid"))?;
+        let title = offer["title"]
+            .as_str()
+            .filter(|title| !title.is_empty() && title.len() <= 128)
+            .ok_or_else(|| anyhow::anyhow!("shared model title is invalid"))?;
+        let revision = super::gateway_model_service::offer_execution_revision(&listed, id)
+            .ok_or_else(|| anyhow::anyhow!("shared model revision is unavailable"))?;
+        entries.push(HomeServicesModelCatalogEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            revision: revision.to_string(),
+        });
+    }
+    anyhow::ensure!(
+        entries.len() <= HOME_MODEL_CATALOG_MAX_OFFERS,
+        "shared model catalog exceeds its bound"
+    );
+    services_gossip_join_known_peers_blocking(
+        runtime,
+        HOME_SERVICES_REQUESTS_TOPIC,
+        std::slice::from_ref(requester_peer_id),
+    )?;
+    let mut payload = serde_json::json!({
+        "schema":"elastos.model-offer-catalog/v1",
+        "kind":"model_offer_catalog",
+        "request_id":request_id,
+        "target_requester_peer_id":requester_peer_id,
+        "target_requester_principal_id":requester_principal_id,
+        "provider_peer_id":runtime.peer_id,
+        "created_at":now,
+        "expires_at":now.saturating_add(HOME_MODEL_CATALOG_TTL_SECS),
+        "offers":entries,
+    });
+    crate::carrier::sign_service_message(data_dir, &mut payload)?;
+    let delivery = services_peer_provider_request_blocking(
+        &runtime.transport,
+        "gossip_send",
+        serde_json::json!({
+            "topic":HOME_SERVICES_REQUESTS_TOPIC,
+            "sender_id":runtime.peer_id,
+            "sender":"Services",
+            "message":payload.to_string(),
+            "ts":now,
+        }),
+    )?;
+    home_services_require_remote_request_delivery(&delivery)
 }
 
 fn home_services_require_remote_request_delivery(
@@ -2679,7 +3021,8 @@ fn home_services_send_access_decision(
             "grant_id": super::model_grant_id(&request.request_id),
             "peer_did": runtime.peer_id,
             "connect_ticket": runtime.connect_ticket,
-            "offer_scope": "local_engines",
+            "offer_ids": &request.approved_offer_ids,
+            "offer_revision": &request.approved_offer_revision,
             "operations": super::MODEL_OPERATIONS,
             "expires_at": request.grant_expires_at,
         });
@@ -2712,7 +3055,7 @@ fn home_services_sync_access_decisions(
         .lock()
         .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     let mut state = home_services_selection_state(data_dir, context)?;
-    if state.remote_offer_requests.is_empty() {
+    if state.remote_offer_requests.is_empty() && state.model_catalog_requests.is_empty() {
         return Ok(());
     }
     let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
@@ -2732,7 +3075,22 @@ fn home_services_sync_access_decisions(
         })
         .map(|request| request.request_id.clone())
         .collect::<BTreeSet<_>>();
-    let known_peers = state
+    let current_catalog_requests = state
+        .model_catalog_requests
+        .iter()
+        .filter(|(offer_id, catalog)| {
+            contacts.contacts.values().any(|contact| {
+                *offer_id
+                    == &home_services_contact_offer_id(
+                        &contact.contact_id,
+                        super::MODEL_SERVICE_KIND,
+                    )
+                    && catalog.target_peer_id == contact.peer_id
+            })
+        })
+        .map(|(_, catalog)| catalog.request_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut known_peers = state
         .remote_offer_requests
         .values()
         .filter(|request| current_requests.contains(&request.request_id))
@@ -2741,6 +3099,13 @@ fn home_services_sync_access_decisions(
             (!peer_id.is_empty()).then(|| peer_id.to_string())
         })
         .collect::<BTreeSet<_>>();
+    known_peers.extend(
+        state
+            .model_catalog_requests
+            .values()
+            .filter(|catalog| current_catalog_requests.contains(&catalog.request_id))
+            .map(|catalog| catalog.target_peer_id.clone()),
+    );
     if known_peers.is_empty() {
         return Ok(());
     }
@@ -2773,6 +3138,19 @@ fn home_services_sync_access_decisions(
         else {
             continue;
         };
+        if payload["kind"] == "model_offer_catalog" {
+            match home_services_merge_model_catalog(
+                context,
+                &mut state,
+                &payload,
+                &runtime.peer_id,
+                &current_catalog_requests,
+            ) {
+                Ok(merged) => changed |= merged,
+                Err(error) => tracing::warn!(%error, "shared model catalog ignored"),
+            }
+            continue;
+        }
         if !payload
             .get("request_id")
             .and_then(serde_json::Value::as_str)
@@ -2803,6 +3181,67 @@ fn home_services_sync_access_decisions(
         }
     }
     Ok(())
+}
+
+fn home_services_merge_model_catalog(
+    context: &HomeLaunchTokenContext,
+    state: &mut HomeServicesSelectionState,
+    payload: &serde_json::Value,
+    local_peer_id: &str,
+    current_requests: &BTreeSet<String>,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        payload["schema"] == "elastos.model-offer-catalog/v1"
+            && payload["target_requester_peer_id"].as_str() == Some(local_peer_id)
+            && payload["target_requester_principal_id"].as_str() == Some(&context.principal_id),
+        "model catalog target is invalid"
+    );
+    let request_id = home_services_payload_text(payload, "request_id", 256)
+        .filter(|id| current_requests.contains(id))
+        .ok_or_else(|| anyhow::anyhow!("model catalog request is unavailable"))?;
+    let provider_peer_id = home_services_payload_text(payload, "provider_peer_id", 256)
+        .ok_or_else(|| anyhow::anyhow!("model catalog provider is unavailable"))?;
+    let catalog = state
+        .model_catalog_requests
+        .values_mut()
+        .find(|catalog| {
+            catalog.request_id == request_id && catalog.target_peer_id == provider_peer_id
+        })
+        .ok_or_else(|| anyhow::anyhow!("model catalog contact changed"))?;
+    let now = now_ts();
+    let created_at = payload["created_at"].as_u64().unwrap_or_default();
+    let expires_at = payload["expires_at"].as_u64().unwrap_or_default();
+    anyhow::ensure!(
+        created_at >= catalog.requested_at.saturating_sub(30)
+            && created_at <= now.saturating_add(30)
+            && created_at > catalog.responded_at
+            && expires_at > now
+            && expires_at > created_at
+            && expires_at - created_at <= HOME_MODEL_CATALOG_TTL_SECS,
+        "model catalog expired or replayed"
+    );
+    let offers = payload["offers"]
+        .as_array()
+        .filter(|offers| offers.len() <= HOME_MODEL_CATALOG_MAX_OFFERS)
+        .ok_or_else(|| anyhow::anyhow!("model catalog exceeds its bound"))?;
+    let mut entries = Vec::with_capacity(offers.len());
+    let mut ids = BTreeSet::new();
+    for offer in offers {
+        let entry: HomeServicesModelCatalogEntry = serde_json::from_value(offer.clone())?;
+        anyhow::ensure!(
+            super::gateway_model_service::safe_id(&entry.id, 256)
+                && !entry.title.is_empty()
+                && entry.title.len() <= 128
+                && super::gateway_model_service::valid_offer_execution_revision(&entry.revision)
+                && ids.insert(entry.id.clone()),
+            "model catalog entry is invalid"
+        );
+        entries.push(entry);
+    }
+    catalog.responded_at = created_at;
+    catalog.expires_at = expires_at;
+    catalog.entries = entries;
+    Ok(true)
 }
 
 fn home_services_merge_access_decision(
@@ -3496,12 +3935,21 @@ fn home_services_remote_model_grant(
             && grant["grant_id"].as_str()
                 == Some(super::model_grant_id(&record.request_id).as_str())
             && grant["peer_did"].as_str() == Some(&record.target_peer_id)
-            && grant["offer_scope"] == "local_engines"
             && grant["operations"] == serde_json::json!(super::MODEL_OPERATIONS)
             && expiry > now_ts()
             && expiry > revision
             && expiry - revision <= super::MODEL_GRANT_TTL_SECS,
         "model grant is expired or does not match the requested service"
+    );
+    let offer_ids: BTreeSet<String> = serde_json::from_value(grant["offer_ids"].clone())?;
+    let offer_revision = grant["offer_revision"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        offer_ids.len() == 1
+            && offer_ids
+                .iter()
+                .all(|id| super::gateway_model_service::safe_id(id, 256))
+            && super::gateway_model_service::valid_offer_execution_revision(offer_revision),
+        "model grant needs one exact approved offer"
     );
     record.target_peer_id.parse::<iroh::PublicKey>()?;
     Ok(serde_json::json!({
@@ -3512,7 +3960,8 @@ fn home_services_remote_model_grant(
         "connect_ticket": ticket,
         "principal_id": context.principal_id,
         "service_display_name": record.service_display_name,
-        "offer_scope": "local_engines",
+        "offer_ids": offer_ids,
+        "offer_revision": offer_revision,
         "operations": grant["operations"],
         "expires_at": expiry,
     }))
@@ -3602,7 +4051,8 @@ pub(crate) fn authorize_home_service_model(
                     && record.status == "approved"
                     && record.service_uri == super::MODEL_SERVICE_URI
                     && record.service_kind == super::MODEL_SERVICE_KIND
-                    && home_services_local_model_shared(data_dir, &context)?,
+                    && (home_services_local_model_shared(data_dir, &context)?
+                        || crate::api::any_hosted_model_shared(data_dir)),
                 "model grant is not active"
             );
             let profile = load_profile_authority_for_context(data_dir, &context)?
@@ -3641,6 +4091,8 @@ pub(crate) fn authorize_home_service_model(
                 expires_at: record
                     .grant_expires_at
                     .ok_or_else(|| anyhow::anyhow!("model grant expiry required"))?,
+                approved_offer_ids: record.approved_offer_ids.clone(),
+                approved_offer_revision: record.approved_offer_revision.clone(),
             };
             grant.validate(source, requester_principal_id, now)?;
             anyhow::ensure!(authorized.is_none(), "model grant ownership is ambiguous");
@@ -3720,7 +4172,12 @@ pub(crate) fn sync_runtime_services_mailboxes(
     }
     // Keep requests and decisions independent: an unavailable incoming request
     // path must not prevent a previously issued decision from being applied.
-    let requests = home_services_sync_access_requests(data_dir, &context, Some(discovery_service));
+    let requests = home_services_sync_access_requests(
+        data_dir,
+        &context,
+        Some(discovery_service),
+        Some(provider_registry),
+    );
     let decisions = home_services_sync_access_decisions(
         data_dir,
         &context,
@@ -3736,6 +4193,7 @@ pub(super) fn home_services_sync_access_requests(
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
+    provider_registry: Option<&elastos_runtime::provider::ProviderRegistry>,
 ) -> anyhow::Result<()> {
     let mutation_lock = home_services_mutation_lock(data_dir)?;
     let _guard = mutation_lock
@@ -3743,6 +4201,8 @@ pub(super) fn home_services_sync_access_requests(
         .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
     if !home_services_local_exit_shared(data_dir, context)?
         && !home_services_local_engine_shared(data_dir, context)?
+        && !home_services_local_model_shared(data_dir, context)?
+        && !crate::api::any_hosted_model_shared(data_dir)
     {
         return Ok(());
     }
@@ -3781,11 +4241,19 @@ pub(super) fn home_services_sync_access_requests(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if messages.is_empty() {
-        return Ok(());
-    }
     let mut state = home_services_requests_state(data_dir, context)?;
     let mut changed = false;
+    let prior_catalog_peers = state.catalog_last_response_at.len();
+    state
+        .catalog_last_response_at
+        .retain(|peer_id, _| known_peers.contains(peer_id));
+    changed |= state.catalog_last_response_at.len() != prior_catalog_peers;
+    let prior_pending = state.pending_model_catalogs.len();
+    state.pending_model_catalogs.retain(|peer_id, request| {
+        known_peers.contains(peer_id)
+            && now_ts().saturating_sub(request.created_at) <= HOME_MODEL_CATALOG_TTL_SECS
+    });
+    changed |= state.pending_model_catalogs.len() != prior_pending;
     for message in messages {
         let Ok(payload) = crate::carrier::verify_service_message(&message, "requester_peer_id")
         else {
@@ -3801,6 +4269,42 @@ pub(super) fn home_services_sync_access_requests(
                     .and_then(serde_json::Value::as_str)
                     == contact.did.as_deref()
         }) {
+            continue;
+        }
+        if payload["kind"] == "model_offer_catalog_request" {
+            let now = now_ts();
+            let request_id = home_services_payload_text(&payload, "request_id", 256)
+                .filter(|id| home_services_request_id_is_valid(id));
+            let peer_id = home_services_payload_text(&payload, "requester_peer_id", 256);
+            let did = home_services_payload_text(&payload, "requester_did", 256);
+            let principal_id = home_services_payload_text(&payload, "requester_principal_id", 256);
+            let created_at = payload["created_at"].as_u64().unwrap_or_default();
+            if payload["schema"] == "elastos.model-offer-catalog-request/v1"
+                && payload["target_peer_id"].as_str() == Some(&runtime.peer_id)
+                && created_at > 0
+                && created_at <= now.saturating_add(30)
+                && now.saturating_sub(created_at) <= HOME_MODEL_CATALOG_TTL_SECS
+            {
+                if let (
+                    Some(request_id),
+                    Some(peer_id),
+                    Some(requester_did),
+                    Some(requester_principal_id),
+                ) = (request_id, peer_id, did, principal_id)
+                {
+                    state.pending_model_catalogs.insert(
+                        peer_id.clone(),
+                        HomePendingModelCatalogRequest {
+                            request_id,
+                            requester_peer_id: peer_id,
+                            requester_did,
+                            requester_principal_id,
+                            created_at,
+                        },
+                    );
+                    changed = true;
+                }
+            }
             continue;
         }
         changed |= home_services_merge_access_request(
@@ -3822,7 +4326,75 @@ pub(super) fn home_services_sync_access_requests(
         state.requests.remove(&oldest);
         changed = true;
     }
+    let now = now_ts();
+    let mut catalog_requests = state
+        .pending_model_catalogs
+        .iter()
+        .filter(|(peer_id, _)| {
+            now.saturating_sub(
+                state
+                    .catalog_last_response_at
+                    .get(*peer_id)
+                    .copied()
+                    .unwrap_or_default(),
+            ) >= HOME_MODEL_CATALOG_RESPONSE_COOLDOWN_SECS
+        })
+        .map(|(peer_id, request)| {
+            (
+                state
+                    .catalog_last_response_at
+                    .get(peer_id)
+                    .copied()
+                    .unwrap_or_default(),
+                peer_id.clone(),
+                request.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    catalog_requests
+        .sort_by_key(|(last_response, _, request)| (*last_response, request.created_at));
+    catalog_requests.truncate(4);
+    for (_, peer_id, _) in &catalog_requests {
+        state.catalog_last_response_at.insert(peer_id.clone(), now);
+        changed = true;
+    }
     if changed {
+        state.updated_at = now_ts();
+        home_save_services_requests_state(data_dir, context, &state)?;
+    }
+    drop(_guard);
+    let mut delivered = Vec::new();
+    for (_, peer_id, request) in catalog_requests {
+        match provider_registry
+            .ok_or_else(|| anyhow::anyhow!("model provider unavailable"))
+            .and_then(|registry| {
+                home_services_send_model_catalog_response(
+                    data_dir,
+                    context,
+                    discovery_service,
+                    &runtime,
+                    registry,
+                    &request,
+                )
+            }) {
+            Ok(()) => delivered.push((peer_id, request.request_id)),
+            Err(error) => tracing::warn!(%error, "shared model catalog response unavailable"),
+        }
+    }
+    if !delivered.is_empty() {
+        let _guard = mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
+        let mut state = home_services_requests_state(data_dir, context)?;
+        for (peer_id, request_id) in delivered {
+            if state
+                .pending_model_catalogs
+                .get(&peer_id)
+                .is_some_and(|pending| pending.request_id == request_id)
+            {
+                state.pending_model_catalogs.remove(&peer_id);
+            }
+        }
         state.updated_at = now_ts();
         home_save_services_requests_state(data_dir, context, &state)?;
     }
@@ -3890,6 +4462,12 @@ fn home_services_merge_access_request(
         grant_scope: home_services_payload_text(payload, "grant_scope", 128),
         request_id: request_id.clone(),
         offer_id: home_services_payload_text(payload, "offer_id", 256).unwrap_or_default(),
+        requested_model_offer_id: home_services_payload_text(payload, "model_offer_id", 256),
+        requested_model_offer_revision: home_services_payload_text(
+            payload,
+            "model_offer_revision",
+            71,
+        ),
         service_uri,
         service_kind,
         service_display_name: home_services_payload_text(payload, "service_display_name", 256)
@@ -3908,6 +4486,8 @@ fn home_services_merge_access_request(
         status,
         authenticated_request: true,
         grant_expires_at: None,
+        approved_offer_ids: BTreeSet::new(),
+        approved_offer_revision: String::new(),
         exit_max_active_streams: None,
         exit_max_active_streams_per_principal: None,
     };
@@ -3944,7 +4524,7 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
     } else if kind == super::MODEL_SERVICE_KIND && uri == super::MODEL_SERVICE_URI {
         (
             "AI model",
-            "Approval lets their Assistant run your shared local model through your Runtime. Your Runtime decides every request and keeps hosted models private.",
+            "Approval is for one named model offer through your Runtime. A generic request needs a new exact-offer request before approval.",
         )
     } else {
         (
@@ -3997,6 +4577,31 @@ pub(super) fn append_home_service_access_notifications(
             home_services_request_notification_copy(&request.service_kind, &request.service_uri);
         notifications.unread_count += 1;
         notifications.attention_count += 1;
+        let approval_effect = if request.service_kind == super::MODEL_SERVICE_KIND {
+            match request.requested_model_offer_id.as_deref() {
+                Some(id) => {
+                    let detail =
+                        crate::api::model_provider_config::hosted_model_offer_hint(data_dir, id)
+                            .map(|hint| {
+                                format!(
+                                    "{} via {}, model {}",
+                                    hint.offer_title, hint.provider_label, hint.requested_selector
+                                )
+                            })
+                            .unwrap_or_else(|| id.to_string());
+                    let revision = request
+                        .requested_model_offer_revision
+                        .as_deref()
+                        .unwrap_or("revision unavailable");
+                    format!(
+                        "{approval_effect} Requested offer: {detail} ({id}), revision {revision}."
+                    )
+                }
+                None => approval_effect.to_string(),
+            }
+        } else {
+            approval_effect.to_string()
+        };
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
             source_app: SERVICES_CAPSULE_ID.to_string(),
@@ -4051,12 +4656,20 @@ pub(super) fn append_home_service_access_notifications(
 pub(super) fn approve_home_service_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    home_services_mark_access_request(data_dir, context, discovery_service, request_id, "approved")
+    home_services_mark_access_request(
+        data_dir,
+        context,
+        registry,
+        discovery_service,
+        request_id,
+        "approved",
+    )
 }
 
 /// Deny as this principal. `Err` means no denial was saved (unknown request
@@ -4069,7 +4682,14 @@ pub(super) fn deny_home_service_access_request(
     >,
     request_id: &str,
 ) -> anyhow::Result<HomeServiceAccessDecisionRecorded> {
-    home_services_record_access_decision(data_dir, context, discovery_service, request_id, "denied")
+    home_services_record_access_decision(
+        data_dir,
+        context,
+        None,
+        discovery_service,
+        request_id,
+        "denied",
+    )
 }
 
 /// A service access decision this principal made and this Runtime saved. The
@@ -4091,14 +4711,22 @@ impl HomeServiceAccessDecisionRecorded {
 fn home_services_mark_access_request(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     request_id: &str,
     status: &str,
 ) -> anyhow::Result<String> {
-    home_services_record_access_decision(data_dir, context, discovery_service, request_id, status)?
-        .into_message()
+    home_services_record_access_decision(
+        data_dir,
+        context,
+        registry,
+        discovery_service,
+        request_id,
+        status,
+    )?
+    .into_message()
 }
 
 /// Authorize (principal-scoped lookup), apply and save the decision, then try
@@ -4107,6 +4735,7 @@ fn home_services_mark_access_request(
 fn home_services_record_access_decision(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
@@ -4147,6 +4776,40 @@ fn home_services_record_access_decision(
         }
     }
     let mut request = request;
+    if status == "approved"
+        && request.service_kind == super::MODEL_SERVICE_KIND
+        && request.service_uri == super::MODEL_SERVICE_URI
+    {
+        let registry = registry.ok_or_else(|| anyhow::anyhow!("model provider unavailable"))?;
+        let result = tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                registry.send_raw("model", &serde_json::json!({"op":"offers_list"})),
+            )
+            .await
+        })??;
+        let requested_id = request
+            .requested_model_offer_id
+            .as_deref()
+            .filter(|id| super::gateway_model_service::safe_id(id, 256))
+            .ok_or_else(|| anyhow::anyhow!("exact model offer request required"))?;
+        super::gateway_model_service::shareable_offer_for_home(
+            &result,
+            data_dir,
+            home_services_local_model_shared(data_dir, context)?,
+            requested_id,
+        )
+        .ok_or_else(|| anyhow::anyhow!("requested model offer is unavailable"))?;
+        let offer_revision =
+            super::gateway_model_service::offer_execution_revision(&result, requested_id)
+                .ok_or_else(|| anyhow::anyhow!("requested model offer revision unavailable"))?;
+        anyhow::ensure!(
+            request.requested_model_offer_revision.as_deref() == Some(offer_revision),
+            "requested model offer revision changed; request again"
+        );
+        request.approved_offer_ids = BTreeSet::from([requested_id.to_string()]);
+        request.approved_offer_revision = offer_revision.to_string();
+    }
     request.status = status.to_string();
     request.updated_at = revision;
     let grant_ttl = if request.service_kind == super::MODEL_SERVICE_KIND {
@@ -4194,6 +4857,34 @@ fn home_services_record_access_decision(
     })
 }
 
+fn require_admin_principal(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<()> {
+    let Some(proof_binding_id) = context.proof_binding_id.as_deref() else {
+        anyhow::bail!("admin passkey required");
+    };
+    let principal = crate::auth::load_principal_for_proof_binding(data_dir, proof_binding_id)?;
+    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
+    if !crate::auth::is_admin(&principal) {
+        anyhow::bail!("admin passkey required");
+    }
+    Ok(())
+}
+
+fn apply_hosted_share_selection(data_dir: &std::path::Path, selected: &mut BTreeSet<String>) {
+    let Ok(cards) = crate::api::hosted_model_share_cards(data_dir) else {
+        return;
+    };
+    for card in cards {
+        if card.share_enabled {
+            selected.insert(card.offer_id);
+        } else {
+            selected.remove(&card.offer_id);
+        }
+    }
+}
+
 fn apply_home_services_selection(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -4203,8 +4894,10 @@ fn apply_home_services_selection(
     let local_offers = std::mem::take(&mut services.local_offers);
     let remote_offers = std::mem::take(&mut services.remote_offers);
 
+    let mut local_selected = state.local_offer_ids.clone();
+    apply_hosted_share_selection(data_dir, &mut local_selected);
     let (local_offers, available_local_offers) =
-        partition_service_offers(local_offers, &state.local_offer_ids);
+        partition_service_offers(local_offers, &local_selected);
     let (mut remote_offers, available_remote_offers) =
         partition_service_offers(remote_offers, &state.remote_offer_ids);
     let now = now_ts();
@@ -4237,6 +4930,18 @@ fn apply_home_services_selection(
     services.remote_offers = remote_offers;
     services.available_local_offers = available_local_offers;
     services.available_remote_offers = available_remote_offers;
+    services.model_catalogs = services
+        .remote_offers
+        .iter()
+        .chain(services.available_remote_offers.iter())
+        .filter_map(|offer| {
+            state
+                .model_catalog_requests
+                .get(&offer.offer_id)
+                .filter(|catalog| catalog.expires_at > now && !catalog.entries.is_empty())
+                .map(|catalog| (offer.offer_id.clone(), catalog.entries.clone()))
+        })
+        .collect();
     Ok(())
 }
 
@@ -7303,7 +8008,8 @@ mod services_kind_tests {
             super::super::MODEL_SERVICE_URI,
         );
         assert_eq!(noun, "AI model");
-        assert!(effect.contains("shared local model"));
+        assert!(effect.contains("shared model"));
+        assert!(effect.contains("Your Runtime decides every request."));
         let (noun, _) = home_services_request_notification_copy(
             crate::carrier::ENGINE_SERVICE_KIND,
             crate::carrier::ENGINE_SERVICE_URI,

@@ -87,3 +87,81 @@ assert.deepEqual(plain(COMPACT_PHASE_TEXT), { ...plain(PHASE_TEXT), absent: "Not
   reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time" });
 assert.deepEqual(Object.keys(PHASE_TEXT).sort(), Object.keys(phases).filter(name => name !== "failed").sort(), "every phase except failed reads its copy from the table");
 console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection, phase copy tables");
+
+// Advance a pending operation beyond the former three-minute polling ceiling.
+// The bounded clock exercises the controller without downloading model bytes.
+class FixtureNode {
+  constructor(tag) { this.tagName = tag; this.children = []; this.dataset = {}; this.classList = { add() {} }; }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = nodes; }
+  setAttribute() {}
+  addEventListener() {}
+  contains() { return false; }
+  focus() {}
+}
+let nextTimer = 0, statusCalls = 0, settled = false;
+const timers = new Map();
+const fixtureRoot = new FixtureNode("section");
+const fixtureRuntime = () => ({
+  admitted: settled, kept: false, dispatch_ready: settled,
+  offer_id: settled ? `model:${"b".repeat(64)}` : null,
+  preparation: { operation_id: "long-preparation", cid, state: settled ? "admitted" : "preparing",
+    total_bytes: 1024, completed_bytes: settled ? 1024 : statusCalls,
+    cancel_requested: false, admitted: settled, activation_pending: false },
+});
+const fixtureContext = {
+  window: { addEventListener() {}, removeEventListener() {} },
+  document: { hidden: false, activeElement: null, createElement: tag => new FixtureNode(tag),
+    createTextNode: text => ({ textContent: text }), addEventListener() {}, removeEventListener() {} },
+  AbortController, crypto: { randomUUID: () => `poll-${statusCalls}` },
+  setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+  clearTimeout: id => timers.delete(id),
+  fetch: async (path, options) => {
+    let result;
+    if (path === "/api/capsules/catalog") result = { schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified",
+      capsules: [{ ...catalogRow(cid, "Small fixture"), model_runtime: fixtureRuntime() }] };
+    else if (path === "/api/capsules/interfaces") result = { interfaces: [{ capsule: "marketplace",
+      interface: { id: "elastos.marketplace.catalog", methods: ["use", "status", "cancel", "retention", "reclaim"].map(operation => ({
+        id: `content.${operation}`, operation, resource: "elastos://capsules/*", approval: "runtime_policy", risk: operation === "status" ? "read" : "write",
+      })) }, bindings: ["use", "status", "cancel", "retention", "reclaim"].map(operation => ({ method: `content.${operation}`, executable: true })) }] };
+    else {
+      const request = JSON.parse(options.body);
+      assert.equal(request.method, "content.status");
+      assert.equal(request.input.operation_id, "long-preparation");
+      statusCalls++;
+      assert.ok(statusCalls <= 132, "fixture bounds the status requests");
+      const runtime = fixtureRuntime();
+      result = { ...request, schema: "elastos.capsules.invoke-result/v1", status: "ok",
+        output: { ...runtime, ...runtime.preparation, cid } };
+    }
+    return { ok: true, text: async () => JSON.stringify(result) };
+  },
+};
+vm.runInNewContext(source, fixtureContext);
+const control = fixtureContext.window.ElastosModelManagement.create({ root: fixtureRoot, capsule: "marketplace", token: "fixture", cid, compact: true });
+const pendingPolls = () => [...timers].filter(([, timer]) => timer.delay === 1500);
+const tickPoll = async () => {
+  const pending = pendingPolls();
+  assert.equal(pending.length, 1, "visible pending operation keeps exactly one status poll");
+  const [id, timer] = pending[0]; timers.delete(id); await timer.callback();
+};
+control.setVisible(true);
+await new Promise(setImmediate);
+for (let index = 0; index < 130; index++) await tickPoll();
+assert.equal(statusCalls, 130);
+settled = true;
+await tickPoll();
+assert.equal(pendingPolls().length, 0, "terminal admission stops polling");
+const visibleText = node => [node.textContent || "", ...(node.children || []).map(visibleText)].join(" ");
+assert.match(visibleText(fixtureRoot), /Available on this device/);
+settled = false;
+await control.refresh();
+assert.equal(pendingPolls().length, 1);
+control.setVisible(false);
+assert.equal(timers.size, 0, "hidden controller releases timers");
+control.setVisible(true);
+await new Promise(setImmediate);
+assert.equal(pendingPolls().length, 1);
+control.destroy();
+assert.equal(timers.size, 0, "destroyed controller releases timers");
+console.log("PASS long model preparation: 131 bounded status reads, terminal render, hide and destroy cleanup");

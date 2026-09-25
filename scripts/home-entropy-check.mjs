@@ -184,6 +184,7 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
@@ -210,6 +211,7 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".elastos" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
@@ -444,6 +446,7 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".audit" ||
       entry.name === ".superpowers" ||
       entry.name === "superpowers" ||
       entry.name === ".claude" ||
@@ -1053,6 +1056,7 @@ assert(
 assert(
   systemJs.includes('"/api/apps/system/summary"') &&
     systemJs.includes('"/api/apps/system/appearance/preferences"') &&
+    systemJs.includes('"/api/apps/system/ai-provider"') &&
     systemJs.includes("createHomeClipboardClient") &&
     systemJs.includes('targetId: "system"') &&
     systemJs.includes('purpose: "identity.did"') &&
@@ -2625,11 +2629,12 @@ assert(
   "Home must allow Library picker results to return only to Archive, Browser and Chat Room",
 );
 assert(
-  shellJs.includes('assistant: new Set(["marketplace"])') &&
-    shellJs.includes('"home-agent": new Set(["marketplace"])') &&
+  shellJs.includes('assistant: new Set(["marketplace", "system", "inbox"])') &&
+    shellJs.includes('"home-agent": new Set(["marketplace", "system", "inbox"])') &&
     shellJs.includes("assistantModelsMarketplaceQuery") &&
+    shellJs.includes("assistantAiProviderSettingsQuery") &&
     shellJs.includes("marketplaceAssistantHandoffQuery"),
-  "Open Models must hand off through Marketplace with a bounded Assistant CID query",
+  "Assistant Models, Settings, and Inbox handoffs must use bounded destinations and queries",
 );
 assert(
   shellJs.includes('marketplace: "runtime-target"') &&
@@ -2757,8 +2762,9 @@ assert(
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260819a") &&
-    servicesIndex.includes("services-20260711i") &&
+    servicesIndex.includes("services-20260921b") &&
+    servicesIndex.includes("./style.css?v=services-20260921b") &&
+    servicesIndex.includes("./services.js?v=services-20260921b") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
     servicesScript.includes("Browser Engine") &&
@@ -2770,6 +2776,12 @@ assert(
     servicesScript.includes('const EXIT_SERVICE_KIND = "remote_exit"') &&
     servicesScript.includes('const BROWSER_ENGINE_SERVICE_KIND = "browser_engine"') &&
     servicesScript.includes('const CONFIGURED_REMOTE_EXIT_SOURCE = "configured_remote_exit"') &&
+    servicesScript.includes('const HOSTED_SHARE_SOURCE = "hosted_connection"') &&
+    servicesScript.includes("HOSTED_SHARE_TERMS_BY_PROCESSOR") &&
+    servicesScript.includes("openrouter-5.1-5.2+model") &&
+    servicesScript.includes("venice-7.3+model") &&
+    servicesScript.includes("Hosted connections stay private until you enable Share") &&
+    !servicesScript.includes("hosted models stay private") &&
     servicesScript.includes("VISIBLE_SERVICE_KINDS") &&
     servicesScript.includes("visibleServiceOffers") &&
     servicesScript.includes("isReadOnlyServiceOffer") &&
@@ -2790,6 +2802,7 @@ assert(
     servicesStyle.includes(".settings-sidebar") &&
     servicesStyle.includes(".services-toolbar") &&
     servicesStyle.includes(".service-confirm") &&
+    servicesStyle.includes(".service-terms") &&
     servicesStyle.includes(".pc2-btn-danger") &&
     (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 4 &&
     (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
@@ -3674,13 +3687,16 @@ assertProtectedPrincipalRootAccessor(
 assert(
   gatewayApi.includes("is_unencrypted_principal_root_state") &&
     gatewayTests.includes(
-      "test_home_browser_state_resets_plaintext_for_protected_principal_root",
+      "test_home_browser_state_defaults_preserve_protected_plaintext_and_refuse_overwrite",
+    ) &&
+    gatewayTests.includes(
+      "test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite",
     ) &&
     gatewayTests.includes(
       "test_home_summary_ignores_services_state_left_unencrypted_before_root_protection",
     ) &&
     gatewayTests.includes("test_home_summary_ignores_invalid_protected_services_state"),
-  "Home must reset untrusted or invalid principal-root UI state without accepting it",
+  "Home must return defaults for unreadable principal-root UI state, preserve its bytes and refuse overwrite",
 );
 assertProtectedPrincipalRootAccessor(
   gatewayApi,
@@ -5097,6 +5113,25 @@ assert(
   "Marketplace must accept Models navigation and open a ready CID in Assistant",
 );
 assert(
+  marketplaceUi.includes('data-action="open-ai-provider-settings"') &&
+    marketplaceUi.includes("Manage models") &&
+    !marketplaceUi.includes("OpenRouter") &&
+    read("capsules/assistant/browser/agent-harness.js").includes('["open-ai-provider-settings", "Manage models"]') &&
+    !read("capsules/assistant/browser/agent-harness.js").includes("OpenRouter"),
+  "Assistant and Marketplace must retain their System model-management links",
+);
+assert(
+  assistantIndex.includes('placeholder="Message Assistant"') &&
+    !assistantIndex.includes("Ask on this machine") &&
+    !assistantIndex.includes("agent-think-btn") &&
+    assistantIndex.includes("Show reasoning on replies") &&
+    assistantIndex.includes('aria-haspopup="listbox"') &&
+    (assistantIndex.match(/id="agent-model-picker"/g) || []).length === 1 &&
+    !read("capsules/assistant/browser/agent-harness.js").includes("cost unknown") &&
+    !read("capsules/assistant/browser/agent-shelf.js").includes("Ask on this machine"),
+  "Assistant composer must stay route-neutral with one model selector and no Think chip",
+);
+assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
     marketplaceUi.includes("function acceptedContentLabels(") &&
     marketplaceUi.includes("function executableActions(") &&
@@ -5473,7 +5508,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260819f";
+const systemAssetVersion = "system-models-20260923a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -5783,6 +5818,8 @@ assert(
     inbox.includes('entry.kind !== "inspect_action_request"') &&
     inbox.includes("wallet-price-http-approve:") &&
     inbox.includes("wallet-price-http-deny:") &&
+    inbox.includes("hosted-http-approve:") &&
+    inbox.includes("hosted-http-deny:") &&
     gatewayApi.includes("append_runtime_capability_notifications") &&
     gatewayApi.includes("/api/capability/pending") &&
     gatewayTests.includes(
@@ -6911,6 +6948,15 @@ assert(
     modelServiceRuntime.includes("fn remote_principal_id(") &&
     modelServiceRuntime.includes('local_object.remove("_runtime_invocation");') &&
     modelServiceRuntime.includes("fn shareable_offers(") &&
+    modelServiceRuntime.includes("fn shareable_offers_for_home(") &&
+    modelServiceRuntime.includes("fn shareable_listed_offers(") &&
+    modelServiceRuntime.includes("fn public_shared_offer(") &&
+    modelServiceRuntime.includes("crate::api::offer_is_shareable(offer)") &&
+    modelServiceRuntime.includes("shareable_offers_include_explicitly_shared_hosted") &&
+    gatewayApi.includes("/api/apps/system/ai-provider/share") &&
+    gatewayApi.includes("Hosted connections stay private until you enable Share") &&
+    gatewayHomeSystemTests.includes("test_system_ai_provider_share_guest_forbidden") &&
+    gatewayHomeSystemTests.includes("test_system_ai_provider_share_requires_terms_and_preserves_peer") &&
     modelServiceRuntime.includes("fn redact_provider_error(") &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
@@ -7487,6 +7533,38 @@ assert(
   system.includes(`style.css?v=${systemAssetVersion}`) &&
     system.includes(`system.js?v=${systemAssetVersion}`),
   "System browser assets must be cache-busted after UI changes",
+);
+assert(
+  system.includes('data-settings="models"') &&
+    system.includes('data-ai-provider') &&
+    system.includes('id="ai-provider-title" class="pc2-section-title">Hosted<') &&
+    system.includes("Add hosted model") &&
+    !system.includes("This Home stores the key.") &&
+    !system.includes("The selected processor receives prompts outside this Home.") &&
+    system.includes("This Home owns the system prompt for Venice.") &&
+    system.includes('id="ai-provider-name"') &&
+    system.includes('id="ai-provider-kind"') &&
+    system.includes("Hosted by") &&
+    system.includes('value="openrouter"') &&
+    system.includes('value="venice"') &&
+    system.includes('id="ai-provider-key"') &&
+    system.includes('type="password"') &&
+    system.includes('autocomplete="off"') &&
+    system.includes('id="ai-provider-validate"') &&
+    system.includes('id="ai-provider-save"') &&
+    system.includes(">Check key and load models<") &&
+    system.includes(">Save<") &&
+    !system.includes("Share OpenRouter") &&
+    !system.includes("Share Venice") &&
+    systemJs.includes('"/api/apps/system/ai-provider/validate"') &&
+    systemJs.includes("provider: selectedProvider()") &&
+    systemJs.includes("Use in Assistant") &&
+    systemJs.includes("Share as service") &&
+    systemJs.includes('replaceButton.textContent = "Edit"') &&
+    systemJs.includes("Leave the API key blank to keep the stored key.") &&
+    systemJs.includes("Disconnect") &&
+    systemJs.includes("ElastosModelManagement.create"),
+  "System Models tab must host named hosted-model instances with a masked key",
 );
 assert(
   (systemJs.match(/function notifyHomeSummaryChanged\(/g) || []).length === 1,
@@ -8356,8 +8434,10 @@ assert(
   "System must not hold browser wallet adapter authority",
 );
 const tasks = read("TASKS.md");
+const deferredWork = read("docs/audits/2026-09-23-open-backlog-snapshot.md");
 const browserPlanningSurface = [
   tasks,
+  deferredWork,
   read("docs/BROWSER_CAPSULE.md"),
   read("docs/BROWSER_PROVIDER_BAKEOFF.md"),
 ].join("\n");
@@ -9423,7 +9503,7 @@ assert(
     currentState.includes("provider-role capsules now") &&
     currentState.includes("project authority metadata for service-plane inspection") &&
     currentState.includes("first_party_capsules_have_complete_projection_contract") &&
-    tasks.includes("Keep first-party capsule projection validation covered") &&
+    deferredWork.includes("Keep first-party capsule projection validation covered") &&
     homeShellHostContract.includes("first_party_capsules_have_complete_projection_contract") &&
     includesNormalized(currentState, "Runtime gates, approval, launch tokens, providers, and audit remain") &&
     includesNormalized(currentState, "no desktop GUI markup or code in the neutral host document") &&
@@ -9445,9 +9525,9 @@ assert(
     includesNormalized(currentState, "origin-isolation change requires a fresh commit-bound operator pass") &&
     currentState.includes("any later Home shell behavior change requires a new or re-reviewed") &&
     !tasks.includes("finish operator-profile proof for the reduced CLI dispatch boundary") &&
-    tasks.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
-    includesNormalized(tasks, "Keep `elastos:bus@v1` bounded and immutable"),
-  "state.md and TASKS.md must preserve current Home shell proof truth and keep future Components and Bus work versioned",
+    deferredWork.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
+    includesNormalized(deferredWork, "Keep `elastos:bus@v1` bounded and immutable"),
+  "State and the dated backlog must preserve Home shell proof and versioned future Components and Bus work",
 );
 assert(
   homeShellManualUxReport.includes('const SCHEMA = "elastos.home-shell.manual-ux/v1"') &&
@@ -11937,7 +12017,7 @@ assert(
   "Local carrier setup smoke must exercise the direct Home CLI contract, not a PTY wrapper path",
 );
 const productionStorageTaskLines =
-  tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
+  deferredWork.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
   [];
 assert(
   productionStorageTaskLines.length === 1 &&
@@ -11959,7 +12039,7 @@ assert(
     productionStorageTaskLines[0].includes(
       "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
     ),
-  "TASKS.md must keep exactly one open production multi-peer availability/storage infrastructure blocker",
+  "The dated open-backlog snapshot must preserve exactly one production multi-peer availability/storage infrastructure blocker",
   productionStorageTaskLines,
 );
 assert(
@@ -12024,7 +12104,7 @@ assert(
       "Optional storage-market endpoint-quorum admission gate",
     ) &&
     contentAvailabilityDoc.includes("Optional external repair-fleet dispatch") &&
-    tasks.includes(
+    deferredWork.includes(
       "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
     ) &&
     namespacesDoc.includes("explicit capability keys"),

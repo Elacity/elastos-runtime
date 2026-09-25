@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-20260819f">
+<link rel="stylesheet" href="./style.css?v=system-models-20260923a">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -297,8 +297,63 @@
         </section>
 
         <section class="settings-content" data-settings="models" aria-labelledby="models-title">
-          <h1 id="models-title">Models</h1>
-          <div data-model-management hidden></div>
+          <div class="models-heading"><div><h1 id="models-title">Models</h1>
+            <p class="pc2-card-sublabel">Choose where your models run. Manage access and stored keys here.</p></div>
+            <button id="ai-provider-add" class="pc2-btn" type="button">Add hosted model</button></div>
+          <section id="local-models" class="pc2-section" aria-labelledby="local-models-title">
+            <h2 id="local-models-title" class="pc2-section-title">On this Home</h2>
+            <p class="pc2-card-sublabel">These models run on this device. Prompts stay here.</p>
+            <div data-model-management hidden></div>
+          </section>
+          <section id="approval-lens" class="pc2-section" aria-labelledby="approval-lens-title">
+            <h2 id="approval-lens-title" class="pc2-section-title">Approval Lens</h2>
+            <p class="pc2-card-sublabel">Choose who gives advice on hosted connections. You decide in Inbox.</p>
+            <div class="pc2-group"><div class="pc2-group-row approval-lens-controls">
+              <p id="approval-lens-status" role="status">Loading evaluator…</p>
+              <label for="approval-lens-model">Evaluator</label>
+              <select id="approval-lens-model" class="pc2-input" aria-label="Evaluator"></select>
+              <div class="system-inline-row">
+                <button id="approval-lens-select" class="pc2-btn pc2-btn-secondary" type="button">Use evaluator</button>
+              </div>
+              <details id="approval-lens-manage"><summary>Manage evaluator</summary>
+                <div class="system-inline-row">
+                  <button id="approval-lens-edit" class="pc2-btn pc2-btn-secondary" type="button">Edit connection</button>
+                  <button id="approval-lens-disconnect" class="pc2-btn pc2-btn-secondary" type="button">Disconnect</button>
+                </div>
+              </details>
+            </div></div>
+          </section>
+          <section class="pc2-section" data-ai-provider aria-labelledby="ai-provider-title">
+            <h2 id="ai-provider-title" class="pc2-section-title">Hosted</h2>
+            <p id="ai-provider-egress-note" class="pc2-card-sublabel" role="status">External HTTPS is paused. Key checks and hosted requests are unavailable. Saved keys, models, and past results stay here.</p>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <p class="pc2-card-sublabel" data-ai-provider-venice-fact hidden>This Home owns the system prompt for Venice.</p>
+                <p class="pc2-card-value system-status" data-field="ai-provider-state" aria-live="polite"></p>
+                <p class="pc2-card-value system-status" data-field="ai-provider-privacy" hidden></p>
+                <div id="ai-provider-instances" class="ai-provider-instances"></div>
+                <div id="ai-provider-form" class="ai-provider-form" hidden>
+                  <h2 id="ai-provider-form-title" class="pc2-section-title">Add hosted model</h2>
+                  <label class="pc2-card-label" for="ai-provider-kind">Hosted by</label>
+                  <select id="ai-provider-kind" class="pc2-input" aria-label="Hosted by">
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="venice">Venice</option>
+                  </select>
+                  <label class="pc2-card-label" for="ai-provider-key" data-ai-provider-key-label>API key</label>
+                  <input id="ai-provider-key" class="pc2-input" type="password" autocomplete="off" spellcheck="false" aria-label="API key">
+                  <label class="pc2-card-label" for="ai-provider-name">Name (optional)</label>
+                  <input id="ai-provider-name" class="pc2-input" type="text" autocomplete="off" spellcheck="false" aria-label="Hosted model name">
+                  <label class="pc2-card-label" for="ai-provider-model">Model</label>
+                  <select id="ai-provider-model" class="pc2-input" aria-label="Selected model"></select>
+                  <div class="system-inline-row">
+                    <button id="ai-provider-validate" class="pc2-btn pc2-btn-secondary" type="button">Check key and load models</button>
+                    <button id="ai-provider-save" class="pc2-btn" type="button">Save</button>
+                    <button id="ai-provider-cancel" class="pc2-btn pc2-btn-secondary" type="button">Cancel</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
         </section>
         <section class="settings-content" data-settings="catalog" aria-labelledby="catalog-title">
           <div class="catalog-toolbar">
@@ -425,6 +480,6 @@
       });
     })();
   </script>
-  <script type="module" src="./system.js?v=system-20260819f"></script>
+  <script type="module" src="./system.js?v=system-models-20260923a"></script>
 </body>
 </html>

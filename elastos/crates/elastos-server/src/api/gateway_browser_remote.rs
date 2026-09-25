@@ -44,7 +44,8 @@ struct ServedPage {
     last_seen: Mutex<tokio::time::Instant>,
 }
 
-static SERVED: OnceLock<Mutex<BTreeMap<(PathBuf, String), Arc<ServedPage>>>> = OnceLock::new();
+type ServedPages = BTreeMap<(PathBuf, String), Arc<ServedPage>>;
+static SERVED: OnceLock<Mutex<ServedPages>> = OnceLock::new();
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -170,9 +171,9 @@ pub(in crate::api::gateway) struct RemoteAdmissionPause {
     pub(in crate::api::gateway) resume: Notify,
 }
 #[cfg(test)]
-static ADMISSION_PAUSES: OnceLock<
-    Mutex<BTreeMap<(PathBuf, String, String), Arc<RemoteAdmissionPause>>>,
-> = OnceLock::new();
+type AdmissionPauses = BTreeMap<(PathBuf, String, String), Arc<RemoteAdmissionPause>>;
+#[cfg(test)]
+static ADMISSION_PAUSES: OnceLock<Mutex<AdmissionPauses>> = OnceLock::new();
 #[cfg(test)]
 pub(in crate::api::gateway) async fn hold_remote_admission_for_test(
     root: &FsPath,

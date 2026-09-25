@@ -79,7 +79,7 @@ pub(crate) fn register_browser_operator_sessions(
     service
 }
 
-fn service(state: &GatewayState) -> Result<Arc<BrowserOperatorService>, Response> {
+fn service(state: &GatewayState) -> Result<Arc<BrowserOperatorService>, Box<Response>> {
     SERVICES
         .get_or_init(Default::default)
         .lock()
@@ -87,10 +87,10 @@ fn service(state: &GatewayState) -> Result<Arc<BrowserOperatorService>, Response
         .get(&state.data_dir)
         .and_then(Weak::upgrade)
         .ok_or_else(|| {
-            failure(
+            Box::new(failure(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "operator_sessions_unavailable",
-            )
+            ))
         })
 }
 pub(super) async fn remember_inspection(
@@ -206,7 +206,7 @@ async fn engine_input(
     if event["type"] == "operator_ref"
         || (event["type"] == "operator_lease" && event["command"] == "acquire")
     {
-        let service = service(state)?;
+        let service = service(state).map_err(|response| *response)?;
         let records = service.records.lock().await;
         let record = records
             .get(event["admission_id"].as_str().unwrap_or_default())
@@ -295,7 +295,7 @@ pub(in crate::api::gateway) async fn request_admission(
 ) -> Response {
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let session = match operator_session(&service, &headers).await {
         Ok(s) => s,
@@ -366,7 +366,7 @@ pub(in crate::api::gateway) async fn admission_status(
 ) -> Response {
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let session = match operator_session(&service, &headers).await {
         Ok(s) => s,
@@ -415,7 +415,7 @@ pub(in crate::api::gateway) async fn pending_admissions(
     }
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let records = service.records.lock().await;
     let requests: Vec<_> = records.iter().filter(|(_,r)|r.page_id == page_id && r.phase == "pending" && r.created.elapsed().as_secs() < 60)
@@ -447,7 +447,7 @@ pub(in crate::api::gateway) async fn approve_admission(
     let owner_token = home_launch_token_header(&headers).unwrap_or_default();
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let snapshot = service
         .snapshots
@@ -586,7 +586,7 @@ pub(in crate::api::gateway) async fn revoke_admission(
     };
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let release_pending = {
         let mut records = service.records.lock().await;
@@ -677,7 +677,7 @@ pub(in crate::api::gateway) async fn operator_input(
 ) -> Response {
     let service = match service(&state) {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let session = match operator_session(&service, &headers).await {
         Ok(s) => s,

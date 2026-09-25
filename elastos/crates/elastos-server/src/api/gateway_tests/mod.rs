@@ -1,3 +1,7 @@
+pub(super) use super::gateway_home_system_ai_provider::{
+    clear_hosted_ai_validate_doubles, install_openrouter_models_double,
+    install_venice_validate_double, OpenRouterModelsDouble, VeniceAuthDouble,
+};
 use super::*;
 use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
 use axum::body::Body;
@@ -468,6 +472,16 @@ async fn browser_engine_retrying_close_test_state(
     exit_close: Option<MockExitClosePlan>,
     ownership: Option<Arc<MockBrowserOwnershipCounts>>,
 ) -> GatewayState {
+    let carrier_endpoint = if exit_close.is_some() {
+        Some(
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
@@ -515,7 +529,7 @@ async fn browser_engine_retrying_close_test_state(
         provider_registry: Some(registry),
         collaboration_chat_product_port: None,
         collaboration_presence_product_port: None,
-        carrier_endpoint: None,
+        carrier_endpoint,
         collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
@@ -857,6 +871,8 @@ mod inspect;
 mod library;
 mod marketplace;
 mod model;
+#[cfg(target_os = "macos")]
+mod model_installed_fixture;
 mod recovery;
 #[cfg(unix)]
 mod remote_engine;

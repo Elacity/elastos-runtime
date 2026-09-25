@@ -7,8 +7,11 @@ import {
   listProjects,
   createProject,
 } from "./agent-state.js";
-import { persistAgentWorkspaceSoon, captureActiveSessionState, restoreSessionState, serializeSessionForPersist } from "./agent-workspace.js";
+import {
+  persistAgentWorkspaceSoon, captureActiveSessionState, restoreSessionState, serializeSessionForPersist,
+} from "./agent-workspace.js";
 import { closeHarnessPage } from "./agent-configure.js";
+import { clearBackendReports } from "./agent-live.js";
 import {
   renderActiveSession,
   renderFollowUpQueue,
@@ -549,6 +552,7 @@ export function selectSession(sessionId) {
 
 export function newChat() {
   captureActiveSessionState();
+  clearBackendReports();
   const previous = ctx.sessions.find(session => session.id === ctx.activeSessionId);
   const recoveryDraft = previous?.lastTurn && !previous.lastTurn.completedAt &&
     !["completed", "failed", "stopped"].includes(previous.lastTurn.state)

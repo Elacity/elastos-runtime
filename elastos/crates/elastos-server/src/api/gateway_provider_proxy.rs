@@ -1686,7 +1686,12 @@ pub(super) async fn gateway_provider_proxy(
             }
         },
         "model" => match op.as_str() {
-            "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
+            "offers_list" => &[
+                ASSISTANT_CAPSULE_ID,
+                HOME_AGENT_CAPSULE_ID,
+                MARKETPLACE_CAPSULE_ID,
+            ],
+            "runs_create" | "runs_get" | "runs_events" | "runs_cancel" => {
                 &[ASSISTANT_CAPSULE_ID, HOME_AGENT_CAPSULE_ID]
             }
             _ => {
@@ -1778,8 +1783,7 @@ pub(super) async fn gateway_provider_proxy(
                 &remote_model_grants,
                 &context,
                 &launch_capsule_id,
-                &op,
-                &request,
+                (&op, &request),
                 crate::auth::now_ts(),
             )
             .await
@@ -1796,6 +1800,20 @@ pub(super) async fn gateway_provider_proxy(
                     return (StatusCode::OK, Json(remote_response)).into_response();
                 }
                 Ok(None) => {}
+                Err(super::gateway_model_remote::RemoteRouteError::PreDispatchRefused {
+                    binding,
+                    reason,
+                }) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "status": "error", "code": "remote_model_invocation_refused",
+                            "message": "This invocation was refused before provider dispatch.",
+                            "reason": reason, "refusal": binding,
+                        })),
+                    )
+                        .into_response();
+                }
                 Err(super::gateway_model_remote::RemoteRouteError::Transport(message)) => {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1955,6 +1973,45 @@ pub(super) async fn gateway_provider_proxy(
                 &scheme,
                 anyhow::anyhow!("model provider audit failed: {}", err),
             );
+        }
+        if launch_capsule_id == "assistant" && op == "runs_create" {
+            if let Some(offer_id) = request.get("offer_id").and_then(serde_json::Value::as_str) {
+                if let Some(hint) = crate::api::hosted_model_offer_hint(&state.data_dir, offer_id) {
+                    let gate = crate::jev_approval_lens::prepare_assistant_hosted_http(
+                        &state.data_dir,
+                        registry.as_ref(),
+                        &crate::jev_approval_lens::AssistantHostedHttpContext {
+                            request_id: audit.request_id,
+                            principal_id: &principal_id,
+                            session_id: &session_id,
+                            capsule_id: &launch_capsule_id,
+                            grant_id: &context.grant_id,
+                            offer_id,
+                            hint,
+                        },
+                    )
+                    .await;
+                    match gate {
+                        crate::jev_approval_lens::HostedHttpGate::Proceed => {}
+                        crate::jev_approval_lens::HostedHttpGate::NeedsReview => {
+                            return Json(serde_json::json!({
+                                "status": "error",
+                                "code": "approval_required",
+                                "message": crate::jev_approval_lens::HOSTED_HTTP_REVIEW_MESSAGE,
+                            }))
+                            .into_response();
+                        }
+                        crate::jev_approval_lens::HostedHttpGate::Denied => {
+                            return Json(serde_json::json!({
+                                "status": "error",
+                                "code": "approval_denied",
+                                "message": crate::jev_approval_lens::HOSTED_HTTP_DENIED_MESSAGE,
+                            }))
+                            .into_response();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2117,6 +2174,25 @@ pub(super) async fn gateway_provider_proxy(
             return gateway_provider_error_response(
                 &scheme,
                 anyhow::anyhow!("model provider audit failed: {}", err),
+            );
+        }
+        if launch_capsule_id == "assistant" && op == "runs_create" {
+            let outcome = if completed { "accepted" } else { "failed" };
+            let request_id = request
+                .get("offer_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|offer_id| {
+                    crate::jev_approval_lens::outcome_request_id(
+                        &state.data_dir,
+                        offer_id,
+                        audit.request_id,
+                    )
+                })
+                .unwrap_or_else(|| audit.request_id.to_string());
+            let _ = crate::jev_approval_lens::record_actual_outcome(
+                &state.data_dir,
+                &request_id,
+                outcome,
             );
         }
     }

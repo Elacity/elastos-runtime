@@ -6,6 +6,7 @@ mod test_support;
 use elastos_model_contract::{model_input_hash, RUNTIME_CREATE_BINDING_SCHEMA};
 use serde_json::{json, Value};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -337,4 +338,103 @@ fn unexpected_guard_exit_forces_local_llama_group_cleanup() {
     provider.shutdown();
 
     assert_guard_and_engine_stopped(&events);
+}
+
+#[test]
+fn production_provider_refuses_every_external_adapter_before_socket_and_after_restart() {
+    let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+    sink.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", sink.local_addr().unwrap());
+    let root = test_support::temp_root_path("model-provider-process", "external-paused");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = json!({
+        "concurrency_limit": 1, "input_bytes_limit": 8192,
+        "inline_output_bytes_limit": 8192, "event_bytes_limit": 8192,
+        "runtime_ms_limit": 30000, "retention_secs": 60,
+        "cancel_settlement_timeout_ms": 20
+    });
+    let hosted = json!({
+        "backend_provider_label": "Fixture Provider", "selection_mode": "pinned",
+        "privacy_policy_ref": "fixture:privacy:v1", "terms_ref": "fixture:terms:v1",
+        "upstream_routing_fallback_assertion": "operator_asserted_disabled",
+        "model_privacy": ""
+    });
+    let adapters = [
+        (
+            "decisions",
+            "decision.evaluate",
+            json!({"kind":"open_router_decisions",
+            "api_url":format!("{endpoint}/decisions"),"api_key":"fixture-key","model":"fixture/jev",
+            "hosted":hosted}),
+        ),
+        (
+            "chat",
+            "text.generate",
+            json!({"kind":"open_ai_compatible_text",
+            "api_url":format!("{endpoint}/chat"),"api_key":"fixture-key","model":"fixture/text",
+            "hosted":hosted}),
+        ),
+        (
+            "responses",
+            "text.generate",
+            json!({"kind":"open_ai_responses_text",
+            "api_url":format!("{endpoint}/responses"),"api_key":"fixture-key","model":"fixture/text",
+            "hosted":hosted}),
+        ),
+        (
+            "job",
+            "image.generate",
+            json!({"kind":"http_job_artifact",
+            "create_url":format!("{endpoint}/create"),"status_url":format!("{endpoint}/status"),
+            "cancel_url":format!("{endpoint}/cancel"),"bearer_token":"fixture-key",
+            "poll_interval_ms":1000}),
+        ),
+    ];
+    let offers = adapters.iter().map(|(id, operation, adapter)| json!({
+        "id":id,"title":id,"operation":operation,
+        "input_modalities":if *id=="chat" || *id=="responses" {json!(["text/plain"])} else {json!(["application/json"])},
+        "output_modalities":if *id=="chat" || *id=="responses" {json!(["text/plain"])} else {json!(["application/json"])},
+        "policy":policy,"adapter":adapter,"enabled":true
+    })).collect::<Vec<_>>();
+    let init = json!({"op":"init","config":{
+        "base_path":root,"allowed_paths":[],"read_only":false,"encryption_key":"",
+        "extra":{"provider_id":"model-provider","journal_dir":root.join("journal"),"offers":offers}
+    }});
+    for pass in 0..2 {
+        let mut provider = ProviderProcess::start();
+        let started = provider.request(init.clone());
+        assert_eq!(
+            started["status"], "ok",
+            "existing offers must survive startup: {started}"
+        );
+        for (id, operation, _) in &adapters {
+            let input = json!({});
+            let request_id = format!("request:external-paused:{pass}:{id}");
+            let create = json!({"op":"runs_create","offer_id":id,"operation":operation,
+            "input":input,"runtime_binding":{
+                "schema":RUNTIME_CREATE_BINDING_SCHEMA,"principal_id":"person:local:test",
+                "session_id":"session:test","capsule_id":"assistant","grant_id":"grant:test",
+                "request_id":request_id,"offer_id":id,"operation":operation,
+                "input_hash":model_input_hash(&input).unwrap()
+            }});
+            let reply = provider.request(create.clone());
+            assert!(
+                reply
+                    .to_string()
+                    .contains("Hosted external HTTPS is paused."),
+                "{id}: {reply}"
+            );
+            let retry = provider.request(create);
+            assert!(
+                retry
+                    .to_string()
+                    .contains("Hosted external HTTPS is paused."),
+                "retry {id}: {retry}"
+            );
+        }
+        provider.shutdown();
+    }
+    assert!(matches!(sink.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
 }

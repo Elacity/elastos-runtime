@@ -302,7 +302,7 @@ function renderComposerAttachments() {
     host.hidden = true;
     const field = composerInput();
     if (field) {
-      field.placeholder = "Ask on this machine";
+      field.placeholder = "Message Assistant";
     }
     return;
   }

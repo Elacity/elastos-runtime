@@ -2703,7 +2703,8 @@ pub(crate) async fn fetch_model_part(
         request["max_bytes"] = json!(65536);
         65536
     };
-    let mut stream = registry
+    let index_read = path == CONTENT_OBJECT_MANIFEST_PATH && range.is_none();
+    let opened = registry
         .open_provider_stream(
             ProviderInvocation {
                 source: "runtime-model-preparation".into(),
@@ -2717,9 +2718,25 @@ pub(crate) async fn fetch_model_part(
             },
             ProviderStreamOptions::default(),
         )
-        .await?;
-    let bytes = stream.drain_to_vec()?;
-    anyhow::ensure!(bytes.len() as u64 <= limit, "model read exceeds bound");
+        .await;
+    if index_read && opened.is_err() {
+        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_open",
+            "model index read substage failed");
+    }
+    let mut stream = opened?;
+    let drained = stream.drain_to_vec();
+    if index_read && drained.is_err() {
+        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_drain",
+            "model index read substage failed");
+    }
+    let bytes = drained?;
+    if bytes.len() as u64 > limit {
+        if index_read {
+            tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
+                "model index read substage failed");
+        }
+        anyhow::bail!("model read exceeds bound");
+    }
     if range.is_some() {
         anyhow::ensure!(bytes.len() as u64 == limit, "incomplete model range");
     }
@@ -3084,10 +3101,17 @@ impl ContentProvider {
         let registry = self.registry()?;
         let transfer = ContentFetchTransfer::from_request(request)?;
         let local_only = request.get("local_only").and_then(|value| value.as_bool()) == Some(true);
-        let result = match self
+        let model_index = path == CONTENT_OBJECT_MANIFEST_PATH
+            && transfer.bounded_read
+            && transfer.max_bytes.is_some();
+        let local = self
             .fetch_from_local_backend(&registry, cid, path, &transfer)
-            .await
-        {
+            .await;
+        if model_index && local.is_err() {
+            tracing::warn!(target: "elastos::model_index_read", stage = "local_bounded_index_cat",
+                "model index read substage failed");
+        }
+        let result = match local {
             Ok(result) => result,
             Err(local_err) if local_only => {
                 if local_backend_needs_prepare(&local_err)
@@ -3104,18 +3128,29 @@ impl ContentProvider {
                     return Err(local_err);
                 }
             }
-            Err(local_err) => match self
-                .fetch_from_availability_provider(&registry, cid, path, &transfer)
-                .await
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => return Err(local_err),
-                Err(availability_err) => {
-                    return Err(ProviderError::Provider(format!(
-                        "{local_err}; availability fetch failed: {availability_err}"
-                    )))
+            Err(local_err) => {
+                let fallback = self
+                    .fetch_from_availability_provider(&registry, cid, path, &transfer)
+                    .await;
+                if model_index {
+                    let outcome = match &fallback {
+                        Ok(Some(_)) => "completed",
+                        Ok(None) => "unavailable",
+                        Err(_) => "failed",
+                    };
+                    tracing::warn!(target: "elastos::model_index_read", stage = "availability_fallback",
+                        outcome, "model index read fallback settled");
                 }
-            },
+                match fallback {
+                    Ok(Some(result)) => result,
+                    Ok(None) => return Err(local_err),
+                    Err(availability_err) => {
+                        return Err(ProviderError::Provider(format!(
+                            "{local_err}; availability fetch failed: {availability_err}"
+                        )))
+                    }
+                }
+            }
         };
 
         let receipt_availability = self
@@ -4628,13 +4663,45 @@ impl ContentProvider {
         &self,
         cid: &str,
     ) -> Option<Result<SignedAvailabilityReceipt, ProviderError>> {
-        match self.latest_receipts() {
-            Ok(receipts) => receipts
-                .into_iter()
-                .find(|receipt| receipt.payload.cid == cid)
-                .map(Ok),
-            Err(err) => Some(Err(err)),
-        }
+        (|| {
+            let path = self.receipts_path();
+            if !path.exists() {
+                return Ok(None);
+            }
+            let file = std::fs::File::open(path)?;
+            let mut latest = None;
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let envelope: Value = serde_json::from_str(&line).map_err(|err| {
+                    ProviderError::Provider(format!("content receipt ledger decode failed: {err}"))
+                })?;
+                let row_cid = envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("cid"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "content receipt ledger decode failed: missing payload CID".into(),
+                        )
+                    })?;
+                if row_cid != cid {
+                    continue;
+                }
+                let receipt: SignedAvailabilityReceipt =
+                    serde_json::from_str(&line).map_err(|err| {
+                        ProviderError::Provider(format!(
+                            "content receipt ledger decode failed: {err}"
+                        ))
+                    })?;
+                verify_signed_receipt(&receipt)?;
+                latest = Some(receipt);
+            }
+            Ok(latest)
+        })()
+        .transpose()
     }
 
     fn latest_receipts(&self) -> Result<Vec<SignedAvailabilityReceipt>, ProviderError> {
@@ -9135,6 +9202,91 @@ mod tests {
 
     const TEST_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
+    fn signed_test_availability_receipt(cid: &str, legacy: bool) -> Value {
+        let (signing_key, _) = elastos_runtime::signature::generate_keypair();
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
+        let receipt = AvailabilityReceipt {
+            schema: AVAILABILITY_RECEIPT_SCHEMA.to_string(),
+            cid: cid.to_string(),
+            uri: format!("elastos://{cid}"),
+            object_did: None,
+            publisher_did: signer_did.clone(),
+            provider: "ipfs-provider".to_string(),
+            policy: "local_pin".to_string(),
+            status: "local_pinned".to_string(),
+            replicas: 1,
+            peer_selection: local_peer_selection_json(),
+            quota: local_quota_json(),
+            repair_worker: repair_worker_json(false),
+            storage_market: default_content_storage_market_json(),
+            repair_graph: default_content_repair_graph_json(),
+            abuse_controls: default_content_abuse_controls_json(),
+            accounting: default_content_accounting_json(),
+            checked_at: 1,
+        };
+        let mut payload = serde_json::to_value(receipt).unwrap();
+        if legacy {
+            let payload = payload.as_object_mut().unwrap();
+            payload.remove("peer_selection");
+            payload.remove("quota");
+            payload.remove("repair_worker");
+        }
+        let (signature, signed_did) = crate::crypto::domain_separated_sign(
+            &signing_key,
+            AVAILABILITY_RECEIPT_DOMAIN,
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+        );
+        assert_eq!(signed_did, signer_did);
+        let envelope =
+            json!({"payload": payload, "signature": signature, "signer_did": signer_did});
+        crate::crypto::verify_signed_json_envelope_against_dids(
+            &serde_json::to_vec(&envelope).unwrap(),
+            AVAILABILITY_RECEIPT_DOMAIN,
+            &[signed_did],
+        )
+        .unwrap();
+        envelope
+    }
+
+    async fn content_with_bounded_local_index(
+        index: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        Arc<ProviderRegistry>,
+        Arc<MockAvailabilityProvider>,
+        Arc<ContentProvider>,
+    ) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let content = Arc::new(ContentProvider::new(
+            data_dir.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        let ipfs = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(index),
+                "_runtime_complete_metadata": {
+                    "schema": "elastos.provider.complete-metadata/v1",
+                    "cid": TEST_CID,
+                    "path": CONTENT_OBJECT_MANIFEST_PATH,
+                    "max_bytes": 65536,
+                    "actual_bytes": index.len(),
+                    "completed": true,
+                }
+            }))),
+        });
+        registry
+            .register_sub_provider("content", content.clone())
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("ipfs", ipfs.clone())
+            .await
+            .unwrap();
+        (data_dir, registry, ipfs, content)
+    }
+
     struct MockIpfsProvider {
         add_count: Mutex<usize>,
         added_files: Mutex<Vec<String>>,
@@ -11710,6 +11862,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_fetch_ignores_unrelated_signed_old_receipt() {
+        let index = b"{\"signed_index\":true}";
+        let (_data_dir, _registry, ipfs, content) = content_with_bounded_local_index(index).await;
+        let old_cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdj";
+        append_jsonl(
+            &content.receipts_path(),
+            &signed_test_availability_receipt(old_cid, true),
+        )
+        .unwrap();
+        append_jsonl(
+            &content.receipts_path(),
+            &signed_test_availability_receipt(TEST_CID, false),
+        )
+        .unwrap();
+        let response = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_test_stream_payload(&response["data"]["stream"]),
+            index
+        );
+        assert_eq!(response["data"]["availability"]["status"], "local_pinned");
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+
+        let dashboard_error = content
+            .send_raw(&json!({"op": "status"}))
+            .await
+            .expect_err("the dashboard must report its incompatible old ledger");
+        assert!(dashboard_error
+            .to_string()
+            .contains("receipt ledger decode failed"));
+    }
+
+    #[tokio::test]
+    async fn content_fetch_rejects_matching_signed_receipt_corruption() {
+        let (_data_dir, _registry, ipfs, content) = content_with_bounded_local_index(b"{}").await;
+        let mut receipt = signed_test_availability_receipt(TEST_CID, false);
+        receipt["payload"]["status"] = json!("tampered");
+        append_jsonl(&content.receipts_path(), &receipt).unwrap();
+
+        let error = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream",
+            }))
+            .await
+            .expect_err("matching corrupt receipt must fail closed");
+        assert!(error.to_string().contains("receipt verification failed"));
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn content_fetch_rejects_matching_signed_old_receipt() {
+        let (_data_dir, _registry, ipfs, content) = content_with_bounded_local_index(b"{}").await;
+        append_jsonl(
+            &content.receipts_path(),
+            &signed_test_availability_receipt(TEST_CID, true),
+        )
+        .unwrap();
+
+        let error = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream",
+            }))
+            .await
+            .expect_err("a matching old receipt needs an explicit schema decision");
+        assert!(error.to_string().contains("missing field `peer_selection`"));
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn content_fetch_propagates_range_progress_transfer_receipt() {
         let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
         let response = content
@@ -12232,6 +12472,62 @@ mod tests {
             assert_eq!(request["path"], OBJECT_MANIFEST_PATH);
             assert!(request["_runtime_invocation"]["range"].is_null());
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_index_diagnostic_names_local_and_fallback_failure_without_payload() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct LogWriter(StdArc<StdMutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_root, registry, ipfs, _content) = registry_with_content_and_ipfs().await;
+        *ipfs.bounded_read_not_ready.lock().await = true;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_error("unavailable", "private-fixture-marker")),
+        });
+        registry.register(availability.clone()).await;
+        let log = StdArc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let log = log.clone();
+                move || LogWriter(log.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        fetch_model_part(&registry, TEST_CID, OBJECT_MANIFEST_PATH, None)
+            .await
+            .expect_err("the bounded index read must fail in the controlled fixture");
+        let output = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("stage=\"local_bounded_index_cat\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("stage=\"availability_fallback\""),
+            "{output}"
+        );
+        assert!(output.contains("outcome=\"failed\""), "{output}");
+        assert!(output.contains("stage=\"runtime_stream_open\""), "{output}");
+        assert!(!output.contains("stage=\"runtime_stream_validation\""));
+        assert!(!output.contains(TEST_CID));
+        assert!(!output.contains("private-fixture-marker"));
+        assert_eq!(ipfs.requests.lock().await.len(), 1);
+        assert_eq!(availability.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

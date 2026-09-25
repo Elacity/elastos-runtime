@@ -83,7 +83,8 @@ const server = createServer(async (req, res) => {
       const chunks = []; for await (const chunk of req) chunks.push(chunk);
       const body = Buffer.concat(chunks).toString("utf8");
       const input = body ? JSON.parse(body) : null;
-      calls.push({ method: req.method, path: url.pathname, revision: input?.if_revision });
+      calls.push({ method: req.method, path: url.pathname, revision: input?.if_revision,
+        ...(url.pathname === "/api/provider/model/runs_create" ? { input } : {}) });
       if (url.pathname === workspacePath) {
         if (req.method === "GET") { json(stored || initial); return; }
         assert.equal(req.method, "PUT");
@@ -98,6 +99,9 @@ const server = createServer(async (req, res) => {
       if (url.pathname === "/api/provider/model/offers_list") {
         json({ offers: [{ id: offerId, title: "Qwen installed fixture", operation: "text.generate",
           input_modalities: ["text/plain"], output_modalities: ["text/plain"] }] }); return;
+      }
+      if (url.pathname === "/api/provider/model/runs_create") {
+        json({ status: "error", code: "approval_required", message: "Approval required" }); return;
       }
       if (url.pathname === "/api/capsules/catalog") {
         json({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: [{
@@ -201,7 +205,7 @@ try {
   assert.equal(await frame.locator("#agent-composer-input").inputValue(), edited);
   await frame.locator("#agent-model-picker").click();
   await frame.locator(`#agent-model-menu [data-model-cid="${cid}"][aria-selected="true"]`).waitFor({ state: "visible" });
-  assert.equal(await frame.locator("#agent-model-menu").getByRole("option", { name: "Qwen installed fixture", exact: true }).count(), 1);
+  assert.equal(await frame.locator("#agent-model-menu").getByRole("option", { name: /Qwen installed fixture/ }).count(), 1);
   await frame.locator("#agent-model-picker").click();
   stage = "Chat Build Studio controls";
   // Text-only fixture: Build has no typed capability and no image/video offer is
@@ -232,9 +236,72 @@ try {
   assert.equal(await secondFrame.locator("#agent-composer-input").inputValue(), firstDraft);
   assertComplete(stored.document);
   assert.equal(calls.filter(call => call.path.includes("/runs_")).length, 0, "Opening, migration, modes and recovery must not invoke runs");
+  stage = "pending approval stays tied to the saved prompt and connection";
+  const pendingPrompt = "Saved approval prompt: calm river";
+  const providerPrompt = "Provider-only prompt: calm river";
+  let hash = 2166136261;
+  for (const char of JSON.stringify([pendingPrompt, providerPrompt, null])) { hash ^= char.charCodeAt(0); hash = Math.imul(hash, 16777619); }
+  const pending = {
+    id: "pending-approval", title: "Pending approval", messages: [{ id: "pending-user", role: "user", text: pendingPrompt, modelText: providerPrompt }],
+    lastTurn: { turnId: "pending-turn", state: "failed", error: "approval_required",
+      completedAt: Date.now(), approvalOfferId: "offer:another-model",
+      approvalPromptHash: (hash >>> 0).toString(16).padStart(8, "0") },
+  };
+  stored.document.sessions.unshift(pending);
+  stored.document.activeSessionId = pending.id;
+  await page.reload(); frame = page.frameLocator("iframe");
+  await frame.getByRole("button", { name: "Continue request" }).waitFor({ state: "visible" });
+  await frame.getByRole("button", { name: "Review in Inbox" }).waitFor({ state: "visible" });
+  for (const width of [390, 768, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    assert.equal(await frame.getByRole("button", { name: "Continue request" }).isVisible(), true, `${width}px Continue control`);
+    assert.equal(await frame.getByRole("button", { name: "Review in Inbox" }).isVisible(), true, `${width}px Inbox control`);
+    assert.equal(await frame.locator("html").evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, `${width}px horizontal overflow`);
+  }
+  await frame.getByRole("button", { name: "Continue request" }).focus();
+  assert.equal(await frame.getByRole("button", { name: "Continue request" }).evaluate(element => element === document.activeElement), true);
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 0, "reload does not dispatch pending prompt");
+  await frame.getByRole("button", { name: "Continue request" }).click();
+  await frame.getByText("Select the original connection and saved prompt to continue.").waitFor({ state: "visible" });
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 0, "a different connection cannot dispatch pending prompt");
+  stored.document.sessions.find(session => session.id === pending.id).lastTurn.approvalOfferId = offerId;
+  stored.document.sessions.find(session => session.id === pending.id).messages[0].modelText = "Changed provider-only prompt";
+  await page.reload(); frame = page.frameLocator("iframe");
+  await frame.getByRole("button", { name: "Continue request" }).waitFor({ state: "visible" });
+  await frame.getByRole("button", { name: "Continue request" }).click();
+  await frame.getByText("Select the original connection and saved prompt to continue.").waitFor({ state: "visible" });
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 0, "changed provider text cannot dispatch pending prompt");
+  stored.document.sessions.find(session => session.id === pending.id).messages[0].modelText = providerPrompt;
+  stored.document.sessions.find(session => session.id === pending.id).messages[0].parts = [{ kind: "text", text: "Changed attached text" }];
+  await page.reload(); frame = page.frameLocator("iframe");
+  await frame.getByRole("button", { name: "Continue request" }).waitFor({ state: "visible" });
+  await frame.getByRole("button", { name: "Continue request" }).click();
+  await frame.getByText("Select the original connection and saved prompt to continue.").waitFor({ state: "visible" });
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 0, "changed parts cannot dispatch pending prompt");
+  delete stored.document.sessions.find(session => session.id === pending.id).messages[0].parts;
+  await page.reload(); frame = page.frameLocator("iframe");
+  await frame.getByRole("button", { name: "Continue request" }).waitFor({ state: "visible" });
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 0, "reload still waits for human Continue");
+  await frame.getByRole("button", { name: "Continue request" }).click();
+  await until(() => calls.some(call => call.path.endsWith("/runs_create")), "explicit saved prompt retry");
+  const retry = calls.find(call => call.path.endsWith("/runs_create"));
+  assert.equal(retry.input.offer_id, offerId);
+  assert.ok(retry.input.input.prompt.includes(providerPrompt), "explicit retry keeps the provider prompt");
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 1, "one click creates one request");
+  await until(() => {
+    const turn = stored.document.sessions.find(session => session.id === pending.id)?.lastTurn;
+    return turn?.turnId !== "pending-turn" && turn?.error === "approval_required"
+      && turn?.approvalOfferId === offerId && turn?.approvalPromptHash === pending.lastTurn.approvalPromptHash;
+  }, "real blocked run persisted");
+  const blocked = stored.document.sessions.find(session => session.id === pending.id).lastTurn;
+  assert.equal(blocked.approvalOfferId, offerId);
+  assert.equal(blocked.approvalPromptHash, pending.lastTurn.approvalPromptHash);
+  await page.reload(); frame = page.frameLocator("iframe");
+  await frame.getByRole("button", { name: "Continue request" }).waitFor({ state: "visible" });
+  assert.equal(calls.filter(call => call.path.endsWith("/runs_create")).length, 1, "blocked run reload does not dispatch");
   assert.deepEqual(errors, []);
   assert.deepEqual(pageErrors, []);
-  console.log("PASS canonical Assistant rendered migration, complete history, editable drafts, model selection, modes and two-page CAS recovery");
+  console.log("PASS canonical Assistant migration, history, drafts, model selection, CAS recovery, and pending approval replay at 390/768/1280");
   if (ownedProof) await rm(proofDir, { recursive: true, force: true });
 } catch (error) {
   const report = { stage, error: String(error.stack || error), calls, errors, pageErrors, conflicts, revision: stored?.revision };

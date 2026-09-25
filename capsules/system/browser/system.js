@@ -57,6 +57,7 @@ const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const frameHomeToken = readLaunchToken();
 const models = window.ElastosModelManagement.create({
   root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
+  onReadyOpen: ({ cid, offer_id }) => openCapsuleTarget("assistant", { model_cid: cid, offer_id }),
 });
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
@@ -149,7 +150,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
-  models: ["models", "use", "keep", "preparation"],
+  models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
   about: ["about", "device", "version", "source", "network", "did"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
@@ -178,6 +179,7 @@ async function boot() {
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
+  configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
   configureChainAccess();
@@ -677,6 +679,472 @@ async function onGuestRegistrationChange() {
     showGuestRegistrationStatus(String(error.message || error), "error");
   } finally {
     setGuestRegistrationControlState();
+  }
+}
+
+function configureAiProvider() {
+  const instancesNode = document.querySelector("#ai-provider-instances");
+  const addButton = document.querySelector("#ai-provider-add");
+  const formNode = document.querySelector("#ai-provider-form");
+  const nameInput = document.querySelector("#ai-provider-name");
+  const providerSelect = document.querySelector("#ai-provider-kind");
+  const keyInput = document.querySelector("#ai-provider-key");
+  const modelSelect = document.querySelector("#ai-provider-model");
+  const validateButton = document.querySelector("#ai-provider-validate");
+  const saveButton = document.querySelector("#ai-provider-save");
+  const cancelButton = document.querySelector("#ai-provider-cancel");
+  const veniceFact = document.querySelector("[data-ai-provider-venice-fact]");
+  if (!instancesNode || !addButton || !formNode || !nameInput || !providerSelect || !keyInput || !modelSelect || !validateButton || !saveButton || !cancelButton) {
+    return;
+  }
+  const validationEndButton = document.createElement("button");
+  validationEndButton.className = "pc2-btn pc2-btn-secondary";
+  validationEndButton.type = "button";
+  validationEndButton.textContent = "End key-check access";
+  validationEndButton.hidden = true;
+  validateButton.after(validationEndButton);
+  const selectedProvider = () => (providerSelect.value === "venice" ? "venice" : "openrouter");
+  let editingId = "";
+  let latestStatus = null;
+  const updateValidationEnd = () => {
+    const state = latestStatus?.validation_egress_approval_state?.[selectedProvider()];
+    validationEndButton.hidden = latestStatus?.hosted_external_https !== "operator_ready" && state !== "pending" && state !== "approved";
+    validationEndButton.textContent = latestStatus?.hosted_external_https === "operator_ready" ? "End hosted HTTPS" : "End key-check access";
+  };
+  const setBusy = (busy) => {
+    addButton.disabled = busy || !hasShellAccess();
+    nameInput.disabled = busy || !hasShellAccess();
+    providerSelect.disabled = busy || !hasShellAccess() || Boolean(editingId);
+    keyInput.disabled = busy || !hasShellAccess();
+    modelSelect.disabled = busy || !hasShellAccess();
+    validateButton.disabled = busy || !hasShellAccess();
+    validationEndButton.disabled = busy || !hasShellAccess();
+    saveButton.disabled = busy || !hasShellAccess();
+    cancelButton.disabled = busy;
+    cancelButton.textContent = latestStatus?.staged_connections?.some((entry) => entry.id === editingId)
+      ? "Close; keep staged key" : "Cancel";
+    instancesNode.querySelectorAll("button").forEach((button) => {
+      button.disabled = busy || !hasShellAccess() || button.dataset.egressPaused === "true";
+    });
+  };
+  const showState = (message, tone) => {
+    setTextFields("ai-provider-state", message);
+    for (const node of document.querySelectorAll('[data-field="ai-provider-state"]')) {
+      node.hidden = !message;
+      node.dataset.tone = tone || "";
+    }
+  };
+  const showPrivacy = (privacy) => {
+    const text = readText(privacy);
+    setTextFields("ai-provider-privacy", text ? `Discovered privacy: ${text}.` : "");
+    for (const node of document.querySelectorAll('[data-field="ai-provider-privacy"]')) {
+      node.hidden = !text;
+    }
+  };
+  const applyProviderChrome = () => {
+    if (veniceFact) veniceFact.hidden = selectedProvider() !== "venice";
+    updateValidationEnd();
+  };
+  const fillModels = (models, selected) => {
+    const values = [];
+    const privacyById = new Map();
+    for (const model of models) {
+      const id = typeof model === "string" ? readText(model) : readText(model && model.id);
+      if (!id || values.includes(id)) continue;
+      values.push(id);
+      const privacy = model && typeof model === "object" ? readText(model.privacy) : "";
+      if (privacy) privacyById.set(id, privacy);
+    }
+    const current = readText(selected);
+    if (current && !values.includes(current)) values.unshift(current);
+    modelSelect.replaceChildren();
+    for (const id of values) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = id;
+      option.dataset.privacy = privacyById.get(id) || "";
+      modelSelect.append(option);
+    }
+    if (current) modelSelect.value = current;
+    const selectedOption = modelSelect.selectedOptions[0];
+    showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
+  };
+  const hideForm = () => {
+    editingId = "";
+    formNode.hidden = true;
+    instancesNode.hidden = false;
+    document.querySelector("#local-models").hidden = false;
+    document.querySelector("#approval-lens").hidden = false;
+    addButton.hidden = false;
+    nameInput.value = "";
+    keyInput.value = "";
+    providerSelect.value = "openrouter";
+    fillModels([], "");
+    applyProviderChrome();
+    setBusy(false);
+  };
+  const showForm = (instance) => {
+    formNode.hidden = false;
+    instancesNode.hidden = true;
+    document.querySelector("#local-models").hidden = true;
+    document.querySelector("#approval-lens").hidden = true;
+    addButton.hidden = true;
+    editingId = instance && instance.id ? String(instance.id) : "";
+    nameInput.value = instance && instance.name ? String(instance.name) : "";
+    providerSelect.value = instance && instance.provider === "venice" ? "venice" : "openrouter";
+    keyInput.value = "";
+    fillModels([], instance && instance.selected_model ? instance.selected_model : "");
+    applyProviderChrome();
+    document.querySelector("#ai-provider-form-title").textContent = editingId ? "Edit hosted model" : "Add hosted model";
+    saveButton.textContent = "Save";
+    keyInput.focus();
+    setBusy(false);
+  };
+  const renderInstances = (status) => {
+    const connections = status && Array.isArray(status.connections) ? status.connections : [];
+    instancesNode.replaceChildren();
+    for (const connection of connections) {
+      if (!connection || connection.connected !== true) continue;
+      if (connection.operation === "decision.evaluate") continue;
+      const card = document.createElement("div");
+      card.className = "ai-provider-instance";
+      const title = document.createElement("p");
+      title.className = "pc2-card-label";
+      title.textContent = readText(connection.name) || "Hosted model";
+      const detail = document.createElement("p");
+      detail.className = "pc2-card-sublabel";
+      detail.textContent = `${readText(connection.processor_label) || "Hosted"} · ${readText(connection.selected_model)}`;
+      const actions = document.createElement("div");
+      actions.className = "system-inline-row";
+      const useButton = document.createElement("button");
+      useButton.className = "pc2-btn";
+      useButton.type = "button";
+      useButton.textContent = "Use in Assistant";
+      useButton.dataset.egressPaused = connection.egress_state === "paused" ? "true" : "false";
+      useButton.disabled = connection.egress_state === "paused";
+      useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
+      const shareButton = document.createElement("button");
+      shareButton.className = "pc2-btn pc2-btn-secondary";
+      shareButton.type = "button";
+      shareButton.textContent = connection.share_enabled ? "Shared as service" : "Share as service";
+      shareButton.addEventListener("click", () => openCapsuleTarget("services"));
+      const replaceButton = document.createElement("button");
+      replaceButton.className = "pc2-btn pc2-btn-secondary";
+      replaceButton.type = "button";
+      replaceButton.textContent = "Edit";
+      replaceButton.addEventListener("click", () => {
+        showForm(connection);
+        showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
+      });
+      const disconnectButton = document.createElement("button");
+      disconnectButton.className = "pc2-btn pc2-btn-secondary";
+      disconnectButton.type = "button";
+      disconnectButton.textContent = "Disconnect";
+      disconnectButton.addEventListener("click", async () => {
+        if (!hasShellAccess()) return;
+        setBusy(true);
+        showState("", "");
+        try {
+          latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+            method: "DELETE",
+            headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: connection.id }),
+          });
+          hideForm();
+          await refreshStatus();
+          showState(`${readText(connection.name)} is disconnected.`, "");
+        } catch (error) {
+          showState(publicSystemError(error, "This Home could not disconnect that hosted model."), "error");
+        } finally {
+          setBusy(false);
+        }
+      });
+      const state = document.createElement("span");
+      state.className = "ai-provider-state";
+      state.textContent = connection.egress_state === "operator_ready" ? "Hosted HTTPS active"
+        : connection.egress_state === "ready" ? "Hosted connection approved"
+        : connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
+        : connection.egress_approval_state === "pending" ? "Hosted connection needs Inbox review"
+        : connection.egress_state === "paused" ? "External HTTPS paused"
+        : connection.approval_state === "approved" ? "Assistant access approved"
+        : connection.share_enabled ? "Shared" : "Private";
+      title.append(state);
+      const more = document.createElement("details");
+      more.className = "ai-provider-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Details and access";
+      const identity = document.createElement("p");
+      identity.className = "pc2-card-sublabel";
+      identity.textContent = `Instance: ${connection.id}`;
+      const secondary = document.createElement("div");
+      secondary.className = "system-inline-row";
+      secondary.append(shareButton);
+      if (connection.egress_state === "operator_ready" || connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
+        const endApproval = document.createElement("button");
+        endApproval.className = "pc2-btn pc2-btn-secondary";
+        endApproval.type = "button";
+        endApproval.textContent = connection.egress_state === "operator_ready" ? "End hosted HTTPS" : "End hosted approval";
+        endApproval.addEventListener("click", async () => {
+          if (!hasShellAccess()) return;
+          endApproval.disabled = true;
+          try {
+            await fetchJson("/api/apps/system/approval-lens/revoke", {
+              method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+              body: JSON.stringify({ id: connection.id }),
+            });
+            await refreshStatus();
+            showState(connection.egress_state === "operator_ready" ? "Hosted HTTPS ended for this Home." : "Hosted approval ended. A later request needs Inbox review again.", "");
+          } catch (error) {
+            showState(publicSystemError(error, "Approval could not be ended."), "error");
+            endApproval.disabled = false;
+          }
+        });
+        secondary.append(endApproval);
+      }
+      secondary.append(disconnectButton);
+      more.append(summary, identity, secondary);
+      actions.append(useButton, replaceButton);
+      card.append(title, detail, actions, more);
+      instancesNode.append(card);
+    }
+    for (const staged of Array.isArray(status?.staged_connections) ? status.staged_connections : []) {
+      if (!staged || !/^model:hosted-[0-9a-f]{32}$/i.test(staged.id || "")) continue;
+      const card = document.createElement("div");
+      card.className = "ai-provider-instance";
+      const detail = document.createElement("p");
+      detail.className = "pc2-card-sublabel";
+      detail.textContent = `${staged.provider} · ${staged.has_saved_model ? "Staged key change" : "Key check needed"}`;
+      const resume = document.createElement("button");
+      resume.className = "pc2-btn pc2-btn-secondary";
+      resume.type = "button";
+      resume.textContent = "Continue setup";
+      resume.addEventListener("click", () => {
+        const saved = connections.find((entry) => entry.id === staged.id);
+        showForm(saved || { id: staged.id, provider: String(staged.provider).toLowerCase() });
+        showState("This Home kept the staged key. Check it again, approve the connection in Inbox if asked, then choose a model.", "");
+      });
+      const discard = document.createElement("button");
+      discard.className = "pc2-btn pc2-btn-secondary";
+      discard.type = "button";
+      discard.textContent = "Discard staged key";
+      discard.addEventListener("click", async () => {
+        if (!hasShellAccess()) return;
+        discard.disabled = true;
+        showState("Finishing any current key check, then removing the staged key.", "");
+        try {
+          await fetchJson("/api/apps/system/ai-provider/staged", {
+            method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: staged.id }),
+          });
+          await refreshStatus();
+          showState(staged.has_saved_model
+            ? "Staged key removed. The saved model key remains. Check Inbox before its next request."
+            : "Staged key removed.", "success");
+        } catch (error) {
+          showState(publicSystemError(error, "This Home could not discard the staged key."), "error");
+          discard.disabled = false;
+        }
+      });
+      card.append(detail, resume, discard);
+      instancesNode.append(card);
+    }
+  };
+  const lensModel = document.querySelector("#approval-lens-model");
+  const lensStatus = document.querySelector("#approval-lens-status");
+  const lensSelect = document.querySelector("#approval-lens-select");
+  const lensEdit = document.querySelector("#approval-lens-edit");
+  const lensDisconnect = document.querySelector("#approval-lens-disconnect");
+  const lensEnd = document.createElement("button");
+  lensEnd.className = "pc2-btn pc2-btn-secondary";
+  lensEnd.type = "button";
+  lensEnd.textContent = "End hosted approval";
+  lensEnd.hidden = true;
+  lensDisconnect.after(lensEnd);
+  const updateLensEnd = () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    lensEnd.hidden = !connection || (connection.egress_state !== "operator_ready" && connection.approval_state !== "approved" && !["pending", "approved"].includes(connection.egress_approval_state));
+    lensEnd.textContent = connection?.egress_state === "operator_ready" ? "End hosted HTTPS" : "End hosted approval";
+    lensEnd.disabled = !hasShellAccess();
+  };
+  const renderLens = (status) => {
+    const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
+    const current = decisions.find(c => c.id === status.approval_lens_offer_id);
+    lensModel.replaceChildren();
+    for (const connection of decisions) {
+      const option = document.createElement("option"); option.value = connection.id;
+      option.textContent = `${connection.name} · ${connection.processor_label} · ${connection.selected_model}`;
+      lensModel.append(option);
+    }
+    if (current) lensModel.value = current.id;
+    lensStatus.textContent = current && status.hosted_external_https === "paused"
+      ? `${current.name} selected · external HTTPS paused`
+      : current ? `Using ${current.name} · ${current.processor_label}`
+      : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
+      : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
+    lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
+    updateLensEnd();
+  };
+  lensModel.addEventListener("change", updateLensEnd);
+  lensEnd.addEventListener("click", async () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection || !hasShellAccess()) return;
+    lensEnd.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/approval-lens/revoke", {
+        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: connection.id }),
+      });
+      await refreshStatus();
+      showState(connection.egress_state === "operator_ready" ? "Hosted HTTPS ended for this Home." : "Hosted approval ended.", "");
+    } catch (error) {
+      showState(publicSystemError(error, "Approval could not be ended."), "error");
+      lensEnd.disabled = false;
+    }
+  });
+  lensEdit.addEventListener("click", () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection) return;
+    showForm(connection);
+    showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
+  });
+  lensDisconnect.addEventListener("click", async () => {
+    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
+    if (!connection || !hasShellAccess()) return;
+    lensDisconnect.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/ai-provider", {
+        method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: connection.id }),
+      });
+      hideForm();
+      await refreshStatus();
+      showState(`${readText(connection.name)} is disconnected.`, "");
+    } catch (error) {
+      showState(publicSystemError(error, "This Home could not disconnect that evaluator."), "error");
+      lensDisconnect.disabled = false;
+    }
+  });
+  lensSelect.addEventListener("click", async () => {
+    lensSelect.disabled = true;
+    try {
+      await fetchJson("/api/apps/system/approval-lens", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
+      await refreshStatus();
+    } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
+    finally { lensSelect.disabled = false; }
+  });
+  const refreshStatus = async () => {
+    latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
+    document.querySelector("#ai-provider-egress-note").textContent = latestStatus.hosted_external_https === "operator_ready"
+      ? "Owner-authorized HTTPS is active for configured hosted models. This Home stores keys and pays for requests. End hosted HTTPS here at any time."
+      : latestStatus.hosted_external_https === "consent_required"
+        ? "This Home keeps provider keys. Approve each hosted connection in Inbox before its key check or model request."
+        : "External HTTPS is paused. Saved keys, models, and past results stay here.";
+    renderInstances(latestStatus);
+    renderLens(latestStatus);
+    updateValidationEnd();
+    return latestStatus;
+  };
+  validationEndButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    try {
+      await fetchJson("/api/apps/system/approval-lens/revoke", {
+        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ id: `validation:${selectedProvider()}` }),
+      });
+      await refreshStatus();
+      showState("Hosted HTTPS ended for this Home.", "");
+    } catch (error) {
+      showState(publicSystemError(error, "Key-check access could not be ended."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+  addButton.addEventListener("click", () => {
+    showForm(null);
+    showState("Choose a host, enter its key, then check and choose a model. The name is optional.", "");
+  });
+  cancelButton.addEventListener("click", () => {
+    hideForm();
+    addButton.focus();
+    showState("", "");
+  });
+  providerSelect.addEventListener("change", applyProviderChrome);
+  modelSelect.addEventListener("change", () => {
+    const selectedOption = modelSelect.selectedOptions[0];
+    showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
+  });
+  validateButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    showState("", "");
+    try {
+      // Validation and Save use the same Runtime connection identity.
+      if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
+      const result = await fetchJson("/api/apps/system/ai-provider/validate", {
+        method: "POST",
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value, id: editingId }),
+      });
+      fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
+      showState("This key is valid.", "success");
+    } catch (error) {
+      showState(hostedProviderValidationError(error), "error");
+    } finally {
+      await refreshStatus().catch(() => {});
+      setBusy(false);
+    }
+  });
+  saveButton.addEventListener("click", async () => {
+    if (!hasShellAccess()) return;
+    setBusy(true);
+    showState("", "");
+    try {
+      // Keep this instance identity when activation fails after persistence.
+      // Retrying Save updates the same connection instead of creating another.
+      if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
+      const body = {
+        id: editingId,
+        provider: selectedProvider(),
+        name: nameInput.value,
+        api_key: keyInput.value,
+        model: modelSelect.value,
+      };
+      latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+        method: "POST",
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      hideForm();
+      await refreshStatus();
+      showState("This hosted model is saved on this Home.", "success");
+    } catch (error) {
+      await refreshStatus().catch(() => {});
+      const activationPending = /selection_unavailable|model activation pending|model retirement pending/.test(String(error.message || error));
+      const consentPending = String(error.message || error).includes("Approve this hosted connection in Inbox");
+      showState(activationPending
+        ? "This model is saved. Activation is waiting for current model work to finish. Select Save to try again."
+        : consentPending ? "The key is stored on this Home. Approve this connection in Inbox, then select Save again."
+        : publicSystemError(error, "This Home could not save that hosted model."), "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+  hideForm();
+  setBusy(false);
+  if (hasShellAccess()) {
+    addButton.disabled = true;
+    refreshStatus().then(() => setBusy(false)).catch((error) => {
+      if (/^request failed: 403 admin passkey required$/i.test(String(error.message || error))) {
+        keyInput.value = "";
+        formNode.hidden = true;
+        addButton.hidden = true;
+        document.querySelector("#approval-lens").hidden = true;
+        showState("Hosted model setup is not available for this account yet.", "error");
+        return;
+      }
+      showState(publicSystemError(error, "Hosted model status is unavailable."), "error");
+    });
   }
 }
 
@@ -1216,7 +1684,7 @@ function pulseDeviceDidCopyButton() {
   }, 1200);
 }
 
-function openCapsuleTarget(target) {
+function openCapsuleTarget(target, query = {}) {
   const id = readText(target);
   if (!id || !homeParentOrigin || !window.top || window.top === window) {
     return;
@@ -1224,6 +1692,7 @@ function openCapsuleTarget(target) {
   window.top.postMessage({
     type: "home:open-target",
     target: id,
+    query,
     homeToken: apiHomeToken,
   }, homeParentOrigin);
 }
@@ -3323,6 +3792,33 @@ function publicSystemError(value, fallback) {
     return fallback;
   }
   return message;
+}
+
+function hostedProviderValidationError(value) {
+  const message = readText(value && value.message ? value.message : value);
+  if (message.includes("Approve this hosted connection in Inbox")) {
+    return "The key is stored on this Home. Approve this connection in Inbox, then select Check key and load models again.";
+  }
+  for (const detail of [
+    "The hosted connection request was denied. Try again after the decision window.",
+    "Hosted access was denied or ended. Review Inbox.",
+    "Hosted HTTPS was ended on this Home. Start a new connection check in Inbox.",
+    "Runtime blocked this hosted route. Review the connection configuration.",
+    "Hosted HTTPS could not reach the host. Check the network and try again.",
+    "This Home could not check the hosted connection. Try again.",
+  ]) {
+    if (message.includes(detail)) return detail;
+  }
+  if (message.includes("Hosted external HTTPS is paused until Runtime network authority is available.")) {
+    return "External HTTPS is paused on this Home. The key has not been checked.";
+  }
+  if (/invalid (OpenRouter|Venice) key/i.test(message)) {
+    return "The provider could not validate this key.";
+  }
+  if (/^request failed: 403 admin passkey required$/i.test(message)) {
+    return "Sign in as the Home admin to check provider keys.";
+  }
+  return publicSystemError(value, "This Home could not check the key. Try again.");
 }
 
 function showError(error) {

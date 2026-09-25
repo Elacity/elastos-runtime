@@ -45,7 +45,7 @@ protected-content path.
 
 Before a separately approved merge to `main`:
 
-1. Account for the included work and the explicitly deferred scope in `TASKS.md`.
+1. Account for the included work in `TASKS.md` and the explicitly deferred scope in `docs/DEFERRED_WORK.md`.
 2. Pass all CI jobs on the exact candidate, including both Linux architectures,
    macOS source-home and the release build.
 3. Preserve reviewed ancestry and authorship. Integrate dependent work into its
@@ -99,7 +99,7 @@ Review the candidate in authority-owned slices:
 7. Model/Assistant contracts and configured-offer behavior.
 8. Release metadata, manifests, checksums, documentation, and installer truth.
 
-Use `TASKS.md` and `state.md` to identify the included and deferred scope for
+Use `TASKS.md`, `docs/DEFERRED_WORK.md` and `state.md` to identify the included and deferred scope for
 the candidate under review.
 
 ## Installed acceptance

@@ -24,6 +24,7 @@ const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+const CAT_TO_PATH_CHUNK: usize = 64 * 1024;
 const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BOUNDED_READ_KUBO_TIMEOUT: &str = "100ms";
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
@@ -339,6 +340,24 @@ impl IpfsProvider {
         }
     }
 
+    fn kubo_cat_to_path(
+        &mut self,
+        arg: &str,
+        dest: &Path,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        let url = format!("{}/api/v0/cat?arg={}&offline=true", self.api_url(), arg);
+        match ureq::post(&url).timeout(timeout).call() {
+            Ok(resp) if resp.status() == 200 => {
+                let written = copy_reader_to_path(resp.into_reader(), dest)?;
+                update_coord_last_used(&self.data_dir);
+                Ok(written)
+            }
+            Ok(resp) => Err(format!("kubo cat -> HTTP {} for {}", resp.status(), arg)),
+            Err(e) => Err(format!("kubo cat -> {} for {}", e, arg)),
+        }
+    }
+
     fn kubo_prefetch_cid(&mut self, cid: &str) -> Result<(), String> {
         let url = format!("{}/api/v0/pin/add?arg={}", self.api_url(), cid);
         match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
@@ -379,6 +398,16 @@ impl IpfsProvider {
         }
     }
 
+    fn fetch_to_path(&mut self, arg: &str, dest: &Path) -> Result<u64, String> {
+        // Dest copies borrow a local repo hit, then Content fails over to
+        // Carrier. Pin/add and gateway fallback search the public swarm.
+        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+            self.kubo_cat_to_path(arg, dest, LARGE_HTTP_TIMEOUT)
+        } else {
+            Err("local dest cat backend is not ready".into())
+        }
+    }
+
     fn handle(&mut self, req: Request) -> Response {
         match req {
             Request::RuntimePrepareBackend {} => {
@@ -389,6 +418,13 @@ impl IpfsProvider {
                     Ok(()) => {
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
                         {
+                            if let Err(error) =
+                                directory_hash::seal_backend_repository(&self.repo_dir)
+                            {
+                                eprintln!("ipfs-provider: private repository seal failed: {error}");
+                                self.state = KuboState::Error;
+                                return private_preparation_error();
+                            }
                             match directory_hash::verify_backend(self) {
                                 Ok(()) => Response::ok_empty(),
                                 Err(error) => {
@@ -1022,16 +1058,8 @@ impl IpfsProvider {
             _ => cid.to_string(),
         };
 
-        match self.fetch_bytes(&arg) {
-            Ok(bytes) => {
-                if let Some(parent) = dest_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                match fs::write(dest_path, &bytes) {
-                    Ok(()) => Response::ok_empty(),
-                    Err(e) => Response::error("write_failed", &e.to_string()),
-                }
-            }
+        match self.fetch_to_path(&arg, dest_path) {
+            Ok(_) => Response::ok_empty(),
             Err(e) => Response::error("cat_failed", &e),
         }
     }
@@ -1345,6 +1373,34 @@ impl IpfsProvider {
 
     // ── Internal: local IPFS gateway only ──────────────────────────
 
+    fn fetch_from_local_gateway_to_path(
+        &self,
+        arg: &str,
+        dest: &Path,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        if self.gateway_port == 0 {
+            return Err(format!(
+                "local Elastos IPFS gateway unavailable for {}. No HTTP fallback is allowed.",
+                arg
+            ));
+        }
+
+        let url = format!("http://127.0.0.1:{}/ipfs/{}", self.gateway_port, arg);
+        match ureq::get(&url).timeout(timeout).call() {
+            Ok(resp) if resp.status() == 200 => copy_reader_to_path(resp.into_reader(), dest),
+            Ok(resp) => Err(format!(
+                "local Elastos IPFS gateway -> HTTP {} for {}. No HTTP fallback is allowed.",
+                resp.status(),
+                arg
+            )),
+            Err(e) => Err(format!(
+                "local Elastos IPFS gateway -> {} for {}. No HTTP fallback is allowed.",
+                e, arg
+            )),
+        }
+    }
+
     fn fetch_from_local_gateway_with_timeout(
         &self,
         arg: &str,
@@ -1443,23 +1499,54 @@ impl IpfsProvider {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("ELASTOS_DATA_DIR") {
-        PathBuf::from(dir)
-    } else if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("elastos")
-    } else if let Some(home) = std::env::var_os("HOME") {
+struct DataDirChoice<'a> {
+    explicit: Option<&'a str>,
+    parent_content_repo: Option<&'a Path>,
+    xdg_data_home: Option<&'a str>,
+    home: Option<&'a Path>,
+}
+
+fn select_data_dir(choice: DataDirChoice<'_>) -> PathBuf {
+    if let Some(dir) = choice.explicit.map(str::trim).filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(parent) = choice.parent_content_repo {
+        if parent.is_absolute() && parent.join("ipfs-repo").join("config").is_file() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(dir) = choice
+        .xdg_data_home
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    {
+        return PathBuf::from(dir).join("elastos");
+    }
+    if let Some(home) = choice.home {
         #[cfg(target_os = "macos")]
         {
-            PathBuf::from(home).join("Library/Application Support/elastos")
+            return home.join("Library/Application Support/elastos");
         }
         #[cfg(not(target_os = "macos"))]
         {
-            PathBuf::from(home).join(".local/share/elastos")
+            return home.join(".local/share/elastos");
         }
-    } else {
-        PathBuf::from("/tmp/elastos")
     }
+    PathBuf::from("/tmp/elastos")
+}
+
+fn data_dir() -> PathBuf {
+    let explicit = std::env::var("ELASTOS_DATA_DIR").ok();
+    let parent = std::env::var("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR").ok();
+    let parent_path = parent.as_deref().map(Path::new);
+    let xdg = std::env::var("XDG_DATA_HOME").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    select_data_dir(DataDirChoice {
+        explicit: explicit.as_deref(),
+        parent_content_repo: parent_path,
+        xdg_data_home: xdg.as_deref(),
+        home: home.as_deref(),
+    })
 }
 
 fn now_unix_secs() -> u64 {
@@ -1587,6 +1674,46 @@ fn try_flock_exclusive(_file: &fs::File) -> bool {
 }
 
 // ── Path safety ─────────────────────────────────────────────────────
+
+fn copy_reader_to_path(mut reader: impl Read, dest: &Path) -> Result<u64, String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create dest parent -> {e}"))?;
+    }
+    let mut tmp_name = dest.as_os_str().to_os_string();
+    tmp_name.push(".part");
+    let tmp = PathBuf::from(tmp_name);
+    let copied = (|| {
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("create dest -> {e}"))?;
+        let mut buf = vec![0u8; CAT_TO_PATH_CHUNK];
+        let mut written = 0u64;
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("read cat body -> {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("write dest -> {e}"))?;
+            written += n as u64;
+        }
+        file.sync_all().map_err(|e| format!("sync dest -> {e}"))?;
+        Ok(written)
+    })();
+    match copied {
+        Ok(written) => {
+            fs::rename(&tmp, dest).map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                format!("commit dest -> {e}")
+            })?;
+            Ok(written)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
 
 fn validate_dest_path(data_dir: &Path, dest: &Path) -> Result<(), String> {
     if !dest.is_absolute() {
@@ -2774,6 +2901,105 @@ mod tests {
         let data_dir = data_dir();
         let result = validate_dest_path(&data_dir, Path::new("relative/path"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dest_cat_to_path_uses_offline_local_cat_without_prefetch() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("weights.gguf");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend = std::thread::spawn(move || {
+            let mut socket = accept_bounded_fixture(&listener);
+            let headers = read_bounded_fixture_headers(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nGGUF")
+                .unwrap();
+            drop(socket);
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "dest cat must not pin, prefetch or retry"
+            );
+            headers
+        });
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let response = provider.handle(
+            parse_request(
+                &serde_json::json!({
+                    "op": "cat_to_path",
+                    "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                    "path": "weights.gguf",
+                    "dest": dest.to_string_lossy(),
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        let headers = backend.join().unwrap();
+        assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+        assert!(headers.starts_with("POST /api/v0/cat?"));
+        assert!(headers.contains("offline=true"));
+        assert!(!headers.contains("/api/v0/pin/add"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"GGUF");
+    }
+
+    #[test]
+    fn copy_reader_to_path_writes_chunked_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("out.bin");
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        let written = copy_reader_to_path(std::io::Cursor::new(data.clone()), &dest).unwrap();
+        assert_eq!(written, data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert!(!dest.with_extension("bin.part").exists());
+    }
+
+    #[test]
+    fn managed_home_content_attaches_to_existing_parent_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("gateway");
+        let child = root.path().join("child-xdg");
+        std::fs::create_dir_all(parent.join("ipfs-repo")).unwrap();
+        std::fs::write(parent.join("ipfs-repo").join("config"), b"{}\n").unwrap();
+        let selected = select_data_dir(DataDirChoice {
+            explicit: None,
+            parent_content_repo: Some(&parent),
+            xdg_data_home: Some(child.to_str().unwrap()),
+            home: Some(root.path()),
+        });
+        assert_eq!(selected, parent);
+    }
+
+    #[test]
+    fn explicit_data_dir_overrides_parent_content_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("gateway");
+        let explicit = root.path().join("explicit");
+        std::fs::create_dir_all(parent.join("ipfs-repo")).unwrap();
+        std::fs::write(parent.join("ipfs-repo").join("config"), b"{}\n").unwrap();
+        let selected = select_data_dir(DataDirChoice {
+            explicit: Some(explicit.to_str().unwrap()),
+            parent_content_repo: Some(&parent),
+            xdg_data_home: Some(root.path().join("xdg").to_str().unwrap()),
+            home: Some(root.path()),
+        });
+        assert_eq!(selected, explicit);
+    }
+
+    #[test]
+    fn absent_parent_repo_keeps_the_child_data_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("gateway");
+        let child = root.path().join("child-xdg");
+        std::fs::create_dir_all(&parent).unwrap();
+        let selected = select_data_dir(DataDirChoice {
+            explicit: None,
+            parent_content_repo: Some(&parent),
+            xdg_data_home: Some(child.to_str().unwrap()),
+            home: Some(root.path()),
+        });
+        assert_eq!(selected, child.join("elastos"));
     }
 
     #[test]

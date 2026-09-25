@@ -171,7 +171,7 @@ async function requestSystemWindow(entry, action, query = {}) {
     loaded = true;
   };
   frame.addEventListener("load", record.onLoad);
-  // Startup is bounded. The person's passkey decision has no Home transport timer.
+  // Startup is bounded. The person's sign-in decision has no Home transport timer.
   record.timer = window.setTimeout(() => finishSystemWindowRequest(record, false), 15000);
   probeSystemWindow(record);
   return record.promise;
@@ -1319,6 +1319,13 @@ function postMarketplaceNavigate(entry, query) {
   }, "*");
 }
 
+function postServicesNavigate(entry, query) {
+  const frame = entry.node.querySelector(".window-frame");
+  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
+  if (!homeToken || !frame?.contentWindow) return;
+  frame.contentWindow.postMessage({ type: "elastos.services.navigate/v1", homeToken, query }, "*");
+}
+
 function browserLaunchAuthority(route) {
   try {
     const url = new URL(route, window.location.href);
@@ -1741,6 +1748,9 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   }
   if (targetId === "marketplace" && Object.keys(options.query || {}).length > 0) {
     postMarketplaceNavigate(entry, options.query);
+  }
+  if (targetId === "services" && Object.keys(options.query || {}).length > 0) {
+    postServicesNavigate(entry, options.query);
   }
   if ((targetId === "inbox" || targetId === "wallet") && Object.keys(options.query || {}).length > 0) {
     const ok = await requestSelectionWindow(entry, options.query);

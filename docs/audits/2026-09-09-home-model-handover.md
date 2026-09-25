@@ -51,7 +51,7 @@ The clean-source Runtime-only release build passed with Rust 1.91.0,
 `RUSTFLAGS='-D warnings'`, `CARGO_BUILD_JOBS=1` and
 `cargo build --release --locked -p elastos-server --bin elastos` from
 `$SOURCE_ROOT/elastos`, using `$SHARED_CARGO_TARGET`. The exact artifact hash and
-size are in the [build checkpoint](../../state.md#diagnostic-build-and-handover-checkpoint).
+size are in the [dated build record](../../state.md#execution-evidence-history--2026-09-10).
 This docs-only commit follows that build. Preserve its actual source provenance;
 verify unchanged relevant build inputs/configuration and the artifact hash before
 reuse rather than rebuilding for documentation alone.
@@ -73,9 +73,9 @@ cold peer delivery and remote authority remain open in the canonical plan.
 
 ## Remaining ownership and scope
 
-Use the nine ordered steps in
-[Builder-only execution](../../TASKS.md#builder-only-execution) as the single queue.
-The plan records the dependencies and exact proof needed for each step. Model and distribution
+At this handover, the plan had nine ordered steps. The current
+[TASKS Now](../../TASKS.md#now) is the single execution queue and gives the
+next proof for each open action. Model and distribution
 contracts remain in [Model Provider](../MODEL_PROVIDER.md) and
 [Content capsule distribution](../CONTENT_CAPSULE_DISTRIBUTION.md).
 

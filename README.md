@@ -8,26 +8,25 @@ For released versions, supported installation targets and known limitations,
 see [state.md](state.md). A source checkout and a published installation have
 separate artifact identities and verification records.
 
-## Install the Linux preview
+## Install from the publisher
+
+The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-elastos setup
-elastos
 ```
 
-Running `elastos` opens Home. The default setup installs Home and its core Apps.
-You do not need a separate `elastos serve` process for this path.
-Home is the user-facing front door to the managed Runtime.
+The installer installs Runtime, sets up the Home profile, and opens Home. Keep
+the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
+later run `elastos` from a new shell. You do not need a separate `elastos serve`
+process for this path. Home is the user-facing front door to the managed
+Runtime.
 
 Only one live host may own an ElastOS data home at a time. Stop Home before
 using the separate operator runtime in the same home. See [Installing
 ElastOS](docs/INSTALL.md) for profiles, updates, trust verification, and
-operator setup.
-
-macOS currently uses source-home staging rather than the public installer. See
-the [Mac staging runbook](docs/MAC.md).
+operator setup. See the [Mac staging runbook](docs/MAC.md) for source-home
+staging and Browser VM work.
 
 ## Build from source
 

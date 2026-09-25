@@ -81,6 +81,15 @@
           "audit": "summary",
           "resource": "elastos://capsules/*",
           "operation": "retention"
+        },
+        {
+          "id": "content.reclaim",
+          "description": "Remove a model from this device",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "reclaim"
         }
       ]
     }

@@ -36,8 +36,10 @@ change before the receiver pins one.
 Local Use also needs the platform llama.cpp engine. The Runtime derives
 dispatch readiness from the current signed entry, the admission, the verified
 `llama-server` engine receipt and one matching offer from the local model
-provider, and its local model startup profile is accepted on `darwin-arm64`
-only. A receiver on another host admits the package and stays not ready.
+provider. Current source has startup profiles for `darwin-arm64` and
+`linux-amd64`; the latter uses a bounded CPU path. Linux readiness still needs
+a compatible installed engine receipt and target proof. Other hosts stay not
+ready until they have a verified profile.
 
 The helper streams every transfer in 1 MiB chunks and hashes as it goes, so a
 6 GB package stays on disk and travels as raw bytes end to end.

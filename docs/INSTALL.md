@@ -2,20 +2,22 @@
 
 ## Install from the publisher
 
-The public endpoint currently serves the older 0.1.2 Linux preview. Its
-installer prints separate setup commands. The 0.7.1 installer in this checkout
-combines installation, Home setup, and launch into one command:
+The installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. The signed release determines which binaries exist for a given platform.
+
+This checkout's installer combines installation, Home setup, and launch into one
+command:
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
 That complete flow becomes available at this URL when the candidate installer
-and signed release are published. macOS Apple silicon downloads are still in
-preparation; developers can use the [Mac source guide](MAC.md).
+and signed release are published. Developers can use the [Mac source
+guide](MAC.md) for source-home staging and Browser VM work.
 
-The candidate installer detects the platform, verifies the signed release,
-installs Runtime, and fetches the Home profile from the trusted publisher. It
+The candidate installer detects the platform (Linux `x86_64`/`aarch64` or
+macOS Apple silicon), verifies the signed release, installs Runtime, and
+fetches the Home profile from the trusted publisher. It
 starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
 terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
 setup completes and prints the full command for opening Home later. The installer

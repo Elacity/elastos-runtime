@@ -17,6 +17,7 @@ import {
   desktopObjects,
   postToHome,
   openModelsFromAgent,
+  openAiProviderSettingsFromAgent,
 } from "./harness-host.js";
 import {
   agentStageId,
@@ -77,7 +78,7 @@ import {
 import {
   getLiveInferenceState,
   probeLiveInference,
-  selectLiveOffer,
+  selectLiveOfferForUse,
   selectedLiveOffer,
   liveContentChoice,
   liveContentModels,
@@ -234,7 +235,6 @@ bindAgentConfigure(
         /* optional during early boot */
       }
     },
-    buildInstalledModelRows: (hostEl, emptyText) => buildInstalledModelRows(hostEl, emptyText),
     syncModelTrigger: () => syncModelTrigger(),
   },
 );
@@ -605,25 +605,22 @@ function stopParticles() {
   }
 }
 
-/** Keeps the composer model trigger + Think toggle honest to state. */
+/** Keeps the composer model trigger honest to the selected instance name. */
 function syncTruthStrip() {
   syncModelTrigger();
   const thinkToggle = document.querySelector("[data-truth-thinking-toggle]");
   if (thinkToggle) {
-    thinkToggle.setAttribute("aria-pressed", reasoningVisible ? "true" : "false");
-    thinkToggle.setAttribute(
-      "aria-label",
-      reasoningVisible ? "Hide model thinking" : "Show model thinking",
-    );
-    thinkToggle.title = reasoningVisible
-      ? "Hide model thinking blocks"
-      : "Show model thinking blocks";
+    if (thinkToggle.type === "checkbox") {
+      thinkToggle.checked = reasoningVisible;
+    } else {
+      thinkToggle.setAttribute("aria-pressed", reasoningVisible ? "true" : "false");
+    }
   }
   document.documentElement.dataset.agentReasoning = reasoningVisible ? "on" : "off";
 }
 
-function toggleReasoningVisible() {
-  reasoningVisible = setReasoningVisible(!reasoningVisible);
+function applyReasoningVisible(visible) {
+  reasoningVisible = setReasoningVisible(visible);
   syncTruthStrip();
   for (const block of document.querySelectorAll(".agent-thinking")) {
     if (!reasoningVisible) {
@@ -633,6 +630,10 @@ function toggleReasoningVisible() {
       block.hidden = false;
     }
   }
+}
+
+function toggleReasoningVisible() {
+  applyReasoningVisible(!reasoningVisible);
 }
 
 function clearFloatingMenuStyle(menu) {
@@ -691,10 +692,14 @@ function modelMenuOpen() {
 
 /** Menu can be summoned from the composer trigger or the sidebar Models row. */
 let modelMenuAnchor = null;
+let modelSelectionPending = false;
+let modelSelectionMessage = "";
 
 function closeModelMenu() {
   const menu = modelMenuEl();
   const btn = modelBtnEl();
+  const returnFocus = menu?.contains(document.activeElement);
+  const anchor = modelMenuAnchor || btn;
   if (menu) {
     menu.hidden = true;
     clearFloatingMenuStyle(menu);
@@ -703,6 +708,7 @@ function closeModelMenu() {
     btn.setAttribute("aria-expanded", "false");
   }
   modelMenuAnchor = null;
+  if (returnFocus) anchor?.focus({ preventScroll: true });
 }
 
 function syncModelTrigger() {
@@ -714,55 +720,101 @@ function syncModelTrigger() {
   const name = btn.querySelector(".agent-model-name");
   const tier = btn.querySelector(".agent-model-tier");
   const liveInference = getLiveInferenceState();
-  const offer = liveInference.live ? selectedLiveOffer() : null;
+  const offer = selectedLiveOffer();
+  const content = liveContentModels().find(model => model.offerId === offer?.offerId);
+  const label = content?.title || offer?.label || liveInference.model || "No model";
   if (name) {
-    name.textContent = offer?.label || liveInference.model || "No model";
+    name.textContent = label;
   }
   if (tier) {
     tier.textContent = "";
     tier.hidden = true;
   }
-  btn.title = offer
-    ? `${offer.label} — model offer on this Home`
-    : "Chosen model unavailable. Open Models to prepare a model, or choose another offer.";
+  btn.setAttribute("aria-label", offer ? `Model: ${label}` : "Choose a model");
+  btn.title = offer ? label : "Choose a model";
+}
+
+function optionIdForOffer(host, offerId) {
+  const scope = host?.closest?.("#agent-model-menu") ? "menu" : "page";
+  return `agent-model-option-${scope}-${String(offerId || "").replace(/[^a-zA-Z0-9:_-]/g, "_")}`;
+}
+
+function fillOptionFacts(host, facts, expanded) {
+  host.replaceChildren();
+  host.hidden = !expanded;
+  if (!expanded || !facts?.detailRows?.length) {
+    return;
+  }
+  for (const row of facts.detailRows) {
+    const dt = document.createElement("dt");
+    dt.textContent = row.term;
+    const dd = document.createElement("dd");
+    dd.textContent = row.value;
+    host.append(dt, dd);
+  }
 }
 
 function buildInstalledModelRows(host, emptyText) {
   host.replaceChildren();
+  if (modelSelectionPending || modelSelectionMessage) {
+    const status = document.createElement("p");
+    status.className = "agent-model-menu-empty";
+    status.setAttribute("role", modelSelectionMessage ? "alert" : "status");
+    status.textContent = modelSelectionMessage || "Keeping this model on this device…";
+    host.append(status);
+  }
   /* Rows are the advertised model offers — nothing else is inference. */
   const liveInference = getLiveInferenceState();
-  if (!liveInference.checking) {
-    const activeOffer = selectedLiveOffer();
-    for (const model of liveInference.models) {
-      if (liveContentModels().some(content => content.offerId === model.offerId)) continue;
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "agent-model-option is-live";
-      row.setAttribute("role", "option");
-      const on = activeOffer?.offerId === model.offerId && liveContentChoice() == null;
-      row.setAttribute("aria-selected", on ? "true" : "false");
-      row.classList.toggle("is-active", on);
-      row.dataset.liveOfferId = model.offerId;
-      row.innerHTML =
-        `<span class="agent-model-option-copy">` +
-        `<span class="agent-model-option-title"></span>` +
-        `<span class="agent-model-option-desc"></span>` +
-        `</span>` +
-        `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
-      row.querySelector(".agent-model-option-title").textContent = model.label;
-      row.querySelector(".agent-model-option-desc").textContent =
-        model.detail || "Live · on this Home via gateway";
-      host.append(row);
-    }
+  const activeOffer = selectedLiveOffer();
+  for (const model of liveInference.models) {
+    if (liveContentModels().some(content => content.offerId === model.offerId)) continue;
+    const row = document.createElement("button");
+    row.type = "button";
+    row.disabled = modelSelectionPending;
+    row.className = "agent-model-option";
+    row.id = optionIdForOffer(host, model.offerId);
+    row.setAttribute("role", "option");
+    const on = activeOffer?.offerId === model.offerId && liveContentChoice() == null;
+    row.setAttribute("aria-selected", on ? "true" : "false");
+    row.classList.toggle("is-active", on);
+    row.dataset.liveOfferId = model.offerId;
+    const route = model.selectionFacts?.routeSubtitle || model.detail || "";
+    row.setAttribute("aria-label", route ? `${model.label}, ${route}` : model.label);
+    row.innerHTML =
+      `<span class="agent-model-option-copy">` +
+      `<span class="agent-model-option-title"></span>` +
+      `<span class="agent-model-option-desc"></span>` +
+      `<dl class="agent-model-option-facts" hidden></dl>` +
+      `</span>` +
+      `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
+    row.querySelector(".agent-model-option-title").textContent = model.label;
+    const desc = row.querySelector(".agent-model-option-desc");
+    desc.textContent = route;
+    desc.hidden = !route;
+    fillOptionFacts(row.querySelector(".agent-model-option-facts"), model.selectionFacts, on);
+    host.append(row);
   }
   for (const model of liveContentModels()) {
     const row = document.createElement("button");
-    row.type = "button"; row.className = "agent-model-option";
-    row.dataset.liveOfferId = model.offerId; row.dataset.modelCid = model.cid;
-    row.textContent = model.title;
-    row.title = model.cid;
+    row.type = "button";
+    row.disabled = modelSelectionPending;
+    row.className = "agent-model-option";
+    row.id = optionIdForOffer(host, model.cid || model.offerId);
+    row.dataset.liveOfferId = model.offerId;
+    row.dataset.modelCid = model.cid;
     row.setAttribute("role", "option");
-    row.setAttribute("aria-selected", String((liveContentChoice() == null || liveContentChoice() === model.cid) && selectedLiveOffer()?.offerId === model.offerId));
+    const selected = (liveContentChoice() == null || liveContentChoice() === model.cid) && selectedLiveOffer()?.offerId === model.offerId;
+    row.setAttribute("aria-selected", String(selected));
+    row.classList.toggle("is-active", selected);
+    row.setAttribute("aria-label", `${model.title}, This Home · local`);
+    row.innerHTML =
+      `<span class="agent-model-option-copy">` +
+      `<span class="agent-model-option-title"></span>` +
+      `<span class="agent-model-option-desc"></span>` +
+      `</span>` +
+      `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
+    row.querySelector(".agent-model-option-title").textContent = model.title;
+    row.querySelector(".agent-model-option-desc").textContent = "This Home · local";
     host.append(row);
   }
   if (!host.children.length) {
@@ -771,7 +823,11 @@ function buildInstalledModelRows(host, emptyText) {
     empty.textContent = emptyText;
     host.append(empty);
   }
-  for (const [action, label] of [["refresh-models", "Refresh models"], ["open-models", "Open Models"]]) {
+  for (const [action, label] of [
+    ["refresh-models", "Refresh models"],
+    ["open-models", "Find models in Marketplace"],
+    ["open-ai-provider-settings", "Manage models"],
+  ]) {
     const button = document.createElement("button");
     button.type = "button"; button.className = "agent-model-option";
     button.dataset.modelAction = action; button.textContent = label;
@@ -789,8 +845,8 @@ function renderModelMenu() {
   if (modelMenuOpen()) {
     const anchor = modelMenuAnchor || modelBtnEl();
     positionFloatingMenu(modelMenuEl(), anchor, {
-      minWidth: 230,
-      maxWidth: 280,
+      minWidth: 280,
+      maxWidth: 360,
       preferRight: anchor === modelBtnEl(),
     });
   }
@@ -807,8 +863,14 @@ function openModelMenu(anchor = null) {
   btn?.setAttribute("aria-expanded", "true");
   modelMenuAnchor = at;
   menu.hidden = false;
-  positionFloatingMenu(menu, at, { minWidth: 230, maxWidth: 280, preferRight: at === btn });
-  menu.focus?.({ preventScroll: true });
+  positionFloatingMenu(menu, at, { minWidth: 280, maxWidth: 360, preferRight: at === btn });
+  const selected = menu.querySelector('[role="option"][aria-selected="true"]') || menu.querySelector('[role="option"]');
+  if (selected) {
+    menu.setAttribute("aria-activedescendant", selected.id);
+    selected.focus?.({ preventScroll: true });
+  } else {
+    menu.focus?.({ preventScroll: true });
+  }
 }
 
 function toggleModelMenu() {
@@ -1354,6 +1416,63 @@ export function bindAgentHarness() {
     },
     true
   );
+  document.addEventListener("change", (event) => {
+    const thinkToggle = event.target.closest?.("[data-truth-thinking-toggle]");
+    if (thinkToggle?.type === "checkbox") {
+      applyReasoningVisible(thinkToggle.checked);
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (!modelMenuOpen()) {
+      return;
+    }
+    const menu = modelMenuEl();
+    const options = [...(menu?.querySelectorAll('[role="option"]') || [])];
+    if (!options.length) {
+      return;
+    }
+    const current = options.findIndex(
+      (row) => row === document.activeElement || row.classList.contains("is-keyboard"),
+    );
+    const move = (index) => {
+      event.preventDefault();
+      const next = (index + options.length) % options.length;
+      options.forEach((row, i) => {
+        row.classList.toggle("is-keyboard", i === next);
+        const facts = row.querySelector(".agent-model-option-facts");
+        if (facts) {
+          facts.hidden = row.getAttribute("aria-selected") !== "true" && i !== next;
+        }
+      });
+      const row = options[next];
+      menu.setAttribute("aria-activedescendant", row.id);
+      row.focus({ preventScroll: true });
+    };
+    if (event.key === "ArrowDown") {
+      move(current < 0 ? 0 : current + 1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      move(current < 0 ? options.length - 1 : current - 1);
+      return;
+    }
+    if (event.key === "Home") {
+      move(0);
+      return;
+    }
+    if (event.key === "End") {
+      move(options.length - 1);
+      return;
+    }
+    if (
+      (event.key === "Enter" || event.key === " ") &&
+      current >= 0 &&
+      event.target === menu
+    ) {
+      event.preventDefault();
+      options[current].click();
+    }
+  });
 
   document.addEventListener("click", (event) => {
     if (
@@ -1503,6 +1622,9 @@ export function bindAgentHarness() {
     }
     const thinkToggle = event.target.closest?.("[data-truth-thinking-toggle]");
     if (thinkToggle) {
+      if (thinkToggle.matches?.("input")) {
+        return;
+      }
       event.preventDefault();
       toggleReasoningVisible();
       return;
@@ -1513,10 +1635,10 @@ export function bindAgentHarness() {
       toggleModelMenu();
       return;
     }
-    if (event.target.closest?.("[data-model-add]")) {
+    const chooseModel = event.target.closest?.("[data-model-picker-open]");
+    if (chooseModel) {
       event.preventDefault();
-      closeModelMenu();
-      openHarnessPage("configure", { section: "models" });
+      openModelMenu(chooseModel);
       return;
     }
     const sidebarNav = event.target.closest?.("[data-sidebar-nav]");
@@ -1605,6 +1727,7 @@ export function bindAgentHarness() {
     if (modelAction) {
       event.preventDefault();
       if (modelAction === "open-models") openModelsFromAgent();
+      else if (modelAction === "open-ai-provider-settings") openAiProviderSettingsFromAgent();
       else {
         const refresh = probeLiveInference({ force: true });
         syncTruthStrip(); renderModelMenu();
@@ -1615,11 +1738,22 @@ export function bindAgentHarness() {
     const liveOpt = event.target.closest?.(".agent-model-option[data-live-offer-id]");
     if (liveOpt?.dataset.liveOfferId) {
       event.preventDefault();
-      selectLiveOffer(liveOpt.dataset.liveOfferId, liveOpt.dataset.modelCid ?? null);
-      syncTruthStrip();
-      renderHarnessPage();
-      persistAgentWorkspaceSoon();
-      closeModelMenu();
+      if (modelSelectionPending) return;
+      modelSelectionPending = true; modelSelectionMessage = "";
+      const selection = selectLiveOfferForUse(liveOpt.dataset.liveOfferId, liveOpt.dataset.modelCid ?? null);
+      renderModelMenu();
+      void selection.then(changed => {
+        if (!changed) return;
+        syncTruthStrip();
+        renderHarnessPage();
+        persistAgentWorkspaceSoon();
+        closeModelMenu();
+      }).catch(() => {
+        modelSelectionMessage = "Could not keep this model on this device. Select it again to retry.";
+      }).finally(() => {
+        modelSelectionPending = false;
+        renderModelMenu();
+      });
       return;
     }
     if (

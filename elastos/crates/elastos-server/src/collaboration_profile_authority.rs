@@ -1171,7 +1171,18 @@ mod tests {
     fn write_device_key(data_dir: &Path, seed_byte: u8) -> String {
         let seed = [seed_byte; 32];
         std::fs::create_dir_all(data_dir.join("identity")).unwrap();
-        std::fs::write(data_dir.join("identity").join("device.key"), seed).unwrap();
+        let key_path = data_dir.join("identity").join("device.key");
+        std::fs::write(&key_path, seed).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                data_dir.join("identity"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let (_, did) = elastos_identity::derive_did(&seed);
         did
     }

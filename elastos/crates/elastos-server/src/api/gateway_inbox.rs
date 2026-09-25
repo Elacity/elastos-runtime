@@ -40,12 +40,47 @@ pub(super) async fn inbox_summary(
     {
         append_inspect_action_notifications(&mut notifications, inspect_requests);
     }
+    #[cfg(unix)]
+    let hosted_routes = {
+        notifications.entries.retain(|entry| {
+            !entry.action_ref.as_ref().is_some_and(|action| {
+                action
+                    .action_id
+                    .starts_with(crate::api::model_provider_egress_decision::APPROVE_PREFIX)
+            })
+        });
+        notifications.unread_count = notifications
+            .entries
+            .iter()
+            .filter(|entry| !entry.read)
+            .count();
+        notifications.attention_count = notifications
+            .entries
+            .iter()
+            .filter(|entry| entry.severity == "attention")
+            .count();
+        if ensure_admin_context(&state.data_dir, &context).is_ok() {
+            match crate::api::model_provider_egress_decision::inbox_history(&state.data_dir) {
+                Ok(routes) => {
+                    let pending = routes.iter().filter(|route| route.is_pending()).count();
+                    notifications.attention_count += pending;
+                    notifications.unread_count += pending;
+                    routes
+                }
+                Err(err) => return inbox_error_response(err),
+            }
+        } else {
+            Vec::new()
+        }
+    };
     Json(InboxSummaryResponse {
         app: HomeCapsuleIdentity {
             id: INBOX_CAPSULE_ID.to_string(),
             route: "/apps/inbox/".to_string(),
         },
         notifications,
+        #[cfg(unix)]
+        hosted_routes,
     })
     .into_response()
 }
@@ -364,6 +399,7 @@ async fn dispatch_inbox_action(
     }
     if let Some(request_id) = action_id.strip_prefix("service-approve-request:") {
         let discovery_service = state.collaboration_discovery_service.clone();
+        let provider_registry = state.provider_registry.clone();
         let data_dir = data_dir.clone();
         let context = context.clone();
         let request_id = request_id.to_string();
@@ -371,6 +407,7 @@ async fn dispatch_inbox_action(
             approve_home_service_access_request(
                 &data_dir,
                 &context,
+                provider_registry.as_deref(),
                 discovery_service.as_ref(),
                 &request_id,
             )
@@ -425,6 +462,65 @@ async fn dispatch_inbox_action(
             "Rejected Wallet market-price HTTP source through Inbox",
         )?;
         return Ok("Rejected Wallet market-price source.".to_string());
+    }
+    #[cfg(unix)]
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::api::model_provider_egress_decision::END_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        let proof = context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        crate::api::model_provider_egress_decision::end_decision(data_dir, request_id, proof)?;
+        let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
+        return Ok(
+            "Ended this hosted access. A later request needs a new Inbox decision.".to_string(),
+        );
+    }
+    #[cfg(unix)]
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::api::model_provider_egress_decision::APPROVE_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        let proof = context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok(
+            "Approved this hosted access. End it in Inbox when it is no longer needed.".to_string(),
+        );
+    }
+    #[cfg(unix)]
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::api::model_provider_egress_decision::DENY_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        let proof = context
+            .proof_binding_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        crate::api::model_provider_egress_decision::deny(data_dir, request_id, proof)?;
+        let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
+        return Ok("Denied this hosted access.".to_string());
+    }
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::jev_approval_lens::HOSTED_HTTP_APPROVE_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        crate::jev_approval_lens::record_human_decision(data_dir, request_id, "approve")?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok("Approved this hosted connection. Send again from Assistant.".to_string());
+    }
+    if let Some(request_id) =
+        action_id.strip_prefix(crate::jev_approval_lens::HOSTED_HTTP_DENY_PREFIX)
+    {
+        ensure_admin_context(data_dir, context)?;
+        crate::jev_approval_lens::record_human_decision(data_dir, request_id, "deny")?;
+        let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
+        return Ok("Denied this hosted connection.".to_string());
     }
     anyhow::bail!("unknown inbox action");
 }

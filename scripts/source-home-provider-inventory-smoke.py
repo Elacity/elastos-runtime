@@ -28,6 +28,13 @@ REQUIRED_PROVIDER_RUNTIMES = (
     "protected-content-protect-provider",
     "protected-content-decrypt-provider",
 )
+RETAINED_RELEASE_PROVIDERS = (
+    "operator-drive-adapter",
+    "drm-provider",
+    "rights-provider",
+    "key-provider",
+    "decrypt-provider",
+)
 
 
 def assert_provider_names_and_loops(setup_text: str) -> None:
@@ -245,6 +252,80 @@ def run_integrity_smoke(components: dict) -> None:
         )
 
 
+def run_retained_provider_stamp_smoke(setup_text: str, components: dict) -> None:
+    stamp = setup_text.split("stamp_source_home_components_manifest() {", 1)[1]
+    stamp = stamp.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        data_dir = root / "data"
+        bin_dir = data_dir / "bin"
+        bin_dir.mkdir(parents=True)
+        source = root / "source-components.json"
+        installed = data_dir / "components.json"
+        names = ("shell", "model-provider", "kubo", *RETAINED_RELEASE_PROVIDERS)
+        manifest = {
+            "schema": components["schema"],
+            "capsules": {},
+            "external": {name: json.loads(json.dumps(components["external"][name])) for name in names},
+        }
+        previous = json.loads(json.dumps(manifest))
+        for name in names:
+            payload = f"{name}-installed\n".encode()
+            (bin_dir / name).write_bytes(payload)
+            if name == "kubo":
+                continue  # Kubo's pin is for an archive, not its installed binary.
+            prior = previous["external"][name]["platforms"]["linux-amd64"]
+            prior.update(
+                checksum="sha256:" + hashlib.sha256(payload).hexdigest(),
+                size=len(payload),
+                cid=f"bafy-{name}-prior",
+            )
+            current = manifest["external"][name]["platforms"]["linux-amd64"]
+            current.update(checksum="", size=0, cid="")
+        source.write_text(json.dumps(manifest))
+        installed.write_text(json.dumps(previous))
+        env = {**os.environ,
+               "COMPONENTS_SRC": str(source), "COMPONENTS_DEST": str(installed),
+               "DATA_DIR": str(data_dir), "SETUP_PLATFORM": "linux-amd64",
+               "SOURCE_HOME_BINARY_NAMES_JSON": json.dumps(["model-provider"]),
+               "APP_CAPSULES_JSON": "[]", "SOURCE_HOME_KUBO_INSTALLED": "0"}
+
+        def stamp_once() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["python3", "-c", stamp], env=env, text=True, capture_output=True,
+                cwd=ROOT,
+            )
+
+        result = stamp_once()
+        if result.returncode:
+            raise AssertionError(f"source-home stamp failed: {result.stderr}")
+        stamped = json.loads(installed.read_text())
+        for name in RETAINED_RELEASE_PROVIDERS:
+            assert stamped["external"][name]["platforms"]["linux-amd64"] == previous["external"][name]["platforms"]["linux-amd64"]
+            assert name in stamped["profiles"]["source-home"]["components"]
+        assert stamped["external"]["kubo"] == manifest["external"]["kubo"]
+        assert "kubo" not in stamped["profiles"]["source-home"]["components"]
+        first = installed.read_bytes()
+        assert stamp_once().returncode == 0
+        assert installed.read_bytes() == first
+
+        (bin_dir / "drm-provider").write_bytes(b"changed provider bytes")
+        result = stamp_once()
+        assert result.returncode != 0 and "does not match its prior" in result.stderr
+        assert installed.read_bytes() == first
+
+        (bin_dir / "drm-provider").write_bytes(b"drm-provider-installed\n")
+        stripped = json.loads(installed.read_text())
+        stripped["external"]["drm-provider"]["platforms"]["linux-amd64"].update(
+            checksum="", size=0, cid="",
+        )
+        installed.write_text(json.dumps(stripped))
+        stripped_bytes = installed.read_bytes()
+        result = stamp_once()
+        assert result.returncode != 0 and "checksum is unavailable" in result.stderr
+        assert installed.read_bytes() == stripped_bytes
+
+
 def main() -> None:
     setup_text = SETUP.read_text(encoding="utf-8")
     components = json.loads(COMPONENTS.read_text(encoding="utf-8"))
@@ -253,6 +334,7 @@ def main() -> None:
     assert_release_support_inventory()
     assert_external_metadata(components)
     run_integrity_smoke(components)
+    run_retained_provider_stamp_smoke(setup_text, components)
 
     print(
         json.dumps(

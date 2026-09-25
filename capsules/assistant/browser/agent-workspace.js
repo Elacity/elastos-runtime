@@ -16,6 +16,7 @@ import {
   selectLiveOffer,
   liveOfferChoice,
   liveContentChoice,
+  clearBackendReports,
 } from "./agent-live.js";
 import { recoverStalePersistedTurn } from "./agent-stream-qos.js";
 import { scheduleAgentWorkspacePersist } from "./harness-host.js";
@@ -71,6 +72,7 @@ export function captureActiveSessionState() {
 /** Imported source selections remain available until the user chooses another. */
 export function restoreSessionState(session, { draft = session?.composerDraft } = {}) {
   if (!store) return;
+  clearBackendReports();
   const mode = session?.mode === "studio" ? "studio" : session?.mode === "build" ? "build" : "chat";
   if (mode === "studio" && typeof session?.studio?.studioDraft === "string") draft = { ...draft, text: session.studio.studioDraft, parts: draft?.parts ?? [] };
   if (mode !== "studio" && session?.chatComposerDraft) draft = session.chatComposerDraft;

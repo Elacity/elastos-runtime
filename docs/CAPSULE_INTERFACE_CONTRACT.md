@@ -157,8 +157,8 @@ The first manifest-declared affordance descriptors now cover all first-party
 app, viewer, shell, connector, content, and provider surfaces. The Home-facing
 set includes `home`, `home-gui`, `home-cli`, `browser`, `wallet`, `wallet-metamask`,
 `wallet-unisat`, `wallet-walletconnect`, `inbox`, `services`, `system`,
-`library`, `documents`, `archive-manager`, `chat-room`, `chat`,
-`agent`, `marketplace`, `gba-emulator`, and `gba-ucity`.
+`library`, `documents`, `archive-manager`, `chat-room`, `assistant`,
+`marketplace`, `gba-emulator`, and `gba-ucity`.
 
 These descriptors give shells a shared way to answer "what can this capsule ask
 for, and what risk/approval/audit shape does that imply?" The descriptors are

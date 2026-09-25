@@ -3901,6 +3901,12 @@ pub(crate) mod tests {
         assert_eq!(contacts_b.contacts().len(), 1);
         let conversation_id = contacts_a.contacts()[0].conversation_id().to_string();
         assert_eq!(conversation_id, contacts_b.contacts()[0].conversation_id());
+        node_a
+            .memory_lookup
+            .add_endpoint_info(node_b.endpoint.watch_addr().get());
+        node_b
+            .memory_lookup
+            .add_endpoint_info(node_a.endpoint.watch_addr().get());
         DurableProfilePeerPair {
             trusted,
             identity_a,

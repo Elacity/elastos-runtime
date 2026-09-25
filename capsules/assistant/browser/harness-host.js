@@ -240,7 +240,7 @@ export async function flushAgentWorkspace() {
 
 /* ---- messaging ------------------------------------------------------------- */
 
-export function openModelsFromAgent() {
+function postHomeOpenTarget(target, query) {
   const value = new URL(window.location.href).searchParams.get("home_origin");
   let origin;
   try {
@@ -249,10 +249,21 @@ export function openModelsFromAgent() {
     origin = parsed.origin;
   } catch { return false; }
   if (!homeToken || window.top === window) return false;
-  // The top Home registers this exact nested app source before accepting its intent.
   window.top.postMessage({ type: "home:app-ready", homeToken }, origin);
-  window.top.postMessage({ type: "home:open-target", target: "marketplace", query: { category: "models" }, homeToken }, origin);
+  window.top.postMessage({ type: "home:open-target", target, query, homeToken }, origin);
   return true;
+}
+
+export function openModelsFromAgent() {
+  return postHomeOpenTarget("marketplace", { category: "models" });
+}
+
+export function openAiProviderSettingsFromAgent() {
+  return postHomeOpenTarget("system", { settings: "models" });
+}
+
+export function openInboxFromAgent() {
+  return postHomeOpenTarget("inbox", {});
 }
 
 /* The Home GUI frame is opaque-sandboxed, so the only honest target is "*";

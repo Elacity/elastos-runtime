@@ -48,9 +48,9 @@ fn run_id_for_capsule(principal_id: &str, request_id: &str, capsule_id: &str) ->
 // Replies follow the provider contract (`capsules/model-provider/src/contract.rs`):
 // a `RunView` carries `status` and, once settled, a `terminal` outcome; a
 // `RunEventsPage` carries no status at all, only events with a `terminal` flag.
-fn run_view(run_id: &str, status: &str) -> Value {
+fn run_view(run_id: &str, status: &str, offer_id: &str) -> Value {
     let mut view = json!({
-        "schema": "elastos.model.run-view/v1", "run_id": run_id, "offer_id": "qwen-local",
+        "schema": "elastos.model.run-view/v1", "run_id": run_id, "offer_id": offer_id,
         "operation": "text.generate", "status": status, "sequence_cursor": 0 });
     if matches!(
         status,
@@ -88,7 +88,9 @@ fn events_page(run_id: &str, page: u32) -> Value {
 #[derive(Default)]
 struct FakeModelProvider {
     calls: TokioMutex<Vec<Value>>,
+    execution_revision: std::sync::Mutex<Option<String>>,
     run_owners: std::sync::Mutex<BTreeMap<String, String>>,
+    run_offers: std::sync::Mutex<BTreeMap<String, String>>,
     event_pages: std::sync::Mutex<BTreeMap<String, u32>>,
     run_status: std::sync::Mutex<BTreeMap<String, String>>,
     /// Injected once onto the next `runs_get` or `runs_events` reply.
@@ -97,6 +99,7 @@ struct FakeModelProvider {
     next_create_data: std::sync::Mutex<Option<Value>>,
     /// Extra top-level `run_id` that disagrees with `data.run_id`.
     next_create_alias_run_id: std::sync::Mutex<Option<String>>,
+    next_create_status_error: std::sync::Mutex<Option<Value>>,
 }
 
 #[async_trait::async_trait]
@@ -115,7 +118,14 @@ impl Provider for FakeModelProvider {
         let op = request["op"].as_str().unwrap_or_default();
         let typed_fields = match op {
             "offers_list" => vec!["op"],
-            "runs_create" => vec!["op", "offer_id", "operation", "input", "runtime_binding"],
+            "runs_create" => vec![
+                "op",
+                "offer_id",
+                "operation",
+                "input",
+                "runtime_binding",
+                "expected_execution_binding_hash",
+            ],
             "runs_events" => vec!["op", "run_id", "after_sequence", "runtime_binding"],
             _ => vec!["op", "run_id", "runtime_binding"],
         };
@@ -123,13 +133,33 @@ impl Provider for FakeModelProvider {
             return Ok(json!({ "status": "error", "message": "fields differ from the contract" }));
         }
         if op == "offers_list" {
+            let revision = self
+                .execution_revision
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("sha256:{}", "a".repeat(64)));
             return Ok(json!({ "status": "ok", "data": { "offers": [
                 { "id": "qwen-local", "title": "Qwen", "operation": "text.generate", "hosted": null },
-                { "id": "gpt-hosted", "title": "GPT", "operation": "text.generate",
-                  "hosted": { "placement": "hosted", "backend_provider_label": "OpenAI" } },
-            ] } }));
+                { "id": "model:openrouter", "title": "GPT", "operation": "text.generate",
+                  "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" } },
+            ], "offer_revisions": {"qwen-local": revision, "model:openrouter": revision} } }));
         }
         if op == "runs_create" {
+            let revision = self
+                .execution_revision
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("sha256:{}", "a".repeat(64)));
+            if request["expected_execution_binding_hash"].as_str() != Some(revision.as_str()) {
+                return Ok(
+                    json!({"status":"error", "code":"selection_unavailable", "message":"model offer revision changed"}),
+                );
+            }
+            if let Some(error) = self.next_create_status_error.lock().unwrap().take() {
+                return Ok(error);
+            }
             let binding: RuntimeCreateBinding =
                 serde_json::from_value(request["runtime_binding"].clone())
                     .map_err(provider_error)?;
@@ -151,7 +181,11 @@ impl Provider for FakeModelProvider {
                 .lock()
                 .unwrap()
                 .insert(run_id.clone(), "running".to_string());
-            let mut reply = run_view(&run_id, "running");
+            self.run_offers
+                .lock()
+                .unwrap()
+                .insert(run_id.clone(), offer_id.to_string());
+            let mut reply = run_view(&run_id, "running", offer_id);
             if let Some(overlay) = self.next_create_data.lock().unwrap().take() {
                 if let Some(data) = reply.get_mut("data").and_then(Value::as_object_mut) {
                     if let Some(object) = overlay.as_object() {
@@ -187,6 +221,13 @@ impl Provider for FakeModelProvider {
                 json!({ "status": "error", "code": "denied", "message": "run owner mismatch" }),
             );
         }
+        let offer_id = self
+            .run_offers
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .cloned()
+            .unwrap();
         Ok(match op {
             "runs_get" => {
                 let status = self
@@ -196,14 +237,14 @@ impl Provider for FakeModelProvider {
                     .get(&binding.run_id)
                     .cloned()
                     .unwrap_or_else(|| "running".to_string());
-                run_view(&binding.run_id, &status)
+                run_view(&binding.run_id, &status, &offer_id)
             }
             "runs_cancel" => {
                 self.run_status
                     .lock()
                     .unwrap()
                     .insert(binding.run_id.clone(), "cancelled".to_string());
-                run_view(&binding.run_id, "cancelled")
+                run_view(&binding.run_id, "cancelled", &offer_id)
             }
             _ => {
                 let mut pages = self.event_pages.lock().unwrap();
@@ -468,7 +509,25 @@ impl TwoRuntimes {
     }
 
     fn write_request_record(&self, status: &str) {
+        self.write_request_record_with_expiry(status, now_ts() + 3600);
+    }
+
+    fn write_request_record_with_expiry(&self, status: &str, expires_at: u64) {
+        self.write_request_record_with_expiry_and_offers(status, expires_at, &["qwen-local"]);
+    }
+
+    fn write_request_record_with_expiry_and_offers(
+        &self,
+        status: &str,
+        expires_at: u64,
+        approved_offer_ids: &[&str],
+    ) {
         let now = now_ts();
+        let approved_offer_revision = if approved_offer_ids.is_empty() {
+            String::new()
+        } else {
+            format!("sha256:{}", "a".repeat(64))
+        };
         write_home_principal_object_json_for_authority(
             self.owner.path(),
             &self.authority,
@@ -492,7 +551,9 @@ impl TwoRuntimes {
                     "updated_at": now,
                     "status": status,
                     "authenticated_request": true,
-                    "grant_expires_at": now + 3600,
+                    "grant_expires_at": expires_at,
+                    "approved_offer_ids": approved_offer_ids,
+                    "approved_offer_revision": approved_offer_revision,
                 } },
             }),
         );
@@ -629,10 +690,119 @@ async fn offers_list_over_carrier_shares_only_local_offers() {
     let offers = &listed["result"]["data"]["offers"];
     assert_eq!(offers.as_array().unwrap().len(), 1, "{listed}");
     assert_eq!(offers[0]["id"], "qwen-local");
-    assert!(!listed.to_string().contains("gpt-hosted"), "{listed}");
+    assert!(!listed.to_string().contains("model:openrouter"), "{listed}");
     let foreign = fx.call("offers_list", list("browser")).await;
     assert_eq!(foreign["ok"], false);
     assert_eq!(foreign["code"], "denied");
+    assert_eq!(fx.provider_ops().await, vec!["offers_list"]);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn older_generic_grant_and_newly_shared_hosted_offer_cannot_expand_access() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    // An older owner request has no approved-offer snapshot, even if local
+    // sharing is currently on. It cannot start new work.
+    fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[]);
+    let legacy = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "assistant")}),
+        )
+        .await;
+    assert_eq!(legacy["code"], "denied", "{legacy}");
+    let local = fx.create_run("legacy-local", "qwen-local").await;
+    assert_eq!(local["code"], "denied", "{local}");
+    assert!(fx.provider_ops().await.is_empty());
+
+    // A newer grant approved only the local offer. Sharing a hosted offer
+    // afterwards leaves the signed scope unchanged.
+    fx.write_request_record("approved");
+    let id = "model:openrouter";
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(id),
+        },
+    )
+    .await
+    .unwrap();
+    crate::api::model_provider_config::set_hosted_offer_share(
+        fx.owner.path(),
+        id,
+        true,
+        Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+    )
+    .unwrap();
+    let listed = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "assistant")}),
+        )
+        .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(
+        listed["result"]["data"]["offers"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(listed["result"]["data"]["offers"][0]["id"], "qwen-local");
+    let hosted = fx.create_run("newly-shared-hosted", id).await;
+    assert_eq!(hosted["code"], "offer_unavailable", "{hosted}");
+    assert_eq!(fx.create_count().await, 0);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn replacing_local_model_under_the_same_id_requires_a_new_grant() {
+    let fx = TwoRuntimes::start().await;
+    *fx.provider.execution_revision.lock().unwrap() = Some(format!("sha256:{}", "b".repeat(64)));
+    let listed = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "assistant")}),
+        )
+        .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert!(listed["result"]["data"]["offers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let refused = fx.create_run("changed-local-model", "qwen-local").await;
+    assert_eq!(refused["code"], "offer_unavailable", "{refused}");
+    assert!(fx.provider.run_owners.lock().unwrap().is_empty());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn marketplace_remote_discovery_requires_grant_and_has_no_run_authority() {
+    let fx = TwoRuntimes::start().await;
+    let listed = fx
+        .call(
+            "offers_list",
+            json!({"op":"offers_list", "remote_model":fx.remote(SEED_PRINCIPAL, "marketplace")}),
+        )
+        .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["result"]["data"]["offers"][0]["id"], "qwen-local");
+    let wrong = fx.call("offers_list", json!({"op":"offers_list", "remote_model":fx.remote("unapproved-principal", "marketplace")})).await;
+    assert_eq!(wrong["ok"], false, "{wrong}");
+    for operation in ["runs_create", "runs_get", "runs_events", "runs_cancel"] {
+        let denied = fx
+            .call(
+                operation,
+                json!({"op":operation, "remote_model":fx.remote(SEED_PRINCIPAL, "marketplace")}),
+            )
+            .await;
+        assert_eq!(denied["ok"], false, "{operation}: {denied}");
+    }
     assert_eq!(fx.provider_ops().await, vec!["offers_list"]);
     fx.shutdown().await;
 }
@@ -648,7 +818,14 @@ async fn runs_create_rebinds_the_request_to_the_remote_principal() {
     let native = fx.last_provider_call().await;
     assert_eq!(
         keys(&native),
-        BTreeSet::from(["input", "offer_id", "op", "operation", "runtime_binding"])
+        BTreeSet::from([
+            "expected_execution_binding_hash",
+            "input",
+            "offer_id",
+            "op",
+            "operation",
+            "runtime_binding"
+        ])
     );
     assert_eq!(
         native["runtime_binding"]["principal_id"],
@@ -666,7 +843,7 @@ async fn runs_create_rebinds_the_request_to_the_remote_principal() {
     assert_eq!(record["offer_id"], "qwen-local");
     assert!(record["terminal_at"].is_null(), "{record}");
 
-    let hosted = fx.create_run("seed-req-hosted", "gpt-hosted").await;
+    let hosted = fx.create_run("seed-req-hosted", "model:openrouter").await;
     assert_eq!(hosted["ok"], false, "{hosted}");
     assert_eq!(hosted["code"], "offer_unavailable");
     assert_eq!(
@@ -764,6 +941,86 @@ async fn revoke_before_dispatch_sends_no_create() {
             "seed-req-revoke-before"
         ))
         .is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_rejects_a_changed_execution_revision_after_owner_precheck() {
+    let fx = TwoRuntimes::start().await;
+    let barrier = install_create_race_barrier(fx.owner.path(), CreateRacePoint::BeforeDispatch);
+    let (created, _) = tokio::join!(
+        fx.create_run("seed-req-revision-race", "qwen-local"),
+        async {
+            barrier.wait_prepared().await;
+            *fx.provider.execution_revision.lock().unwrap() =
+                Some(format!("sha256:{}", "b".repeat(64)));
+            barrier.release();
+        }
+    );
+    assert_eq!(created["ok"], false, "{created}");
+    assert!(fx.provider.run_owners.lock().unwrap().is_empty());
+    assert!(fx
+        .run_record(&run_id_for(
+            &fx.remote_principal(),
+            "seed-req-revision-race"
+        ))
+        .is_null());
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_share_pause_waits_for_admitted_create_then_refuses_next_create() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Other shared offer",
+            instance_id: Some("model:openrouter"),
+        },
+    )
+    .await
+    .unwrap();
+    crate::api::model_provider_config::set_hosted_offer_share(
+        fx.owner.path(),
+        "model:openrouter",
+        true,
+        Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+    )
+    .unwrap();
+    let barrier = install_create_race_barrier(fx.owner.path(), CreateRacePoint::BeforeDispatch);
+    let (created, _) = tokio::join!(
+        fx.create_run("before-local-share-pause", "qwen-local"),
+        async {
+            barrier.wait_prepared().await;
+            barrier.release();
+            let _guard = crate::api::gateway::gateway_model_service::model_share_gate()
+                .write()
+                .await;
+            write_home_principal_object_json_for_authority(
+                fx.owner.path(),
+                &fx.authority,
+                "services-state.json",
+                json!({
+                    "schema":"elastos.services.state/v1",
+                    "principal_id":fx.authority.principal_id,
+                    "localhost_root":fx.localhost_root(),
+                    "updated_at":now_ts(),
+                    "local_offer_ids":[],
+                }),
+            );
+        }
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let refused = fx.create_run("after-local-share-pause", "qwen-local").await;
+    assert_eq!(refused["code"], "offer_unavailable", "{refused}");
+    assert_eq!(fx.create_count().await, 1);
     fx.shutdown().await;
 }
 
@@ -981,6 +1238,60 @@ mod consumer_path {
         RemoteRouteError, REMOTE_RUN_INDEX_MAX,
     };
 
+    #[tokio::test]
+    async fn remote_model_create_does_not_retry_ticket_entries_after_dispatch_error() {
+        let fx = TwoRuntimes::start().await;
+        let mut grant = fx.consumer_grant();
+        let bytes = serde_json::to_vec(&json!({ "topic": null,
+            "endpoints": [&fx.owner_addr, &fx.owner_addr] }))
+        .unwrap();
+        grant.connect_ticket = data_encoding::BASE32_NOPAD
+            .encode(&bytes)
+            .to_ascii_lowercase();
+        *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+            "status":"error", "code":"denied", "message":"provider failed after invocation",
+        }));
+        let offer_id = remote_offer_id(&fx.grant_id, "qwen-local");
+        let request = |id: &str| {
+            json!({ "op":"runs_create", "offer_id":offer_id,
+            "operation":"text.generate", "input":{"prompt":"tiny fixture"},
+            "runtime_binding":{"request_id":id} })
+        };
+        let error = fx
+            .route(
+                &[grant.clone()],
+                "runs_create",
+                request("ambiguous-provider"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(error, RemoteRouteError::PreDispatchRefused { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            fx.create_count().await,
+            1,
+            "a second ticket entry would create again"
+        );
+        fx.write_request_record("denied");
+        let refused = fx
+            .route(&[grant], "runs_create", request("fresh-revoked"))
+            .await
+            .unwrap_err();
+        match refused {
+            RemoteRouteError::PreDispatchRefused { binding, reason } => {
+                assert_eq!(reason, "denied");
+                assert_eq!(binding["offer_id"], offer_id);
+                assert_eq!(binding["request_id"], "fresh-revoked");
+                assert_eq!(binding["scope"], "invocation");
+            }
+            other => panic!("expected bound refusal, got {other}"),
+        }
+        assert_eq!(fx.create_count().await, 1);
+        fx.shutdown().await;
+    }
+
     fn ticket_for(endpoint: &iroh::EndpointAddr) -> String {
         let bytes = serde_json::to_vec(&json!({ "topic": null, "endpoints": [endpoint] })).unwrap();
         let mut encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
@@ -1000,6 +1311,9 @@ mod consumer_path {
     impl TwoRuntimes {
         fn consumer_grant(&self) -> ConsumerModelGrant {
             ConsumerModelGrant::from_record(&json!({
+                "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA,
+                "offer_ids": ["qwen-local"],
+                "offer_revision": format!("sha256:{}", "a".repeat(64)),
                 "grant_id": self.grant_id,
                 "peer_did": self.owner_service.endpoint().unwrap().id().to_string(),
                 "connect_ticket": ticket_for(&self.owner_addr),
@@ -1031,8 +1345,7 @@ mod consumer_path {
                 grants,
                 &seed_context(),
                 capsule_id,
-                op,
-                &normalized,
+                (op, &normalized),
                 now_ts(),
             )
             .await
@@ -1838,5 +2151,179 @@ async fn a_legacy_record_refuses_changed_input_replay_after_the_journal_is_prune
         page["result"]["data"]["events"][0]["kind"],
         "settlement_unknown"
     );
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_old_runs() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    let id = "model:openrouter";
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(id),
+        },
+    )
+    .await
+    .unwrap();
+    let share = |enabled| {
+        crate::api::model_provider_config::set_hosted_offer_share(
+            fx.owner.path(),
+            id,
+            enabled,
+            Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+        )
+        .unwrap()
+    };
+    share(true);
+    let hosted_scope = &[id];
+    fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, hosted_scope);
+    let created = fx.create_run("hosted-before-denial", id).await;
+    assert_eq!(created["ok"], true, "{created}");
+    let old_run = run_id_for(&fx.remote_principal(), "hosted-before-denial");
+    assert_eq!(created["result"]["data"]["offer_id"], id);
+    let baseline = fx.create_count().await;
+    for case in [
+        "wrong-principal",
+        "unauthorized-grant",
+        "expired",
+        "paused",
+        "revoked",
+    ] {
+        let mut remote = fx.remote(SEED_PRINCIPAL, "assistant");
+        match case {
+            "wrong-principal" => remote["principal_id"] = json!(OTHER_SEED_PRINCIPAL),
+            "unauthorized-grant" => {
+                remote["grant_id"] = json!(model_grant_id("unapproved-request"))
+            }
+            "expired" => fx.write_request_record_with_expiry_and_offers(
+                "approved",
+                now_ts() - 1,
+                hosted_scope,
+            ),
+            "paused" => {
+                share(false);
+            }
+            "revoked" => fx.write_request_record("denied"),
+            _ => unreachable!(),
+        }
+        let denied = fx
+            .call(
+                "runs_create",
+                json!({
+                    "op":"runs_create", "offer_id":id, "operation":"text.generate",
+                    "input":{"prompt":"fresh denial"}, "request_id":format!("hosted-{case}"),
+                    "remote_model":remote,
+                }),
+            )
+            .await;
+        assert_eq!(denied["ok"], false, "{case}: {denied}");
+        let expected_code = if case == "paused" {
+            "offer_unavailable"
+        } else {
+            "denied"
+        };
+        assert_eq!(denied["code"], expected_code, "{case}: {denied}");
+        assert_eq!(
+            fx.create_count().await,
+            baseline,
+            "{case} dispatched upstream"
+        );
+        let settled = fx.run_operation("runs_get", &old_run, SEED_PRINCIPAL).await;
+        assert_eq!(settled["ok"], true, "{case}: old run lost: {settled}");
+        assert_eq!(settled["result"]["data"]["offer_id"], id);
+        fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, hosted_scope);
+        share(true);
+    }
+    let resumed = fx.create_run("hosted-after-regrant", id).await;
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(fx.create_count().await, baseline + 1);
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/changed",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(id),
+        },
+    )
+    .await
+    .unwrap();
+    *fx.provider.execution_revision.lock().unwrap() = Some(format!("sha256:{}", "b".repeat(64)));
+    let changed = fx.create_run("hosted-after-model-change", id).await;
+    assert_eq!(changed["code"], "offer_unavailable", "{changed}");
+    assert_eq!(fx.create_count().await, baseline + 1);
+    crate::api::model_provider_config::remove_hosted_offer(fx.owner.path(), None, id)
+        .await
+        .unwrap();
+    let disconnected = fx.create_run("hosted-after-disconnect", id).await;
+    assert_eq!(disconnected["ok"], false, "{disconnected}");
+    assert_eq!(disconnected["code"], "offer_unavailable", "{disconnected}");
+    assert_eq!(fx.create_count().await, baseline + 1);
+    let old = fx.run_operation("runs_get", &old_run, SEED_PRINCIPAL).await;
+    assert_eq!(old["ok"], true, "{old}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_model_refusal_proves_this_invocation_and_preserves_older_uncertainty() {
+    let fx = TwoRuntimes::start().await;
+    let mut remote = fx.remote(SEED_PRINCIPAL, "assistant");
+    remote["refusal_scope"] = json!("invocation");
+    let request = |id: &str| {
+        json!({
+            "op": "runs_create", "request_id": id, "offer_id": "qwen-local",
+            "operation": "text.generate", "input": {"prompt":"tiny fixture"},
+            "remote_model": remote,
+        })
+    };
+    assert_eq!(
+        fx.call("runs_create", request("old-accepted")).await["ok"],
+        true
+    );
+    let baseline = fx.create_count().await;
+    fx.write_request_record("denied");
+    let refused = fx.call("runs_create", request("new-refused")).await;
+    assert_eq!(refused["ok"], true, "{refused}");
+    assert_eq!(refused["result"]["code"], "remote_model_invocation_refused");
+    assert_eq!(
+        refused["result"]["refusal"],
+        crate::api::gateway::gateway_model_service::invocation_refusal_binding(&request(
+            "new-refused"
+        ))
+        .unwrap()
+    );
+    assert_eq!(fx.create_count().await, baseline);
+    let old = fx.call("runs_create", request("old-accepted")).await;
+    assert_eq!(
+        old["ok"], false,
+        "older accepted request cannot become fresh refusal: {old}"
+    );
+    assert!(old.get("result").is_none());
+    fx.write_request_record("approved");
+    let forged_request = request("provider-forgery");
+    *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+        "status":"error", "code":"remote_model_invocation_refused", "message":"denied",
+        "reason":"denied", "refusal": crate::api::gateway::gateway_model_service::invocation_refusal_binding(&forged_request).unwrap(),
+    }));
+    let forged = fx.call("runs_create", forged_request).await;
+    assert_eq!(
+        forged["ok"], false,
+        "provider cannot assert Runtime dispatch state: {forged}"
+    );
+    assert!(forged.get("result").is_none());
+    assert_eq!(fx.create_count().await, baseline + 1);
     fx.shutdown().await;
 }

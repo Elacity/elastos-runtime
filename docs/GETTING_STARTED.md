@@ -1,18 +1,16 @@
 # Getting started with ElastOS Runtime
 
-## Install the Linux preview
+## Install from the publisher
 
-The public binary installer is the current Linux `x86_64`/`aarch64` preview.
-macOS uses source-home staging; see the [Mac runbook](MAC.md).
+The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. See the [Mac runbook](MAC.md) for source-home staging.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-elastos setup
-elastos
 ```
 
-After setup, `elastos` opens Home. The
+The installer installs Runtime, sets up the Home profile, and opens Home. Keep
+the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
+later run `elastos` from a new shell. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
 receives only the components in that manifest. Source and installed artifacts

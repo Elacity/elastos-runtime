@@ -15,6 +15,7 @@ elastos-namespace = { path = "../elastos-namespace" }
 elastos-storage = { path = "../elastos-storage" }
 elastos-compute = { path = "../elastos-compute" }
 elastos-auth = { path = "../elastos-auth" }
+elastos-model-contract = { path = "../elastos-model-contract" }
 
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"

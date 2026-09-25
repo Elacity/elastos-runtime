@@ -7,7 +7,7 @@ use anyhow::Result;
 use elastos_model_contract::model_input_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -101,6 +101,16 @@ pub struct ProviderInitExtra {
     pub offers: Vec<ConfiguredOffer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_admitted_offers: Vec<RuntimeAdmittedOffer>,
+    /// One-shot owner Remove. Runtime sets this on Init so an unresolved Stop
+    /// journal does not pin the exact admission.
+    #[serde(default)]
+    pub owner_reclaim: bool,
+    /// Private engine socket paths selected by the Runtime's macOS Seatbelt launch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime_local_sockets: BTreeMap<String, String>,
+    /// Runtime-owned hosted HTTPS effect socket. It carries no provider key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_hosted_socket: Option<String>,
 }
 
 /// Private Init provenance projected by Runtime from its verified inventory.
@@ -135,6 +145,25 @@ impl ProviderInitExtra {
             if !offer_ids.insert(offer.id.as_str()) {
                 anyhow::bail!("duplicate model offer id in provider config");
             }
+        }
+        if !self.runtime_local_sockets.is_empty() {
+            let unique_sockets: BTreeSet<_> = self.runtime_local_sockets.values().collect();
+            if unique_sockets.len() != self.runtime_local_sockets.len()
+                || self.runtime_local_sockets.values().any(|path| {
+                    !path.starts_with('/') || !path.ends_with(".sock") || path.len() >= 104
+                })
+                || self.offers.iter().any(|offer| {
+                    matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+                        && !self.runtime_local_sockets.contains_key(&offer.id)
+                })
+            {
+                anyhow::bail!("invalid Runtime local model sockets");
+            }
+        }
+        if self.runtime_hosted_socket.as_ref().is_some_and(|path| {
+            !path.starts_with('/') || !path.ends_with(".sock") || path.len() >= 104
+        }) {
+            anyhow::bail!("invalid Runtime hosted effect socket");
         }
         if self.runtime_admitted_offers.len() > MAX_OFFER_COUNT {
             anyhow::bail!("too many Runtime model admissions");
@@ -185,6 +214,8 @@ pub struct HostedDisclosureConfig {
     pub privacy_policy_ref: String,
     pub terms_ref: String,
     pub upstream_routing_fallback_assertion: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_privacy: String,
 }
 
 impl HostedDisclosureConfig {
@@ -213,6 +244,13 @@ impl HostedDisclosureConfig {
                 "hosted upstream_routing_fallback_assertion must be operator_asserted_disabled"
             );
         }
+        if !self.model_privacy.is_empty() {
+            validate_bounded_trimmed(
+                &self.model_privacy,
+                "hosted model_privacy",
+                MAX_HOSTED_PROVIDER_LABEL_BYTES,
+            )?;
+        }
         Ok(())
     }
 
@@ -239,12 +277,22 @@ pub(crate) fn test_hosted_disclosure() -> HostedDisclosureConfig {
         terms_ref: "fixture:terms:v1".to_string(),
         upstream_routing_fallback_assertion: UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
             .to_string(),
+        model_privacy: String::new(),
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdapterConfig {
+    OpenRouterDecisions {
+        api_url: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_response_model: Option<String>,
+        hosted: HostedDisclosureConfig,
+    },
     OpenAiCompatibleText {
         api_url: String,
         #[serde(default)]
@@ -278,7 +326,14 @@ pub enum AdapterConfig {
 impl AdapterConfig {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::OpenAiCompatibleText {
+            Self::OpenRouterDecisions {
+                api_url,
+                api_key,
+                model,
+                hosted,
+                ..
+            }
+            | Self::OpenAiCompatibleText {
                 api_url,
                 api_key,
                 model,
@@ -474,12 +529,31 @@ impl ConfiguredOffer {
         self.validate_canonical_modalities()?;
         self.policy.validate()?;
         self.adapter.validate()?;
+        if let AdapterConfig::OpenRouterDecisions {
+            model,
+            expected_response_model,
+            ..
+        } = &self.adapter
+        {
+            anyhow::ensure!(
+                !model.starts_with('~'),
+                "decision models require a pinned selector"
+            );
+            if let Some(expected) = expected_response_model {
+                validate_bounded_trimmed(expected, "decision expected_response_model", 256)?;
+                anyhow::ensure!(
+                    !expected.starts_with('~'),
+                    "decision response model requires a pinned identity"
+                );
+            }
+        }
         Ok(())
     }
 
     pub fn summary(&self) -> OfferSummary {
         let hosted = match &self.adapter {
-            AdapterConfig::OpenAiCompatibleText { model, hosted, .. }
+            AdapterConfig::OpenRouterDecisions { model, hosted, .. }
+            | AdapterConfig::OpenAiCompatibleText { model, hosted, .. }
             | AdapterConfig::OpenAiResponsesText { model, hosted, .. } => {
                 Some(hosted.summary(model))
             }
@@ -499,6 +573,19 @@ impl ConfiguredOffer {
 
     pub fn execution_binding_hash(&self) -> Result<String> {
         let adapter = match &self.adapter {
+            AdapterConfig::OpenRouterDecisions {
+                api_url,
+                model,
+                expected_response_model,
+                ..
+            } => {
+                let mut binding =
+                    json!({"kind": "open_router_decisions", "api_url": api_url, "model": model});
+                if let Some(expected) = expected_response_model {
+                    binding["expected_response_model"] = json!(expected);
+                }
+                binding
+            }
             AdapterConfig::OpenAiCompatibleText { api_url, model, .. } => json!({
                 "kind": "open_ai_compatible_text",
                 "api_url": api_url,
@@ -541,6 +628,22 @@ impl ConfiguredOffer {
 
     fn validate_canonical_modalities(&self) -> Result<()> {
         match &self.adapter {
+            AdapterConfig::OpenRouterDecisions { .. } => {
+                anyhow::ensure!(
+                    self.operation == elastos_model_contract::decisions::OPERATION,
+                    "decision offers require operation decision.evaluate"
+                );
+                validate_exact_modalities(
+                    &self.input_modalities,
+                    &["application/json"],
+                    "decision input_modalities",
+                )?;
+                validate_exact_modalities(
+                    &self.output_modalities,
+                    &["application/json"],
+                    "decision output_modalities",
+                )?;
+            }
             AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
@@ -915,6 +1018,9 @@ mod tests {
         fs::set_permissions(&model, fs::Permissions::from_mode(0o600)).unwrap();
         let extra = ProviderInitExtra {
             runtime_admitted_offers: Vec::new(),
+            owner_reclaim: false,
+            runtime_local_sockets: BTreeMap::new(),
+            runtime_hosted_socket: None,
             provider_id: Some("model-provider".to_string()),
             journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
             offers: vec![local_llama_offer(&engine, &model)],
@@ -1014,6 +1120,9 @@ mod tests {
     fn adapter_config_rejects_unsafe_urls_and_secret_length() {
         let config = ProviderInitExtra {
             runtime_admitted_offers: Vec::new(),
+            owner_reclaim: false,
+            runtime_local_sockets: BTreeMap::new(),
+            runtime_hosted_socket: None,
             provider_id: None,
             journal_dir: Some("/tmp/model-provider".to_string()),
             offers: vec![ConfiguredOffer {

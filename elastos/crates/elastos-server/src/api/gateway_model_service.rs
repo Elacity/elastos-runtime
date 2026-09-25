@@ -3,12 +3,14 @@
 //! A seed Runtime routes typed model operations over Carrier `provider_invoke`
 //! with target `model`. This Runtime owns the decision. It verifies the grant
 //! from the source endpoint key, rewrites the request into a destination-owned
-//! binding, filters offers to local engines, calls its own model provider, and
-//! records every run it created for that grant so revocation can find them.
+//! binding, filters offers to shared local engines and hosted offers the owner
+//! enabled for Share, calls its own model provider, and records every run it
+//! created for that grant so revocation can find them. Unshared hosted
+//! connections stay private.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -23,7 +25,7 @@ use super::gateway_provider_proxy::normalize_model_provider_request;
 pub(crate) const MODEL_SERVICE_KIND: &str = "remote_model";
 pub(crate) const MODEL_SERVICE_URI: &str = "elastos://peer/model";
 pub(crate) const MODEL_LOCAL_OFFER: &str = "local:provider:model";
-pub(crate) const MODEL_GRANT_SCHEMA: &str = "elastos.service.remote-model-grant/v1";
+pub(crate) const MODEL_GRANT_SCHEMA: &str = "elastos.service.remote-model-grant/v2";
 pub(crate) const MODEL_GRANT_SCOPE: &str = "principal_scoped_remote_model_grant";
 pub(crate) const MODEL_GRANT_TTL_SECS: u64 = 6 * 3600;
 pub(crate) const MODEL_RUN_RETENTION_SECS: u64 = 24 * 3600;
@@ -39,6 +41,13 @@ const MODEL_RUN_INDEX_SCHEMA: &str = "elastos.services.model-runs/v1";
 const MODEL_RUN_INDEX_MAX: usize = 512;
 const MODEL_REQUEST_MAX_BYTES: usize = 256 * 1024;
 const AUTHORITY_DEADLINE: Duration = Duration::from_secs(1);
+
+/// A Share or Disconnect decision waits for an admitted create to reach the
+/// provider. New creates then observe the completed owner decision.
+pub(in crate::api::gateway) fn model_share_gate() -> &'static tokio::sync::RwLock<()> {
+    static GATE: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::RwLock::new(()))
+}
 
 pub(crate) fn model_grant_id(request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
@@ -65,6 +74,10 @@ pub(crate) struct ModelServiceGrant {
     pub grant_id: String,
     pub revision: u64,
     pub expires_at: u64,
+    /// Exact model offers present when the person approved this grant.
+    /// An older grant has no snapshot and cannot authorize a new run.
+    pub approved_offer_ids: BTreeSet<String>,
+    pub approved_offer_revision: String,
 }
 
 impl ModelServiceGrant {
@@ -86,6 +99,15 @@ impl ModelServiceGrant {
                 && self.expires_at > self.revision
                 && self.expires_at - self.revision <= MODEL_GRANT_TTL_SECS,
             "model grant expired or invalid"
+        );
+        anyhow::ensure!(
+            self.approved_offer_ids.len() == 1
+                && self.approved_offer_ids.iter().all(|id| safe_id(id, 256)),
+            "model grant needs one exact approved offer"
+        );
+        anyhow::ensure!(
+            valid_offer_execution_revision(&self.approved_offer_revision),
+            "model grant needs an exact offer revision"
         );
         Ok(())
     }
@@ -219,7 +241,7 @@ enum RunSlot {
     /// and, while the run is still open, a live journal read.
     Existing {
         run_id: String,
-        record: RemoteModelRunRecord,
+        record: Box<RemoteModelRunRecord>,
     },
     /// A slot is held under the reservation key until commit or release.
     Reserved,
@@ -320,7 +342,7 @@ fn reserve_run_slot(
         }) {
             return Ok(RunSlot::Existing {
                 run_id: run_id.clone(),
-                record: record.clone(),
+                record: Box::new(record.clone()),
             });
         }
         if index.pending.contains_key(key) {
@@ -418,7 +440,7 @@ pub(crate) fn remote_model_runs_for_grant(
         .collect())
 }
 
-fn safe_id(value: &str, max: usize) -> bool {
+pub(in crate::api::gateway) fn safe_id(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value
@@ -428,6 +450,70 @@ fn safe_id(value: &str, max: usize) -> bool {
 
 fn denied(code: &str, message: &str) -> Value {
     json!({ "ok": false, "code": code, "error": message })
+}
+
+pub(crate) const INVOCATION_REFUSAL_SCHEMA: &str = "elastos.model.invocation-refusal/v1";
+
+/// Binds a refusal to this invocation, without settling any previous attempt.
+pub(crate) fn invocation_refusal_binding(request: &Value) -> Option<Value> {
+    if request["op"] != "runs_create" || request["remote_model"]["refusal_scope"] != "invocation" {
+        return None;
+    }
+    Some(json!({
+        "schema": INVOCATION_REFUSAL_SCHEMA,
+        "scope": "invocation", "dispatch": "not_started",
+        "request_id": request.get("request_id")?.as_str()?,
+        "offer_id": request.get("offer_id")?.as_str()?,
+        "operation": request.get("operation")?.as_str()?,
+        "input_hash": elastos_model_contract::model_input_hash(request.get("input")?).ok()?,
+        "remote_model": request.get("remote_model")?,
+    }))
+}
+
+fn refused_before_dispatch(
+    data_dir: &Path,
+    source_did: &str,
+    request: &Value,
+    code: &str,
+    message: &str,
+    owns_reservation: bool,
+) -> Value {
+    let Some(binding) = invocation_refusal_binding(request) else {
+        return denied(code, message);
+    };
+    let grant_id = request["remote_model"]["grant_id"]
+        .as_str()
+        .unwrap_or_default();
+    let principal = remote_principal_id(
+        source_did,
+        request["remote_model"]["principal_id"]
+            .as_str()
+            .unwrap_or_default(),
+    );
+    let capsule = request["remote_model"]["capsule_id"]
+        .as_str()
+        .unwrap_or_default();
+    let request_id = request["request_id"].as_str().unwrap_or_default();
+    let Ok(index) = read_run_index(data_dir) else {
+        return denied(code, message);
+    };
+    let known = index.runs.values().any(|run| {
+        run.grant_id == grant_id
+            && run.remote_principal_id == principal
+            && record_capsule_id(run) == capsule
+            && run.request_id == request_id
+    });
+    let pending = index.pending.contains_key(&run_reservation_key(
+        grant_id, &principal, capsule, request_id,
+    ));
+    if known || (pending && !owns_reservation) {
+        return denied(code, message);
+    }
+    json!({ "ok": true, "result": {
+        "status": "error", "code": "remote_model_invocation_refused",
+        "reason": code, "message": "This invocation was refused before provider dispatch.",
+        "refusal": binding,
+    } })
 }
 
 /// Bounded error classes cross Carrier; raw provider text stays on this Runtime.
@@ -499,16 +585,26 @@ fn index_settlement_reply(
     json!({ "ok": true, "result": reply })
 }
 
+struct RetainedRunQuery<'a> {
+    operation: &'a str,
+    run_id: &'a str,
+    record: &'a RemoteModelRunRecord,
+    after_sequence: u64,
+}
+
 fn recover_missing_run_or_deny(
     data_dir: &Path,
     now: u64,
-    operation: &str,
-    run_id: &str,
-    record: &RemoteModelRunRecord,
+    query: RetainedRunQuery<'_>,
     result: &Value,
     message: &str,
-    after_sequence: u64,
 ) -> Value {
+    let RetainedRunQuery {
+        operation,
+        run_id,
+        record,
+        after_sequence,
+    } = query;
     if provider_error_code(result) == "run_not_found" {
         tracing::info!(
             "remote model run {run_id} settled from the Runtime record after the provider forgot it"
@@ -566,10 +662,13 @@ async fn answer_retained_create(
     context: &HomeLaunchTokenContext,
     capsule_id: &str,
     normalized: &Value,
-    request_id: &str,
-    run_id: String,
-    record: RemoteModelRunRecord,
+    retained: (String, RemoteModelRunRecord),
 ) -> Value {
+    let (run_id, record) = retained;
+    let request_id = normalized
+        .pointer("/runtime_binding/request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if let Some(refusal) = refuse_unbound_or_conflicting_create(&record, normalized) {
         return refusal;
     }
@@ -598,7 +697,16 @@ async fn answer_retained_create(
     };
     if let Some(message) = provider_status_error(&result) {
         return recover_missing_run_or_deny(
-            data_dir, now, "runs_get", &run_id, &record, &result, &message, 0,
+            data_dir,
+            now,
+            RetainedRunQuery {
+                operation: "runs_get",
+                run_id: &run_id,
+                record: &record,
+                after_sequence: 0,
+            },
+            &result,
+            &message,
         );
     }
     if let Some(status) =
@@ -629,8 +737,8 @@ fn remote_context(record_principal: &str, grant_id: &str) -> HomeLaunchTokenCont
     }
 }
 
-/// Local engine offers are the shareable set. Hosted adapters stay private to
-/// this Runtime's owner.
+/// Local engine offers are shareable. A hosted offer is shareable only after
+/// the owner enables Share on that connection.
 fn shareable_offers(result: &Value) -> Vec<Value> {
     result
         .pointer("/data/offers")
@@ -639,18 +747,161 @@ fn shareable_offers(result: &Value) -> Vec<Value> {
         .map(|offers| {
             offers
                 .iter()
-                .filter(|offer| offer.get("hosted").is_none_or(Value::is_null))
+                .filter(|offer| crate::api::offer_is_shareable(offer))
                 .cloned()
                 .collect()
         })
         .unwrap_or_default()
 }
 
+fn listed_offers_array_mut(result: &mut Value) -> Option<&mut Vec<Value>> {
+    let offers = if result.pointer("/data/offers").is_some() {
+        result.pointer_mut("/data/offers")
+    } else {
+        result.get_mut("offers")
+    };
+    match offers {
+        Some(Value::Array(offers)) => Some(offers),
+        _ => None,
+    }
+}
+
+fn annotate_listed_offers_with_hosted_share(result: &mut Value, data_dir: &Path) {
+    let Ok(operator_offers) = crate::api::load_model_provider_operator_offers(data_dir) else {
+        return;
+    };
+    let Some(listed) = listed_offers_array_mut(result) else {
+        return;
+    };
+    for offer in listed {
+        let Some(id) = offer.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(operator) = operator_offers
+            .iter()
+            .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))
+        else {
+            continue;
+        };
+        if let Some(share) = operator.get("share") {
+            offer["share"] = share.clone();
+        }
+        if let Some(enabled) = operator.get("enabled") {
+            offer["enabled"] = enabled.clone();
+        }
+        if crate::api::model_provider_config::operator_offer_has_key(operator) {
+            offer["key_present"] = Value::Bool(true);
+        }
+    }
+}
+
+fn listed_offer_is_hosted(offer: &Value) -> bool {
+    offer.get("hosted").is_some_and(|value| !value.is_null())
+        || offer
+            .pointer("/adapter/hosted")
+            .is_some_and(|value| !value.is_null())
+}
+
+fn shareable_listed_offers(result: &Value, include_local: bool) -> Vec<Value> {
+    shareable_offers(result)
+        .into_iter()
+        .filter(|offer| include_local || listed_offer_is_hosted(offer))
+        .collect()
+}
+
+fn public_shared_offer(mut offer: Value) -> Value {
+    if let Some(object) = offer.as_object_mut() {
+        object.remove("share");
+        object.remove("key_present");
+        object.remove("enabled");
+    }
+    if let Some(hosted) = offer.get_mut("hosted").and_then(Value::as_object_mut) {
+        hosted.remove("privacy_policy_ref");
+        hosted.remove("terms_ref");
+        if !hosted.contains_key("payer") {
+            hosted.insert("payer".to_string(), Value::String("this Home".to_string()));
+        }
+        if !hosted.contains_key("intermediary") {
+            hosted.insert(
+                "intermediary".to_string(),
+                Value::String("this Home".to_string()),
+            );
+        }
+    }
+    offer
+}
+
+pub(in crate::api::gateway) fn shareable_offers_for_home(
+    result: &Value,
+    data_dir: &Path,
+    include_local: bool,
+) -> Vec<Value> {
+    let mut annotated = result.clone();
+    annotate_listed_offers_with_hosted_share(&mut annotated, data_dir);
+    shareable_listed_offers(&annotated, include_local)
+        .into_iter()
+        .map(public_shared_offer)
+        .collect()
+}
+
+pub(in crate::api::gateway) fn offer_execution_revision<'a>(
+    result: &'a Value,
+    id: &str,
+) -> Option<&'a str> {
+    result["data"]["offer_revisions"][id]
+        .as_str()
+        .filter(|value| valid_offer_execution_revision(value))
+}
+
+pub(in crate::api::gateway) fn valid_offer_execution_revision(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+pub(in crate::api::gateway) fn shareable_offer_for_home(
+    result: &Value,
+    data_dir: &Path,
+    include_local: bool,
+    id: &str,
+) -> Option<Value> {
+    shareable_offers_for_home(result, data_dir, include_local)
+        .into_iter()
+        .find(|offer| offer["id"].as_str() == Some(id) && offer["operation"] == "text.generate")
+}
+
+fn shareable_offers_for_grant(
+    result: &Value,
+    data_dir: &Path,
+    include_local: bool,
+    approved_offer_ids: &BTreeSet<String>,
+    approved_offer_revision: &str,
+) -> Vec<Value> {
+    shareable_offers_for_home(result, data_dir, include_local)
+        .into_iter()
+        .filter(|offer| {
+            offer["id"].as_str().is_some_and(|id| {
+                approved_offer_ids.contains(id)
+                    && offer_execution_revision(result, id) == Some(approved_offer_revision)
+            })
+        })
+        .collect()
+}
+
 fn with_offers(mut result: Value, offers: Vec<Value>) -> Value {
     if result.pointer("/data/offers").is_some() {
         result["data"]["offers"] = Value::Array(offers);
+        if let Some(data) = result.get_mut("data").and_then(Value::as_object_mut) {
+            data.remove("offer_revisions");
+        }
     } else {
         result["offers"] = Value::Array(offers);
+        if let Some(object) = result.as_object_mut() {
+            object.remove("offer_revisions");
+        }
     }
     result
 }
@@ -711,11 +962,11 @@ struct CreateRaceBarrier {
 }
 
 #[cfg(test)]
-static CREATE_RACE_BARRIERS: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::BTreeMap<(PathBuf, CreateRacePoint), Arc<CreateRaceBarrier>>,
-    >,
-> = std::sync::OnceLock::new();
+type CreateRaceBarriers =
+    std::collections::BTreeMap<(PathBuf, CreateRacePoint), Arc<CreateRaceBarrier>>;
+#[cfg(test)]
+static CREATE_RACE_BARRIERS: std::sync::OnceLock<std::sync::Mutex<CreateRaceBarriers>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct CreateRaceBarrierGuard {
@@ -882,49 +1133,21 @@ const REMOTE_RUN_ID_POINTERS: [&str; 4] = ["/data/run/id", "/data/run_id", "/run
 async fn reject_dispatched_create(
     registry: &ProviderRegistry,
     data_dir: &Path,
-    now: u64,
     reservation_key: &str,
     held_slot: bool,
     context: &HomeLaunchTokenContext,
-    capsule_id: &str,
-    grant_id: &str,
-    source_did: &str,
-    requester_principal_id: &str,
-    request_id: &str,
-    normalized: &Value,
+    record: RemoteModelRunRecord,
     result: &Value,
 ) -> Value {
+    let now = record.created_at;
+    let capsule_id = record.capsule_id.clone();
     let trustworthy_run_id = unique_string_pointers(result, &REMOTE_RUN_ID_POINTERS)
         .ok()
         .flatten();
     if let Some(run_id) = trustworthy_run_id {
-        let record = RemoteModelRunRecord {
-            grant_id: grant_id.to_string(),
-            source_endpoint_did: source_did.to_string(),
-            requester_principal_id: requester_principal_id.to_string(),
-            remote_principal_id: context.principal_id.clone(),
-            capsule_id: capsule_id.to_string(),
-            offer_id: normalized["offer_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            operation: normalized["operation"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            request_id: request_id.to_string(),
-            input_hash: normalized
-                .pointer("/runtime_binding/input_hash")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            created_at: now,
-            terminal_status: None,
-            terminal_at: None,
-        };
         match commit_run_slot(data_dir, now, reservation_key, &run_id, record) {
             Ok(()) => {
-                let status = if cancel_unrecorded_run(registry, context, capsule_id, &run_id).await
+                let status = if cancel_unrecorded_run(registry, context, &capsule_id, &run_id).await
                 {
                     "cancelled"
                 } else {
@@ -934,7 +1157,7 @@ async fn reject_dispatched_create(
             }
             Err(err) => {
                 tracing::warn!("remote model run index write failed: {err}");
-                let _ = cancel_unrecorded_run(registry, context, capsule_id, &run_id).await;
+                let _ = cancel_unrecorded_run(registry, context, &capsule_id, &run_id).await;
                 if held_slot {
                     release_run_slot(data_dir, now, reservation_key);
                 }
@@ -991,9 +1214,10 @@ pub(crate) async fn invoke(
         remote["principal_id"]
             .as_str()
             .filter(|value| safe_id(value, 128)),
-        remote["capsule_id"]
-            .as_str()
-            .filter(|value| MODEL_CONSUMER_CAPSULES.contains(value)),
+        remote["capsule_id"].as_str().filter(|value| {
+            MODEL_CONSUMER_CAPSULES.contains(value)
+                || (operation == "offers_list" && *value == "marketplace")
+        }),
     ) else {
         return denied(
             "denied",
@@ -1020,86 +1244,136 @@ pub(crate) async fn invoke(
     local_object.remove("_runtime_invocation");
     local_object.remove("op");
 
-    let (context, indexed_run) = match operation {
-        "offers_list" | "runs_create" => {
-            let grant =
-                match read_authority(data_dir, &network, source, grant_id, requester_principal_id)
-                    .await
+    let (context, indexed_run, include_local, approved_offer_ids, approved_offer_revision) =
+        match operation {
+            "offers_list" | "runs_create" => {
+                let grant = match read_authority(
+                    data_dir,
+                    &network,
+                    source,
+                    grant_id,
+                    requester_principal_id,
+                )
+                .await
                 {
                     Ok(grant) => grant,
                     Err(err) => {
                         tracing::info!("remote model authority denied: {err}");
-                        return denied("denied", "model grant is not active for this requester");
+                        return refused_before_dispatch(
+                            data_dir,
+                            &source_did,
+                            request,
+                            "denied",
+                            "model grant is not active for this requester",
+                            false,
+                        );
                     }
                 };
-            if let Err(err) = grant.validate(&source, requester_principal_id, now) {
-                tracing::info!("remote model grant rejected: {err}");
-                return denied("denied", "model grant is not active for this requester");
+                if let Err(err) = grant.validate(&source, requester_principal_id, now) {
+                    tracing::info!("remote model grant rejected: {err}");
+                    return refused_before_dispatch(
+                        data_dir,
+                        &source_did,
+                        request,
+                        "denied",
+                        "model grant is not active for this requester",
+                        false,
+                    );
+                }
+                let include_local = super::gateway_home_system::local_model_offer_is_shared(
+                    data_dir,
+                    &grant.provider_principal_id,
+                );
+                (
+                    remote_context(
+                        &remote_principal_id(&source_did, requester_principal_id),
+                        &grant.grant_id,
+                    ),
+                    None,
+                    include_local,
+                    grant.approved_offer_ids,
+                    grant.approved_offer_revision,
+                )
             }
-            (
-                remote_context(
-                    &remote_principal_id(&source_did, requester_principal_id),
-                    &grant.grant_id,
-                ),
-                None,
-            )
-        }
-        _ => {
-            let Some(run_id) = local_object
-                .get("run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
+            _ => {
+                let Some(run_id) = local_object
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
+                    return denied(
+                        "invalid_provider_invocation",
+                        "model run operation requires run_id",
+                    );
+                };
+                let record = match remote_model_run(data_dir, &run_id) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return denied("denied", "model run is not owned by this grant"),
+                    Err(err) => {
+                        tracing::warn!("remote model run index unavailable: {err}");
+                        return denied("provider_failure", "model run index is unavailable");
+                    }
+                };
+                if record.grant_id != grant_id
+                    || record.source_endpoint_did != source_did
+                    || record.requester_principal_id != requester_principal_id
+                    || record.capsule_id != capsule_id
+                {
+                    return denied("denied", "model run is not owned by this grant");
+                }
+                (
+                    remote_context(&record.remote_principal_id, grant_id),
+                    Some((run_id, record)),
+                    true,
+                    BTreeSet::new(),
+                    String::new(),
+                )
+            }
+        };
+
+    let mut normalized =
+        match normalize_model_provider_request(operation, &local, &context, capsule_id) {
+            Ok(normalized) => normalized,
+            Err((_, message)) => {
+                tracing::info!("remote model request rejected: {message}");
                 return denied(
                     "invalid_provider_invocation",
-                    "model run operation requires run_id",
+                    "model request did not match the typed contract",
                 );
-            };
-            let record = match remote_model_run(data_dir, &run_id) {
-                Ok(Some(record)) => record,
-                Ok(None) => return denied("denied", "model run is not owned by this grant"),
-                Err(err) => {
-                    tracing::warn!("remote model run index unavailable: {err}");
-                    return denied("provider_failure", "model run index is unavailable");
-                }
-            };
-            if record.grant_id != grant_id
-                || record.source_endpoint_did != source_did
-                || record.requester_principal_id != requester_principal_id
-                || record.capsule_id != capsule_id
-            {
-                return denied("denied", "model run is not owned by this grant");
             }
-            (
-                remote_context(&record.remote_principal_id, grant_id),
-                Some((run_id, record)),
-            )
-        }
-    };
+        };
 
-    let normalized = match normalize_model_provider_request(operation, &local, &context, capsule_id)
-    {
-        Ok(normalized) => normalized,
-        Err((_, message)) => {
-            tracing::info!("remote model request rejected: {message}");
-            return denied(
-                "invalid_provider_invocation",
-                "model request did not match the typed contract",
-            );
-        }
+    // A Share change waits until an admitted create has reached the provider
+    // and its run has been recorded or cancelled on this Runtime.
+    let share_guard = if operation == "runs_create" {
+        Some(model_share_gate().read().await)
+    } else {
+        None
     };
-
     if operation == "runs_create" {
-        let offers = match registry
+        let (offers, revisions) = match registry
             .send_raw("model", &json!({ "op": "offers_list" }))
             .await
         {
-            Ok(result) => shareable_offers(&result),
+            Ok(result) => (
+                shareable_offers_for_grant(
+                    &result,
+                    data_dir,
+                    include_local,
+                    &approved_offer_ids,
+                    &approved_offer_revision,
+                ),
+                result["data"]["offer_revisions"].clone(),
+            ),
             Err(err) => {
                 tracing::warn!("remote model offers unavailable: {err}");
-                return denied(
+                return refused_before_dispatch(
+                    data_dir,
+                    &source_did,
+                    request,
                     "offer_unavailable",
                     "model offers are unavailable on this Runtime",
+                    false,
                 );
             }
         };
@@ -1108,11 +1382,29 @@ pub(crate) async fn invoke(
             .iter()
             .any(|offer| offer["id"].as_str() == Some(offer_id))
         {
-            return denied(
+            return refused_before_dispatch(
+                data_dir,
+                &source_did,
+                request,
                 "offer_unavailable",
                 "model offer is not shared through this grant",
+                false,
             );
         }
+        let Some(execution_revision) = revisions[offer_id]
+            .as_str()
+            .filter(|value| valid_offer_execution_revision(value))
+        else {
+            return refused_before_dispatch(
+                data_dir,
+                &source_did,
+                request,
+                "offer_unavailable",
+                "model offer revision is unavailable on this Runtime",
+                false,
+            );
+        };
+        normalized["expected_execution_binding_hash"] = json!(execution_revision);
     }
 
     // A create holds its record slot before any model work starts. A retry of
@@ -1144,17 +1436,19 @@ pub(crate) async fn invoke(
                     &context,
                     capsule_id,
                     &normalized,
-                    &request_id,
-                    run_id,
-                    record,
+                    (run_id, *record),
                 )
                 .await;
             }
             Err(err) => {
                 tracing::info!("remote model run refused before dispatch: {err}");
-                return denied(
+                return refused_before_dispatch(
+                    data_dir,
+                    &source_did,
+                    request,
                     "rate_limited",
                     "model run capacity on this Runtime is exhausted",
+                    false,
                 );
             }
         }
@@ -1166,8 +1460,16 @@ pub(crate) async fn invoke(
         #[cfg(test)]
         await_create_race_barrier(data_dir, CreateRacePoint::BeforeDispatch).await;
         if !grant_is_active(data_dir, &network, source, grant_id, requester_principal_id).await {
+            let refusal = refused_before_dispatch(
+                data_dir,
+                &source_did,
+                request,
+                "denied",
+                "model grant is not active for this requester",
+                true,
+            );
             release_run_slot(data_dir, now, &reservation_key);
-            return denied("denied", "model grant is not active for this requester");
+            return refusal;
         }
     }
 
@@ -1196,12 +1498,14 @@ pub(crate) async fn invoke(
             return recover_missing_run_or_deny(
                 data_dir,
                 now,
-                operation,
-                run_id,
-                record,
+                RetainedRunQuery {
+                    operation,
+                    run_id,
+                    record,
+                    after_sequence: normalized["after_sequence"].as_u64().unwrap_or(0),
+                },
                 &result,
                 &message,
-                normalized["after_sequence"].as_u64().unwrap_or(0),
             );
         }
         let class = redact_provider_error(&message);
@@ -1214,6 +1518,30 @@ pub(crate) async fn invoke(
         await_create_race_barrier(data_dir, CreateRacePoint::BeforeCommit).await;
     }
 
+    let create_record = || RemoteModelRunRecord {
+        grant_id: grant_id.to_string(),
+        source_endpoint_did: source_did.clone(),
+        requester_principal_id: requester_principal_id.to_string(),
+        remote_principal_id: context.principal_id.clone(),
+        capsule_id: capsule_id.to_string(),
+        offer_id: normalized["offer_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        operation: normalized["operation"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        request_id: request_id.clone(),
+        input_hash: normalized
+            .pointer("/runtime_binding/input_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        created_at: now,
+        terminal_status: None,
+        terminal_at: None,
+    };
     let reply = normalize_remote_model_reply(&result);
     if operation == "runs_create" {
         let expected_offer = normalized["offer_id"].as_str().unwrap_or_default();
@@ -1227,16 +1555,10 @@ pub(crate) async fn invoke(
             return reject_dispatched_create(
                 &registry,
                 data_dir,
-                now,
                 &reservation_key,
                 held_slot,
                 &context,
-                capsule_id,
-                grant_id,
-                &source_did,
-                requester_principal_id,
-                &request_id,
-                &normalized,
+                create_record(),
                 &result,
             )
             .await;
@@ -1250,33 +1572,21 @@ pub(crate) async fn invoke(
     };
 
     let result = match operation {
-        "offers_list" => with_offers(result.clone(), shareable_offers(&result)),
+        "offers_list" => with_offers(
+            result.clone(),
+            shareable_offers_for_grant(
+                &result,
+                data_dir,
+                include_local,
+                &approved_offer_ids,
+                &approved_offer_revision,
+            ),
+        ),
         "runs_create" => {
             if let Some(run_id) = reply.run_id.clone() {
-                let record = RemoteModelRunRecord {
-                    grant_id: grant_id.to_string(),
-                    source_endpoint_did: source_did.clone(),
-                    requester_principal_id: requester_principal_id.to_string(),
-                    remote_principal_id: context.principal_id.clone(),
-                    capsule_id: capsule_id.to_string(),
-                    offer_id: normalized["offer_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    operation: normalized["operation"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    request_id: request_id.clone(),
-                    input_hash: normalized
-                        .pointer("/runtime_binding/input_hash")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    created_at: now,
-                    terminal_status: reply.terminal_status.clone(),
-                    terminal_at: reply.terminal_status.is_some().then_some(now),
-                };
+                let mut record = create_record();
+                record.terminal_status = reply.terminal_status.clone();
+                record.terminal_at = reply.terminal_status.is_some().then_some(now);
                 if let Err(err) = commit_run_slot(data_dir, now, &reservation_key, &run_id, record)
                 {
                     // The run exists on this Runtime but has no owner record;
@@ -1315,6 +1625,7 @@ pub(crate) async fn invoke(
             result
         }
     };
+    drop(share_guard);
     if held_slot
         && !grant_is_active(data_dir, &network, source, grant_id, requester_principal_id).await
     {
@@ -1453,6 +1764,8 @@ mod tests {
             grant_id: model_grant_id("r"),
             revision: 1_000,
             expires_at: 1_000 + MODEL_GRANT_TTL_SECS,
+            approved_offer_ids: BTreeSet::from(["qwen".into()]),
+            approved_offer_revision: format!("sha256:{}", "a".repeat(64)),
         };
         assert!(grant.validate(&key, "seed-principal", 1_500).is_ok());
         assert!(grant.validate(&other, "seed-principal", 1_500).is_err());
@@ -1465,6 +1778,16 @@ mod tests {
             ..grant.clone()
         };
         assert!(too_long.validate(&key, "seed-principal", 1_500).is_err());
+        for ids in [
+            BTreeSet::new(),
+            BTreeSet::from(["qwen".into(), "other".into()]),
+        ] {
+            let invalid = ModelServiceGrant {
+                approved_offer_ids: ids,
+                ..grant.clone()
+            };
+            assert!(invalid.validate(&key, "seed-principal", 1_500).is_err());
+        }
     }
 
     #[test]
@@ -1481,6 +1804,42 @@ mod tests {
         assert_eq!(ids, vec!["qwen", "local-2"]);
         let filtered = with_offers(result.clone(), shareable_offers(&result));
         assert_eq!(filtered["data"]["offers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shareable_offers_include_explicitly_shared_hosted() {
+        let result = json!({ "status": "ok", "data": { "offers": [
+            { "id": "qwen", "hosted": null },
+            {
+                "id": "model:openrouter",
+                "operation": "text.generate",
+                "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" },
+                "share": { "enabled": true, "terms_ack": "openrouter-5.1-5.2+model", "processor": "OpenRouter", "payer": "this Home", "model": "fixture/model" },
+                "key_present": true
+            },
+            { "id": "model:venice", "hosted": { "placement": "hosted", "backend_provider_label": "Venice" } }
+        ] } });
+        let ids: Vec<_> = shareable_offers(&result)
+            .into_iter()
+            .map(|offer| offer["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["qwen", "model:openrouter"]);
+        let published = public_shared_offer(shareable_offers(&result)[1].clone());
+        assert_eq!(published["id"], "model:openrouter");
+        assert!(published.get("share").is_none());
+        assert_eq!(published["hosted"]["payer"], "this Home");
+        assert_eq!(published["hosted"]["intermediary"], "this Home");
+        assert_eq!(published["hosted"]["backend_provider_label"], "OpenRouter");
+        assert!(published["hosted"].get("privacy_policy_ref").is_none());
+        assert!(published["hosted"].get("terms_ref").is_none());
+        let encoded = published.to_string();
+        assert!(!encoded.contains("openrouter.ai"));
+        assert!(!encoded.contains("api_key"));
+        let hosted_only: Vec<_> = shareable_listed_offers(&result, false)
+            .into_iter()
+            .map(|offer| offer["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(hosted_only, vec!["model:openrouter"]);
     }
 
     #[test]

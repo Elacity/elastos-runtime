@@ -36,6 +36,8 @@
     ...PHASE_TEXT, absent: "Not on this device yet", preparing: "Getting the model…",
     reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time",
   });
+  const RECLAIM_CONFIRM_TEXT = "This removes prepared model files from this device. Conversations stay. Other copies, if any, keep their files.";
+  const RECLAIM_BUSY_TEXT = "Stop the current reply in Assistant, then try Remove again.";
   const text = (v, max = 256) => typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f]/.test(v);
   function check(ok) { if (!ok) throw new Error("Invalid model response"); }
   function parseRuntime(r, cid) {
@@ -100,9 +102,10 @@
   window.ElastosModelManagement = {
     create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: requiredCid = null, compact = false, onReadyOpen = null }) {
       let visible = false, closed = false, generation = 0, busy = false, timer, reader;
-      let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false, polls = 0;
+      let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false;
       let unresolvedUse = null, reconcileRequired = false;
       let pendingFocus = null;
+      let reclaimStep = "idle";
       root.classList.add("model-management");
       root.tabIndex = -1;
       const show = () => visible && !closed && !document.hidden;
@@ -143,7 +146,7 @@
         for (const entry of registry.interfaces.filter(e => e.capsule === capsule)) {
           check(text(entry.interface?.id, 160) && /^[A-Za-z0-9_.:-]+$/.test(entry.interface.id));
           for (const method of entry.interface?.methods || []) {
-            if (method.resource !== "elastos://capsules/*" || !["use", "status", "cancel", "retention"].includes(method.operation)) continue;
+            if (method.resource !== "elastos://capsules/*" || !["use", "status", "cancel", "retention", "reclaim"].includes(method.operation)) continue;
             check(!found.has(method.operation));
             const bindings = entry.bindings?.filter(b => b.method === method.id);
             check(method.id === `content.${method.operation}` && bindings?.length === 1
@@ -152,7 +155,7 @@
             found.set(method.operation, { id: method.id, interface: entry.interface.id });
           }
         }
-        check(found.size === 4);
+        check(found.size === 5);
         methods = found;
       }
       async function load() {
@@ -164,8 +167,9 @@
             request("/api/capsules/catalog", null, io.signal), request("/api/capsules/interfaces", null, io.signal),
           ]);
           if (epoch !== generation || !show()) return;
-          bindMethods(interfaces); model = parseCatalog(catalog); polls = 0;
+          bindMethods(interfaces); model = parseCatalog(catalog);
           reconcileRequired = false;
+          reclaimStep = "idle";
           if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation) unresolvedUse = null;
         } catch {
           if (epoch !== generation || !show()) return;
@@ -180,13 +184,12 @@
         const runtime = model?.model_runtime, preparation = runtime?.preparation;
         const pending = active(preparation) || (preparation && runtime.admitted && !runtime.dispatch_ready);
         if (!show() || busy || message || !pending) return;
-        if (polls >= 120) { message = "Preparation is still pending. Refresh to check its status."; render(); return; }
         timer = setTimeout(poll, 1500);
       }
       async function poll() {
         if (!show() || busy || !model) return;
         const epoch = generation, cid = model.cid, id = model.model_runtime.preparation.operation_id;
-        const io = controller(); reader = io; polls++;
+        const io = controller(); reader = io;
         try {
           const result = await invoke("status", { operation_id: id }, io.signal);
           if (epoch !== generation || !show() || model?.cid !== cid) return;
@@ -206,15 +209,26 @@
         busy = true; message = ""; render();
         const io = controller();
         try {
-          const input = operation === "retention" ? { cid, keep } : operation === "cancel" ? { operation_id: id } : { cid };
+          const opening = operation === "open";
+          const input = opening ? { cid, keep: true } : operation === "retention" ? { cid, keep } : operation === "cancel" ? { operation_id: id } : { cid };
           if (operation === "use" && !unresolvedUse) unresolvedUse = { cid, id: `model-${crypto.randomUUID()}` };
-          const result = await invoke(operation, input, io.signal, operation === "use" ? unresolvedUse.id : undefined);
+          const result = await invoke(opening ? "retention" : operation, input, io.signal, operation === "use" ? unresolvedUse.id : undefined);
           if (epoch !== generation || !show() || model?.cid !== cid) return;
           check(result.cid === cid);
-          if (operation === "retention") {
-            check(result.kept === keep && typeof result.admitted === "boolean");
-            // Admission can finish while Keep is in flight. Read a fresh catalog
-            // instead of combining new readiness with an older preparation.
+          if (operation === "retention" || opening) {
+            check(result.kept === (opening ? true : keep) && typeof result.admitted === "boolean");
+            if (opening) check(result.admitted);
+            const catalog = await request("/api/capsules/catalog", null, io.signal);
+            if (epoch !== generation || !show() || model?.cid !== cid) return;
+            const candidate = parseCatalog(catalog);
+            check(candidate?.cid === cid);
+            model = candidate;
+            if (opening) {
+              check(model.model_runtime.kept && model.model_runtime.dispatch_ready);
+              onReadyOpen({ cid, offer_id: model.model_runtime.offer_id });
+            }
+          } else if (operation === "reclaim") {
+            check(typeof result.admitted === "boolean");
             const catalog = await request("/api/capsules/catalog", null, io.signal);
             if (epoch !== generation || !show() || model?.cid !== cid) return;
             const candidate = parseCatalog(catalog);
@@ -223,13 +237,28 @@
           } else {
             const r = operationRuntime(result, cid);
             check(r.preparation?.operation_id === result.operation_id && (operation !== "cancel" || result.operation_id === id));
-            model.model_runtime = r; polls = 0;
+            model.model_runtime = r;
             if (operation === "use") unresolvedUse = null;
           }
         } catch {
           if (epoch === generation && show()) {
+            if (operation === "reclaim") {
+              try {
+                const catalog = await request("/api/capsules/catalog", null, io.signal);
+                if (epoch === generation && show() && model?.cid === cid) {
+                  const candidate = parseCatalog(catalog);
+                  if (candidate?.cid === cid && candidate.model_runtime.admitted) {
+                    model = candidate;
+                    reclaimStep = "busy";
+                    return;
+                  }
+                }
+              } catch {}
+            }
             reconcileRequired = true;
-            message = "Model action could not be confirmed. Refresh to check its status.";
+            message = operation === "open"
+              ? "Could not confirm that this model is kept. Refresh, then open it again."
+              : "Model action could not be confirmed. Refresh to check its status.";
           }
         } finally {
           io.done(); busy = false;
@@ -298,15 +327,32 @@
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready) controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
-          const open = button("Open in Assistant", () => onReadyOpen({ cid: model.cid, offer_id: r.offer_id }));
+          const open = button("Open in Assistant", () => void act("open"), reconcileRequired);
           open.dataset.modelControl = "open-assistant";
           controls.append(open);
         }
+        if (r.admitted && !active(p) && reclaimStep === "busy") {
+          row.append(element("p", RECLAIM_BUSY_TEXT, "model-reclaim-busy"));
+        }
+        if (!compact && r.admitted && !active(p) && reclaimStep === "confirm") {
+          row.append(element("p", RECLAIM_CONFIRM_TEXT, "model-reclaim-confirm"));
+          const decline = button("Keep this model", () => { reclaimStep = "idle"; render(); }, reconcileRequired);
+          decline.dataset.modelControl = "reclaim-decline";
+          const confirm = button("Remove now", () => { reclaimStep = "idle"; void act("reclaim"); }, reconcileRequired);
+          confirm.dataset.modelControl = "reclaim-confirm";
+          controls.append(decline, confirm);
+        } else if (!compact && r.admitted && !active(p)) {
+          const reclaim = button("Remove from this device", () => { reclaimStep = "confirm"; render(); }, reconcileRequired);
+          reclaim.dataset.modelControl = "reclaim";
+          controls.append(reclaim);
+        }
         if (active(p)) { const cancel = button("Cancel preparation", () => void act("cancel"), p.cancel_requested || reconcileRequired); cancel.dataset.modelControl = "cancel"; controls.append(cancel); }
-        const labelNode = element("label", "", "model-keep"), toggle = element("input");
-        toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
-        toggle.addEventListener("change", () => void act("retention", toggle.checked));
-        labelNode.append(toggle, document.createTextNode("Keep on this device")); controls.append(labelNode);
+        if (!compact && reclaimStep !== "confirm") {
+          const labelNode = element("label", "", "model-keep"), toggle = element("input");
+          toggle.type = "checkbox"; toggle.checked = r.kept; toggle.disabled = !(r.admitted || active(p)) || p?.cancel_requested || busy || loading || reconcileRequired; toggle.dataset.modelControl = "keep";
+          toggle.addEventListener("change", () => void act("retention", toggle.checked));
+          labelNode.append(toggle, document.createTextNode("Keep on this device")); controls.append(labelNode);
+        }
         row.append(controls);
         if (!compact) {
           row.append(element("p", r.kept

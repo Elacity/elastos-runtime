@@ -9,6 +9,7 @@ use crate::contract::{
 };
 use crate::journal::{deterministic_run_id, now_ms};
 use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
+use elastos_model_contract::decisions;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -38,19 +39,91 @@ const LOCAL_TEXT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const LOCAL_TEXT_TIMED_FLUSH_LIMIT: usize = crate::config::MAX_RUN_EVENT_COUNT_LIMIT / 2;
 const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
+const RUNTIME_HOSTED_EFFECT_URL: &str = "http://runtime.invalid/v1/hosted-effect";
 
-fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, AdapterFault> {
-    reqwest::Client::builder()
+fn effect_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    direct_url: &str,
+    runtime_socket: Option<&str>,
+    offer_id: &str,
+    run_id: &str,
+    request_id: &str,
+    effect: &'static str,
+) -> reqwest::RequestBuilder {
+    let url = if runtime_socket.is_some() {
+        RUNTIME_HOSTED_EFFECT_URL
+    } else {
+        direct_url
+    };
+    let builder = client.request(method, url);
+    if runtime_socket.is_some() {
+        builder
+            .header("x-elastos-offer-id", offer_id)
+            .header("x-elastos-run-id", run_id)
+            .header("x-elastos-request-id", request_id)
+            .header("x-elastos-effect", effect)
+    } else {
+        builder
+    }
+}
+
+fn backend_client_with_socket(
+    timeout_ms: u64,
+    unix_socket: Option<&str>,
+) -> std::result::Result<reqwest::Client, AdapterFault> {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(BACKEND_CONNECT_TIMEOUT_MS))
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-        .map_err(|err| {
-            AdapterFault::transport(
+        .timeout(Duration::from_millis(timeout_ms));
+    if let Some(path) = unix_socket {
+        #[cfg(unix)]
+        {
+            builder = builder.unix_socket(path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(AdapterFault::transport(
                 "model backend transport was interrupted",
-                format!("failed to build backend client: {err}"),
-            )
-        })
+                "Unix socket transport is unavailable on this platform".into(),
+            ));
+        }
+    }
+    builder.build().map_err(|err| {
+        AdapterFault::transport(
+            "model backend transport was interrupted",
+            format!("failed to build backend client: {err}"),
+        )
+    })
+}
+
+// The native provider has no network sandbox. Until Runtime owns a confined
+// egress broker, every external adapter fails before it can open a socket.
+// Unit fixtures keep exercising their backend protocol; the production binary
+// is covered by process and installed zero-request tests.
+#[cfg(test)]
+thread_local! {
+    static TEST_EXTERNAL_HTTP_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn require_external_http_containment(
+    runtime_socket: Option<&str>,
+) -> std::result::Result<(), AdapterFault> {
+    #[cfg(target_os = "macos")]
+    if runtime_socket.is_some() {
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = runtime_socket;
+    #[cfg(test)]
+    if TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.get()) {
+        return Ok(());
+    }
+    Err(AdapterFault::context(
+        "Hosted external HTTPS is paused.",
+        "Runtime network authority is not available",
+    ))
 }
 
 fn remaining_run_timeout(deadline_ms: u64) -> std::result::Result<Duration, AdapterFault> {
@@ -120,6 +193,28 @@ impl AdapterFault {
             error: RunError {
                 class: ErrorClass::BackendFailed,
                 code: "backend_failed".to_string(),
+                message: message.to_string(),
+            },
+            detail: Some(bound_detail(detail.into())),
+        }
+    }
+
+    pub fn authentication(message: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            error: RunError {
+                class: ErrorClass::AuthenticationRejected,
+                code: "authentication_rejected".to_string(),
+                message: message.to_string(),
+            },
+            detail: Some(bound_detail(detail.into())),
+        }
+    }
+
+    pub fn rate_limited(message: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            error: RunError {
+                class: ErrorClass::RateLimited,
+                code: "rate_limited".to_string(),
                 message: message.to_string(),
             },
             detail: Some(bound_detail(detail.into())),
@@ -346,6 +441,7 @@ impl HostedBackendReport {
 
 struct LocalTextWorkerTask {
     run_id: String,
+    request_id: String,
     generation: u64,
     backend: LocalTextBackend,
     offer: ConfiguredOffer,
@@ -353,9 +449,17 @@ struct LocalTextWorkerTask {
     prompt: String,
     cancel_rx: watch::Receiver<bool>,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 enum LocalTextBackend {
+    // Decisions share the cancellable HTTP worker lifecycle; output is inline JSON.
+    OpenRouterDecisions {
+        api_url: String,
+        api_key: Option<String>,
+        model: String,
+        input: decisions::Input,
+    },
     OpenAiCompatible {
         api_url: String,
         api_key: Option<String>,
@@ -392,6 +496,7 @@ struct HttpArtifactCreateWorkerTask {
     binding: RuntimeCreateBinding,
     input: Value,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 struct HttpArtifactStatusWorkerTask {
@@ -404,6 +509,7 @@ struct HttpArtifactStatusWorkerTask {
     binding: RuntimeCreateBinding,
     backend_state: Value,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 struct HttpArtifactCancelWorkerTask {
@@ -415,6 +521,7 @@ struct HttpArtifactCancelWorkerTask {
     binding: RuntimeCreateBinding,
     backend_state: Value,
     updates: mpsc::Sender<WorkerUpdate>,
+    hosted_socket: Option<String>,
 }
 
 impl LocalTextStreamState {
@@ -474,6 +581,7 @@ pub struct LiveAdapterExecutor {
     workers: Arc<Mutex<BTreeMap<String, WorkerRecord>>>,
     next_generation: Arc<AtomicU64>,
     local_llama: LocalLlamaEngines,
+    hosted_socket: Option<String>,
 }
 
 impl LiveAdapterExecutor {
@@ -493,13 +601,37 @@ impl LiveAdapterExecutor {
         self.local_llama.close_offer(offer_id).await
     }
 
+    pub(crate) async fn update_local_model_sockets(&self, sockets: BTreeMap<String, String>) {
+        self.local_llama.update_runtime_sockets(sockets).await;
+    }
+
+    #[cfg(test)]
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
+        Self::new_with_local_sockets(runtime, updates, BTreeMap::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_local_sockets(
+        runtime: Handle,
+        updates: mpsc::Sender<WorkerUpdate>,
+        sockets: BTreeMap<String, String>,
+    ) -> Self {
+        Self::new_with_runtime_sockets(runtime, updates, sockets, None)
+    }
+
+    pub(crate) fn new_with_runtime_sockets(
+        runtime: Handle,
+        updates: mpsc::Sender<WorkerUpdate>,
+        sockets: BTreeMap<String, String>,
+        hosted_socket: Option<String>,
+    ) -> Self {
         Self {
             runtime,
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
-            local_llama: LocalLlamaEngines::default(),
+            local_llama: LocalLlamaEngines::with_runtime_sockets(sockets),
+            hosted_socket,
         }
     }
 
@@ -650,6 +782,7 @@ impl LiveAdapterExecutor {
         self.spawn_text_worker(
             backend,
             offer,
+            &binding.request_id,
             prompt,
             deadline_ms,
             PreparedLocalTextWorker {
@@ -666,6 +799,7 @@ impl LiveAdapterExecutor {
         &self,
         backend: LocalTextBackend,
         offer: &ConfiguredOffer,
+        request_id: &str,
         prompt: &str,
         deadline_ms: u64,
         prepared: PreparedLocalTextWorker,
@@ -680,10 +814,13 @@ impl LiveAdapterExecutor {
         let updates = self.updates.clone();
         let offer = offer.clone();
         let prompt = prompt.to_string();
+        let request_id = request_id.to_string();
+        let hosted_socket = self.hosted_socket.clone();
         let run_id_for_task = run_id.clone();
         let join_handle = self.runtime.spawn(async move {
             let timed_out = run_local_text_worker(LocalTextWorkerTask {
                 run_id: run_id_for_task.clone(),
+                request_id,
                 generation,
                 backend,
                 offer,
@@ -691,6 +828,7 @@ impl LiveAdapterExecutor {
                 prompt,
                 cancel_rx,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -743,6 +881,7 @@ impl LiveAdapterExecutor {
         let create_url = create_url.to_string();
         let bearer_token = bearer_token.map(str::to_string);
         let run_id_for_task = run_id.clone();
+        let hosted_socket = self.hosted_socket.clone();
         let join_handle = self.runtime.spawn(async move {
             run_http_artifact_create_worker(HttpArtifactCreateWorkerTask {
                 run_id: run_id_for_task.clone(),
@@ -754,6 +893,7 @@ impl LiveAdapterExecutor {
                 binding,
                 input,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -806,6 +946,7 @@ impl LiveAdapterExecutor {
         let status_url = status_url.to_string();
         let bearer_token = bearer_token.map(str::to_string);
         let run_id_for_task = run_id.clone();
+        let hosted_socket = self.hosted_socket.clone();
         let backend_state_for_task = next_backend_state.clone();
         let join_handle = self.runtime.spawn(async move {
             run_http_artifact_status_worker(HttpArtifactStatusWorkerTask {
@@ -818,6 +959,7 @@ impl LiveAdapterExecutor {
                 binding,
                 backend_state: backend_state_for_task,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -889,6 +1031,7 @@ impl LiveAdapterExecutor {
         let cancel_url = cancel_url.to_string();
         let bearer_token = bearer_token.map(str::to_string);
         let run_id_for_task = run_id.clone();
+        let hosted_socket = self.hosted_socket.clone();
         let backend_state_for_task = backend_state.clone();
         let join_handle = self.runtime.spawn(async move {
             run_http_artifact_cancel_worker(HttpArtifactCancelWorkerTask {
@@ -900,6 +1043,7 @@ impl LiveAdapterExecutor {
                 binding,
                 backend_state: backend_state_for_task,
                 updates: updates.clone(),
+                hosted_socket,
             })
             .await;
             let _ = updates
@@ -927,7 +1071,44 @@ impl AdapterExecutor for LiveAdapterExecutor {
         input: &Value,
         deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault> {
+        if !matches!(adapter, AdapterConfig::LocalLlamaCppText { .. }) {
+            require_external_http_containment(self.hosted_socket.as_deref())?;
+        }
         match adapter {
+            AdapterConfig::OpenRouterDecisions {
+                api_url,
+                api_key,
+                model,
+                ..
+            } => {
+                let decision: decisions::Input =
+                    serde_json::from_value(input.clone()).map_err(|_| {
+                        AdapterFault::context("model input is invalid", "invalid decision input")
+                    })?;
+                decision.validate().map_err(|_| {
+                    AdapterFault::context("model input is invalid", "invalid decision questions")
+                })?;
+                let backend_state = self.spawn_local_text_worker(
+                    LocalTextBackend::OpenRouterDecisions {
+                        api_url: api_url.clone(),
+                        api_key: api_key.clone(),
+                        model: model.clone(),
+                        input: decision,
+                    },
+                    offer,
+                    binding,
+                    "",
+                    deadline_ms,
+                )?;
+                Ok(DispatchResult::Running {
+                    events: vec![EventSeed {
+                        kind: "dispatched",
+                        data: json!({"offer_id": offer.id}),
+                    }],
+                    backend_state,
+                })
+            }
+
             AdapterConfig::OpenAiCompatibleText {
                 api_url,
                 api_key,
@@ -1015,7 +1196,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<ReconcileResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. }
+            AdapterConfig::OpenRouterDecisions { .. }
+            | AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 reconcile_local_text(self, binding, backend_state)
@@ -1047,7 +1229,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         allow_send: bool,
     ) -> std::result::Result<CancelResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. }
+            AdapterConfig::OpenRouterDecisions { .. }
+            | AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => {
                 cancel_local_text(self, binding, backend_state)
@@ -1078,7 +1261,8 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<CancelReservation, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. }
+            AdapterConfig::OpenRouterDecisions { .. }
+            | AdapterConfig::OpenAiCompatibleText { .. }
             | AdapterConfig::OpenAiResponsesText { .. }
             | AdapterConfig::LocalLlamaCppText { .. } => reserve_local_text_cancel(backend_state),
             AdapterConfig::HttpJobArtifact { cancel_url, .. } => {
@@ -1270,6 +1454,7 @@ async fn run_http_artifact_create_worker(task: HttpArtifactCreateWorkerTask) {
         &task.offer,
         &task.binding,
         &task.input,
+        task.hosted_socket.as_deref(),
     )
     .await
     {
@@ -1297,6 +1482,7 @@ async fn run_http_artifact_status_worker(task: HttpArtifactStatusWorkerTask) {
         &task.offer,
         &task.binding,
         &task.backend_state,
+        task.hosted_socket.as_deref(),
     )
     .await
     {
@@ -1326,6 +1512,7 @@ async fn run_http_artifact_cancel_worker(task: HttpArtifactCancelWorkerTask) {
         &task.offer,
         &task.binding,
         &task.backend_state,
+        task.hosted_socket.as_deref(),
     )
     .await
     {
@@ -1355,29 +1542,38 @@ async fn run_http_artifact_create_worker_inner(
     offer: &ConfiguredOffer,
     binding: &RuntimeCreateBinding,
     input: &Value,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    let client = backend_client(offer.policy.runtime_ms_limit)?;
+    require_external_http_containment(hosted_socket)?;
+    let client = backend_client_with_socket(offer.policy.runtime_ms_limit, hosted_socket)?;
     let request = {
-        let mut builder = client
-            .post(create_url)
-            .header("content-type", "application/json")
-            .json(&json!({
-                "request_id": binding.request_id,
-                "offer_id": offer.id,
-                "operation": offer.operation,
-                "input": input,
-            }));
-        if let Some(bearer_token) = bearer_token {
-            builder = builder.header("authorization", format!("Bearer {bearer_token}"));
+        let mut builder = effect_request(
+            &client,
+            reqwest::Method::POST,
+            create_url,
+            hosted_socket,
+            &offer.id,
+            &deterministic_run_id(binding),
+            &binding.request_id,
+            "job_create",
+        )
+        .header("content-type", "application/json")
+        .json(&json!({
+            "request_id": binding.request_id,
+            "offer_id": offer.id,
+            "operation": offer.operation,
+            "input": input,
+        }));
+        if hosted_socket.is_none() {
+            if let Some(bearer_token) = bearer_token {
+                builder = builder.header("authorization", format!("Bearer {bearer_token}"));
+            }
         }
         builder
     };
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     let value = read_bounded_json_response_async(response).await?;
     let job_id = value.get("job_id").and_then(Value::as_str).ok_or_else(|| {
@@ -1415,7 +1611,9 @@ async fn run_http_artifact_status_worker_inner(
     offer: &ConfiguredOffer,
     _binding: &RuntimeCreateBinding,
     backend_state: &Value,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment(hosted_socket)?;
     let state = parse_http_job_backend_state(backend_state)?;
     let now = now_ms();
     if state.cancel_requested
@@ -1427,17 +1625,28 @@ async fn run_http_artifact_status_worker_inner(
         return Ok(worker_settlement_unknown_result());
     }
     let url = status_request_url(status_url, &state.job_id)?;
-    let client = backend_client(offer.policy.runtime_ms_limit)?;
-    let mut request = client.get(url);
-    if let Some(bearer_token) = bearer_token {
-        request = request.header("authorization", format!("Bearer {bearer_token}"));
+    let client = backend_client_with_socket(offer.policy.runtime_ms_limit, hosted_socket)?;
+    let mut request = effect_request(
+        &client,
+        reqwest::Method::GET,
+        &url,
+        hosted_socket,
+        &offer.id,
+        &deterministic_run_id(_binding),
+        &_binding.request_id,
+        "job_status",
+    );
+    if hosted_socket.is_some() {
+        request = request.header("x-elastos-job-id", &state.job_id);
+    }
+    if hosted_socket.is_none() {
+        if let Some(bearer_token) = bearer_token {
+            request = request.header("authorization", format!("Bearer {bearer_token}"));
+        }
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     let value = read_bounded_json_response_async(response).await?;
     parse_http_job_status_result(value, offer, state, poll_interval_ms)
@@ -1446,12 +1655,36 @@ async fn run_http_artifact_status_worker_inner(
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    if !matches!(&task.backend, LocalTextBackend::LocalLlama { .. }) {
+        require_external_http_containment(task.hosted_socket.as_deref())?;
+    }
     let mut backend_report = matches!(
         &task.backend,
         LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
     )
     .then(HostedBackendReport::default);
+    let mut local_socket = None;
     let (api_url, api_key, body, private_endpoint) = match &task.backend {
+        LocalTextBackend::OpenRouterDecisions {
+            api_url,
+            api_key,
+            model,
+            input,
+        } => {
+            return run_decision_worker(
+                api_url,
+                api_key.as_deref(),
+                model,
+                input,
+                &task.offer,
+                task.deadline_ms,
+                &mut task.cancel_rx,
+                &task.run_id,
+                &task.request_id,
+                task.hosted_socket.as_deref(),
+            )
+            .await;
+        }
         LocalTextBackend::OpenAiCompatible {
             api_url,
             api_key,
@@ -1495,22 +1728,44 @@ async fn run_local_text_worker_inner(
                 &task.prompt,
                 Some(endpoint.enable_thinking),
             );
+            local_socket = endpoint.unix_socket;
             (endpoint.api_url, None, body, true)
         }
     };
-    let client = backend_client(
+    let client = backend_client_with_socket(
         remaining_run_timeout(task.deadline_ms)?
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX),
+        local_socket.as_deref().or(task.hosted_socket.as_deref()),
     )?;
+    let runtime_socket = if private_endpoint {
+        None
+    } else {
+        task.hosted_socket.as_deref()
+    };
     let request = {
-        let mut builder = client
-            .post(&api_url)
-            .header("content-type", "application/json")
-            .json(&body);
-        if let Some(api_key) = api_key.as_deref() {
-            builder = builder.header("authorization", format!("Bearer {api_key}"));
+        let effect = if matches!(&task.backend, LocalTextBackend::OpenAiResponses { .. }) {
+            "responses"
+        } else {
+            "text"
+        };
+        let mut builder = effect_request(
+            &client,
+            reqwest::Method::POST,
+            &api_url,
+            runtime_socket,
+            &task.offer.id,
+            &task.run_id,
+            &task.request_id,
+            effect,
+        )
+        .header("content-type", "application/json")
+        .json(&body);
+        if runtime_socket.is_none() {
+            if let Some(api_key) = api_key.as_deref() {
+                builder = builder.header("authorization", format!("Bearer {api_key}"));
+            }
         }
         builder
     };
@@ -1522,10 +1777,7 @@ async fn run_local_text_worker_inner(
         response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_effect_http_status(&response, runtime_socket));
     }
 
     let mut response = response;
@@ -1667,6 +1919,107 @@ async fn run_local_text_worker_inner(
     })
 }
 
+async fn run_decision_worker(
+    api_url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    input: &decisions::Input,
+    offer: &ConfiguredOffer,
+    deadline_ms: u64,
+    cancel: &mut watch::Receiver<bool>,
+    run_id: &str,
+    request_id: &str,
+    hosted_socket: Option<&str>,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment(hosted_socket)?;
+    let client = backend_client_with_socket(
+        remaining_run_timeout(deadline_ms)?
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        hosted_socket,
+    )?;
+    let body = json!({"model": model, "state": input.state, "questions": input.questions,
+        "provider": {"allow_fallbacks": false}});
+    let mut request = effect_request(
+        &client,
+        reqwest::Method::POST,
+        api_url,
+        hosted_socket,
+        &offer.id,
+        run_id,
+        request_id,
+        "decisions",
+    )
+    .json(&body);
+    if hosted_socket.is_none() {
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+    }
+    let response = tokio::select! {
+        _ = cancel.changed() => return Ok(worker_settlement_unknown_result()),
+        response = request.send() => response.map_err(map_reqwest_failure)?,
+    };
+    if !response.status().is_success() {
+        return Err(map_effect_http_status(&response, hosted_socket));
+    }
+    let value = tokio::select! {
+        _ = cancel.changed() => return Ok(worker_settlement_unknown_result()),
+        value = read_bounded_json_response_async(response) => value?,
+    };
+    let mut report = HostedBackendReport::default();
+    if let Some(object) = value.as_object() {
+        report.observe_responses_completed(object);
+    }
+    if let Some(usage) = value.get("usage").and_then(Value::as_object) {
+        if usage.contains_key("cost") {
+            report.cost.observe(parse_backend_cost(usage));
+        }
+    }
+    let output = (|| {
+        let mut output: decisions::Output = serde_json::from_value(json!({
+            "schema": decisions::OUTPUT_SCHEMA, "model": value.get("model"), "answers": value.get("answers")
+        })).map_err(|_| AdapterFault::malformed("model backend returned invalid data", "invalid decision response"))?;
+        // Runtime binds catalog canonical identity to this exact offer revision.
+        // The backend report keeps the reported identity; the typed output binds
+        // to the requested selector after the exact canonical check succeeds.
+        let expected = match &offer.adapter {
+            AdapterConfig::OpenRouterDecisions {
+                expected_response_model: Some(expected),
+                ..
+            } => expected.as_str(),
+            _ => model,
+        };
+        output.validate_for(input, expected).map_err(|_| {
+            AdapterFault::malformed(
+                "model backend returned invalid data",
+                "decision response does not match request",
+            )
+        })?;
+        output.model = model.to_string();
+        let output = serde_json::to_value(output).map_err(|_| {
+            AdapterFault::malformed(
+                "model backend returned invalid data",
+                "invalid decision output",
+            )
+        })?;
+        sanitize_output(&output, offer)?;
+        Ok::<_, AdapterFault>(output)
+    })();
+    let (status, output, error) = match output {
+        Ok(output) => (RunStatus::Completed, Some(output), None),
+        Err(fault) => (RunStatus::Failed, None, Some(fault.error)),
+    };
+    Ok(ReconcileResult::Terminal {
+        events: Vec::new(),
+        status,
+        output,
+        error,
+        backend_report: Some(Box::new(report.finish())),
+    })
+}
+
 fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
     match fault {
         LocalLlamaFault::Timeout => AdapterFault::timeout(
@@ -1697,6 +2050,11 @@ fn text_generation_request_body(
     if let Some(enable_thinking) = enable_thinking {
         body["chat_template_kwargs"] = json!({
             "enable_thinking": enable_thinking,
+        });
+    }
+    if offer.id == "model:venice" {
+        body["venice_parameters"] = json!({
+            "include_venice_system_prompt": false,
         });
     }
     body
@@ -2083,6 +2441,55 @@ fn map_reqwest_failure(err: reqwest::Error) -> AdapterFault {
     )
 }
 
+fn map_backend_http_status(status: reqwest::StatusCode) -> AdapterFault {
+    let code = status.as_u16();
+    let detail = format!("unexpected backend status {code}");
+    match code {
+        401 | 403 => AdapterFault::authentication("model backend rejected authentication", detail),
+        408 | 504 => AdapterFault::timeout("model backend timed out", detail),
+        429 => AdapterFault::rate_limited("model backend rate limited the request", detail),
+        400 | 413 | 422 => AdapterFault::context("model backend rejected the request", detail),
+        _ => AdapterFault::backend_failed("model backend failed", detail),
+    }
+}
+
+fn map_effect_http_status(
+    response: &reqwest::Response,
+    runtime_socket: Option<&str>,
+) -> AdapterFault {
+    if runtime_socket.is_some() && response.status() == reqwest::StatusCode::FORBIDDEN {
+        let state = response
+            .headers()
+            .get("x-elastos-hosted-access")
+            .and_then(|value| value.to_str().ok());
+        let (code, message) = match state {
+            Some("pending") => (
+                "hosted_access_pending",
+                "Hosted access is waiting for approval in Inbox.",
+            ),
+            Some("denied") => ("hosted_access_denied", "Hosted access was denied in Inbox."),
+            Some("ended") => (
+                "hosted_access_ended",
+                "Hosted access ended. Approve the new request in Inbox to use it again.",
+            ),
+            Some("refused") => (
+                "hosted_effect_refused",
+                "Runtime refused the hosted request before provider dispatch.",
+            ),
+            _ => return map_backend_http_status(response.status()),
+        };
+        return AdapterFault {
+            error: RunError {
+                class: ErrorClass::AccessRefused,
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+            detail: None,
+        };
+    }
+    map_backend_http_status(response.status())
+}
+
 async fn read_bounded_json_response_async(
     mut response: reqwest::Response,
 ) -> std::result::Result<Value, AdapterFault> {
@@ -2236,7 +2643,9 @@ async fn run_http_artifact_cancel_worker_inner(
     offer: &ConfiguredOffer,
     _binding: &RuntimeCreateBinding,
     backend_state: &Value,
+    hosted_socket: Option<&str>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
+    require_external_http_containment(hosted_socket)?;
     let state = parse_http_job_backend_state(backend_state)?;
     let deadline = state.cancel_deadline_ms.ok_or_else(|| {
         AdapterFault::malformed(
@@ -2247,20 +2656,27 @@ async fn run_http_artifact_cancel_worker_inner(
     if now_ms() >= deadline {
         return Ok(worker_settlement_unknown_result());
     }
-    let client = backend_client(offer.policy.runtime_ms_limit)?;
-    let mut request = client
-        .post(cancel_url)
-        .header("content-type", "application/json")
-        .json(&json!({ "job_id": state.job_id }));
-    if let Some(bearer_token) = bearer_token {
-        request = request.header("authorization", format!("Bearer {bearer_token}"));
+    let client = backend_client_with_socket(offer.policy.runtime_ms_limit, hosted_socket)?;
+    let mut request = effect_request(
+        &client,
+        reqwest::Method::POST,
+        cancel_url,
+        hosted_socket,
+        &offer.id,
+        &deterministic_run_id(_binding),
+        &_binding.request_id,
+        "job_cancel",
+    )
+    .header("content-type", "application/json")
+    .json(&json!({ "job_id": state.job_id }));
+    if hosted_socket.is_none() {
+        if let Some(bearer_token) = bearer_token {
+            request = request.header("authorization", format!("Bearer {bearer_token}"));
+        }
     }
     let response = request.send().await.map_err(map_reqwest_failure)?;
     if !response.status().is_success() {
-        return Err(AdapterFault::backend_failed(
-            "model backend failed",
-            format!("unexpected backend status {}", response.status().as_u16()),
-        ));
+        return Err(map_effect_http_status(&response, hosted_socket));
     }
     if response.status() != reqwest::StatusCode::NO_CONTENT {
         let _ = read_bounded_json_response_async(response).await?;
@@ -3033,6 +3449,248 @@ mod tests {
         }
     }
 
+    fn decision_input() -> decisions::Input {
+        serde_json::from_value(
+            json!({"schema": decisions::INPUT_SCHEMA, "state": "Bounded test action",
+            "questions": {"review": {"type": "choice", "instructions": "Choose a review outcome",
+                "criteria": {"allow": "Authorized", "defer": "Needs human review"}}}}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn decision_http_request_and_failed_reply_preserve_reported_accounting() {
+        for (canonical, actual_model, choice, expected_status) in [
+            (None, "typesafe/jev-1.13", "defer", RunStatus::Completed),
+            (None, "different-model", "defer", RunStatus::Failed),
+            (None, "typesafe/jev-1.13", "invented", RunStatus::Failed),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.13-20260917",
+                "defer",
+                RunStatus::Completed,
+            ),
+            (
+                None,
+                "typesafe/jev-1.13-20260917",
+                "defer",
+                RunStatus::Failed,
+            ),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.13-20260918",
+                "defer",
+                RunStatus::Failed,
+            ),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.14",
+                "defer",
+                RunStatus::Failed,
+            ),
+            (
+                Some("typesafe/jev-1.13-20260917"),
+                "typesafe/jev-1.13-20260917",
+                "invented",
+                RunStatus::Failed,
+            ),
+        ] {
+            let server = start_server(vec![HttpResponseSpec {
+                status_line: "200 OK",
+                headers: vec![],
+                body: serde_json::to_vec(&json!({"model": actual_model,
+                    "answers": {"review": {"type": "choice", "choice": choice, "confidence": 0.8}},
+                    "usage": {"input_tokens": 25, "output_tokens": 0, "cost": 0.00000105}}))
+                .unwrap(),
+            }]);
+            let url = format!("{}/api/alpha/decisions", server.base_url);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (_cancel_tx, mut cancel) = watch::channel(false);
+            let input = decision_input();
+            let mut offer = openai_offer(&url);
+            offer.adapter = AdapterConfig::OpenRouterDecisions {
+                api_url: url.clone(),
+                api_key: Some("fixture-secret".into()),
+                model: "typesafe/jev-1.13".into(),
+                expected_response_model: canonical.map(String::from),
+                hosted: crate::config::test_hosted_disclosure(),
+            };
+            let binding_hash = offer.execution_binding_hash().unwrap();
+            let mut changed = offer.clone();
+            if let AdapterConfig::OpenRouterDecisions {
+                expected_response_model,
+                ..
+            } = &mut changed.adapter
+            {
+                *expected_response_model = Some("different-catalog-revision".into());
+            }
+            assert_ne!(binding_hash, changed.execution_binding_hash().unwrap());
+            let result = runtime
+                .block_on(run_decision_worker(
+                    &url,
+                    Some("fixture-secret"),
+                    "typesafe/jev-1.13",
+                    &input,
+                    &offer,
+                    now_ms() + 5000,
+                    &mut cancel,
+                    "run:fixture",
+                    "fixture-request",
+                    None,
+                ))
+                .unwrap();
+            let ReconcileResult::Terminal {
+                status,
+                output,
+                backend_report: Some(report),
+                ..
+            } = result
+            else {
+                panic!("missing terminal report")
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(output.is_some(), expected_status == RunStatus::Completed);
+            if let Some(output) = &output {
+                assert_eq!(
+                    output["model"], "typesafe/jev-1.13",
+                    "typed output identifies the selected model"
+                );
+                serde_json::from_value::<decisions::Output>(output.clone())
+                    .unwrap()
+                    .validate_for(&input, "typesafe/jev-1.13")
+                    .unwrap();
+            }
+            let report = serde_json::to_value(report).unwrap();
+            assert_eq!(report["resolved_model"]["value"], actual_model);
+            assert_eq!(report["usage"]["status"], "reported");
+            assert_eq!(report["cost"]["value"]["value"], "1.05e-6");
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert!(request.starts_with("POST /api/alpha/decisions "));
+            assert!(request
+                .to_lowercase()
+                .contains("authorization: bearer fixture-secret"));
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(
+                body,
+                json!({"model":"typesafe/jev-1.13", "state":input.state, "questions":input.questions, "provider":{"allow_fallbacks":false}})
+            );
+            assert!(!output
+                .unwrap_or(Value::Null)
+                .to_string()
+                .contains("fixture-secret"));
+        }
+    }
+
+    #[test]
+    fn decision_cancellation_during_headers_or_body_keeps_unknown_settlement() {
+        for send_headers in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://{}/api/alpha/decisions",
+                listener.local_addr().unwrap()
+            );
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std_mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").unwrap();
+                    stream.flush().unwrap();
+                }
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (cancel_tx, mut cancel) = watch::channel(false);
+            let input = decision_input();
+            let offer = openai_offer(&url);
+            let result = runtime.block_on(async {
+                let worker = run_decision_worker(
+                    &url,
+                    None,
+                    "typesafe/jev-1.13",
+                    &input,
+                    &offer,
+                    now_ms() + 2000,
+                    &mut cancel,
+                    "run:fixture",
+                    "fixture-request",
+                    None,
+                );
+                let interrupt = async {
+                    ready_rx.await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    cancel_tx.send(true).unwrap();
+                };
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::join!(worker, interrupt).0
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            });
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::SettlementUnknown,
+                    output: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn decision_restart_reconciles_unknown_without_another_post() {
+        let server = start_server(Vec::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (updates, _receiver) = mpsc::channel(1);
+        let executor = LiveAdapterExecutor::new(runtime.handle().clone(), updates);
+        let mut offer = openai_offer(&server.base_url);
+        offer.operation = decisions::OPERATION.into();
+        offer.input_modalities = vec!["application/json".into()];
+        offer.output_modalities = vec!["application/json".into()];
+        offer.adapter = AdapterConfig::OpenRouterDecisions {
+            api_url: server.base_url.clone(),
+            api_key: None,
+            model: "typesafe/jev-1.13".into(),
+            expected_response_model: None,
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        offer.validate().unwrap();
+        let state = serialize_local_text_backend_state(false).unwrap();
+        let result = executor
+            .reconcile(&offer.adapter, &offer, &openai_binding(), &state)
+            .unwrap();
+        assert!(matches!(
+            result,
+            ReconcileResult::Terminal {
+                status: RunStatus::SettlementUnknown,
+                ..
+            }
+        ));
+        assert!(server.requests.lock().unwrap().is_empty());
+        if let AdapterConfig::OpenRouterDecisions { model, .. } = &mut offer.adapter {
+            *model = "~typesafe/jev-latest".into();
+        }
+        assert!(offer.validate().is_err());
+    }
+
     fn text_input(prompt: &str) -> Value {
         json!({
             "schema": "elastos.model.input.text/v1",
@@ -3106,6 +3764,14 @@ mod tests {
                 "chat_template_kwargs": { "enable_thinking": false },
             })
         );
+        let mut venice = openai_offer("https://api.venice.ai/api/v1/chat/completions");
+        venice.id = "model:venice".to_string();
+        let venice_body = text_generation_request_body(&venice, "hosted", "hello", None);
+        assert_eq!(
+            venice_body["venice_parameters"],
+            json!({ "include_venice_system_prompt": false })
+        );
+        assert!(hosted.get("venice_parameters").is_none());
         assert_eq!(
             responses,
             json!({
@@ -3123,6 +3789,227 @@ mod tests {
         offer.policy.inline_output_bytes_limit = 4_096;
         assert_eq!(text_generation_max_tokens(&offer), 1_024);
         assert_ne!(text_generation_max_tokens(&offer), first);
+    }
+
+    #[test]
+    fn map_backend_http_status_classifies_hosted_failures() {
+        let cases = [
+            (
+                401,
+                ErrorClass::AuthenticationRejected,
+                "authentication_rejected",
+            ),
+            (
+                403,
+                ErrorClass::AuthenticationRejected,
+                "authentication_rejected",
+            ),
+            (408, ErrorClass::BackendTimeout, "backend_timeout"),
+            (429, ErrorClass::RateLimited, "rate_limited"),
+            (400, ErrorClass::ContextRejected, "context_rejected"),
+            (413, ErrorClass::ContextRejected, "context_rejected"),
+            (422, ErrorClass::ContextRejected, "context_rejected"),
+            (504, ErrorClass::BackendTimeout, "backend_timeout"),
+            (500, ErrorClass::BackendFailed, "backend_failed"),
+        ];
+        for (code, class, error_code) in cases {
+            let fault =
+                map_backend_http_status(reqwest::StatusCode::from_u16(code).expect("test status"));
+            assert_eq!(fault.error.class, class, "status {code}");
+            assert_eq!(fault.error.code, error_code, "status {code}");
+            assert_eq!(
+                fault.detail.as_deref(),
+                Some(format!("unexpected backend status {code}").as_str()),
+                "status {code}"
+            );
+        }
+    }
+
+    fn hosted_openai_status_fault(status_line: &'static str) -> AdapterFault {
+        let server = start_server(vec![HttpResponseSpec {
+            status_line,
+            body: br#"{"error":{"message":"fixture-denied-body"}}"#.to_vec(),
+            headers: Vec::new(),
+        }]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
+            run_id: "run-hosted-status".to_string(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
+            offer: openai_offer(&format!("{}/chat", server.base_url)),
+            deadline_ms: now_ms().saturating_add(30_000),
+            prompt: "hello".to_string(),
+            cancel_rx,
+            updates: update_tx,
+        };
+        let fault = runtime
+            .block_on(run_local_text_worker_inner(&mut task))
+            .unwrap_err();
+        assert!(update_rx.try_recv().is_err());
+        let encoded = format!("{fault:?}");
+        assert!(
+            !encoded.contains("fixture-denied-body"),
+            "hosted fault must omit backend body"
+        );
+        assert!(
+            !encoded.contains("secret"),
+            "hosted fault must omit the configured credential"
+        );
+        fault
+    }
+
+    #[test]
+    fn hosted_openai_compatible_401_is_authentication_rejected() {
+        let fault = hosted_openai_status_fault("401 Unauthorized");
+        assert_eq!(fault.error.class, ErrorClass::AuthenticationRejected);
+        assert_eq!(fault.error.code, "authentication_rejected");
+    }
+
+    #[test]
+    fn hosted_runtime_refusal_keeps_owner_access_distinct_from_provider_403() {
+        use std::os::unix::net::UnixListener;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (marker, expected_code, expected_message) in [
+            (
+                Some("pending"),
+                "hosted_access_pending",
+                "waiting for approval",
+            ),
+            (Some("denied"), "hosted_access_denied", "was denied"),
+            (
+                Some("ended"),
+                "hosted_access_ended",
+                "Approve the new request",
+            ),
+            (Some("refused"), "hosted_effect_refused", "Runtime refused"),
+            (
+                None,
+                "authentication_rejected",
+                "backend rejected authentication",
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "elastos-hosted-refusal-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..count])
+                    .starts_with("POST /v1/hosted-effect "));
+                let header = marker
+                    .map(|state| format!("X-Elastos-Hosted-Access: {state}\r\n"))
+                    .unwrap_or_default();
+                write!(stream, "HTTP/1.1 403 Forbidden\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let (update_tx, mut update_rx) = mpsc::channel(1);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let mut task = LocalTextWorkerTask {
+                request_id: "fixture-request".into(),
+                hosted_socket: Some(path.to_string_lossy().into_owned()),
+                run_id: "run-hosted-refusal".into(),
+                generation: 1,
+                backend: LocalTextBackend::OpenAiCompatible {
+                    api_url: "https://example.invalid/chat".into(),
+                    api_key: None,
+                    model: "fixture-model".into(),
+                },
+                offer: openai_offer("https://example.invalid/chat"),
+                deadline_ms: now_ms().saturating_add(30_000),
+                prompt: "hello".into(),
+                cancel_rx,
+                updates: update_tx,
+            };
+            let fault = runtime
+                .block_on(run_local_text_worker_inner(&mut task))
+                .unwrap_err();
+            server.join().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(update_rx.try_recv().is_err());
+            assert_eq!(fault.error.code, expected_code);
+            assert!(fault.error.message.contains(expected_message));
+            assert_eq!(
+                fault.error.class,
+                if marker.is_some() {
+                    ErrorClass::AccessRefused
+                } else {
+                    ErrorClass::AuthenticationRejected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_openai_compatible_429_is_rate_limited() {
+        let fault = hosted_openai_status_fault("429 Too Many Requests");
+        assert_eq!(fault.error.class, ErrorClass::RateLimited);
+        assert_eq!(fault.error.code, "rate_limited");
+    }
+
+    #[test]
+    fn hosted_openai_compatible_400_is_context_rejected() {
+        let fault = hosted_openai_status_fault("400 Bad Request");
+        assert_eq!(fault.error.class, ErrorClass::ContextRejected);
+        assert_eq!(fault.error.code, "context_rejected");
+    }
+
+    #[test]
+    fn hosted_openai_compatible_deadline_is_backend_timeout() {
+        let server = start_server_with_first_byte_delay(
+            vec![HttpResponseSpec {
+                status_line: "200 OK",
+                body: sse_body(&[], true),
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            }],
+            Duration::from_millis(1_200),
+        );
+        let mut offer = openai_offer(&format!("{}/chat", server.base_url));
+        offer.policy.runtime_ms_limit = 200;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
+            run_id: "run-hosted-timeout".to_string(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
+            offer,
+            deadline_ms: now_ms().saturating_add(200),
+            prompt: "hello".to_string(),
+            cancel_rx,
+            updates: update_tx,
+        };
+        let fault = runtime
+            .block_on(run_local_text_worker_inner(&mut task))
+            .unwrap_err();
+        assert_eq!(fault.error.class, ErrorClass::BackendTimeout);
+        assert_eq!(fault.error.code, "backend_timeout");
+        assert!(update_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3198,6 +4085,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(1);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-delayed-first-byte".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -3409,6 +4298,8 @@ mod tests {
                 .unwrap();
             let result = runtime.block_on(async move {
                 let mut task = LocalTextWorkerTask {
+                    request_id: "fixture-request".into(),
+                    hosted_socket: None,
                     run_id: "run-coalesced".to_string(),
                     generation: 1,
                     backend: LocalTextBackend::OpenAiCompatible {
@@ -3560,6 +4451,8 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker = tokio::spawn(async move {
             let mut task = LocalTextWorkerTask {
+                request_id: "fixture-request".into(),
+                hosted_socket: None,
                 run_id: "small-live-delta".into(),
                 generation: 1,
                 backend: LocalTextBackend::OpenAiCompatible {
@@ -3681,6 +4574,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-admitted-budget".into(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -3884,6 +4779,8 @@ mod tests {
         let (update_tx, mut update_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-truncated".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -3922,6 +4819,8 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         drop(cancel_tx);
         let mut task = LocalTextWorkerTask {
+            request_id: "fixture-request".into(),
+            hosted_socket: None,
             run_id: "run-control-loss".to_string(),
             generation: 1,
             backend: LocalTextBackend::OpenAiCompatible {
@@ -4001,6 +4900,7 @@ mod tests {
                 &offer,
                 &binding(),
                 &serialize_http_job_backend_state(&state).unwrap(),
+                None,
             ))
             .unwrap();
         let ReconcileResult::StillRunning {
@@ -4059,6 +4959,7 @@ mod tests {
                     cancel_deadline_ms: None,
                 })
                 .unwrap(),
+                None,
             ))
             .unwrap();
 
@@ -4313,6 +5214,7 @@ mod tests {
                     cancel_deadline_ms: None,
                 })
                 .unwrap(),
+                None,
             ))
             .unwrap_err();
 
@@ -4321,5 +5223,93 @@ mod tests {
         let public_error = serde_json::to_string(&fault.error).unwrap();
         assert!(!public_error.contains("/status-redirect"));
         assert!(!public_error.contains(&target.base_url));
+    }
+
+    #[test]
+    fn queued_external_workers_refuse_before_create_status_cancel_or_text_sockets() {
+        let sink = start_server(vec![]);
+        let url = format!("{}/blocked", sink.base_url);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.set(false));
+        let artifact = offer();
+        let text = openai_offer(&url);
+        let input = json!({});
+        let fault = runtime.block_on(run_http_artifact_create_worker_inner(
+            &url,
+            Some("fixture-key"),
+            5,
+            &artifact,
+            &binding(),
+            &input,
+            None,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        let fault = runtime.block_on(run_http_artifact_status_worker_inner(
+            &url,
+            Some("fixture-key"),
+            5,
+            &artifact,
+            &binding(),
+            &input,
+            None,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        let fault = runtime.block_on(run_http_artifact_cancel_worker_inner(
+            &url,
+            Some("fixture-key"),
+            &artifact,
+            &binding(),
+            &input,
+            None,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (updates, _receiver) = mpsc::channel(1);
+        for backend in [
+            LocalTextBackend::OpenAiCompatible {
+                api_url: url.clone(),
+                api_key: Some("fixture-key".into()),
+                model: "test".into(),
+            },
+            LocalTextBackend::OpenAiResponses {
+                api_url: url.clone(),
+                api_key: Some("fixture-key".into()),
+                model: "test".into(),
+            },
+        ] {
+            let mut task = LocalTextWorkerTask {
+                request_id: "fixture-request".into(),
+                hosted_socket: None,
+                run_id: "run:fixture".into(),
+                generation: 1,
+                backend,
+                offer: text.clone(),
+                deadline_ms: now_ms() + 5000,
+                prompt: "test".into(),
+                cancel_rx: cancel_rx.clone(),
+                updates: updates.clone(),
+            };
+            let fault = runtime.block_on(run_local_text_worker_inner(&mut task));
+            assert!(fault.unwrap_err().error.message.contains("paused"));
+        }
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let fault = runtime.block_on(run_decision_worker(
+            &url,
+            Some("fixture-key"),
+            "fixture/jev",
+            &decision_input(),
+            &text,
+            now_ms() + 5000,
+            &mut cancel,
+            "run:fixture",
+            "fixture-request",
+            None,
+        ));
+        assert!(fault.unwrap_err().error.message.contains("paused"));
+        TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.set(true));
+        assert!(sink.requests.lock().unwrap().is_empty());
     }
 }

@@ -43,8 +43,8 @@ one successful remote session does not prove package portability.
 
 ## Execution order
 
-B01-B16 define release acceptance areas. Current execution slices, owners and
-deadline checkpoints live in [TASKS.md](../TASKS.md#browser-maturity-workstream).
+B01-B16 define release acceptance areas. The current J4 handoff lives in
+[TASKS.md](../TASKS.md#now); dated checkpoints remain in the recorded audits.
 The accepted B01 contract and bounded B04 ownership prerequisites unblock their
 consumers while device and operator qualification remain open. Run local
 installation/usability, operator capability

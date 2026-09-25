@@ -131,14 +131,14 @@ two-Runtime acceptance below.
 The following work is not part of this candidate:
 
 - encrypted mailbox delivery for a sender or recipient that remains offline;
-- durable group catch-up beyond the current bounded gossip buffer;
+- general group catch-up beyond J6's bounded public-room history;
 - user-created group identity and signed membership;
 - silent block as a separate local action from removal;
 - broad discovery rendezvous and abuse controls;
 - multi-device pairing UX;
 - direct-message attachments.
 
-These items remain in `TASKS.md`. Do not add a fallback transport or widen the
+These items remain in [deferred work](DEFERRED_WORK.md#collaboration-identity-and-carrier-boundary). Do not add a fallback transport or widen the
 current candidate to implement them during acceptance.
 
 ## Verification commands

@@ -70,8 +70,8 @@ const WALLET_CONNECTOR_TARGETS = new Set(
   Object.keys(WALLET_CONNECTOR_TARGET_TITLES),
 );
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
-  assistant: new Set(["marketplace"]),
-  "home-agent": new Set(["marketplace"]),
+  assistant: new Set(["marketplace", "system", "inbox"]),
+  "home-agent": new Set(["marketplace", "system", "inbox"]),
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
@@ -1820,13 +1820,23 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
-  if (["assistant", "home-agent"].includes(context.targetId) &&
-      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
-       data.target !== "marketplace" ||
-       !assistantModelsMarketplaceQuery(data.query))) return;
+  if (["assistant", "home-agent"].includes(context.targetId)) {
+    if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])) return;
+    const marketplace = data.target === "marketplace" && assistantModelsMarketplaceQuery(data.query);
+    const settings = data.target === "system" && assistantAiProviderSettingsQuery(data.query);
+    const inbox = data.target === "inbox" && data.query && typeof data.query === "object"
+      && !Array.isArray(data.query) && Object.keys(data.query).length === 0;
+    if (!marketplace && !settings && !inbox) return;
+  }
   if (context.targetId === "marketplace" && target === "assistant" &&
       (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
        !marketplaceAssistantHandoffQuery(data.query))) return;
+  if (context.targetId === "marketplace" && target === "services" &&
+      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
+       || !data.query || typeof data.query !== "object" || Array.isArray(data.query)
+       || Object.keys(data.query).join(",") !== "service_offer_id"
+       || typeof data.query.service_offer_id !== "string"
+       || !/^[A-Za-z0-9_.:-]{1,256}$/.test(data.query.service_offer_id))) return;
   if (
     context.kind === "app-frame" &&
     context.targetId === "wallet" &&
@@ -1980,7 +1990,18 @@ function assistantModelsMarketplaceQuery(query) {
     && MODEL_CONTENT_CID.test(query.model_cid);
 }
 
+function assistantAiProviderSettingsQuery(query) {
+  if (!query || typeof query !== "object" || Array.isArray(query)) {
+    return false;
+  }
+  const keys = Object.keys(query);
+  return keys.length === 1 && keys[0] === "settings" && query.settings === "models";
+}
+
 function marketplaceAssistantHandoffQuery(query) {
+  if (query && typeof query === "object" && !Array.isArray(query)
+      && Object.keys(query).length === 1 && typeof query.offer_id === "string"
+      && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(query.offer_id)) return true;
   if (!query || typeof query !== "object" || Array.isArray(query)
       || !MODEL_CONTENT_CID.test(query.model_cid || "")) {
     return false;

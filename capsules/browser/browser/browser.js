@@ -1091,6 +1091,15 @@ function classifyFreshWindowCloseSummary(summary) {
   if (page) {
     return { state: "owned", page };
   }
+  const closeOwnership = sessions.window_close_ownership;
+  if (
+    sessions.recoverable_page === null &&
+    closeOwnership?.schema === "elastos.browser.window-close-ownership/v1" &&
+    closeOwnership.browser_instance === browserInstanceId &&
+    closeOwnership.state === "absent"
+  ) {
+    return terminalWindowCloseAbsence();
+  }
   return pendingWindowCloseOwnership("runtime_ownership_unproven");
 }
 

@@ -89,6 +89,63 @@ impl BrowserRefInput {
     }
 }
 
+/// The provider-facing projection shares the public ref payload. Runtime alone
+/// supplies lease commands after the owner has approved the authenticated session.
+pub fn browser_operator_event_valid(value: &serde_json::Value) -> bool {
+    let Some(mut object) = value.as_object().cloned() else {
+        return false;
+    };
+    match object
+        .remove("type")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .as_deref()
+    {
+        Some("operator_ref") => {
+            serde_json::from_value::<BrowserRefInput>(serde_json::Value::Object(object))
+                .is_ok_and(|input| input.valid())
+        }
+        Some("operator_lease") => {
+            let id = object
+                .get("admission_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !(32..=36).contains(&id.len())
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
+            {
+                return false;
+            }
+            match object.get("command").and_then(|v| v.as_str()) {
+                Some("release") => object.len() == 2,
+                Some("acquire") => {
+                    object.len() == 5
+                        && object
+                            .get("document_generation")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(browser_operator_id_valid)
+                        && object
+                            .get("duration_ms")
+                            .and_then(|v| v.as_u64())
+                            .is_some_and(|n| (2000..=30000).contains(&n))
+                        && object
+                            .get("actions")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|actions| {
+                                (1..=2).contains(&actions.len())
+                                    && (actions.len() != 2 || actions[0] != actions[1])
+                                    && actions.iter().all(|action| {
+                                        matches!(action.as_str(), Some("click" | "type" | "fill"))
+                                    })
+                            })
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,62 +246,5 @@ mod tests {
                 .unwrap()
                 .valid());
         }
-    }
-}
-
-/// The provider-facing projection shares the public ref payload. Runtime alone
-/// supplies lease commands after the owner has approved the authenticated session.
-pub fn browser_operator_event_valid(value: &serde_json::Value) -> bool {
-    let Some(mut object) = value.as_object().cloned() else {
-        return false;
-    };
-    match object
-        .remove("type")
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .as_deref()
-    {
-        Some("operator_ref") => {
-            serde_json::from_value::<BrowserRefInput>(serde_json::Value::Object(object))
-                .is_ok_and(|input| input.valid())
-        }
-        Some("operator_lease") => {
-            let id = object
-                .get("admission_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if !(32..=36).contains(&id.len())
-                || !id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
-            {
-                return false;
-            }
-            match object.get("command").and_then(|v| v.as_str()) {
-                Some("release") => object.len() == 2,
-                Some("acquire") => {
-                    object.len() == 5
-                        && object
-                            .get("document_generation")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(browser_operator_id_valid)
-                        && object
-                            .get("duration_ms")
-                            .and_then(|v| v.as_u64())
-                            .is_some_and(|n| (2000..=30000).contains(&n))
-                        && object
-                            .get("actions")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|actions| {
-                                (1..=2).contains(&actions.len())
-                                    && (actions.len() != 2 || actions[0] != actions[1])
-                                    && actions.iter().all(|action| {
-                                        matches!(action.as_str(), Some("click" | "type" | "fill"))
-                                    })
-                            })
-                }
-                _ => false,
-            }
-        }
-        _ => false,
     }
 }

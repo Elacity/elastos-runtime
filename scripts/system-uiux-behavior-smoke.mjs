@@ -826,6 +826,32 @@ async function main() {
     );
     await malformedPage.close();
 
+    await page.goto(`${server.baseUrl}/fixture?settings=models`, {
+      waitUntil: "networkidle",
+    });
+    frame = await waitForSystemFrame(page);
+    await frame.waitForFunction(
+      () => document.querySelector("#ai-provider-instances .ai-provider-instance"),
+    );
+    const hostedPause = await frame.evaluate(() => {
+      const card = [...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
+        .find((node) => node.textContent.includes("VeniceQwen3.8F"));
+      return {
+        note: document.querySelector("#ai-provider-egress-note")?.textContent?.trim(),
+        state: card?.querySelector(".ai-provider-state")?.textContent?.trim(),
+        useDisabled: card?.querySelector("button")?.disabled,
+        lens: document.querySelector("#approval-lens-status")?.textContent?.trim(),
+      };
+    });
+    assert(
+      hostedPause.note?.includes("External HTTPS is paused") &&
+        hostedPause.state === "External HTTPS paused" &&
+        hostedPause.useDisabled === true &&
+        hostedPause.lens?.includes("external HTTPS paused"),
+      "System did not show saved hosted connections as paused",
+      hostedPause,
+    );
+
     assert(
       appearancePlans.length === 0,
       "System behavior smoke left planned appearance replies unused",

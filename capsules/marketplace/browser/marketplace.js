@@ -1,3 +1,5 @@
+import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_OFFER_ID } from "./model-services.js";
+
 (function () {
   const params = new URLSearchParams(window.location.search);
   const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -24,6 +26,13 @@
     mediaLoadError: null,
     mediaTruncated: false,
     modelCatalogState: "unconfigured",
+    sharedModels: [],
+    modelAccess: [],
+    sharedLoading: false,
+    sharedLoaded: false,
+    sharedError: "",
+    accessError: "",
+    remoteAvailability: [],
   };
 
   const pendingMediaBuys = new Set();
@@ -301,7 +310,38 @@
     await Promise.all([
       loadCatalogData().then(render),
       loadMediaData().then(render),
+      ...(state.sharedLoaded ? [loadSharedModels()] : []),
     ]);
+  }
+
+  async function loadSharedModels() {
+    if (state.sharedLoading) return;
+    state.sharedLoading = true;
+    state.sharedLoaded = true;
+    state.sharedModels = [];
+    state.modelAccess = [];
+    state.remoteAvailability = [];
+    state.sharedError = state.accessError = "";
+    render();
+    const read = async (url, post = false) => {
+      const response = await fetch(url, { method: post ? "POST" : "GET", headers: {
+        "x-elastos-home-token": homeToken, ...(post ? { "content-type": "application/json" } : {}),
+      }, ...(post ? { body: "{}" } : {}), signal: AbortSignal.timeout(35000) });
+      if (!response.ok) throw new Error("Model access unavailable");
+      const reply = await response.json();
+      if (reply?.status === "error") throw new Error("Model access unavailable");
+      return reply;
+    };
+    // Summary reconciles new Inbox approvals into grants before discovery reads them.
+    await read("/api/apps/services/summary")
+      .then(reply => { state.modelAccess = modelAccessOpportunities(reply); })
+      .catch(() => { state.accessError = "Access status is unavailable. Open Services or refresh."; });
+    await read("/api/provider/model/offers_list", true).then(reply => {
+      state.sharedModels = sharedModelOffers(reply);
+      state.remoteAvailability = (reply?.data ?? reply)?.remote_services || [];
+    }).catch(() => { state.sharedError = "Shared models are unavailable. Refresh to check again."; });
+    state.sharedLoading = false;
+    render();
   }
 
   async function loadCatalogData() {
@@ -566,6 +606,7 @@
 
   function selectDestination(id, options = {}) {
     state.destination = normalizeDestination(id);
+    if (state.destination === "models" && !state.sharedLoaded) void loadSharedModels();
     document.querySelectorAll("[data-destination]").forEach((node) => {
       const selected = node.dataset.destination === state.destination;
       node.classList.toggle("selected", selected);
@@ -628,6 +669,7 @@
   }
 
   function surfaceState() {
+    if (state.destination === "models") return { destination: "models", loading: false, error: null };
     if (state.destination === "media") {
       return {
         destination: "media",
@@ -695,17 +737,60 @@
     bindAppActions(els.storeSections);
   }
 
+  function openAiProviderSettings() {
+    if (window.top === window || !homeParentOrigin) {
+      showToast("Open Apps from Home to open Settings.", true);
+      return;
+    }
+    window.top.postMessage({
+      type: "home:open-target",
+      target: "system",
+      query: { settings: "models" },
+      homeToken,
+    }, homeParentOrigin);
+  }
+
+  function modelsSettingsChrome() {
+    return `<div class="store-models-settings">
+      <button class="store-pill" type="button" data-action="open-ai-provider-settings">Manage models</button>
+      <button class="store-pill" type="button" data-action="refresh-shared-models" ${state.sharedLoading ? "disabled" : ""}>Refresh shared models</button>
+    </div>`;
+  }
+
+  function renderModels() {
+    const local = filteredByDestination();
+    const matches = item => !state.search || JSON.stringify(item).toLowerCase().includes(state.search);
+    const shared = state.sharedModels.filter(matches);
+    const access = state.modelAccess.filter(matches);
+    const localStatus = state.appLoading ? "Loading verified models…" : state.appLoadError
+      || (state.modelCatalogState === "unavailable" ? "The model catalog could not be verified." : "");
+    const unavailable = state.remoteAvailability.filter(service => service.status !== "reachable").length;
+    els.storeSections.innerHTML = `${modelsSettingsChrome()}
+      <section class="store-section"><h2 class="store-section-title">On this Home</h2>
+        <p>Get a verified model to run on this device. Prompts stay here.</p>
+        ${localStatus ? `<p role="status">${escapeHtml(localStatus)}</p>` : local.length ? renderSection("Models", local, { showHeading: false }) : '<p>No matching verified models.</p>'}
+      </section>
+      <section class="store-section"><h2 class="store-section-title">Shared with me</h2>
+        <p>These exact models are available through access approved by their Home.</p>
+        ${state.sharedLoading ? '<p role="status">Checking shared models…</p>' : state.sharedError ? `<p role="status">${escapeHtml(state.sharedError)}</p>` : shared.length ? shared.map(model => `<article class="shared-model-card">
+          <div class="store-section-head"><h3>${escapeHtml(model.title)}</h3><button class="store-pill" data-action="use-shared-model" data-offer="${escapeAttr(model.id)}">Use in Assistant</button></div>
+          <p>Home: ${escapeHtml(model.owner)} · Available when checked</p>
+          <dl class="shared-model-facts">${[{ term: "Model", value: model.facts.requestedModel }, ...model.facts.detailRows].map(row => `<dt>${escapeHtml(row.term)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("")}</dl>
+          <details><summary>Access details</summary><p>Grant expires ${escapeHtml(new Date(model.expiresAt * 1000).toLocaleString())}.</p><p>${escapeHtml(model.id)}</p></details>
+        </article>`).join("") : '<p>No shared model is available from the current check.</p>'}
+        ${unavailable && !state.sharedLoading ? `<p role="status">${unavailable} approved service${unavailable === 1 ? " is" : "s are"} unavailable. Refresh or review access in Services.</p>` : ""}
+      </section>
+      <section class="store-section"><h2 class="store-section-title">Access through People</h2>
+        <p>Ask a connected person for access in Services. Their approval lets this Home check which models they share.</p>
+        ${state.accessError ? `<p role="status">${escapeHtml(state.accessError)}</p>` : access.map(item => `<article class="shared-model-card"><div class="store-section-head"><div><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.status)}</p></div><button class="store-pill" data-action="model-service-access" data-offer="${escapeAttr(item.id)}">${item.requestable ? "Request access" : "Review access"}</button></div></article>`).join("")}
+      </section>`;
+    bindAppActions(els.storeSections);
+  }
+
   function renderCategorySections() {
+    if (state.destination === "models") { renderModels(); return; }
     const apps = filteredByDestination();
     if (!apps.length) {
-      if (state.destination === "models" && !state.search) {
-        els.storeSections.innerHTML = emptyState(
-          state.modelCatalogState === "unavailable" ? "Models are unavailable" : "No models available",
-          state.modelCatalogState === "unavailable" ? "The model catalog could not be verified. Refresh to check again." : "Verified models on this Home will appear here.",
-          icons.package,
-        );
-        return;
-      }
       els.storeSections.innerHTML = emptyState(
         state.search ? "No results" : "No apps in this category",
         state.search ? "Try a different search." : "Choose another category from the sidebar.",
@@ -969,7 +1054,10 @@
         <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
       </header>
       <div class="modal-body">
-        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>` : `<section class="modal-section">
+        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>
+        <section class="modal-section">
+          <button class="modal-btn secondary" type="button" data-action="open-ai-provider-settings">Manage storage in System</button>
+        </section>` : `<section class="modal-section">
           <div class="modal-section-title">About</div>
           <div class="modal-description">${escapeHtml(app.description)}</div>
         </section>
@@ -1233,6 +1321,18 @@
         }
         if (action === "close-detail") {
           closeDetail();
+        }
+        if (action === "open-ai-provider-settings") {
+          openAiProviderSettings();
+        }
+        if (action === "refresh-shared-models") void loadSharedModels();
+        if (action === "use-shared-model" && REMOTE_MODEL_ID.test(target.dataset.offer || "")
+            && state.sharedModels.some(model => model.id === target.dataset.offer)) {
+          window.top.postMessage({ type: "home:open-target", target: "assistant", query: { offer_id: target.dataset.offer }, homeToken }, homeParentOrigin);
+        }
+        if (action === "model-service-access" && SERVICE_OFFER_ID.test(target.dataset.offer || "")
+            && state.modelAccess.some(item => item.id === target.dataset.offer)) {
+          window.top.postMessage({ type: "home:open-target", target: "services", query: { service_offer_id: target.dataset.offer }, homeToken }, homeParentOrigin);
         }
       });
       node.addEventListener("keydown", (event) => {

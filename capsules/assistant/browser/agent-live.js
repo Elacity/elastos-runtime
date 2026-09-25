@@ -96,21 +96,109 @@ export function getLiveInferenceState() {
 
 /** Chat offers → model-menu rows. An offer exists only when its backend is
  * configured (readiness-honest provider), so listing is the truth probe. */
+const lastBackendReports = Object.create(null);
+let backendReportRunId = "";
+
 function chatOfferRows(offers) {
-  return textOfferRows(eligibleTextOffers(offers));
+  const reports = Object.create(null);
+  for (const [offerId, entry] of Object.entries(lastBackendReports)) {
+    if (entry && entry.runId === backendReportRunId && entry.report) {
+      reports[offerId] = entry.report;
+    }
+  }
+  return textOfferRows(eligibleTextOffers(offers), reports);
+}
+
+function forgetBackendReport(offerId) {
+  if (typeof offerId === "string" && offerId.trim() !== "") {
+    delete lastBackendReports[offerId];
+  }
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+function rememberBackendReport(offerId, report, runId) {
+  if (
+    typeof offerId !== "string" ||
+    offerId.trim() === "" ||
+    typeof runId !== "string" ||
+    runId.trim() === "" ||
+    !report ||
+    typeof report !== "object"
+  ) {
+    return;
+  }
+  if (runId !== backendReportRunId) {
+    return;
+  }
+  lastBackendReports[offerId] = { runId, report };
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
+}
+
+/** A new chat or offer run must not inherit another run's backend facts. */
+export function clearBackendReports() {
+  for (const key of Object.keys(lastBackendReports)) {
+    delete lastBackendReports[key];
+  }
+  backendReportRunId = "";
+  if (offersCache) {
+    liveState.models = chatOfferRows(offersCache);
+  }
 }
 
 /* An existing choice stays exact. Only a workspace with no choice uses the
    initial first advertised offer; later absence never substitutes another. */
 let selectedLiveOfferId = "";
 let selectedContentCid = null;
+let selectionEpoch = 0;
 
 export function selectLiveOffer(offerId, modelCid = null) {
+  ++selectionEpoch;
   selectedLiveOfferId = typeof offerId === "string" ? offerId : "";
   selectedContentCid = modelCid;
   if (!liveState.checking) {
     liveState.live = Boolean(currentChoice(liveState.models, liveState.catalogModels));
   }
+}
+
+// Explicit user selection retains verified local content. Workspace restore and
+// launch hydration continue to use selectLiveOffer without changing retention.
+export async function selectLiveOfferForUse(offerId, modelCid = null) {
+  const local = liveContentModels().find(model => model.offerId === offerId && (modelCid == null || model.cid === modelCid));
+  // Runtime derives admitted local offer IDs from the verified content binding.
+  // A missing catalog mapping cannot turn that offer into an operator choice.
+  if (modelCid == null && !local && !/^model:[0-9a-f]{64}$/.test(offerId)) {
+    selectLiveOffer(offerId);
+    return true;
+  }
+  const failure = () => new Error("Could not keep this model on this device. Select it again to retry.");
+  if (!local) throw failure();
+  const epoch = selectionEpoch;
+  const token = getHomeGuiLaunchToken();
+  if (!token) throw failure();
+  const body = { capsule: "assistant", interface: "elastos.assistant.model", method: "content.retention",
+    request_id: newRequestId(), input: { cid: local.cid, keep: true } };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 35000);
+  try {
+    const response = await fetch(new URL("/api/capsules/interfaces/invoke", window.location.href).href, {
+      method: "POST", headers: { "content-type": "application/json", "x-elastos-home-token": token },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
+    const result = await response.json();
+    if (!response.ok || result.schema !== "elastos.capsules.invoke-result/v1" || result.status !== "ok"
+        || !["capsule", "interface", "method", "request_id"].every(key => result[key] === body[key])
+        || result.output?.cid !== local.cid || result.output.kept !== true || result.output.admitted !== true) throw failure();
+    if (epoch !== selectionEpoch) return false;
+    if (!liveContentModels().some(model => model.cid === local.cid && model.offerId === offerId)) throw failure();
+    selectLiveOffer(offerId, local.cid);
+    return true;
+  } catch {
+    throw failure();
+  } finally { clearTimeout(timeout); }
 }
 
 export function liveContentChoice() { return selectedContentCid; }
@@ -128,8 +216,7 @@ export function liveOfferChoice() {
 }
 
 export function selectedLiveOffer() {
-  if (!liveState.live || liveState.checking) return null;
-  return currentChoice(liveState.models, liveState.catalogModels);
+  return currentChoice(liveState.models, liveState.catalogModels) || null;
 }
 
 /** Cached offers_list — model menu + Configure panel + probe share it. */
@@ -170,7 +257,6 @@ export async function probeLiveInference({ force = false } = {}) {
   }
   const epoch = ++probeEpoch;
   liveState.checking = true;
-  liveState.live = false;
   probePromise = (async () => {
     try {
       /* Reachability and offers in one call: the 0.7.1 model-provider contract
@@ -347,6 +433,15 @@ export async function modelRunCall(op, body = {}) {
     const error = new Error(data?.message || data?.code || `model ${op} failed (${res.status})`);
     error.code = data?.code || "model_error";
     error.status = res.status;
+    if (data?.code === "approval_required") error.approvalOfferId = body.offer_id;
+    error.preDispatchRefusal =
+      data?.code === "approval_required" || data?.code === "approval_denied"
+      || (op === "runs_create" && res.status === 409
+        && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(body.offer_id)
+        && data?.code === "remote_model_invocation_refused"
+        && data?.refusal?.schema === "elastos.model.invocation-refusal/v1"
+        && data.refusal.scope === "invocation" && data.refusal.dispatch === "not_started"
+        && data.refusal.request_id === body.request_id && data.refusal.offer_id === body.offer_id);
     throw error;
   }
   return data?.data ?? data;
@@ -431,7 +526,11 @@ export async function streamChatViaContract(
   let created;
   let runId;
   const createRequestId = resuming ? null : newRequestId();
-  if (!resuming) patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
+  if (!resuming) {
+    backendReportRunId = "";
+    forgetBackendReport(offer?.offerId);
+    patch({ createRequestId, state: TurnState.SUBMITTED, completedAt: null });
+  }
   try {
     created = resuming
       ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
@@ -445,7 +544,8 @@ export async function streamChatViaContract(
     if (!resuming) {
       const refused = error.preDispatchRefusal === true;
       patch({ state: refused ? TurnState.FAILED : TurnState.SETTLEMENT_UNKNOWN,
-        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null });
+        error: refused ? error.code : "run_acceptance_unknown", completedAt: refused ? Date.now() : null,
+        ...(error.approvalOfferId ? { approvalOfferId: error.approvalOfferId } : {}) });
       if (!refused) throw contractError("run_acceptance_unknown", "Run acceptance is unknown. Start a new chat.");
     }
     throw error;
@@ -457,6 +557,7 @@ export async function streamChatViaContract(
     ? Number(created.sequence_cursor)
     : 0;
   run.id = runId;
+  backendReportRunId = runId;
   patch({
     providerRunId: runId,
     state: TurnState.SUBMITTED,
@@ -514,6 +615,7 @@ export async function streamChatViaContract(
     );
   };
   const createdTerminal = created.terminal && typeof created.terminal === "object" ? created.terminal : null;
+  rememberBackendReport(offer?.offerId, createdTerminal?.backend_report, runId);
   if (createdTerminal && created.output_retained === false) {
     createdTerminal.outputRetained = false;
   }
@@ -540,6 +642,7 @@ export async function streamChatViaContract(
         return finish({ detached: true });
       }
       const applied = applyRunEventsPage(page, afterSequence);
+      rememberBackendReport(offer?.offerId, applied.backendReport, runId);
       afterSequence = applied.nextCursor;
       let eventsInSlice = 0;
       let sliceStart = Date.now();

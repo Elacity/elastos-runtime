@@ -123,7 +123,19 @@ for target_dir in marketplace/browser system/browser; do
   done
 done
 
-for target_dir in assistant/browser home-agent/browser; do
+# Marketplace and Assistant present the same provider-owned model facts.
+model_facts_source="capsules/assistant/browser/model-contract.js"
+model_facts_target="capsules/marketplace/browser/model-contract.js"
+if [[ "$MODE" == "--check" ]]; then
+  if ! cmp -s "$model_facts_source" "$model_facts_target"; then
+    echo "[vendor-ui] DRIFT: $model_facts_target" >&2
+    FAILED=1
+  fi
+else
+  cp "$model_facts_source" "$model_facts_target"
+fi
+
+for target_dir in assistant/browser; do
   model_target="capsules/$target_dir/model-selection.js"
   if [[ "$MODE" == "--check" ]]; then
     if ! cmp -s capsules/_shared/model-selection.js "$model_target"; then

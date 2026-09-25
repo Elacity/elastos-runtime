@@ -26,6 +26,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::address_lookup::AddrFilter;
+use iroh::endpoint::{BeforeConnectOutcome, EndpointHooks};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, SecretKey, Watcher};
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -426,6 +428,7 @@ pub struct GossipState {
     peers: Arc<Mutex<Vec<String>>>,
     topic_peers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     did: Option<String>,
+    direct_only: bool,
     browser_exit_network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
     browser_exit_reservations: browser_exit::BrowserExitReservations,
     browser_engine_probe_slots: Arc<tokio::sync::Semaphore>,
@@ -458,6 +461,7 @@ impl GossipState {
             peers: Arc::new(Mutex::new(Vec::new())),
             topic_peers: Arc::new(Mutex::new(HashMap::new())),
             did,
+            direct_only: false,
         }
     }
 }
@@ -508,12 +512,20 @@ fn add_ticket_endpoints(
     bootstrap_peers: &mut Vec<iroh::EndpointId>,
     endpoints: &[iroh::EndpointAddr],
     mark_bootstrap: bool,
+    network: Option<CarrierNodeNetwork>,
 ) -> Vec<String> {
     let mut added = Vec::new();
     for addr in endpoints {
+        let addr = match network {
+            Some(network) => match endpoint_addr_for_network(addr.clone(), network) {
+                Ok(addr) => addr,
+                Err(_) => continue,
+            },
+            None => addr.clone(),
+        };
         let endpoint_id = addr.id;
         let peer_id = endpoint_id.to_string();
-        memory_lookup.add_endpoint_info(addr.clone());
+        memory_lookup.add_endpoint_info(addr);
         if mark_bootstrap && !bootstrap_peers.contains(&endpoint_id) {
             bootstrap_peers.push(endpoint_id);
         }
@@ -546,6 +558,7 @@ fn add_ticket_endpoints(
 fn seed_address_book_from_operator_peer_store(
     memory_lookup: &MemoryLookup,
     data_dir: &std::path::Path,
+    network: CarrierNodeNetwork,
 ) -> Vec<iroh::EndpointId> {
     let config = match load_operator_control(data_dir) {
         Ok(config) => config,
@@ -575,7 +588,13 @@ fn seed_address_book_from_operator_peer_store(
             continue;
         }
 
-        add_ticket_endpoints(memory_lookup, &mut bootstrap_peers, &endpoints, true);
+        add_ticket_endpoints(
+            memory_lookup,
+            &mut bootstrap_peers,
+            &endpoints,
+            true,
+            Some(network),
+        );
         debug!(
             peer_did,
             "seeded Carrier address book from operator peer store"
@@ -954,7 +973,7 @@ async fn join_gossip_topic(
     force_direct: bool,
 ) -> Result<()> {
     let bootstrap_peers = state.bootstrap_peers.clone();
-    if force_direct {
+    if force_direct || state.direct_only {
         return join_gossip_topic_direct(state, topic_name, bootstrap_peers).await;
     }
 
@@ -1064,18 +1083,210 @@ pub async fn start_carrier_node(
 /// How a Carrier node attaches to the network.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CarrierNodeNetwork {
-    /// Production networking: N0 relay and public address discovery, mDNS
-    /// (unless disabled by env), and the well-known 4433 bind attempt.
+    /// Explicit N0 constructor for tests that still need public discovery.
+    /// Operator configuration cannot select this value.
     Public,
-    /// Loopback-scope networking for tests: no relay, no public address
-    /// discovery, no mDNS, ephemeral bind. Peers are reachable only through
-    /// explicit `MemoryLookup` seeding, so nothing in a test depends on
-    /// public infrastructure, NAT behavior, or the shared 4433 port. A
-    /// connect between two public-preset in-process nodes races the relay
-    /// and NAT-observed paths against the local one and can fail with
-    /// CONNECTION_REFUSED under load.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Direct connections only. The Minimal preset has no public Iroh relay
+    /// and no public address discovery. Peers use explicit tickets and
+    /// MemoryLookup. An approved ElastOS relay stays CR3. This constructor
+    /// rejects `ELASTOS_RELAY_URL`.
     Isolated,
+}
+
+/// Shared network selector. Unset and `direct` are Isolated/Minimal.
+/// `public` is an error so configuration cannot restore N0 defaults.
+/// An empty or unknown value is an error.
+fn parse_elastos_carrier_network(raw: Option<&str>) -> anyhow::Result<CarrierNodeNetwork> {
+    let Some(raw) = raw else {
+        return Ok(CarrierNodeNetwork::Isolated);
+    };
+    let raw = raw.trim();
+    anyhow::ensure!(!raw.is_empty(), "ELASTOS_CARRIER_NETWORK is empty");
+    match raw {
+        "direct" => Ok(CarrierNodeNetwork::Isolated),
+        "public" => anyhow::bail!("ELASTOS_CARRIER_NETWORK=public is invalid: use direct"),
+        other => anyhow::bail!("ELASTOS_CARRIER_NETWORK is invalid: {other}"),
+    }
+}
+
+/// Operator-approved ElastOS relay URL. Empty or invalid is an error.
+/// The direct constructor rejects a present URL until CR3 names the relay.
+fn parse_elastos_relay_url(raw: Option<&str>) -> anyhow::Result<Option<url::Url>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    anyhow::ensure!(!raw.is_empty(), "ELASTOS_RELAY_URL is empty");
+    raw.parse::<url::Url>()
+        .map(Some)
+        .map_err(|err| anyhow::anyhow!("ELASTOS_RELAY_URL is not a valid URL: {err}"))
+}
+
+#[cfg(test)]
+fn endpoint_route_census(addr: &iroh::EndpointAddr) -> (usize, usize) {
+    let mut route_direct = 0usize;
+    let mut route_relayed = 0usize;
+    for transport in &addr.addrs {
+        if transport.is_ip() {
+            route_direct += 1;
+        } else if transport.is_relay() {
+            route_relayed += 1;
+        }
+    }
+    (route_direct, route_relayed)
+}
+
+fn endpoint_addr_for_network(
+    addr: iroh::EndpointAddr,
+    network: CarrierNodeNetwork,
+) -> anyhow::Result<iroh::EndpointAddr> {
+    if network != CarrierNodeNetwork::Isolated {
+        return Ok(addr);
+    }
+    let mut next = addr;
+    next.addrs.retain(|transport| transport.is_ip());
+    anyhow::ensure!(
+        !next.addrs.is_empty(),
+        "direct-only Carrier has no IP route to the peer"
+    );
+    Ok(next)
+}
+
+fn retain_network_ticket_endpoints(
+    endpoints: Vec<iroh::EndpointAddr>,
+    network: CarrierNodeNetwork,
+) -> Vec<iroh::EndpointAddr> {
+    endpoints
+        .into_iter()
+        .filter_map(|addr| endpoint_addr_for_network(addr, network).ok())
+        .collect()
+}
+
+fn published_direct_endpoint_addr(addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
+    let mut next = addr;
+    next.addrs.retain(|transport| transport.is_ip());
+    next
+}
+
+fn direct_only_relay_only_error(endpoints: &[iroh::EndpointAddr]) -> Option<serde_json::Value> {
+    let has_relay = endpoints
+        .iter()
+        .any(|addr| addr.addrs.iter().any(|transport| transport.is_relay()));
+    if !has_relay {
+        return None;
+    }
+    if retain_network_ticket_endpoints(endpoints.to_vec(), CarrierNodeNetwork::Isolated).is_empty()
+    {
+        Some(serde_json::json!({
+            "status": "error",
+            "code": "foreign_relay_rejected",
+            "message": "direct-only Carrier has no IP route to the peer"
+        }))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct RejectForeignRelayHook;
+
+impl EndpointHooks for RejectForeignRelayHook {
+    async fn before_connect<'a>(
+        &'a self,
+        remote_addr: &'a iroh::EndpointAddr,
+        _alpn: &'a [u8],
+    ) -> BeforeConnectOutcome {
+        if remote_addr
+            .addrs
+            .iter()
+            .any(|transport| transport.is_relay())
+        {
+            BeforeConnectOutcome::Reject
+        } else {
+            BeforeConnectOutcome::Accept
+        }
+    }
+}
+
+fn apply_isolated_endpoint_policy(builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+    builder
+        .addr_filter(AddrFilter::ip_only())
+        .hooks(RejectForeignRelayHook)
+}
+
+fn apply_public_relay_map(
+    builder: iroh::endpoint::Builder,
+    approved: Option<&url::Url>,
+) -> iroh::endpoint::Builder {
+    match approved {
+        Some(relay_url) => {
+            let config = iroh::RelayConfig::new(relay_url.clone().into(), Some(Default::default()));
+            builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])))
+        }
+        None => builder,
+    }
+}
+
+fn short_lived_endpoint_builder(
+    secret_key: SecretKey,
+    network: CarrierNodeNetwork,
+    approved_relay: Option<&url::Url>,
+) -> anyhow::Result<iroh::endpoint::Builder> {
+    anyhow::ensure!(
+        network != CarrierNodeNetwork::Isolated || approved_relay.is_none(),
+        "ELASTOS_RELAY_URL cannot be set with ELASTOS_CARRIER_NETWORK=direct"
+    );
+    Ok(match network {
+        CarrierNodeNetwork::Isolated => apply_isolated_endpoint_policy(
+            Endpoint::builder(iroh::endpoint::presets::Minimal).secret_key(secret_key),
+        ),
+        CarrierNodeNetwork::Public => apply_public_relay_map(
+            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key),
+            approved_relay,
+        ),
+    })
+}
+
+async fn bind_carrier_endpoint(
+    secret_key: SecretKey,
+    network: CarrierNodeNetwork,
+    approved_relay: Option<&url::Url>,
+    requested_bind_addr: std::net::SocketAddr,
+    allow_ephemeral_fallback: bool,
+) -> anyhow::Result<Endpoint> {
+    let builder = || short_lived_endpoint_builder(secret_key.clone(), network, approved_relay);
+    let bound = builder()?.bind_addr(requested_bind_addr).map_err(|error| {
+        anyhow::anyhow!("Invalid Carrier address {requested_bind_addr}: {error}")
+    })?;
+    match bound.bind().await {
+        Ok(endpoint) => Ok(endpoint),
+        Err(error) if !allow_ephemeral_fallback => {
+            anyhow::bail!(
+                "Failed to bind requested Carrier address {requested_bind_addr}: {error}"
+            );
+        }
+        Err(_) => builder()?
+            .bind()
+            .await
+            .context("Failed to bind Carrier endpoint"),
+    }
+}
+
+pub(crate) async fn bind_short_lived_carrier_dial(
+    addr: iroh::EndpointAddr,
+) -> anyhow::Result<(Endpoint, iroh::EndpointAddr)> {
+    let network =
+        parse_elastos_carrier_network(std::env::var("ELASTOS_CARRIER_NETWORK").ok().as_deref())?;
+    let approved = parse_elastos_relay_url(std::env::var("ELASTOS_RELAY_URL").ok().as_deref())?;
+    let addr = endpoint_addr_for_network(addr, network)?;
+    let mut rng_bytes = [0u8; 32];
+    getrandom::getrandom(&mut rng_bytes).map_err(|err| anyhow::anyhow!("rng: {err}"))?;
+    let secret_key = SecretKey::from_bytes(&rng_bytes);
+    let endpoint = short_lived_endpoint_builder(secret_key, network, approved.as_ref())?
+        .bind()
+        .await
+        .context("Failed to bind")?;
+    Ok((endpoint, addr))
 }
 
 /// The well-known Carrier bind address used when an operator names none.
@@ -1105,12 +1316,18 @@ pub async fn start_carrier_node_with_registry_bound(
     provider_registry: Option<Weak<ProviderRegistry>>,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<CarrierNode> {
+    let network =
+        parse_elastos_carrier_network(std::env::var("ELASTOS_CARRIER_NETWORK").ok().as_deref())?;
+    let approved = parse_elastos_relay_url(std::env::var("ELASTOS_RELAY_URL").ok().as_deref())?;
+    if network == CarrierNodeNetwork::Isolated && approved.is_some() {
+        anyhow::bail!("ELASTOS_RELAY_URL cannot be set with ELASTOS_CARRIER_NETWORK=direct");
+    }
     start_carrier_node_with_network(
         signing_key,
         did,
         data_dir,
         provider_registry,
-        CarrierNodeNetwork::Public,
+        network,
         bind_addr,
     )
     .await
@@ -1129,7 +1346,7 @@ pub(crate) async fn start_isolated_carrier_node_with_registry(
         data_dir,
         provider_registry,
         CarrierNodeNetwork::Isolated,
-        None,
+        Some("0.0.0.0:0".parse()?),
     )
     .await
 }
@@ -1150,60 +1367,20 @@ async fn start_carrier_node_with_network(
     }
     let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-    let endpoint = match network {
-        CarrierNodeNetwork::Public => {
-            // Build an endpoint with Iroh's N0 DNS and relay services unless a
-            // custom relay is configured. Topic discovery remains the
-            // tracker's DHT layer.
-            let mut builder =
-                Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key.clone());
-            if let Ok(relay_url) = std::env::var("ELASTOS_RELAY_URL") {
-                if let Ok(url) = relay_url.parse::<url::Url>() {
-                    let config = iroh::RelayConfig::new(url.into(), Some(Default::default()));
-                    builder = builder
-                        .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])));
-                    info!("carrier: using custom relay {}", relay_url);
-                }
-            }
-            let requested_bind_addr = match bind_addr {
-                Some(addr) => addr,
-                None => DEFAULT_CARRIER_BIND_ADDR
-                    .parse::<std::net::SocketAddr>()
-                    .context("default Carrier bind address must parse")?,
-            };
-            match builder
-                .bind_addr(requested_bind_addr)
-                .map_err(|e| anyhow::anyhow!("{}", e))
-            {
-                Ok(builder) => match builder.bind().await {
-                    Ok(ep) => ep,
-                    Err(error) if bind_addr.is_some() => {
-                        anyhow::bail!("Failed to bind requested Carrier address {requested_bind_addr}: {error}");
-                    }
-                    Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
-                        .secret_key(secret_key)
-                        .bind()
-                        .await
-                        .context("Failed to bind Carrier endpoint")?,
-                },
-                Err(error) if bind_addr.is_some() => {
-                    anyhow::bail!(
-                        "Invalid requested Carrier address {requested_bind_addr}: {error}"
-                    );
-                }
-                Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
-                    .secret_key(secret_key)
-                    .bind()
-                    .await
-                    .context("Failed to bind Carrier endpoint")?,
-            }
-        }
-        CarrierNodeNetwork::Isolated => Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key)
-            .bind()
-            .await
-            .context("Failed to bind isolated Carrier endpoint")?,
-    };
+    let approved = parse_elastos_relay_url(std::env::var("ELASTOS_RELAY_URL").ok().as_deref())?;
+    let requested_bind_addr = bind_addr.unwrap_or(
+        DEFAULT_CARRIER_BIND_ADDR
+            .parse::<std::net::SocketAddr>()
+            .context("default Carrier bind address must parse")?,
+    );
+    let endpoint = bind_carrier_endpoint(
+        secret_key,
+        network,
+        approved.as_ref(),
+        requested_bind_addr,
+        bind_addr.is_none(),
+    )
+    .await?;
 
     // Add mDNS for LAN discovery alongside the N0 preset lookup services.
     match network {
@@ -1232,7 +1409,8 @@ async fn start_carrier_node_with_network(
     // so a peer-DID custody dial can resolve without a live discovery
     // round trip. Shared by every caller of this startup path (serve,
     // gateway, and future custody-node roles).
-    let bootstrap_peers = seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir);
+    let bootstrap_peers =
+        seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir, network);
 
     let gossip = spawn_carrier_gossip(&endpoint);
 
@@ -1246,6 +1424,7 @@ async fn start_carrier_node_with_network(
     {
         let mut state = gossip_state.lock().await;
         state.bootstrap_peers = bootstrap_peers;
+        state.direct_only = network == CarrierNodeNetwork::Isolated;
     }
 
     let file_handler = FileHandler {
@@ -1648,9 +1827,11 @@ async fn handle_file_stream(
                 registry,
                 &msg.data,
                 data_dir,
-                network,
-                source_endpoint_id,
-                reservations,
+                BrowserExitAdmission {
+                    network,
+                    source: source_endpoint_id,
+                    reservations,
+                },
             )
             .await;
         }
@@ -1831,6 +2012,12 @@ async fn carrier_gossip_pull(
     })
 }
 
+struct BrowserExitAdmission {
+    network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
+    source: iroh::PublicKey,
+    reservations: browser_exit::BrowserExitReservations,
+}
+
 async fn handle_browser_carrier_exit_stream(
     send: &mut iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
@@ -1838,10 +2025,13 @@ async fn handle_browser_carrier_exit_stream(
     registry: Arc<ProviderRegistry>,
     data: &serde_json::Value,
     data_dir: &std::path::Path,
-    network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
-    source: iroh::PublicKey,
-    reservations: browser_exit::BrowserExitReservations,
+    admission: BrowserExitAdmission,
 ) -> Result<()> {
+    let BrowserExitAdmission {
+        network,
+        source,
+        reservations,
+    } = admission;
     let admitted = async {
         let authority = browser_exit::BrowserExitAuthority {
             data_dir: data_dir.to_path_buf(),
@@ -6984,9 +7174,12 @@ impl Provider for CarrierGossipProvider {
             }
 
             "get_ticket" => {
-                // Use watch_addr() to include relay URLs (NAT traversal)
                 let mut watcher = state.endpoint.watch_addr();
-                let addr = watcher.get();
+                let addr = if state.direct_only {
+                    published_direct_endpoint_addr(watcher.get())
+                } else {
+                    watcher.get()
+                };
                 let ticket_json = serde_json::json!({
                     "topic": null,
                     "endpoints": [addr],
@@ -7009,17 +7202,31 @@ impl Provider for CarrierGossipProvider {
                     Ok(endpoints) => endpoints,
                     Err(err) => return Ok(err),
                 };
+                if state.direct_only {
+                    if let Some(error) = direct_only_relay_only_error(&endpoints) {
+                        return Ok(error);
+                    }
+                }
+                let network = state.direct_only.then_some(CarrierNodeNetwork::Isolated);
                 let added = add_ticket_endpoints(
                     &memory_lookup,
                     &mut state.bootstrap_peers,
                     &endpoints,
                     true,
+                    network,
                 );
                 let connected = connect_ticket_endpoints(
                     &state.endpoint,
                     &state.gossip,
                     state.peers.clone(),
-                    &endpoints,
+                    &retain_network_ticket_endpoints(
+                        endpoints,
+                        if state.direct_only {
+                            CarrierNodeNetwork::Isolated
+                        } else {
+                            CarrierNodeNetwork::Public
+                        },
+                    ),
                 )
                 .await;
                 Ok(
@@ -7035,11 +7242,18 @@ impl Provider for CarrierGossipProvider {
                     Ok(endpoints) => endpoints,
                     Err(err) => return Ok(err),
                 };
+                if state.direct_only {
+                    if let Some(error) = direct_only_relay_only_error(&endpoints) {
+                        return Ok(error);
+                    }
+                }
+                let network = state.direct_only.then_some(CarrierNodeNetwork::Isolated);
                 let added = add_ticket_endpoints(
                     &memory_lookup,
                     &mut state.bootstrap_peers,
                     &endpoints,
                     false,
+                    network,
                 );
                 Ok(serde_json::json!({"status":"ok","data":{"added": added}}))
             }
@@ -7555,7 +7769,14 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                 Ok(response) => return Ok(response),
                                 Err(err) => {
                                     self.forget_peer(peer).await;
-                                    errors.push(carrier_provider_public_invoke_error(index, &err))
+                                    errors.push(carrier_provider_public_invoke_error(index, &err));
+                                    // A lost create reply may hide accepted work. A later
+                                    // endpoint's refusal cannot settle that first attempt.
+                                    if invocation.target == "model"
+                                        && invocation.op == "runs_create"
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -7823,15 +8044,7 @@ impl CarrierClient {
         addr: iroh::EndpointAddr,
         timeout_secs: u64,
     ) -> Result<Self> {
-        let mut rng_bytes = [0u8; 32];
-        getrandom::getrandom(&mut rng_bytes).map_err(|e| anyhow::anyhow!("rng: {}", e))?;
-        let secret_key = SecretKey::from_bytes(&rng_bytes);
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await
-            .context("Failed to bind")?;
-
+        let (endpoint, addr) = bind_short_lived_carrier_dial(addr).await?;
         Self::connect_owned_endpoint(endpoint, addr, timeout_secs).await
     }
 
@@ -14512,7 +14725,13 @@ pub(crate) mod tests {
         let memory_lookup = MemoryLookup::new();
         let mut bootstrap_peers = Vec::new();
 
-        let added = add_ticket_endpoints(&memory_lookup, &mut bootstrap_peers, &endpoints, false);
+        let added = add_ticket_endpoints(
+            &memory_lookup,
+            &mut bootstrap_peers,
+            &endpoints,
+            false,
+            None,
+        );
 
         assert_eq!(added.len(), 1);
         assert!(
@@ -14943,7 +15162,8 @@ pub(crate) mod tests {
         let memory_lookup = MemoryLookup::new();
         let mut bootstrap_peers = Vec::new();
 
-        let added = add_ticket_endpoints(&memory_lookup, &mut bootstrap_peers, &endpoints, true);
+        let added =
+            add_ticket_endpoints(&memory_lookup, &mut bootstrap_peers, &endpoints, true, None);
 
         assert_eq!(added.len(), 1);
         assert_eq!(bootstrap_peers, vec![expected_peer]);
@@ -16507,5 +16727,211 @@ pub(crate) mod tests {
         next_message.nonce = 3;
         assert!(push_gossip_buffer_message(&mut buffer, next_message));
         assert_eq!(buffer.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_elastos_carrier_network_rejects_empty_and_invalid_values() {
+        assert_eq!(
+            parse_elastos_carrier_network(None).unwrap(),
+            CarrierNodeNetwork::Isolated
+        );
+        assert_eq!(
+            parse_elastos_carrier_network(Some("direct")).unwrap(),
+            CarrierNodeNetwork::Isolated
+        );
+        assert!(parse_elastos_carrier_network(Some("public"))
+            .unwrap_err()
+            .to_string()
+            .contains("public"));
+        assert!(parse_elastos_carrier_network(Some(""))
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+        assert!(parse_elastos_carrier_network(Some("n0"))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid"));
+        let relay: url::Url = "https://relay.example.invalid./".parse().unwrap();
+        assert!(short_lived_endpoint_builder(
+            SecretKey::from_bytes(&[9u8; 32]),
+            CarrierNodeNetwork::Isolated,
+            Some(&relay),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ELASTOS_RELAY_URL"));
+    }
+
+    #[test]
+    fn test_direct_only_endpoint_addr_requires_an_ip_route() {
+        let secret = SecretKey::from_bytes(&[12u8; 32]);
+        let id_only = iroh::EndpointAddr::from(secret.public());
+        assert!(
+            endpoint_addr_for_network(id_only.clone(), CarrierNodeNetwork::Isolated)
+                .unwrap_err()
+                .to_string()
+                .contains("no IP route")
+        );
+        assert!(endpoint_addr_for_network(id_only, CarrierNodeNetwork::Public).is_ok());
+
+        let with_ip = iroh::EndpointAddr::from(secret.public())
+            .with_addrs([iroh::TransportAddr::Ip("127.0.0.1:9".parse().unwrap())]);
+        let kept = endpoint_addr_for_network(with_ip, CarrierNodeNetwork::Isolated).unwrap();
+        assert_eq!(endpoint_route_census(&kept), (1, 0));
+    }
+
+    #[test]
+    fn test_direct_only_strips_foreign_relay_from_mixed_addr() {
+        let secret = SecretKey::from_bytes(&[13u8; 32]);
+        let mixed = iroh::EndpointAddr::from(secret.public()).with_addrs([
+            iroh::TransportAddr::Ip("127.0.0.1:9".parse().unwrap()),
+            iroh::TransportAddr::Relay("https://relay.example.invalid./".parse().unwrap()),
+        ]);
+        assert_eq!(endpoint_route_census(&mixed), (1, 1));
+        let kept = endpoint_addr_for_network(mixed, CarrierNodeNetwork::Isolated).unwrap();
+        assert_eq!(endpoint_route_census(&kept), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn test_direct_carrier_bind_fallback_preserves_policy() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let requested = occupied.local_addr().unwrap();
+        let endpoint = bind_carrier_endpoint(
+            SecretKey::from_bytes(&[43u8; 32]),
+            CarrierNodeNetwork::Isolated,
+            None,
+            requested,
+            true,
+        )
+        .await
+        .unwrap();
+        let addr = endpoint.watch_addr().get();
+        let (direct, relayed) = endpoint_route_census(&addr);
+        assert!(direct >= 1);
+        assert_eq!(relayed, 0);
+        assert!(addr
+            .addrs
+            .iter()
+            .filter_map(|addr| match addr {
+                iroh::TransportAddr::Ip(addr) => Some(addr),
+                _ => None,
+            })
+            .all(|addr| addr.port() != requested.port()));
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_isolated_short_lived_endpoint_has_zero_relay_addrs() {
+        let secret_key = SecretKey::from_bytes(&[42u8; 32]);
+        let endpoint = short_lived_endpoint_builder(secret_key, CarrierNodeNetwork::Isolated, None)
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let addr = endpoint.watch_addr().get();
+        let (direct, relayed) = endpoint_route_census(&addr);
+        assert_eq!(relayed, 0, "Isolated short-lived client has no relay addrs");
+        assert!(direct >= 1, "Isolated short-lived client keeps an IP addr");
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_isolated_short_lived_connect_rejects_foreign_relay_before_dial() {
+        let secret_key = SecretKey::from_bytes(&[15u8; 32]);
+        let endpoint = short_lived_endpoint_builder(secret_key, CarrierNodeNetwork::Isolated, None)
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let peer = SecretKey::from_bytes(&[16u8; 32]);
+        let relay_only =
+            iroh::EndpointAddr::from(peer.public()).with_addrs([iroh::TransportAddr::Relay(
+                "https://relay.example.invalid./".parse().unwrap(),
+            )]);
+        let err = endpoint
+            .connect(relay_only, iroh_gossip::ALPN)
+            .await
+            .expect_err("foreign relay must fail before dial");
+        let text = format!("{err:#}");
+        assert!(
+            !text.to_ascii_lowercase().contains("relay.example.invalid"),
+            "Isolated connect must reject the foreign relay before dial: {text}"
+        );
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_isolated_gossip_join_without_mode_uses_direct_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[41u8; 32]);
+        let node =
+            start_isolated_carrier_node_with_registry(&sk, &did, dir.path().to_path_buf(), None)
+                .await
+                .unwrap();
+        {
+            let state = node.gossip_state.lock().await;
+            assert!(state.direct_only);
+            assert!(state.last_direct_join_peers.is_none());
+        }
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let joined = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join",
+                "topic": "__test/isolated-direct-policy"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(joined["status"], "ok", "{joined}");
+        {
+            let state = node.gossip_state.lock().await;
+            assert!(
+                state.last_direct_join_peers.is_some(),
+                "Isolated gossip_join stays on the direct peer path"
+            );
+        }
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_isolated_connect_rejects_relay_only_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[43u8; 32]);
+        let node =
+            start_isolated_carrier_node_with_registry(&sk, &did, dir.path().to_path_buf(), None)
+                .await
+                .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let secret = SecretKey::from_bytes(&[14u8; 32]);
+        let relay_only =
+            iroh::EndpointAddr::from(secret.public()).with_addrs([iroh::TransportAddr::Relay(
+                "https://relay.example.invalid./".parse().unwrap(),
+            )]);
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "connect",
+                "ticket": encode_ticket_for(relay_only)
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "error", "{response}");
+        assert_eq!(response["code"], "foreign_relay_rejected", "{response}");
+        shutdown_test_carrier_node(node).await;
+    }
+
+    #[tokio::test]
+    async fn test_default_carrier_node_is_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[45u8; 32]);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        {
+            let state = node.gossip_state.lock().await;
+            assert!(
+                state.direct_only,
+                "unset ELASTOS_CARRIER_NETWORK starts Isolated"
+            );
+        }
+        shutdown_test_carrier_node(node).await;
     }
 }

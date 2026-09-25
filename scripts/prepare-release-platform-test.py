@@ -20,7 +20,7 @@ APPS = [
     "home-cli", "home-gui", "home", "system", "wallet-metamask", "wallet-unisat",
     "wallet-walletconnect", "wallet", "browser", "documents", "library", "marketplace",
     "archive-manager", "inbox", "services", "people", "gba-emulator", "gba-ucity",
-    "gba-nonogram", "chat-room", "assistant", "home-agent", "elacity-player",
+    "gba-nonogram", "chat-room", "assistant", "elacity-player",
 ]
 MOCK_CARGO = r'''#!/usr/bin/env python3
 import json, os, pathlib, struct, sys
@@ -35,12 +35,13 @@ elif args[0] == "locate-project":
 elif args[0] == "metadata":
     print(json.dumps({"target_directory": os.environ["MOCK_TARGET"]}))
 else:
-    assert args[0] == "build" and "--locked" in args and "--target" in args, args
+    assert args[0] == "build" and "--locked" in args, args
     if os.environ.get("FAIL_BUILD"):
         sys.exit(19)
-    target = args[args.index("--target") + 1]
     name = "elastos" if "--bin" in args else pathlib.Path.cwd().name
-    output = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / target / "release" / name
+    cargo_target_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+    target = args[args.index("--target") + 1] if "--target" in args else ""
+    output = cargo_target_dir / (f"{target}/release/{name}" if target else f"release/{name}")
     output.parent.mkdir(parents=True, exist_ok=True)
     header = bytearray(64)
     if target.endswith("linux-musl"):
@@ -193,7 +194,13 @@ class PrepareWorkerTest(unittest.TestCase):
         (mock / "cargo").write_text(MOCK_CARGO)
         (mock / "rustup").write_text(
             '#!/bin/sh\nprintf "aarch64-apple-darwin\\nx86_64-unknown-linux-musl\\naarch64-unknown-linux-musl\\n"\n')
-        (mock / "rustc").write_text('#!/bin/sh\nprintf "rustc fixture 1.91\\n"\n')
+        (mock / "rustc").write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-vV" ]; then\n'
+            '  printf "release: fixture\\nhost: aarch64-apple-darwin\\n"\n'
+            '  exit 0\n'
+            'fi\n'
+            'printf "rustc fixture 1.91\\n"\n')
         (mock / "uname").write_text(
             '#!/bin/sh\nif [ "$1" = -s ]; then echo "${MOCK_OS:-Darwin}"; '
             'else echo "${MOCK_ARCH:-arm64}"; fi\n')
@@ -289,7 +296,7 @@ class PrepareWorkerTest(unittest.TestCase):
         self.assertEqual(len(builds), 2 + len(self.native) - len(LINUX_ONLY))
         for build in builds:
             self.assertIn("--locked", build["args"])
-            self.assertIn("aarch64-apple-darwin", build["args"])
+            self.assertNotIn("--target", build["args"])
             self.assertEqual(build["target_dir"], self.env["CARGO_TARGET_DIR"])
         before = (output / "platform-input.json").read_bytes()
         _, refused = self.prepare()

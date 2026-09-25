@@ -510,13 +510,13 @@ async fn remote_engine_preparation_replay_close_and_late_input_keep_exact_native
 pub(super) async fn exercise_consumer_http_remote_engine(
     app: &axum::Router,
     token: &str,
-    consumer_root: &std::path::Path,
     adapter: &Value,
     principal: &str,
     exit: &ConsumerExitFixture,
     gateway: &GatewayState,
     native_calls: &TokioMutex<Vec<Value>>,
 ) {
+    let consumer_root = &gateway.data_dir;
     // Only the consumer Runtime owns the public TURN ingress. The serving
     // Engine retains its loopback native TURN authority and exact cleanup owner.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

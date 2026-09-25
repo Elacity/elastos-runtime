@@ -7,10 +7,10 @@
 //! All first-party providers (did, peer, model) use the `elastos://` namespace
 //! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://model/*`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use base64::Engine as _;
 use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
@@ -28,6 +28,17 @@ fn private_ipfs_unavailable() -> ProviderError {
 
 fn private_model_configuration(target: &str, op: &str) -> bool {
     target.eq_ignore_ascii_case("model") && op == "init"
+}
+
+fn model_index_stream(invocation: &ProviderInvocation) -> bool {
+    invocation.source == "runtime-model-preparation"
+        && invocation.target == "content"
+        && invocation.op == "fetch"
+        && invocation.request["path"] == "_elastos_object.json"
+        && invocation.request["bounded_read"] == true
+        && invocation.request["max_bytes"]
+            .as_u64()
+            .is_some_and(|limit| (1..=65536).contains(&limit))
 }
 
 // Internal wire types. Only the typed local methods below can dispatch them.
@@ -636,6 +647,12 @@ pub struct ProviderRegistry {
     sub_providers: RwLock<HashMap<String, SubProviderRegistration>>,
     /// Optional Carrier transport for Runtime-mediated provider invocation.
     carrier_invoker: RwLock<Option<Arc<dyn ProviderCarrierInvoker>>>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    local_model_sockets: RwLock<Option<LocalModelSocketPool>>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    local_model_refresh: Mutex<()>,
+    #[cfg(target_os = "macos")]
+    hosted_model_socket: RwLock<Option<String>>,
 }
 
 enum SubProviderRegistration {
@@ -654,6 +671,12 @@ enum SubProviderRegistration {
 enum ProviderTargetVisibility {
     CapsuleResource,
     RuntimeOnly,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct LocalModelSocketPool {
+    assigned: std::collections::BTreeMap<String, String>,
+    vacant: Vec<String>,
 }
 
 impl SubProviderRegistration {
@@ -686,7 +709,89 @@ impl ProviderRegistry {
             providers: RwLock::new(HashMap::new()),
             sub_providers: RwLock::new(HashMap::new()),
             carrier_invoker: RwLock::new(None),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            local_model_sockets: RwLock::new(None),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            local_model_refresh: Mutex::new(()),
+            #[cfg(target_os = "macos")]
+            hosted_model_socket: RwLock::new(None),
         }
+    }
+
+    /// Keep the confined child's engine ports stable across Init refreshes.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn set_local_model_sockets(
+        &self,
+        sockets: std::collections::BTreeMap<String, String>,
+        vacant: Vec<String>,
+    ) {
+        *self.local_model_sockets.write().await = Some(LocalModelSocketPool {
+            assigned: sockets,
+            vacant,
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn set_hosted_model_socket(&self, socket: String) {
+        *self.hosted_model_socket.write().await = Some(socket);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn apply_local_model_sockets(
+        &self,
+        config: &mut super::BridgeProviderConfig,
+    ) -> Result<(), ProviderError> {
+        let pool = self.local_model_sockets.read().await;
+        let Some(pool) = pool.as_ref() else {
+            return Ok(());
+        };
+        let offers = config.extra["offers"]
+            .as_array()
+            .ok_or_else(|| ProviderError::Provider("model offers unavailable".into()))?;
+        let mut ids = std::collections::BTreeSet::new();
+        for offer in offers {
+            if offer["adapter"]["kind"] == "local_llama_cpp_text" {
+                let id = offer["id"].as_str().ok_or_else(|| {
+                    ProviderError::Provider("local model offer id unavailable".into())
+                })?;
+                if !ids.insert(id.to_string()) {
+                    return Err(ProviderError::Provider(
+                        "duplicate local model offer".into(),
+                    ));
+                }
+            }
+        }
+        let mut vacant = pool.vacant.clone();
+        vacant.extend(
+            pool.assigned
+                .iter()
+                .filter(|(id, _)| !ids.contains(*id))
+                .map(|(_, socket)| socket.clone()),
+        );
+        if ids
+            .iter()
+            .filter(|id| !pool.assigned.contains_key(*id))
+            .count()
+            > vacant.len()
+        {
+            return Err(ProviderError::Provider(
+                "local model socket capacity unavailable".into(),
+            ));
+        }
+        let mut sockets = std::collections::BTreeMap::new();
+        for id in ids {
+            let socket = match pool.assigned.get(&id) {
+                Some(socket) => socket.clone(),
+                None => vacant.pop().expect("capacity checked"),
+            };
+            sockets.insert(id, socket);
+        }
+        config.extra["runtime_local_sockets"] = serde_json::json!(sockets);
+        #[cfg(target_os = "macos")]
+        if let Some(socket) = self.hosted_model_socket.read().await.as_deref() {
+            config.extra["runtime_hosted_socket"] = serde_json::json!(socket);
+        }
+        Ok(())
     }
 
     /// Register the Runtime-owned Carrier provider-plane invoker.
@@ -1176,6 +1281,14 @@ impl ProviderRegistry {
         config: &super::BridgeProviderConfig,
     ) -> Result<(), ProviderError> {
         let unavailable = || ProviderError::Provider("model activation pending".into());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let _refresh = self.local_model_refresh.lock().await;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let config = {
+            let mut config = config.clone();
+            self.apply_local_model_sockets(&mut config).await?;
+            config
+        };
         // Retain registration ownership through dispatch; unregister cannot
         // replace this slot while its configuration request is in flight.
         let slots = self.sub_providers.read().await;
@@ -1200,12 +1313,46 @@ impl ProviderRegistry {
                     unavailable()
                 })?;
         let data = &response["data"];
-        if response["status"] != "ok"
-            || data["provider"] != "model-provider"
+        if response["status"] != "ok" {
+            let code = response["code"].as_str().unwrap_or("");
+            let message = response["message"].as_str().unwrap_or("");
+            let detail = [code, message]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(": ");
+            return Err(ProviderError::Provider(if detail.is_empty() {
+                "model activation pending".into()
+            } else {
+                detail
+            }));
+        }
+        if data["provider"] != "model-provider"
             || data["protocol_version"] != "elastos.model-provider/v1"
             || data["offers_ready"].as_u64().is_none_or(|n| n > 64)
         {
             return Err(unavailable());
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut pool = self.local_model_sockets.write().await;
+            if let Some(pool) = pool.as_mut() {
+                let sockets: std::collections::BTreeMap<String, String> =
+                    serde_json::from_value(config.extra["runtime_local_sockets"].clone())
+                        .map_err(|_| unavailable())?;
+                let used = sockets
+                    .values()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let all = pool
+                    .assigned
+                    .values()
+                    .chain(pool.vacant.iter())
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                pool.vacant = all.difference(&used).cloned().collect();
+                pool.assigned = sockets;
+            }
         }
         Ok(())
     }
@@ -1229,13 +1376,37 @@ impl ProviderRegistry {
                 })?;
             let data = &response["data"];
             let offers = data["offers"].as_array().ok_or_else(unavailable)?;
+            let revisions = data["offer_revisions"]
+                .as_object()
+                .ok_or_else(unavailable)?;
+            let mut seen_ids = HashSet::new();
             if response.as_object().is_none_or(|object| object.len() != 2)
                 || response["status"] != "ok"
-                || data.as_object().is_none_or(|object| object.len() != 4)
+                || data.as_object().is_none_or(|object| object.len() != 5)
                 || data["schema"] != "elastos.model.offers-list/v1"
                 || data["provider"] != "model-provider"
                 || data["protocol_version"] != "elastos.model-provider/v1"
                 || offers.len() > 64
+                || revisions.len() != offers.len()
+                || offers.iter().any(|offer| {
+                    let Some(id) = offer["id"].as_str() else {
+                        return true;
+                    };
+                    if !seen_ids.insert(id) {
+                        return true;
+                    }
+                    let Some(digest) = revisions
+                        .get(id)
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| value.strip_prefix("sha256:"))
+                    else {
+                        return true;
+                    };
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
             {
                 return Err(unavailable());
             }
@@ -1522,7 +1693,12 @@ impl ProviderRegistry {
                     .await?
             }
         };
-        apply_provider_transfer_response(&mut response, &invocation)?;
+        let validated = apply_provider_transfer_response(&mut response, &invocation);
+        if model_index_stream(&invocation) && validated.is_err() {
+            tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
+                "model index read substage failed");
+        }
+        validated?;
         attach_provider_transfer_receipt(&mut response, &invocation, "completed");
         Ok(response)
     }
@@ -1550,15 +1726,22 @@ impl ProviderRegistry {
                 "provider stream open failed: {message}"
             )));
         }
-        let data = response
-            .get("data")
-            .and_then(|data| data.as_object())
-            .ok_or_else(|| {
-                ProviderError::Provider(
-                    "provider stream open requires response data object".to_string(),
-                )
-            })?;
-        let bytes = provider_stream_response_bytes(data)?;
+        let bytes = (|| {
+            let data = response
+                .get("data")
+                .and_then(|data| data.as_object())
+                .ok_or_else(|| {
+                    ProviderError::Provider(
+                        "provider stream open requires response data object".to_string(),
+                    )
+                })?;
+            provider_stream_response_bytes(data)
+        })();
+        if model_index_stream(&invocation) && bytes.is_err() {
+            tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
+                "model index read substage failed");
+        }
+        let bytes = bytes?;
         let chunk_size = options.chunk_size.clamp(1, PROVIDER_STREAM_CHUNK_BYTES);
         let max_in_flight_chunks = options.max_in_flight_chunks.max(1);
         let id = format!(
@@ -2383,6 +2566,100 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn confined_model_refresh_assigns_predeclared_socket_to_new_local_offer() {
+        let registry = ProviderRegistry::new();
+        registry
+            .set_local_model_sockets(
+                std::collections::BTreeMap::from([(
+                    "local-a".to_string(),
+                    "/tmp/elastos-model-fixture.sock".to_string(),
+                )]),
+                vec!["/tmp/elastos-model-spare.sock".to_string()],
+            )
+            .await;
+        let mut config = super::super::BridgeProviderConfig {
+            extra: serde_json::json!({"offers":[
+                {"id":"local-a","adapter":{"kind":"local_llama_cpp_text"}},
+                {"id":"hosted","adapter":{"kind":"open_ai_compatible_text"}}
+            ]}),
+            ..Default::default()
+        };
+        registry
+            .apply_local_model_sockets(&mut config)
+            .await
+            .unwrap();
+        assert_eq!(
+            config.extra["runtime_local_sockets"]["local-a"],
+            "/tmp/elastos-model-fixture.sock"
+        );
+        config.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"local-b","adapter":{"kind":"local_llama_cpp_text"}}));
+        registry
+            .apply_local_model_sockets(&mut config)
+            .await
+            .unwrap();
+        assert_eq!(
+            config.extra["runtime_local_sockets"]["local-b"],
+            "/tmp/elastos-model-spare.sock"
+        );
+        let first = config.extra["runtime_local_sockets"].clone();
+        registry
+            .apply_local_model_sockets(&mut config)
+            .await
+            .unwrap();
+        assert_eq!(config.extra["runtime_local_sockets"], first);
+        config.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"local-c","adapter":{"kind":"local_llama_cpp_text"}}));
+        assert!(registry
+            .apply_local_model_sockets(&mut config)
+            .await
+            .is_err());
+        config.extra["offers"].as_array_mut().unwrap().pop();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        *provider.response.lock().await =
+            Some(serde_json::json!({"status":"error", "message":"init refused"}));
+        registry
+            .register_sub_provider("model", provider.clone())
+            .await
+            .unwrap();
+        assert!(registry
+            .refresh_local_model_configuration(&config)
+            .await
+            .is_err());
+        let pool = registry.local_model_sockets.read().await;
+        assert_eq!(pool.as_ref().unwrap().assigned.len(), 1);
+        assert_eq!(pool.as_ref().unwrap().vacant.len(), 1);
+        drop(pool);
+        *provider.response.lock().await = Some(serde_json::json!({"status":"ok", "data":{
+            "provider":"model-provider", "protocol_version":"elastos.model-provider/v1", "offers_ready":2
+        }}));
+        registry
+            .refresh_local_model_configuration(&config)
+            .await
+            .unwrap();
+        let pool = registry.local_model_sockets.read().await;
+        assert_eq!(pool.as_ref().unwrap().assigned.len(), 2);
+        assert!(pool.as_ref().unwrap().vacant.is_empty());
+        drop(pool);
+        config.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|offer| offer["id"] == "local-a" || offer["id"] == "hosted");
+        registry
+            .refresh_local_model_configuration(&config)
+            .await
+            .unwrap();
+        let pool = registry.local_model_sockets.read().await;
+        assert_eq!(pool.as_ref().unwrap().assigned.len(), 1);
+        assert_eq!(pool.as_ref().unwrap().vacant.len(), 1);
+    }
     use std::time::Duration;
     use tokio::sync::{Mutex, Notify};
 
@@ -2714,13 +2991,41 @@ mod tests {
             .unwrap();
         let valid = serde_json::json!({"status":"ok", "data":{
             "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
-            "protocol_version":"elastos.model-provider/v1", "offers":[]
+            "protocol_version":"elastos.model-provider/v1", "offers":[], "offer_revisions":{}
         }});
         *provider.response.lock().await = Some(valid.clone());
         assert_eq!(
             registry.local_model_offers().await.unwrap(),
             Vec::<serde_json::Value>::new()
         );
+        let offer = serde_json::json!({"id":"model:local"});
+        let mut one = valid.clone();
+        one["data"]["offers"] = serde_json::json!([offer.clone()]);
+        one["data"]["offer_revisions"] =
+            serde_json::json!({"model:local":format!("sha256:{}", "a".repeat(64))});
+        *provider.response.lock().await = Some(one.clone());
+        assert_eq!(registry.local_model_offers().await.unwrap(), vec![offer]);
+        for revisions in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"model:local":"not-a-digest"}),
+            serde_json::json!({"other":format!("sha256:{}", "a".repeat(64))}),
+        ] {
+            let mut response = one.clone();
+            response["data"]["offer_revisions"] = revisions;
+            *provider.response.lock().await = Some(response);
+            assert!(registry.local_model_offers().await.is_err());
+        }
+        let mut duplicate = one.clone();
+        duplicate["data"]["offers"] = serde_json::json!([
+            {"id":"model:local"}, {"id":"model:local"}, {"id":"model:other"}
+        ]);
+        duplicate["data"]["offer_revisions"]["model:other"] =
+            serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+        duplicate["data"]["offer_revisions"]["model:unrelated"] =
+            serde_json::json!(format!("sha256:{}", "c".repeat(64)));
+        *provider.response.lock().await = Some(duplicate);
+        assert!(registry.local_model_offers().await.is_err());
         for (field, value) in [
             ("schema", serde_json::json!("unknown")),
             ("provider", serde_json::json!("other")),
@@ -2837,7 +3142,35 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            ProviderError::Provider("model activation pending".into()).to_string()
+            ProviderError::Provider("private failure".into()).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn model_refresh_propagates_provider_selection_unavailable() {
+        let registry = ProviderRegistry::new();
+        let provider = Arc::new(PrivateIpfsMock::default());
+        *provider.response.lock().await = Some(serde_json::json!({
+            "status":"error",
+            "code":"selection_unavailable",
+            "message":"model offer is not available"
+        }));
+        registry
+            .register_sub_provider("model", provider)
+            .await
+            .unwrap();
+        let err = registry
+            .refresh_local_model_configuration(&super::super::BridgeProviderConfig::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("selection_unavailable"),
+            "Init error code must reach the gateway, got {err}"
+        );
+        assert!(
+            err.contains("model offer is not available"),
+            "Init error message must reach the gateway, got {err}"
         );
     }
 

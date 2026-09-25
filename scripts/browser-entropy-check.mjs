@@ -2270,8 +2270,20 @@ assert(
     ) &&
     browserMain.includes('"terminal_pre_effect_failure"') &&
     browserMain.includes('"terminal_post_effect_cleanup"') &&
-    !classifyFreshWindowCloseSummaryBlock.includes(
-      "terminalWindowCloseAbsence()",
+    classifyFreshWindowCloseSummaryBlock.includes(
+      'closeOwnership?.schema === "elastos.browser.window-close-ownership/v1"',
+    ) &&
+    classifyFreshWindowCloseSummaryBlock.includes(
+      "closeOwnership.browser_instance === browserInstanceId",
+    ) &&
+    classifyFreshWindowCloseSummaryBlock.includes(
+      "sessions.recoverable_page === null",
+    ) &&
+    classifyFreshWindowCloseSummaryBlock.includes(
+      'closeOwnership.state === "absent"',
+    ) &&
+    classifyFreshWindowCloseSummaryBlock.includes(
+      "return terminalWindowCloseAbsence();",
     ) &&
     settleInitialRuntimeOpenPostFailureBlock.includes(
       "isAuthoritySessionError(error)",
@@ -2302,6 +2314,9 @@ assert(
     ) &&
     browserWindowCloseHandshakeTest.includes(
       "cleanup-pending outcome plus an empty summary never proves absence",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "fresh close accepts only Runtime's exact instance-bound absence receipt",
     ) &&
     browserWindowCloseHandshakeTest.includes(
       "initial 409 conflict never proves Browser ownership absent",

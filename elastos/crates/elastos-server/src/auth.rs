@@ -7044,7 +7044,7 @@ fn ensure_no_symlink_components(data_dir: &Path, path: &Path) -> anyhow::Result<
     Ok(())
 }
 
-fn ensure_protected_principal_root_object_parent(
+pub(crate) fn ensure_protected_principal_root_object_parent(
     data_dir: &Path,
     path: &Path,
 ) -> anyhow::Result<()> {

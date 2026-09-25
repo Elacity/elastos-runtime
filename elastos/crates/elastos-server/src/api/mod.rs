@@ -13,13 +13,26 @@ pub(crate) mod capsule_inventory;
 // Runtime startup composition; this is not a capsule operation or HTTP route.
 #[cfg(unix)]
 pub use capsule_inventory::preparation::{
-    append_admitted_model_startup_offers, settle_pending_model_startup,
+    append_admitted_model_startup_offers, complete_admitted_model_startup,
+    settle_pending_model_startup,
 };
 pub mod gateway;
 pub(crate) mod gateway_local_control;
 pub mod handlers;
 pub mod middleware;
 mod model_provider_config;
+#[cfg(target_os = "macos")]
+pub mod model_provider_egress;
+#[cfg(unix)]
+mod model_provider_egress_decision;
+#[cfg(test)]
+pub(crate) use model_provider_config::seed_model_provider_operator_offers_for_test;
+pub(crate) use model_provider_config::{
+    ai_provider_status, any_hosted_model_shared, approval_lens_has_selection,
+    hosted_model_offer_hint, hosted_model_share_cards, load_model_provider_operator_offers,
+    named_jev_hosted_offer, offer_is_shareable, operator_has_hosted_offer, remove_hosted_offer,
+    save_hosted_offer, set_hosted_offer_share, HostedAiProvider, HostedModelOfferHint,
+};
 pub use model_provider_config::{model_provider_bridge_config, model_provider_config};
 pub mod routes;
 pub mod server;

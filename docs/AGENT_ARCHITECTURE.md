@@ -207,9 +207,10 @@ The boundaries are:
 - **Runtime** verifies the principal and session, enforces capabilities, owns
   lifecycle and audit, and routes the operation.
 - **Agent Host** owns agent-loop behavior but cannot mint authority.
-- **Model provider** owns model-backend credentials, protocol adaptation,
-  model availability, and inference semantics. The Agent Host should not
-  receive upstream credentials or endpoints.
+- **Runtime** stores hosted model credentials and brokers exact approved HTTPS
+  destinations. **Model provider** owns protocol adaptation, model
+  availability, and inference semantics. The Agent Host does not receive
+  upstream credentials or endpoints.
 - **Effect providers** own operation semantics for resources such as content,
   messaging, Browser, wallet, chain, rights, or storage. They do not decide
   that an unverified caller is authorized.
@@ -355,9 +356,9 @@ The repository already establishes several parts of this model:
   authority remains Runtime-owned rather than becoming a Profile capsule.
 - Capability and audit policy already applies to typed model-provider
   resources.
-- The old terminal `chat` and `agent` source capsules are retired. Product Chat
-  is the `chat-room` App. The installed `home-agent` capsule is the
-  Home-integrated conversational Agent surface and uses typed Runtime model and
+- The old terminal `chat`, `agent`, and `home-agent` source capsules are retired.
+  Product Chat is the `chat-room` App. The installed `assistant` capsule is the
+  Home-integrated conversational surface and uses typed Runtime model and
   workspace operations. It is not the future general autonomous Agent Host.
 - The architecture already separates mutable capsule state from immutable
   capsule artifacts.
@@ -365,7 +366,7 @@ The repository already establishes several parts of this model:
 The complete parity path is not yet proven. In particular, `state.md` records
 that principal, proof binding, device, capsule, launch grant, and session are
 not yet independently established end to end for the Component path. The
-installed Home Agent does not yet provide the general Agent Host contract with
+installed Assistant does not yet provide the general Agent Host contract with
 durable task/session recovery, persistent approvals, and arbitrary governed
 tools. End-to-end proof for a corresponding signed agent identity document,
 private persona contract, and standing mandate product remains open.

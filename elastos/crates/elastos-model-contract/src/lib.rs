@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decisions;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -132,6 +134,19 @@ impl RuntimeAccessBinding {
         }
         Ok(())
     }
+}
+
+/// Stable run identity shared by Runtime recovery and the provider journal.
+/// Session and grant rotation preserve ownership by principal and capsule.
+pub fn model_run_id(binding: &RuntimeCreateBinding) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"elastos:model-run:v1\n");
+    hasher.update(binding.principal_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(binding.capsule_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(binding.request_id.as_bytes());
+    format!("run:sha256:{}", hex_hash(&hasher.finalize()))
 }
 
 pub fn model_input_hash(input: &Value) -> ContractResult<String> {

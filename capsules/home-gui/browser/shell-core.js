@@ -528,12 +528,14 @@ export function initializeShellLayout(summary) {
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
   const occupiedPositions = [];
-  const layoutEntries = stored
-    ? desktopLayoutEntries(summary).sort((left, right) => (
+  const allEntries = desktopLayoutEntries(summary);
+  const layoutEntries = allEntries.filter((entry) => desktopEntryExists(summary, entry.id));
+  if (stored) {
+    layoutEntries.sort((left, right) => (
       Number(Object.prototype.hasOwnProperty.call(storedDesktop, right.id)) -
       Number(Object.prototype.hasOwnProperty.call(storedDesktop, left.id))
-    ))
-    : desktopLayoutEntries(summary).filter((entry) => desktopEntryExists(summary, entry.id));
+    ));
+  }
   for (const [index, entry] of layoutEntries.entries()) {
     const defaultPosition = defaultDesktopPosition(index);
     const storedPosition = storedDesktop[entry.id];
@@ -546,6 +548,24 @@ export function initializeShellLayout(summary) {
     occupiedPositions.push(position);
     if (!storedPosition || !positionsEqual(storedPosition, position)) {
       changed = true;
+    }
+  }
+  // Hidden targets keep their saved positions for a later reveal. They do not
+  // reserve desktop space while visible targets are restored.
+  if (stored) {
+    for (const [index, entry] of allEntries.entries()) {
+      if (desktopEntryExists(summary, entry.id) ||
+          !Object.prototype.hasOwnProperty.call(storedDesktop, entry.id)) {
+        continue;
+      }
+      const storedPosition = storedDesktop[entry.id];
+      const position = clampDesktopPosition(normalizeDesktopPosition(
+        storedPosition, defaultDesktopPosition(index),
+      ));
+      shellState.shellLayoutState.desktop[entry.id] = position;
+      if (!positionsEqual(storedPosition, position)) {
+        changed = true;
+      }
     }
   }
   const currentDesktopIds = new Set(Object.keys(shellState.shellLayoutState.desktop));
@@ -785,7 +805,7 @@ function nextAvailableDesktopPosition(occupiedPositions, preferredIndex) {
 
 function occupiedDesktopPositionsExcept(targetId) {
   return Object.entries(shellState.shellLayoutState.desktop)
-    .filter(([entryId]) => entryId !== targetId)
+    .filter(([entryId]) => entryId !== targetId && isTargetOnDesktop(entryId))
     .map(([, position]) => clampDesktopPosition(position));
 }
 
@@ -864,6 +884,15 @@ export function addTargetToDesktop(targetId) {
     return false;
   }
   shellState.shellLayoutState.desktopHidden = next;
+  const storedPosition = shellState.shellLayoutState.desktop[targetId];
+  const occupiedPositions = occupiedDesktopPositionsExcept(targetId);
+  if (storedPosition && desktopPositionOverlapsAny(storedPosition, occupiedPositions)) {
+    const entries = desktopLayoutEntries(shellState.currentSummary);
+    const preferredIndex = entries.findIndex((entry) => entry.id === targetId);
+    shellState.shellLayoutState.desktop[targetId] = nextAvailableDesktopPosition(
+      occupiedPositions, Math.max(0, preferredIndex),
+    );
+  }
   return true;
 }
 

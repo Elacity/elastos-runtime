@@ -85,6 +85,8 @@ pub struct RunsCreateRequest {
     pub operation: String,
     pub input: Value,
     pub runtime_binding: RuntimeCreateBinding,
+    #[serde(default)]
+    pub expected_execution_binding_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +142,7 @@ pub enum ErrorClass {
     SelectionUnavailable,
     CredentialsUnavailable,
     AuthenticationRejected,
+    AccessRefused,
     RateLimited,
     ContextRejected,
     BackendTimeout,

@@ -1926,6 +1926,43 @@ struct ServicesContactFixture {
     peer_id: String,
 }
 
+struct ServicesCatalogModelProvider {
+    offer: serde_json::Value,
+    revision: Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl elastos_runtime::provider::Provider for ServicesCatalogModelProvider {
+    fn name(&self) -> &'static str {
+        "services-catalog-model-fixture"
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    async fn handle(
+        &self,
+        _: elastos_runtime::provider::ResourceRequest,
+    ) -> Result<elastos_runtime::provider::ResourceResponse, elastos_runtime::provider::ProviderError>
+    {
+        panic!("catalog fixture uses only the private model operation")
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+        assert_eq!(request["op"], "offers_list");
+        let id = self.offer["id"].as_str().unwrap();
+        let revision = self.revision.lock().unwrap().clone();
+        Ok(json!({"status":"ok","data":{
+            "offers":[self.offer],
+            "offer_revisions":{(id):revision},
+        }}))
+    }
+}
+
 async fn services_contact_fixture(
     data_dir: &std::path::Path,
     name: &str,
@@ -3134,7 +3171,7 @@ async fn test_services_exit_activation_fences_held_ack_and_rolls_back_failed_sta
             configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
         let alice =
             services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
-        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
         accept_services_contact_pair(&alice, &bob);
         let action =
             services_contact_pending_request(left.path(), right.path(), &alice, &bob).await;
@@ -4487,7 +4524,7 @@ async fn test_home_events_stream_requires_home_authority_and_serves_sse() {
     let unauthorized = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/events/stream")
                 .body(Body::empty())
                 .unwrap(),
@@ -7599,7 +7636,7 @@ async fn test_home_browser_state_drops_unknown_targets() {
 }
 
 #[tokio::test]
-async fn test_home_browser_state_recovers_from_malformed_saved_state() {
+async fn test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
@@ -7686,17 +7723,12 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
         )
         .await
         .unwrap();
-    assert_eq!(updated.status(), StatusCode::OK);
-    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap())
-        .expect("Home should rewrite malformed browser state as valid JSON");
-    assert_eq!(
-        stored["layout"]["desktopIconsVisible"],
-        serde_json::Value::Bool(true)
-    );
+    assert_eq!(updated.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&state_path).unwrap(), malformed_before);
 }
 
 #[tokio::test]
-async fn test_home_browser_state_resets_plaintext_for_protected_principal_root() {
+async fn test_home_browser_state_defaults_preserve_protected_plaintext_and_refuse_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let protection =
@@ -7783,10 +7815,8 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
         )
         .await
         .unwrap();
-    assert_eq!(updated.status(), StatusCode::OK);
-    let stored = std::fs::read_to_string(&state_path).unwrap();
-    assert!(!stored.contains("desktopIconsVisible"));
-    assert!(stored.contains("elastos.principal-root.object/v1"));
+    assert_eq!(updated.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&state_path).unwrap(), plaintext_before);
 }
 
 #[tokio::test]
@@ -9215,7 +9245,6 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_execution_gr
     super::remote_engine::exercise_consumer_http_remote_engine(
         &browser_app,
         &browser_token,
-        left.path(),
         &remote_offer["selectable_adapters"][0]["id"],
         &alice.authority.principal_id,
         &consumer_exit,
@@ -9414,6 +9443,226 @@ async fn test_configured_services_runtime_request_uses_existing_peer_without_coo
     assert_eq!(offer["enabled"], false);
     configured_services_runtime_assert_preserved(left.path(), &alice).await;
     configured_services_runtime_assert_preserved(right.path(), &bob).await;
+}
+
+fn services_direct_route_ticket(peer_id: &str) -> String {
+    let id: iroh::EndpointId = peer_id.parse().expect("peer id");
+    let endpoint = iroh::EndpointAddr::from(id)
+        .with_addrs([iroh::TransportAddr::Ip("203.0.113.8:4000".parse().unwrap())]);
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "topic": null,
+        "endpoints": [endpoint],
+    }))
+    .unwrap();
+    let mut encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
+    encoded.make_ascii_lowercase();
+    encoded
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_request_ignores_legacy_direct_ticket_file() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    let ticket = services_direct_route_ticket(&bob.peer_id);
+    std::fs::write(
+        left.path().join("services-peer-routes.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "elastos.services.peer-routes/v1",
+            "routes": [{
+                "peer_id": bob.peer_id,
+                "connect_ticket": ticket
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let calls = alice
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .clone();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "get_ticket",
+            "gossip_join",
+            "gossip_join_peers",
+            "gossip_send"
+        ]
+    );
+    assert_eq!(calls[2]["body"]["peers"], json!([bob.peer_id]));
+    assert!(!serde_json::to_string(&calls).unwrap().contains(&ticket));
+    let messages = bus
+        .lock()
+        .await
+        .topic_messages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    let request =
+        crate::carrier::verify_service_message(&messages[0], "requester_peer_id").unwrap();
+    assert_eq!(request["kind"], "service_access_request");
+    assert_eq!(request["target_peer_id"], bob.peer_id);
+
+    assert_eq!(request["requester_peer_id"], alice.peer_id);
+    assert!(request.get("requester_connect_ticket").is_none());
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_request_rejects_legacy_contact_route_override() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let live = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network.clone()).await;
+    let live_dest = services_contact_fixture(live.path(), "LiveDest", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    configured_services_runtime_remove_attached_runtime(live.path(), &live_dest);
+    let live_peer_id = live_dest.peer_id.clone();
+    let ticket = services_direct_route_ticket(&live_peer_id);
+    let bob_contact_id = home_people_contact_id(&bob.profile.document().profile_did);
+    std::fs::write(
+        left.path().join("services-peer-routes.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "elastos.services.peer-routes/v1",
+            "routes": [{
+                "contact_id": bob_contact_id,
+                "peer_id": live_peer_id,
+                "connect_ticket": ticket
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let calls = alice
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .clone();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "get_ticket",
+            "gossip_join",
+            "gossip_join_peers",
+            "gossip_send"
+        ]
+    );
+    assert_eq!(calls[2]["body"]["peers"], json!([bob.peer_id]));
+    assert!(!serde_json::to_string(&calls).unwrap().contains(&ticket));
+    let messages = bus
+        .lock()
+        .await
+        .topic_messages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    let request =
+        crate::carrier::verify_service_message(&messages[0], "requester_peer_id").unwrap();
+    assert_eq!(request["kind"], "service_access_request");
+    assert_eq!(request["target_peer_id"], bob.peer_id);
+    assert_ne!(request["target_peer_id"], live_peer_id);
+    assert_eq!(request["requester_peer_id"], alice.peer_id);
+    assert!(request.get("requester_connect_ticket").is_none());
+}
+
+#[tokio::test]
+async fn test_configured_services_runtime_request_ignores_mismatched_direct_ticket() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice = services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+    configured_services_runtime_remove_attached_runtime(left.path(), &alice);
+    configured_services_runtime_remove_attached_runtime(right.path(), &bob);
+    std::fs::write(
+        left.path().join("services-peer-routes.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "elastos.services.peer-routes/v1",
+            "routes": [{
+                "peer_id": bob.peer_id,
+                "connect_ticket": services_direct_route_ticket(&alice.peer_id)
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+    let (status, body) = services_contact_post(
+        &alice.app,
+        &token,
+        "/api/apps/services/offers",
+        json!({"offer_id":services_contact_offer(&bob),"section":"others","selected":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let calls = alice
+        .peer_provider
+        .state
+        .provider_requests
+        .lock()
+        .await
+        .clone();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "get_ticket",
+            "gossip_join",
+            "gossip_join_peers",
+            "gossip_send"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -9674,6 +9923,192 @@ async fn test_services_runtime_mailbox_receives_and_activates_without_inbox_or_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_services_runtime_mailbox_receives_requests_when_only_models_are_shared() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    for hosted in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus.clone(), network).await;
+        accept_services_contact_pair(&alice, &bob);
+        let offer = format!(
+            "offer:{}:model",
+            home_people_contact_id(&bob.profile.document().profile_did)
+        );
+        let token = app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, body) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"others","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // A generic request cannot create an approvable model grant.
+        bob.discovery_service
+            .sync_services_mailboxes_once(right.path(), 0)
+            .await;
+        assert!(services_mailbox_saved_state(
+            right.path(),
+            &bob.authority,
+            "services-requests.json"
+        )["requests"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        let model_id = if hosted {
+            "model:hosted-0123456789abcdef0123456789abcdef"
+        } else {
+            "model:local-0123456789abcdef0123456789abcdef"
+        };
+        if hosted {
+            crate::api::model_provider_config::save_hosted_offer(
+                right.path(),
+                None,
+                HostedOfferSave {
+                    provider: HostedAiProvider::Venice,
+                    api_key: "fixture-key",
+                    model: "fixture/text",
+                    expected_response_model: None,
+                    privacy: None,
+                    name: "Hosted test",
+                    instance_id: Some(model_id),
+                },
+            )
+            .await
+            .unwrap();
+            crate::api::model_provider_config::set_hosted_offer_share(
+                right.path(),
+                model_id,
+                true,
+                Some(HostedAiProvider::Venice.share_terms_ack()),
+            )
+            .unwrap();
+        } else {
+            // The Services card requires the installed model provider marker.
+            std::fs::create_dir_all(right.path().join("bin")).unwrap();
+            std::fs::write(right.path().join("bin/model-provider"), b"fixture").unwrap();
+            let token = app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+            let (status, body) = services_contact_post(
+                &bob.app,
+                &token,
+                "/api/apps/services/offers",
+                json!({"offer_id":MODEL_LOCAL_OFFER,"section":"mine","selected":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let revision = Arc::new(std::sync::Mutex::new(format!("sha256:{}", "a".repeat(64))));
+        bob.registry
+            .register_sub_provider(
+                "model",
+                Arc::new(ServicesCatalogModelProvider {
+                    offer: if hosted {
+                        json!({"id":model_id,"title":"Hosted test","operation":"text.generate",
+                            "hosted":{"placement":"hosted","backend_provider_label":"Venice"}})
+                    } else {
+                        json!({"id":model_id,"title":"SmolLM2","operation":"text.generate"})
+                    },
+                    revision: revision.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let (status, body) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"catalog","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        bob.discovery_service
+            .sync_services_mailboxes_once(right.path(), 0)
+            .await;
+        let (status, summary) =
+            home_test_get_json(&alice.app, "/api/apps/services/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        let catalog = &summary["model_catalogs"][&offer][0];
+        assert_eq!(catalog["id"], model_id);
+        assert_eq!(catalog["revision"], format!("sha256:{}", "a".repeat(64)));
+        let (status, _) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"others","selected":true,
+                "model_offer_id":model_id,"model_offer_revision":format!("sha256:{}", "b".repeat(64))}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = services_contact_post(
+            &alice.app,
+            &token,
+            "/api/apps/services/offers",
+            json!({"offer_id":offer,"section":"others","selected":true,
+                "model_offer_id":model_id,"model_offer_revision":format!("sha256:{}", "a".repeat(64))}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        bob.discovery_service
+            .sync_services_mailboxes_once(right.path(), 0)
+            .await;
+        let saved =
+            services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json");
+        let requests = saved["requests"].as_object().unwrap();
+        assert_eq!(requests.len(), 1, "hosted={hosted}: {saved}");
+        let request = requests.values().next().unwrap();
+        assert_eq!(request["service_kind"], MODEL_SERVICE_KIND);
+        assert_eq!(request["status"], "pending");
+        assert_eq!(request["requested_model_offer_id"], model_id);
+        assert_eq!(
+            request["requested_model_offer_revision"],
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert!(bob.exit_provider.requests.lock().await.is_empty());
+        let (status, _) = home_test_post_json(
+            &bob.app,
+            "/api/apps/home/launch",
+            &bob.authority.home_token,
+            "http://localhost:61180",
+            json!({"target":INBOX_CAPSULE_ID}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (_, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        let action = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "service_access_request")
+            .unwrap()["action_ref"]["action_id"]
+            .as_str()
+            .unwrap();
+        if hosted {
+            *revision.lock().unwrap() = format!("sha256:{}", "b".repeat(64));
+        }
+        let (status, body) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        if hosted {
+            assert!(!status.is_success(), "{body}");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_signed_message() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
@@ -9807,4 +10242,968 @@ async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_sign
         before,
         bob.peer_provider.state.provider_requests.lock().await.len()
     );
+}
+
+fn ai_provider_config_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir
+        .join("providers")
+        .join("model-provider")
+        .join("config.json")
+}
+
+fn private_home_paths(root: &std::path::Path) -> BTreeSet<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(root, root, &mut out);
+    out
+}
+
+async fn ai_provider_raw(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, String) {
+    let mut builder = test_browser_request("localhost:61180", "null")
+        .method(method)
+        .uri(uri)
+        .header("x-elastos-home-token", token);
+    if body.is_some() {
+        builder = builder.header(CONTENT_TYPE, "application/json");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from(
+                    body.map(|value| value.to_string()).unwrap_or_default(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn install_valid_hosted_doubles() {
+    install_openrouter_models_double(OpenRouterModelsDouble::Models(vec![
+        "fixture/model".to_string()
+    ]));
+    install_venice_validate_double(
+        VeniceAuthDouble::Permitted,
+        Some(vec![(
+            "fixture/model".to_string(),
+            Some("private".to_string()),
+        )]),
+    );
+}
+
+fn assert_ai_provider_http_omits_secrets(body: &str) {
+    assert!(!body.contains("sk-or"));
+    assert!(!body.contains("sk-vnz"));
+    assert!(!body.contains("openrouter.ai"));
+    assert!(!body.contains("venice.ai"));
+    assert!(!body.contains("api_key"));
+    assert!(!body.contains("api_url"));
+    assert!(!body.contains("Authorization"));
+}
+
+fn connection<'a>(payload: &'a serde_json::Value, provider: &str) -> &'a serde_json::Value {
+    payload["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["provider"] == provider)
+        .unwrap()
+}
+
+fn has_provider(payload: &serde_json::Value, provider: &str) -> bool {
+    payload["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["provider"] == provider)
+}
+
+fn connection_id(payload: &serde_json::Value, provider: &str) -> String {
+    connection(payload, provider)["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn assert_config_omits_hosted_secrets(data_dir: &std::path::Path) {
+    let stored = std::fs::read_to_string(ai_provider_config_path(data_dir)).unwrap();
+    assert!(!stored.contains("sk-or"));
+    assert!(!stored.contains("sk-vnz"));
+    assert!(!stored.contains("\"api_key\""));
+}
+
+fn hosted_secret(data_dir: &std::path::Path, offer_id: &str) -> String {
+    std::fs::read_to_string(
+        data_dir
+            .join("providers")
+            .join("model-provider")
+            .join("secrets")
+            .join(offer_id.replace(':', "_")),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_guest_save_forbidden_and_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &guest.system_token,
+        Some(json!({
+            "provider": "openrouter",
+            "api_key": "sk-or-fixture-valid",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!body.contains("sk-or-fixture-valid"));
+    assert!(!ai_provider_config_path(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_guest_get_forbidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let (status, body) = ai_provider_raw(
+        &app,
+        "GET",
+        "/api/apps/system/ai-provider",
+        &guest.system_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!body.contains("sk-or"));
+    assert!(!body.contains("sk-vnz"));
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_invalid_key_leaves_that_provider_absent() {
+    for (provider, api_key, invalid_text, install) in [
+        (
+            "openrouter",
+            "sk-or-fixture-invalid",
+            "invalid OpenRouter key",
+            "or-invalid",
+        ),
+        (
+            "venice",
+            "sk-vnz-fixture-invalid",
+            "invalid Venice key",
+            "vnz-invalid",
+        ),
+        (
+            "venice",
+            "sk-vnz-fixture-invalid",
+            "invalid Venice key",
+            "vnz-denied",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let app = gateway_router(test_state(dir.path()));
+        let authority = passkey_authority(dir.path());
+        match install {
+            "or-invalid" => {
+                install_openrouter_models_double(OpenRouterModelsDouble::InvalidKey);
+            }
+            "vnz-denied" => {
+                install_venice_validate_double(VeniceAuthDouble::Denied, None);
+            }
+            _ => {
+                install_venice_validate_double(VeniceAuthDouble::InvalidKey, None);
+            }
+        }
+        let (status, body) = ai_provider_raw(
+            &app,
+            "POST",
+            "/api/apps/system/ai-provider/validate",
+            &authority.system_token,
+            Some(json!({"provider": provider, "api_key": api_key})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{provider} {body}");
+        assert_eq!(body, invalid_text);
+        assert!(!body.contains(api_key));
+        let (status, body) = ai_provider_raw(
+            &app,
+            "POST",
+            "/api/apps/system/ai-provider",
+            &authority.system_token,
+            Some(json!({
+                "provider": provider,
+                "api_key": api_key,
+                "model": "fixture/model"
+            })),
+        )
+        .await;
+        clear_hosted_ai_validate_doubles();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{provider} {body}");
+        assert!(!ai_provider_config_path(dir.path()).exists());
+    }
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_admin_save_replace_disconnect_keeps_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![json!({
+            "id": "model:local-llama",
+            "adapter": { "kind": "local_llama_cpp_text" }
+        })],
+    )
+    .unwrap();
+    let before_paths = private_home_paths(dir.path());
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "provider": "openrouter",
+            "name": "Jev",
+            "api_key": "sk-or-fixture-valid",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ai_provider_http_omits_secrets(&body);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["storage_home"], "this Home");
+    assert_eq!(payload["connections"].as_array().unwrap().len(), 1);
+    assert_eq!(connection(&payload, "openrouter")["connected"], true);
+    assert_eq!(connection(&payload, "openrouter")["name"], "Jev");
+    assert_eq!(
+        connection(&payload, "openrouter")["processor_label"],
+        "OpenRouter"
+    );
+    assert_eq!(
+        connection(&payload, "openrouter")["processor_kind"],
+        "external"
+    );
+    assert_eq!(
+        connection(&payload, "openrouter")["selected_model"],
+        "fixture/model"
+    );
+    assert_eq!(connection(&payload, "openrouter")["key_present"], true);
+    assert!(!has_provider(&payload, "venice"));
+    let openrouter_id = connection_id(&payload, "openrouter");
+    install_venice_validate_double(VeniceAuthDouble::InvalidKey, None);
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "provider": "venice",
+            "api_key": "sk-vnz-fixture-invalid",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body, "invalid Venice key");
+    let stored = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    assert_config_omits_hosted_secrets(dir.path());
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-valid"
+    );
+    assert!(!stored.contains("model:venice"));
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "provider": "venice",
+            "name": "Venice",
+            "api_key": "sk-vnz-fixture-valid",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ai_provider_http_omits_secrets(&body);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(connection(&payload, "venice")["connected"], true);
+    assert_eq!(connection(&payload, "venice")["name"], "Venice");
+    assert_eq!(connection(&payload, "venice")["privacy"], "private");
+    assert_eq!(connection(&payload, "openrouter")["connected"], true);
+    let venice_id = connection_id(&payload, "venice");
+    let config_path = ai_provider_config_path(dir.path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(config_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    let stored = std::fs::read_to_string(&config_path).unwrap();
+    assert_config_omits_hosted_secrets(dir.path());
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-valid"
+    );
+    assert_eq!(
+        hosted_secret(dir.path(), &venice_id),
+        "sk-vnz-fixture-valid"
+    );
+    assert!(stored.contains(&openrouter_id));
+    assert!(stored.contains(&venice_id));
+    assert!(stored.contains("open_ai_compatible_text"));
+    assert!(stored.contains("model:local-llama"));
+    assert!(!stored.contains("terms_ack"));
+    assert!(!stored.contains("\"payer\""));
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+    let after_save = private_home_paths(dir.path());
+    let added = after_save
+        .difference(&before_paths)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        added
+            .iter()
+            .all(|path| path.starts_with("providers/model-provider/")),
+        "{added:?}"
+    );
+    assert!(added.iter().all(|path| {
+        !path.contains("grant") && !path.contains("inbox") && !path.contains("services")
+    }));
+    let (status, get_body) = ai_provider_raw(
+        &app,
+        "GET",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{get_body}");
+    assert_ai_provider_http_omits_secrets(&get_body);
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "id": venice_id,
+            "provider": "venice",
+            "name": "Venice",
+            "api_key": "sk-vnz-fixture-replaced",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ai_provider_http_omits_secrets(&body);
+    assert_config_omits_hosted_secrets(dir.path());
+    assert_eq!(
+        hosted_secret(dir.path(), &venice_id),
+        "sk-vnz-fixture-replaced"
+    );
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-valid"
+    );
+    let stored = std::fs::read_to_string(&config_path).unwrap();
+    assert!(stored.contains(&venice_id));
+    assert!(stored.contains(&openrouter_id));
+    let before_edit = private_home_paths(dir.path());
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({"id":venice_id, "provider":"venice",
+            "name":"Venice edited", "api_key":"", "model":"fixture/model"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ai_provider_http_omits_secrets(&body);
+    assert_eq!(
+        hosted_secret(dir.path(), &venice_id),
+        "sk-vnz-fixture-replaced"
+    );
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-valid"
+    );
+    assert_eq!(private_home_paths(dir.path()), before_edit);
+    for (id, provider) in [
+        (venice_id.as_str(), "openrouter"),
+        ("model:hosted-ffffffffffffffffffffffffffffffff", "venice"),
+    ] {
+        let (status, _) = ai_provider_raw(
+            &app,
+            "POST",
+            "/api/apps/system/ai-provider",
+            &authority.system_token,
+            Some(json!({"id":id, "provider":provider,
+                "name":"Invalid edit", "api_key":"", "model":"fixture/model"})),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+    }
+    let (status, body) = ai_provider_raw(
+        &app,
+        "DELETE",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({"id": venice_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(!has_provider(&payload, "venice"));
+    assert_eq!(connection(&payload, "openrouter")["connected"], true);
+    let stored = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!stored.contains(&venice_id));
+    assert!(stored.contains(&openrouter_id));
+    assert!(stored.contains("model:local-llama"));
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-valid"
+    );
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "provider": "venice",
+            "name": "Venice",
+            "api_key": "sk-vnz-fixture-valid",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let venice_id = connection_id(&payload, "venice");
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "provider": "openrouter",
+            "name": "Jev",
+            "api_key": "sk-or-fixture-replaced",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_config_omits_hosted_secrets(dir.path());
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-replaced"
+    );
+    assert_eq!(
+        hosted_secret(dir.path(), &venice_id),
+        "sk-vnz-fixture-valid"
+    );
+    let (status, body) = ai_provider_raw(
+        &app,
+        "DELETE",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({"id": openrouter_id})),
+    )
+    .await;
+    clear_hosted_ai_validate_doubles();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(!has_provider(&payload, "openrouter"));
+    assert_eq!(connection(&payload, "venice")["connected"], true);
+    let stored = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!stored.contains(&openrouter_id));
+    assert!(stored.contains(&venice_id));
+    assert!(stored.contains("model:local-llama"));
+}
+
+fn shareable_hosted_ids(data_dir: &std::path::Path) -> Vec<String> {
+    crate::api::load_model_provider_operator_offers(data_dir)
+        .unwrap()
+        .into_iter()
+        .filter(|offer| {
+            offer
+                .pointer("/adapter/hosted")
+                .is_some_and(|value| !value.is_null())
+                && crate::api::offer_is_shareable(offer)
+        })
+        .filter_map(|offer| {
+            offer
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn operator_share_enabled(data_dir: &std::path::Path, offer_id: &str) -> bool {
+    crate::api::load_model_provider_operator_offers(data_dir)
+        .unwrap()
+        .iter()
+        .find(|offer| offer.get("id").and_then(serde_json::Value::as_str) == Some(offer_id))
+        .and_then(|offer| offer.get("share"))
+        .and_then(|share| share.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_share_guest_forbidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "provider": "openrouter",
+            "name": "Jev",
+            "api_key": "sk-or-fixture-valid",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let openrouter_id = connection_id(&payload, "openrouter");
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &guest.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "enabled": true,
+            "terms_ack": "openrouter-5.1-5.2+model"
+        })),
+    )
+    .await;
+    clear_hosted_ai_validate_doubles();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!operator_share_enabled(dir.path(), &openrouter_id));
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_share_requires_terms_and_preserves_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    install_valid_hosted_doubles();
+    let mut openrouter_id = String::new();
+    let mut venice_id = String::new();
+    for (provider, name, api_key) in [
+        ("openrouter", "Jev", "sk-or-fixture-valid"),
+        ("venice", "Venice", "sk-vnz-fixture-valid"),
+    ] {
+        let (status, body) = ai_provider_raw(
+            &app,
+            "POST",
+            "/api/apps/system/ai-provider",
+            &authority.system_token,
+            Some(json!({
+                "provider": provider,
+                "name": name,
+                "api_key": api_key,
+                "model": "fixture/model"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if provider == "openrouter" {
+            openrouter_id = connection_id(&payload, "openrouter");
+        } else {
+            venice_id = connection_id(&payload, "venice");
+        }
+    }
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+    let before = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body, "share terms acknowledgment is required");
+    assert_eq!(
+        std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap(),
+        before
+    );
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "enabled": true,
+            "terms_ack": "venice-7.3+model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body, "invalid share terms acknowledgment");
+    assert_eq!(
+        std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap(),
+        before
+    );
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "enabled": true,
+            "terms_ack": "openrouter-5.1-5.2+model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ai_provider_http_omits_secrets(&body);
+    assert_eq!(
+        shareable_hosted_ids(dir.path()),
+        vec![openrouter_id.clone()]
+    );
+    let (summary_status, summary) = home_test_get_json(
+        &app,
+        "/api/apps/services/summary",
+        &issue_home_launch_token(dir.path(), SERVICES_CAPSULE_ID).unwrap(),
+        "null",
+    )
+    .await;
+    assert_eq!(summary_status, StatusCode::OK, "{summary}");
+    let openrouter_card = summary["local_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["offer_id"] == openrouter_id)
+        .expect("shared OpenRouter card");
+    assert_eq!(openrouter_card["share_enabled"], true);
+    assert_eq!(openrouter_card["status"], "configured");
+    assert_eq!(openrouter_card["display_name"], "Jev");
+    let venice_card = summary["available_local_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(summary["local_offers"].as_array().unwrap().iter())
+        .find(|offer| offer["offer_id"] == venice_id)
+        .expect("Venice card");
+    assert_eq!(venice_card["share_enabled"], false);
+    let stored = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    assert!(stored.contains("\"enabled\": true"));
+    assert!(stored.contains("openrouter-5.1-5.2+model"));
+    assert!(stored.contains("\"processor\": \"OpenRouter\""));
+    assert!(stored.contains("\"payer\": \"this Home\""));
+    assert!(stored.contains("\"model\": \"fixture/model\""));
+    assert!(stored.contains(&venice_id));
+    assert!(!stored.contains("venice-7.3+model"));
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "provider": "openrouter",
+            "name": "Jev",
+            "api_key": "sk-or-fixture-replaced",
+            "model": "fixture/model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_config_omits_hosted_secrets(dir.path());
+    assert_eq!(
+        hosted_secret(dir.path(), &openrouter_id),
+        "sk-or-fixture-replaced"
+    );
+    assert!(operator_share_enabled(dir.path(), &openrouter_id));
+    let stored = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    assert!(stored.contains(&openrouter_id));
+    assert_eq!(
+        shareable_hosted_ids(dir.path()),
+        vec![openrouter_id.clone()]
+    );
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "enabled": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+    assert!(!operator_share_enabled(dir.path(), &openrouter_id));
+    let stored = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    assert!(stored.contains(&venice_id));
+    assert!(stored.contains(&openrouter_id));
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &authority.system_token,
+        Some(json!({
+            "id": openrouter_id,
+            "enabled": true,
+            "terms_ack": "openrouter-5.1-5.2+model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = ai_provider_raw(
+        &app,
+        "DELETE",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({"id": openrouter_id})),
+    )
+    .await;
+    clear_hosted_ai_validate_doubles();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(shareable_hosted_ids(dir.path()).is_empty());
+    let stored = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    assert!(!stored.contains(&openrouter_id));
+    assert!(stored.contains(&venice_id));
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_two_openrouter_instances_and_venice() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    install_valid_hosted_doubles();
+    let mut ids = Vec::new();
+    for (provider, name, key) in [
+        ("openrouter", "Jev", "sk-or-fixture-valid"),
+        ("openrouter", "DeepSeek", "sk-or-fixture-valid"),
+        ("venice", "Venice", "sk-vnz-fixture-valid"),
+    ] {
+        let (status, body) = ai_provider_raw(
+            &app,
+            "POST",
+            "/api/apps/system/ai-provider",
+            &authority.system_token,
+            Some(json!({
+                "provider": provider,
+                "name": name,
+                "api_key": key,
+                "model": "fixture/model"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        ids.push(
+            payload["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    clear_hosted_ai_validate_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "GET",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["connections"].as_array().unwrap().len(), 3);
+    let names = payload["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"Jev".to_string()));
+    assert!(names.contains(&"DeepSeek".to_string()));
+    assert!(names.contains(&"Venice".to_string()));
+    assert_ne!(ids[0], ids[1]);
+    assert_config_omits_hosted_secrets(dir.path());
+    install_valid_hosted_doubles();
+    let (status, body) = ai_provider_raw(
+        &app,
+        "POST",
+        "/api/apps/system/ai-provider/share",
+        &authority.system_token,
+        Some(json!({
+            "id": ids[0],
+            "enabled": true,
+            "terms_ack": "openrouter-5.1-5.2+model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(shareable_hosted_ids(dir.path()), vec![ids[0].clone()]);
+    assert!(!operator_share_enabled(dir.path(), &ids[1]));
+    let (status, body) = ai_provider_raw(
+        &app,
+        "DELETE",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        Some(json!({"id": ids[1]})),
+    )
+    .await;
+    clear_hosted_ai_validate_doubles();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let names = payload["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"Jev".to_string()));
+    assert!(!names.contains(&"DeepSeek".to_string()));
+    assert!(names.contains(&"Venice".to_string()));
+    assert!(operator_share_enabled(dir.path(), &ids[0]));
+}
+
+#[tokio::test]
+async fn test_system_ai_provider_migrates_legacy_openrouter_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![json!({
+            "id": "model:openrouter",
+            "title": "OpenRouter",
+            "enabled": true,
+            "adapter": {
+                "kind": "open_ai_compatible_text",
+                "api_url": "https://openrouter.ai/api/v1/chat/completions",
+                "api_key": "sk-or-fixture-valid",
+                "model": "fixture/model",
+                "hosted": {
+                    "backend_provider_label": "OpenRouter",
+                    "selection_mode": "pinned",
+                    "privacy_policy_ref": "https://openrouter.ai/privacy",
+                    "terms_ref": "https://openrouter.ai/terms",
+                    "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                }
+            }
+        })],
+    )
+    .unwrap();
+    assert_config_omits_hosted_secrets(dir.path());
+    assert_eq!(
+        hosted_secret(dir.path(), "model:openrouter"),
+        "sk-or-fixture-valid"
+    );
+    let stored = std::fs::read_to_string(ai_provider_config_path(dir.path())).unwrap();
+    assert!(stored.contains("\"id\": \"model:openrouter\""));
+    assert!(stored.contains("runtime:model-provider:model:openrouter"));
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let (status, body) = ai_provider_raw(
+        &app,
+        "GET",
+        "/api/apps/system/ai-provider",
+        &authority.system_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(connection(&payload, "openrouter")["id"], "model:openrouter");
+    assert_eq!(connection(&payload, "openrouter")["connected"], true);
+    assert_ai_provider_http_omits_secrets(&body);
 }

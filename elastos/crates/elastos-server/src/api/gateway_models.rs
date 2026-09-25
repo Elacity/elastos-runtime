@@ -193,6 +193,8 @@ struct HomeServiceOfferSummary {
     capsule_contract: String,
     source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    share_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_contract: Option<HomeServiceRuntimeContractSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     contact_id: Option<String>,
@@ -214,6 +216,14 @@ struct HomeServiceRuntimeContractSummary {
     wallet_injection: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeServicesModelCatalogEntry {
+    id: String,
+    title: String,
+    revision: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HomeServicesSummary {
     schema: String,
@@ -229,6 +239,8 @@ struct HomeServicesSummary {
     available_local_offers: Vec<HomeServiceOfferSummary>,
     #[serde(default)]
     available_remote_offers: Vec<HomeServiceOfferSummary>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_catalogs: BTreeMap<String, Vec<HomeServicesModelCatalogEntry>>,
     grant_model: String,
     carrier_contract: String,
     capsule_contract: String,
@@ -246,6 +258,7 @@ impl Default for HomeServicesSummary {
             remote_offers: Vec::new(),
             available_local_offers: Vec::new(),
             available_remote_offers: Vec::new(),
+            model_catalogs: BTreeMap::new(),
             grant_model: "principal_scoped_provider_grant".to_string(),
             carrier_contract: "People discovers trusted offers; Carrier carries signed offer envelopes; providers enforce grants.".to_string(),
             capsule_contract: "capsule -> runtime capability -> provider grant -> service".to_string(),
@@ -536,6 +549,8 @@ struct HomeAppearanceSummary {
 struct InboxSummaryResponse {
     app: HomeCapsuleIdentity,
     notifications: HomeNotificationsSummary,
+    #[cfg(unix)]
+    hosted_routes: Vec<super::model_provider_egress_decision::HostedRouteSummary>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
