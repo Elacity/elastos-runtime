@@ -1429,6 +1429,12 @@ fn materialize_provider_offer(
         // a named offer and requests each external effect through Runtime.
         adapter.remove("api_key");
         adapter.remove("bearer_token");
+        if let Some(hosted) = adapter
+            .get_mut("hosted")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            hosted.remove("egress_contract");
+        }
     }
     apply_fixture_chat_url(fixtures, &mut offer);
     offer
@@ -1828,11 +1834,35 @@ fn read_model_provider_private_file(
 #[cfg(test)]
 mod hosted_hint_tests {
     use super::{
-        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer, named_jev_hosted_offer,
+        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer,
+        materialize_provider_offer, named_jev_hosted_offer,
         seed_model_provider_operator_offers_for_test, set_hosted_offer_share, status_from_offers,
         HostedAiProvider,
     };
     use serde_json::json;
+
+    #[test]
+    fn provider_init_omits_runtime_egress_contract() {
+        let offer = hosted_offer(
+            HostedAiProvider::OpenRouter,
+            "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Fixture",
+            "fixture/model",
+            None,
+        );
+        assert_eq!(
+            offer.pointer("/adapter/hosted/egress_contract"),
+            Some(&json!("connection-v1"))
+        );
+        let projected = materialize_provider_offer(offer.clone(), None);
+        assert!(projected
+            .pointer("/adapter/hosted/egress_contract")
+            .is_none());
+        assert_eq!(
+            offer.pointer("/adapter/hosted/egress_contract"),
+            Some(&json!("connection-v1"))
+        );
+    }
 
     #[test]
     fn hosted_hint_omits_urls_and_keys() {
