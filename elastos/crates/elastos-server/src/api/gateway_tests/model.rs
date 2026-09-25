@@ -1781,6 +1781,60 @@ async fn owner_inbox_retains_hosted_route_history_and_ends_exact_decision() {
 }
 
 #[tokio::test]
+async fn owner_inbox_end_keeps_competing_decision_from_cancelling_without_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let app = gateway_router(test_state(dir.path()));
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let scope = crate::api::model_provider_egress_decision::EgressScope {
+        offer_id: "validation:venice".into(),
+        effect: "validate_models".into(),
+        method: "GET".into(),
+        url: "http://127.0.0.1:9998/models".into(),
+        origin: "http://127.0.0.1:9998".into(),
+        recipient: "127.0.0.1".into(),
+        payer: "this Home".into(),
+        provider: "Venice".into(),
+        purpose: "Load hosted model choices".into(),
+        configuration_id: "b".repeat(64),
+    };
+    let id = crate::api::model_provider_egress_decision::request(
+        dir.path(),
+        &scope,
+        Some(&authority.proof_binding_id),
+    )
+    .unwrap();
+    let held =
+        crate::api::model_provider_egress::hold_admission_for_test(dir.path(), &scope.offer_id)
+            .await;
+    let end_action = format!("model-egress-end:{id}");
+    let deny_action = format!("model-egress-deny:{id}");
+    let mut end = Box::pin(
+        app.clone()
+            .oneshot(inbox_action_request(inbox_token.clone(), &end_action)),
+    );
+    if let Ok(response) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut end).await
+    {
+        let (status, body) = status_json(response.unwrap()).await;
+        panic!("End returned before admission released: {status} {body}");
+    }
+    let mut deny = Box::pin(app.oneshot(inbox_action_request(inbox_token, &deny_action)));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut deny)
+            .await
+            .is_err()
+    );
+    drop(held);
+    let (status, body) = status_json(end.await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(deny.await.unwrap().status(), StatusCode::OK);
+    let history = crate::api::model_provider_egress_decision::inbox_history(dir.path()).unwrap();
+    let history = serde_json::to_value(history).unwrap();
+    assert_eq!(history[0]["status"], "ended");
+}
+
+#[tokio::test]
 async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let dir = tempfile::tempdir().unwrap();
     crate::api::seed_model_provider_operator_offers_for_test(
