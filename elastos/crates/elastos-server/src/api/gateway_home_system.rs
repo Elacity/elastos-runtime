@@ -4199,13 +4199,8 @@ pub(super) fn home_services_sync_access_requests(
     let _guard = mutation_lock
         .lock()
         .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
-    if !home_services_local_exit_shared(data_dir, context)?
-        && !home_services_local_engine_shared(data_dir, context)?
-        && !home_services_local_model_shared(data_dir, context)?
-        && !crate::api::any_hosted_model_shared(data_dir)
-    {
-        return Ok(());
-    }
+    let model_shared = home_services_local_model_shared(data_dir, context)?
+        || crate::api::any_hosted_model_shared(data_dir);
     let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     let known_peers = contacts
         .contacts
@@ -4331,13 +4326,14 @@ pub(super) fn home_services_sync_access_requests(
         .pending_model_catalogs
         .iter()
         .filter(|(peer_id, _)| {
-            now.saturating_sub(
-                state
-                    .catalog_last_response_at
-                    .get(*peer_id)
-                    .copied()
-                    .unwrap_or_default(),
-            ) >= HOME_MODEL_CATALOG_RESPONSE_COOLDOWN_SECS
+            model_shared
+                && now.saturating_sub(
+                    state
+                        .catalog_last_response_at
+                        .get(*peer_id)
+                        .copied()
+                        .unwrap_or_default(),
+                ) >= HOME_MODEL_CATALOG_RESPONSE_COOLDOWN_SECS
         })
         .map(|(peer_id, request)| {
             (
@@ -4534,6 +4530,9 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
     }
 }
 
+const PRIVATE_ENGINE_APPROVAL_COPY: &str =
+    "Your Browser Engine is private. Share it in Services before approving this request.";
+
 pub(super) fn append_home_service_access_notifications(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -4598,6 +4597,14 @@ pub(super) fn append_home_service_access_notifications(
                     )
                 }
                 None => approval_effect.to_string(),
+            }
+        } else if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+            && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
+        {
+            match home_services_local_engine_shared(data_dir, context) {
+                Ok(false) => PRIVATE_ENGINE_APPROVAL_COPY.to_string(),
+                Ok(true) => approval_effect.to_string(),
+                Err(_) => "Check Browser Engine sharing in Services before approval.".to_string(),
             }
         } else {
             approval_effect.to_string()
@@ -4770,8 +4777,15 @@ fn home_services_record_access_decision(
         let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
         if !contacts.contacts.values().any(|contact| {
             contact.peer_id == request.requester_peer_id && contact.did == request.requester_did
-        }) || !home_services_request_shared(data_dir, context, &request)?
-        {
+        }) {
+            anyhow::bail!("service request person or shared offer is no longer available");
+        }
+        if !home_services_request_shared(data_dir, context, &request)? {
+            if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+                && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
+            {
+                anyhow::bail!(PRIVATE_ENGINE_APPROVAL_COPY);
+            }
             anyhow::bail!("service request person or shared offer is no longer available");
         }
     }

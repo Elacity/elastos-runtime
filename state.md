@@ -1,5 +1,21 @@
 # State
 
+## Browser Engine private Share request source correction, 25 September 2026 UTC
+
+An isolated source regression now covers a connected Consumer requesting an
+Owner Browser Engine while it is private, both when the Owner shares an AI
+model and when every service is private. The Owner receives the signed request
+in Inbox with the Share step stated. Approval leaves it pending while Engine
+Share is private; after Owner shares the Engine, approval succeeds. Services
+describes the remote Engine as a request to its owner, not an available engine.
+The Engine change preserves the AI model Share state. Focused request, Inbox
+and Engine-grant tests, Services UI smoke, formatting and Home entropy checks
+pass. Independent source review found no blocking issue in the corrected
+receive, approval and catalog paths. This is source and simulated UI evidence;
+the signed-in Owner and Consumer Homes still run their prior installed bytes.
+The real pending request and human Share/approval state remain intact. An
+installed Browser Engine request journey remains open under J4/B08.
+
 ## SEC1 Mac child policy candidate stopped at Init, 25 September 2026 UTC
 
 An uncommitted source candidate replaced the Mac model child's broad file

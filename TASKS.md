@@ -30,6 +30,13 @@ Each row requires a receipt with source/tree, dirty patch, built and installed h
 
 The [Browser acceptance contract](docs/BROWSER_ACCEPTANCE.md) defines B01–B16. These open boxes track full qualification; a partial source or installed result does not check them. J4 in [Now](#now) is the current execution handoff. One Browser/Net/Exit ABI governs local and remote placements. The current Selkies path is a proof baseline, not product audio acceptance. The operator decision report supplies a structured `next_action`; do not spend more branch time tuning Selkies as the product path when a hosted or native target is required.
 
+The private Browser Engine request correction passes source and simulated
+Services UI checks, including all-private and AI-model-shared Owner states.
+Next, install a reviewed matching candidate on isolated Owner and Consumer
+Homes and prove the ordinary request → Owner Share → Inbox approval → Engine
+use path. Preserve the current human request and its private Share state until
+that separate installed proof is ready.
+
 - [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
 - [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).
 - [ ] [B03: Every failure has an actionable diagnosis](docs/BROWSER_ACCEPTANCE.md#b03).
