@@ -10,15 +10,18 @@ bytes then rejected Init with `base_path is unavailable`, before guard or
 engine launch. A temporary diagnostic provider captured `EPERM` from its own
 Runtime-base canonicalization. One exact `file-read-metadata` grant for that
 base left the same Init failure; the grant and source instrumentation were
-reverted. The blocked Seatbelt operation or ancestor remains unknown. This is
-a source-policy candidate failure, not a completed model load.
+reverted. A standalone Rust canonicalization probe under the candidate file
+rules also returned `EPERM`. Its scoped OS record identifies denied
+`file-read-metadata` on `/Users`, the first base-path ancestor. Other logged
+paths and the complete permission set needed for Init remain unresolved. This
+is a source-policy candidate failure, not a completed model load.
 
 Independent review also found that the candidate permits broad reads under
 `/usr`, selects engine libraries by directory scan, and tests inherited
 writable descriptors only in a synthetic child over descriptors 3–255. The
 converted network fixture lost descendant checks. Keep the candidate dirty
-and uninstalled while the next owner traces the denied operation, narrows
-system reads, restores descendant coverage, and proves provider → guard →
+and uninstalled while the next owner reviews narrow ancestor traversal,
+narrows system reads, restores descendant coverage, and proves provider → guard →
 engine load and denial on that chain. Active-run provider rollover and
 immediate post-Get Use are separate gates. The isolated provider was reaped;
 public and human Homes, holders and keys stayed unchanged. The ignored private
