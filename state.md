@@ -1,5 +1,23 @@
 # State
 
+## SEC1 Mac descriptor custody test, 25 September 2026 UTC
+
+In a synthetic Seatbelt test, the child kept reading the original verified
+inode through an inherited read-only descriptor after a same-user parent
+replaced its pathname. Direct opens of the replacement and owner-only canary
+were denied. A second test changed the same inode's bytes in place through a
+same-user writer; the child then read and mapped the changed bytes through its
+held descriptor. Descriptor pinning resists pathname replacement but does not
+make the verified bytes immutable.
+
+Current model validation and the provider → guard → llama-server launch reopen
+a pathname; no production descriptor handoff or valid GGUF load was tested.
+The builder stopped before source, build or installed changes. Stable verified
+byte custody and least-privilege handoff through the real load chain need a
+reviewed design and an isolated engine proof before integration. Receipt:
+`.audit/sec1-mac-fd-custody-feasibility.private.md`. SEC1 and immediate
+Marketplace Get → Use acceptance remain open.
+
 ## SEC1 Mac staging path test, 25 September 2026 UTC
 
 A synthetic Seatbelt staging root let one sandbox child read a file added after
