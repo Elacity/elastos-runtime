@@ -15,6 +15,11 @@ Carrier framing limits, native-component interoperability and advanced Assistant
 ## Model expansion
 
 The useful seed model and the signed Qwen3.5-9B Mac journey remain Required.
+Qwen3.8-27B is an optional higher-capacity Mac candidate. Qualify its pinned
+engine, exact quantized artifact, license, signing authority, memory and useful
+answers through the existing model contract before catalogue inclusion. It
+adds no release gate; [model selection](MODEL_PROVIDER.md#staged-delivery-path)
+records the candidate and proof requirements.
 The full Qwen matrix remains open for Later: both acquisition orders, wider
 distribution and benchmarks, and independent-holder checks. Preserve MA1,
 MA3, AI and CR criteria in Notion and their existing receipts. Bonsai and

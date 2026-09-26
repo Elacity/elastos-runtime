@@ -402,8 +402,19 @@ tests before sharing is accepted:
    ordinary prompt set and pass criteria, then record complete answers, cold
    load time, output rate, peak memory and the 10% free-disk reserve on each
    named target. A model name or family does not prove engine compatibility.
+   Keep Qwen3.5-4B as the CPU-seed candidate and Qwen3.5-9B as the Mac option.
+   Qwen's published comparison favors 9B on most language and coding tests;
+   our quantized installed models still need the ordinary-prompt check above.
+   Add Qwen3.8-27B as an optional higher-capacity Mac candidate, subject to the
+   same admission and quality checks. Its inspected community Q4 GGUF is
+   16.46 GB before engine and context memory. Measure it on the named Mac
+   before offering it; it is outside the blocking release scope.
+   [Qwen's 4B/9B comparison](https://huggingface.co/Qwen/Qwen3.5-4B),
+   [Qwen3.8 model card](https://huggingface.co/Qwen/Qwen3.8-27B) and
+   [community GGUF artifact](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf)
+   supply candidate facts, rather than installed acceptance.
    Wider Qwen acquisition-order and independent-holder checks, Bonsai and
-   newer-model comparisons remain Later.
+   other model comparisons remain Later.
 2. Use llama.cpp as the common first engine for macOS Metal and later Jetson
    CUDA. Pin engine and model provenance. Runtime verifies installed artifacts;
    the model provider owns start, health, limits, streaming, cancellation,
