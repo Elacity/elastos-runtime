@@ -149,7 +149,7 @@ The contract and its limits live in
 The first package-delivery milestone was planned around a signed,
 CID-identified Qwen content capsule. That wording is historical: later
 receipts record installed Qwen and SmolLM2 journeys on named Homes. Current
-acceptance and target limits are in [state.md](state.md#current-model-foundation-23-september-2026-utc)
+acceptance and target limits are in [state.md](state.md#current-model-foundation-24-september-2026-utc)
 and [TASKS Now](TASKS.md#now). The intended experience uses Marketplace
 discovery and exact handoff into Assistant, keeps the selected local model,
 and provides recoverability-aware removal in System. The contract lives in

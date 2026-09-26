@@ -386,13 +386,24 @@ to Git review; model bytes and private publisher keys stay outside Git.
 
 ## Staged delivery path
 
-Local-engine and hosted-API acceptance are separate tracks. Each backend must
-pass installed lifecycle tests before it can be shared:
+Local-engine and hosted-API acceptance are separate tracks. The
+[0.7.2 release plan](https://app.notion.com/p/3d6b682adcca81948f78d12abcd677b9)
+requires useful local Assistant replies and approved hosted use on Mac and
+Linux. Remote sharing is Later. Each backend must pass installed lifecycle
+tests before sharing is accepted:
 
-1. Evaluate Qwen3.5-9B Q4_K_M as the stable Mac baseline and PrismML Bonsai 8B
-   Q1 as an experimental low-memory comparison on an M5 Mac with 24 GB of
-   memory. Qwen3.8-27B and Bonsai 27B remain later benchmark candidates rather
-   than initial defaults.
+1. Keep signed SmolLM2-135M as the small installation and failure-test baseline.
+   Earlier installed Mac receipts record Qwen3.5-9B Q4_K_M replies, save,
+   reload and restart. Complete its signed Marketplace Get, immediate Use,
+   useful Assistant reply and restart reuse on a suitable Mac candidate.
+   Qwen3.5-4B is the first candidate for regular use on the seed. Before adding
+   it to the signed catalogue, verify the pinned engine, exact weights and
+   quantization provenance, license and publisher authority. Define a small
+   ordinary prompt set and pass criteria, then record complete answers, cold
+   load time, output rate, peak memory and the 10% free-disk reserve on each
+   named target. A model name or family does not prove engine compatibility.
+   Wider Qwen acquisition-order and independent-holder checks, Bonsai and
+   newer-model comparisons remain Later.
 2. Use llama.cpp as the common first engine for macOS Metal and later Jetson
    CUDA. Pin engine and model provenance. Runtime verifies installed artifacts;
    the model provider owns start, health, limits, streaming, cancellation,
@@ -404,14 +415,13 @@ pass installed lifecycle tests before it can be shared:
    of the same provider. Use the seam only where official docs confirm the
    request. Private setup publishes no offer.
    Prove a live authorized private hosted run for each provider after the
-   owner enters that provider's key in Home. Prove the existing
-   provider-internal OpenAI Responses API adapter separately. xAI/Grok stays
-   later.
-4. Prove J3 sharing of the accepted Mac local model with another Runtime.
+   owner enters that provider's key in Home. The separate provider-internal
+   OpenAI Responses API proof and xAI/Grok remain Later.
+4. Later, prove J3 sharing of the accepted Mac local model with another Runtime.
    This requires signed offer and grant admission plus bounded Carrier ingress.
    A Jetson deployment is a separate acceptance track.
-5. After each private connection exists, add an explicit owner-funded Share of
-   that exact provider and model through existing Services and Marketplace.
+5. Later, after each private connection exists, add an explicit owner-funded
+   Share of that exact provider and model through existing Services and Marketplace.
    Qualify OpenRouter Terms 5.1–5.2 or Venice TOS 7.3, plus the selected model
    terms, before Share. Keep one connection budget across that provider's
    private and shared offers, with per-consumer limits. Commercial billing,
