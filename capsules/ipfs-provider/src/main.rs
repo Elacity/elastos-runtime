@@ -1373,34 +1373,6 @@ impl IpfsProvider {
 
     // ── Internal: local IPFS gateway only ──────────────────────────
 
-    fn fetch_from_local_gateway_to_path(
-        &self,
-        arg: &str,
-        dest: &Path,
-        timeout: Duration,
-    ) -> Result<u64, String> {
-        if self.gateway_port == 0 {
-            return Err(format!(
-                "local Elastos IPFS gateway unavailable for {}. No HTTP fallback is allowed.",
-                arg
-            ));
-        }
-
-        let url = format!("http://127.0.0.1:{}/ipfs/{}", self.gateway_port, arg);
-        match ureq::get(&url).timeout(timeout).call() {
-            Ok(resp) if resp.status() == 200 => copy_reader_to_path(resp.into_reader(), dest),
-            Ok(resp) => Err(format!(
-                "local Elastos IPFS gateway -> HTTP {} for {}. No HTTP fallback is allowed.",
-                resp.status(),
-                arg
-            )),
-            Err(e) => Err(format!(
-                "local Elastos IPFS gateway -> {} for {}. No HTTP fallback is allowed.",
-                e, arg
-            )),
-        }
-    }
-
     fn fetch_from_local_gateway_with_timeout(
         &self,
         arg: &str,
