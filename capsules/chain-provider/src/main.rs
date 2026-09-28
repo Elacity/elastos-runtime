@@ -418,11 +418,13 @@ impl ChainProvider {
                 network,
                 wallet,
                 content_access_id,
+                block,
             } => self.resolve_protected_content_purchase_access(
                 &request_id,
                 &network,
                 &wallet,
                 &content_access_id,
+                block,
             ),
             Request::ResolveProtectedContentItemAccess {
                 request_id,
@@ -2275,6 +2277,7 @@ impl ChainProvider {
         network_id: &str,
         wallet: &str,
         content_access_id: &str,
+        block: ProtectedContentAccessBlock,
     ) -> Response {
         if request_id.trim().is_empty() || request_id.len() > 256 {
             return Response::error(
@@ -2328,12 +2331,18 @@ impl ChainProvider {
                 contract: &method.contract,
                 data: &data,
                 expected_content_access_id: Some(&content_access_id),
-                // The upfront "is this copy theirs" check. The grant is
-                // readable at the block that carries the acquisition, so
-                // reading it at finality would deny a transaction the caller
-                // watched confirm. Releasing the key is gated separately, on
-                // finalized evidence.
-                block: ProtectedContentRightsBlock::Head,
+                // `Latest` is the upfront "is this copy theirs" check. The
+                // grant is readable at the block that carries the
+                // acquisition, so reading it at finality would deny a
+                // transaction the caller watched confirm. Releasing the key
+                // is gated separately, on finalized evidence; `Finalized`
+                // lets the open ask that same question before custody does.
+                block: match block {
+                    ProtectedContentAccessBlock::Finalized => {
+                        ProtectedContentRightsBlock::Finalized
+                    }
+                    ProtectedContentAccessBlock::Latest => ProtectedContentRightsBlock::Head,
+                },
             },
         ) {
             Ok(observation) => observation,

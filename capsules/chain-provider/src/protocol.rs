@@ -30,15 +30,15 @@ pub(super) const PROTECTED_CONTENT_PURCHASE_ACCESS_SCHEMA: &str =
 pub(super) const PROTECTED_CONTENT_ITEM_ACCESS_SCHEMA: &str =
     "elastos.chain.protected-content-item-access/v1";
 
-/// The block an item-keyed access read is evaluated at: `latest` for the
-/// same reason the content-id purchase-access read reads the head (a grant is
-/// readable in the block that carries it), `finalized` where only state no
-/// reorg can take back will do. Either way every source is pinned to one
-/// common block and must agree there.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+/// The block an access read is evaluated at: `latest` because a grant is
+/// readable in the block that carries it, `finalized` where only state no
+/// reorg can take back will do -- the block custody judges a release by.
+/// Either way every source is pinned to one common block and must agree there.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProtectedContentAccessBlock {
     Finalized,
+    #[default]
     Latest,
 }
 
@@ -446,6 +446,10 @@ pub(super) enum Request {
         network: String,
         wallet: String,
         content_access_id: String,
+        /// Absent means `latest`, the upfront ownership check. The open asks
+        /// `finalized` to learn whether custody can release yet.
+        #[serde(default)]
+        block: ProtectedContentAccessBlock,
     },
     /// R50: whether `wallet` holds access to the item `(ledger, token_id)`,
     /// asked by the item (`AuthorityGateway.hasAccess`) rather than by its

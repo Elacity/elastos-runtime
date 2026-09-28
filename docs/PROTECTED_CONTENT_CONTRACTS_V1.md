@@ -166,7 +166,9 @@ action semantics from the boolean on-chain entitlement alone. Production-
 approved chain ids, contract addresses, selectors, and ABI fixtures remain open
 review inputs, but they are required typed policy fields now, not ambient
 provider configuration. The observation finality model itself is fixed to
-`finalized` in this current review v1 line.
+`finalized` in this current review v1 line. The reasons and the cost it adds
+before a new mint or purchase can be opened are in
+[Key release waits for finality](PROTECTED_CONTENT.md#key-release-waits-for-finality).
 
 `RightsEvaluationEvidenceRequestV1` is the matching typed evidence request. It
 pins the exact `ProtectedContentBindingV1` and `RightsPolicyIdentityV1`. A node

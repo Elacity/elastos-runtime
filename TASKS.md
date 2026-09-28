@@ -164,6 +164,10 @@ Open:
     - [ ] Hint a buyer to wait for finality after a revert within the
       finality lag, instead of a plain failure.
     - [ ] Read the buy receipt at the finalized block instead of latest.
+    - [x] Show an open attempted inside the finality lag after a mint or
+      purchase as "finalizing, opens in about N minutes" instead of a
+      failure. Custody key release reads only `finalized` state; see
+      [Key release waits for finality](docs/PROTECTED_CONTENT.md#key-release-waits-for-finality).
     - [ ] Decode ERC-20 approval/buy calldata server-side instead of
       trusting the chain-provider's steps.
     - [ ] Adopt a market purchase when this Home already holds a listing of

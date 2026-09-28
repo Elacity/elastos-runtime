@@ -15299,3 +15299,182 @@ fn manifest_publisher_binding_is_chosen_by_origin_and_requires_a_did_key() {
         Binding::Exact
     );
 }
+
+const FINALITY_WALLET: &str = "0x0000000000000000000000000000000000000007";
+
+fn finality_access_answer(request: &Value, has_access: bool) -> Value {
+    ok_provider_response(json!({
+        "schema": "elastos.chain.protected-content-purchase-access/v1",
+        "request_id": request["request_id"],
+        "network": "base-mainnet",
+        "chain_id": 8453,
+        "wallet": FINALITY_WALLET,
+        "content_access_id": request["content_access_id"],
+        "has_access": has_access,
+        "finalized_block_number": 44,
+        "finalized_block_hash": format!("0x{}", "cc".repeat(32)),
+        "finalized_block_timestamp": 1_000,
+        "observed_at": 1_000,
+    }))
+}
+
+fn finality_unbound_answer() -> Value {
+    json!({
+        "status": "error",
+        "code": "unknown_protected_content_object",
+        "message": "protected-content content access id is not bound on chain",
+    })
+}
+
+/// The request the finality check sends, so each answer can echo it.
+fn finality_request(block: &str) -> Value {
+    json!({
+        "request_id": format!("open-finality:{block}"),
+        "content_access_id": format!("0x{}", hex::encode(content_access_id(0x51).as_bytes())),
+    })
+}
+
+async fn finality_progress_with(
+    answers: Vec<Result<Value, ProviderError>>,
+    confirmed_at: u64,
+    now: u64,
+) -> (Option<super::RuntimeCustodyOpenProgress>, Vec<Value>) {
+    let registry = Arc::new(ProviderRegistry::new());
+    let chain = SequencedProvider::new(CHAIN_PROVIDER_ID, answers);
+    registry
+        .register_sub_provider(CHAIN_PROVIDER_ID, chain.clone())
+        .await
+        .unwrap();
+    let progress = super::runtime_custody_open_finality_progress(
+        registry.as_ref(),
+        "base-mainnet",
+        FINALITY_WALLET,
+        content_access_id(0x51),
+        "open-finality",
+        confirmed_at,
+        now,
+    )
+    .await;
+    (progress, chain.requests().await)
+}
+
+/// A copy whose grant is at the head but not yet at the finalized block is
+/// inside the finality lag: custody would refuse it as unbound, so the open
+/// answers `finalizing` before any Wallet request or custody call is made.
+#[tokio::test]
+async fn open_finality_progress_reports_finalizing_when_only_the_head_has_the_grant() {
+    let now = 10_000;
+    let (progress, requests) = finality_progress_with(
+        vec![
+            Ok(finality_unbound_answer()),
+            Ok(finality_access_answer(&finality_request("latest"), true)),
+        ],
+        now - 120,
+        now,
+    )
+    .await;
+    let progress = progress.expect("a copy inside the finality lag is finalizing");
+    let answer = progress.as_json();
+    assert_eq!(answer["stage"], "finalizing");
+    assert_eq!(answer["resumable"], true);
+    assert_eq!(answer["awaits_person"], false);
+    assert_eq!(
+        answer["ready_at"],
+        json!(now - 120 + super::RUNTIME_CUSTODY_EXPECTED_FINALITY_LAG_SECS)
+    );
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0]["op"],
+        "resolve_protected_content_purchase_access"
+    );
+    assert_eq!(requests[0]["block"], "finalized");
+    assert_eq!(requests[0]["network"], "base-mainnet");
+    assert_eq!(requests[0]["wallet"], FINALITY_WALLET);
+    assert_eq!(requests[1]["block"], "latest");
+}
+
+/// The estimate never names a moment already past: a lag longer than usual
+/// still reads as "any moment now", not as a time that went by.
+#[tokio::test]
+async fn open_finality_progress_never_estimates_a_ready_time_in_the_past() {
+    let now = 10_000;
+    let confirmed_at = now - super::RUNTIME_CUSTODY_EXPECTED_FINALITY_LAG_SECS - 300;
+    let (progress, _) = finality_progress_with(
+        vec![
+            Ok(finality_unbound_answer()),
+            Ok(finality_access_answer(&finality_request("latest"), true)),
+        ],
+        confirmed_at,
+        now,
+    )
+    .await;
+    let answer = progress.expect("still finalizing").as_json();
+    assert!(answer["ready_at"].as_u64().unwrap() > now);
+}
+
+#[tokio::test]
+async fn open_finality_progress_is_silent_once_the_grant_is_finalized() {
+    let now = 10_000;
+    let (progress, requests) = finality_progress_with(
+        vec![Ok(finality_access_answer(
+            &finality_request("finalized"),
+            true,
+        ))],
+        now - 120,
+        now,
+    )
+    .await;
+    assert!(progress.is_none());
+    assert_eq!(requests.len(), 1);
+}
+
+/// Past the watch window finality is long settled, so the open spends no
+/// chain read on it.
+#[tokio::test]
+async fn open_finality_progress_skips_the_chain_for_a_long_settled_copy() {
+    let now = 100_000;
+    let (progress, requests) = finality_progress_with(
+        Vec::new(),
+        now - super::RUNTIME_CUSTODY_FINALITY_WATCH_SECS - 1,
+        now,
+    )
+    .await;
+    assert!(progress.is_none());
+    assert!(requests.is_empty());
+}
+
+/// No grant at the head either: that is not a finality wait, and the open
+/// goes on to let custody give its own answer.
+#[tokio::test]
+async fn open_finality_progress_is_silent_when_the_head_has_no_grant_either() {
+    let now = 10_000;
+    let (progress, requests) = finality_progress_with(
+        vec![
+            Ok(finality_access_answer(
+                &finality_request("finalized"),
+                false,
+            )),
+            Ok(finality_access_answer(&finality_request("latest"), false)),
+        ],
+        now - 120,
+        now,
+    )
+    .await;
+    assert!(progress.is_none());
+    assert_eq!(requests.len(), 2);
+}
+
+/// A chain read that fails adds no new way for an open to fail: the open
+/// carries on exactly as it did before this check existed.
+#[tokio::test]
+async fn open_finality_progress_is_silent_when_the_chain_cannot_answer() {
+    let now = 10_000;
+    let (progress, requests) = finality_progress_with(
+        vec![Err(ProviderError::Provider("rpc unavailable".to_string()))],
+        now - 120,
+        now,
+    )
+    .await;
+    assert!(progress.is_none());
+    assert_eq!(requests.len(), 1);
+}

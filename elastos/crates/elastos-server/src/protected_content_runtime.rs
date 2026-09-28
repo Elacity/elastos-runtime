@@ -302,6 +302,8 @@ pub(crate) const RUNTIME_CUSTODY_DOWNLOAD_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody download is unavailable";
 pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
     "Runtime custody open is denied before purchase";
+pub(crate) const RUNTIME_CUSTODY_OPEN_FINALIZING_MESSAGE: &str =
+    "Runtime custody open awaits chain finality of the acquisition";
 pub(crate) const RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody content availability is unavailable";
 pub(crate) const RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE: &str =
@@ -1235,6 +1237,10 @@ pub(crate) enum RuntimeCustodyOpenStage {
     Unavailable,
     /// This principal may not open this item. Asking again answers the same.
     Denied,
+    /// The acquisition is confirmed at the chain head but not yet at the
+    /// finalized block, which is the only state custody releases a key on.
+    /// Nobody has to act: the same open succeeds once finality passes it.
+    Finalizing,
 }
 
 impl RuntimeCustodyOpenStage {
@@ -1243,6 +1249,7 @@ impl RuntimeCustodyOpenStage {
             Self::RightsApproval => "rights_approval",
             Self::Unavailable => "unavailable",
             Self::Denied => "denied",
+            Self::Finalizing => "finalizing",
         }
     }
 
@@ -1253,7 +1260,7 @@ impl RuntimeCustodyOpenStage {
     /// than of the words describing it.
     const fn resumable(self) -> bool {
         match self {
-            Self::RightsApproval | Self::Unavailable => true,
+            Self::RightsApproval | Self::Unavailable | Self::Finalizing => true,
             Self::Denied => false,
         }
     }
@@ -1287,6 +1294,9 @@ pub(crate) struct RuntimeCustodyOpenProgress {
     approval: Option<RuntimeCustodyOpenApproval>,
     /// When the resumable window closes, for the stages that have one.
     expires_at: Option<u64>,
+    /// When a finalizing open is expected to succeed. An estimate for the
+    /// viewer to show, never a bound on how long it may keep asking.
+    ready_at: Option<u64>,
 }
 
 impl RuntimeCustodyOpenProgress {
@@ -1305,6 +1315,7 @@ impl RuntimeCustodyOpenProgress {
                 approval_request_id: approval_request_id.to_string(),
             }),
             expires_at: Some(expires_at),
+            ready_at: None,
         }
     }
 
@@ -1314,6 +1325,7 @@ impl RuntimeCustodyOpenProgress {
             stage: RuntimeCustodyOpenStage::Unavailable,
             approval: None,
             expires_at: None,
+            ready_at: None,
         }
     }
 
@@ -1323,6 +1335,17 @@ impl RuntimeCustodyOpenProgress {
             stage: RuntimeCustodyOpenStage::Denied,
             approval: None,
             expires_at: None,
+            ready_at: None,
+        }
+    }
+
+    /// The acquisition awaits finality; `ready_at` is the estimate to show.
+    pub(crate) const fn finalizing(ready_at: u64) -> Self {
+        Self {
+            stage: RuntimeCustodyOpenStage::Finalizing,
+            approval: None,
+            expires_at: None,
+            ready_at: Some(ready_at),
         }
     }
 
@@ -1356,6 +1379,9 @@ impl RuntimeCustodyOpenProgress {
         }
         if let Some(expires_at) = self.expires_at {
             answer["expires_at"] = json!(expires_at);
+        }
+        if let Some(ready_at) = self.ready_at {
+            answer["ready_at"] = json!(ready_at);
         }
         answer
     }
@@ -1391,6 +1417,10 @@ impl std::fmt::Display for RuntimeCustodyOpenProgress {
             RuntimeCustodyOpenStage::Denied => {
                 write!(formatter, "This item belongs to a different account")
             }
+            RuntimeCustodyOpenStage::Finalizing => write!(
+                formatter,
+                "This item's transaction is confirmed and awaits chain finality; it opens once finality passes"
+            ),
         }
     }
 }
@@ -9562,6 +9592,120 @@ fn runtime_custody_open_unavailable(message: &'static str, cause: &anyhow::Error
         .context(message)
 }
 
+/// How long after an acquisition confirms the open still asks whether it has
+/// reached the finalized block. Finality on Base trails the head by about
+/// 15-20 minutes; past an hour it has long settled, and the open spends no
+/// chain read on it.
+pub(crate) const RUNTIME_CUSTODY_FINALITY_WATCH_SECS: u64 = 60 * 60;
+
+/// How long finality usually trails a confirmed acquisition on Base: Ethereum
+/// finalizes after two epochs (about 13-15 minutes) and the L2 batch must be
+/// posted first. Only used to tell the person roughly when to expect it.
+pub(crate) const RUNTIME_CUSTODY_EXPECTED_FINALITY_LAG_SECS: u64 = 20 * 60;
+
+/// What one access read answered.
+enum RuntimeCustodyAccessAt {
+    Granted,
+    NotGranted,
+    Unanswered,
+}
+
+/// Asks the chain whether `wallet` holds the access at `block` (`finalized`
+/// or `latest`). An unbound content id is an answer -- nothing is granted at
+/// that block -- while anything the chain could not answer is `Unanswered`.
+async fn runtime_custody_access_at(
+    registry: &ProviderRegistry,
+    network: &str,
+    wallet: &str,
+    content_access_id: ContentAccessIdV1,
+    request_id: &str,
+    block: &'static str,
+) -> RuntimeCustodyAccessAt {
+    let content_access_id_hex = runtime_content_access_id_hex(content_access_id);
+    let request_id = format!("{request_id}:{block}");
+    let answer = invoke_json_provider_classified(
+        registry,
+        CHAIN_PROVIDER_ID,
+        "resolve_protected_content_purchase_access",
+        json!({
+            "op": "resolve_protected_content_purchase_access",
+            "request_id": request_id,
+            "network": network,
+            "wallet": wallet,
+            "content_access_id": content_access_id_hex,
+            "block": block,
+        }),
+        ProviderInvocationTransport::Local,
+    )
+    .await;
+    match answer {
+        Ok(data)
+            if data["request_id"] == request_id.as_str()
+                && data["content_access_id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&content_access_id_hex)) =>
+        {
+            match data["has_access"].as_bool() {
+                Some(true) => RuntimeCustodyAccessAt::Granted,
+                Some(false) => RuntimeCustodyAccessAt::NotGranted,
+                None => RuntimeCustodyAccessAt::Unanswered,
+            }
+        }
+        Err(ProviderInvocationFailure::Refused { code, .. })
+            if code == "unknown_protected_content_object" =>
+        {
+            RuntimeCustodyAccessAt::NotGranted
+        }
+        Ok(_) | Err(_) => RuntimeCustodyAccessAt::Unanswered,
+    }
+}
+
+/// Whether an open should wait for finality instead of asking custody now.
+///
+/// Custody releases a key only on finalized rights evidence, while an
+/// acquisition is readable at the head seconds after it confirms. Inside that
+/// lag, every custody node would answer "unbound" and the open would fail
+/// after spending a Wallet approval. This asks the same question custody will
+/// ask first, and answers `finalizing` when only the head has the grant.
+///
+/// It only ever turns a certain failure into a wait: when the copy is long
+/// settled, already finalized, not granted at the head either, or the chain
+/// cannot answer, it returns `None` and the open proceeds exactly as before.
+pub(crate) async fn runtime_custody_open_finality_progress(
+    registry: &ProviderRegistry,
+    network: &str,
+    wallet: &str,
+    content_access_id: ContentAccessIdV1,
+    request_id: &str,
+    confirmed_at: u64,
+    now: u64,
+) -> Option<RuntimeCustodyOpenProgress> {
+    if now.saturating_sub(confirmed_at) > RUNTIME_CUSTODY_FINALITY_WATCH_SECS {
+        return None;
+    }
+    let read = |block| {
+        runtime_custody_access_at(
+            registry,
+            network,
+            wallet,
+            content_access_id,
+            request_id,
+            block,
+        )
+    };
+    if !matches!(read("finalized").await, RuntimeCustodyAccessAt::NotGranted) {
+        return None;
+    }
+    if !matches!(read("latest").await, RuntimeCustodyAccessAt::Granted) {
+        return None;
+    }
+    let expected = confirmed_at.saturating_add(RUNTIME_CUSTODY_EXPECTED_FINALITY_LAG_SECS);
+    // A lag longer than usual reads as "any moment now", never a time gone by.
+    Some(RuntimeCustodyOpenProgress::finalizing(
+        expected.max(now.saturating_add(60)),
+    ))
+}
+
 pub(crate) async fn open_runtime_custody_viewer(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
@@ -9744,6 +9888,32 @@ pub(crate) async fn open_runtime_custody_viewer(
         ));
     }
     let buy = reconstructed_buy_receipt(&draft, &fresh_availability, &purchase, &profile_did)?;
+    // Inside the finality lag custody would refuse this copy as unbound, and
+    // only after the Wallet approved the release. Ask first and answer a wait.
+    // A resumed approval is past this point already and is left to finish.
+    if resumed_pending_release.is_none() {
+        if let RuntimeCustodyPurchaseProgress::Complete { terminal } = &purchase.progress {
+            if let Some(progress) = runtime_custody_open_finality_progress(
+                registry.as_ref(),
+                &purchase.network,
+                &purchase.address,
+                draft.content_access_id(),
+                &format!("open-finality:{}", hex::encode(mint_id.as_bytes())),
+                terminal.confirmed_at,
+                crate::auth::now_ts(),
+            )
+            .await
+            {
+                tracing::debug!(
+                    stage = progress.stage_label(),
+                    "runtime custody open: acquisition awaits finality, answering with typed open progress"
+                );
+                return Err(anyhow::Error::new(progress)
+                    .context(format!("{}:{}", file!(), line!()))
+                    .context(RUNTIME_CUSTODY_OPEN_FINALIZING_MESSAGE));
+            }
+        }
+    }
     let composition =
         load_runtime_custody_composition(data_dir, registry.clone())?.ok_or_else(|| {
             runtime_custody_open_unavailable(
