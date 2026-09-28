@@ -107,6 +107,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/exit-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/ipfs-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/media-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/model-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/protected-content-protect-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/protected-content-decrypt-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/browser-engine-adapter" && cargo build --release)
@@ -180,6 +181,7 @@ NET_PROVIDER_BIN="${REPO_ROOT}/capsules/net-provider/target/release/net-provider
 EXIT_PROVIDER_BIN="${REPO_ROOT}/capsules/exit-provider/target/release/exit-provider" \
 IPFS_PROVIDER_BIN="${REPO_ROOT}/capsules/ipfs-provider/target/release/ipfs-provider" \
 MEDIA_PROVIDER_BIN="${REPO_ROOT}/capsules/media-provider/target/release/media-provider" \
+MODEL_PROVIDER_BIN="${REPO_ROOT}/capsules/model-provider/target/release/model-provider" \
 PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider" \
 PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="${REPO_ROOT}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider" \
 BROWSER_ENGINE_ADAPTER_BIN="${REPO_ROOT}/capsules/browser-engine-adapter/target/release/browser-engine-adapter" \
@@ -243,6 +245,7 @@ mapping = {
     "exit-provider": pathlib.Path(os.environ["EXIT_PROVIDER_BIN"]),
     "ipfs-provider": pathlib.Path(os.environ["IPFS_PROVIDER_BIN"]),
     "media-provider": pathlib.Path(os.environ["MEDIA_PROVIDER_BIN"]),
+    "model-provider": pathlib.Path(os.environ["MODEL_PROVIDER_BIN"]),
     "protected-content-protect-provider": pathlib.Path(
         os.environ["PROTECTED_CONTENT_PROTECT_PROVIDER_BIN"]
     ),
