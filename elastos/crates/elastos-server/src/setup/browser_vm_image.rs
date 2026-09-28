@@ -996,11 +996,12 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("checksum mismatch"));
         verify_installed(target.path(), &info, &platform).unwrap();
+        let expected_entries = if platform == "darwin-arm64" { 4 } else { 5 };
         assert_eq!(
             fs::read_dir(target.path().join("browser-vm"))
                 .unwrap()
                 .count(),
-            4,
+            expected_entries,
             "download and failed stages leave only the installed set, aliases and lock"
         );
         crate::carrier::CarrierRuntimeService::new(node)
