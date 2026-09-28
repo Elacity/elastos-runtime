@@ -45,6 +45,10 @@ export const OPEN_PROGRESS_SCHEMA = "elastos.protected-content.open-progress/v1"
 const RESUME_POLICY = new Map([
   ["rights_approval", { intervalMs: 2000, maxAttempts: 180 }],
   ["unavailable", { intervalMs: 3000, maxAttempts: 3 }],
+  // The acquisition is confirmed but not yet final on chain, and a key is only
+  // released on final state. That usually takes 15-20 minutes; asking every
+  // 15 s for up to 40 minutes covers it without hammering the chain.
+  ["finalizing", { intervalMs: 15000, maxAttempts: 160 }],
 ]);
 
 const OPEN_RESPONSE_KEYS = [
@@ -88,6 +92,7 @@ export function readOpenProgress(payload) {
     awaitsPerson: value.awaits_person === true,
     connectorId,
     expiresAt: Number.isInteger(value.expires_at) && value.expires_at > 0 ? value.expires_at : 0,
+    readyAt: Number.isInteger(value.ready_at) && value.ready_at > 0 ? value.ready_at : 0,
   };
 }
 
@@ -98,7 +103,12 @@ export function readOpenProgress(payload) {
  * sentence: that sentence is Runtime's stable wording for its operators, and it
  * names internal machinery a player should never put on screen.
  */
-export function waitingMessage(progress) {
+export function waitingMessage(progress, now = Math.floor(Date.now() / 1000)) {
+  if (progress?.stage === "finalizing") {
+    const minutes = Math.ceil((progress.readyAt - now) / 60);
+    const when = progress.readyAt && minutes > 0 ? `in about ${minutes} min` : "any moment now";
+    return `This is confirmed and being finalized on chain. It plays on its own ${when}.`;
+  }
   if (progress?.stage !== "rights_approval") {
     return "This is not ready yet. Trying again...";
   }
@@ -567,7 +577,7 @@ export function createPlayerController({
     // Runtime says when the wallet request lapses. Stopping with it means the
     // player stops asking at the moment there is nothing left to answer.
     if (progress.expiresAt && nowSeconds() >= progress.expiresAt) return false;
-    showOverlay(waitingMessage(progress));
+    showOverlay(waitingMessage(progress, nowSeconds()));
     cancelResume();
     resumeTimer = setTimeoutImpl(() => {
       resumeTimer = null;

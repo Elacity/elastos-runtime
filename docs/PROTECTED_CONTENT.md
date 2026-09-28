@@ -394,6 +394,52 @@ failure for content the way a conscripted replica can, and the exact
 three-replica requirement in the canonical path is satisfied by nodes that
 actually host that plane.
 
+### Key release waits for finality
+
+A custody node releases its share only on rights evidence read at the chain's
+`finalized` block. `latest` and `safe` are never accepted. The rule is part of
+the signed policy (`RightsObservationFinalityV1::Finalized`, see
+[the contract](PROTECTED_CONTENT_CONTRACTS_V1.md)), and the chain provider
+hard-codes it for every rights read that can lead to a release. There are two
+reasons:
+
+- A released key cannot be recalled. The evidence that justifies a release
+  must be state that can no longer be undone. On Base, `finalized` means the
+  Ethereum block that carries the L2 batch is finalized by Ethereum consensus.
+  `safe` means only that the batch is posted to Ethereum: an Ethereum reorg
+  before finality, combined with the sequencer posting different L2 history,
+  could still remove the mint or purchase that granted access.
+- The corroboration across RPC sources depends on it. Sources are pinned to
+  the lowest finalized block among them and must agree on its hash. That is
+  sound only because the finalized head never moves backwards. The `safe`
+  head can be reset after an Ethereum reorg.
+
+This has a visible cost. Access is readable at the chain head in the block
+that grants it, and the upfront ownership check reads the head, so a new mint
+or purchase shows as owned within seconds. Custody cannot release until the
+`finalized` block reaches that block. On Base, that is Ethereum finality (two
+epochs, about 13–15 minutes) plus batch posting: roughly 15–20 minutes after
+the transaction confirms.
+
+The open waits through that window instead of failing. For a copy confirmed
+less than an hour ago, before any Wallet request or custody call, it asks the
+chain provider the question custody will ask, at the `finalized` block. If
+access is not there yet but is at the head, the open answers the `finalizing`
+stage: resumable, nobody needs to act, with an estimated `ready_at`. The
+Reader and the Player keep asking every 15 seconds for up to 40 minutes and
+show the estimate. In every other case, including a chain read that fails,
+the open proceeds unchanged and custody gives its own answer. The wait never
+releases anything early; it only avoids a release attempt that would be
+refused.
+
+A release attempted inside the window anyway, for example one resumed from an
+earlier Wallet approval, still fails closed: every custody node logs
+`rights observed block_tag=finalized … outcome=unbound` and rejects with
+`unknown_protected_content_object`.
+
+The rule stays. Reading `safe` instead was considered and rejected: it would
+trade a guarantee that cannot be recalled for about 15 minutes of waiting.
+
 `CustodyEnvelopeV1` is private Runtime provisioning material. Runtime can
 carry the envelope but cannot open the node-sealed shares. Public metadata
 contains bounded identities, threshold and epoch facts, the CEK commitment,
