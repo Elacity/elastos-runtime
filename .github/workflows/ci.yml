@@ -131,7 +131,7 @@ jobs:
           ELASTOS_TEST_PROTECT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-protect-provider/target/release/protected-content-protect-provider
           ELASTOS_TEST_DECRYPT_PROVIDER_BIN: ${{ github.workspace }}/capsules/protected-content-decrypt-provider/target/release/protected-content-decrypt-provider
           ELASTOS_TEST_CUSTODY_PROVIDER_BIN: ${{ github.workspace }}/capsules/custody-provider/target/release/custody-provider
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
 
@@ -173,12 +173,14 @@ jobs:
       # capsules; this mirrors `just test-capsules`.
       - name: test own-workspace capsules
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          failed=0
           for lock in capsules/*/Cargo.lock; do
               capsule="$(dirname "$lock")"
               echo "== testing $capsule =="
-              (cd "$capsule" && cargo test)
+              (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
+          exit "$failed"
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
@@ -282,8 +284,8 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # The source-home jobs run only once the test phase is green, in parallel
-  # across the three architectures. They are the de-facto release builders:
+  # The source-home jobs run after the cheap source gate, in parallel
+  # with tests across the three architectures. They are the de-facto release builders:
   # setup-source-home compiles the runtime, shell, home-cli and every provider
   # in --release into the repo target dirs, so each job finishes by topping
   # that up to a full workspace release build (incremental at that point) and
@@ -293,7 +295,7 @@ jobs:
     name: source-home-linux (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    needs: [test-elastos, test-capsules]
+    needs: source-gate
     strategy:
       fail-fast: false
       matrix:
@@ -373,7 +375,7 @@ jobs:
     name: source-home-macos
     runs-on: macos-14
     timeout-minutes: 90
-    needs: [test-elastos, test-capsules]
+    needs: source-gate
     steps:
       - uses: actions/checkout@v5
         with:
