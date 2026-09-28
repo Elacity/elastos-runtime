@@ -71,6 +71,16 @@ All notable changes to the public ElastOS Runtime repository.
   `https://replica.invalid/ensure` placeholder, so a mint that placed all three
   copies settled `repair_needed` with one and the Creator stopped at "Publish
   to storage". Model-content local-object restore is unchanged.
+- A wallet connector opens the same way from the Wallet rail and the Wallet
+  window. Launched from the rail it went to a separate connector sheet whose
+  "Open MetaMask" did nothing; it now opens as a window from both, and the
+  sheet is removed.
+- An Inbox wallet approval offers only what can complete. Approve appears
+  only for a built-in wallet, which Inbox signs after a passkey; a request on
+  an external wallet such as MetaMask offers "Review in Wallet" instead of a
+  passkey prompt the server then refused. A request Runtime raises itself,
+  such as opening protected content, no longer shows an Open button with no
+  app behind it.
 - A bought market item says what this Home holds of it. Only a copy in this
   Home's Library reads "In your library"; a purchase whose copy is not here
   yet, or that opens only on ela.city, reads "Purchased", and no bought card

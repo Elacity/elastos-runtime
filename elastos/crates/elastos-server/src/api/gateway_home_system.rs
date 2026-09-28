@@ -4628,6 +4628,7 @@ pub(super) fn append_home_service_access_notifications(
             severity: "attention".to_string(),
             read: false,
             created_at: request.created_at,
+            passkey_approval: false,
         });
     }
     for request in grants {
@@ -4656,6 +4657,7 @@ pub(super) fn append_home_service_access_notifications(
             severity: "info".to_string(),
             read: true,
             created_at: request.updated_at,
+            passkey_approval: false,
         });
     }
 }

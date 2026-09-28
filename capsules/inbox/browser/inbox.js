@@ -513,8 +513,13 @@
         actions.appendChild(createActionButton("Revoke access", actionId, "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
         const requestId = actionId.slice("wallet-approve-request:".length);
-        actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
-        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
+        // Inbox signs only with a built-in wallet, after a passkey. Any other
+        // account, such as an external wallet, is approved in Wallet.
+        const passkeyApproval = entry.passkey_approval === true;
+        if (passkeyApproval) {
+          actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
+        }
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId }), passkeyApproval ? undefined : "primary"));
         actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-review-request:")) {
         const requestId = actionId.slice("wallet-review-request:".length);

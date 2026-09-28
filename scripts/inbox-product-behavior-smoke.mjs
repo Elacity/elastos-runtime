@@ -475,6 +475,31 @@ async function runInboxHomeChromeSmoke() {
   }
   assert.deepEqual(serviceActions, ["service-approve-request:service-1", "service-deny-request:service-1"]);
 
+  // Inbox can only sign with a built-in wallet after a passkey, so Approve
+  // appears only on a request the server marks as passkey-approvable. An
+  // external wallet (MetaMask) request goes to Wallet instead.
+  for (const [passkeyApproval, expected] of [
+    [undefined, ["Review in Wallet", "Reject"]],
+    [true, ["Approve", "Review in Wallet", "Reject"]],
+  ]) {
+    context.fetch = async () => jsonResponse({ notifications: { entries: [{
+      id: "entry-wallet-approval", kind: "wallet_approval_request", title: "Wallet approval request",
+      body: "runtime requests wallet approval for Open protected content.", severity: "attention", read: false,
+      action_ref: { action_id: "wallet-approve-request:wallet-request-2" },
+      ...(passkeyApproval === undefined ? {} : { passkey_approval: passkeyApproval }),
+    }] } });
+    for (const callback of windowListeners.get("message") || []) {
+      callback({ origin: "null", source: parentFrame,
+        data: { type: "elastos:menu-command", cmd: "refresh" } });
+    }
+    await settle();
+    const walletButtons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
+    assert.deepEqual(walletButtons.map(button => button.textContent), expected,
+      `wallet approval actions with passkey_approval=${passkeyApproval}`);
+    assert(String(walletButtons[0].className).includes("primary"),
+      `the first wallet approval action must be the primary one (passkey_approval=${passkeyApproval})`);
+  }
+
   const grantActions = [];
   let grantRevoked = false;
   const grantEntry = {

@@ -11840,7 +11840,7 @@ fn runtime_release_wallet_request(
         invocation.session_id,
         Some(invocation.proof_binding_id.to_string()),
         invocation.grant_id,
-        "runtime",
+        RUNTIME_PROVIDER_ID,
         format!(
             "runtime-open-{}",
             hex::encode(invocation.mint_id.as_bytes())

@@ -146,6 +146,13 @@ Open:
   asserting the raised effect is provably dead, which moves a safety guarantee
   from the journal to its caller — an owner decision, not a repair to make in
   passing.
+- [ ] Take a wallet approval straight to its approval method. Inbox now shows
+  Approve only for a built-in wallet and hides an Open with no app behind it,
+  but an external-wallet request still takes three steps: the toast's Review
+  opens Inbox, Review in Wallet opens Wallet, and only then does the connector
+  open. The toast was deliberately left as it is for now. Doing it needs the
+  Inbox entry to name the request's connector, so the toast and the card can
+  open that connector directly and a built-in request can go to its passkey.
 - [ ] Track the media transcode stage. Publish progress is read from the mint
   journal now and "Publish to storage" is no longer untracked, but
   "Transcode & fragment" still is: deriving it needs the media preparation

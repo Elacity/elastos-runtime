@@ -86,6 +86,7 @@ pub(super) fn append_inspect_action_notifications(
             severity: "attention".to_string(),
             read: false,
             created_at,
+            passkey_approval: false,
         });
     }
 }
