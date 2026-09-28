@@ -3289,12 +3289,13 @@ mod tests {
     }
 
     fn start_server(responses: Vec<HttpResponseSpec>) -> TestServer {
-        start_server_with_first_byte_delay(responses, Duration::ZERO)
+        start_server_with_first_byte_delay(responses, Duration::ZERO, false)
     }
 
     fn start_server_with_first_byte_delay(
         responses: Vec<HttpResponseSpec>,
         first_byte_delay: Duration,
+        allow_client_disconnect: bool,
     ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3339,9 +3340,20 @@ mod tests {
                 }
                 response.push_str("\r\n");
                 thread::sleep(first_byte_delay);
-                stream.write_all(response.as_bytes()).unwrap();
-                stream.write_all(&spec.body).unwrap();
-                stream.flush().unwrap();
+                let write_result = stream
+                    .write_all(response.as_bytes())
+                    .and_then(|_| stream.write_all(&spec.body))
+                    .and_then(|_| stream.flush());
+                if let Err(err) = write_result {
+                    assert!(
+                        allow_client_disconnect
+                            && matches!(
+                                err.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            ),
+                        "HTTP fixture write failed: {err}"
+                    );
+                }
             }
         }).unwrap();
         TestServer {
@@ -3979,6 +3991,7 @@ mod tests {
                 headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
             }],
             Duration::from_millis(1_200),
+            true,
         );
         let mut offer = openai_offer(&format!("{}/chat", server.base_url));
         offer.policy.runtime_ms_limit = 200;
@@ -4075,6 +4088,7 @@ mod tests {
                 headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
             }],
             Duration::from_millis(700),
+            false,
         );
         let mut offer = openai_offer(&format!("{}/chat", server.base_url));
         offer.policy.runtime_ms_limit = 2_000;
