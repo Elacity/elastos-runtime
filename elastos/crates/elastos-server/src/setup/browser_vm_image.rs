@@ -710,14 +710,17 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
                 .context("Browser image free-space check failed");
         }
         let stats = unsafe { stats.assume_init() };
+        fn disk_block_count(count: impl Into<u64>) -> u64 {
+            count.into()
+        }
         #[cfg(target_pointer_width = "64")]
         let block_size = stats.f_frsize;
         #[cfg(target_pointer_width = "32")]
         let block_size = u64::from(stats.f_frsize);
         disk_budget(
             needed,
-            (stats.f_bavail as u64).saturating_mul(block_size),
-            (stats.f_blocks as u64).saturating_mul(block_size),
+            disk_block_count(stats.f_bavail).saturating_mul(block_size),
+            disk_block_count(stats.f_blocks).saturating_mul(block_size),
         )
     }
     #[cfg(not(unix))]
