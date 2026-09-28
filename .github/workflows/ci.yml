@@ -21,7 +21,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D unused_must_use"
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   # Fast, compile-free gate: formatting and script-based source proofs.
@@ -89,7 +89,7 @@ jobs:
       # would be redundant.
       - name: cargo clippy
         working-directory: elastos
-        run: cargo clippy --workspace --all-targets -- -D clippy::all
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test-elastos:
     name: test-elastos
