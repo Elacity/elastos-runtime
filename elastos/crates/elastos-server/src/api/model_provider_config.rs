@@ -1069,7 +1069,7 @@ pub(super) fn read_hosted_secret(
     Ok(Some(secret.to_string()))
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn read_hosted_egress_grants(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let path = model_provider_root_dir(data_dir).join("egress-grants.json");
     let metadata = match fs::symlink_metadata(&path) {
@@ -1272,7 +1272,7 @@ pub(super) fn recent_hosted_egress_history(
     Ok(records)
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let path = model_provider_root_dir(data_dir).join("egress-job-bindings.json");
     let metadata = match fs::symlink_metadata(&path) {
@@ -1292,7 +1292,7 @@ pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option
         .map(Some)
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn write_hosted_job_bindings(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         bytes.len() <= 4 * 1024 * 1024,

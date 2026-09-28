@@ -26,11 +26,11 @@ const MAX_DECISIONS: usize = 1024;
 static DECISION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) struct ActiveDecision {
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub id: String,
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub owner_proof_binding_id: String,
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub expires_at_ms: u64,
 }
 
@@ -112,7 +112,7 @@ pub(super) struct HostedRouteSummary {
     expires_at: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[derive(Serialize)]
 pub(super) struct StagedConnectionSummary {
     id: String,
@@ -120,7 +120,7 @@ pub(super) struct StagedConnectionSummary {
     status: &'static str,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(super) fn staged_connections(data_dir: &Path) -> anyhow::Result<Vec<StagedConnectionSummary>> {
     let now = now_ms()?;
     let file = read(data_dir)?;
@@ -571,11 +571,11 @@ pub(super) fn active(
         "hosted egress owner unavailable"
     );
     Ok(ActiveDecision {
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         id: decision.id.clone(),
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         owner_proof_binding_id: owner.to_string(),
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         expires_at_ms: decision.expires_at_ms,
     })
 }
@@ -616,16 +616,16 @@ pub(super) fn active_connection(
         "hosted egress owner unavailable"
     );
     Ok(ActiveDecision {
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         id: decision.id.clone(),
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         owner_proof_binding_id: owner.to_string(),
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         expires_at_ms: decision.expires_at_ms,
     })
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn connection_state(
     data_dir: &Path,
     scope: &EgressScope,
@@ -650,7 +650,7 @@ pub(super) fn connection_state(
     })
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn refusal_state(
     data_dir: &Path,
     scope: &EgressScope,
