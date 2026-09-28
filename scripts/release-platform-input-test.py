@@ -191,6 +191,7 @@ class PlatformInputTest(unittest.TestCase):
         source = self.root / "actual-source"
         (source / "scripts").mkdir(parents=True)
         (source / "elastos").mkdir()
+        (source / ".gitignore").write_text("__pycache__/\n")
         (source / "elastos/Cargo.lock").write_text("version = 4\n")
         self.write_json(source / "components.json", self.template)
         for name in ("release-platform-input.py", "components-release-integrity-check.py",
