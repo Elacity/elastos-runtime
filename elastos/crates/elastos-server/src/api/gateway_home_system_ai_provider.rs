@@ -250,6 +250,7 @@ fn normalize_model(provider: crate::api::HostedAiProvider, value: &str) -> anyho
     Ok(trimmed.to_string())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn parse_openrouter_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredModel>> {
     let payload: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| ai_provider_request_error("invalid OpenRouter key"))?;
@@ -299,6 +300,7 @@ fn parse_openrouter_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredMo
     Ok(models)
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn parse_venice_rate_limits_body(bytes: &[u8]) -> anyhow::Result<bool> {
     let payload: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| ai_provider_request_error("invalid Venice key"))?;
@@ -309,6 +311,7 @@ fn parse_venice_rate_limits_body(bytes: &[u8]) -> anyhow::Result<bool> {
         == Some(true))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn parse_venice_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredModel>> {
     let payload: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| ai_provider_request_error("invalid Venice key"))?;

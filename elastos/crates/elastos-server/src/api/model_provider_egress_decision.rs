@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
+#[cfg(any(test, target_os = "macos"))]
+use super::model_provider_config::archive_hosted_egress_decision;
 use super::model_provider_config::{
-    archive_hosted_egress_decision, read_hosted_egress_decisions, recent_hosted_egress_history,
-    write_hosted_egress_decisions,
+    read_hosted_egress_decisions, recent_hosted_egress_history, write_hosted_egress_decisions,
 };
 
 pub(super) const APPROVE_PREFIX: &str = "model-egress-approve:";
@@ -25,8 +26,11 @@ const MAX_DECISIONS: usize = 1024;
 static DECISION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) struct ActiveDecision {
+    #[cfg(any(test, target_os = "macos"))]
     pub id: String,
+    #[cfg(any(test, target_os = "macos"))]
     pub owner_proof_binding_id: String,
+    #[cfg(any(test, target_os = "macos"))]
     pub expires_at_ms: u64,
 }
 
@@ -223,6 +227,7 @@ fn validate_scope(scope: &EgressScope) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn archive_expired(data_dir: &Path, file: &mut DecisionFile, now: u64) -> anyhow::Result<()> {
     let expired = file
         .decisions
@@ -244,6 +249,7 @@ fn archive_expired(data_dir: &Path, file: &mut DecisionFile, now: u64) -> anyhow
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn request(
     data_dir: &Path,
     scope: &EgressScope,
@@ -309,6 +315,7 @@ fn validate_connection(scope: &EgressScope, connection: &ConnectionScope) -> any
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn request_connection(
     data_dir: &Path,
     scope: &EgressScope,
@@ -564,8 +571,11 @@ pub(super) fn active(
         "hosted egress owner unavailable"
     );
     Ok(ActiveDecision {
+        #[cfg(any(test, target_os = "macos"))]
         id: decision.id.clone(),
+        #[cfg(any(test, target_os = "macos"))]
         owner_proof_binding_id: owner.to_string(),
+        #[cfg(any(test, target_os = "macos"))]
         expires_at_ms: decision.expires_at_ms,
     })
 }
@@ -606,12 +616,16 @@ pub(super) fn active_connection(
         "hosted egress owner unavailable"
     );
     Ok(ActiveDecision {
+        #[cfg(any(test, target_os = "macos"))]
         id: decision.id.clone(),
+        #[cfg(any(test, target_os = "macos"))]
         owner_proof_binding_id: owner.to_string(),
+        #[cfg(any(test, target_os = "macos"))]
         expires_at_ms: decision.expires_at_ms,
     })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn connection_state(
     data_dir: &Path,
     scope: &EgressScope,
@@ -636,6 +650,7 @@ pub(super) fn connection_state(
     })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn refusal_state(
     data_dir: &Path,
     scope: &EgressScope,

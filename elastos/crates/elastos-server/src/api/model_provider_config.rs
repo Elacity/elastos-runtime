@@ -322,6 +322,7 @@ fn load_hosted_validate_fixtures_unlocked(
 }
 
 /// Load owner-scoped validate fixtures. An absent file keeps the public HTTPS pins.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn load_hosted_validate_fixtures(
     data_dir: &Path,
 ) -> anyhow::Result<Option<HostedValidateFixtures>> {
@@ -696,6 +697,7 @@ fn hosted_offer(
     })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn offer_uses_connection_authority(
     data_dir: &Path,
     offer_id: &str,
@@ -1067,6 +1069,7 @@ pub(super) fn read_hosted_secret(
     Ok(Some(secret.to_string()))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn read_hosted_egress_grants(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let path = model_provider_root_dir(data_dir).join("egress-grants.json");
     let metadata = match fs::symlink_metadata(&path) {
@@ -1151,7 +1154,7 @@ fn hosted_egress_history_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("egress-decision-history")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(test, target_os = "macos")))]
 pub(super) fn archive_hosted_egress_decision(
     data_dir: &Path,
     file_name: &str,
@@ -1269,6 +1272,7 @@ pub(super) fn recent_hosted_egress_history(
     Ok(records)
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let path = model_provider_root_dir(data_dir).join("egress-job-bindings.json");
     let metadata = match fs::symlink_metadata(&path) {
@@ -1288,6 +1292,7 @@ pub(super) fn read_hosted_job_bindings(data_dir: &Path) -> anyhow::Result<Option
         .map(Some)
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) fn write_hosted_job_bindings(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         bytes.len() <= 4 * 1024 * 1024,
