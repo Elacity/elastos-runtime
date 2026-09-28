@@ -322,6 +322,7 @@ export function compileLiveContext({
   maxTokens,
   capabilities = TEXT_CONTRACT_CAPABILITIES,
   degradedFallback = false,
+  debug = false,
 } = {}) {
   const raw = sessionMessages || session?.messages || [];
   let { history, currentInput: splitCurrent } = splitSessionMessages(raw);
@@ -370,7 +371,7 @@ export function compileLiveContext({
     thinkingChars,
   });
   attachProviderPayload(compiled);
-  logContextManifest(compiled.manifest, compiled.invariants);
+  logContextManifest(compiled.manifest, compiled.invariants, { debug });
   return compiled;
 }
 

@@ -265,6 +265,7 @@ bindAgentStream(
     get reasoningEffort() { return reasoningEffort; },
   },
   {
+    debug: new URL(window.location.href).searchParams.get("assistant_debug") === "1",
     streamEl,
     streamScrollEl,
     streamViewportEl,

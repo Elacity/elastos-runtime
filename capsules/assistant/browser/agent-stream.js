@@ -2371,6 +2371,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
           systemPrompt: ctx.systemPrompt,
           notes: ctx.agentNotes,
           maxTokens: ctx.maxTokens,
+          debug: host.debug === true,
         });
         persistTurn(
           turnStorePatch(turnId, {
@@ -2659,7 +2660,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       timings.t6 = Date.now();
       setPhase("presentation_done");
       window.requestAnimationFrame(() => drainFollowUpQueue());
-      if (perf.renders) {
+      if (host.debug === true && perf.renders) {
         const ms = (a, b) => (a && b ? a - b : 0);
         const durs = perf.traces.map((row) => row.dur);
         const answerLens = perf.traces.map((row) => row.answerLen);
@@ -2837,12 +2838,14 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       progressFlushTimer = 0;
     }
     try {
-      console.info("[home-stream-qos]", {
-        ...qos.metrics,
-        answerLen,
-        reasoningLen,
-        renders: perf.renders,
-      });
+      if (host.debug === true) {
+        console.info("[home-stream-qos]", {
+          ...qos.metrics,
+          answerLen,
+          reasoningLen,
+          renders: perf.renders,
+        });
+      }
     } catch {
       /* telemetry optional */
     }

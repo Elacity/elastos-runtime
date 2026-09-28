@@ -836,8 +836,8 @@ export function compileContext({
   };
 }
 
-export function logContextManifest(manifest, invariants = null) {
-  if (!manifest || typeof console?.table !== "function") {
+export function logContextManifest(manifest, invariants = null, { debug = false } = {}) {
+  if (!debug || !manifest || typeof console?.table !== "function") {
     return;
   }
   console.table([
