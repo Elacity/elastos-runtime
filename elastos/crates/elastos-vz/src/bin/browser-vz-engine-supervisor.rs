@@ -4067,7 +4067,14 @@ extern "C" fn report_shutdown_signal(
     let sender_pid = if info.is_null() {
         0
     } else {
-        unsafe { (*info).si_pid }.max(0)
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { (*info).si_pid() }.max(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unsafe { (*info).si_pid }.max(0)
+        }
     };
     let si_code = if info.is_null() {
         0
