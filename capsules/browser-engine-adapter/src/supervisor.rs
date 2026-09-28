@@ -789,11 +789,10 @@ mod private_request_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut child = Command::new("/bin/sh")
+        let mut child = Command::new("python3")
             .args([
                 "-c",
-                "exec 0<&-; exec /bin/sh -c ': > \"$1\"; exec sleep 30' browser-private-request-test \"$1\"",
-                "browser-private-request-test",
+                "import os,sys,time; os.close(0); open(sys.argv[1], 'x').close(); time.sleep(30)",
             ])
             .arg(&marker)
             .stdin(Stdio::piped())
