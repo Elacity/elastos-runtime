@@ -339,7 +339,12 @@ jobs:
           export HOME="${SOURCE_HOME}"
           export XDG_DATA_HOME="${SOURCE_HOME}/.local/share"
           export PATH="${CARGO_HOME}/bin:${PATH}"
-          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$(dirname "$(command -v ffmpeg)")"
+          MEDIA_TOOLS_DIR="${RUNNER_TEMP}/source-home-media-tools"
+          install -d -m 700 "${MEDIA_TOOLS_DIR}"
+          for tool in ffmpeg ffprobe; do
+            install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
+          done
+          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
@@ -414,19 +419,7 @@ jobs:
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 16 * 1024 * 1024) exit 1 }'
       - name: install host prerequisites
-        run: |
-          brew install e2fsprogs coturn ffmpeg
-          # setup-source-home's media prerequisite imports ffmpeg/ffprobe and
-          # fail-closed rejects any group-writable ancestor of the resolved
-          # binaries (Homebrew's Cellar defaults to 775). Tighten the
-          # user-owned ancestors so the import chain passes admission.
-          for tool in ffmpeg ffprobe; do
-            p="$(python3 -c "import os,shutil;print(os.path.realpath(shutil.which('$tool')))")"
-            while [ "$p" != "/" ]; do
-              p="$(dirname "$p")"
-              { [ -O "$p" ] && chmod g-w "$p"; } || true
-            done
-          done
+        run: brew install e2fsprogs coturn ffmpeg
       - name: source-home into isolated MAC_TEST_HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -440,7 +433,12 @@ jobs:
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
           export HOME="${MAC_TEST_HOME}"
           export PATH="${CARGO_HOME}/bin:/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:${PATH}"
-          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$(dirname "$(command -v ffmpeg)")"
+          MEDIA_TOOLS_DIR="${RUNNER_TEMP}/source-home-media-tools"
+          install -d -m 700 "${MEDIA_TOOLS_DIR}"
+          for tool in ffmpeg ffprobe; do
+            install -m 700 "$(command -v "${tool}")" "${MEDIA_TOOLS_DIR}/${tool}"
+          done
+          export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="${MEDIA_TOOLS_DIR}"
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${HOME}/Library/Application Support/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
