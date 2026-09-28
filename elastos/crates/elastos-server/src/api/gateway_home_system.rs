@@ -8008,8 +8008,8 @@ mod services_kind_tests {
             super::super::MODEL_SERVICE_URI,
         );
         assert_eq!(noun, "AI model");
-        assert!(effect.contains("shared model"));
-        assert!(effect.contains("Your Runtime decides every request."));
+        assert!(effect.contains("one named model offer"));
+        assert!(effect.contains("new exact-offer request"));
         let (noun, _) = home_services_request_notification_copy(
             crate::carrier::ENGINE_SERVICE_KIND,
             crate::carrier::ENGINE_SERVICE_URI,
