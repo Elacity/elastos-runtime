@@ -792,7 +792,7 @@ mod private_request_tests {
         let mut child = Command::new("/bin/sh")
             .args([
                 "-c",
-                "exec 0<&-; : > \"$1\"; sleep 30",
+                "exec 0<&-; exec /bin/sh -c ': > \"$1\"; exec sleep 30' browser-private-request-test \"$1\"",
                 "browser-private-request-test",
             ])
             .arg(&marker)
