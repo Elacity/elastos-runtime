@@ -2345,7 +2345,7 @@ mod tests {
                 "total": 5,
             }
         }))]);
-        let offer = artifact_offer_with_cancel_timeout(&server.base_url, 1_000);
+        let offer = artifact_offer_with_poll_and_cancel_timeout(&server.base_url, 10_000, 1_000);
         let root = temp_root("artifact-status-progress");
         let input = artifact_input("status");
         let binding = create_binding("request:artifact-status-progress", &offer, &input);
