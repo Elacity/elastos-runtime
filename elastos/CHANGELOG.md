@@ -5,6 +5,16 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Unreleased]
 
 ### Added
+- An open attempted right after a mint or purchase waits instead of failing.
+  Custody releases a key only on rights evidence read at the finalized block,
+  which on Base trails a confirmed transaction by 15-20 minutes. Inside that
+  window the open used to spend a Wallet approval and three custody calls and
+  then fail as unavailable. It now asks the chain the question custody will
+  ask, at the finalized block, before any Wallet request. When access is
+  there only at the head, it answers a typed `finalizing` stage with an
+  estimated ready time, and the Reader and the Player wait through it. The
+  finalized-only rule is unchanged; see
+  [Key release waits for finality](../docs/PROTECTED_CONTENT.md#key-release-waits-for-finality).
 - Approving an open shows a message a person can read. The wallet used to be
   handed the rights request's canonical bytes hex-encoded, and a wallet decodes
   a `0x` prefix before displaying it, so a nested identity graph arrived on
