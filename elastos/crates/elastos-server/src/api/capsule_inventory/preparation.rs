@@ -1203,7 +1203,7 @@ async fn preserve_active_model_offers(
             continue;
         }
         ensure!(
-            found.len() == 1 && *found[0] == activation.summary(),
+            found.len() == 1 && model_offer_matches(found[0], &activation.summary()),
             "active model binding changed"
         );
         activation.check_root(data_dir, owner)?;
@@ -1371,7 +1371,7 @@ fn withdrawal_config(
         let activation = owner.activation.as_ref().unwrap();
         activation.check_root(data_dir, owner)?;
         ensure!(
-            activation.summary() == *public,
+            model_offer_matches(public, &activation.summary()),
             "live activation evidence changed"
         );
         if owner.operation_id != retirement.admission_id {
@@ -1541,7 +1541,7 @@ async fn start_owner_reclaim(
     let live = registry.local_model_offers().await?;
     ensure!(
         live.iter()
-            .filter(|offer| **offer == activation.summary())
+            .filter(|offer| model_offer_matches(offer, &activation.summary()))
             .count()
             == 1,
         "retirement requires exact active provider evidence"
@@ -1659,7 +1659,7 @@ async fn prepare_capacity(
                 activation.check_root(data_dir, owner)?;
                 ensure!(
                     live.iter()
-                        .filter(|offer| **offer == activation.summary())
+                        .filter(|offer| model_offer_matches(offer, &activation.summary()))
                         .count()
                         == 1,
                     "retirement requires exact active provider evidence"
@@ -2441,6 +2441,34 @@ impl ModelActivation {
     }
 }
 
+// The saved activation binds execution identity and policy. The live provider
+// owns wire-schema capabilities; old descriptors keep their original bytes.
+fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    let mut identity = actual.clone();
+    let Some(object) = identity.as_object_mut() else {
+        return false;
+    };
+    if let Some(capability) = object.remove("input_schemas") {
+        let Some(schemas) = capability.as_array() else {
+            return false;
+        };
+        if !(1..=2).contains(&schemas.len())
+            || schemas
+                .iter()
+                .filter(|schema| **schema == elastos_model_contract::TEXT_INPUT_V1_SCHEMA)
+                .count()
+                != 1
+            || schemas.iter().any(|schema| {
+                schema != elastos_model_contract::TEXT_INPUT_V1_SCHEMA
+                    && schema != elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            })
+        {
+            return false;
+        }
+    }
+    identity == *expected
+}
+
 /// Caller-scoped dispatch facts, not engine warmth or inference evidence. The
 /// inventory and signed catalog remain the owners; this projection stores nothing.
 pub(in crate::api) fn unavailable_model_runtime_projection() -> serde_json::Value {
@@ -2578,7 +2606,7 @@ pub(in crate::api) async fn model_runtime_projection(
                 .iter()
                 .filter(|offer| offer["id"] == expected.offer["id"])
                 .collect();
-            if matching.len() == 1 && matching[0] == &expected.offer {
+            if matching.len() == 1 && model_offer_matches(matching[0], &expected.offer) {
                 projection["dispatch_ready"] = serde_json::json!(true);
                 projection["offer_id"] = expected.offer["id"].clone();
             } else {
@@ -2742,7 +2770,10 @@ pub async fn complete_admitted_model_startup(
         let Some(activation) = &owner.activation else {
             continue;
         };
-        if offers.iter().any(|offer| *offer == activation.summary()) {
+        if offers
+            .iter()
+            .any(|offer| model_offer_matches(offer, &activation.summary()))
+        {
             activation.check_root(data_dir, owner)?;
             ready.insert(owner.operation_id.clone());
         }
@@ -3518,6 +3549,55 @@ mod tests {
             }
         }
 
+        #[test]
+        fn live_schema_capabilities_preserve_exact_activation_identity() {
+            let expected = bound_model_offer(
+                "cid",
+                "weights.gguf",
+                "weights",
+                "receipt",
+                "engine",
+                "Fixture",
+            )
+            .unwrap();
+            let saved = serde_json::to_vec(&expected).unwrap();
+            assert!(model_offer_matches(&expected, &expected));
+            for schemas in [
+                serde_json::json!([elastos_model_contract::TEXT_INPUT_V1_SCHEMA]),
+                serde_json::json!([
+                    elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                    elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+                ]),
+                serde_json::json!([
+                    elastos_model_contract::TEXT_INPUT_V2_SCHEMA,
+                    elastos_model_contract::TEXT_INPUT_V1_SCHEMA
+                ]),
+            ] {
+                let mut live = expected.clone();
+                live["input_schemas"] = schemas;
+                assert!(model_offer_matches(&live, &expected));
+                live["policy"]["input_bytes_limit"] = serde_json::json!(1);
+                assert!(!model_offer_matches(&live, &expected));
+            }
+            for schemas in [
+                serde_json::json!([]),
+                serde_json::json!(null),
+                serde_json::json!(["unknown"]),
+                serde_json::json!([
+                    elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                    elastos_model_contract::TEXT_INPUT_V1_SCHEMA
+                ]),
+            ] {
+                let mut live = expected.clone();
+                live["input_schemas"] = schemas;
+                assert!(!model_offer_matches(&live, &expected));
+            }
+            let mut extra = expected.clone();
+            extra["adapter"] = serde_json::json!({});
+            assert!(!model_offer_matches(&extra, &expected));
+            assert_eq!(serde_json::to_vec(&expected).unwrap(), saved);
+        }
+
         #[tokio::test]
         async fn model_catalog_readiness_matches_admitted_offer_without_mutating_preparation() {
             use axum::body::{to_bytes, Body};
@@ -3539,6 +3619,10 @@ mod tests {
             offer.as_object_mut().unwrap().remove("adapter");
             offer.as_object_mut().unwrap().remove("enabled");
             offer["stream_output"] = serde_json::json!(true);
+            offer["input_schemas"] = serde_json::json!([
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            ]);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
             let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
@@ -3692,6 +3776,10 @@ mod tests {
             offer.as_object_mut().unwrap().remove("adapter");
             offer.as_object_mut().unwrap().remove("enabled");
             offer["stream_output"] = serde_json::json!(true);
+            offer["input_schemas"] = serde_json::json!([
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            ]);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
             let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
@@ -3857,6 +3945,18 @@ mod tests {
                 (
                     "/data/offers/0/output_modalities",
                     serde_json::json!(["image/png"]),
+                ),
+                ("/data/offers/0/input_schemas", serde_json::json!("text/v2")),
+                (
+                    "/data/offers/0/input_schemas",
+                    serde_json::json!(["unknown"]),
+                ),
+                (
+                    "/data/offers/0/input_schemas",
+                    serde_json::json!([
+                        elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                        elastos_model_contract::TEXT_INPUT_V1_SCHEMA
+                    ]),
                 ),
                 ("/data/offers/0/stream_output", serde_json::json!(false)),
                 (
@@ -4364,6 +4464,10 @@ mod tests {
                         offer.as_object_mut().unwrap().remove("adapter");
                         offer.as_object_mut().unwrap().remove("enabled");
                         offer["stream_output"] = serde_json::json!(true);
+                        offer["input_schemas"] = serde_json::json!([
+                            elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                            elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+                        ]);
                         offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
                     }
                     let revisions = offers

@@ -409,6 +409,57 @@ fn production_provider_refuses_every_external_adapter_before_socket_and_after_re
             started["status"], "ok",
             "existing offers must survive startup: {started}"
         );
+        let listed = provider.request(json!({"op":"offers_list"}));
+        for (id, expected) in [
+            (
+                "chat",
+                json!([
+                    elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                    elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+                ]),
+            ),
+            (
+                "responses",
+                json!([elastos_model_contract::TEXT_INPUT_V1_SCHEMA]),
+            ),
+        ] {
+            let offer = listed["data"]["offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|offer| offer["id"] == id)
+                .unwrap();
+            assert_eq!(offer["input_schemas"], expected);
+        }
+        // Trace the production offer reply through the canonical Assistant selector.
+        // Load as a data module so this fixture also works on older Node runtimes.
+        let ui = Command::new("node")
+            .args(["--input-type=module", "-e", r#"
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const source = readFileSync('../assistant/browser/model-contract.js', 'utf8');
+const contract = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const reply = JSON.parse(process.argv[1]);
+const messages = [{role:'system',content:'Be concise.'},{role:'user',content:'first'},
+  {role:'agent',content:'reply'},{role:'user',content:'last'}];
+const rows = contract.textOfferRows(contract.eligibleTextOffers(reply));
+for (const id of ['chat','responses']) {
+  const row = rows.find(row => row.offerId === id);
+  const body = contract.textRunCreateBody({offer:row,messages,requestId:'fixture'});
+  assert.equal(body.input.schema, id === 'chat' ? contract.MODEL_TEXT_INPUT_V2_SCHEMA : contract.MODEL_TEXT_INPUT_SCHEMA);
+  if (id === 'chat') assert.deepEqual(body.input.messages, messages.map(m=>({...m,role:m.role==='agent'?'assistant':m.role})));
+  else assert.equal(body.input.prompt, contract.transcriptPrompt(messages));
+}
+"#])
+            .arg(listed.to_string())
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("Node is required for the Assistant contract fixture");
+        assert!(
+            ui.status.success(),
+            "Assistant offer negotiation: {}",
+            String::from_utf8_lossy(&ui.stderr)
+        );
         for (id, operation, _) in &adapters {
             let input = json!({});
             let request_id = format!("request:external-paused:{pass}:{id}");

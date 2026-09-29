@@ -559,7 +559,19 @@ impl ConfiguredOffer {
             }
             _ => None,
         };
+        let input_schemas = match &self.adapter {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => vec![
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA.to_owned(),
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA.to_owned(),
+            ],
+            AdapterConfig::OpenAiResponsesText { .. } => {
+                vec![elastos_model_contract::TEXT_INPUT_V1_SCHEMA.to_owned()]
+            }
+            _ => Vec::new(),
+        };
         OfferSummary {
+            input_schemas,
             id: self.id.clone(),
             title: self.title.clone(),
             operation: self.operation.clone(),
@@ -569,6 +581,14 @@ impl ConfiguredOffer {
             policy: self.policy.summary(),
             hosted,
         }
+    }
+
+    // Capabilities describe accepted wire formats. Existing run authority binds the
+    // input hash and execution settings, so adding a format preserves v1 revisions.
+    pub fn execution_summary(&self) -> OfferSummary {
+        let mut summary = self.summary();
+        summary.input_schemas.clear();
+        summary
     }
 
     pub fn execution_binding_hash(&self) -> Result<String> {
@@ -622,7 +642,7 @@ impl ConfiguredOffer {
         };
         Ok(model_input_hash(&json!({
             "adapter": adapter,
-            "offer": self.summary(),
+            "offer": self.execution_summary(),
         }))?)
     }
 
@@ -1204,6 +1224,44 @@ mod tests {
     }
 
     #[test]
+    fn schema_capabilities_preserve_the_v1_execution_revision() {
+        let offer = base_offer();
+        let mut legacy_summary = serde_json::to_value(offer.summary()).unwrap();
+        legacy_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("input_schemas");
+        // This is the pre-capability revision projection used by retained runs.
+        let legacy_hash = model_input_hash(&json!({
+            "offer": legacy_summary,
+            "adapter": {"kind":"open_ai_compatible_text", "api_url":"https://example.test/v1/chat/completions", "model":"gpt-test"}
+        })).unwrap();
+        assert_eq!(offer.execution_binding_hash().unwrap(), legacy_hash);
+        let old: OfferSummary = serde_json::from_value(legacy_summary.clone()).unwrap();
+        assert!(old.input_schemas.is_empty());
+        assert_eq!(serde_json::to_value(old).unwrap(), legacy_summary);
+        assert_eq!(
+            offer.summary().input_schemas,
+            vec![
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            ]
+        );
+        let mut responses = offer.clone();
+        responses.adapter = AdapterConfig::OpenAiResponsesText {
+            api_url: "https://example.test/v1/responses".into(),
+            api_key: None,
+            model: "gpt-test".into(),
+            hosted: test_hosted_disclosure(),
+        };
+        assert_eq!(
+            responses.summary().input_schemas,
+            vec![elastos_model_contract::TEXT_INPUT_V1_SCHEMA]
+        );
+        assert_ne!(responses.execution_binding_hash().unwrap(), legacy_hash);
+    }
+
+    #[test]
     fn execution_binding_hash_changes_only_for_semantic_execution_inputs() {
         let openai = base_offer();
         let openai_hash = openai.execution_binding_hash().unwrap();
@@ -1389,7 +1447,18 @@ mod tests {
             *api_key = Some("rotated-responses-key".to_string());
         }
         assert_eq!(responses_hash, rotated.execution_binding_hash().unwrap());
-        assert_eq!(responses.summary(), chat.summary());
+        assert_eq!(responses.execution_summary(), chat.execution_summary());
+        assert_eq!(
+            responses.summary().input_schemas,
+            vec![elastos_model_contract::TEXT_INPUT_V1_SCHEMA]
+        );
+        assert_eq!(
+            chat.summary().input_schemas,
+            vec![
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            ]
+        );
         let public = serde_json::to_string(&responses.summary()).unwrap();
         assert!(!public.contains("example.test"));
         assert!(!public.contains("sentinel-responses-key"));

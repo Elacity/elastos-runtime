@@ -511,6 +511,18 @@ pub(crate) fn offers_list_without_local_provider() -> Value {
     })
 }
 
+fn annotate_remote_offer(offer: &mut Value, grant: &ConsumerModelGrant) {
+    if let Some(Value::String(id)) = offer.get_mut("id") {
+        *id = remote_offer_id(&grant.grant_id, id);
+    }
+    offer["remote_service"] = json!({
+        "grant_id": grant.grant_id,
+        "peer_did": grant.peer_did,
+        "display_name": grant.display_name,
+        "expires_at": grant.expires_at,
+    });
+}
+
 pub(crate) async fn append_remote_offers(
     registry: &ProviderRegistry,
     grants: &[ConsumerModelGrant],
@@ -536,15 +548,7 @@ pub(crate) async fn append_remote_offers(
                     .unwrap_or_default();
                 let count = offers.len();
                 for mut offer in offers {
-                    if let Some(Value::String(id)) = offer.get_mut("id") {
-                        *id = remote_offer_id(&grant.grant_id, id);
-                    }
-                    offer["remote_service"] = json!({
-                        "grant_id": grant.grant_id,
-                        "peer_did": grant.peer_did,
-                        "display_name": grant.display_name,
-                        "expires_at": grant.expires_at,
-                    });
+                    annotate_remote_offer(&mut offer, grant);
                     if let Some(Value::Array(target)) = response.pointer_mut("/data/offers") {
                         target.push(offer);
                     } else if let Some(Value::Array(target)) = response.get_mut("offers") {
@@ -748,6 +752,27 @@ mod tests {
             crate::carrier::public_key_to_did(&key).unwrap()
         );
         assert!(grant.peer_did.starts_with("did:key:z6Mk"));
+        for schemas in [
+            None,
+            Some(json!([elastos_model_contract::TEXT_INPUT_V1_SCHEMA])),
+            Some(json!([
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            ])),
+        ] {
+            let mut offer = json!({"id":"qwen-local","title":"Fixture","operation":"text.generate","input_modalities":["text/plain"],"output_modalities":["text/plain"]});
+            if let Some(schemas) = &schemas {
+                offer["input_schemas"] = schemas.clone();
+            }
+            annotate_remote_offer(&mut offer, &grant);
+            let wire: Value = serde_json::from_slice(&serde_json::to_vec(&offer).unwrap()).unwrap();
+            assert_eq!(wire.get("input_schemas"), schemas.as_ref());
+            assert_eq!(
+                parse_remote_offer_id(wire["id"].as_str().unwrap()),
+                Some((grant.grant_id.as_str(), "qwen-local"))
+            );
+        }
+
         assert!(ConsumerModelGrant::from_record(&json!({
             "schema": crate::api::gateway::gateway_model_service::MODEL_GRANT_SCHEMA, "offer_ids": ["qwen-local"], "offer_revision": format!("sha256:{}", "a".repeat(64)),
             "grant_id": "g", "peer_did": "not-a-peer-id", "connect_ticket": "t", "expires_at": 1,

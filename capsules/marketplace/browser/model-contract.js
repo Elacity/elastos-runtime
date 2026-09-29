@@ -7,6 +7,7 @@
    increasing sequences, a terminal event ends the run. */
 
 export const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
+export const MODEL_TEXT_INPUT_V2_SCHEMA = "elastos.model.input.text/v2";
 export const MODEL_TEXT_OUTPUT_SCHEMA = "elastos.model.output.text/v1";
 
 const TEXT_MODALITY = "text/plain";
@@ -284,15 +285,15 @@ export function textOfferRows(offers, backendReports = {}) {
       label: offer.title,
       detail: offerRowDetail(offer, facts),
       streamOutput: offer.stream_output === true,
+      inputSchemas: Array.isArray(offer.input_schemas) ? [...offer.input_schemas] : [],
       selectionFacts: facts,
     };
   });
 }
 
 /**
- * The typed text input is a single prompt. A chat turn is rendered as a
- * transcript so the model sees the conversation; the compiled message list
- * (system, user, agent) is the source of truth and is not reordered.
+ * Older offers accept one prompt. Render the compiled conversation as a
+ * transcript only for this v1 path.
  */
 export function transcriptPrompt(messages) {
   const lines = [];
@@ -325,10 +326,18 @@ export function textRunCreateBody({ offer, messages, requestId }) {
     offer_id: offer.offerId,
     operation: offer.operation,
     request_id: requestId,
-    input: {
-      schema: MODEL_TEXT_INPUT_SCHEMA,
-      prompt: transcriptPrompt(messages),
-    },
+    input: offer.inputSchemas?.includes(MODEL_TEXT_INPUT_V2_SCHEMA)
+      ? {
+          schema: MODEL_TEXT_INPUT_V2_SCHEMA,
+          messages: messages.map(({ role, content }) => ({
+            role: role === "agent" ? "assistant" : role,
+            content,
+          })),
+        }
+      : {
+          schema: MODEL_TEXT_INPUT_SCHEMA,
+          prompt: transcriptPrompt(messages),
+        },
   };
 }
 

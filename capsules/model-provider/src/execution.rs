@@ -557,11 +557,22 @@ mod tests {
                 break;
             }
             buffer.extend_from_slice(&chunk[..read]);
-            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+            if let Some(end) = buffer.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buffer[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + length {
+                    break;
+                }
             }
         }
-        String::from_utf8_lossy(&buffer).into_owned()
+        String::from_utf8(buffer).unwrap()
     }
 
     fn write_response(stream: &mut TcpStream, action: &ResponseAction) {
@@ -3663,6 +3674,66 @@ mod tests {
     }
 
     #[test]
+    fn text_v2_engine_request_preserves_messages_and_v1_compatibility() {
+        let messages = json!([
+            {"role":"system","content":" Be concise. "},
+            {"role":"user","content":"Hello"},
+            {"role":"assistant","content":"Hi"},
+            {"role":"user","content":"Continue 日本語"}
+        ]);
+        for input in [
+            text_input("old prompt"),
+            json!({"schema":elastos_model_contract::TEXT_INPUT_V2_SCHEMA,"messages":messages}),
+        ] {
+            let server = start_server(vec![sse_action(
+                &[json!({"choices":[{"delta":{"content":"done"}}]}).to_string()],
+                true,
+            )]);
+            let mut offer = local_text_offer(&server.base_url);
+            if let AdapterConfig::OpenAiCompatibleText { api_url, .. } = &mut offer.adapter {
+                *api_url = format!("{}/v1/chat/completions", server.base_url);
+            }
+            let root = temp_root("text-roles-capture");
+            let mut provider = ProviderCoordinatorHandle::start();
+            init_provider(&provider, &root, vec![offer.clone()]);
+            let offers = send_request(
+                &provider,
+                ProviderOperation::OffersList,
+                json!({"op":"offers_list"}),
+            );
+            assert_eq!(
+                offers["data"]["offers"][0]["input_schemas"],
+                json!([
+                    elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                    elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+                ])
+            );
+            let binding = create_binding("request:roles", &offer, &input);
+            let created = create_run(&provider, &offer, &binding, &input);
+            let terminal = wait_for_terminal(
+                &provider,
+                created["data"]["run_id"].as_str().unwrap(),
+                &access_binding(&binding),
+            );
+            assert_eq!(terminal["data"]["status"], "completed");
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST /v1/chat/completions "));
+            let body: Value =
+                serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+            let expected = if input["schema"] == elastos_model_contract::TEXT_INPUT_V2_SCHEMA {
+                messages.clone()
+            } else {
+                json!([{"role":"user","content":"old prompt"}])
+            };
+            assert_eq!(body["messages"], expected);
+            drop(requests);
+            provider.shutdown_on_eof();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn text_stream_deltas_are_ordered_and_terminal_output_is_exact() {
         let server = start_server(vec![sse_action(
             &[
@@ -4339,6 +4410,8 @@ mod tests {
             offer.execution_binding_hash().unwrap(),
             crate::journal::now_ms(),
         );
+        // A journal written before schema capabilities contains the same v1 authority.
+        run.offer.input_schemas.clear();
         run.status = crate::contract::RunStatus::Running;
         run.backend_state = Some(serialize_local_text_backend_state(false).unwrap());
         run.events = vec![
@@ -4367,7 +4440,14 @@ mod tests {
         init_provider(&provider, &root, vec![offer.clone()]);
         let response = get_run(&provider, &run_id, &access_binding(&binding));
         assert_eq!(response["data"]["status"], "settlement_unknown");
-
+        let retry = create_run(&provider, &offer, &binding, &input);
+        assert_eq!(retry["data"]["run_id"], run_id);
+        assert_eq!(retry["data"]["status"], "settlement_unknown");
+        let stored = load_run(&root, &run_id);
+        assert_eq!(stored.runtime_binding, binding);
+        assert_eq!(stored.input_hash, run.input_hash);
+        assert!(stored.offer.input_schemas.is_empty());
+        assert!(server.requests.lock().unwrap().is_empty());
         provider.shutdown_on_eof();
     }
 

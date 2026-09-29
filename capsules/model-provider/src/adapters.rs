@@ -446,7 +446,7 @@ struct LocalTextWorkerTask {
     backend: LocalTextBackend,
     offer: ConfiguredOffer,
     deadline_ms: u64,
-    prompt: String,
+    messages: Vec<Value>,
     cancel_rx: watch::Receiver<bool>,
     updates: mpsc::Sender<WorkerUpdate>,
     hosted_socket: Option<String>,
@@ -754,7 +754,7 @@ impl LiveAdapterExecutor {
         backend: LocalTextBackend,
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
-        prompt: &str,
+        messages: &[Value],
         deadline_ms: u64,
     ) -> std::result::Result<Value, AdapterFault> {
         let run_id = deterministic_run_id(binding);
@@ -783,7 +783,7 @@ impl LiveAdapterExecutor {
             backend,
             offer,
             &binding.request_id,
-            prompt,
+            messages,
             deadline_ms,
             PreparedLocalTextWorker {
                 run_id,
@@ -800,7 +800,7 @@ impl LiveAdapterExecutor {
         backend: LocalTextBackend,
         offer: &ConfiguredOffer,
         request_id: &str,
-        prompt: &str,
+        messages: &[Value],
         deadline_ms: u64,
         prepared: PreparedLocalTextWorker,
         mut workers: std::sync::MutexGuard<'_, BTreeMap<String, WorkerRecord>>,
@@ -813,7 +813,7 @@ impl LiveAdapterExecutor {
         } = prepared;
         let updates = self.updates.clone();
         let offer = offer.clone();
-        let prompt = prompt.to_string();
+        let messages = messages.to_vec();
         let request_id = request_id.to_string();
         let hosted_socket = self.hosted_socket.clone();
         let run_id_for_task = run_id.clone();
@@ -825,7 +825,7 @@ impl LiveAdapterExecutor {
                 backend,
                 offer,
                 deadline_ms,
-                prompt,
+                messages,
                 cancel_rx,
                 updates: updates.clone(),
                 hosted_socket,
@@ -1097,7 +1097,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
                     },
                     offer,
                     binding,
-                    "",
+                    &[],
                     deadline_ms,
                 )?;
                 Ok(DispatchResult::Running {
@@ -1280,9 +1280,9 @@ fn dispatch_text(
     input: &Value,
     deadline_ms: u64,
 ) -> std::result::Result<DispatchResult, AdapterFault> {
-    let prompt = validate_text_prompt(input)?;
+    let messages = validate_text_messages(offer, input)?;
     let backend_state =
-        executor.spawn_local_text_worker(backend, offer, binding, prompt, deadline_ms)?;
+        executor.spawn_local_text_worker(backend, offer, binding, &messages, deadline_ms)?;
     Ok(DispatchResult::Running {
         events: vec![EventSeed {
             kind: "dispatched",
@@ -1294,17 +1294,37 @@ fn dispatch_text(
     })
 }
 
-fn validate_text_prompt(input: &Value) -> std::result::Result<&str, AdapterFault> {
-    let schema = input.get("schema").and_then(Value::as_str);
-    if schema != Some("elastos.model.input.text/v1") {
-        return Err(AdapterFault::context(
+fn validate_text_messages(
+    offer: &ConfiguredOffer,
+    input: &Value,
+) -> std::result::Result<Vec<Value>, AdapterFault> {
+    let invalid = || {
+        AdapterFault::context(
             "model input is invalid",
-            "text offer input schema must be elastos.model.input.text/v1",
-        ));
+            "unsupported or invalid text input schema",
+        )
+    };
+    match input.get("schema").and_then(Value::as_str) {
+        Some(elastos_model_contract::TEXT_INPUT_V1_SCHEMA) => {
+            let prompt = input
+                .get("prompt")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?;
+            Ok(vec![json!({"role": "user", "content": prompt})])
+        }
+        Some(elastos_model_contract::TEXT_INPUT_V2_SCHEMA)
+            if matches!(
+                offer.adapter,
+                AdapterConfig::OpenAiCompatibleText { .. }
+                    | AdapterConfig::LocalLlamaCppText { .. }
+            ) =>
+        {
+            elastos_model_contract::validate_text_input_v2(input)
+                .map(<[Value]>::to_vec)
+                .map_err(|_| invalid())
+        }
+        _ => Err(invalid()),
     }
-    input.get("prompt").and_then(Value::as_str).ok_or_else(|| {
-        AdapterFault::context("model input is invalid", "text offer input missing prompt")
-    })
 }
 
 pub(crate) fn is_local_text_backend_state(value: &Value) -> bool {
@@ -1692,7 +1712,7 @@ async fn run_local_text_worker_inner(
         } => (
             api_url.clone(),
             api_key.clone(),
-            text_generation_request_body(&task.offer, model, &task.prompt, None),
+            text_generation_request_body(&task.offer, model, &task.messages, None),
             false,
         ),
         LocalTextBackend::OpenAiResponses {
@@ -1702,7 +1722,19 @@ async fn run_local_text_worker_inner(
         } => (
             api_url.clone(),
             api_key.clone(),
-            responses_text_request_body(&task.offer, model, &task.prompt),
+            responses_text_request_body(
+                &task.offer,
+                model,
+                task.messages
+                    .first()
+                    .and_then(|message| message["content"].as_str())
+                    .ok_or_else(|| {
+                        AdapterFault::context(
+                            "model input is invalid",
+                            "Responses requires a v1 prompt",
+                        )
+                    })?,
+            ),
             false,
         ),
         LocalTextBackend::LocalLlama {
@@ -1725,7 +1757,7 @@ async fn run_local_text_worker_inner(
             let body = text_generation_request_body(
                 &task.offer,
                 &endpoint.model,
-                &task.prompt,
+                &task.messages,
                 Some(endpoint.enable_thinking),
             );
             local_socket = endpoint.unix_socket;
@@ -2036,16 +2068,14 @@ fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
 fn text_generation_request_body(
     offer: &ConfiguredOffer,
     model: &str,
-    prompt: &str,
+    messages: &[Value],
     enable_thinking: Option<bool>,
 ) -> Value {
     let mut body = json!({
         "model": model,
         "stream": true,
         "max_tokens": text_generation_max_tokens(offer),
-        "messages": [
-            { "role": "user", "content": prompt }
-        ]
+        "messages": messages
     });
     if let Some(enable_thinking) = enable_thinking {
         body["chat_template_kwargs"] = json!({
@@ -3751,11 +3781,52 @@ mod tests {
     }
 
     #[test]
+    fn text_v2_validation_is_shared_and_responses_stays_v1() {
+        let offer = openai_offer("http://fixture.invalid/chat");
+        let input = json!({"schema":elastos_model_contract::TEXT_INPUT_V2_SCHEMA,"messages":[
+            {"role":"system","content":"Be concise."},{"role":"user","content":"Hi"}
+        ]});
+        assert_eq!(
+            validate_text_messages(&offer, &input).unwrap(),
+            input["messages"].as_array().unwrap().clone()
+        );
+        let mut invalid = input.clone();
+        invalid["messages"][0]["role"] = json!("tool");
+        assert!(validate_text_messages(&offer, &invalid).is_err());
+        let mut responses = offer.clone();
+        responses.adapter = AdapterConfig::OpenAiResponsesText {
+            api_url: "http://fixture.invalid/responses".into(),
+            api_key: None,
+            model: "fixture".into(),
+            hosted: crate::config::test_hosted_disclosure(),
+        };
+        assert_eq!(
+            responses.summary().input_schemas,
+            vec![elastos_model_contract::TEXT_INPUT_V1_SCHEMA]
+        );
+        assert!(validate_text_messages(&responses, &input).is_err());
+        assert_eq!(
+            validate_text_messages(&responses, &text_input("v1")).unwrap(),
+            vec![json!({"role":"user","content":"v1"})]
+        );
+    }
+
+    #[test]
     fn responses_and_chat_request_json_use_policy_token_ceiling() {
         let mut offer = openai_offer("http://example.invalid/chat");
         offer.policy.inline_output_bytes_limit = 64;
-        let hosted = text_generation_request_body(&offer, "hosted", "hello", None);
-        let local = text_generation_request_body(&offer, "local", "hello", Some(false));
+        let hosted = text_generation_request_body(
+            &offer,
+            "hosted",
+            &[json!({"role": "user", "content": "hello"})],
+            None,
+        );
+        let local = text_generation_request_body(
+            &offer,
+            "local",
+            &[json!({"role": "user", "content": "hello"})],
+            Some(false),
+        );
         let responses = responses_text_request_body(&offer, "responses", "hello");
         assert_eq!(
             hosted,
@@ -3778,7 +3849,12 @@ mod tests {
         );
         let mut venice = openai_offer("https://api.venice.ai/api/v1/chat/completions");
         venice.id = "model:venice".to_string();
-        let venice_body = text_generation_request_body(&venice, "hosted", "hello", None);
+        let venice_body = text_generation_request_body(
+            &venice,
+            "hosted",
+            &[json!({"role": "user", "content": "hello"})],
+            None,
+        );
         assert_eq!(
             venice_body["venice_parameters"],
             json!({ "include_venice_system_prompt": false })
@@ -3861,7 +3937,7 @@ mod tests {
             },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
             deadline_ms: now_ms().saturating_add(30_000),
-            prompt: "hello".to_string(),
+            messages: vec![json!({"role": "user", "content": "hello"})],
             cancel_rx,
             updates: update_tx,
         };
@@ -3945,7 +4021,7 @@ mod tests {
                 },
                 offer: openai_offer("https://example.invalid/chat"),
                 deadline_ms: now_ms().saturating_add(30_000),
-                prompt: "hello".into(),
+                messages: vec![json!({"role": "user", "content": "hello"})],
                 cancel_rx,
                 updates: update_tx,
             };
@@ -4013,7 +4089,7 @@ mod tests {
             },
             offer,
             deadline_ms: now_ms().saturating_add(200),
-            prompt: "hello".to_string(),
+            messages: vec![json!({"role": "user", "content": "hello"})],
             cancel_rx,
             updates: update_tx,
         };
@@ -4110,7 +4186,7 @@ mod tests {
             },
             offer,
             deadline_ms: now_ms().saturating_add(30_000),
-            prompt: "hello".to_string(),
+            messages: vec![json!({"role": "user", "content": "hello"})],
             cancel_rx,
             updates: update_tx,
         };
@@ -4323,7 +4399,7 @@ mod tests {
                     },
                     offer,
                     deadline_ms: now_ms().saturating_add(30_000),
-                    prompt: "hello".to_string(),
+                    messages: vec![json!({"role": "user", "content": "hello"})],
                     cancel_rx,
                     updates: update_tx,
                 };
@@ -4476,7 +4552,7 @@ mod tests {
                 },
                 offer,
                 deadline_ms: now_ms() + 120_000,
-                prompt: "hello".into(),
+                messages: vec![json!({"role": "user", "content": "hello"})],
                 cancel_rx,
                 updates: update_tx,
             };
@@ -4599,7 +4675,7 @@ mod tests {
             },
             offer,
             deadline_ms: now_ms().saturating_add(120000),
-            prompt: "fixture".into(),
+            messages: vec![json!({"role": "user", "content": "fixture"})],
             cancel_rx,
             updates: update_tx,
         };
@@ -4804,7 +4880,7 @@ mod tests {
             },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
             deadline_ms: now_ms().saturating_add(30_000),
-            prompt: "hello".to_string(),
+            messages: vec![json!({"role": "user", "content": "hello"})],
             cancel_rx,
             updates: update_tx,
         };
@@ -4844,7 +4920,7 @@ mod tests {
             },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
             deadline_ms: now_ms().saturating_add(30_000),
-            prompt: "hello".to_string(),
+            messages: vec![json!({"role": "user", "content": "hello"})],
             cancel_rx,
             updates: update_tx,
         };
@@ -5302,7 +5378,7 @@ mod tests {
                 backend,
                 offer: text.clone(),
                 deadline_ms: now_ms() + 5000,
-                prompt: "test".into(),
+                messages: vec![json!({"role": "user", "content": "test"})],
                 cancel_rx: cancel_rx.clone(),
                 updates: updates.clone(),
             };

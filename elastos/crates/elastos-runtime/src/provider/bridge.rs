@@ -225,6 +225,7 @@ struct HostedRunBinding {
     operation: String,
     input_hash: String,
     effect_input_hash: Option<String>,
+    input_schema: Option<String>,
     pending: usize,
     accepted: bool,
     dispatched: bool,
@@ -578,10 +579,16 @@ impl ProviderBridge {
             .map_err(|_| rejected())?;
         let run_id = model_run_id(&binding);
         let effect_input_hash = match operation {
-            "text.generate" if input["schema"] == "elastos.model.input.text/v1" => input
-                .get("prompt")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|prompt| model_input_hash(&serde_json::json!(prompt)).ok()),
+            "text.generate" if input["schema"] == elastos_model_contract::TEXT_INPUT_V1_SCHEMA => {
+                input
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|prompt| model_input_hash(&serde_json::json!(prompt)).ok())
+            }
+            "text.generate" if input["schema"] == elastos_model_contract::TEXT_INPUT_V2_SCHEMA => {
+                elastos_model_contract::validate_text_input_v2(input).map_err(|_| rejected())?;
+                Some(model_input_hash(&input["messages"]).map_err(|_| rejected())?)
+            }
             elastos_model_contract::decisions::OPERATION
                 if input["schema"] == elastos_model_contract::decisions::INPUT_SCHEMA =>
             {
@@ -620,6 +627,7 @@ impl ProviderBridge {
                     operation: operation.to_owned(),
                     input_hash: binding.input_hash,
                     effect_input_hash,
+                    input_schema: input["schema"].as_str().map(str::to_owned),
                     pending: 1,
                     accepted: false,
                     dispatched: false,
@@ -746,11 +754,23 @@ impl ProviderBridge {
                         {
                             None
                         } else {
-                            prompt
-                                .and_then(|value| model_input_hash(&serde_json::json!(value)).ok())
+                            match run.input_schema.as_deref() {
+                                Some(elastos_model_contract::TEXT_INPUT_V1_SCHEMA) => prompt
+                                    .and_then(|value| {
+                                        model_input_hash(&serde_json::json!(value)).ok()
+                                    }),
+                                Some(elastos_model_contract::TEXT_INPUT_V2_SCHEMA) => body
+                                    .get("messages")
+                                    .and_then(|messages| model_input_hash(messages).ok()),
+                                _ => None,
+                            }
                         }
                     }
-                    "responses" if run.operation == "text.generate" => {
+                    "responses"
+                        if run.operation == "text.generate"
+                            && run.input_schema.as_deref()
+                                == Some(elastos_model_contract::TEXT_INPUT_V1_SCHEMA) =>
+                    {
                         if body["stream"] != true
                             || body["store"] != false
                             || object.keys().any(|key| {
@@ -1460,6 +1480,123 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("expected test provider marker {} to exist", path.display());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_text_v2_requires_exact_messages_and_schema() {
+        let (reader, _) = tokio::io::duplex(4096);
+        let (writer, _) = tokio::io::duplex(4096);
+        let bridge = ProviderBridge::from_io(tokio::io::BufReader::new(reader), writer);
+        let pid = std::process::id();
+        bridge._local_provider_birth.store(
+            super::super::local_model_broker::process_birth(pid).unwrap(),
+            Ordering::Release,
+        );
+        bridge._local_provider_pid.store(pid, Ordering::Release);
+        let messages = serde_json::json!([
+            {"role":"system","content":"Be concise."},
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"answer"},
+            {"role":"user","content":"last"}
+        ]);
+        let input = serde_json::json!({"schema":elastos_model_contract::TEXT_INPUT_V2_SCHEMA,"messages":messages});
+        let binding = RuntimeCreateBinding {
+            schema: RUNTIME_CREATE_BINDING_SCHEMA.into(),
+            principal_id: "principal:fixture".into(),
+            session_id: "session:fixture".into(),
+            capsule_id: "assistant".into(),
+            grant_id: "grant:fixture".into(),
+            request_id: "request:v2".into(),
+            offer_id: "model:openrouter".into(),
+            operation: "text.generate".into(),
+            input_hash: model_input_hash(&input).unwrap(),
+        };
+        let request = serde_json::json!({"op":"runs_create","offer_id":binding.offer_id,
+            "operation":binding.operation,"input":input,"runtime_binding":binding});
+        let run_id = bridge.record_confined_model_run(&request).unwrap().unwrap();
+        bridge
+            .hosted_run_bindings
+            .lock()
+            .unwrap()
+            .get_mut(&run_id)
+            .unwrap()
+            .dispatched = true;
+        let body = serde_json::json!({"model":"fixture","stream":true,"max_tokens":32,"messages":messages});
+        let matches = |effect, body: &serde_json::Value| {
+            bridge.confined_model_effect_matches(
+                &binding.offer_id,
+                &run_id,
+                &binding.request_id,
+                effect,
+                &serde_json::to_vec(body).unwrap(),
+            )
+        };
+        assert!(matches("text", &body));
+        for (pointer, value) in [
+            ("/messages/2/role", serde_json::json!("user")),
+            ("/messages/2/content", serde_json::json!("changed")),
+            ("/stream", serde_json::json!(false)),
+        ] {
+            let mut changed = body.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(!matches("text", &changed));
+        }
+        let mut extra = body.clone();
+        extra["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role":"user","content":"extra"}));
+        assert!(!matches("text", &extra));
+        let mut swapped = body.clone();
+        swapped["messages"].as_array_mut().unwrap().swap(1, 2);
+        assert!(!matches("text", &swapped));
+        let mut extra_key = body.clone();
+        extra_key["messages"][0]["name"] = serde_json::json!("hidden");
+        assert!(!matches("text", &extra_key));
+        let mut extra_top = body.clone();
+        extra_top["tools"] = serde_json::json!([]);
+        assert!(!matches("text", &extra_top));
+        let mut venice = body.clone();
+        venice["venice_parameters"] = serde_json::json!({"include_venice_system_prompt":true});
+        assert!(!matches("text", &venice));
+        assert!(!matches(
+            "responses",
+            &serde_json::json!({"model":"fixture","stream":true,"store":false,"input":messages,"max_output_tokens":32})
+        ));
+        assert!(!matches(
+            "responses",
+            &serde_json::json!({"model":"fixture","stream":true,"store":false,"input":"last","max_output_tokens":32})
+        ));
+        assert!(!matches(
+            "text",
+            &serde_json::json!({"model":"fixture","stream":true,"messages":[{"role":"user","content":"last"}]})
+        ));
+        let mut invalid = request.clone();
+        invalid["input"]["messages"][0]["extra"] = serde_json::json!(true);
+        invalid["runtime_binding"]["input_hash"] =
+            serde_json::json!(model_input_hash(&invalid["input"]).unwrap());
+        assert!(bridge.record_confined_model_run(&invalid).is_err());
+        let mut v1 = request.clone();
+        v1["input"] = serde_json::json!({"schema":elastos_model_contract::TEXT_INPUT_V1_SCHEMA,"prompt":"last"});
+        v1["runtime_binding"]["request_id"] = serde_json::json!("request:v1");
+        v1["runtime_binding"]["input_hash"] =
+            serde_json::json!(model_input_hash(&v1["input"]).unwrap());
+        let v1_id = bridge.record_confined_model_run(&v1).unwrap().unwrap();
+        bridge
+            .hosted_run_bindings
+            .lock()
+            .unwrap()
+            .get_mut(&v1_id)
+            .unwrap()
+            .dispatched = true;
+        assert!(!bridge.confined_model_effect_matches(
+            &binding.offer_id,
+            &v1_id,
+            "request:v1",
+            "text",
+            &serde_json::to_vec(&body).unwrap()
+        ));
     }
 
     #[cfg(target_os = "macos")]

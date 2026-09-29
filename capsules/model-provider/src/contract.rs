@@ -235,6 +235,8 @@ pub struct OfferPolicySummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OfferSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_schemas: Vec<String>,
     pub id: String,
     pub title: String,
     pub operation: String,
