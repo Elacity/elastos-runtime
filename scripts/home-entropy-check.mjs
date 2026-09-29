@@ -5511,7 +5511,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-models-20260929c";
+const systemAssetVersion = "system-models-20260929d";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {

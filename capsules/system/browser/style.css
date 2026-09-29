@@ -1904,6 +1904,8 @@ code {
 :root[data-el-form-factor="phone"] .settings-sidebar {
   display: flex;
   padding: calc(var(--system-phone-menu) + 12px) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  box-shadow: none;
 }
 
 /* .settings shows at the pushed-aside view's rounded corners: the drawer's
