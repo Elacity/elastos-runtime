@@ -156,10 +156,12 @@ target before acting.
 - **No approval needed:** fast-forward pushes to the branch of the active task
   or its existing draft PR; opening draft PRs; rerunning checks; reading logs.
   Report what was pushed, including the remote, branch, commits and check results.
-- **Standing task-merge permission:** merge a task PR into
-  `feat/0.7.1-models` when the current candidate passes all required checks,
-  independent review is complete, all findings are resolved, and its dependencies
-  are integrated.
+- **Standing task-merge permission:** merge a task PR only into the repository
+  and target branch named in the [approved task permission record](docs/audits/2026-09-29-standing-task-permissions.md).
+  Read that record before merging. A change to the approved target requires
+  explicit user approval. The current candidate must pass all required checks,
+  independent review must be complete, all findings must be resolved, and its
+  dependencies must be integrated.
   Check compatibility with the current base and report the PR, source and merge
   commits, review and checks. Use a normal merge; history rewrite needs approval.
 - **Standing test-key permission:** create and use disposable keys and signatures
