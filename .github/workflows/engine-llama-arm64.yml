@@ -1,0 +1,50 @@
+name: Jetson llama.cpp CPU engine
+
+on:
+  push:
+    branches: [feat/0.7.1-jetson-engine]
+    paths:
+      - scripts/build/build-llama-server-bundle.sh
+      - .github/workflows/engine-llama-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-llama-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    container:
+      # Docker Official Image, Ubuntu 22.04 linux/arm64/v8; resolved 2026-09-28.
+      image: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_CONTAINER_IMAGE: ubuntu@sha256:1cc7bb38a74c0e126716646e47c0b3c5c139547d386d5ff7a64cf3ea316ca523
+      RECIPE_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential cmake git ca-certificates curl binutils file python3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build, verify ELF limits and run SmolLM2
+        run: bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/jetson-engine"
+      - name: Upload verified run artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llama-b10516-ubuntu22.04-arm64-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/jetson-engine/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
