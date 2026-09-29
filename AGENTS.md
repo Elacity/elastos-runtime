@@ -6,8 +6,16 @@ are the only place for work status, acceptance criteria and proof.
 
 ## Work Tracking And Acceptance
 
-- Update the owning GitHub issue as work moves. State what changed, link the
-  PR, and record the exact candidate, checks, results and remaining work.
+- GitHub issues own the work queue. In each lane, take the lowest-numbered open
+  task whose dependencies are satisfied and which has no active blocker. Keep
+  at most one task issue In progress per lane. Parent issues group the lane;
+  they do not authorize a second active task. User messages approve, redirect
+  or reorder work; they do not create a parallel task list.
+- Close a task only when its Done means is proven, then take the next unblocked
+  task in that lane. Keep blocked work open with its blocker in the issue.
+- Update the owning GitHub issue before reporting progress. State what changed,
+  link the PR, and record the exact candidate, checks, results and remaining
+  work. The report names the issue, PR, proof and next issue.
 - Keep one work record. Do not create briefings, plans, gists or notes files.
   Existing `state.md`, `TASKS.md` and dated audits are historical references;
   move useful open work to its issue instead of maintaining a parallel queue.
@@ -137,6 +145,9 @@ them creates a cleanup obligation; "temporary" is not a lifecycle.
   different-history refs are not automatic deletion candidates: preserve or
   explicitly waive the unique history first. Before deleting a worktree,
   verify its status, untracked files, open files/processes, and protecting ref.
+- Stop each test Home and its owned child processes when its test ends. Keep
+  its data until its retention decision is made. Remove completed-test login
+  agents; an agent kept for an active test must name the owning GitHub issue.
 - Build outputs, Cargo targets, dependency caches, VM hibernation state, and
   proof scratch directories are rebuildable artifacts, not rollback copies.
   Do not retain them merely because they were expensive to create.
@@ -215,9 +226,12 @@ capsules, provider config, and `components.json`.
 
 ## Review And Commit Discipline
 
+- Keep review requests off draft PRs. Request review only after a PR leaves
+  draft. When it is ready, tell Anders who must review it; Anders contacts them.
 - For a PR authored by Anders that touches signing, update checks, Inbox
-  approvals, keys, sandboxing or seed publishing, request `irzhywau` as reviewer.
-  Also request the feature owner's review when the task requires it.
+  approvals, keys, sandboxing or seed publishing, name `irzhywau` as a required
+  human reviewer. Also name the feature owner when the task requires that review.
+  Independent agent review and required human review are separate evidence.
 - Keep commits authority-bound and reviewable: one coherent concern per commit,
   with its own verification commands.
 - Preserve commit history by default. Ask before amending, squashing, rebasing
