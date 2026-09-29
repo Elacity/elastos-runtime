@@ -7911,6 +7911,12 @@ assert(
   "Home must present guest enrollment as self-registration",
 );
 assert(
+  shellIndex.includes('id="home-unlock-create"') &&
+    shellAuth.includes("unlockCreate.hidden = !(showFace && guestRegistrationEnabled);") &&
+    shellAuth.includes('unlockMode = "create_guest";'),
+  "Home lock face must offer Create account to first-time visitors when guest registration is on",
+);
+assert(
   shellAuth.includes("unlockPerson?.addEventListener(\"click\", startUnlock);") &&
     shellAuth.includes("setUnlockStatus(\"Choose your passkey.\", \"muted\");") &&
     shellAuth.includes('unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";') &&
