@@ -42,9 +42,9 @@ are the only place for work status, acceptance criteria and proof.
 ## Branch Roles
 
 - `main` is the stable source line.
-- `upstream/<version>-dev` branches are development integration lines. Resolve
-  the active line from `state.md` and fetched refs against the owning GitHub
-  issue before choosing a base. The issue records the approved task base.
+- `upstream/<version>-dev` branches are development integration lines. The
+  owning GitHub issue records the approved task base; fetched refs verify it.
+  This replaces the old rule to choose the active line from `state.md` and fetched refs.
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
