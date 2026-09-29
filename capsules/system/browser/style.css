@@ -523,6 +523,19 @@ code {
 .model-list li,
 .model-controls,
 .model-keep { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.model-controls .pc2-btn:is([data-model-control="use"], [data-model-control="open-assistant"]) {
+  border-color: transparent;
+  background: var(--el-accent);
+  color: var(--el-accent-ink);
+  font-weight: 600;
+}
+.model-controls .pc2-btn:is([data-model-control="use"], [data-model-control="open-assistant"]):is(:hover, :focus-visible):not(:disabled) {
+  background: var(--el-accent-strong);
+}
+.model-controls .pc2-btn:is([data-model-control="use"], [data-model-control="open-assistant"]):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--el-accent) 50%, transparent);
+  outline-offset: 2px;
+}
 .model-details summary { cursor: pointer; }
 .model-identity { overflow-wrap: anywhere; }
 @media (max-width: 767.98px) {
