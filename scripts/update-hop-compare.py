@@ -145,6 +145,11 @@ def health(port):
         return False
 
 
+def operator_response_lost(output):
+    return ("operator peer returned an empty response" in output
+            or bool(re.search(r"Error: connection lost\s+Caused by:\s+timed out", output)))
+
+
 def inspect(config):
     need(config["schema"] == "elastos.update-hop.fixture/v1", "unknown fixture schema")
     need(config["approval"].strip(), "exact fixture approval reference required")
@@ -255,7 +260,8 @@ def compare(observation):
     check("health", after["healthy"], "HTTP /healthz after the observation window")
     check("host_lock", after["host_lock"] == ("held" if after["host_exit"] is None else "released"), "observed lock=" + after["host_lock"])
     if observation["role"] == "operator":
-        reproduced = (after["host_exit"] == 75 and after["binary_sha256"] == new["binary_sha256"]
+        reproduced = (checks["actual_version_change_attempt"]["status"] == "passed"
+                      and after["host_exit"] == 75 and after["binary_sha256"] == new["binary_sha256"]
                       and checks["components_content"]["status"] == "passed"
                       and after["binary_version"] == "elastos " + new["version"]
                       and after["installed_version"] == before["installed_version"]
@@ -382,7 +388,7 @@ def run(config, output):
                                "attempted": "Installing " in apply_text or after["binary_sha256"] != before["binary_sha256"],
                                "apply_exit": exit_code,
                                "cache_stage_observed": "Capsule cache unchanged" in host_text or bool(re.search(r"Cleared \d+ changed cached capsule", host_text)),
-                               "operator_response_lost": "operator peer returned an empty response" in command_text}
+                               "operator_response_lost": operator_response_lost(command_text)}
                 write(output / (role + "-observation.json"), observation)
                 checks = compare(observation)
                 stages = ["Installing ", "Downloading binary", "Binary verified", "Downloading components",
