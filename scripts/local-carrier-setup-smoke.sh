@@ -24,7 +24,7 @@ case "$(uname -m)" in
         ;;
 esac
 
-SMOKE_TEMP_BASE="${CARGO_TARGET_DIR:-${REPO_ROOT}/target-build}"
+SMOKE_TEMP_BASE="${RUNNER_TEMP:-${CARGO_TARGET_DIR:-${REPO_ROOT}/target-build}}"
 mkdir -p "$SMOKE_TEMP_BASE"
 TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${SMOKE_TEMP_BASE}/elastos-local-carrier-setup.XXXXXX")}"
 XDG_DATA_HOME="${TEST_ROOT}/xdg-data"
@@ -133,7 +133,8 @@ MEDIA_TOOLS_ARCHIVE=$(
     source scripts/publish-release.sh
     TMPDIR="${TEST_ROOT}/media-package"
     mkdir -p "$TMPDIR"
-    build_packaged_media_tools_archive "${SETUP_PLATFORM}"
+    CARGO_TARGET_DIR="${TEST_ROOT}/media-target" \
+        build_packaged_media_tools_archive "${SETUP_PLATFORM}"
 )
 export MEDIA_TOOLS_ARCHIVE
 for capsule in \
