@@ -971,7 +971,15 @@ button {
   background: var(--bg-surface);
 }
 
+/* The drawer has the height for full lists, so the narrow-window strips
+   that scroll sideways go back to the desktop's rows. */
+:root[data-el-form-factor="phone"] .store-nav {
+  display: grid;
+  overflow-x: visible;
+}
+
 :root[data-el-form-factor="phone"] .store-sidebar .store-nav-item {
+  width: 100%;
   min-height: var(--el-touch-target);
   font-size: 16px;
 }
