@@ -59,6 +59,10 @@ def digest(path):
     return h.hexdigest()
 
 
+def json_digest(path):
+    return hashlib.sha256(json.dumps(read(path), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def read(path):
     return json.loads(Path(path).read_text())
 
@@ -135,7 +139,7 @@ def lock_state(path):
 def health(port):
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=1) as response:
+        with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1) as response:
             return response.status == 200
     except (OSError, ValueError):
         return False
@@ -207,7 +211,9 @@ def inspect(config):
         need(release["payload"]["platforms"][release_platform][key]["sha256"] == digest(paths[key]), "release artifact binding differs")
     for role in ("cli", "operator"):
         need(source(config, role)["publisher_dids"] == [head["signer_did"]], "fixture signer differs")
-    return {key: {"sha256": digest(path), "bytes": path.stat().st_size} for key, path in paths.items()}
+    artifacts = {key: {"sha256": digest(path), "bytes": path.stat().st_size} for key, path in paths.items()}
+    artifacts["components"]["semantic_sha256"] = json_digest(paths["components"])
+    return artifacts
 
 
 def snapshot(config, role, process, version):
@@ -218,6 +224,7 @@ def snapshot(config, role, process, version):
         installed_version = None
     return {"binary_sha256": digest(binary(config, role)) if binary(config, role).is_file() else None,
             "components_sha256": digest(directory / "components.json") if (directory / "components.json").is_file() else None,
+            "components_semantic_sha256": json_digest(directory / "components.json") if (directory / "components.json").is_file() else None,
             "binary_version": version,
             "catalogue": files(inside(directory, config["catalogue"])),
             "preserved": {key: files(inside(directory, relative)) for key, relative in config["preserve"][role].items()},
@@ -235,23 +242,27 @@ def compare(observation):
     check("apply_command", observation["apply_exit"] == 0, "exit=" + str(observation["apply_exit"]))
     for key in ("binary_sha256", "components_sha256"):
         check(key, after[key] == new[key], "installed hash compared with the supplied new artifact")
+    if after.get("components_semantic_sha256") and observation.get("new_components_semantic_sha256"):
+        check("components_content", after["components_semantic_sha256"] == observation["new_components_semantic_sha256"], "installed component JSON compared with the verified new artifact")
+    else:
+        checks["components_content"] = {"status": "unavailable", "reason": "older observation lacks the component content digest; derive it separately from retained files"}
     check("source_version", after["installed_version"] == new["version"], "sources.json must record the new version")
     check("binary_version", after["binary_version"] == "elastos " + new["version"], "exact --version output compared with the supplied version")
     check("catalogue", after["catalogue"] == {".": new["catalogue_sha256"]}, "installed catalogue compared with the supplied new catalogue hash")
     for key, value in before["preserved"].items():
         check("preserve_" + key, bool(value) and value == after["preserved"][key], "before/after fixture file hashes; model stub is preservation only")
     check("host_survival", after["host_exit"] is None, "host exit=" + str(after["host_exit"]))
-    check("health", after["healthy"], "HTTP /api/health after the observation window")
+    check("health", after["healthy"], "HTTP /healthz after the observation window")
     check("host_lock", after["host_lock"] == ("held" if after["host_exit"] is None else "released"), "observed lock=" + after["host_lock"])
     if observation["role"] == "operator":
         reproduced = (after["host_exit"] == 75 and after["binary_sha256"] == new["binary_sha256"]
-                      and after["components_sha256"] == new["components_sha256"]
+                      and checks["components_content"]["status"] == "passed"
                       and after["binary_version"] == "elastos " + new["version"]
                       and after["installed_version"] == before["installed_version"]
-                      and observation.get("host_wait_reached") and observation.get("operator_response_lost")
+                      and observation.get("cache_stage_observed") and observation.get("operator_response_lost")
                       and observation["apply_exit"] != 0)
         if reproduced:
-            checks["G6"] = {"status": "failed", "reason": "host reached its own release wait then exited 75; the operator lost its response after verified replacement and before sources.json advanced"}
+            checks["G6"] = {"status": "failed", "reason": "host exited 75 after verified replacement and the cache stage, before sources.json advanced; the operator lost its response; the wait boundary has no direct log marker"}
         elif checks["apply_command"]["status"] == "passed" and checks["source_version"]["status"] == "passed":
             checks["G6"] = {"status": "passed", "reason": "operator apply completed and saved the new source version in this run"}
         else:
@@ -266,7 +277,7 @@ def compare(observation):
 
 def unavailable_path(reason):
     names = ("actual_version_change_attempt", "apply_command", "binary_sha256", "components_sha256",
-             "source_version", "binary_version", "catalogue", "preserve_identity", "preserve_chat",
+             "components_content", "source_version", "binary_version", "catalogue", "preserve_identity", "preserve_chat",
              "preserve_draft", "preserve_library", "preserve_model_stub", "host_survival", "health",
              "host_lock", "G6", "stage", "restart", "undo", "external_assets")
     return {"status": "unavailable", "reason": reason,
@@ -301,6 +312,12 @@ def run(config, output):
             return 124
 
     def info(role):
+        if role != "controller":
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://127.0.0.1:{config['ports'][role]}/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=3) as response:
+                bootstrap = json.load(response)
+            need(bootstrap.get("schema") == "elastos.carrier.bootstrap/v1", role + " Carrier bootstrap unavailable")
+            return {"did": bootstrap["did"], "connect_ticket": bootstrap["ticket"]}
         label = role + "-info"
         need(command(role, ["node", "info", "--json"], label) == 0, label + " failed")
         return read(output / (label + ".log"))
@@ -318,7 +335,7 @@ def run(config, output):
         port = config["ports"][role]
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
-        proc = spawn(role, ["serve", "--addr", f"127.0.0.1:{port}", "--storage-path", str(home(config, role) / "storage")], role + "-host")
+        proc = spawn(role, ["gateway", "--addr", f"127.0.0.1:{port}", "--cache-dir", str(home(config, role) / "gateway-cache")], role + "-host")
         deadline = time.monotonic() + 30
         while proc.poll() is None and time.monotonic() < deadline:
             if health(port) and lock_state(data(config, role) / "host-process.lock") == "held":
@@ -359,13 +376,15 @@ def run(config, output):
                 after = observe(role, host, role + "-version-after")
                 host_text = (output / (role + "-host.log")).read_text(errors="replace")
                 command_text = (output / (role + "-apply.log")).read_text(errors="replace")
+                apply_text = host_text + command_text
                 observation = {"role": role, "new": config["new"], "before": before, "after": after,
-                               "attempted": True, "apply_exit": exit_code,
-                               "host_wait_reached": "Capsule cache unchanged" in host_text or bool(re.search(r"Cleared \d+ changed cached capsule", host_text)),
+                               "new_components_semantic_sha256": artifacts["components"]["semantic_sha256"],
+                               "attempted": "Installing " in apply_text or after["binary_sha256"] != before["binary_sha256"],
+                               "apply_exit": exit_code,
+                               "cache_stage_observed": "Capsule cache unchanged" in host_text or bool(re.search(r"Cleared \d+ changed cached capsule", host_text)),
                                "operator_response_lost": "operator peer returned an empty response" in command_text}
                 write(output / (role + "-observation.json"), observation)
                 checks = compare(observation)
-                apply_text = host_text + command_text
                 stages = ["Installing ", "Downloading binary", "Binary verified", "Downloading components",
                           "Components verified", "Installed binary:", "Installed binary verified",
                           "Installed components:", "support assets", "Capsule cache", "Principal-root readiness:",
