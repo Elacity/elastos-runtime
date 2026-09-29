@@ -295,6 +295,25 @@
         messageInput.addEventListener("input", syncComposerPresentation);
       }
 
+      if (messageInput && composerForm) {
+        messageInput.addEventListener("keydown", (event) => {
+          // 229: Safari reports an IME's confirming Enter without isComposing.
+          if (event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey
+            || event.isComposing || event.keyCode === 229) {
+            return;
+          }
+          // A phone keyboard's Return adds a line; Send sends.
+          if (document.documentElement.dataset.elFormFactor === "phone") {
+            return;
+          }
+          event.preventDefault();
+          const sendButton = document.getElementById("send-button");
+          if (sendButton instanceof HTMLButtonElement && !sendButton.disabled) {
+            composerForm.requestSubmit(sendButton);
+          }
+        });
+      }
+
       if (roomAccessToggle) {
         new MutationObserver(() => {
           announceHomeChrome();
