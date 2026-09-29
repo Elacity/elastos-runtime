@@ -336,6 +336,9 @@ for name, capsule_dir in browser_capsules.items():
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
+catalog_dest = data_dir / "model-catalog.json"
+catalog_dest.write_bytes(components_src.with_name("model-catalog.json").read_bytes())
+catalog_dest.chmod(0o600)
 PY
 
 echo "[local-carrier-setup] staged local artifacts into ${ARTIFACTS_DIR}"
