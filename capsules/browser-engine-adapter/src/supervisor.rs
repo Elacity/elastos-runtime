@@ -797,16 +797,22 @@ mod private_request_tests {
             .arg(&marker)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        for _ in 0..100 {
+        for _ in 0..1000 {
             if marker.exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(marker.exists());
+        if !marker.exists() {
+            let status = child.try_wait().unwrap();
+            kill_and_reap(&mut child);
+            panic!(
+                "Python pipe fixture did not create marker within 10 s; child status: {status:?}"
+            );
+        }
 
         let result = write_private_supervisor_request(&mut child, b"private request");
 
