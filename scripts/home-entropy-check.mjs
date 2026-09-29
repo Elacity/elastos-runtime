@@ -1376,6 +1376,14 @@ const servicesCapsule = read("capsules/services/capsule.json");
 const peopleCapsule = read("capsules/people/capsule.json");
 const peopleIndex = read("capsules/people/browser/index.html");
 const peopleScript = read("capsules/people/browser/people.js");
+assert(
+  peopleScript.includes('message.type !== "elastos:runtime-events"') &&
+    peopleScript.includes('item?.kind === "people.changed"') &&
+    peopleScript.includes('status === "connecting"') &&
+    !peopleScript.includes("setTimeout(") &&
+    !peopleScript.includes("setInterval("),
+  "People must follow Discovery through Home runtime events and show Connecting, without its own polling",
+);
 const peopleStyle = read("capsules/people/browser/style.css");
 const peopleDiscoverySmoke = read("scripts/people-discovery-smoke.mjs");
 const debugGuide = read("DEBUG.md");
