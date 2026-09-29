@@ -1,8 +1,27 @@
 # Agent And Operator Process
 
 This file is the durable working contract for people and agents changing this
-repo. Product principles live in [PRINCIPLES.md](PRINCIPLES.md), current truth
-lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
+repo. Product principles live in [PRINCIPLES.md](PRINCIPLES.md). GitHub issues
+are the only place for work status, acceptance criteria and proof.
+
+## Work Tracking And Acceptance
+
+- Update the owning GitHub issue as work moves. State what changed, link the
+  PR, and record the exact candidate, checks, results and remaining work.
+- Keep one work record. Do not create briefings, plans, gists or notes files.
+  Existing `state.md`, `TASKS.md` and dated audits are historical references;
+  move useful open work to its issue instead of maintaining a parallel queue.
+- Keep seed security details, credentials and private operator data out of
+  public issues, PRs and logs. Give the public issue only a safe summary and
+  the approval or verification still needed. Retain sensitive raw evidence
+  privately under its existing access controls.
+- Every Done means includes the complete user journey. A visible feature must
+  work well from start to end, with clear controls and recovery. Keep an
+  unfinished or confusing feature hidden until that journey passes. Hiding a
+  feature does not complete its task. Source checks alone do not prove the
+  installed product works.
+- Durable product instructions, licences, test fixtures and artifact provenance
+  stay with their code or package. They do not carry a second work queue.
 
 ## User-Facing Communication
 
@@ -24,7 +43,8 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 - `main` is the stable source line.
 - `upstream/<version>-dev` branches are development integration lines. Resolve
-  the active line from `state.md` and fetched refs before choosing a base.
+  the active line from `state.md` and fetched refs against the owning GitHub
+  issue before choosing a base. The issue records the approved task base.
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
@@ -93,12 +113,13 @@ Local refs, worktrees, build outputs, proof directories, installed artifacts,
 and rollback copies are operational state with an explicit lifecycle. Creating
 them creates a cleanup obligation; "temporary" is not a lifecycle.
 
-- Keep a local, untracked operator ledger for every non-canonical branch,
+- Keep a local, untracked machine-readable inventory for every non-canonical branch,
   worktree, detached HEAD, large proof directory, installed runtime, and
   rollback set. Record its exact path or ref, commit and tree where applicable,
   owner or purpose, dirty state, creation or observation date, protection
   source, and one terminal decision: keep, review/merge, archive, or remove.
-  Never commit private paths or operator details from this ledger.
+  This lifecycle inventory is not a status or proof log. Keep private paths and
+  operator details private. References to the local ledger below mean this inventory.
 - Keep local branches only for active development or valuable work that is not
   protected by a fetched remote ref or intentional tag. Do not create
   `backup/*`, `archive/*`, timestamped safety, or sync refs for clean or already
@@ -194,6 +215,9 @@ capsules, provider config, and `components.json`.
 
 ## Review And Commit Discipline
 
+- For a PR authored by Anders that touches signing, update checks, Inbox
+  approvals, keys, sandboxing or seed publishing, request `irzhywau` as reviewer.
+  Also request the feature owner's review when the task requires it.
 - Keep commits authority-bound and reviewable: one coherent concern per commit,
   with its own verification commands.
 - Preserve commit history by default. Ask before amending, squashing, rebasing
@@ -203,15 +227,14 @@ capsules, provider config, and `components.json`.
 - Do not delete or rewrite dirty worktrees unless the user explicitly approves
   it. If duplicate trees exist, prove byte identity and clean status before
   recommending deletion.
-- Avoid volatile proof logs in durable docs. Store open work in `TASKS.md`,
-  verified current truth in `state.md`, and release history in
-  `elastos/CHANGELOG.md`.
+- Put work status and proof in the owning GitHub issue. Keep release history in
+  `elastos/CHANGELOG.md` and product instructions in the relevant documentation.
 - Keep product documentation release-neutral. Use version numbers only for
   exact release state, compatibility or migration, release notes or changelogs,
   manifests, and exact Git refs or evidence. Keep standing instructions,
   READMEs, contracts, and roadmaps independent of the current release.
   Branch heads, PR numbers, commit IDs, CI results, and installation snapshots
-  belong in `state.md` or a dated evidence record. Contract versions,
+  belong in the owning GitHub issue. Contract versions,
   dependency pins, and artifact provenance stay with the contract or artifact
   they identify.
 
@@ -254,15 +277,12 @@ and result.
 
 ## Journey Register Gate
 
-Product-behavior changes and releases are measured against the journey audit
-register [docs/audits/ElastOS-Home-Journey-Audit.xlsx](docs/audits/ElastOS-Home-Journey-Audit.xlsx),
-the standing reference for stability and correctness for any PR or release.
-Before declaring product work done or a release ready, load the
-[e2e-audit skill](.claude/skills/e2e-audit/SKILL.md) and apply its
-invariant: read the touched areas' journeys and findings, keep Pass journeys
-stable, update rows a change intentionally alters in the same PR, add rows for
-new surface, and close findings only with their recorded proof. Live verdicts
-come from installed evidence on the exact revision, never from source reading.
+Use [docs/audits/ElastOS-Home-Journey-Audit.xlsx](docs/audits/ElastOS-Home-Journey-Audit.xlsx)
+and the [e2e-audit skill](.claude/skills/e2e-audit/SKILL.md) as historical test
+input. Transfer relevant journeys and open findings to the owning GitHub issue.
+Keep accepted journeys working, add acceptance checks for changed behavior,
+and record results in that issue. Installed acceptance requires evidence from
+the exact candidate and human checks where specified.
 
 ## Public Live Deployment
 
@@ -333,8 +353,8 @@ alias, and verify non-interactive commands work. If no durable SSH is available,
 say the Mac is blocked instead of implying it was verified.
 
 Do not commit staging aliases, private key names, reverse-tunnel ports, local
-worktree paths, or operator usernames. Keep those details in local operator
-notes and pass them through explicit environment variables or CLI flags.
+worktree paths, or operator usernames. Keep those details in private operational
+configuration and pass them through explicit environment variables or CLI flags.
 
 Target proof must cite the exact source tree, target-local commit or artifact
 receipt, and verification command used for the run. Do not treat a missing
@@ -406,8 +426,8 @@ Rust target; do not re-document dependency installation here.
   the PUBLISHED release binary from `https://elastos.elacitylabs.com`. Whenever
   the published binary trails this dev tree's `install.sh` contract (newer
   subcommands, setup profiles), the installed-path proofs fail;
-  [state.md](state.md) ("Public Install Truth") records the currently published
-  version and its compatibility. Use the source `elastos serve` path above to
+  the owning GitHub issue records the accepted installed version and its
+  compatibility. Use the source `elastos serve` path above to
   run the runtime locally instead.
 - No KVM: crosvm/microVM paths (Browser VM, full-screen chat microVM) warn and
   fail closed here, so product Browser proof and microVM chat are not runnable
