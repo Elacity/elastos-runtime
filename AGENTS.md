@@ -50,8 +50,8 @@ integration branch. The current checkout and `main` are not implicit bases:
   immediately: the new branch must merge back only after (or together with)
   its parent, merging it into `upstream/XX-dev` may conflict with the parent's
   changes, and it needs a rebase if the parent moves.
-- Name branches `feat/<slug>` or `fix/<slug>`; do not push or set upstream
-  tracking until asked.
+- Name branches `feat/<slug>` or `fix/<slug>`. Pushes and upstream tracking
+  follow the Push Approval Levels below.
 
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
 
@@ -151,10 +151,31 @@ target before acting.
 - release: merge to `main`, update release notes/version/tag, and push only
   after the release gate passes.
 
-Default safety rule: code is not pushed, deployed, tagged, or merged to `main`
-unless the user explicitly asks for that action after seeing the relevant local
-state and verification result. "Looks good" after reviewing one commit is not
-permission to publish unrelated remaining commits.
+### Push Approval Levels
+
+- **No approval needed:** fast-forward pushes to the branch of the active task
+  or its existing draft PR; opening draft PRs; rerunning checks; reading logs.
+  Report what was pushed, including the remote, branch, commits and check results.
+- **Standing task-merge permission:** merge a task PR into
+  `feat/0.7.1-models` when the current candidate passes all required checks,
+  independent review is complete, all findings are resolved, and its dependencies
+  are integrated.
+  Check compatibility with the current base and report the PR, source and merge
+  commits, review and checks. Use a normal merge; history rewrite needs approval.
+- **Standing test-key permission:** create and use disposable keys and signatures
+  for a named, isolated test fixture. Keep its trust store separate from real
+  Homes and production keys. Record its owner and cleanup condition; keep private
+  keys out of source, logs and reports. This permission covers fixture keys only.
+- **Ask first:** force-push or history rewrite; merges into other bases; changes
+  to `main`; tags and releases; production signing, including release and catalogue
+  keys; changes on the seed or existing installed Homes; deleting branches;
+  other secrets and credentials.
+
+Signing runs outside CI. Fork PRs and publication jobs use GitHub-hosted runners.
+
+These levels replace blanket push-approval requirements. Verification and the
+agreed publication scope still apply. Keep unrelated work and private operational
+records outside the published candidate.
 
 Before any remote push, show:
 
@@ -173,14 +194,10 @@ capsules, provider config, and `components.json`.
 
 - Keep commits authority-bound and reviewable: one coherent concern per commit,
   with its own verification commands.
-- Do not hide corrective commits. If a reviewed commit must be repaired before
-  publish, fold the repair into the coherent slice before asking for review.
-- Preserve reviewed history by default. When a branch has a reviewed prefix and
-  an unpublished tail, reorganize only the unpublished tail unless the user
-  explicitly asks to redo the whole branch.
-- If a commit is too small, badly titled, or only fixes the immediately previous
-  unpublished commit, merge it into that unpublished slice before review instead
-  of publishing a corrective follow-up.
+- Preserve commit history by default. Ask before amending, squashing, rebasing
+  or otherwise rewriting commits, including an unpublished tail.
+- If a correction belongs with the previous unpublished commit, propose folding
+  it into that concern for review. Obtain approval before rewriting the history.
 - Do not delete or rewrite dirty worktrees unless the user explicitly approves
   it. If duplicate trees exist, prove byte identity and clean status before
   recommending deletion.
