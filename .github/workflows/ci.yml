@@ -29,8 +29,8 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Same-repository PRs use Namespace. Fork PRs, tag/main publication runs,
-  # and the explicit GitHub comparison use GitHub-hosted runners.
+  # Trusted x86-64 PRs use Namespace. ARM64, fork PRs, tag/main publication
+  # runs and the explicit GitHub comparison use GitHub-hosted runners.
   # Fast, compile-free gate: formatting and script-based source proofs.
   # Everything compile-heavy (clippy, tests, source-home) fans out in
   # parallel once this passes.
@@ -300,7 +300,7 @@ jobs:
   # build-release job is needed.
   source-home-linux:
     name: source-home-linux (${{ matrix.os }})
-    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && github.ref_type != 'tag' && inputs.linux_runner == 'namespace')) && matrix.namespace_runner || matrix.os }}
+    runs-on: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && github.ref_type != 'tag' && inputs.linux_runner == 'namespace')) && matrix.trusted_runner || matrix.os }}
     timeout-minutes: 90
     needs: source-gate
     strategy:
@@ -309,9 +309,11 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
         include:
           - os: ubuntu-24.04
-            namespace_runner: namespace-profile-elastos-ci-x86
+            trusted_runner: namespace-profile-elastos-ci-x86
+          # The Namespace ARM64 trial exceeded this job's 90-minute limit.
+          # Keep the verified GitHub runner until issue #114 has a passing trial.
           - os: ubuntu-24.04-arm
-            namespace_runner: namespace-profile-elastos-ci-arm
+            trusted_runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
