@@ -2766,7 +2766,7 @@ assert(
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
     servicesIndex.includes("services-20260921b") &&
-    servicesIndex.includes("./style.css?v=services-20260921b") &&
+    servicesIndex.includes("./style.css?v=services-20260929a") &&
     servicesIndex.includes("./services.js?v=services-20260921b") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
