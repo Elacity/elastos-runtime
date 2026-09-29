@@ -419,7 +419,8 @@ class PrepareWorkerTest(unittest.TestCase):
                 source = (SOURCE / "scripts" / script).read_text()
                 block = 'media_info = platform_info("media-tools")' + source.split(
                     'media_info = platform_info("media-tools")', 1)[1].split(
-                    "\ndef write_capsule_archive", 1)[0]
+                    "\ndef write_capsule_archive", 1)[0].split(
+                    '\nif platform == "linux-arm64":', 1)[0]
                 artifacts = self.root / script
                 artifacts.mkdir()
                 descriptor = {"release_path": "media-tools-darwin-arm64.tar.gz"}
@@ -434,6 +435,30 @@ class PrepareWorkerTest(unittest.TestCase):
                 with patch.dict(os.environ, {"MEDIA_TOOLS_ARCHIVE": str(self.root / "missing-archive")}):
                     with self.assertRaises(FileNotFoundError):
                         exec(compile(block, script, "exec"), scope)
+
+    def test_arm64_carrier_fixture_stages_the_pinned_engine_archive(self):
+        script = "local-carrier-setup-smoke.sh"
+        source = (SOURCE / "scripts" / script).read_text()
+        block = 'if platform == "linux-arm64":' + source.split(
+            'if platform == "linux-arm64":', 1)[1].split("\ndef write_capsule_archive", 1)[0]
+        artifacts = self.root / "carrier-artifacts"
+        artifacts.mkdir()
+        descriptor = json.loads((self.repo / "components.json").read_text())[
+            "external"]["llama-server"]["platforms"]["linux-arm64"]
+        scope = {"platform": "linux-arm64", "artifacts_dir": artifacts,
+                 "platform_info": lambda name: descriptor, "os": os, "pathlib": __import__("pathlib"),
+                 "shutil": shutil, "hashlib": hashlib}
+        with patch.dict(os.environ, {"ELASTOS_LLAMA_ARM64_BUNDLE": str(self.arm64_engine)}):
+            exec(compile(block, script, "exec"), scope)
+        staged = artifacts / descriptor["release_path"]
+        self.assertEqual(staged.read_bytes(), self.arm64_engine.read_bytes())
+        wrong = self.root / "wrong-arm64-engine.tar.gz"
+        data = bytearray(self.arm64_engine.read_bytes())
+        data[-1] ^= 1
+        wrong.write_bytes(data)
+        with patch.dict(os.environ, {"ELASTOS_LLAMA_ARM64_BUNDLE": str(wrong)}):
+            with self.assertRaisesRegex(SystemExit, "differs from components.json"):
+                exec(compile(block, script, "exec"), scope)
 
     def test_demo_rejects_old_input_and_overlays_selected_platform(self):
         source = (SOURCE / "scripts/home-demo-local.sh").read_text()

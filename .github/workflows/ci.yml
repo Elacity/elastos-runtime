@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -348,7 +349,21 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: fetch pinned Jetson engine archive
+        if: matrix.os == 'ubuntu-24.04-arm'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 36501810782 \
+            --repo Elacity/elastos-runtime \
+            --name llama-b10516-ubuntu22.04-arm64-cpu-36501810782-1 \
+            --dir "${RUNNER_TEMP}/llama-arm64-bundle"
+          echo 'da2b1e87fd7ffb90e540a6ded7a725994594e9bc260bf539858392d5fc96b205  llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz' \
+            | (cd "${RUNNER_TEMP}/llama-arm64-bundle" && sha256sum --check -)
       - name: local-carrier setup smoke
+        env:
+          ELASTOS_LLAMA_ARM64_BUNDLE: ${{ runner.temp }}/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
