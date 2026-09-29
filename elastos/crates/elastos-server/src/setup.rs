@@ -344,6 +344,9 @@ async fn run_with_data_dir(
     for name in &components {
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
+        if name == "llama-server" {
+            verify_arm64_model_host(&platform)?;
+        }
         let status = match effective_component_install_state_for_name(
             &manifest,
             &data_dir,
@@ -1407,6 +1410,9 @@ fn write_cache_metadata(
         })?;
         let (version, checksum, binary) =
             local_model_engine_receipt_args(component, platform_info.unwrap())?;
+        if platform == "linux-arm64" && platform_info.unwrap().release_path.is_some() {
+            probe_arm64_model_engine(&dest.join(binary))?;
+        }
         local_model_engine_receipt::write(dest, version, platform, checksum, binary)?;
         let install_path = resolve_install_path(component, platform_info)
             .ok_or_else(|| anyhow::anyhow!("local model engine install path is unavailable"))?;
@@ -1436,6 +1442,102 @@ fn write_cache_metadata(
         return Ok(());
     };
     write_platform_cache_metadata(platform_info, dest)
+}
+
+// Linux AArch64 HWCAP: FP16 scalar, FP16 SIMD and dot product.
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+const ARM64_MODEL_HWCAP: u64 = (1 << 9) | (1 << 10) | (1 << 20);
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+fn arm64_model_cpu_features_available(hwcap: u64) -> bool {
+    hwcap & ARM64_MODEL_HWCAP == ARM64_MODEL_HWCAP
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "aarch64")))]
+fn arm64_model_elf_compatible(header: &[u8]) -> bool {
+    header.len() >= 20
+        && header.starts_with(b"\x7fELF\x02\x01\x01")
+        && matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
+        && u16::from_le_bytes([header[18], header[19]]) == 183
+}
+
+pub(crate) fn verify_arm64_model_host(platform: &str) -> anyhow::Result<()> {
+    if platform != "linux-arm64" {
+        return Ok(());
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        let available = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
+        anyhow::ensure!(
+            arm64_model_cpu_features_available(available),
+            "ARM64 llama-server requires dot product and FP16 CPU features"
+        );
+    }
+    Ok(())
+}
+
+fn probe_arm64_model_engine(path: &Path) -> anyhow::Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        verify_arm64_model_host("linux-arm64")?;
+        let check_elf = |file: &Path| -> anyhow::Result<()> {
+            let mut header = [0_u8; 20];
+            fs::File::open(file)?.read_exact(&mut header)?;
+            anyhow::ensure!(
+                arm64_model_elf_compatible(&header),
+                "ARM64 model engine bundle contains an incompatible ELF: {}",
+                file.display()
+            );
+            Ok(())
+        };
+        check_elf(path)?;
+        let mut libraries = 0;
+        for entry in fs::read_dir(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("engine path has no parent"))?,
+        )? {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().contains(".so") || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            check_elf(&entry.path())?;
+            libraries += 1;
+        }
+        anyhow::ensure!(libraries > 0, "ARM64 model engine libraries are missing");
+        let mut child = Command::new(path)
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("ARM64 model engine cannot start: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::ensure!(
+                    status.success(),
+                    "ARM64 model engine or host libraries are incompatible"
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("ARM64 model engine compatibility probe timed out");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn local_model_engine_receipt_args<'a>(
@@ -1627,6 +1729,7 @@ pub(crate) fn verified_local_model_engine(
         "local model engine install path is unavailable"
     );
     local_model_engine_receipt::verify(&bundle, version, &platform, archive, binary)?;
+    verify_arm64_model_host(&platform)?;
     anyhow::ensure!(
         local_model_engine_receipt_identity(data_dir, manifest)? == identity
             && compute_sha256_checksum(&identity.path)? == identity.sha256,
@@ -3161,6 +3264,33 @@ mod tests {
     // its await without blocking the runtime; sync tests use blocking_lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[test]
+    fn arm64_model_profile_requires_dot_product_and_both_fp16_features() {
+        assert!(arm64_model_cpu_features_available(ARM64_MODEL_HWCAP));
+        assert!(arm64_model_cpu_features_available(
+            ARM64_MODEL_HWCAP | (1 << 0)
+        ));
+        for bit in [1 << 9, 1 << 10, 1 << 20] {
+            assert!(!arm64_model_cpu_features_available(
+                ARM64_MODEL_HWCAP & !bit
+            ));
+        }
+    }
+
+    #[test]
+    fn arm64_model_bundle_rejects_wrong_elf_machine_and_format() {
+        let mut header = [0_u8; 20];
+        header[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        header[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        header[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        assert!(arm64_model_elf_compatible(&header));
+        header[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        assert!(!arm64_model_elf_compatible(&header));
+        header[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        header[4] = 1;
+        assert!(!arm64_model_elf_compatible(&header));
+    }
+
     #[cfg(unix)]
     #[test]
     fn home_cli_renderer_archive_extraction_preserves_native_bytes_and_mode() {
@@ -4647,6 +4777,23 @@ mod tests {
         assert_eq!(state, InstallState::Installed);
         fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(bundle.join("unexpected.dylib"), b"unexpected\n").unwrap();
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(matches!(
+            component_install_state_for_name(
+                &manifest,
+                &data,
+                "llama-server",
+                component,
+                resolve_platform_info(component, "darwin-arm64"),
+            ),
+            InstallState::Stale(_)
+        ));
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_file(bundle.join("unexpected.dylib")).unwrap();
+        let library = bundle.join("libfixture.dylib");
+        fs::set_permissions(&library, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&library, b"changed library\n").unwrap();
+        fs::set_permissions(&library, fs::Permissions::from_mode(0o400)).unwrap();
         fs::set_permissions(&bundle, fs::Permissions::from_mode(0o500)).unwrap();
         assert!(matches!(
             component_install_state_for_name(

@@ -3,6 +3,7 @@
 
 import json
 import hashlib
+import io
 import os
 from pathlib import Path
 import re
@@ -182,6 +183,23 @@ class PrepareWorkerTest(unittest.TestCase):
             "platforms": {platform: {**self.stale_descriptor(f"media-tools-{platform}"),
                                       "extract_path": "media-tools"}
                           for platform in ("linux-amd64", "linux-arm64", "darwin-arm64")}}
+        self.arm64_engine = self.root / "llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        header[16:20] = (2).to_bytes(2, "little") + (183).to_bytes(2, "little")
+        with tarfile.open(self.arm64_engine, "w:gz") as archive:
+            for name in ("llama-server", "libllama.so"):
+                member = tarfile.TarInfo(f"llama-b10516/{name}")
+                member.mode = 0o755
+                member.size = len(header)
+                archive.addfile(member, io.BytesIO(header))
+        external["llama-server"] = {"version": "b10516", "platforms": {"linux-arm64": {
+            "release_path": self.arm64_engine.name,
+            "checksum": "sha256:" + hashlib.sha256(self.arm64_engine.read_bytes()).hexdigest(),
+            "size": self.arm64_engine.stat().st_size,
+            "extract_path": "llama-b10516",
+            "install_path": "libexec/llama.cpp/b10516/linux-arm64",
+            "binary_path": "llama-server"}}}
         (self.repo / "components.json").write_text(json.dumps({
             "schema": "elastos.components/v1", "external": external,
             "profiles": {"home": {"components": ["home", "shell", "media-tools", "media-provider"]}}}))
@@ -211,7 +229,8 @@ class PrepareWorkerTest(unittest.TestCase):
                     "MOCK_TARGET": str(self.root / "resolved-cache"),
                     "MOCK_LOG": str(self.root / "cargo.log"),
                     "MOCK_MEDIA_LOG": str(self.root / "media.log"),
-                    "MOCK_AUDIT_LOG": str(self.root / "audit.log")}
+                    "MOCK_AUDIT_LOG": str(self.root / "audit.log"),
+                    "ELASTOS_LLAMA_ARM64_BUNDLE": str(self.arm64_engine)}
         self.commit("fixture", init=True)
         (self.repo / "capsules/home/browser/secret.txt").write_text("ignored private input")
 
@@ -263,6 +282,25 @@ class PrepareWorkerTest(unittest.TestCase):
                               "helper['check_archive'](helper['Path'](sys.argv[1]), 'media-tools', "
                               "media_platform=sys.argv[2])", str(archive_path), platform)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_arm64_rejects_unpinned_engine_before_build(self):
+        wrong = self.root / "wrong-llama.tar.gz"
+        wrong.write_bytes(b"different archive")
+        env = {**self.env, "MOCK_OS": "Linux", "MOCK_ARCH": "aarch64",
+               "ELASTOS_LLAMA_ARM64_BUNDLE": str(wrong)}
+        output, result = self.prepare(env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wrong size", result.stderr)
+        self.assertFalse(output.exists())
+        self.assertFalse((self.root / "cargo.log").exists())
+        content = bytearray(self.arm64_engine.read_bytes())
+        content[-1] ^= 1
+        wrong.write_bytes(content)
+        output, result = self.prepare("prepared-checksum", env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checksum differs", result.stderr)
+        self.assertFalse(output.exists())
+        self.assertFalse((self.root / "cargo.log").exists())
 
     def test_success_uses_real_packaging_and_receipt(self):
         output, result = self.prepare()
