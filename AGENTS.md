@@ -13,6 +13,13 @@ are the only place for work status, acceptance criteria and proof.
   or reorder work; they do not create a parallel task list.
 - Close a task only when its Done means is proven, then take the next unblocked
   task in that lane. Keep blocked work open with its blocker in the issue.
+- While CI runs after a push, start or continue the next eligible issue in the
+  other lane. Keep the one-active-task limit in each lane. Read CI results when
+  they finish; do not watch or poll CI. If both lanes are blocked, record the
+  blockers in their issues.
+- Run at most one heavy local build on this Mac at a time. Workers agree which
+  issue owns that build before starting it. CI builds do not count toward this
+  local limit. Continue reviews, source work or other light checks in parallel.
 - Update the owning GitHub issue before reporting progress. State what changed,
   link the PR, and record the exact candidate, checks, results and remaining
   work. The report names the issue, PR, proof and next issue.
@@ -84,6 +91,9 @@ integration branch. The current checkout and `main` are not implicit bases:
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
 
 ## Branch Lifecycle
+
+Retire a branch or close a PR only with its owner's agreement. A green check,
+merge or duplicate finding does not replace that agreement.
 
 Before creating, deleting, merging, or publishing branches, produce a short
 branch inventory:
