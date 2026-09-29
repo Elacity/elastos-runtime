@@ -5,6 +5,7 @@
 //! main.rs because they depend on binary-only infrastructure (`IpfsBridge`,
 //! `find_installed_provider_binary`).
 
+use std::cmp::Ordering;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,80 @@ pub type TryP2pFn = Box<
         + Send
         + Sync,
 >;
+
+/// An empty installed version is the legacy first-install state. Every
+/// nonempty version must have exact SemVer syntax before it is compared.
+pub fn compare_release_versions(installed: &str, offered: &str) -> anyhow::Result<Ordering> {
+    let offered = semver::Version::parse(offered)
+        .map_err(|err| anyhow::anyhow!("Invalid signed release version '{offered}': {err}"))?;
+    if installed.is_empty() {
+        return Ok(Ordering::Greater);
+    }
+    let installed = semver::Version::parse(installed)
+        .map_err(|err| anyhow::anyhow!("Invalid installed release version '{installed}': {err}"))?;
+    Ok(offered.cmp_precedence(&installed))
+}
+
+pub fn verify_source_channel(source: &TrustedSource, signed_channel: &str) -> anyhow::Result<()> {
+    let subscribed = if source.channel.trim().is_empty() {
+        "stable"
+    } else {
+        source.channel.trim()
+    };
+    anyhow::ensure!(
+        subscribed == signed_channel,
+        "Signed release channel '{signed_channel}' differs from trusted source '{}' subscription '{subscribed}'",
+        source.name
+    );
+    Ok(())
+}
+
+/// Check metadata fetched by CID against the returned bytes. Published release
+/// envelopes fit in one IPFS block; Kubo may encode that block as raw or as a
+/// UnixFS File in dag-pb (including the CIDv0 form used by older publishers).
+pub fn verify_release_metadata_cid(cid_text: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use sha2::Digest;
+
+    let cid = cid::Cid::try_from(cid_text)
+        .map_err(|err| anyhow::anyhow!("Invalid release metadata CID {cid_text}: {err}"))?;
+    anyhow::ensure!(
+        cid.hash().code() == 0x12 && cid.hash().digest().len() == 32,
+        "Unsupported release metadata CID hash: {cid_text}"
+    );
+    let encoded = match cid.codec() {
+        0x55 => bytes.to_vec(), // raw
+        0x70 => {
+            anyhow::ensure!(
+                !bytes.is_empty() && bytes.len() <= 256 * 1024,
+                "Release metadata is outside the supported single-block UnixFS size"
+            );
+            let mut unixfs = vec![0x08, 0x02, 0x12]; // Type=File, Data
+            append_varint(&mut unixfs, bytes.len());
+            unixfs.extend_from_slice(bytes);
+            unixfs.push(0x18); // filesize
+            append_varint(&mut unixfs, bytes.len());
+            let mut node = vec![0x0a]; // PBNode.Data
+            append_varint(&mut node, unixfs.len());
+            node.extend_from_slice(&unixfs);
+            node
+        }
+        codec => anyhow::bail!("Unsupported release metadata CID codec {codec}: {cid_text}"),
+    };
+    let digest = sha2::Sha256::digest(&encoded);
+    anyhow::ensure!(
+        digest.as_slice() == cid.hash().digest(),
+        "Release metadata bytes do not match requested CID {cid_text}"
+    );
+    Ok(())
+}
+
+fn append_varint(target: &mut Vec<u8>, mut value: usize) {
+    while value >= 0x80 {
+        target.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    target.push(value as u8);
+}
 
 pub fn ordered_update_gateways(source_gateways: &[String]) -> Vec<String> {
     let mut gateways = Vec::new();
@@ -506,11 +581,15 @@ pub async fn run_update_for_data_dir(
         );
         fetch_fn(head_cid, ordered_gateways.clone()).await?
     };
+    if let Some(cid) = resolved_head_cid.as_deref() {
+        verify_release_metadata_cid(cid, &head_bytes)?;
+    }
 
     // 4. Verify signature
     let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)?;
 
     let head_version = head["payload"]["version"].as_str().unwrap_or("unknown");
+    verify_source_channel(&source, head["payload"]["channel"].as_str().unwrap_or(""))?;
     let release_cid = head["payload"]["latest_release_cid"].as_str().unwrap_or("");
     let release_object_cid = optional_release_object_cid(&head)?;
 
@@ -610,6 +689,9 @@ async fn run_upgrade_from_head(
     } else {
         fetch_fn(release_cid.to_string(), ordered_gateways.to_vec()).await?
     };
+    if working_gateway.is_none() {
+        verify_release_metadata_cid(release_cid, &release_bytes)?;
+    }
 
     // Verify the chosen envelope, then its binding to the already verified head.
     let (release, signer_did) = verify_release_envelope_against_dids(
@@ -618,6 +700,7 @@ async fn run_upgrade_from_head(
         &source.publisher_dids,
     )?;
     verify_release_binding(head, &release_bytes, &release)?;
+    verify_source_channel(source, head["payload"]["channel"].as_str().unwrap_or(""))?;
     println!("  Release signer: {}", signer_did);
 
     // 5. Compare versions
@@ -632,14 +715,23 @@ async fn run_upgrade_from_head(
         }
     );
 
-    if version == current_version && !force {
-        println!();
-        println!("  Installed release is up to date.");
-        return Ok(());
+    let version_order = compare_release_versions(current_version, version)?;
+    match version_order {
+        Ordering::Equal if !force => {
+            println!();
+            println!("  Installed release is up to date.");
+            return Ok(());
+        }
+        Ordering::Less if !force => {
+            anyhow::bail!(
+                "Signed release {version} is older than installed release {current_version}; use an explicit rollback command if intended"
+            );
+        }
+        _ => {}
     }
 
     // Show update plan
-    let is_rollback = force && version == current_version;
+    let is_rollback = force && version_order != Ordering::Greater;
     println!();
     if is_rollback {
         println!("  Rollback plan:");
@@ -944,6 +1036,67 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
 
+    fn raw_cid(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(bytes);
+        let hash = cid::multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).unwrap();
+        cid::Cid::new_v1(0x55, hash).to_string()
+    }
+
+    #[test]
+    fn release_metadata_cid_checks_raw_and_legacy_kubo_unixfs_bytes() {
+        let bytes = b"{\"payload\":{\"version\":\"0.7.1-rc.2\"}}\n";
+        let raw = "bafkreieynbxlorpjjxg22vh5sic4plqiwg3dfcul4edj74xlfi2uv37v2q";
+        let legacy = "QmZFMnZjkiTqy9VY5FDdKudvpsKtKxifk1poBrV7k4sqp8";
+        assert_eq!(raw_cid(bytes), raw);
+        verify_release_metadata_cid(raw, bytes).unwrap();
+        verify_release_metadata_cid(legacy, bytes).unwrap();
+        assert!(verify_release_metadata_cid(raw, b"wrong bytes").is_err());
+        assert!(verify_release_metadata_cid(legacy, b"wrong bytes").is_err());
+        assert!(verify_release_metadata_cid("release-a", bytes).is_err());
+    }
+
+    #[test]
+    fn release_versions_use_exact_semver_precedence() {
+        assert_eq!(
+            compare_release_versions("0.7.1-rc.1", "0.7.1-rc.10").unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_release_versions("0.7.1-rc.10", "0.7.1-rc.1").unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_release_versions("0.7.1+build.1", "0.7.1+build.2").unwrap(),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_release_versions("", "0.7.1-rc.1").unwrap(),
+            Ordering::Greater
+        );
+        for invalid in ["0.7", "0.7.01", "0.7.1-", "0.7.1-rc_1", "unknown"] {
+            assert!(compare_release_versions("0.7.0", invalid).is_err());
+            assert!(compare_release_versions(invalid, "0.7.1").is_err());
+        }
+    }
+
+    #[test]
+    fn source_subscription_must_match_signed_channel() {
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": ["did:key:fixture"], "channel": "canary"
+        }))
+        .unwrap();
+        verify_source_channel(&source, "canary").unwrap();
+        assert!(verify_source_channel(&source, "stable").is_err());
+
+        let legacy: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "legacy", "publisher_dids": ["did:key:fixture"]
+        }))
+        .unwrap();
+        verify_source_channel(&legacy, "stable").unwrap();
+        assert!(verify_source_channel(&legacy, "canary").is_err());
+    }
+
     #[test]
     fn release_platform_matches_publisher_keys_for_each_host() {
         // CPU architecture alone must not select a Linux executable on macOS.
@@ -978,11 +1131,275 @@ mod tests {
 
     fn binding_head(release: &[u8]) -> serde_json::Value {
         use sha2::Digest;
+        let digest = sha2::Sha256::digest(release);
+        let multihash = cid::multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).unwrap();
         serde_json::json!({
             "schema": "elastos.release.head/v1", "version": "0.7.1", "channel": "stable",
-            "latest_release_cid": "release-a",
-            "release_sha256": hex::encode(sha2::Sha256::digest(release))
+            "latest_release_cid": cid::Cid::new_v1(0x55, multihash).to_string(),
+            "release_sha256": hex::encode(digest)
         })
+    }
+
+    #[tokio::test]
+    async fn explicit_older_head_cid_selects_its_bytes_and_rejects_other_content() {
+        use std::sync::{Arc, Mutex};
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let did = crate::crypto::encode_signing_key_did(&key);
+        let data = tempfile::tempdir().unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(
+            serde_json::from_value(serde_json::json!({
+                "name": "fixture", "publisher_dids": [did], "channel": "stable",
+                "installed_version": "0.6.0"
+            }))
+            .unwrap(),
+        );
+        save_trusted_sources(data.path(), &sources).unwrap();
+
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": "0.7.0", "channel": "stable"
+            }),
+            "elastos.release.v1",
+        );
+        let release_cid = raw_cid(&release);
+        let mut head_payload = binding_head(&release);
+        head_payload["version"] = serde_json::json!("0.7.0");
+        let old_head = binding_envelope(head_payload, "elastos.release.head.v1");
+        let old_head_cid = raw_cid(&old_head);
+        let mut newer_payload = binding_head(&release);
+        newer_payload["version"] = serde_json::json!("0.7.1");
+        let newer_head = binding_envelope(newer_payload, "elastos.release.head.v1");
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requested = requests.clone();
+        let expected_head = old_head_cid.clone();
+        let expected_release = release_cid.clone();
+        let old_bytes = old_head.clone();
+        let release_bytes = release.clone();
+        let fetch: FetchFn = Box::new(move |cid, _| {
+            requested.lock().unwrap().push(cid.clone());
+            let bytes = if cid == expected_head {
+                old_bytes.clone()
+            } else if cid == expected_release {
+                release_bytes.clone()
+            } else {
+                panic!("unexpected CID {cid}")
+            };
+            Box::pin(async move { Ok(bytes) })
+        });
+        run_update_for_data_dir(
+            data.path(),
+            &fetch,
+            None,
+            true,
+            Some(old_head_cid.clone()),
+            true,
+            Vec::new(),
+            "0.6.0",
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![old_head_cid.clone(), release_cid]
+        );
+
+        let wrong_bytes: FetchFn = Box::new(move |_, _| {
+            let bytes = newer_head.clone();
+            Box::pin(async move { Ok(bytes) })
+        });
+        let err = run_update_for_data_dir(
+            data.path(),
+            &wrong_bytes,
+            None,
+            true,
+            Some(old_head_cid),
+            true,
+            Vec::new(),
+            "0.6.0",
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("do not match requested CID"));
+    }
+
+    #[tokio::test]
+    async fn signed_head_on_other_channel_stops_before_release_fetch() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let did = crate::crypto::encode_signing_key_did(&key);
+        let data = tempfile::tempdir().unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(
+            serde_json::from_value(serde_json::json!({
+                "name": "fixture", "publisher_dids": [did], "channel": "stable",
+                "installed_version": "0.7.0"
+            }))
+            .unwrap(),
+        );
+        save_trusted_sources(data.path(), &sources).unwrap();
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": "0.7.1", "channel": "canary"
+            }),
+            "elastos.release.v1",
+        );
+        let mut payload = binding_head(&release);
+        payload["channel"] = serde_json::json!("canary");
+        let head = binding_envelope(payload, "elastos.release.head.v1");
+        let head_cid = raw_cid(&head);
+        let requested_head_cid = head_cid.clone();
+        let fetch: FetchFn = Box::new(move |cid, _| {
+            assert_eq!(cid, requested_head_cid);
+            let bytes = head.clone();
+            Box::pin(async move { Ok(bytes) })
+        });
+        let err = run_update_for_data_dir(
+            data.path(),
+            &fetch,
+            None,
+            true,
+            Some(head_cid),
+            true,
+            Vec::new(),
+            "0.7.0",
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("differs from trusted source"));
+    }
+
+    #[tokio::test]
+    async fn older_signed_release_needs_explicit_rollback() {
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": "0.7.1-rc.1", "channel": "stable"
+            }),
+            "elastos.release.v1",
+        );
+        let mut head_payload = binding_head(&release);
+        head_payload["version"] = serde_json::json!("0.7.1-rc.1");
+        let head_bytes = binding_envelope(head_payload, "elastos.release.head.v1");
+        let did =
+            crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &did).unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [did], "channel": "stable"
+        }))
+        .unwrap();
+        let release_cid = raw_cid(&release);
+        let fetch: FetchFn = Box::new(move |_, _| {
+            let bytes = release.clone();
+            Box::pin(async move { Ok(bytes) })
+        });
+        let data = tempfile::tempdir().unwrap();
+        let result = run_upgrade_from_head(
+            &fetch,
+            &head,
+            &head_bytes,
+            None,
+            "0.7.1-rc.1",
+            &release_cid,
+            None,
+            "0.7.1-rc.10",
+            &source,
+            data.path(),
+            true,
+            &[],
+            true,
+            false,
+            "fixture",
+            None,
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("older than installed"));
+        run_upgrade_from_head(
+            &fetch,
+            &head,
+            &head_bytes,
+            None,
+            "0.7.1-rc.1",
+            &release_cid,
+            None,
+            "0.7.1-rc.10",
+            &source,
+            data.path(),
+            true,
+            &[],
+            true,
+            true,
+            "fixture",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_signed_artifact_content_stops_before_install() {
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": "0.7.1", "channel": "stable",
+                "platforms": {(detect_release_platform()): {
+                    "binary": {"cid": "binary-a", "sha256": "a".repeat(64)},
+                    "components": {"cid": "components-a", "sha256": "b".repeat(64)}
+                }}
+            }),
+            "elastos.release.v1",
+        );
+        let head_bytes = binding_envelope(binding_head(&release), "elastos.release.head.v1");
+        let did =
+            crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &did).unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [did], "channel": "stable"
+        }))
+        .unwrap();
+        let release_cid = raw_cid(&release);
+        let requested_release_cid = release_cid.clone();
+        let fetch: FetchFn = Box::new(move |cid, _| {
+            let bytes = if cid == requested_release_cid {
+                release.clone()
+            } else if cid == "binary-a" {
+                b"wrong binary".to_vec()
+            } else {
+                panic!("unexpected CID {cid}")
+            };
+            Box::pin(async move { Ok(bytes) })
+        });
+        let data = tempfile::tempdir().unwrap();
+        let err = run_upgrade_from_head(
+            &fetch,
+            &head,
+            &head_bytes,
+            None,
+            "0.7.1",
+            &release_cid,
+            None,
+            "0.7.0",
+            &source,
+            data.path(),
+            false,
+            &[],
+            true,
+            false,
+            "fixture",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Binary SHA-256 mismatch"));
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -1039,6 +1456,7 @@ mod tests {
         });
         let release = binding_envelope(payload.clone(), "elastos.release.v1");
         let head = binding_head(&release);
+        let release_cid = head["latest_release_cid"].as_str().unwrap().to_string();
         let mut different_payload = payload;
         different_payload["platforms"][detect_release_platform()]["binary"]["cid"] =
             serde_json::json!("binary-b");
@@ -1082,12 +1500,14 @@ mod tests {
                     let counter = artifact_requests.clone();
                     let metadata_counter = cid_requests.clone();
                     let bytes = release_bytes.clone();
+                    let requested_release_cid = release_cid.clone();
                     let fetch: FetchFn = Box::new(move |cid, _| {
                         let counter = counter.clone();
                         let metadata_counter = metadata_counter.clone();
                         let bytes = bytes.clone();
+                        let requested_release_cid = requested_release_cid.clone();
                         Box::pin(async move {
-                            if cid == "release-a" {
+                            if cid == requested_release_cid {
                                 metadata_counter.fetch_add(1, Ordering::SeqCst);
                                 return Ok(bytes);
                             }
@@ -1118,7 +1538,7 @@ mod tests {
                         &head_bytes,
                         None,
                         "0.7.1",
-                        "release-a",
+                        &release_cid,
                         None,
                         if mode == "same-version" {
                             "0.7.1"

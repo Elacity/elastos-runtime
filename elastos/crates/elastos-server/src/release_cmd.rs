@@ -45,29 +45,16 @@ pub async fn run_update_command(
         None
     };
 
-    let platform = update::detect_release_platform().to_string();
     let gateway_only_fetch = no_p2p;
-    let fetch_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let carrier_for_fetch = carrier_client.clone();
     let fetch_fn: update::FetchFn = Box::new(move |cid, gateways| {
         let client = carrier_for_fetch.clone();
-        let counter = fetch_counter.clone();
-        let platform = platform.clone();
-        let gateway_only_fetch = gateway_only_fetch;
         Box::pin(async move {
             let mut carrier_error: Option<anyhow::Error> = None;
 
             if !gateway_only_fetch {
                 if let Some(client) = client.as_ref() {
-                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let path = match n {
-                        0 => "release-head.json".to_string(),
-                        1 => "release.json".to_string(),
-                        2 => format!("elastos-{}", platform),
-                        3 => format!("components-{}.json", platform),
-                        _ => return Err(anyhow::anyhow!("unexpected fetch #{}", n)),
-                    };
-                    match client.fetch_file(&path).await {
+                    match client.fetch_content(&cid, None).await {
                         Ok(bytes) => return Ok(bytes),
                         Err(err) => carrier_error = Some(err),
                     }

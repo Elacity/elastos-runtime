@@ -1,7 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -468,17 +467,34 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
         .filter(|value| !value.is_empty());
-    let head_bytes = client
-        .fetch_file("release-head.json")
-        .await
-        .with_context(|| {
+    let head_bytes = if let Some(cid) = head_cid.as_deref() {
+        client.fetch_content(cid, None).await.with_context(|| {
             format!(
-                "Carrier fetch of release-head.json from trusted source '{}' failed.",
+                "Carrier fetch of head CID {cid} from trusted source '{}' failed.",
                 source.name
             )
-        })?;
+        })?
+    } else {
+        // Older publishers announce a signed head without its content CID.
+        client
+            .fetch_file("release-head.json")
+            .await
+            .with_context(|| {
+                format!(
+                    "Carrier fetch of legacy release-head.json from trusted source '{}' failed.",
+                    source.name
+                )
+            })?
+    };
+    if let Some(cid) = head_cid.as_deref() {
+        crate::update::verify_release_metadata_cid(cid, &head_bytes)?;
+    }
 
     let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)?;
+    crate::update::verify_source_channel(
+        &source,
+        head["payload"]["channel"].as_str().unwrap_or(""),
+    )?;
     let latest_version = head["payload"]["version"]
         .as_str()
         .unwrap_or("unknown")
@@ -494,7 +510,17 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
         channel,
         current_version,
         latest_version: latest_version.clone(),
-        update_available: latest_version != source.installed_version,
+        update_available: match crate::update::compare_release_versions(
+            &source.installed_version,
+            &latest_version,
+        )? {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Less => anyhow::bail!(
+                "Signed release {latest_version} is older than installed release {}",
+                source.installed_version
+            ),
+        },
         discovery: "Carrier".to_string(),
         working_gateway: None,
         head_cid,
@@ -522,24 +548,10 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         })?,
     );
 
-    let platform = crate::update::detect_release_platform().to_string();
-    let fetch_counter = Arc::new(AtomicUsize::new(0));
     let carrier_for_fetch = carrier_client.clone();
-    let fetch_fn: crate::update::FetchFn = Box::new(move |_cid, _gateways| {
+    let fetch_fn: crate::update::FetchFn = Box::new(move |cid, _gateways| {
         let client = carrier_for_fetch.clone();
-        let counter = fetch_counter.clone();
-        let platform = platform.clone();
-        Box::pin(async move {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let path = match n {
-                0 => "release-head.json".to_string(),
-                1 => "release.json".to_string(),
-                2 => format!("elastos-{}", platform),
-                3 => format!("components-{}.json", platform),
-                _ => return Err(anyhow::anyhow!("unexpected operator update fetch #{}", n)),
-            };
-            client.fetch_file(&path).await
-        })
+        Box::pin(async move { client.fetch_content(&cid, None).await })
     });
 
     let try_p2p: crate::update::TryP2pFn = Box::new(|source, publisher_did| {
