@@ -961,6 +961,8 @@ button {
 :root[data-el-form-factor="phone"] .store-shell {
   height: 100dvh;
   overflow: hidden;
+  /* Shows at the pushed-aside view's rounded corners: the drawer's fill. */
+  background: var(--bg-surface);
 }
 
 :root[data-el-form-factor="phone"] .store-sidebar {
