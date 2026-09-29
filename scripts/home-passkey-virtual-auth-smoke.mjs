@@ -4024,9 +4024,11 @@ async function ensureSignedWithVirtualPasskey(page, onCreated) {
     throw skip;
   }
 
-  const secondary = page.locator("#home-unlock-secondary");
-  await secondary.waitFor({ state: "visible", timeout: 15_000 });
-  await secondary.click();
+  // The lock face offers "Create account" directly; the card's secondary
+  // action covers the neutral surface.
+  const createEntry = page.locator("#home-unlock-create:visible, #home-unlock-secondary:visible").first();
+  await createEntry.waitFor({ state: "visible", timeout: 15_000 });
+  await createEntry.click();
   state = await homeState(page);
   assert(
     state.unlockTitle === "Create guest account" && state.unlockNameVisible,
