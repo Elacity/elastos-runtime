@@ -587,7 +587,11 @@ pub(super) async fn people_discovery_update(
                     now,
                 )
                 .await?;
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -608,7 +612,11 @@ pub(super) async fn people_discovery_refresh(
         &headers,
         false,
         |service, authority, now| async move {
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -1056,6 +1064,12 @@ fn configured_people_discovery_summary(
         )
     } else if !status.enabled() {
         ("off", "Discovery is off.".to_string())
+    } else if status.connecting() {
+        (
+            "connecting",
+            "Discovery is connecting. People who are visible appear here in a few seconds."
+                .to_string(),
+        )
     } else if status.available() {
         (
             "visible",
@@ -1236,6 +1250,29 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "off");
         assert!(json.get("remote_visibility_may_remain_until").is_none());
         assert!(json.get("remote_visibility_remaining_seconds").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_reports_connecting_before_first_relay_pass() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                true,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_connecting_for_test(),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "connecting");
+        assert_eq!(
+            json["status_message"],
+            "Discovery is connecting. People who are visible appear here in a few seconds."
+        );
     }
 
     #[test]
@@ -5221,7 +5258,17 @@ async fn home_realtime_snapshot(
     .await;
     let recovery_readiness = recovery_readiness_for_context(&state.data_dir, context);
     let desktop_signature = home_desktop_events_signature(state, context).await;
-    let people_signature = home_people_realtime_signature(&home_state.people);
+    let mut people_signature = home_people_realtime_signature(&home_state.people);
+    if let (Some(service), Ok(Some(authority))) = (
+        state.collaboration_discovery_service.as_ref(),
+        contact_authority.as_ref(),
+    ) {
+        if let Ok(status) =
+            service.read_only_status(authority.store.as_ref(), &authority.profile, now_ts())
+        {
+            people_signature.push(home_discovery_realtime_signature(&status));
+        }
+    }
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
@@ -5344,6 +5391,27 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         room.local_runtime_role.as_deref().unwrap_or_default(),
         pending.join(","),
         sessions.join(",")
+    )
+}
+
+/// Discovery state that People shows. Countdown seconds stay out so the
+/// signature changes only when what a person can act on changes.
+fn home_discovery_realtime_signature(
+    status: &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+) -> String {
+    let mut visible = status
+        .visible_people()
+        .iter()
+        .map(|person| person.advertisement_id())
+        .collect::<Vec<_>>();
+    visible.sort_unstable();
+    format!(
+        "discovery:{}:{}:{}:{}:{}",
+        status.enabled(),
+        status.connecting(),
+        status.available(),
+        status.incoming_requests().len(),
+        visible.join(",")
     )
 }
 
