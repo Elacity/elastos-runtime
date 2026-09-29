@@ -11,8 +11,10 @@ are the only place for work status, acceptance criteria and proof.
   at most one task issue In progress per lane. Parent issues group the lane;
   they do not authorize a second active task. User messages approve, redirect
   or reorder work; they do not create a parallel task list.
-- Close a task only when its Done means is proven, then take the next unblocked
-  task in that lane. Keep blocked work open with its blocker in the issue.
+- Close a task only when its Done means is proven and its PR has the required
+  reviews and is merged. Until then, keep verified work open in QA / Review.
+  Take the next unblocked task in that lane; starting it does not complete its
+  predecessor. Keep blocked work open with its blocker in the issue.
 - While CI runs after a push, start or continue the next eligible issue in the
   other lane. Keep the one-active-task limit in each lane. Read CI results when
   they finish; do not watch or poll CI. If both lanes are blocked, record the
@@ -73,8 +75,18 @@ are the only place for work status, acceptance criteria and proof.
 
 ## Creating Work Branches
 
-New feature or bugfix branches start from a user-selected `upstream/XX-dev`
-integration branch. The current checkout and `main` are not implicit bases:
+Every 0.7.1 task branch uses [feat/0.7.1-models](https://github.com/Elacity/elastos-runtime/tree/feat/0.7.1-models) as its base and PR target unless
+the owning issue specifies another base. This is standing approval; do not ask
+for each task. Fetch the current base before branching and record it in the issue.
+Tasks that use this default base depend on the models branch and merge back into
+it. Exceptions follow the base and target recorded in their issue. If the base
+moves, check compatibility before merging; history rewrite still needs approval.
+This standing approval takes precedence over the branching skill's per-task
+base question for 0.7.1.
+
+For other work without an approved issue base, use a user-selected
+`upstream/XX-dev` integration branch. The current checkout and `main` are not
+implicit bases:
 
 - Run `git fetch origin --prune`, then list `upstream/*-dev` lines and active
   `feat/*`/`fix/*` branches before proposing bases.
@@ -202,8 +214,8 @@ target before acting.
   and target branch explicitly approved by the user for that task.
   Check that approval before merging. A change to the approved target requires
   explicit user approval. The current candidate must pass all required checks,
-  independent review must be complete, all findings must be resolved, and its
-  dependencies must be integrated.
+  independent review must be complete, required human reviews must approve the
+  candidate, all findings must be resolved, and its dependencies must be integrated.
   Check compatibility with the current base and report the PR, source and merge
   commits, review and checks. Use a normal merge; history rewrite needs approval.
 - **Standing test-key permission:** create and use disposable keys and signatures
@@ -236,8 +248,9 @@ capsules, provider config, and `components.json`.
 
 ## Review And Commit Discipline
 
-- Keep review requests off draft PRs. Request review only after a PR leaves
-  draft. When it is ready, tell Anders who must review it; Anders contacts them.
+- Keep review requests off draft PRs. When a PR leaves draft, request the
+  required reviewers on GitHub yourself and name them in the report. Keep an
+  existing request instead of sending a duplicate.
 - For a PR authored by Anders that touches signing, update checks, Inbox
   approvals, keys, sandboxing or seed publishing, name `irzhywau` as a required
   human reviewer. Also name the feature owner when the task requires that review.
