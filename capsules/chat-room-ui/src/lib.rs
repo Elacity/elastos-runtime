@@ -2888,7 +2888,7 @@ impl App {
             direct_mode || !controls.show_conversation_join,
         )?;
         self.conversation_join_submit
-            .set_disabled(!controls.enable_gateway_controls);
+            .set_disabled(!controls.show_conversation_join);
         let invite_url = state.join_invite_url.as_deref().unwrap_or_default();
         self.conversation_invite_output.set_value(invite_url);
         set_hidden(
@@ -4389,18 +4389,21 @@ mod tests {
         assert!(shell_isolated.enable_text_send);
         assert!(shell_isolated.show_attach);
         assert!(shell_isolated.enable_attach);
-        assert!(!shell_isolated.show_browser_requests);
-        assert!(!shell_isolated.show_room_access_toggle);
-        assert!(!shell_isolated.show_room_access);
+        assert!(shell_isolated.show_browser_requests);
+        assert!(shell_isolated.show_room_access_toggle);
+        assert!(shell_isolated.show_room_access);
         assert!(!shell_isolated.show_conversation_join);
-        assert!(!shell_isolated.enable_gateway_controls);
+        assert!(shell_isolated.enable_gateway_controls);
+
+        let shell_isolated_unjoined = chat_control_policy(true, false, true, false, true, true);
+        assert!(shell_isolated_unjoined.show_conversation_join);
 
         let gateway_isolated = chat_control_policy(true, false, false, true, true, true);
-        assert!(gateway_isolated.show_browser_requests);
-        assert!(gateway_isolated.show_room_access_toggle);
-        assert!(gateway_isolated.show_room_access);
+        assert!(!gateway_isolated.show_browser_requests);
+        assert!(!gateway_isolated.show_room_access_toggle);
+        assert!(!gateway_isolated.show_room_access);
         assert!(!gateway_isolated.show_conversation_join);
-        assert!(gateway_isolated.enable_gateway_controls);
+        assert!(!gateway_isolated.enable_gateway_controls);
     }
 
     #[test]
@@ -4418,10 +4421,10 @@ mod tests {
         assert!(!configured.show_conversation_join);
 
         let unconfigured_gateway = chat_control_policy(true, false, false, false, false, false);
-        assert!(unconfigured_gateway.show_conversation_join);
+        assert!(!unconfigured_gateway.show_conversation_join);
 
         let unconfigured_shell = chat_control_policy(true, false, true, false, false, false);
-        assert!(!unconfigured_shell.show_conversation_join);
+        assert!(unconfigured_shell.show_conversation_join);
     }
 
     #[test]
@@ -4868,16 +4871,16 @@ fn chat_control_policy(
     show_access_controls: bool,
     has_pending_requests: bool,
 ) -> ChatControlPolicy {
-    let gateway_surface = room_mode_known && !shell_mode && !configured;
+    let home_access_surface = room_mode_known && shell_mode && !configured;
     ChatControlPolicy {
         enable_text_send: session_active,
         show_attach: room_mode_known && !configured,
         enable_attach: room_mode_known && !configured && session_active,
-        show_browser_requests: gateway_surface && has_pending_requests,
-        show_room_access_toggle: gateway_surface && session_active,
-        show_room_access: gateway_surface && session_active && show_access_controls,
-        show_conversation_join: gateway_surface && !session_active,
-        enable_gateway_controls: gateway_surface && session_active,
+        show_browser_requests: home_access_surface && has_pending_requests,
+        show_room_access_toggle: home_access_surface && session_active,
+        show_room_access: home_access_surface && session_active && show_access_controls,
+        show_conversation_join: home_access_surface && !session_active,
+        enable_gateway_controls: home_access_surface && session_active,
     }
 }
 
