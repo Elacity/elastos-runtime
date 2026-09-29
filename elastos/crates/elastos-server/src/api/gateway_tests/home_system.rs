@@ -4122,6 +4122,18 @@ fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &st
     );
 }
 
+fn assert_recovery_setup_required_projection(payload: &Value, reason: &str, path: &str) {
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": "setup_required",
+            "reason": reason,
+        }),
+        "{path}"
+    );
+}
+
 #[tokio::test]
 async fn existing_profile_setup_protects_root_without_claiming_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -4256,7 +4268,11 @@ async fn existing_profile_setup_protects_root_without_claiming_recovery() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
-    assert_recovery_readiness_projection(&payload, "setup_required", "profile without backup");
+    assert_recovery_setup_required_projection(
+        &payload,
+        "recovery_kit_missing",
+        "profile without backup",
+    );
     assert_eq!(
         payload["discovery"]["status"], "unconfigured",
         "Profile creation does not opt into discovery"
@@ -4285,7 +4301,7 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     ] {
         let (status, payload) = home_test_get_json(&app, path, token, origin).await;
         assert_eq!(status, StatusCode::OK, "{path}");
-        assert_recovery_readiness_projection(&payload, "setup_required", path);
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_missing", path);
     }
     assert_eq!(file_snapshot(dir.path()), before_summary);
 
@@ -4321,6 +4337,24 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["profile"]["display_name"], "Owner");
     assert_eq!(payload["profile_readiness"]["status"], "ready");
+
+    // A verified kit that predates the Profile is outdated, not missing.
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_outdated", path);
+    }
 }
 
 #[tokio::test]

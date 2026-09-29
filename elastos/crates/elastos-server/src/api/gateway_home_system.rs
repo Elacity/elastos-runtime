@@ -5671,15 +5671,18 @@ pub(super) fn recovery_readiness_for_context(
         &home_browser_localhost_root(context),
     ) {
         Ok(recovery) => {
+            let kit_outdated = recovery
+                .required_actions
+                .iter()
+                .any(|action| action == "download_recovery_kit_with_profile");
             if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
-                && !recovery
-                    .required_actions
-                    .iter()
-                    .any(|action| action == "download_recovery_kit_with_profile")
+                && !kit_outdated
             {
                 RecoveryReadinessSummary::ready()
+            } else if recovery.recovery_configured {
+                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_OUTDATED)
             } else {
-                RecoveryReadinessSummary::setup_required()
+                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_MISSING)
             }
         }
         Err(_) => RecoveryReadinessSummary::unavailable(),
@@ -7992,7 +7995,9 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             runtime_signature: String::new(),
-            recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            recovery_readiness: RecoveryReadinessSummary::setup_required(
+                RECOVERY_READINESS_REASON_KIT_MISSING,
+            ),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),

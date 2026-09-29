@@ -78,7 +78,16 @@ impl ProfileReadinessSummary {
 pub struct RecoveryReadinessSummary {
     schema: &'static str,
     status: &'static str,
+    /// Why setup is still required, so Home can greet a new account
+    /// differently from one whose Recovery Kit predates its Profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
+
+/// Recovery setup is required because no Recovery Kit was ever verified.
+pub const RECOVERY_READINESS_REASON_KIT_MISSING: &str = "recovery_kit_missing";
+/// Recovery setup is required because the verified kit does not cover the Profile.
+pub const RECOVERY_READINESS_REASON_KIT_OUTDATED: &str = "recovery_kit_outdated";
 
 impl RecoveryReadinessSummary {
     const SCHEMA: &'static str = "elastos.recovery.readiness/v1";
@@ -87,13 +96,15 @@ impl RecoveryReadinessSummary {
         Self {
             schema: Self::SCHEMA,
             status: "ready",
+            reason: None,
         }
     }
 
-    fn setup_required() -> Self {
+    fn setup_required(reason: &'static str) -> Self {
         Self {
             schema: Self::SCHEMA,
             status: "setup_required",
+            reason: Some(reason),
         }
     }
 
@@ -101,6 +112,7 @@ impl RecoveryReadinessSummary {
         Self {
             schema: Self::SCHEMA,
             status: "unavailable",
+            reason: None,
         }
     }
 }
