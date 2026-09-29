@@ -6237,10 +6237,20 @@ body.assistant-space-active #inbox-rail {
     touch-action: none;
   }
 
+  /* One opaque fill in every chrome mode: the desktop head and
+     --panel-strong are translucent and show the Home screen through. The
+     !important pair answers the desktop unified-sidebar rules, which are
+     !important. */
+  .window .window-head,
+  .window.window-chrome-unified-sidebar .window-head,
+  .window.window-chrome-unified-toolbar .window-head {
+    background: linear-gradient(var(--panel-strong), var(--panel-strong)) var(--frame-fill) !important;
+    box-shadow: inset 0 -1px 0 var(--hairline) !important;
+  }
+
   /* Unified modes float the head over the capsule's safe-top on the desktop;
      on a phone the capsule's main column starts at the very top, so the head
-     goes in flow here too and takes the sidebar's fill. The !important pair
-     answers the desktop unified-sidebar rules, which are !important. */
+     goes in flow here too. */
   .window.window-chrome-unified-sidebar .window-head,
   .window.window-chrome-unified-toolbar .window-head {
     position: relative;
@@ -6250,8 +6260,6 @@ body.assistant-space-active #inbox-rail {
     padding: 0;
     align-items: center;
     border-radius: 0;
-    background-color: var(--panel-strong) !important;
-    box-shadow: inset 0 -1px 0 var(--hairline) !important;
   }
 
   .window .window-body,
