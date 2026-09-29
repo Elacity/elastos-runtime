@@ -678,6 +678,42 @@ def rollback_size(root):
     return total
 
 
+def upgrade_rollback_receipt(root, log_path):
+    if os.path.lexists(root):
+        return rollback_receipt(root, rollback_size(root))
+
+    # Runtime omits the backup only for this exact empty-upgrade receipt.
+    def unique_object(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError
+        return value
+
+    expected = {
+        "schema": "elastos.principal-root.upgrade-receipt/v1",
+        "status": "already_ready",
+        "root_count": 0,
+        "object_count": 0,
+        "roots": [],
+    }
+    try:
+        if log_path.lstat().st_uid != os.geteuid():
+            raise ValueError
+        receipt = json.loads(
+            read_regular(log_path, 4096, owner_only=True), object_pairs_hook=unique_object
+        )
+        if (
+            not isinstance(receipt, dict)
+            or receipt != expected
+            or type(receipt["root_count"]) is not int
+            or type(receipt["object_count"]) is not int
+        ):
+            raise ValueError
+    except (RestartError, OSError, ValueError, TypeError, KeyError):
+        reject("rollback_missing_without_empty_upgrade")
+    return None
+
+
 def rollback_receipt(root, size):
     return {
         "relative_identity": f"backups/{root.name}",
@@ -685,6 +721,26 @@ def rollback_receipt(root, size):
         "reason": "principal_root_upgrade",
         "cleanup_condition": "remove_after_verified_restart_and_explicit_operator_reconciliation",
     }
+
+
+def upgrade_rollback_receipt(root, upgrade_log):
+    if root.exists() or root.is_symlink():
+        return rollback_receipt(root, rollback_size(root))
+    # A fresh or fully migrated installation has no objects to move, so the
+    # Runtime returns already_ready and creates no backup directory.
+    try:
+        receipt = json.loads(read_regular(upgrade_log, MAX_RESTART_RECEIPT, owner_only=True))
+    except (ValueError, UnicodeError):
+        reject("principal_root_upgrade_missing_rollback")
+    if receipt != {
+        "schema": "elastos.principal-root.upgrade-receipt/v1",
+        "status": "already_ready",
+        "root_count": 0,
+        "object_count": 0,
+        "roots": [],
+    }:
+        reject("principal_root_upgrade_missing_rollback")
+    return None
 
 
 def validate_receipt_destination(path):
@@ -983,7 +1039,7 @@ def build_context(source_root, values, home, xdg, host, port):
         "gateway": gateway,
         "addr": values.addr,
         "port": port,
-        "home_url": f"http://{probe_host}:{port}/apps/home/",
+        "home_url": f"http://{probe_host}:{port}/home/",
         "services_url": f"http://{probe_host}:{port}/apps/services/",
         "gateway_log": data_dir / "logs" / f"gateway-{stamp}-{os.getpid()}.log",
         "upgrade_log": data_dir / "logs" / f"principal-root-upgrade-{stamp}-{os.getpid()}.json",
@@ -1059,7 +1115,7 @@ def active_restart(context, wait_seconds):
             context["rollback"],
             context["upgrade_log"],
         )
-        rollback = rollback_receipt(context["rollback"], rollback_size(context["rollback"]))
+        rollback = upgrade_rollback_receipt(context["rollback"], context["upgrade_log"])
         pid, identity = start_gateway(
             gateway,
             addr,

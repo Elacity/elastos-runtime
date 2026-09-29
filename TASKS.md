@@ -10,117 +10,426 @@ Guiding-star constraints live in [PRINCIPLES.md](PRINCIPLES.md).
 
 Do not add new product surface area until the `Now` section is materially tighter.
 
+## Browser maturity workstream
+
+The Browser work requested on 2026-09-07 has one acceptance contract:
+[Browser maturity goals](docs/BROWSER_ACCEPTANCE.md). The delivery queue below
+applies within this workstream; existing release work retains its own scope.
+People and agents use the same Browser authority and lifecycle. Runtime owns
+device compatibility and independent local or remote placement of Engine and
+Exit. These checkboxes are the canonical status; the linked document gives
+instructions, dependencies, and measurable acceptance criteria.
+
+Initial analysis source:
+[`8ac18bec65ca650615be879f7ab3f66799d9fc53`](https://github.com/Elacity/elastos-runtime/tree/8ac18bec65ca650615be879f7ab3f66799d9fc53).
+Revalidate those findings against the implementation base before each repair.
+
+### Historical delivery queue and 24-hour checkpoint plan
+
+This dated queue preserves the original scope and allocations. The Now section
+owns current execution and resource assignments; these historical Active labels
+do not grant a present lease.
+
+Execution revision: 2026-09-08. The user requests the full Browser outcome by
+2026-09-09, approximately 13:34 UTC, 24 hours after the deadline instruction.
+B01-B16 remain the acceptance baseline. Their broad checkboxes track full
+qualification; the delivery slices below drive current work. B01 stays open for
+its support matrix while its accepted contract unblocks dependent work.
+
+The task Mac passes the requested Home-to-close journey, including decoded
+audio, reload and separately authorized native operator actions. Runs 92/93
+add independent acceptance on the current installed artifact set, including
+bounded actual Camofox and Playwright operation. Current evidence and artifact
+identity are in [state.md](state.md#browser-contract-and-device-qualification).
+Run 96 also completes ordinary browsing through the Linux consumer/Exit and
+Mac Engine, then confirms all 13 close effects. Its viewer reload fails the
+five-second recovery gate. This advances the remote contract milestone while
+the integrated remote journey remains failed.
+The initrd-only RNG activation removes an observed five-second bootstrap delay;
+current launcher samples range from about 9 to 11 seconds. A decoded-audio
+repeat fails with long silence, while a later controlled interruption passes
+audio/video/input recovery. That audio failure remains unexplained. Fresh ordinary installation,
+remote placements, complete operator use and release qualification need proof.
+Sash's reported failure on the published source remains unverified.
+
+| Delivery slice / acceptance mapping | Status and owner | Observable exit requirement |
+| --- | --- | --- |
+| B02.install: install and use Browser on a Mac; B01/B02/B03/B05/B06/B07/B11/B15 | Active; coordinator owns the Mac, installed artifacts and integration | An independently provisioned installation acquires one compatible artifact set and opens Browser through Home. Navigation, decoded video, audio, typing, scrolling, reload, interruption and close pass. Startup/input meet measured budgets, failures name the responsible stage, and a stalled launch leaves another admitted session responsive. |
+| B04.operator: a human and an authorized agent operate the same page; B04/B12/B13/B14 | Active; delegated owner implements operator approval and actions | Actual Engine-page inspection, actions and waits work through Runtime authority. Human/agent handoff retains page, profile and service identity. Native, Playwright and declared Camofox/Camoufox paths pass the shared workflow; stale references and revoked writers are rejected. Profile, files, approvals and accessibility keep their own acceptance cases. |
+| B10.placement: Engine and Exit move independently; B08/B09/B10/B14 | Active on the admitted Mac Engine and Linux consumer/Exit; coordinator owns target execution | The same capsule completes the same journey in A/A/A, A/B/A, A/A/B, A/B/B and A/B/C. Product service controls select approved peers; destination/DNS evidence identifies Exit. Physical LAN, supported WAN and relay-required cases prove media, recovery, revocation and cleanup. |
+| B16.qualification: sustained daily use on each claimed role; B01-B16 | Planned; coordinator assembles candidate, independent reviewer checks evidence, humans perform UX acceptance | Exact candidate artifacts pass the original device, media, recovery, concurrency, profile, wallet, authority, installation/update and operator gates. Include 100 lifecycle cycles, 100 cold and 100 warm launches, 30-minute A/V interaction, eight-hour mixed use, manual UX and the objective audit. A second maintainer repeats installation and use. |
+
+These delivery slices run through accepted contract outputs, rather than waiting
+for each preceding Bxx checkbox to close. Every acceptance ID retains its full
+instructions in `BROWSER_ACCEPTANCE.md`; grouping changes delivery order only.
+In particular, B12 profiles, B13 daily workflows/accessibility/Wallet, B14 leases
+and authority, and B15 update/repair need implementation and behavioral evidence
+alongside the local, operator and remote journeys.
+
+### Resume queue after the requested pause
+
+Work stopped at the user's request on 2026-09-09 for a usage-reset handover.
+The local branch and frozen source edits are preserved. The final private
+handover identifies exact artifact receipts, process ownership, patches and
+commands. A fresh session first reconciles those receipts with actual state.
+Source acceptance, installed journey acceptance and full qualification remain
+separate results. B01-B16 acceptance criteria and checkboxes below are unchanged.
+
+1. **B06/B08 remote reload:** review the frozen viewer scheduling and observation
+   patches, then install only the accepted UI change and repeat the same A/B/A
+   journey. Keep the current Runtime/image/helper set for attribution. The next
+   evidence must show timely display attachment, fresh decoded frames, retained
+   page/profile/services, input and all 13 close effects. Keep run 96 failed.
+2. **B02/B03/B11 Home and responsiveness:** install the reviewed `de0a299e`
+   Runtime candidate and repeat Home timing on the same principal, then the
+   canonical Browser journey. Measure an optimized candidate before release
+   performance claims. Diagnose idle CPU and intermittent audio with matched
+   producer/receiver evidence. Preserve normal fresh sign-in qualification.
+3. **B12/B13 state and daily operations:** install matched host/guest profile
+   protection `52238f2f`; run a new write/close/read pair for cookies, local
+   storage and committed IndexedDB. Preserve failed write 94 and stopped read 95.
+   Prove the reviewed 64 KiB Library upload and changed-byte rejection. Implement
+   Linux profile attachment, protected checkpoints/approved transfer, crash
+   recovery and ephemeral deletion. Downloads, large-file progress/cancel,
+   Wallet consent/return semantics and human accessibility remain open.
+4. **B04/B07/B08/B09/B10/B14 independent source and target work:** extend the
+   bounded installed operator surface to the complete shared workflow; qualify
+   Playwright, Camofox and declared Camoufox paths. Prove two-session progress
+   under a stalled operation. Complete A/A/A, A/B/A, A/A/B, A/B/B and A/B/C with
+   real approved peers, controlled destination/DNS evidence, recovery and
+   revocation. Expired-service selection, pre-allocation revocation and leases
+   retain their UX and authority checks. Use one owner for the shared Mac.
+5. **B02/B15 installation and update:** execute the frozen staged-executable
+   regression red/green tests before source acceptance. Bind the actual image
+   and matching helpers to the distributable component manifest and ordinary
+   installer. Prove missing/corrupt/incompatible/interrupted acquisition,
+   component health settlement, profile migration/rollback and upstream Engine
+   security maintenance. Sash and a second maintainer need the normal install
+   journey. Publication and public deployment require their own authorization.
+6. **B01/B05/B06/B11/B16 qualification:** certify each claimed role and device
+   on one frozen compatible candidate. Run launch/cycle distributions, continuous
+   media, mixed use, manual UX and the objective audit. The runner still needs
+   valid warm conditioning, input-to-visible latency and synchronized A/V offset
+   evidence. A qualifying 100-cold campaign may also supply the 100 lifecycle
+   facts when every cleanup requirement is retained. Idle periods in mixed use
+   do not count toward uninterrupted 30-minute A/V.
+   Reconcile the objective audit's older provider-documentation predicates with
+   the current Runtime contract while preserving real media and manual UX gates.
+
+The planned soak start was missed and none of the required full campaigns has
+started. The original deadline remains recorded below as history; the next
+session must establish a feasible execution schedule from remaining work.
+The user has not waived any acceptance requirement.
+
+### Time and resource control
+
+| Checkpoint from deadline instruction | Required evidence or decision |
+| --- | --- |
+| First 2 hours | Attempt a minimal fresh-install, operator and placement journey wherever the required target is available. For each of the five placements and each target role, record the first failing stage or the missing resource and owner. Check audio early. Establish target access and human-review availability before assigning qualification time. |
+| By hour 8 | Review measured local usability and integrated operator/remote progress. Report any unimplemented contract or unavailable device that threatens the deadline. Redirect source work to those gaps; small local performance gains do not justify leaving remote/operator behavior untested. |
+| By hour 12 | Produce the combined candidate and start the required eight-hour workloads on each independently available target. Complete shorter disruptive, lifecycle and launch-distribution tests before reserving a shared target for its soak. A target that cannot start now puts its full qualification past the planned review window. |
+| Hours 12-20 | Run sustained-use qualification on fixed candidate artifacts. Independent review and tests on other owned targets can continue. A material repair requires the affected evidence to be repeated on the repaired candidate. |
+| Hours 20-24 | Finish human and second-maintainer checks, review receipts, run the objective audit and prepare a local reviewable result with an exact pass/fail/pending matrix. Required publication and public deployment remain separate explicit actions. |
+
+This is an execution budget, not a prediction that all requirements will pass.
+Physical target access, complete operator adapters and remote service behavior
+are current schedule risks. Missing evidence retains its original acceptance
+requirement. Candidate-only platforms remain explicit in the support matrix;
+the deadline does not change a platform's support verdict.
+
+One coordinator owns the shared Mac Runtime, viewer, VM, builder, ports and
+fixture. Three source agents receive separate file scopes and can
+cross-review completed slices. Long jobs on that Mac are scheduled, because
+concurrent mutations would invalidate evidence. Reuse the verified image and
+matching artifacts; inspect standard dependency correctness before adding
+compatibility patches or changing engines.
+
+Each investigation names a hypothesis, the smallest discriminating experiment
+and the journey it restores. At each 30-minute evidence checkpoint, report
+passed, failed and pending milestones, what the user can do, the current failing
+stage and the next experiment. If a checkpoint produces no new evidence, change
+the experiment or the work order. Preserve useful receipts, run checks for the
+touched boundary and return each repair to its installed journey. Keep source
+verification separate from product acceptance and required human review.
+
+- [ ] [B01: One Browser contract and an explicit support matrix](docs/BROWSER_ACCEPTANCE.md#b01).
+- [ ] [B02: A fresh installation opens a usable Browser](docs/BROWSER_ACCEPTANCE.md#b02).
+- [ ] [B03: Every failure has an actionable diagnosis](docs/BROWSER_ACCEPTANCE.md#b03).
+- [ ] [B04: People and agents have equal Browser capabilities](docs/BROWSER_ACCEPTANCE.md#b04).
+- [ ] [B05: Input and navigation feel like a browser](docs/BROWSER_ACCEPTANCE.md#b05).
+- [ ] [B06: Sessions recover from normal interruptions](docs/BROWSER_ACCEPTANCE.md#b06).
+- [ ] [B07: One slow session cannot block the others](docs/BROWSER_ACCEPTANCE.md#b07).
+- [ ] [B08: Remote Engine is an ordinary Runtime service](docs/BROWSER_ACCEPTANCE.md#b08).
+- [ ] [B09: Exit has identical local and remote network semantics](docs/BROWSER_ACCEPTANCE.md#b09).
+- [ ] [B10: Prove independent placement of UI, Engine, and Exit](docs/BROWSER_ACCEPTANCE.md#b10).
+- [ ] [B11: Meet measured responsiveness and media budgets](docs/BROWSER_ACCEPTANCE.md#b11).
+- [ ] [B12: Profiles and user state survive safely](docs/BROWSER_ACCEPTANCE.md#b12).
+- [ ] [B13: Complete daily browser workflows and accessibility](docs/BROWSER_ACCEPTANCE.md#b13).
+- [ ] [B14: Preserve authority, privacy, and bounded revocation](docs/BROWSER_ACCEPTANCE.md#b14).
+- [ ] [B15: Updates and repair preserve a working installation](docs/BROWSER_ACCEPTANCE.md#b15).
+- [ ] [B16: Release only from repeatable product evidence](docs/BROWSER_ACCEPTANCE.md#b16).
+
 ## Now
 
-Read this section as strict priority order for this branch. Do not start a lower
-section if a higher section is incoherent, unverified, or too large to review.
+### Model delivery R14 — 0.7.1 on public Home
 
-Active priority index:
+The released code tip on `fix/0.7.1-security` is
+`a48ed2a70b9421a384848c2208e7bd6d8fe7f566` tree
+`04b3c271ab106300f4e3afd72b95ff791bdc718c`. It is the two-platform
+release-admission overlay. The built Runtime identity remains
+`42e31e30906a4a380654fa29c5d509e3e6385605` tree
+`67de379c49a54683a72964b80bd39b9025c44760`. The branch depends on
+`feat/remote-services` `8da670b5c3f8a4409a7ac5cb0d14f413ee3b105e` and must
+merge with or after it. Both code tips are published on `origin` at those
+commits.
+Public `release-head.json` reports 0.7.1, release CID
+`QmT16KDvZqA4wQc74ssFgy8JJN578Z64AAAhzYvkoE4NF8`, signed by live
+`did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj`. Platforms in
+that head are `aarch64-darwin` Runtime SHA-256
+`82593dfc71f53cffa2dd5fd8c68cbaf4a048890929bf08a85aeb83354558c29f` and
+`x86_64-linux` Runtime SHA-256
+`63b3cdb06a45523f008fc4e67b50eb795a074890b0a3e839cba2ffa5d532d830`. The
+0.1.2 head `QmVLFNQfW6V2LuXCX5xAq1jUmQrReE294Fb2NvETWgNbRk` stays rollback
+only. A fresh isolated Apple silicon Home installed from
+`https://elastos.elacitylabs.com/install.sh` with no `source add`, listed
+verified SmolLM2, completed Get of 144835448 bytes, returned two Assistant
+replies, then restored the same chat and model after Home reload and a full
+Runtime restart with unchanged weights mtime. Public Home
+https://elastos.elacitylabs.com/home/ runs that 0.7.1 Linux Runtime, keeps
+the existing account, and lists verified SmolLM2. Public Marketplace Get
+still fails at MetadataRead. Remote Qwen from the Mac is not restored.
+Protected receipts `isolated-qualification-61770.json`,
+`isolated-qualification-61780.json`, `isolated-qualification-61800.json`
+stay. Full R14, J1–J5, SA1–SA6, CA1, responsive UI, Browser, and remaining
+security stay open. Browser stays paused.
 
-- current priority: publish the tested local candidate for team review after
-  explicit push authorization, then review the combined candidate on its exact
-  revision. The candidate is not ready to merge
-- released line: `origin/main@8ac18bec` is `v0.7.0`. Keep follow-up work on
-  `origin/upstream/0.7.1-dev` until the reviewed 0.7.1 line is ready. The
-  checked publish flow still owns release stamping
-- local candidate `900d7e5c` contains the reviewed PR52 source at
-  `origin/feat/protected-content-installed-provisioning@4d688cc5`, PR54 at
-  `origin/feat/home-first-run-seed-0.7.1@2a49ea57`, and the PR55 Home Agent
-  source from `origin/feat/home-shelf-assistant-face-0.7.1@923193bb`. PR54 and
-  PR55 remain the original feature review slices
-- integrated UIUX source evidence: published
-  `origin/feat/0.7-uiux-candidate` at `8b547590`; this ref is donor evidence,
-  not installed, live, or release truth
-- current protected-content source stack is already in `origin/main` and
-  `origin/upstream/0.7.1-dev`, including the exact PR43 mint-adoption commit
-  `58ebfb23`. The audit fixes retain mixed source and installed evidence.
-  Each remaining GUI gate needs its own verdict
-- separately authorized after localhost: install the same reviewed tree on the
-  seed and the third custody node with matching stable receipts
-- all other work remains queued below
+The 0.7.1 preview uses the existing public Home at
+https://elastos.elacitylabs.com/home/. Ordinary install, Marketplace Get/Use,
+Assistant Send/reply, reload and restart remain the demo path. Reuse existing
+Qwen evidence within its recorded scope. The full R14 requirements remain below.
 
-### Integrated UIUX and protected-content proof
+1. Local owns the publisher discovery repair: health from one control coords
+   file, bootstrap from ELASTOS_SOURCE_PUBLISHER_URL or the legacy same URL.
+   Preserve human Home, admitted models and existing test Homes.
+2. Prepare matching Linux native inputs from this source candidate and verify
+   the isolated seed before updating public Home. Default release admission
+   retains all three platforms and provenance gates.
+3. Coordinator pushes the frozen `feat/remote-services` candidate to GitHub.
+   Public Home stays the preview surface.
 
-Verified integrated source and installed localhost truth is in
-[state.md](state.md). Candidate assembly, source checks, isolated installation,
-and the broad manual Brave journey are complete on `900d7e5c`. The journey
-found open first-run, Browser startup, model, collaboration, and
-protected-content prerequisites. It did not change the pending Wallet approval.
+The broader R14 queue remains required after D1: independent full Mac/seed holder
+reads and demonstrated transfer repairs; responsive preparation cancellation and
+one total attempt budget; reconstructible cloud input and full Linux consumer
+proof; seed-to-Mac Qwen inference; Qwen peer acquisition/pinning without activation.
+Reuse unchanged receipts. Browser, J2 updates, three-platform W1 and all J1–J5,
+M01–M06 and storage/capsule criteria retain their existing acceptance gates.
 
-Open gates, in order:
+The private handoff records the two-hour deadline and target ownership. A failed
+demo checkpoint triggers a specific repair or a clear blocker, not a broad audit.
 
-1. [ ] After explicit authorization, publish the tested candidate for team
-   review. Review the combined candidate on its exact revision before any
-   merge decision.
-2. [ ] After PR54 and PR55 review results or merge commits reach upstream,
-   rebuild or rebase the candidate on that updated upstream. Drop
-   patch-equivalent duplicates and retain the unique integration fixes.
-3. [ ] Rerun the source gates and isolated installed acceptance on that exact
-   rebuilt candidate.
-4. [ ] After separate authorization, install the same reviewed tree on the
-   seed and the third custody node with matching stable Runtime, component,
-   capsule metadata, provider, static audit, installation, and platform
-   restart receipts.
-5. [ ] Provision one real signed owner-only 2-of-3 custody composition across
-   three distinct operators and failure domains.
-6. [ ] Install the private multi-RPC Chain configuration and verify the exact
-   deployed Base network, contract, token, emitter, and finality authority.
-7. [ ] Prove exactly three protected-content replicas and repair after one
-    replica is lost.
-8. [ ] Fund the creator and buyer Base accounts, then run the Brave
-    two-Runtime journey: mint, list, and share on localhost; import, deny,
-    buy, open, play, and close on the seed. Prove one bound KID with allowed,
-    denied, and unbound reads, the CentralStorage binding, the exact
-    `AuthorityGateway.buyAccess` receipt and event, restart, replay, tamper
-    rejection, settlement, cleanup, and zero unresolved state.
-9. [ ] Complete the remaining installed UIUX cases for first-run recovery and
-    Profile creation, configured model execution, collaboration, Browser
-    startup diagnostics, and protected-content prerequisites. Keep the broad
-    localhost journey as completed evidence rather than repeating it.
-10. [ ] Make one atomic cutover that selects the Runtime-owned
-    protected-content path and removes the provisional `drm`, `rights`, `key`,
-    and `decrypt` authority surfaces from startup, registration, resources,
-    packaging, tests, and docs.
+### Preserved Browser closeout (paused during R14)
 
-The operator-owned model-provider configuration remains a separate installed
-Assistant proof item. Missing configuration is an honest zero-offer state.
+Notion owns the approved scope and acceptance. This is the executable order;
+older mission revisions below are history. Preserve B01-B16, the two accepted
+Browser placements, applicable SA1-SA6/CA1, and all existing numerical and human
+gates. Current source, target ownership and receipt identities belong in the
+private development-loop checkpoint. Existing ordinary persistence, media,
+recovery and scroll receipts retain their exact accepted scope.
 
-### Home audit follow-up
+1. **Reconcile and consolidate.** The Mac leftover file for generation
+   `f9cd2b88` is gone after leftover-adapter install `10bf5c6c`. Seed leftover 1
+   remains and is the next separate cleanup goal. The isolated Mac Runtime is
+   `8849b903` with the B13 Wallet slice and leftover adapter installed.
+   Offer `remote-engine-bc829519` stays approved and selectable as
+   `remote-engine-4cec4db7`. Shared image `76967c5b` stays unchanged. The
+   supervisor overlay is now an explicit `ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY=1`
+   opt-in bound to input SHA-256 hashes. Installed diagnostic overlay files are
+   removed so ordinary launches stay on the admitted capsule and image. Keep
+   the host watcher retired. Keep helper leftover pages `vz-6a0bd4a3`,
+   `vz-2d1165cc`, `vz-a35a6fc4`, and `vz-245d4f18`. The five-second audio gate
+   stays open. After seed leftover clearance, run one hash-bound supervisor
+   overlay capture with a live selected grant checked immediately before launch.
+   Local review commit `6aa7c5ae` holds the ICE-pair probe. W1 canary
+   `release.json` is signed and still lacks a catalog and components endpoint.
+   The reviewed Cloud W1 sequence is local on `feat/remote-services` as
+   `2fef812c`, `aac9f263`, and `4009015b`. HEAD is `4009015b` / tree
+   `907bbf1f`, 169 ahead of last-fetched `origin/feat/0.7.1-integration`.
+   Publication and installer tests pass locally. Cloud receives no local Homes,
+   keys, VM images, or unpublished Browser work. Preserve unresolved profiles
+   and unrelated dirty work. Attempt chronology lives in the existing
+   `u9-r8-*` receipts.
+2. **Finish Browser behavior.** After the current media stall owner is named or
+   repaired, finish remaining reload, P2 lifecycle, Browser profile
+   protection/checkpoint/transfer, authority, selected Engine/Exit, ordinary
+   files, and applicable daily-use/accessibility cases. B13 Wallet work is a
+   bounded owned slice: pin remaining source gaps with narrow regressions, then
+   repair consumer mediation and supported-account consent. The completed
+   signature status path now binds page origin and launch on the local
+   regression. Local `eth_requestAccounts` honors the selected default
+   connector when a managed account is also present, and it keeps origin
+   consent. Remote Engine launch now carries
+   `elastos.browser.wallet-consumer-mediation/v1` bound to the authenticated
+   consumer peer, page and generation. Production forwarding admits a request
+   built from that launch payload against the Engine peer plus page and
+   generation. Control-service keeps Wallet Bus on the consumer and refuses
+   Engine `home_token` fetch for that schema. The remaining gap is Carrier
+   transport of the admitted request. Keep Wallet Bus private and keep
+   approval on the consumer. Reuse the existing transaction journal.
+   Capture the actual ela.city sign-in, mint/buy and playback signing requests
+   before compatibility code. Installed local and remote connect/sign-in,
+   approve/reject/expiry, wrong principal/origin/page, and response-loss proof
+   stay required. Irzhy owns J5 metadata wiring and safe rejected-mint recovery
+   at published head `0edd56d5`; that work stays outside this Browser slice.
+   Use the shared state contract in
+   docs/STORAGE_AND_ACCESS.md and capsule composition in docs/CAPSULE_MODEL.md.
+   Browser implements its adapter and only the missing shared mechanisms it
+   needs. Builder/Home owns GBA and AI adapters after the contract/evidence
+   handoff; those remain required release work outside this Browser task.
+   Recheck the complete ordinary local and remote journeys after the affected
+   repairs pass.
+3. **Prove normal delivery.** Use the common signed capsule/catalog, Content and
+   Runtime admission path. Include all Mac Engine helpers, dependencies and image;
+   preserve Browser as the entry capsule and separate package identity from
+   service offers. W1 supplies an isolated trusted signed candidate before tests.
+   This lane holds the reviewed Cloud W1 sequence in three local commits
+   `2fef812c`, `aac9f263`, and `4009015b`. Push waits for an explicit ask.
+   Prove acquisition from each promised availability source and safe reuse,
+   interruption, tamper and compatibility handling. Run fresh Apple-silicon
+   installation with empty Runtime data and no borrowed source-home files through
+   Home, Browser media/input, reload, close and reopen. Run fresh Linux Home using
+   an approved Mac Engine through Services without a local Engine image. Finish
+   B15/J2 update and repair with protected profile preservation. Build only changed
+   components; bind every installed result to exact artifacts/configuration.
+4. **Qualify and hand over.** Freeze the compatible Browser UI, Runtime, Engine,
+   image and policy set before the original B11/B16 distributions and endurance
+   campaign. Keep manual UX, second-maintainer proof and browser-objective-audit
+   required. Changes reopen only dependent evidence and endurance runs. Prepare
+   the exact reviewed GitHub/seed candidate, readable results and remaining
+   non-Browser release dependencies. Local preparation can precede publication
+   approval; push, public deployment and final C5/C6/C7 release retain their
+   separate gates. Browser completion requires every applicable Required case,
+   not only the last successful experiment.
 
-- [ ] Diagnose and prove direct Desktop/Terminal switching on the installed
-  Home. Host-authority and startup-replay repairs have source coverage, but
-  an installed transition can still leave a blank shell. Verify the exact
-  Inbox handoff through that transition and native Terminal Chat separately.
-- [ ] Prove recovery coverage when a Profile is created after the first
-  recovery-kit download, plus clean first-run Profile and window placement.
-- [ ] Complete Browser input ordering, lifecycle and accepted media proof on
-  the target installation. Source checks cover only their stated contracts.
-- [ ] Finish document-dialog keyboard focus and the remaining app-by-app
-  acceptance matrix. Preserve failed, partial and prerequisite-blocked results
-  as separate outcomes; a visible control alone is a partial observation.
-- [ ] Inventory and test the standalone Assistant's distinct Chat, Build, and
-  Studio behavior. Keep it as an explicitly scoped optional app, or migrate
-  its useful behavior and remove it. The default product should present one
-  clear Agent surface through Home Agent.
-- [ ] Define typed Runtime operations before adding Home Agent tools, Library
-  reads, web search, Studio, Usage, or sampling controls. Each surface stays
-  behind its owning operation and its authority checks.
-- [ ] Verify completed-mint adoption after a restart on the installed path.
-  Reconcile partial settled mint records and their custody cleanup obligations;
-  the source adoption repair only rolls forward fully completed records.
+Cursor is the single implementation and test-lane owner. The current user has
+asked to resume and complete Browser. The Cloud W1 task is complete. This lane
+holds the reviewed four-file intake in local commits through `4009015b`. Continue between evidence checkpoints;
+30 minutes is a progress/replanning boundary, not an automatic stop. Each update
+names accepted behavior or a narrowed cause, the next proof and any missing
+input. A repeated identical failure needs a changed experiment before another
+long run. Review coherent source and installed milestones; reuse unaffected
+checks and receipts. When human input or a target is unavailable, state the exact
+blocker and continue independent Browser work. Maintain the 10 percent disk floor
+and preserve user Homes, keys, drafts, profiles, donor work and public services.
+
+Mission revision R3, 2026-09-12 (reconciled 2026-09-13 UTC). The
+[approved five-journey plan](https://app.notion.com/p/wauio/ElastOS-0-7-1-release-plan-five-user-journeys-from-start-to-stop-3d6b682adcca81948f78d12abcd677b9)
+owns J1-J5 acceptance and D1-D6 decisions, including the remote inference
+amendment. This section owns execution order; [state.md](state.md) owns source,
+installed and public evidence. Earlier delivery dates and allocations are history.
+
+`feat/remote-services` is the active candidate, extending the published PR64
+checkpoint with the Browser donor and remote Qwen work. Keep its reviewed history
+and the separate dirty updater slice. Public preview remains on its accepted
+September 11 artifacts. The [team report](docs/audits/2026-09-11-team-sync.md)
+and [contributor review](docs/audits/2026-09-11-contributor-review.md) retain their
+5-11 September scope; current progress is recorded in state.
+
+Use one execution owner for both installed test Homes. Resume the existing
+Browser owner for the next bounded slice; keep Model target use behind an explicit
+handoff. A reviewer checks the result at the evidence boundary. The existing hourly
+monitor reuses recent reviews and inspects new evidence. Prepare the candidate
+locally for review; publication and public cutover retain separate approvals.
+
+Historical Browser slice, 12 September 2026: close the then-live 110 page
+through Home, then prove actual viewer reload within five seconds,
+input/media and all 13 close effects on Engine
+`remote-engine-ec54fd5eab67a5c5913513a47a797fc8` with seed Exit
+`source-home-browser-exit`. That grant and page are no longer the current
+U9 target. Ordinary Automatic open still fails at profile placement when a
+valid grant exists. Select the owning Mac Engine through Settings.
+
+The independent Qwen slice is one immediate Busy replay and retry after capacity
+frees. Review the prepared helper only when that slice starts. Preserve accepted
+reply, replay and revoke evidence. Complete restart during an active run and
+second-principal denial, then join accepted U8/U9 in U10. Marketplace handoff,
+safe removal and cold Content/Carrier delivery remain required under J3; AI1-AI6
+in the approved plan separate that work from later provider and business stages.
+
+The C1-C7 sequence below retains the full release gate.
+
+| ID | Outcome | Status / owner | Required input and next proof |
+| --- | --- | --- | --- |
+| C1-site | A useful, truthful public storefront | Public preview deployed / coordinator | New storefront and canonical Home link pass public HTTPS hash and browser checks at `25966622`. Confirm team review. Installer control stays disabled until signed 0.7.1 delivery is served and verified. |
+| C1-home | Human Home entry at `/home/` | Public route verified / coordinator | Public `/home/` and legacy redirect pass; the new sign-in screen renders without console errors. Anders confirmed existing-account sign-in and saved work. Full J1 sign-out/shortcut acceptance remains open. |
+| C1-proof | The execution loop handles a real reviewed slice | Accepted for source review and monitoring / coordinator | Independent source/rendered review, nine process cases and actual recurring monitor delivery pass. Continue through installed and public proof under C1-seed. |
+| C1-seed | Seed serves the reviewed local candidate and storefront | Bounded deployment accepted / coordinator | Authorized `25966622` deployment passes integrity, 573 artifact comparisons, running/served hashes and zero-migration guards. Account/user-file hashes are preserved. Anders confirmed existing-account sign-in and saved work; the temporary stage and deployment rollback are removed. Full journeys, Browser/protected-video target configuration and signed delivery retain their gates. |
+| C1-delivery | Signed three-platform candidate installation | Functional preparation complete; final assembly after C5 freeze / delivery owner | Native inputs, bootstrap and publisher import have bounded source/artifact proof. Keep working builds for functional tests and rebuild only affected components. Complete atomic promotion, final installer stamping, platform regeneration and signed fresh installs at the final release boundary. |
+| J1 / C2 | Install, passkey, Recovery Kit, Profile and usable Home | Human passkey proof pending / Home and installer owners | Registration binding and atomic/conflict-safe identity persistence are integrated with 66 focused tests passing. Durable owner intent and Profile-inclusive recovery now pass source and UI checks. Real signed Mac installation and seed export pass. Source repairs for kit-first recovery, gateway shutdown and media-tool reuse are accepted. Both targets pass installed browser recovery/reload/retry, complete owned shutdown/restart, full Home setup/media reuse and Carrier cleanup/reuse. User-review account label, Recovery/Advanced spacing and cross-port session isolation are repaired on `1e320578`; shared-browser Mac/Linux proof passes. Next: AUTH-01 final user acceptance on the updated preserved Homes; concurrent-save and window/selection UI; W2-W5; rerun the smoke with System entry through the ElastOS menu, then complete the app matrix; full Linux/Mac staging. Publish J1 for review first under D1. |
+| J2 | Ordinary update preserves user state | Planned / delivery owner and independent reviewer | Coherent update commits on J1; Mac platform selection is repaired in 52fc231e with 11 updater tests; establish the actual stamped 0.7.0 starting updater. The published tag and local 0.7.0 tag differ; a source-home replacement cannot close first-hop proof. Candidate/interruption acceptance remains C6. |
+| J3 / C3 | Obtain a model through Content/Carrier and use it locally | Paused after checkpoint publication / coordinator; independent review | The local-model checkpoint is preserved in draft PR64. Resume its remaining work from the active candidate named in Now. Draft PR64 contains the complete combined checkpoint; the human Mac Home now has one Assistant and admitted Qwen. Bootstrap is accepted. The full corrected donor `6972e165` is merged by `b318bfda`, and Sash shelf ancestry is reconciled by `37c82d4f`. Irzhy foundation `617796a9` is merged by `dd21d8bd`; further intake is frozen for one installed Qwen journey. Mac catalog, Use/cancel/retry, exact admission, cold startup, actual reply and saved conversation pass on installed Runtime `fbf1a4b0`. Reply/draft/exact selection survive reload without implicit dispatch. Stop shows honest unknown, as allowed by Step 5; confirmed cancellation remains unproven. Owned shutdown, restart and second reply pass with identical package files, restored draft and zero received Bitswap payload. Installed model-menu empty-state/placement and workspace-preservation checks pass on `8f28b6e3`. The source-install metadata helper repair and its regression checks pass. The adapted URUX/UIUX candidate already entered through Irzhy reconstruction; the full old-tip merge recommendation is superseded. The approved one-Assistant implementation now preserves Sash’s UI in the canonical capsule, adopts all three stores into protected v2 storage, retains complete history/drafts, and preserves concurrent edits and run ownership. Source and rendered checks pass. Candidate `fa297cb5` now also passes installed one-Assistant catalog/legacy launch, real Qwen reply/save/reload and full Runtime restart with the original draft and exact model intact. The human Mac Home now has an enrolled passkey account and a verified locally cached Qwen package. Its System/Marketplace launch metadata defect is repaired by the `822c4e3d` installer guard and corrected receipts; both apps open in the actual browser. Anders confirms Assistant works. Current `3c2f9a80` repairs pending Keep intent, normal Marketplace Models category/details, theme tokens and duplicate activity/headings. Source/rendered checks and installed Mac retention readback, Qwen reply/save/reload and human model-view observation pass, with matching receipts and user data preserved. Pending preparation itself uses source/rendered proof; the installed model was reused. Linux still needs disk headroom and a reviewed startup profile. Next required work is exact Marketplace-to-Assistant handoff, safe removal and cold Carrier delivery. Broader execution and monitoring pause at this user-feedback checkpoint; full human J3 remains required. See [the convergence check](docs/audits/2026-09-11-assistant-convergence.md). URUX and Irzhy authority-cutover → follow-up work retain their Required gates and dependency order. Track every adapted or pending feature in [the preservation check](docs/audits/2026-09-11-integration-preservation.md). Preserve current recovery, sessions, media reuse and shutdown. The full merge includes storage/window source; retain their separate installed J1 acceptance. Prove normal controls and one bounded test-owned Home preparation attempt before large transfers. Complete acceptance steps 1, 2, 3 and 5 in section 6; hosted/Codex remains Optional; remote inference is Required under C3R/M01-M06, and Jetson remains Later. |
+| C3R / U8 | Approved seed user runs the Mac model | Partial installed acceptance / next execution owner | Accepted results are in state. Next: immediate Busy replay and successful retry, restart during a run without another dispatch, and denial of an unapproved second principal. AI1 adds exact package/offer/terms identity and Marketplace handoff before final M01-M06 acceptance. |
+| J4 / C4 / U9 | Browser works in the two agreed placements | Functional proof open / next execution owner | Ordinary A/B/A open 110 completed after Engine grant renew and Mac Engine selection. Close that live page, then prove actual reload within five seconds, audio/video/input and all 13 close effects. Then finish authority, recovery, state and daily-use checks; B11 performance and B16 qualification retain their gates. |
+| U10 | Qwen and Browser work together | Waiting for U8 and U9 / execution owner | One seed principal uses both on the same Mac; each keeps its own acceptance criteria. Include AI1 when its UX/identity changes enter the candidate. |
+| J5 | Protect, list, buy, play and close controlled video | Implementation open / protected-content owner | Irzhy published head `0edd56d5` on `feat/protected-content-0.7.1-followup` adds connector mint, one wallet effect, terminal approval failures and completed-mint replay. Metadata URI/royalty/Creator wiring and safe rejected-mint recovery after `EffectRaised` remain his J5 work. Browser now has a local completed-signature origin/launch bind regression, local `eth_requestAccounts` honors the selected connector when a managed account is also present, and remote Engine launch mediation plus production admit bind authenticated peer, page and generation. The remaining B13 Wallet gap is Carrier transport of that admitted request. J5 stays one Runtime, two principals, Brave and Base mainnet; funded runs still need the agreed spend limit. Installed/human acceptance remains Required. |
+| C5 | Assemble and freeze the reviewed candidate | Planned / coordinator | Reviewed required source; exact optional task list. Optional work cannot delay freeze. |
+| C6 | Accept the combined signed candidate | Planned / independent reviewer and human testers | All required journeys, shared Home/app regression, Browser qualification and first-hop update proof on matching artifacts. |
+| C7 | Publish and verify the accepted release | Planned / release owner | C6 and explicit approvals, accepted main tree/artifact identity, then public delivery checks. |
+
+User sequencing clarification: finish functional journey work before final release
+assembly. Preserve evidence for unchanged components across source updates. Build
+affected components for testing as needed; stamp the final installer and produce
+the final signed platform packages after the source freeze.
+
+Immediate preview delivery: the fixed d790 candidate passed Mac installation
+and seed export; the user also installed it. The observed shutdown,
+duplicate-download and kit-first recovery repairs now pass source checks.
+The combined automated installed checks pass. AUTH-01 needs a user-operated
+passkey on the prepared matching artifacts; preserve its pending verdict. Preserve all user test Homes. The public preview is deployed and Anders confirmed existing-account
+sign-in and saved work. Jetson is deferred
+at the user's request. Wider J2–J5 work and final three-platform assembly remain
+required for release; unchanged artifacts retain their evidence.
+
+The required shared regression includes Desktop/Terminal and Inbox handoff,
+Create/Recover, Recovery Kit coverage, Profile and window placement, document
+save conflicts and picker acknowledgements, drafts, games, Archive/Library,
+Chat and repeated System Save. One combined record serves J1 and J3. The
+[journey register](docs/audits/ElastOS-Home-Journey-Audit.xlsx) retains the
+underlying findings and their proof requirements.
+
+Existing protected-content two-Runtime, independent-operator and wider Browser
+goals keep their Later gates as set by D2/D4 and the approved plan. The 15 September
+J5 scope decision uses Base mainnet for bounded acceptance, with dedicated test
+wallets/assets and an agreed spending limit before funded runs. Controlled failure
+and replay tests remain local; Anvil repair is outside the critical path. Preserve the
+protected-content Runtime authority cutover, DocumentsSaveRequest/if_revision,
+bridge lifecycle, completed-mint adoption and cleanup obligations during
+integration. Required failures stay open until the relevant proof passes.
+
 - [ ] Turn the journey audit register into an automated pre-release gate:
-  extract Journey Matrix rows with complete verdicts into scripted checks that
-  run before every release, following the existing smoke-script pattern.
-  Journeys whose proof needs installed evidence stay manual and keep their
-  register verdicts authoritative.
-- [ ] Review Irzhy's PR15 follow-up on pinning the canonical
-  `has_access_by_content_id` selector (`0x54d42821`). Current configuration
-  validates its shape. Use a gated channel for deny proofs; a permissive
-  token-threshold configuration is a separate operator choice.
+  extract complete-verdict Journey Matrix rows into checks using the existing
+  smoke-script pattern. Installed and human journeys keep their own authoritative
+  register verdicts; source automation covers only the behavior it can observe.
+- [ ] Review the PR15 follow-up for the canonical `has_access_by_content_id`
+  selector (`0x54d42821`), whose configuration currently validates shape only.
+  Use a gated channel for deny proof; a permissive token threshold remains a
+  separate operator choice. Carry this review with J5/C6 acceptance.
 
 ## Later
 
-### Deferred source integration
+### Protected-content foundation intake
+
+- [ ] Verify the merged `617796a9` provider-host, Chain, Content availability and
+  Carrier peer-seeding source with current model lifecycle and endpoint cleanup.
+  The donor's simulation-only three-node and Anvil fork proof remains historical
+  evidence, now retained in state.md and deploy/custody-host/README.md.
+- [ ] Before installed custody-host acceptance, an explicit Carrier listener
+  either binds the requested address or reports failure; it must retain the
+  configured relay policy. Preserve the default-address compatibility behavior.
+- [ ] Follow with authority cutover `25ab205e`, then ready follow-up `06179578`
+  work. Distinct seed/third-node hardware, independent operators, funded real
+  Base and human Brave acceptance retain their existing J5 gates.
+
+### Retained source integration
 
 The August 31 source-merge scope leaves these items open. Their donor work is
 preserved; an older implementation is not evidence that it fits current contracts.
@@ -132,7 +441,7 @@ preserved; an older implementation is not evidence that it fits current contract
 - [ ] Review the retained native-component interoperability design as a
   separate proposal. COMO adoption needs its own feasibility and isolation proof.
 - [ ] Adapt advanced Assistant workflows under
-  [Deferred Sash UIUX work](#deferred-sash-uiux-work).
+  [Sash UIUX integration](#sash-uiux-integration).
 - [ ] Resolve legacy-auth migration under
   [Operator and audit hardening](#operator-and-audit-hardening), preserving
   historical audit evidence and existing identity state.
@@ -210,14 +519,14 @@ preserved; an older implementation is not evidence that it fits current contract
   offline, and the People state machine reserves `blocked` beside the removed
   states. Unblock clears the flag locally with nothing to re-announce.
 
-#### Deferred Sash UIUX work
+#### Sash UIUX integration
 
 - [ ] Add a People-owned ambient indication while opt-in discovery is active,
   without giving Home read access to People's private discovery state.
 - [ ] Define a typed, attributed capsule-rendered compact panel surface only if
   the product needs app-owned controls inside system chrome. This is future
   surface work, not a migration shortcut.
-- [ ] Add advanced Assistant workflows only after typed Runtime contracts and
+- [ ] Restore the intended Sash Assistant workflows with explicit preservation of existing features and workspaces. Establish typed Runtime contracts and
   accepted product scope exist for them: desktop attachment, knowledge/citation
   and search flows, rich media preview/open, and advanced Studio
   inputs/workflows.
@@ -665,8 +974,8 @@ installed behavior and public-live behavior require separate evidence.
 
 Current protected-content source status lives in [state.md](state.md).
 The contract is in [Protected content](docs/PROTECTED_CONTENT.md).
-The single acceptance sequence is
-[Integrated UIUX and protected-content proof](#integrated-uiux-and-protected-content-proof).
+The J5 and C6 rows in the [current execution queue](#now) own the acceptance
+sequence, with the detailed criteria in sections 8 and 9 of the approved plan.
 External cryptographic review remains open before public dKMS or production
 confidentiality claims.
 

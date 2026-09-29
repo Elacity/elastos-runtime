@@ -74,6 +74,8 @@ import {
   focusWindow,
   renewBrowserWindowAuthority,
   restoreShellSession,
+  probeHomeNavigation,
+  acceptHomeNavigation,
   showDesktopHome,
   supportsMenuNewWindow,
 } from "./shell-windows.js?v=home-20260813a";
@@ -844,6 +846,13 @@ export function setHomeGuiMenuManifest(homeToken, menus) {
     return;
   }
   setMenuManifest(resolvedId, menus);
+}
+
+export function handleHomeGuiHomeNavigation(homeToken, navigation) {
+  const entry = homeGuiWindowEntryForToken(homeToken);
+  return navigation === null
+    ? probeHomeNavigation(entry)
+    : acceptHomeNavigation(entry, navigation);
 }
 
 export function renderHomeGuiShell(summary, options = {}) {

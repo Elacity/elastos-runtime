@@ -61,7 +61,8 @@ pub(super) async fn home_agent_workspace_put(
         Err(err) if is_revision_conflict(&err) => {
             (StatusCode::CONFLICT, err.to_string()).into_response()
         }
-        Err(err) => super::home_error_response(err),
+        Err(err) => gateway_assistant_workspace_v2::migration_error_response(&err)
+            .unwrap_or_else(|| super::home_error_response(err)),
     }
 }
 
@@ -130,6 +131,8 @@ fn save_home_agent_workspace(
     context: &HomeLaunchTokenContext,
     request: HomeAgentWorkspacePutRequest,
 ) -> anyhow::Result<HomeAgentWorkspace> {
+    let _migration_guard = gateway_assistant_workspace_v2::mutation_guard()?;
+    gateway_assistant_workspace_v2::ensure_legacy_writable(data_dir, context)?;
     let _guard = home_agent_workspace_mutation_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("home agent workspace mutation lock poisoned"))?;
@@ -212,4 +215,11 @@ fn is_revision_conflict(err: &anyhow::Error) -> bool {
 fn home_agent_workspace_mutation_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub(super) fn validate_legacy_workspace_bytes(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    validate_workspace_bytes(bytes)?;
+    let workspace = serde_json::from_slice(bytes)?;
+    validate_workspace(&workspace)?;
+    Ok(serde_json::from_slice(bytes)?)
 }

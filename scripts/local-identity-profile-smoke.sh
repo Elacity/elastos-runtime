@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_MANIFEST="${ROOT}/elastos/Cargo.toml"
 DEFAULT_ELASTOS_BIN="${ROOT}/elastos/target/debug/elastos"

@@ -27,6 +27,10 @@ enum Request {
         #[serde(default)]
         config: Value,
     },
+    RefreshConfig {
+        request_id: String,
+        config: Value,
+    },
     Status {
         #[serde(default)]
         principal_id: Option<String>,
@@ -128,6 +132,22 @@ impl ExitProvider {
     fn handle(&mut self, request: Request) -> Response {
         match request {
             Request::Init { config } => self.init(config),
+            Request::RefreshConfig { request_id, config } => {
+                if !is_safe_id(&request_id) {
+                    return Response::error(
+                        "invalid_request",
+                        "config refresh requires a bounded request_id",
+                    );
+                }
+                match self.init(config) {
+                    Response::Ok { .. } => Response::ok(json!({
+                        "schema": "elastos.exit.config-ack/v1",
+                        "request_id": request_id,
+                        "state": "applied",
+                    })),
+                    error => error,
+                }
+            }
             Request::Status { principal_id } => self.status(principal_id),
             Request::DiscoverRemoteCarrierExits {
                 principal_id,
@@ -194,12 +214,28 @@ impl ExitProvider {
             Ok(config) => config,
             Err(err) => return Response::error("invalid_config", err),
         };
+        // Config refresh keeps each live stream's grant and close authority.
+        // Additions are safe; editing/removing an in-use grant waits for close.
+        for active in self.remote_active_streams.values() {
+            let previous = self
+                .remote_carrier_exits
+                .iter()
+                .find(|exit| exit.id == active.exit_id);
+            let replacement = config
+                .remote_carrier_exits
+                .iter()
+                .find(|exit| exit.id == active.exit_id);
+            if previous != replacement {
+                return Response::error(
+                    "exit_config_busy",
+                    "close live streams before changing their Exit grant",
+                );
+            }
+        }
         self.public_agent = http_agent(config.timeout_secs, false);
         self.private_agent = http_agent(config.timeout_secs, true);
         self.backends = config.backends;
         self.remote_carrier_exits = config.remote_carrier_exits;
-        self.remote_active_streams.clear();
-        self.remote_reserved_streams.clear();
         Response::ok(json!({
             "provider": "exit-provider",
             "protocol_version": "1.0",
@@ -929,7 +965,7 @@ struct PrivateTargetConfig {
     schemes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RemoteCarrierExitConfig {
     id: String,
@@ -1131,12 +1167,25 @@ enum RelayIpcKind {
 }
 
 fn parse_config(config: Value) -> Result<ExitConfig, String> {
-    let config = match config.get("extra") {
+    let mut config = match config.get("extra") {
         Some(extra) if extra.is_null() => json!({}),
         Some(extra) => extra.clone(),
         None if looks_like_bridge_provider_config(&config) => json!({}),
         None => config,
     };
+    // Services previously stamped the local relay schema on provider config.
+    // Accept that exact released mistake only for a remote-grant config; all
+    // remaining fields still pass the strict provider parser.
+    if config.get("schema").and_then(Value::as_str) == Some("elastos.browser.local-exit.config/v1")
+        && config
+            .get("remote_carrier_exits")
+            .is_some_and(Value::is_array)
+    {
+        config
+            .as_object_mut()
+            .expect("config with fields is an object")
+            .remove("schema");
+    }
     let config = serde_json::from_value::<ExitConfig>(config).map_err(|err| err.to_string())?;
     if config.timeout_secs == 0 || config.timeout_secs > 60 {
         return Err("exit-provider timeout_secs must be between 1 and 60".to_string());
@@ -1144,8 +1193,13 @@ fn parse_config(config: Value) -> Result<ExitConfig, String> {
     for backend in &config.backends {
         validate_backend(backend)?;
     }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut grants = std::collections::BTreeSet::new();
     for exit in &config.remote_carrier_exits {
         validate_remote_carrier_exit(exit)?;
+        if !ids.insert(&exit.id) || !grants.insert(&exit.grant_id) {
+            return Err("remote Carrier Exit ids and grant ids must be unique".to_string());
+        }
     }
     Ok(config)
 }
@@ -1657,6 +1711,145 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    fn services_exit_config_for_test() -> Value {
+        json!({"remote_carrier_exits":[{
+            "id":"services-bob", "grant_id":"services-grant-bob", "peer_did":"did:elastos:bob",
+            "connect_ticket":"private-ticket", "allowed_principals":["person:alice"],
+            "allowed_hosts":["*"], "allowed_schemes":["tcp","tls"], "allowed_ports":[80,443],
+            "max_active_streams":1, "max_active_streams_per_principal":1
+        }]})
+    }
+
+    #[test]
+    fn services_installed_legacy_config_parses_without_accepting_unknown_schema() {
+        let mut config = services_exit_config_for_test();
+        config["schema"] = json!("elastos.browser.local-exit.config/v1");
+        assert!(
+            parse_config(config.clone()).is_ok(),
+            "released Services config must parse"
+        );
+        config["schema"] = json!("elastos.exit.unrecognized/v1");
+        assert!(parse_config(config).is_err());
+    }
+
+    #[test]
+    fn refresh_config_preserves_live_stream_quota_and_close_owner() {
+        let mut provider = ExitProvider::new();
+        let config = services_exit_config_for_test();
+        assert_eq!(
+            serde_json::to_value(provider.init(config.clone())).unwrap()["status"],
+            "ok"
+        );
+        let opened = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:alice".into()),
+            None,
+        ))
+        .unwrap();
+        let request = serde_json::from_value::<Request>(json!({
+            "op":"refresh_config", "request_id":"refresh-1", "config":config,
+        }));
+        assert!(
+            request.is_ok(),
+            "provider must acknowledge a safe config refresh"
+        );
+        let ack = serde_json::to_value(provider.handle(request.unwrap())).unwrap();
+        assert_eq!(ack["data"]["schema"], "elastos.exit.config-ack/v1");
+        assert_eq!(ack["data"]["request_id"], "refresh-1");
+        assert_eq!(ack["data"]["state"], "applied");
+        assert_eq!(provider.remote_active_streams.len(), 1);
+        assert_eq!(provider.remote_reserved_streams["services-bob"], 1);
+        assert_eq!(
+            error_code(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:alice".into()),
+                None
+            )),
+            "exit_quota_exceeded"
+        );
+        let stream = opened["data"]["stream_id"].as_str().unwrap();
+        assert_eq!(
+            error_code(provider.close_stream(stream, Some("person:other".into()))),
+            "exit_permission_denied"
+        );
+        let closed =
+            serde_json::to_value(provider.close_stream(stream, Some("person:alice".into())))
+                .unwrap();
+        assert_eq!(closed["data"]["closed"], true);
+        assert_eq!(closed["data"]["grant_id"], "services-grant-bob");
+    }
+
+    #[test]
+    fn refresh_config_rejection_preserves_policy_and_accounting() {
+        for mutation in ["remove", "replace", "invalid", "duplicate"] {
+            let mut provider = ExitProvider::new();
+            let mut config = services_exit_config_for_test();
+            provider.init(config.clone());
+            let opened = serde_json::to_value(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:alice".into()),
+                None,
+            ))
+            .unwrap();
+            let before =
+                serde_json::to_value(provider.status(Some("person:alice".into()))).unwrap();
+            match mutation {
+                "remove" => config["remote_carrier_exits"] = json!([]),
+                "replace" => config["remote_carrier_exits"][0]["grant_id"] = json!("other-grant"),
+                "invalid" => config["timeout_secs"] = json!(0),
+                _ => {
+                    let duplicate = config["remote_carrier_exits"][0].clone();
+                    config["remote_carrier_exits"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }
+            }
+            let request = serde_json::from_value(
+                json!({"op":"refresh_config","request_id":"refresh-bad","config":config}),
+            )
+            .unwrap();
+            assert!(matches!(provider.handle(request), Response::Error { .. }));
+            assert_eq!(
+                serde_json::to_value(provider.status(Some("person:alice".into()))).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(provider.close_stream(
+                    opened["data"]["stream_id"].as_str().unwrap(),
+                    Some("person:alice".into())
+                ))
+                .unwrap()["data"]["grant_id"],
+                "services-grant-bob"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_config_adds_grant_without_resetting_existing_streams() {
+        let mut provider = ExitProvider::new();
+        let mut config = services_exit_config_for_test();
+        provider.init(config.clone());
+        provider.open_stream("tls://example.com:443", Some("person:alice".into()), None);
+        let mut addition = config["remote_carrier_exits"][0].clone();
+        addition["id"] = json!("services-carol");
+        addition["grant_id"] = json!("services-grant-carol");
+        config["remote_carrier_exits"]
+            .as_array_mut()
+            .unwrap()
+            .push(addition);
+        let request = serde_json::from_value(
+            json!({"op":"refresh_config","request_id":"refresh-add","config":config.clone()}),
+        )
+        .unwrap();
+        assert!(matches!(provider.handle(request), Response::Ok { .. }));
+        // A repeated bridge init also preserves existing reservations.
+        assert!(matches!(provider.init(config), Response::Ok { .. }));
+        assert_eq!(provider.remote_active_count("services-bob"), 1);
+        assert_eq!(provider.remote_reserved_streams["services-bob"], 1);
+        assert_eq!(provider.remote_carrier_exits.len(), 2);
     }
 
     #[test]

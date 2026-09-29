@@ -223,6 +223,14 @@ body[data-emulator-host-mode="standalone"] #screen-container {
   border-color: rgba(177, 76, 90, 0.42);
 }
 
+#btn-save-recovery:not([hidden]) {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.6rem;
+  z-index: 1;
+  padding: 0.55rem 0.7rem;
+}
+
 #drop-zone {
   position: absolute;
   inset: 0;

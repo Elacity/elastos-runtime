@@ -637,9 +637,8 @@ function snapTargetForPointer(clientX, clientY) {
   if (nearBottom && nearRight) {
     return { state: "se", bounds: snappedWindowBounds("se") };
   }
-  if (nearTop) {
-    return { state: "maximize", bounds: snappedWindowBounds("maximize") };
-  }
+  // Top edge alone is not a target: maximize is the traffic-light button's job,
+  // so dragging a window upward never locks it into a full-screen-like state.
   if (nearLeft) {
     return { state: "left", bounds: snappedWindowBounds("left") };
   }

@@ -24,6 +24,10 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
 
     let mut capsules = crate::api::capsule_inventory::list_active_capsule_manifests(data_dir)
         .into_iter()
+        // Assistant owns new launches even while a retired app tree remains.
+        .filter(|manifest| manifest.name != "home-agent")
+        // A directory or component entry cannot authenticate model content.
+        .filter(|manifest| manifest.model_content.is_none())
         .map(|manifest| {
             catalog_capsule_summary(
                 manifest,
@@ -33,6 +37,45 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
             )
         })
         .collect::<Vec<_>>();
+    let model_catalog_state = match crate::api::capsule_inventory::model_catalog_entries(data_dir) {
+        Ok(None) => "unconfigured",
+        Ok(Some(entries))
+            if entries.iter().all(|entry| {
+                !capsules
+                    .iter()
+                    .any(|capsule| capsule.name == entry.manifest.name)
+            }) =>
+        {
+            for entry in entries {
+                let mut summary = catalog_capsule_summary(
+                    entry.manifest,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                );
+                summary.state = "unprepared".into();
+                summary.installed = false;
+                summary.launchable = false;
+                summary.cid = Some(entry.cid);
+                summary.publisher_did = Some(entry.publisher_did);
+                summary.cid_state = "catalog-declared".into();
+                summary.signature_state = "catalog-signature-verified".into();
+                summary.trust_state = "publisher-verified-admission-pending".into();
+                summary.source = "signed-model-catalog".into();
+                summary.content_size_bytes = Some(entry.size_bytes);
+                summary.icon.clear();
+                summary.projection.audit_mirror.note = Some(
+                    "Catalog publisher verified; content admission and provider readiness remain pending.".into());
+                capsules.push(summary);
+            }
+            "verified"
+        }
+        Ok(Some(_)) => "unavailable",
+        Err(err) => {
+            tracing::debug!(error = %format!("{err:#}"), "model catalog unavailable");
+            "unavailable"
+        }
+    };
     capsules.sort_by(|left, right| {
         capsule_category_order(&left.category)
             .cmp(&capsule_category_order(&right.category))
@@ -69,6 +112,7 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
 
     CapsuleCatalogResponse {
         schema: CAPSULE_CATALOG_SCHEMA.to_string(),
+        model_catalog_state: model_catalog_state.to_string(),
         counts,
         capsules,
         policy: CapsuleCatalogPolicy {
@@ -154,6 +198,11 @@ fn catalog_capsule_summary(
     let component = components.get(&manifest.name);
     let name = manifest.name.clone();
     let role = manifest.role.clone();
+    let window_policy = if role == CapsuleRole::Content {
+        target.and_then(|target| target.window_policy)
+    } else {
+        manifest.window_policy
+    };
     let capsule_type = manifest.capsule_type.clone();
     let runtime_abi = manifest.runtime_abi.clone();
     let bus_contract = manifest.bus_contract.clone();
@@ -216,6 +265,10 @@ fn catalog_capsule_summary(
 
     CapsuleSummary {
         name: name.clone(),
+        model_content: manifest.model_content,
+        model_runtime: None,
+        publisher_did: None,
+        content_size_bytes: None,
         version: manifest.version,
         title: target
             .map(|target| target.title.clone())
@@ -225,6 +278,7 @@ fn catalog_capsule_summary(
             .or_else(|| manifest.description.clone())
             .unwrap_or_else(|| "Capsule metadata available through Runtime.".to_string()),
         author: manifest.author,
+        window_policy,
         role,
         capsule_type,
         runtime_abi,
@@ -607,6 +661,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_catalog_projection_keeps_same_name_local_content_unprepared() {
+        use crate::api::capsule_inventory::tests::{
+            model_catalog_fixture, write_model_catalog_fixture,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let payload = model_catalog_fixture();
+        write_model_catalog_fixture(root.path(), &payload);
+        let dir = root.path().join("capsules/model-fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("capsule.json"),
+            serde_json::to_vec(&payload["entries"][0]["capsule_manifest"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("weights.gguf"), "unverified local bytes").unwrap();
+        let mut components: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("components.json")).unwrap())
+                .unwrap();
+        components["external"]["model-fixture"] = serde_json::json!({
+            "install_path": "capsules/model-fixture", "platforms": {}
+        });
+        std::fs::write(
+            root.path().join("components.json"),
+            serde_json::to_vec(&components).unwrap(),
+        )
+        .unwrap();
+        let summary = serde_json::to_value(capsule_catalog_summary(root.path())).unwrap();
+        assert_eq!(summary["model_catalog_state"], "verified");
+        assert_eq!(summary["capsules"].as_array().unwrap().len(), 1);
+        let model = &summary["capsules"][0];
+        assert_eq!(model["state"], "unprepared");
+        assert_eq!(model["installed"], false);
+        assert_eq!(model["launchable"], false);
+        assert_eq!(model["trust_state"], "publisher-verified-admission-pending");
+        assert_eq!(
+            model["publisher_did"],
+            components["model_catalog"]["publisher_dids"][0]
+        );
+        assert_eq!(model["cid"], payload["entries"][0]["cid"]);
+        assert!(model["content_size_bytes"].as_u64().unwrap() > 0);
+        for field in ["route", "launch_target", "install_path", "release_path"] {
+            assert!(model.get(field).is_none(), "{field}");
+        }
+        assert!(!serde_json::to_string(&summary)
+            .unwrap()
+            .contains(&root.path().display().to_string()));
+    }
+
+    #[test]
+    fn model_catalog_absent_or_malformed_keeps_ordinary_installed_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("capsules/system");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("capsule.json"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../capsules/system/capsule.json"
+            )),
+        )
+        .unwrap();
+        for trust in [
+            None,
+            Some(serde_json::json!("malformed")),
+            Some(serde_json::json!({
+                "head_cid": "invalid", "publisher_dids": []
+            })),
+        ] {
+            let mut components = serde_json::json!({
+                "external": {"system": {"install_path": "capsules/system", "platforms": {}}},
+                "capsules": {}, "profiles": {}
+            });
+            let expected = if let Some(trust) = trust {
+                components["model_catalog"] = trust;
+                "unavailable"
+            } else {
+                "unconfigured"
+            };
+            std::fs::write(
+                root.path().join("components.json"),
+                serde_json::to_vec(&components).unwrap(),
+            )
+            .unwrap();
+            let summary = serde_json::to_value(capsule_catalog_summary(root.path())).unwrap();
+            assert_eq!(summary["model_catalog_state"], expected);
+            let ordinary = summary["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|capsule| capsule["name"] == "system")
+                .expect("ordinary System remains visible");
+            assert_eq!(ordinary["installed"], true);
+            assert!(ordinary.get("model_content").is_none());
+        }
+    }
+
+    #[test]
     fn capsule_title_preserves_product_names() {
         assert_eq!(capsule_title("wallet-metamask"), "MetaMask");
         assert_eq!(capsule_title("wallet-unisat"), "UniSat");
@@ -656,6 +807,7 @@ mod tests {
 #[derive(Serialize)]
 pub(in crate::api::gateway) struct CapsuleCatalogResponse {
     pub(in crate::api::gateway) schema: String,
+    pub(in crate::api::gateway) model_catalog_state: String,
     pub(in crate::api::gateway) counts: CapsuleCatalogCounts,
     pub(in crate::api::gateway) capsules: Vec<CapsuleSummary>,
     pub(in crate::api::gateway) policy: CapsuleCatalogPolicy,
@@ -688,6 +840,16 @@ pub(in crate::api::gateway) struct CapsuleCatalogPolicy {
 #[derive(Serialize)]
 pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) model_content: Option<elastos_common::ModelContentMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) model_runtime: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) publisher_did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) content_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) window_policy: Option<elastos_common::CapsuleWindowPolicy>,
     pub(in crate::api::gateway) version: String,
     pub(in crate::api::gateway) title: String,
     pub(in crate::api::gateway) description: String,

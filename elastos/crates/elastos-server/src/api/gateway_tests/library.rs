@@ -6279,6 +6279,145 @@ async fn test_runtime_custody_creator_tail_pending_or_failed_never_persists_list
 }
 
 #[tokio::test]
+async fn test_runtime_custody_creator_tail_raises_operator_approval_before_finalizing() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_content_publish_requests();
+    set_mock_runtime_listing_publish_failure(false);
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_creator_operator_unapproved();
+    let authority = passkey_authority_with_profile(dir.path(), "admin");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let runtime_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, &token);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-tail-operator-approval",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x83, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &input);
+    let mint_id = facts.mint_id;
+    let facts_for_shot =
+        |facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts| {
+            crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts {
+                content_cid: facts.content_cid.clone(),
+                mint_id: facts.mint_id,
+                content_id: facts.content_id.clone(),
+                display_name: facts.display_name.clone(),
+                availability: facts.availability.clone(),
+                receipt: facts.receipt.clone(),
+                content_security: facts.content_security.clone(),
+                listing_uri: facts.listing_uri.clone(),
+            }
+        };
+
+    // First shot: the mint transaction awaits its wallet approval.
+    let pending = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input.clone(),
+        facts_for_shot(&facts),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pending.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let mint_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+
+    // Second shot: the mint settled, the ledger reports no operator approval,
+    // so a distinct `setApprovalForAll` effect is raised and awaits approval.
+    let pending = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input.clone(),
+        facts_for_shot(&facts),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        pending.to_string(),
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement"
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    assert_ne!(approval_request_id, mint_request_id);
+    let journal = crate::protected_content_runtime::runtime_mint_journal(dir.path());
+    let creator_state = journal
+        .load(mint_id)
+        .unwrap()
+        .creator_state()
+        .cloned()
+        .unwrap();
+    let operator_approval = creator_state
+        .operator_approval()
+        .expect("operator approval effect bound in the journal");
+    assert_eq!(operator_approval.approval_request_id(), approval_request_id);
+    assert!(operator_approval != creator_state.effect().unwrap());
+    // The approval targets the operative that holds the copies (what the
+    // market gateway transfers from), never the asset ledger.
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_to()
+            .await
+            .unwrap()
+            .to_ascii_lowercase(),
+        MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase()
+    );
+    wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+
+    // Third shot: both effects settled, the listing finalizes.
+    let finalized = runtime_custody_publish_creator_tail_for_test(
+        &state,
+        &runtime_authority,
+        registry.clone(),
+        input,
+        facts,
+    )
+    .await
+    .unwrap();
+    assert!(finalized.listing_uri.is_some());
+    let creator_state = journal
+        .load(mint_id)
+        .unwrap()
+        .creator_state()
+        .cloned()
+        .unwrap();
+    assert!(creator_state.terminal().is_some());
+    assert!(creator_state.operator_approval().is_some());
+}
+
+#[tokio::test]
 async fn test_runtime_custody_creator_tail_confirmed_replay_is_exact_and_immutable() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
@@ -6992,6 +7131,154 @@ async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_st
     .unwrap()
     .unwrap();
     assert_eq!(replayed_purchase.account_id, wallet_account_id);
+}
+
+/// A purchase approved under one launch is completed by a later launch of the
+/// same principal: a re-issued Home token (new grant and session) after a
+/// Runtime restart, as the ELACITY-2298 live proof drove it. The wallet binds
+/// the validated Chain outcome to the approval's ORIGINAL authority, so the
+/// Runtime must project the outcome under the effect's persisted authority
+/// rather than the caller's; otherwise the wallet refuses it as a conflict
+/// and the purchase parks in completion_pending forever.
+#[tokio::test]
+async fn test_runtime_custody_buy_completion_projects_outcome_under_the_approval_authority() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let first_launch_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &authority.principal_id,
+        "eip155:8453",
+        &wallet_account_id,
+        10,
+    )
+    .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-relaunch",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x93, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state.clone());
+    let buy_body = json!({ "mint_id": hex::encode(facts.mint_id.as_bytes()) });
+
+    // The wallet binding a launch carries, exactly as the mock wallet derives
+    // it for the approval it stores and for the outcome it is later asked to
+    // attach.
+    let binding_for_launch = |token: &str| {
+        let launch_authority =
+            runtime_wallet_authority_for_app_token(dir.path(), LIBRARY_CAPSULE_ID, token);
+        let probe = WalletProviderRequestV2::new(
+            launch_authority.verified_context(),
+            "wallet-request:00000000000000000000000000000001",
+            1,
+            2,
+            WalletProviderOperationV2::ListApprovals {
+                include_resolved: false,
+            },
+        )
+        .unwrap();
+        mock_wallet_authority_binding(&probe.authority)
+    };
+
+    let (pending_status, pending_payload) =
+        post_library(app.clone(), &first_launch_token, "buy", buy_body.clone()).await;
+    assert_eq!(pending_status, StatusCode::OK);
+    assert_eq!(pending_payload["status"], "error");
+    assert_eq!(
+        pending_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    {
+        let approvals = wallet_provider.provider.approvals.lock().await;
+        let approval = approvals
+            .iter()
+            .find(|approval| {
+                approval.get("request_id").and_then(Value::as_str)
+                    == Some(approval_request_id.as_str())
+            })
+            .expect("purchase approval raised under the first launch");
+        assert_eq!(
+            approval["authority_binding"],
+            binding_for_launch(&first_launch_token),
+            "the approval is bound to the first launch's authority"
+        );
+    }
+    wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+
+    // A later launch of the same principal drives completion; its wallet
+    // binding differs from the one the approval carries.
+    let relaunch_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    assert_ne!(
+        binding_for_launch(&relaunch_token),
+        binding_for_launch(&first_launch_token)
+    );
+    let (ok_status, ok_payload) = post_library(app, &relaunch_token, "buy", buy_body).await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok", "{ok_payload}");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+
+    // The validated Chain outcome is attached to the approval under its own
+    // authority, and the effect is complete with nothing left pending.
+    {
+        let approvals = wallet_provider.provider.approvals.lock().await;
+        let approval = approvals
+            .iter()
+            .find(|approval| {
+                approval.get("request_id").and_then(Value::as_str)
+                    == Some(approval_request_id.as_str())
+            })
+            .unwrap();
+        assert!(
+            approval.get("validated_chain_outcome").is_some(),
+            "validated Chain outcome attached to the approval: {approval}"
+        );
+    }
+    let effect_store = transaction_effect_store_for_test(&state, &authority.principal_id);
+    let effect = effect_store["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|effect| effect["approval_request_id"] == approval_request_id.as_str())
+        .expect("purchase transaction effect");
+    assert_eq!(effect["state"], "complete", "{effect}");
+    assert!(
+        effect.get("completion_error").is_none(),
+        "no completion error: {effect}"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
+
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 TEST_ROOT="${ELASTOS_HOME_CHAT_REUSE_TEST_ROOT:-$(mktemp -d /tmp/elastos-home-chat-reuse.XXXXXX)}"
 HOME_LOG="${TEST_ROOT}/home.txt"

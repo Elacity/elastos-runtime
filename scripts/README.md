@@ -14,7 +14,15 @@ automatically a stable end-user command.
 - `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
 - `share-demo.sh` runs the focused sharing demo.
 - `setup-crosvm.sh` installs VM prerequisites.
-- `publish-release.sh` is the low-level release publisher.
+- `publish-release.sh` is the low-level release publisher. Use
+  `elastos publish-release --version <version> --dry-run` for read-only planning;
+  the low-level script rejects that flag before side effects.
+- `python3 scripts/publish-platform-artifacts-test.py` checks its local platform
+  manifest exports, native/guest target selection and the staged artifact gate
+  without signing or uploading. CI and `just verify` run these checks.
+- `components-release-integrity-check.py --artifact-root <directory> --platform
+  <platform> --manifest <manifest>` verifies hashes and sizes for locally
+  advertised release files before publication.
 - `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.
 
 Use the `justfile` for repository gates:
@@ -30,6 +38,45 @@ audits, formatting, Clippy, Runtime workspace tests, own-workspace capsule
 tests, and the separate Browser local-exit checks. `just verify-release` adds
 browser-based UI source checks, local Carrier setup and Home front-door proofs.
 Publishing trust and signer verification are separate release gates.
+
+## Native platform inputs
+
+Run the preparation worker from one reviewed, clean checkout on each native
+builder. It supports Linux x86_64, Linux ARM64 and macOS Apple silicon. Choose
+an absent output directory outside the checkout:
+
+```sh
+scripts/prepare-release-platform.sh --version 0.7.1 --output /path/to/new-platform-input
+python3 scripts/release-platform-input.py verify /path/to/new-platform-input
+```
+
+The worker builds native Runtime/provider files with locked dependencies, copies
+tracked app sources and rebuilt entrypoints, and writes unsigned local inputs.
+Home CLI is a platform-specific capsule archive that includes its native renderer
+at `home-cli/bin/home-cli`; both setup and Runtime use that installed path.
+The receipt binds the source commit/tree, lockfiles, tool versions, component
+template and each output's size/hash. It records helpers absent from the source
+platform matrix. Generic provider VM archives remain a separate build path.
+Linux preparation needs tracked lockfiles for the standalone Browser helper
+projects; a missing lockfile stops preparation before a native build.
+
+From that same clean candidate checkout, check all three transferred inputs:
+
+```sh
+python3 scripts/release-platform-input.py validate-inputs \
+  --input x86_64-linux=/path/to/linux-x86_64-input \
+  --input aarch64-linux=/path/to/linux-arm64-input \
+  --input aarch64-darwin=/path/to/mac-arm64-input
+```
+
+This checks source and local file agreement, native OS/CPU headers, archive
+contracts and required Home delivery metadata. Source-template external downloads
+retain their pinned URLs and checksums. Media prerequisites, Browser substrate
+provisioning and actual fresh-device installation keep their target acceptance.
+Publisher import, signing and promotion follow this preparation boundary and
+remain separate release work. These commands perform local file operations;
+the builds can fetch Cargo dependencies. Keep their output through candidate
+review, then remove it after adoption or abandonment.
 
 ## Public-install proof
 
@@ -77,6 +124,16 @@ Common branch gates include:
 - `protected-content-provider-contract-smoke.sh` as the fail-closed retirement
   guard for the provisional rights, key, decrypt, and DRM providers; it does not
   verify the canonical v1 custody path
+- `protected-content-installed-e2e-proof.sh` drives the installed two-Runtime
+  protected-content journey phase by phase (provision, preflight,
+  chain-config-real, wallet-setup, mint, availability, buy, open,
+  drill-custody, drill-replica, negative, restart, cleanup, finalize, all)
+  against a real installed client Runtime and the `deploy/custody-host/`
+  three-node harness; its own `--help` documents the full runbook order,
+  including the Home-token login sequence the HTTP journey phases need.
+  `protected-content-installed-e2e-proof-smoke.sh` is its no-docker,
+  no-live-gateway smoke: driver syntax, usage/phase coverage, and argument
+  handling only, not the journey itself
 - `people-conversations-local-smoke.sh` for profile, discovery, contacts, and
   Chat handoff
 - `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
@@ -131,6 +188,20 @@ receipt-output argument.
 fresh request-bound passkey token in
 `ELASTOS_FRESH_PASSKEY_HOME_TOKEN`. Import into the same root is opt-in through
 `ELASTOS_RECOVERY_KIT_IMPORT=1`.
+
+`custody-harness-ci-smoke.sh` is the CI-safe machinery rehearsal for the
+protected-content dKMS ceremony and custody harness: it builds the
+`deploy/custody-host/` image, brings up a fresh throwaway instance of the
+three-node compose harness, runs `protected-content-installed-e2e-proof.sh`'s
+`provision` and `preflight` phases against a throwaway client identity,
+asserts both receipt blocks report `ok: true`, then tears everything down
+(restoring any already-running default harness project it had to stop first).
+It proves the provisioning and preflight machinery only, not the live HTTP
+journey or drill phases.
+
+`deploy/custody-host/` builds that simulation-only container image and
+same-host, container-per-node three-node compose harness; see its own README
+for the explicit simulation boundary and the operator flow it supports.
 
 ## Subdirectories
 

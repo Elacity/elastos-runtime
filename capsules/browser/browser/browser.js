@@ -6,7 +6,7 @@ import {
   normalizeUrl,
   sameBrowserStreamTarget,
   visibleAddressForUrl,
-} from "./browser-runtime-api.js?v=browser-20260627b";
+} from "./browser-runtime-api.js?v=browser-20260907c";
 import {
   createBrowserClipboardBridge,
 } from "./browser-clipboard.js?v=browser-20260725b";
@@ -26,8 +26,10 @@ import {
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260730b";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260731a";
+} from "./browser-status.js?v=browser-20260907c";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260915d";
+import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907c";
+import { createOperatorApprovalController, mountOperatorApproval } from "./browser-operator-approval.js";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -46,7 +48,7 @@ const GUARANTEE_POLICY_WEBVIEW = "policy_webview";
 const LOCAL_EXIT_LABEL = "This device";
 const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
 const DEFAULT_ENGINE_LABEL = "Automatic";
-const DEFAULT_ENGINE_SUMMARY = "Use the best Browser Engine available.";
+const DEFAULT_ENGINE_SUMMARY = "Runtime chooses a compatible Browser Engine.";
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
 const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
@@ -69,7 +71,7 @@ const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).
 const homeParentOrigin = params.get("home_origin") || "";
 const debugMetrics =
   params.get("debug") === "1" || params.get("metrics") === "1";
-const { fetchJson } = createRuntimeApi({ launchToken });
+const { fetchJson, requireViewer } = createRuntimeApi({ launchToken });
 const homeClipboard = createHomeClipboardClient({
   targetId: "browser",
   homeOrigin: homeParentOrigin,
@@ -100,6 +102,9 @@ const metricsNode = document.querySelector("#browser-metrics");
 let currentPage = null;
 let currentPageGeneration = 0;
 let nextPageGeneration = 1;
+const MAX_PENDING_BROWSER_INPUTS = 128;
+let browserInputQueue = null;
+let restoredViewerOwner = null;
 let currentView = null;
 let currentDisplayMode = "";
 let currentDisplayInput = "runtime_route";
@@ -112,6 +117,8 @@ let pageStatusRefreshTimers = [];
 let pageHeartbeatTimer = 0;
 let lastPageStatus = null;
 let unloadCleanupStarted = false;
+let recoverableDisplayAttachStarted = false;
+let displayAttachRetryIdentity = null;
 let remoteDisplay = null;
 let relaunchRequested = false;
 let browserAuthorityRenewal = null;
@@ -119,6 +126,8 @@ let browserAuthorityRenewalRetryTimer = 0;
 let browserAuthorityRenewalAttempts = 0;
 let lastRequestedUrl = DEFAULT_URL;
 let lastLibraryFilePickerRequestId = "";
+const libraryPickerDocumentNonce = crypto.randomUUID();
+let libraryPickerRequest = null;
 let browserSummary = null;
 let browserSummaryPromise = null;
 let runtimeOpenInFlight = 0;
@@ -421,18 +430,203 @@ function recoverableRuntimePage(summary = browserSummary) {
   };
 }
 
+function displayAttachRequestId(generation) {
+  return typeof generation === "string" && generation.startsWith("display:")
+    ? generation.slice("display:".length)
+    : "";
+}
+
+function viewerDisplayAttachTimeoutMs() {
+  const value = globalThis.VIEWER_DISPLAY_ATTACH_TIMEOUT_MS;
+  return typeof value === "number" && value > 0 ? value : 8000;
+}
+
+function reuseDisplayAttachment(pending) {
+  const validRequest = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  const validGeneration = value => typeof value === "string" && /^display:[a-f0-9]{32}$/.test(value);
+  if (
+    !pending ||
+    pending.schema !== "elastos.browser.display-attachment/v1" ||
+    !validRequest(pending.request_id) ||
+    !validGeneration(pending.previous_display_generation)
+  ) {
+    return null;
+  }
+  if (pending.state === "pending" || pending.state === "ready") {
+    return pending;
+  }
+  if (pending.state === "failed" && pending.error_code === "display_attach_uncertain") {
+    return pending;
+  }
+  return null;
+}
+
+function terminalDisplayAttachment(pending) {
+  return pending &&
+    pending.schema === "elastos.browser.display-attachment/v1" &&
+    pending.state === "failed" &&
+    pending.error_code === "display_attach_failed";
+}
+
+function allocateDisplayAttachRetryId(pageId, generation) {
+  const validRequest = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const shared = (boot && boot.retryIdentity) || displayAttachRetryIdentity;
+  if (
+    shared &&
+    shared.page_id === pageId &&
+    shared.generation === generation &&
+    validRequest(shared.request_id)
+  ) {
+    displayAttachRetryIdentity = shared;
+    if (boot) boot.retryIdentity = shared;
+    return shared.request_id;
+  }
+  const requestId = crypto.randomUUID().replace(/-/g, "");
+  if (shared && typeof shared === "object") {
+    shared.page_id = pageId;
+    shared.generation = generation;
+    shared.request_id = requestId;
+    displayAttachRetryIdentity = shared;
+    if (boot) boot.retryIdentity = shared;
+    return requestId;
+  }
+  const next = { page_id: pageId, generation, request_id: requestId };
+  displayAttachRetryIdentity = next;
+  if (boot) boot.retryIdentity = next;
+  return next.request_id;
+}
+
+function markDisplayAttachRetryNeeded(pageId, generation) {
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const shared = (boot && boot.retryIdentity) || displayAttachRetryIdentity || {
+    page_id: "",
+    generation: "",
+    request_id: "",
+  };
+  shared.page_id = pageId;
+  shared.generation = generation;
+  shared.request_id = "";
+  displayAttachRetryIdentity = shared;
+  if (boot) boot.retryIdentity = shared;
+}
+
+function displayAttachRequestForRecovery(pageId, generation, pending) {
+  const reused = reuseDisplayAttachment(pending);
+  if (reused) {
+    return {
+      type: "display_attach",
+      request_id: reused.request_id,
+      display_generation: reused.previous_display_generation,
+    };
+  }
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const shared = (boot && boot.retryIdentity) || displayAttachRetryIdentity;
+  if (
+    terminalDisplayAttachment(pending) ||
+    (shared && shared.page_id === pageId && shared.generation === generation)
+  ) {
+    return {
+      type: "display_attach",
+      request_id: allocateDisplayAttachRetryId(pageId, generation),
+      display_generation: generation,
+    };
+  }
+  return {
+    type: "display_attach",
+    request_id: displayAttachRequestId(generation),
+    display_generation: generation,
+  };
+}
+
+function startRecoverableDisplayAttach() {
+  if (
+    recoverableDisplayAttachStarted ||
+    homeWindowCloseInFlight ||
+    homeWindowTerminalCloseConfirmed
+  ) {
+    return;
+  }
+  const pageId = currentPage?.page_id;
+  const generation = currentPage?.display_session?.display_generation;
+  const requestId = displayAttachRequestId(generation);
+  if (
+    typeof pageId !== "string" ||
+    !pageId ||
+    !launchToken ||
+    !/^[a-f0-9]{32}$/.test(requestId) ||
+    currentPage?.display_session?.mode !== PRODUCT_DISPLAY_MODE ||
+    browserSummary?.engine_adapter?.display_attach_supported !== true
+  ) {
+    return;
+  }
+  recoverableDisplayAttachStarted = true;
+  try {
+    console.info(JSON.stringify({
+      schema: "elastos.browser.media-diagnostic/v1",
+      event: "dying_page_attach",
+      request_id: requestId,
+    }));
+  } catch {
+    // Keep unload attach on the product path if diagnostics cannot print.
+  }
+  fetch(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/webrtc`, {
+    method: "POST",
+    headers: {
+      "x-elastos-home-token": launchToken,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      type: "display_attach",
+      request_id: requestId,
+      display_generation: generation,
+    }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function persistRecoverableDisplayQuery(page) {
+  if (typeof location === "undefined" || typeof history === "undefined") {
+    return;
+  }
+  const url = new URL(location.href);
+  const generation = page?.display_session?.display_generation;
+  const validGeneration = typeof generation === "string" && /^display:[a-f0-9]{32}$/.test(generation);
+  if (typeof page?.page_id === "string" && page.page_id && validGeneration) {
+    url.searchParams.set("page_id", page.page_id);
+    url.searchParams.set("display_generation", generation);
+  } else if (!page?.page_id) {
+    url.searchParams.delete("page_id");
+    url.searchParams.delete("display_generation");
+  }
+  const next = `${url.pathname}${url.search}${url.hash}`;
+  const current = `${location.pathname}${location.search}${location.hash}`;
+  if (next !== current) {
+    history.replaceState(history.state, "", next);
+  }
+}
+
 function publishRuntimePageForHost(page = currentPage) {
   window.__elastosBrowserCurrentPageId = page?.page_id || "";
+  persistRecoverableDisplayQuery(page);
 }
 
 function currentRuntimePageOwner() {
   return runtimePageOwner(currentPage, currentPageGeneration);
 }
 
+function runtimeViewerOwnerActive(owner) {
+  return !unloadCleanupStarted && !homeWindowCloseInFlight && !homeWindowTerminalCloseConfirmed &&
+    sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
+    !runtimePageCleanup.status(owner) &&
+    !sameRuntimePageOwner(pendingHomeWindowCloseDelivery?.owner, owner);
+}
+
 function finalizeRuntimePageClose(owner) {
   if (sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
     currentPage = null;
     currentPageGeneration = 0;
+    restoredViewerOwner = null;
     currentBrowserEngineId = "";
     currentRemoteExitId = "";
     publishRuntimePageForHost(null);
@@ -474,6 +668,18 @@ const runtimePageCleanup = createRuntimePageCleanupController({
   onTerminal: (owner, _outcome, failure) => {
     const applied = finalizeRuntimePageClose(owner);
     deliverPendingHomeBrowserWindowClose(owner, _outcome);
+    if (
+      applied &&
+      (_outcome?.profile_durability === "failed" ||
+        _outcome?.profile_durability === "unknown") &&
+      !unloadCleanupStarted
+    ) {
+      showStatus(
+        "Runtime closed the Browser session, but the profile save failed. You can open the address again.",
+        { sticky: true },
+      );
+      return;
+    }
     if (applied && failure && !unloadCleanupStarted) {
       showStatus(
         "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
@@ -948,6 +1154,11 @@ function settleRemoteDisplayFailure(
   if (unloadCleanupStarted || relaunchRequested) {
     return Promise.resolve();
   }
+  if (sameRuntimePageOwner(currentRuntimePageOwner(), restoredViewerOwner)) {
+    closeRemoteDisplay();
+    showStatus("The Browser display could not reconnect. Reload Browser to retry.", { sticky: true });
+    return Promise.resolve();
+  }
   return failRuntimeOwnedPage(failureKind, message);
 }
 
@@ -1027,11 +1238,13 @@ async function fetchPageStatus({
   if (!currentPage?.page_id) {
     return null;
   }
+  const owner = currentRuntimePageOwner();
   const query = fast ? "?fast=1" : "";
   const status = await fetchJson(
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
+  if (!runtimeViewerOwnerActive(owner)) return null;
   if (
     status?.schema !== "elastos.browser.page-status/v1" ||
     status.page_id !== currentPage.page_id
@@ -1064,13 +1277,14 @@ async function fetchPageStatus({
 
 function handleFileChooserFromStatus(status) {
   const chooser = status?.file_chooser;
-  if (chooser?.pending !== true || !chooser.request_id) {
+  if (chooser?.pending !== true || !chooser.request_id || !currentPage?.page_id) {
     return;
   }
-  if (chooser.request_id === lastLibraryFilePickerRequestId) {
+  if (chooser.request_id === lastLibraryFilePickerRequestId && libraryPickerRequest?.pageId === currentPage.page_id) {
     return;
   }
   lastLibraryFilePickerRequestId = chooser.request_id;
+  libraryPickerRequest = { requestId: chooser.request_id, pageId: currentPage?.page_id, consumed: false };
   showStatus("Choose a Library item for Browser.");
   openLibraryFilePicker();
 }
@@ -1087,6 +1301,8 @@ function openLibraryFilePicker() {
       type: "home:open-target",
       homeToken: launchToken,
       target: "library",
+      requestId: libraryPickerRequest?.requestId,
+      documentNonce: libraryPickerDocumentNonce,
       query: {
         mode: "attach",
         returnTarget: "browser",
@@ -1117,33 +1333,58 @@ async function base64FromBlob(blob) {
 }
 
 async function handleLibraryFilePickerSelection(payload) {
+  const request = libraryPickerRequest;
+  if (!request || request.consumed || payload?.requestId !== request.requestId ||
+      payload?.documentNonce !== libraryPickerDocumentNonce ||
+      !payload?.pickerId || !payload?.deliveryId || currentPage?.page_id !== request.pageId) return false;
+  request.consumed = true;
   if (!payload?.blob || typeof payload.blob.arrayBuffer !== "function") {
     showStatus("Library did not return file bytes for Browser.", { sticky: true });
-    return;
+    return false;
   }
   if (payload.blob.size > LIBRARY_FILE_PICKER_MAX_BYTES) {
     showStatus("Browser file picker accepts Library items up to 16 MiB.", {
       sticky: true,
     });
-    return;
+    return false;
   }
   const fileName = fileNameFromLibraryPayload(payload);
+  const contentBase64 = await base64FromBlob(payload.blob);
+  if (libraryPickerRequest !== request || currentPage?.page_id !== request.pageId) return false;
   showStatus(`Inserting ${fileName}...`);
-  await sendBrowserInput(
+  const response = await sendBrowserInput(
     {
       type: "file_upload",
+      request_id: request.requestId,
       file_name: fileName,
       mime_type:
         typeof payload.mimeType === "string" && payload.mimeType
           ? payload.mimeType
           : payload.blob.type || "application/octet-stream",
-      content_base64: await base64FromBlob(payload.blob),
+      content_base64: contentBase64,
       object_uri: typeof payload.objectUri === "string" ? payload.objectUri : "",
     },
     { history: "replace" },
   );
+  if (libraryPickerRequest !== request || currentPage?.page_id !== request.pageId ||
+      response?.accepted !== true || response?.file_upload?.request_id !== request.requestId) return false;
   lastLibraryFilePickerRequestId = "";
   showStatus(`Inserted ${fileName}.`);
+  return true;
+}
+
+async function handlePageObservationFailure(error, owner) {
+  if (unloadCleanupStarted || !sameRuntimePageOwner(currentRuntimePageOwner(), owner)) return false;
+  if (requestFreshRuntimeAuthority(error)) return false;
+  if (error.runtimeTransportFailure === true) {
+    showStatus("Connection interrupted. Browser is reconnecting.");
+    return true;
+  }
+  await failRuntimeOwnedPage(
+    error.runtimeOwnedFailureKind || "display_status",
+    friendlyOpenError(error),
+  );
+  return false;
 }
 
 function schedulePageStatusRefresh({
@@ -1164,21 +1405,18 @@ function schedulePageStatusRefresh({
         (candidate) => candidate !== timer,
       );
       if (
+        unloadCleanupStarted ||
         !currentPage ||
         document.hidden ||
         (!forceAddress && isAddressEditing())
       ) {
         return;
       }
+      const owner = currentRuntimePageOwner();
       try {
         await fetchPageStatus({ history, forceAddress });
       } catch (error) {
-        if (!requestFreshRuntimeAuthority(error)) {
-          await failRuntimeOwnedPage(
-            error.runtimeOwnedFailureKind || "display_status",
-            friendlyOpenError(error),
-          );
-        }
+        await handlePageObservationFailure(error, owner);
       }
     }, nextDelay);
     return timer;
@@ -1188,7 +1426,7 @@ function schedulePageStatusRefresh({
 function startPageStatusPolling() {
   stopPageStatusPolling();
   const poll = async () => {
-    if (!currentPage) {
+    if (unloadCleanupStarted || !currentPage) {
       return;
     }
     if (document.hidden) {
@@ -1199,18 +1437,15 @@ function startPageStatusPolling() {
       pageStatusTimer = window.setTimeout(poll, PAGE_STATUS_INTERVAL_MS);
       return;
     }
+    const owner = currentRuntimePageOwner();
     try {
       await fetchPageStatus({ fast: true });
     } catch (error) {
-      if (!requestFreshRuntimeAuthority(error)) {
-        await failRuntimeOwnedPage(
-          error.runtimeOwnedFailureKind || "display_status",
-          friendlyOpenError(error),
-        );
-      }
+      await handlePageObservationFailure(error, owner);
     } finally {
       if (
-        currentPage &&
+        sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
+        !unloadCleanupStarted &&
         !relaunchRequested &&
         !runtimePageCleanup.status(currentRuntimePageOwner())?.failure
       ) {
@@ -1224,28 +1459,26 @@ function startPageStatusPolling() {
 function startPageHeartbeat() {
   stopPageHeartbeat();
   const beat = async () => {
-    if (!currentPage?.page_id) {
+    if (unloadCleanupStarted || !currentPage?.page_id) {
       return;
     }
+    const owner = currentRuntimePageOwner();
+    let nextDelay = PAGE_HEARTBEAT_INTERVAL_MS;
     try {
       await fetchJson(
         `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/heartbeat`,
         { method: "POST" },
       );
     } catch (error) {
-      if (!requestFreshRuntimeAuthority(error)) {
-        await failRuntimeOwnedPage(
-          error.runtimeOwnedFailureKind || "display_status",
-          friendlyOpenError(error),
-        );
-      }
+      if (await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
     } finally {
       if (
-        currentPage &&
+        sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
+        !unloadCleanupStarted &&
         !relaunchRequested &&
         !runtimePageCleanup.status(currentRuntimePageOwner())?.failure
       ) {
-        pageHeartbeatTimer = window.setTimeout(beat, PAGE_HEARTBEAT_INTERVAL_MS);
+        pageHeartbeatTimer = window.setTimeout(beat, nextDelay);
       }
     }
   };
@@ -1336,11 +1569,55 @@ async function sendBrowserInput(
   event,
   { focus = true, history = "push" } = {},
 ) {
-  if (!currentPage?.page_id) {
+  const owner = currentRuntimePageOwner();
+  if (!owner) {
+    return;
+  }
+  if (!browserInputQueue || !sameRuntimePageOwner(browserInputQueue.owner, owner)) {
+    browserInputQueue = { owner, tail: Promise.resolve(), pending: 0, failed: false };
+  }
+  const queue = browserInputQueue;
+  if (queue.pending >= MAX_PENDING_BROWSER_INPUTS) {
+    throw new Error("Browser input is busy. Check the page before typing again.");
+  }
+  queue.pending += 1;
+  // Runtime text insertion must settle before a later key or pointer action.
+  const pending = queue.tail.then(() => {
+    if (!sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
+      return;
+    }
+    if (queue.failed) {
+      throw new Error("Browser input was canceled after a failed operation.");
+    }
+    return dispatchBrowserInput(event, { focus, history }, owner);
+  });
+  queue.tail = pending.catch(() => {
+    // Delivery can be uncertain. Abandon dependent input without replaying it.
+    queue.failed = true;
+    if (browserInputQueue === queue) {
+      browserInputQueue = null;
+    }
+  });
+  try {
+    return await pending;
+  } finally {
+    queue.pending -= 1;
+  }
+}
+
+async function dispatchBrowserInput(
+  event,
+  { focus = true, history = "push" } = {},
+  inputOwner = currentRuntimePageOwner(),
+) {
+  if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
     return;
   }
   const requiresRuntimeRoute =
     event?.type === "browser_command" ||
+    // A following text insertion needs the Engine's completed click/focus,
+    // rather than only a successful send on a different transport.
+    event?.type === "click" ||
     event?.type === "paste_text" ||
     event?.type === "file_upload" ||
     event?.type === "clipboard_write";
@@ -1365,20 +1642,29 @@ async function sendBrowserInput(
       focusRemoteInput();
     }
   } else {
+    const inputPageId = inputOwner.page_id;
     let response;
     try {
       response = await fetchJson(
-        `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/input`,
+        `/api/apps/browser/pages/${encodeURIComponent(inputPageId)}/input`,
         {
           method: "POST",
           body: { event },
         },
       );
     } catch (error) {
-      if (recoverMissingRuntimePage(error, "Browser session was released.")) {
+      if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
         return;
       }
+      recoverMissingRuntimePage(error, "Browser session was released.");
       throw error;
+    }
+    if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
+      return;
+    }
+    if (event?.type === "file_upload" &&
+        (currentPage?.page_id !== inputPageId || libraryPickerRequest?.requestId !== event.request_id)) {
+      throw new Error("The Browser file request changed. Check the page before trying again.");
     }
     handleFileChooserFromStatus(response);
     syncViewFromResponse(response);
@@ -1396,6 +1682,7 @@ async function sendBrowserInput(
     if (response?.accepted !== true && !response?.actual_url && !response?.file_chooser) {
       throw new Error("Browser could not send that input.");
     }
+    return response;
   }
 }
 
@@ -1431,6 +1718,13 @@ window.addEventListener("message", (event) => {
   }
   handleLibraryFilePickerSelection(payload).catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
+    return false;
+  }).then((accepted) => {
+    window.top.postMessage({
+      type: "home:picker-accepted", homeToken: launchToken,
+      pickerId: payload.pickerId, requestId: payload.requestId,
+      documentNonce: payload.documentNonce, deliveryId: payload.deliveryId, accepted,
+    }, homeParentOrigin);
   });
 });
 
@@ -1440,6 +1734,11 @@ remoteDisplay = createBrowserRemoteDisplay({
   friendlyOpenError,
   getCurrentDisplayMode: () => currentDisplayMode,
   getLastPageStatus: () => lastPageStatus,
+  supportsDisplayGeneration: () => browserSummary?.engine_adapter?.display_attach_supported === true,
+  captureViewerOwnerGuard: () => {
+    const owner = currentRuntimePageOwner();
+    return () => runtimeViewerOwnerActive(owner);
+  },
   handleRemoteInputChannelMessage,
   handleRemoteInputChannelTeardown: teardownRemoteClipboard,
   onRecoveryRequired: settleRemoteDisplayFailure,
@@ -1459,6 +1758,18 @@ remoteDisplay = createBrowserRemoteDisplay({
   showStatus,
   updateMetrics: updateMetricsNode,
 });
+
+// A requested diagnostic sample reads the current viewer peers; the HUD keeps its normal cadence.
+async function readRemoteDisplayMetrics() {
+  const owner = currentRuntimePageOwner();
+  if (!runtimeViewerOwnerActive(owner)) return null;
+  const metrics = await remoteDisplay.refreshMetrics();
+  if (!metrics || !runtimeViewerOwnerActive(owner)) return null;
+  updateMetricsNode(lastPageStatus || {});
+  return window.__elastosBrowserRemoteDisplayMetrics || null;
+}
+
+window.__elastosBrowserReadRemoteDisplayMetrics = readRemoteDisplayMetrics;
 
 function closeRemoteDisplay() {
   remoteDisplay?.close();
@@ -1498,11 +1809,6 @@ function selectedBrowserEngine(summary = browserSummary) {
   return visibleBrowserEngines(summary).find((engine) => engine.id === selectedBrowserEngineId) || null;
 }
 
-function defaultBrowserEngine(summary = browserSummary) {
-  const engines = visibleBrowserEngines(summary);
-  return engines.find((engine) => engine.default === true) || engines[0] || null;
-}
-
 function browserEngineKindLabel(engine) {
   const substrate = String(engine?.backing_substrate || "").toLowerCase();
   if (substrate === "remote_operator_vm") {
@@ -1538,10 +1844,7 @@ function browserEngineKindLabel(engine) {
 
 function browserEngineLabel(adapterId = selectedBrowserEngineId) {
   if (!adapterId) {
-    const engine = defaultBrowserEngine();
-    return engine
-      ? `${DEFAULT_ENGINE_LABEL} (${browserEngineKindLabel(engine)})`
-      : DEFAULT_ENGINE_LABEL;
+    return DEFAULT_ENGINE_LABEL;
   }
   const engine = visibleBrowserEngines(browserSummary).find(
     (candidate) => candidate.id === adapterId,
@@ -1551,10 +1854,7 @@ function browserEngineLabel(adapterId = selectedBrowserEngineId) {
 
 function browserEngineSummary(engine) {
   if (!engine) {
-    const defaultEngine = defaultBrowserEngine();
-    return defaultEngine
-      ? `${browserEngineLabel("")}. Browser will use this engine unless you choose another one.`
-      : DEFAULT_ENGINE_SUMMARY;
+    return DEFAULT_ENGINE_SUMMARY;
   }
   return `${browserEngineLabel(engine.id)}. Runs the page in an isolated Browser Engine; network access uses the selected Exit Node.`;
 }
@@ -1603,18 +1903,17 @@ function syncExitSelect(summary) {
     return;
   }
   const exits = visibleRemoteCarrierExits(summary);
-  const previous = selectedRemoteExitId;
-  exitSelect.replaceChildren(new Option(LOCAL_EXIT_LABEL, ""));
-  for (const exit of exits) {
-    exitSelect.add(new Option(remoteCarrierExitLabel(exit), exit.id));
-  }
-  selectedRemoteExitId = exits.some((exit) => exit.id === previous)
-    ? previous
-    : "";
-  exitSelect.value = selectedRemoteExitId;
-  const selectedExit = exits.find((exit) => exit.id === selectedRemoteExitId);
+  const selectedExit = renderServiceSelection(exitSelect, {
+    services: exits,
+    selectedId: selectedRemoteExitId,
+    defaultLabel: LOCAL_EXIT_LABEL,
+    labelForService: remoteCarrierExitLabel,
+    unavailableLabel: "Selected Exit Node (unavailable)",
+  });
   const summaryText = selectedExit
     ? remoteCarrierExitSummary(selectedExit)
+    : selectedRemoteExitId
+    ? "Your selected Exit Node is unavailable. Choose another Exit Node to change where Browser traffic exits."
     : LOCAL_EXIT_SUMMARY;
   if (exitSummaryNode) {
     exitSummaryNode.textContent = summaryText;
@@ -1627,34 +1926,48 @@ function syncEngineSelect(summary) {
     return;
   }
   const engines = visibleBrowserEngines(summary);
-  const previous = selectedBrowserEngineId;
-  const defaultEngine = defaultBrowserEngine(summary);
-  engineSelect.replaceChildren(new Option(
-    defaultEngine
-      ? `${DEFAULT_ENGINE_LABEL} (${browserEngineKindLabel(defaultEngine)})`
-      : DEFAULT_ENGINE_LABEL,
-    "",
-  ));
-  for (const engine of engines) {
-    engineSelect.add(new Option(`${browserEngineKindLabel(engine)}: ${engine.id}`, engine.id));
-  }
-  selectedBrowserEngineId = engines.some((engine) => engine.id === previous)
-    ? previous
-    : "";
-  engineSelect.value = selectedBrowserEngineId;
+  const selectedEngine = renderServiceSelection(engineSelect, {
+    services: engines,
+    selectedId: selectedBrowserEngineId,
+    defaultLabel: DEFAULT_ENGINE_LABEL,
+    labelForService: (engine) => `${browserEngineKindLabel(engine)}: ${engine.id}`,
+    unavailableLabel: "Selected Browser Engine (unavailable)",
+  });
   if (engineSummaryNode) {
-    engineSummaryNode.textContent = browserEngineSummary(selectedBrowserEngine(summary));
+    engineSummaryNode.textContent = selectedBrowserEngineId && !selectedEngine
+      ? "Your selected Browser Engine is unavailable. Choose another Engine to change where the page runs."
+      : browserEngineSummary(selectedEngine);
   }
   updateSettingsTitle();
 }
 
-async function fetchBrowserSummary() {
+async function fetchBrowserSummary({ remoteServices = true } = {}) {
   if (browserSummaryPromise) {
     return browserSummaryPromise;
   }
-  const summaryPath = browserInstanceId
-    ? `/api/apps/browser/summary?browser_instance=${encodeURIComponent(browserInstanceId)}`
-    : "/api/apps/browser/summary";
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  if (!remoteServices && boot?.summaryPromise) {
+    const pending = boot.summaryPromise;
+    boot.summaryPromise = null;
+    try {
+      const summary = await pending;
+      browserSummary = summary;
+      syncEngineSelect(summary);
+      syncExitSelect(summary);
+      return summary;
+    } catch {
+      // Fall through to a live summary request when the boot prefetch fails.
+    }
+  }
+  const query = new URLSearchParams();
+  if (browserInstanceId) {
+    query.set("browser_instance", browserInstanceId);
+  }
+  if (!remoteServices) {
+    query.set("remote_services", "0");
+  }
+  const encoded = query.toString();
+  const summaryPath = encoded ? `/api/apps/browser/summary?${encoded}` : "/api/apps/browser/summary";
   browserSummaryPromise = fetchJson(summaryPath, { method: "GET" })
     .then((summary) => {
       browserSummary = summary;
@@ -1662,11 +1975,11 @@ async function fetchBrowserSummary() {
       syncExitSelect(summary);
       return summary;
     })
-    .catch(() => {
+    .catch((error) => {
       browserSummary = null;
       syncEngineSelect(null);
       syncExitSelect(null);
-      return null;
+      throw error;
     })
     .finally(() => {
       browserSummaryPromise = null;
@@ -1823,6 +2136,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   runtimeOpenInFlight += 1;
   try {
     const { displayMode, guaranteeLevel } = await launchContractForOpen();
+    requireViewer(displayMode);
     const previousPage = currentPage;
     const previousGeneration = currentPageGeneration;
     const previousOwner = runtimePageOwner(previousPage, previousGeneration);
@@ -1948,6 +2262,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       );
     }
     await connectRemoteDisplay(openedPage.display_session, openedPage);
+    publishRuntimePageForHost(currentPage);
     startPageStatusPolling();
     startPageHeartbeat();
     if (!remoteDisplay.isTrackReady()) {
@@ -2009,11 +2324,16 @@ async function navigateAddress(value) {
   addressInput.blur();
   setLoading(true);
   showStatus(`Opening ${visibleAddressForUrl(nextUrl)}...`, { sticky: true });
+  const openingStatus = statusNode.firstChild;
   try {
-    await sendBrowserInput(
+    const response = await sendBrowserInput(
       { type: "browser_command", command: "navigate", url: nextUrl },
       { history: "push" },
     );
+    if (response?.accepted === true && statusNode.firstChild === openingStatus) {
+      window.clearTimeout(statusTimer);
+      statusNode.dataset.visible = "false";
+    }
     startPageStatusPolling();
   } catch (error) {
     if (crossStreamTarget) {
@@ -2087,7 +2407,9 @@ settingsButton?.addEventListener("click", (event) => {
   const willOpen = Boolean(settingsPanel?.hidden);
   setSettingsOpen(willOpen);
   if (willOpen) {
-    void fetchBrowserSummary();
+    void fetchBrowserSummary().catch((error) => {
+      showStatus(friendlyOpenError(error), { sticky: true });
+    });
   }
 });
 
@@ -2223,20 +2545,199 @@ bindBrowserInputSurface({
   unlockRemoteAudioFromGesture,
 });
 
+async function attachRecoveredDisplay(summary, owner) {
+  if (!runtimeViewerOwnerActive(owner)) return null;
+  const display = currentPage?.display_session;
+  const validGeneration = value => typeof value === "string" && /^display:[a-f0-9]{32}$/.test(value);
+  const validRequest = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+  if (summary?.engine_adapter?.display_attach_supported !== true || !validGeneration(display?.display_generation)) {
+    throw new Error("Browser needs an update to restore this display. Close Browser to finish the session.");
+  }
+  const pending = summary.sessions.recoverable_page.display_attachment;
+  if (pending && (pending.schema !== "elastos.browser.display-attachment/v1" ||
+      !["pending", "ready", "failed"].includes(pending.state) ||
+      !validRequest(pending.request_id) || !validGeneration(pending.previous_display_generation))) {
+    throw new Error("Runtime could not check the pending Browser display attachment.");
+  }
+  const request = displayAttachRequestForRecovery(
+    owner.page_id,
+    display.display_generation,
+    pending,
+  );
+  let result;
+  const boot = typeof window !== "undefined" ? window.__elastosBrowserRestoreBoot : null;
+  const bootAttach = boot?.attachPromise;
+  if (bootAttach) {
+    boot.attachPromise = null;
+    try {
+      const attached = await bootAttach;
+      if (attached?.page_id === owner.page_id && attached.request && attached.result) {
+        request.request_id = attached.request.request_id;
+        request.display_generation = attached.request.display_generation;
+        result = attached.result;
+      }
+    } catch {
+      result = undefined;
+    }
+  }
+  if (!result) {
+    try {
+      result = await fetchJson(`/api/apps/browser/pages/${encodeURIComponent(owner.page_id)}/webrtc`, {
+        method: "POST",
+        body: request,
+        signal: AbortSignal.timeout(viewerDisplayAttachTimeoutMs()),
+      });
+    } catch (error) {
+      if (!runtimeViewerOwnerActive(owner)) return null;
+      if (error?.payload?.code === "display_attach_failed") {
+        markDisplayAttachRetryNeeded(owner.page_id, request.display_generation);
+      }
+      throw error;
+    }
+  }
+  if (!runtimeViewerOwnerActive(owner)) return null;
+  const offerValid = offer => offer?.schema === "elastos.browser.webrtc-offer/v1" && offer.type === "offer" &&
+    typeof offer.sdp === "string" && offer.sdp.length > 0 && offer.sdp.length <= 256 * 1024 &&
+    (offer.candidates === undefined || (Array.isArray(offer.candidates) && offer.candidates.length <= 256));
+  if (result?.schema !== "elastos.browser.display-attach-result/v1" || result.page_id !== owner.page_id ||
+      result.request_id !== request.request_id || result.previous_display_generation !== request.display_generation ||
+      !validGeneration(result.display_generation) || result.display_generation === request.display_generation ||
+      !offerValid(result.initial_offer) || !offerValid(result.audio_offer)) {
+    throw new Error("Runtime could not restore the Browser display.");
+  }
+  return { ...display, display_generation: result.display_generation,
+    initial_offer: result.initial_offer, audio_offer: result.audio_offer };
+}
+
+async function restoreRuntimePageViewer(summary) {
+  if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed || currentPage) return true;
+  const sessions = summary?.sessions;
+  if (sessions?.schema !== "elastos.browser.session-capacity/v1" ||
+      !Object.hasOwn(sessions, "recoverable_page")) {
+    throw new Error("Browser could not check its current session. Reload Browser to retry.");
+  }
+  if (sessions.recoverable_page === null) {
+    if (sessions.status !== "configured" || sessions.fresh_start_allowed !== true) {
+      throw new Error("Runtime is still resolving Browser session ownership. Reload Browser to retry.");
+    }
+    return false;
+  }
+  const page = recoverableRuntimePage(summary);
+  if (!page || (page.recovery_state === "active" &&
+      page.page_id !== sessions.recoverable_page.engine_page?.page_id)) {
+    throw new Error("Browser could not restore its current session.");
+  }
+  const selection = sessions.recoverable_page.service_selection;
+  if (page.recovery_state === "active" &&
+      (page.schema !== "elastos.browser.engine.page/v1" ||
+       selection?.schema !== "elastos.browser.service-selection/v1" ||
+       typeof selection.engine_id !== "string" || selection.engine_id.length > 512 ||
+       typeof selection.exit_id !== "string" || selection.exit_id.length > 512)) {
+    throw new Error("Runtime could not restore the Browser service selection.");
+  }
+  const owner = runtimePageOwner(page, nextPageGeneration);
+  if (!owner) throw new Error("Runtime could not restore Browser cleanup authority.");
+  currentPage = page;
+  currentPageGeneration = nextPageGeneration++;
+  runtimeOwnershipTerminallyAbsent = false;
+  if (page.recovery_state === "cleanup_pending") {
+    publishRuntimePageForHost(currentPage);
+    showStatus("Browser session cleanup is pending. Close Browser to retry.", { sticky: true });
+    setLoading(false);
+    return true;
+  }
+  restoredViewerOwner = owner;
+  selectedBrowserEngineId = currentBrowserEngineId = selection.engine_id;
+  selectedRemoteExitId = currentRemoteExitId = selection.exit_id;
+  syncEngineSelect(summary);
+  syncExitSelect(summary);
+  showStatus("Restoring the Browser display...", { sticky: true });
+  startPageHeartbeat();
+  let statusPromise = null;
+  try {
+    // Page status is diagnostic; attach replaces offers within retained Runtime authority.
+    if (currentPage.display_session?.mode !== "webrtc_remote_display") {
+      throw new Error("Runtime could not restore the Browser display.");
+    }
+    statusPromise = fetchPageStatus({ history: "replace", forceAddress: true });
+    const display = await attachRecoveredDisplay(summary, owner);
+    if (!display || !runtimeViewerOwnerActive(owner)) {
+      await statusPromise.catch(() => null);
+      return true;
+    }
+    if (display.mode !== "webrtc_remote_display") {
+      throw new Error("Runtime could not restore the Browser display.");
+    }
+    currentDisplayMode = display.mode;
+    syncDisplayInputFromSession(display);
+    currentView = viewFromDisplaySession(display) || currentPage.view;
+    startPageStatusPolling();
+    const connecting = connectRemoteDisplay(display, { ...currentPage, display_session: display });
+    let status;
+    try {
+      status = await statusPromise;
+    } catch (error) {
+      await connecting.catch(() => null);
+      throw error;
+    }
+    if (!status || !runtimeViewerOwnerActive(owner)) {
+      await connecting.catch(() => null);
+      return true;
+    }
+    currentPage = { ...currentPage, display_session: display };
+    publishRuntimePageForHost(currentPage);
+    await connecting;
+    return true;
+  } catch (error) {
+    if (statusPromise) await statusPromise.catch(() => null);
+    if (!runtimeViewerOwnerActive(owner)) return true;
+    throw error;
+  } finally {
+    if (runtimeViewerOwnerActive(owner)) setLoading(false);
+  }
+}
+
 window.addEventListener("beforeunload", () => {
+  startRecoverableDisplayAttach();
   releaseRuntimePageForUnload();
 });
 
-window.addEventListener("pagehide", releaseRuntimePageForUnload);
+window.addEventListener("pagehide", (event) => {
+  if (!event.persisted) {
+    startRecoverableDisplayAttach();
+  }
+  releaseRuntimePageForUnload();
+});
 
-const initialUrl = params.get("url") || DEFAULT_URL;
+mountOperatorApproval({
+  container: settingsPanel,
+  controller: createOperatorApprovalController({
+    fetchJson,
+    runtimeOrigin: new URL(window.location.href).origin,
+    getOwner: () => unloadCleanupStarted || homeWindowCloseInFlight
+      ? null : runtimePageOwner(currentPage, currentPageGeneration),
+    sameOwner: sameRuntimePageOwner,
+  }),
+});
+
+const requestedStartupUrl = params.get("url");
+const initialUrl = requestedStartupUrl || DEFAULT_URL;
 addressInput.value = initialUrl;
-updateNavState();
-fetchBrowserSummary()
-  .then(() => requestRuntimeOpen(initialUrl, { history: "replace" }))
+setLoading(true);
+fetchBrowserSummary({ remoteServices: false })
+  .then(async (summary) => {
+    if (await restoreRuntimePageViewer(summary)) return;
+    if (!requestedStartupUrl) {
+      setLoading(false);
+      return;
+    }
+    return requestRuntimeOpen(requestedStartupUrl, { history: "replace" });
+  })
   .catch((error) => {
+    if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;
     if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
       return;
     }
+    setLoading(false);
     showStatus(friendlyOpenError(error), { sticky: true });
   });

@@ -12,6 +12,7 @@ pub async fn run_serve(
     capsule: Option<PathBuf>,
     cid: Option<String>,
 ) -> anyhow::Result<()> {
+    crate::runtime_control::watch_gateway_owner()?;
     let data_dir = crate::default_data_dir();
     let subordinate_host = std::env::var("ELASTOS_ALLOW_SUBORDINATE_RUNTIME_HOST")
         .ok()
@@ -133,12 +134,7 @@ pub async fn run_serve(
                             .map_err(|e| anyhow::anyhow!("Failed to set token: {}", e))?;
                     }
 
-                    tracing::info!(
-                        "Created session for VM {}: token={}... tap={}",
-                        vm_id,
-                        &shell_session.token[..8],
-                        needs_tap,
-                    );
+                    tracing::info!("Created session for VM {}: tap={}", vm_id, needs_tap,);
                 }
 
                 vm_provider
@@ -316,7 +312,7 @@ pub async fn run_serve(
         .session_registry
         .create_session(session::SessionType::Shell, None)
         .await;
-    let app_session = infra
+    let _app_session = infra
         .session_registry
         .create_session(session::SessionType::Capsule, None)
         .await;
@@ -367,7 +363,6 @@ pub async fn run_serve(
     if let Some(ref cid) = infra.shell_cid {
         println!("  Capsule  shell           {}", cid);
     }
-    println!("  App:     {}", app_session.token);
     println!("  API:     http://{}", addr);
 
     let components_path = data_dir.join("components.json");
@@ -388,6 +383,9 @@ pub async fn run_serve(
             }
             if let Some(port) = collaboration_context.presence_product_port.clone() {
                 s.set_collaboration_presence_product_port(port);
+            }
+            if let Some(endpoint) = collaboration_context.carrier_endpoint.clone() {
+                s.set_carrier_endpoint(endpoint);
             }
             if let Some(service) = collaboration_context.discovery_service.clone() {
                 s.set_collaboration_discovery_service(service);

@@ -116,6 +116,19 @@ impl RuntimeWalletAuthority {
     pub(super) fn from_verified_context(context: VerifiedWalletInvocationContext) -> Self {
         Self { context }
     }
+
+    /// The authority a persisted transaction effect was created under, rebuilt
+    /// from the effect's own binding. A Wallet approval is bound to the exact
+    /// launch that raised it (principal, session, proof binding, grant, actor,
+    /// launch); once the Runtime restarts, the caller completing the effect
+    /// holds a fresh launch, and the Wallet rightly refuses to attach the
+    /// validated Chain outcome under that new binding. Completing the effect's
+    /// own projection under its original binding is the only legitimate use.
+    pub(in crate::api) fn from_persisted_transaction_authority(
+        context: VerifiedWalletInvocationContext,
+    ) -> Self {
+        Self { context }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -125,11 +138,12 @@ enum HomeLaunchOriginPolicy {
 }
 
 pub(crate) fn home_session_cookie_header_for_token(
+    headers: &HeaderMap,
     token: &str,
     secure: bool,
 ) -> anyhow::Result<HeaderValue> {
     home_launch_cookie_header(
-        HOME_SESSION_COOKIE,
+        &home_session_cookie_name(headers)?,
         token,
         HOME_LAUNCH_TOKEN_TTL_SECS,
         "/",
@@ -137,15 +151,37 @@ pub(crate) fn home_session_cookie_header_for_token(
     )
 }
 
-pub(crate) fn home_session_clear_cookie_header(secure: bool) -> anyhow::Result<HeaderValue> {
+pub(crate) fn home_session_clear_cookie_header(
+    headers: &HeaderMap,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
     let mut value = format!(
         "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
-        HOME_SESSION_COOKIE
+        home_session_cookie_name(headers)?
     );
     if secure {
         value.push_str("; Secure");
     }
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
+pub(crate) fn home_session_cookie_name(headers: &HeaderMap) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    // Browsers share cookies across ports. Bind the cookie name to the
+    // destination authority so independent Homes retain their own sessions.
+    let raw = single_browser_header(headers, "host")?
+        .ok_or_else(|| anyhow::anyhow!("Home browser request is missing its host"))?
+        .parse::<axum::http::uri::Authority>()?;
+    let mut authority = super::gateway_origin::validated_host_authority(headers)?;
+    // The shared HTTP origin normalizer strips :80. Cookie names must retain
+    // that explicit port, including when the destination uses HTTPS.
+    if raw.port_u16() == Some(80) {
+        authority.push_str(":80");
+    }
+    Ok(format!(
+        "{HOME_SESSION_COOKIE}-{}",
+        hex::encode(Sha256::digest(authority.as_bytes()))
+    ))
 }
 
 fn home_launch_cookie_header(
@@ -397,7 +433,7 @@ pub(crate) fn require_home_token_context(
         data_dir,
         headers,
         &[HOME_CAPSULE_ID],
-        Some(HOME_SESSION_COOKIE),
+        Some(&home_session_cookie_name(headers)?),
         HomeLaunchOriginPolicy::Browser,
     )
     .map(|required| required.context)
@@ -445,7 +481,7 @@ pub(in crate::api) fn require_home_runtime_wallet_authority(
         data_dir,
         headers,
         &[HOME_CAPSULE_ID],
-        Some(HOME_SESSION_COOKIE),
+        Some(&home_session_cookie_name(headers)?),
         HomeLaunchOriginPolicy::Browser,
     )?;
     runtime_wallet_authority(&required)
@@ -945,6 +981,85 @@ mod tests {
     }
 
     #[test]
+    fn home_sessions_are_isolated_between_localhost_ports() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_context = local_home_launch_token_context(first.path()).unwrap();
+        let second_context = local_home_launch_token_context(second.path()).unwrap();
+        let first_token =
+            issue_home_launch_token_with_context(first.path(), HOME_CAPSULE_ID, &first_context)
+                .unwrap();
+        let second_token =
+            issue_home_launch_token_with_context(second.path(), HOME_CAPSULE_ID, &second_context)
+                .unwrap();
+        let headers_for = |port| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", format!("localhost:{port}").parse().unwrap());
+            headers.insert(
+                "origin",
+                format!("http://localhost:{port}").parse().unwrap(),
+            );
+            headers
+        };
+        let mut first_headers = headers_for(61561);
+        let mut second_headers = headers_for(61562);
+        let first_name = home_session_cookie_name(&first_headers).unwrap();
+        let second_name = home_session_cookie_name(&second_headers).unwrap();
+        assert_ne!(first_name, second_name);
+        let jar = format!(
+            "{first_name}={first_token}; {second_name}={second_token}; home-session=legacy"
+        );
+        first_headers.insert("cookie", jar.parse().unwrap());
+        second_headers.insert("cookie", jar.parse().unwrap());
+        assert_eq!(
+            require_home_token_context(first.path(), &first_headers).unwrap(),
+            first_context
+        );
+        assert_eq!(
+            require_home_token_context(second.path(), &second_headers).unwrap(),
+            second_context
+        );
+        // An open tab can keep its header while the other Home signs in.
+        first_headers.insert("x-elastos-home-token", first_token.parse().unwrap());
+        require_home_token_context(first.path(), &first_headers).unwrap();
+        let set =
+            home_session_cookie_header_for_token(&first_headers, &first_token, false).unwrap();
+        assert!(set.to_str().unwrap().starts_with(&format!("{first_name}=")));
+        let clear = home_session_clear_cookie_header(&first_headers, false).unwrap();
+        assert!(clear
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("{first_name}=;")));
+        assert!(!clear.to_str().unwrap().contains(&second_name));
+        // Removing the first Home's cookie leaves the second Home signed in.
+        second_headers.insert(
+            "cookie",
+            format!("{second_name}={second_token}").parse().unwrap(),
+        );
+        require_home_token_context(second.path(), &second_headers).unwrap();
+        // System's opaque origin uses the same cookie namespace as Home.
+        first_headers.insert("origin", "null".parse().unwrap());
+        assert_eq!(
+            home_session_cookie_name(&first_headers).unwrap(),
+            first_name
+        );
+        first_headers.insert("host", "LOCALHOST:61561".parse().unwrap());
+        assert_eq!(
+            home_session_cookie_name(&first_headers).unwrap(),
+            first_name
+        );
+        first_headers.insert("host", "example.test".parse().unwrap());
+        let default_name = home_session_cookie_name(&first_headers).unwrap();
+        first_headers.insert("host", "example.test:80".parse().unwrap());
+        assert_ne!(
+            home_session_cookie_name(&first_headers).unwrap(),
+            default_name
+        );
+        first_headers.append("host", "localhost:61562".parse().unwrap());
+        assert!(home_session_cookie_name(&first_headers).is_err());
+    }
+
+    #[test]
     fn browser_launch_token_requires_an_opaque_capsule_origin() {
         let data_dir = tempfile::tempdir().unwrap();
         elastos_identity::load_or_create_did(data_dir.path()).unwrap();
@@ -1380,7 +1495,7 @@ mod tests {
         let mut same_cookie = home.clone();
         same_cookie.insert(
             axum::http::header::COOKIE,
-            format!("{HOME_SESSION_COOKIE}={home_token}")
+            format!("{}={home_token}", home_session_cookie_name(&home).unwrap())
                 .parse()
                 .unwrap(),
         );
@@ -1395,9 +1510,12 @@ mod tests {
         let mut conflicting_cookie = home.clone();
         conflicting_cookie.insert(
             axum::http::header::COOKIE,
-            format!("{HOME_SESSION_COOKIE}={other_home_token}")
-                .parse()
-                .unwrap(),
+            format!(
+                "{}={other_home_token}",
+                home_session_cookie_name(&home).unwrap()
+            )
+            .parse()
+            .unwrap(),
         );
         assert!(
             require_home_token_context(data_dir.path(), &conflicting_cookie)
@@ -1413,9 +1531,12 @@ mod tests {
         let mut rotated_cookie = home.clone();
         rotated_cookie.insert(
             axum::http::header::COOKIE,
-            format!("{HOME_SESSION_COOKIE}={rotated_token}")
-                .parse()
-                .unwrap(),
+            format!(
+                "{}={rotated_token}",
+                home_session_cookie_name(&home).unwrap()
+            )
+            .parse()
+            .unwrap(),
         );
         require_home_token_context(data_dir.path(), &rotated_cookie)
             .expect("a rotated same-session cookie beside a stale header must stay signed");

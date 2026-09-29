@@ -14,8 +14,12 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+#[path = "store_files.rs"]
+mod files;
+use files::IdentityFiles;
+
 /// A stored passkey credential
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCredential {
     /// Base64url-encoded credential ID
     pub credential_id: String,
@@ -32,6 +36,26 @@ pub struct StoredCredential {
 pub struct IdentityData {
     pub user_id: String,
     pub credentials: Vec<StoredCredential>,
+    #[serde(default)]
+    removal_generation: u64,
+}
+
+/// Immutable key history at accepted verification. Sign counters and additions
+/// can advance while Runtime reconciles another registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestCredentialHistory {
+    removal_generation: u64,
+    keys: Vec<[u8; 32]>,
+}
+
+fn credential_key_digest(key: &StoredCredential) -> anyhow::Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(&(
+        &key.credential_id,
+        &key.rp_id,
+        &key.public_key,
+    ))?)
+    .into())
 }
 
 /// On-disk encrypted envelope
@@ -47,6 +71,9 @@ pub struct IdentityStore {
     path: PathBuf,
     pub(crate) data: Option<IdentityData>,
     device_key: Zeroizing<[u8; 32]>,
+    loaded_digest: Option<[u8; 32]>,
+    #[cfg(test)]
+    save_fault: Option<files::SaveFault>,
 }
 
 /// Multicodec prefix for Ed25519 public keys.
@@ -136,6 +163,15 @@ pub fn load_or_create_did(data_dir: &Path) -> anyhow::Result<(ed25519_dalek::Sig
     let device_key = load_or_create_device_key(data_dir)?;
     let (signing_key, did) = derive_did(&device_key);
     Ok((signing_key, did))
+}
+
+/// Read the existing device identity for authority checks. Initialization and
+/// recovery own creation and durability; this path only validates current files.
+pub fn load_existing_did(data_dir: &Path) -> anyhow::Result<(ed25519_dalek::SigningKey, String)> {
+    let files = IdentityFiles::open_existing(data_dir)?;
+    let key = read_device_key(&files)?
+        .ok_or_else(|| anyhow::anyhow!("identity device.key is missing"))?;
+    Ok(derive_did(&key))
 }
 
 /// Load the locally persisted DID nickname, if present.
@@ -235,36 +271,45 @@ pub fn device_key_path(data_dir: &Path) -> PathBuf {
 /// Returns 32 random bytes wrapped in `Zeroizing`. The key file is created
 /// with 0600 permissions on Unix.
 pub fn load_or_create_device_key(data_dir: &Path) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-    let key_path = device_key_path(data_dir);
-    let key_dir = key_path
-        .parent()
-        .expect("device key path always has an identity directory");
+    let files = IdentityFiles::open(data_dir)?;
+    if let Some(key) = read_device_key(&files)? {
+        files.sync()?;
+        Ok(key)
+    } else {
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(key.as_mut());
+        files.replace(
+            c"device.key",
+            key.as_ref(),
+            #[cfg(test)]
+            None,
+        )?;
+        Ok(key)
+    }
+}
 
-    if key_path.exists() {
-        let bytes = std::fs::read(&key_path)?;
+fn read_device_key(files: &IdentityFiles) -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
+    if let Some(bytes) = files.read(c"device.key")? {
+        let bytes = Zeroizing::new(bytes);
         if bytes.len() != 32 {
             anyhow::bail!(
                 "device.key has invalid length {} (expected 32)",
                 bytes.len()
             );
         }
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&bytes);
-        Ok(Zeroizing::new(key))
-    } else {
-        std::fs::create_dir_all(key_dir)?;
-        let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        std::fs::write(&key_path, key)?;
-
-        // Set 0600 permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some(credentials) = files.read(c"credentials.json")? {
+            decrypt_data(&key, &credentials).map_err(|_| {
+                anyhow::anyhow!("identity credentials cannot be verified with device.key")
+            })?;
         }
-
-        Ok(Zeroizing::new(key))
+        Ok(Some(key))
+    } else {
+        if files.read(c"credentials.json")?.is_some() {
+            anyhow::bail!("identity credentials exist but device.key is missing");
+        }
+        Ok(None)
     }
 }
 
@@ -335,30 +380,186 @@ impl IdentityStore {
             path,
             data: None,
             device_key,
+            loaded_digest: None,
+            #[cfg(test)]
+            save_fault: None,
         })
     }
 
     /// Load credentials from disk (encrypted).
     pub fn load(&mut self) -> anyhow::Result<()> {
-        if self.path.exists() {
-            let raw = std::fs::read(&self.path)?;
+        let files = self.files();
+        self.data = None;
+        self.loaded_digest = None;
+        self.reload_locked(&files?)
+    }
+
+    fn files(&self) -> anyhow::Result<IdentityFiles> {
+        let files = IdentityFiles::open(
+            self.path
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| anyhow::anyhow!("identity store has no data root"))?,
+        )?;
+        let key = Zeroizing::new(
+            files
+                .read(c"device.key")?
+                .ok_or_else(|| anyhow::anyhow!("identity device.key is missing"))?,
+        );
+        if key.as_slice() != self.device_key.as_ref() {
+            anyhow::bail!("identity device.key changed or is corrupt");
+        }
+        Ok(files)
+    }
+
+    fn reload_locked(&mut self, files: &IdentityFiles) -> anyhow::Result<()> {
+        self.data = None;
+        self.loaded_digest = None;
+        if let Some(raw) = files.read(c"credentials.json")? {
             let plaintext = decrypt_data(&self.device_key, &raw)?;
-            self.data = Some(serde_json::from_slice(&plaintext)?);
+            let data: IdentityData = serde_json::from_slice(&plaintext)?;
+            validate_credentials(&data)?;
+            self.loaded_digest = Some(Sha256::digest(&raw).into());
+            self.data = Some(data);
         }
         Ok(())
     }
 
-    /// Save credentials to disk (encrypted).
-    pub fn save(&self) -> anyhow::Result<()> {
-        if let Some(ref data) = self.data {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent)?;
+    /// Save only if the loaded encrypted snapshot is still current. Failed
+    /// saves discard the proposed cache and reload durable facts.
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        let files = match self.files() {
+            Ok(files) => files,
+            Err(error) => {
+                self.data = None;
+                self.loaded_digest = None;
+                return Err(error);
             }
-            let json = serde_json::to_vec(data)?;
-            let encrypted = encrypt_data(&self.device_key, &json)?;
-            std::fs::write(&self.path, encrypted)?;
+        };
+        let result = (|| {
+            let current = files.read(c"credentials.json")?;
+            if current.as_ref().map(|raw| Sha256::digest(raw).into()) != self.loaded_digest {
+                anyhow::bail!("identity credentials changed; reload before retrying");
+            }
+            self.save_locked(&files)
+        })();
+        if result.is_err() {
+            // An unreadable durable store leaves the cache empty, never speculative.
+            let _ = self.reload_locked(&files);
         }
+        result
+    }
+
+    fn save_locked(&mut self, files: &IdentityFiles) -> anyhow::Result<()> {
+        let Some(data) = &self.data else {
+            return Ok(());
+        };
+        validate_credentials(data)?;
+        let encrypted = encrypt_data(&self.device_key, &serde_json::to_vec(data)?)?;
+        files.replace(
+            c"credentials.json",
+            &encrypted,
+            #[cfg(test)]
+            self.save_fault.take(),
+        )?;
+        self.loaded_digest = Some(Sha256::digest(&encrypted).into());
         Ok(())
+    }
+
+    /// Reconcile only a first-owner candidate bound by Runtime's durable owner.
+    pub(crate) fn persist_first_owner(
+        &mut self,
+        candidate: &StoredCredential,
+    ) -> anyhow::Result<String> {
+        let files = self.files()?;
+        let result = (|| {
+            self.reload_locked(&files)?;
+            if let Some(data) = &self.data {
+                let [existing] = data.credentials.as_slice() else {
+                    anyhow::bail!("Enrollment credential history conflicts");
+                };
+                if existing.credential_id != candidate.credential_id
+                    || existing.public_key != candidate.public_key
+                    || existing.rp_id != candidate.rp_id
+                    || existing.sign_count < candidate.sign_count
+                {
+                    anyhow::bail!("Enrollment credential conflicts");
+                }
+                files.sync()?;
+                return Ok(data.user_id.clone());
+            }
+            let user_id = self.add_credential(candidate.clone());
+            self.save_locked(&files)?;
+            Ok(user_id)
+        })();
+        if result.is_err() {
+            let _ = self.reload_locked(&files);
+        }
+        result
+    }
+
+    pub(crate) fn guest_credential_history(&self) -> anyhow::Result<GuestCredentialHistory> {
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("guest credential history missing"))?;
+        if data.credentials.len() > 1024 || data.removal_generation == u64::MAX {
+            anyhow::bail!("guest credential history limit exceeded");
+        }
+        Ok(GuestCredentialHistory {
+            removal_generation: data.removal_generation,
+            keys: data
+                .credentials
+                .iter()
+                .map(credential_key_digest)
+                .collect::<anyhow::Result<_>>()?,
+        })
+    }
+
+    /// Append only to the exact verified history, or reconcile the same saved key.
+    pub(crate) fn persist_guest_candidate(
+        &mut self,
+        candidate: &StoredCredential,
+        previous_history: &GuestCredentialHistory,
+    ) -> anyhow::Result<StoredCredential> {
+        let files = self.files()?;
+        let result = (|| {
+            self.reload_locked(&files)?;
+            let current_history = self.guest_credential_history()?;
+            if current_history.removal_generation != previous_history.removal_generation
+                || !previous_history
+                    .keys
+                    .iter()
+                    .all(|key| current_history.keys.contains(key))
+            {
+                anyhow::bail!("guest credential history removed or changed keys");
+            }
+            let data = self
+                .data
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("guest credential history missing"))?;
+            if let Some(existing) = data
+                .credentials
+                .iter()
+                .find(|item| item.credential_id == candidate.credential_id)
+            {
+                if existing.public_key != candidate.public_key
+                    || existing.rp_id != candidate.rp_id
+                    || existing.sign_count < candidate.sign_count
+                {
+                    anyhow::bail!("guest credential conflicts");
+                }
+                files.sync()?;
+                return Ok(existing.clone());
+            }
+            self.add_credential(candidate.clone());
+            self.save_locked(&files)?;
+            Ok(candidate.clone())
+        })();
+        if result.is_err() {
+            let _ = self.reload_locked(&files);
+        }
+        result
     }
 
     /// Return the device key as a hex string (for passing to providers).
@@ -402,6 +603,7 @@ impl IdentityStore {
             self.data = Some(IdentityData {
                 user_id: user_id.clone(),
                 credentials: vec![credential],
+                removal_generation: 0,
             });
         }
 
@@ -432,8 +634,24 @@ impl IdentityStore {
         let before = data.credentials.len();
         data.credentials
             .retain(|cred| cred.credential_id != credential_id);
-        data.credentials.len() != before
+        let removed = data.credentials.len() != before;
+        if removed {
+            data.removal_generation = data.removal_generation.saturating_add(1);
+        }
+        removed
     }
+}
+
+fn validate_credentials(data: &IdentityData) -> anyhow::Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    if data
+        .credentials
+        .iter()
+        .any(|credential| !ids.insert(&credential.credential_id))
+    {
+        anyhow::bail!("identity store contains duplicate credential IDs");
+    }
+    Ok(())
 }
 
 /// Generate a deterministic user ID from a credential ID
@@ -506,6 +724,349 @@ mod tests {
         assert!(store2.is_registered());
         assert_eq!(store2.user_id(), Some(user_id.as_str()));
         assert_eq!(store2.get_credentials().len(), 1);
+    }
+
+    fn persistence_credential(id: &str, sign_count: u32) -> StoredCredential {
+        StoredCredential {
+            credential_id: id.to_string(),
+            public_key: "public-key".to_string(),
+            sign_count,
+            rp_id: "localhost".to_string(),
+        }
+    }
+
+    #[test]
+    fn competing_credential_saves_preserve_the_winner_and_reload_the_loser() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = IdentityStore::new(dir.path()).unwrap();
+        let mut second = IdentityStore::new(dir.path()).unwrap();
+        first.load().unwrap();
+        second.load().unwrap();
+        first.add_credential(persistence_credential("first", 0));
+        second.add_credential(persistence_credential("second", 0));
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                let saved = first.save().is_ok();
+                (saved, first.get_credentials())
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                let saved = second.save().is_ok();
+                (saved, second.get_credentials())
+            });
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(results.iter().filter(|result| result.0).count(), 1);
+        let mut disk = IdentityStore::new(dir.path()).unwrap();
+        disk.load().unwrap();
+        let winner = disk.get_credentials();
+        assert_eq!(winner.len(), 1);
+        for (_, credentials) in results {
+            assert_eq!(credentials[0].credential_id, winner[0].credential_id);
+        }
+    }
+
+    #[test]
+    fn guest_history_allows_counter_advance_and_unrelated_addition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = IdentityStore::new(dir.path()).unwrap();
+        current.add_credential(persistence_credential("admin", 1));
+        current.save().unwrap();
+        let history = current.guest_credential_history().unwrap();
+        let mut pending = IdentityStore::new(dir.path()).unwrap();
+        pending.load().unwrap();
+        current.update_sign_count("admin", 3);
+        current.add_credential(persistence_credential("other-guest", 0));
+        current.save().unwrap();
+        let guest = persistence_credential("guest", 0);
+        pending.persist_guest_candidate(&guest, &history).unwrap();
+        assert_eq!(pending.get_credentials().len(), 3);
+        assert_eq!(pending.get_credentials()[0].sign_count, 3);
+        let bytes = std::fs::read(&pending.path).unwrap();
+        pending.persist_guest_candidate(&guest, &history).unwrap();
+        assert_eq!(std::fs::read(&pending.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn guest_history_rejects_removed_or_conflicting_keys_without_writes() {
+        for change in [
+            "remove-admin",
+            "change-admin",
+            "remove-guest",
+            "conflict-guest",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = IdentityStore::new(dir.path()).unwrap();
+            store.add_credential(persistence_credential("admin", 1));
+            store.save().unwrap();
+            let history = store.guest_credential_history().unwrap();
+            let guest = persistence_credential("guest", 0);
+            match change {
+                "remove-admin" => {
+                    assert!(store.remove_credential("admin"));
+                }
+                "change-admin" => {
+                    store.data.as_mut().unwrap().credentials[0].public_key = "changed".into()
+                }
+                "remove-guest" => {
+                    store.persist_guest_candidate(&guest, &history).unwrap();
+                    assert!(store.remove_credential("guest"));
+                }
+                "conflict-guest" => {
+                    let mut conflict = guest.clone();
+                    conflict.public_key = "changed".into();
+                    store.add_credential(conflict);
+                }
+                _ => unreachable!(),
+            }
+            store.save().unwrap();
+            let bytes = std::fs::read(&store.path).unwrap();
+            assert!(
+                store.persist_guest_candidate(&guest, &history).is_err(),
+                "{change}"
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn stale_credential_save_cannot_lower_counter_or_resurrect_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = IdentityStore::new(dir.path()).unwrap();
+        current.add_credential(persistence_credential("credential", 1));
+        current.save().unwrap();
+        let mut stale = IdentityStore::new(dir.path()).unwrap();
+        stale.load().unwrap();
+        current.update_sign_count("credential", 3);
+        current.save().unwrap();
+        let bytes = std::fs::read(&current.path).unwrap();
+        stale.update_sign_count("credential", 2);
+        assert!(stale.save().is_err());
+        assert_eq!(std::fs::read(&current.path).unwrap(), bytes);
+        assert_eq!(stale.get_credentials()[0].sign_count, 3);
+        current.remove_credential("credential");
+        current.save().unwrap();
+        stale.update_sign_count("credential", 4);
+        assert!(stale.save().is_err());
+        assert!(stale.get_credentials().is_empty());
+    }
+
+    #[test]
+    fn existing_did_reads_current_identity_without_creating_missing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(load_existing_did(&missing).is_err());
+        assert!(!missing.exists());
+        assert!(load_existing_did(dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let (_, expected) = load_or_create_did(dir.path()).unwrap();
+        let key = std::fs::read(device_key_path(dir.path())).unwrap();
+        assert_eq!(load_existing_did(dir.path()).unwrap().1, expected);
+        std::fs::remove_file(device_key_path(dir.path())).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert!(!device_key_path(dir.path()).exists());
+        let files = IdentityFiles::open(dir.path()).unwrap();
+        files.replace(c"device.key", &key, None).unwrap();
+        drop(files);
+        std::fs::remove_file(dir.path().join("identity/identity.lock")).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert!(!dir.path().join("identity/identity.lock").exists());
+        assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), key);
+    }
+
+    #[test]
+    fn existing_did_revalidates_key_and_credentials_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::new(dir.path()).unwrap();
+        store.add_credential(persistence_credential("credential", 0));
+        store.save().unwrap();
+        let expected = load_existing_did(dir.path()).unwrap().1;
+        let key = std::fs::read(device_key_path(dir.path())).unwrap();
+        let credentials = std::fs::read(&store.path).unwrap();
+        for invalid in [vec![0; 32], vec![0; 33], vec![]] {
+            std::fs::write(device_key_path(dir.path()), &invalid).unwrap();
+            assert!(load_existing_did(dir.path()).is_err());
+            assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), invalid);
+            assert_eq!(std::fs::read(&store.path).unwrap(), credentials);
+        }
+        std::fs::write(device_key_path(dir.path()), &key).unwrap();
+        assert_eq!(load_existing_did(dir.path()).unwrap().1, expected);
+        std::fs::write(&store.path, b"corrupt").unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert_eq!(std::fs::read(&store.path).unwrap(), b"corrupt");
+        assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_did_preserves_private_descriptor_checks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_did(dir.path()).unwrap();
+        let key = device_key_path(dir.path());
+        let bytes = std::fs::read(&key).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = dir.path().join("key-alias");
+        std::fs::hard_link(&key, &alias).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        std::fs::remove_file(&key).unwrap();
+        symlink(&alias, &key).unwrap();
+        assert!(load_existing_did(dir.path()).is_err());
+        assert_eq!(std::fs::read(&alias).unwrap(), bytes);
+    }
+
+    #[test]
+    fn missing_device_key_with_credentials_fails_without_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::new(dir.path()).unwrap();
+        store.add_credential(persistence_credential("credential", 0));
+        store.save().unwrap();
+        let bytes = std::fs::read(&store.path).unwrap();
+        std::fs::remove_file(device_key_path(dir.path())).unwrap();
+        assert!(IdentityStore::new(dir.path()).is_err());
+        assert!(!device_key_path(dir.path()).exists());
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn credential_insert_failure_reloads_old_or_new_state() {
+        for fault in [
+            files::SaveFault::BeforeReplace,
+            files::SaveFault::AfterReplace,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = IdentityStore::new(dir.path()).unwrap();
+            let old = persistence_credential("old", 0);
+            let new = persistence_credential("new", 0);
+            store.add_credential(old.clone());
+            store.save().unwrap();
+            let bytes = std::fs::read(&store.path).unwrap();
+            store.add_credential(new.clone());
+            store.save_fault = Some(fault);
+            let error = store.save().unwrap_err();
+            if fault == files::SaveFault::BeforeReplace {
+                assert!(error.to_string().contains("pre-replacement"));
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+                assert_eq!(store.get_credentials(), vec![old]);
+            } else {
+                assert!(error.to_string().contains("indeterminate"));
+                assert_ne!(std::fs::read(&store.path).unwrap(), bytes);
+                assert_eq!(store.get_credentials(), vec![old, new]);
+            }
+            assert!(std::fs::read_dir(dir.path().join("identity"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")));
+            let mut disk = IdentityStore::new(dir.path()).unwrap();
+            disk.load().unwrap();
+            assert_eq!(store.get_credentials(), disk.get_credentials());
+        }
+    }
+
+    #[test]
+    fn competing_fresh_identity_managers_share_one_device_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let keys = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        load_or_create_device_key(dir.path()).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(keys.iter().all(|key| **key == *keys[0]));
+        let bytes = std::fs::read(device_key_path(dir.path())).unwrap();
+        assert_eq!(bytes.as_slice(), keys[0].as_ref());
+        let (_, did) = load_or_create_did(dir.path()).unwrap();
+        assert_eq!(did, derive_did(&keys[0]).1);
+        assert_eq!(load_nickname(dir.path()).unwrap(), None);
+        assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), bytes);
+    }
+
+    #[test]
+    fn corrupt_or_removed_key_clears_cached_credentials_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::new(dir.path()).unwrap();
+        store.add_credential(persistence_credential("old", 0));
+        store.save().unwrap();
+        let bytes = std::fs::read(&store.path).unwrap();
+        std::fs::write(device_key_path(dir.path()), b"corrupt").unwrap();
+        assert!(IdentityStore::new(dir.path()).is_err());
+        store.add_credential(persistence_credential("unsaved", 0));
+        assert!(store.save().is_err());
+        assert!(store.get_credentials().is_empty());
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(device_key_path(dir.path())).unwrap(),
+            b"corrupt"
+        );
+        std::fs::write(device_key_path(dir.path()), [0; 32]).unwrap();
+        assert!(load_or_create_device_key(dir.path()).is_err());
+        assert_eq!(std::fs::read(device_key_path(dir.path())).unwrap(), [0; 32]);
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn failed_counter_save_reloads_durable_counter_before_retry() {
+        for fault in [
+            files::SaveFault::BeforeReplace,
+            files::SaveFault::AfterReplace,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = IdentityStore::new(dir.path()).unwrap();
+            store.add_credential(persistence_credential("credential", 1));
+            store.save().unwrap();
+            let old = std::fs::read(&store.path).unwrap();
+            store.update_sign_count("credential", 2);
+            store.save_fault = Some(fault);
+            assert!(store.save().is_err());
+            let expected = if fault == files::SaveFault::BeforeReplace {
+                1
+            } else {
+                2
+            };
+            assert_eq!(store.get_credentials()[0].sign_count, expected);
+            if expected == 1 {
+                assert_eq!(std::fs::read(&store.path).unwrap(), old);
+            }
+            let mut later = IdentityStore::new(dir.path()).unwrap();
+            later.load().unwrap();
+            later.update_sign_count("credential", 3);
+            later.save().unwrap();
+            let latest = std::fs::read(&store.path).unwrap();
+            assert!(store.save().is_err());
+            assert_eq!(store.get_credentials()[0].sign_count, 3);
+            assert_eq!(std::fs::read(&store.path).unwrap(), latest);
+        }
+    }
+
+    #[test]
+    fn duplicate_credential_save_preserves_bytes_and_reloads_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::new(dir.path()).unwrap();
+        let old = persistence_credential("credential", 0);
+        store.add_credential(old.clone());
+        store.save().unwrap();
+        let bytes = std::fs::read(&store.path).unwrap();
+        store.add_credential(persistence_credential("credential", 1));
+        assert!(store.save().is_err());
+        assert_eq!(store.get_credentials(), vec![old]);
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
     }
 
     #[test]

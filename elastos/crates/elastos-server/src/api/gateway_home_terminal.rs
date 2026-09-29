@@ -678,7 +678,7 @@ async fn start_home_terminal_session(
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -1123,6 +1123,19 @@ async fn cleanup_stale_home_terminal_sessions(now_ms: u64) {
         .collect::<Vec<_>>();
     drop(sessions);
     close_home_terminal_cleanup_targets(cleanup).await;
+}
+
+pub(super) async fn shutdown_home_terminal_sessions() {
+    let sessions = home_terminal_sessions()
+        .lock()
+        .await
+        .drain()
+        .map(|(_, session)| session)
+        .collect::<Vec<_>>();
+    for session in sessions {
+        close_home_terminal_session_handle(session.clone(), "gateway stopped").await;
+        let _ = session.child.lock().await.wait().await;
+    }
 }
 
 async fn close_home_terminal_cleanup_targets(targets: Vec<HomeTerminalCleanupTarget>) {

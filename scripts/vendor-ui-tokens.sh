@@ -108,6 +108,33 @@ for target_dir in "${TARGETS[@]}"; do
   fi
 done
 
+for target_dir in marketplace/browser system/browser; do
+  for asset in model-management.js model-management.css; do
+    model_source="capsules/_shared/$asset"
+    model_target="capsules/$target_dir/$asset"
+    if [[ "$MODE" == "--check" ]]; then
+      if ! cmp -s "$model_source" "$model_target"; then
+        echo "[vendor-ui] DRIFT: $model_target" >&2
+        FAILED=1
+      fi
+    else
+      cp "$model_source" "$model_target"
+    fi
+  done
+done
+
+for target_dir in assistant/browser home-agent/browser; do
+  model_target="capsules/$target_dir/model-selection.js"
+  if [[ "$MODE" == "--check" ]]; then
+    if ! cmp -s capsules/_shared/model-selection.js "$model_target"; then
+      echo "[vendor-ui] DRIFT: $model_target" >&2
+      FAILED=1
+    fi
+  else
+    cp capsules/_shared/model-selection.js "$model_target"
+  fi
+done
+
 if [[ "$MODE" == "--check" ]]; then
   if [[ "$FAILED" -ne 0 ]]; then
     echo "[vendor-ui] FAIL — run \`just vendor-ui\` and commit the result" >&2

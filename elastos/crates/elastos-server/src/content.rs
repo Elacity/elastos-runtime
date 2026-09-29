@@ -100,6 +100,16 @@ const OBJECT_MANIFEST_PATH: &str = "_elastos_object.json";
 const SEALED_OBJECT_PATH: &str = "sealed.json";
 
 pub const CONTENT_OBJECT_MANIFEST_PATH: &str = OBJECT_MANIFEST_PATH;
+const MAX_LOCAL_OBJECT_DIRS: usize = 16;
+const MAX_LOCAL_OBJECT_WALK_DEPTH: usize = 8;
+const LOCAL_OBJECT_WALK_SKIP: &[&str] = &[
+    "ipfs-repo",
+    "logs",
+    "bin",
+    "managed-runtimes",
+    "target",
+    ".git",
+];
 
 pub struct ContentProvider {
     data_dir: PathBuf,
@@ -208,6 +218,8 @@ struct ContentFetchTransfer {
     transfer: ProviderTransfer,
     range: Option<ProviderByteRange>,
     progress: Option<ProviderProgress>,
+    bounded_read: bool,
+    max_bytes: Option<u64>,
 }
 
 impl ContentFetchTransfer {
@@ -277,10 +289,41 @@ impl ContentFetchTransfer {
             }
             None => None,
         };
+        let max_bytes = request
+            .get("max_bytes")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|n| (1..=65536).contains(n))
+                    .ok_or_else(|| {
+                        ProviderError::Provider("invalid complete metadata bound".into())
+                    })
+            })
+            .transpose()?;
+        if max_bytes.is_some()
+            && (request.get("bounded_read") != Some(&Value::Bool(true))
+                || request.get("path").and_then(Value::as_str) != Some(OBJECT_MANIFEST_PATH)
+                || range.is_some()
+                || progress.as_ref().and_then(|p| p.expected_bytes).is_some())
+        {
+            return Err(ProviderError::Provider(
+                "complete metadata requires a local bounded whole index".into(),
+            ));
+        }
         Ok(Self {
             transfer,
             range,
             progress,
+            max_bytes,
+            bounded_read: match request.get("bounded_read") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "bounded_read must be a boolean".into(),
+                    ))
+                }
+            },
         })
     }
 }
@@ -2417,10 +2460,15 @@ pub async fn publish_directory_via_provider(
         .await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContentPublishRequirements {
     min_replicas: u32,
     require_live_multi_peer_proof: bool,
+    /// Availability policy name recorded in the signed availability receipt
+    /// (`ensure_network_availability` reads it as `availability_policy`).
+    /// Callers that verify the receipt against a named policy must set it;
+    /// otherwise the provider records its `network_default`.
+    availability_policy: Option<String>,
 }
 
 impl ContentPublishRequirements {
@@ -2434,14 +2482,31 @@ impl ContentPublishRequirements {
         Ok(Self {
             min_replicas,
             require_live_multi_peer_proof,
+            availability_policy: None,
         })
     }
 
-    fn to_json(self) -> Value {
+    pub(crate) fn with_availability_policy(mut self, policy: &str) -> anyhow::Result<Self> {
+        let policy = policy.trim();
+        if policy.is_empty() {
+            anyhow::bail!("content publish availability policy must not be empty");
+        }
+        self.availability_policy = Some(policy.to_string());
+        Ok(self)
+    }
+
+    fn to_json(&self) -> Value {
         json!({
             "min_replicas": self.min_replicas,
             "require_live_multi_peer_proof": self.require_live_multi_peer_proof,
         })
+    }
+
+    fn apply_to_publish_request(&self, request: &mut Value) {
+        request["availability_requirements"] = self.to_json();
+        if let Some(policy) = &self.availability_policy {
+            request["availability_policy"] = Value::String(policy.clone());
+        }
     }
 }
 
@@ -2564,7 +2629,7 @@ async fn publish_directory_via_provider_impl(
         request["publisher_did"] = Value::String(publisher_did.to_string());
     }
     if let Some(requirements) = requirements {
-        request["availability_requirements"] = requirements.to_json();
+        requirements.apply_to_publish_request(&mut request);
     }
     if !links.is_empty() {
         request["links"] = Value::Array(
@@ -2615,6 +2680,52 @@ pub async fn publish_bytes_via_provider(
     content_response_cid(&response)
 }
 
+/// Complete one bounded model read through the existing local Content path.
+/// Preparation owns aggregate accounting, ordering, integrity and settlement.
+pub(crate) async fn fetch_model_part(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: &str,
+    range: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut request = json!({"op":"fetch", "cid":cid, "path":path,
+        "bounded_read":true, "transfer":"stream"});
+    let limit = if let Some((offset, length)) = range {
+        anyhow::ensure!((1..=65536).contains(&length), "invalid model read bound");
+        request["range"] = json!({"start":offset,"end":offset.checked_add(length - 1)
+            .ok_or_else(|| anyhow::anyhow!("model range overflow"))?});
+        length
+    } else {
+        anyhow::ensure!(
+            path == CONTENT_OBJECT_MANIFEST_PATH,
+            "complete model index required"
+        );
+        request["max_bytes"] = json!(65536);
+        65536
+    };
+    let mut stream = registry
+        .open_provider_stream(
+            ProviderInvocation {
+                source: "runtime-model-preparation".into(),
+                target: "content".into(),
+                op: "fetch".into(),
+                request,
+                transfer: ProviderTransfer::Stream,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            },
+            ProviderStreamOptions::default(),
+        )
+        .await?;
+    let bytes = stream.drain_to_vec()?;
+    anyhow::ensure!(bytes.len() as u64 <= limit, "model read exceeds bound");
+    if range.is_some() {
+        anyhow::ensure!(bytes.len() as u64 == limit, "incomplete model range");
+    }
+    Ok(bytes)
+}
+
 pub async fn fetch_bytes_via_provider(
     registry: &ProviderRegistry,
     cid: &str,
@@ -2655,6 +2766,125 @@ pub async fn fetch_bytes_via_provider(
     session
         .drain_to_vec()
         .map_err(|err| anyhow::anyhow!("content provider stream read failed: {err}"))
+}
+
+/// Validate signed catalog metadata using the existing content closure list.
+/// This proves descriptive consistency only; payload verification and admission
+/// require the later bounded content transfer.
+pub(crate) fn validate_model_content_closure_metadata(
+    capsule: &Value,
+    object: &Value,
+) -> anyhow::Result<(elastos_common::CapsuleManifest, u64)> {
+    let capsule_bytes = serde_json::to_vec(capsule)?;
+    if capsule_bytes.len() > 64 * 1024 {
+        anyhow::bail!("model capsule manifest exceeds its byte limit");
+    }
+    let manifest: elastos_common::CapsuleManifest = serde_json::from_value(capsule.clone())?;
+    manifest.validate().map_err(anyhow::Error::msg)?;
+    let model = manifest
+        .model_content
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("model catalog requires model_content metadata"))?;
+    let fields = object
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid content closure"))?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "schema"
+                | "kind"
+                | "content_digest"
+                | "files"
+                | "links"
+                | "object_did"
+                | "publisher_did"
+        )
+    }) {
+        anyhow::bail!("unknown model content closure field");
+    }
+    let files = object
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("missing model content closure files"))?;
+    if files.is_empty() || files.len() > 32 {
+        anyhow::bail!("model content closure file count exceeds its limit");
+    }
+    for file in files {
+        if file.as_object().is_none_or(|fields| {
+            fields.len() != 3
+                || fields
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "path" | "sha256" | "size"))
+        }) {
+            anyhow::bail!("invalid model content file fields");
+        }
+    }
+    let closure = parse_content_object_manifest("model-catalog", &serde_json::to_vec(object)?)?;
+    if closure.kind != "capsule" || !closure.links.is_empty() || closure.object_did.is_some() {
+        anyhow::bail!("model catalog requires a self-contained capsule closure");
+    }
+    let mut total = 0_u64;
+    let mut paths = BTreeSet::new();
+    let mut previous = "";
+    let mut digest = sha2::Sha256::new();
+    for file in &closure.files {
+        elastos_common::validate_model_content_path(&file.path).map_err(anyhow::Error::msg)?;
+        if file.path.as_str() <= previous
+            || !paths.insert(file.path.to_ascii_lowercase())
+            || file.path.eq_ignore_ascii_case(CONTENT_OBJECT_MANIFEST_PATH)
+            || file.size == 0
+            || file.size > 16 * 1024 * 1024 * 1024
+            || (file.path != manifest.entrypoint && file.size > 1024 * 1024)
+            || file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("invalid, aliased or unbounded model content file");
+        }
+        previous = &file.path;
+        total = total
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow::anyhow!("model size overflow"))?;
+        digest.update(file.path.as_bytes());
+        digest.update(b"\0");
+        digest.update(file.sha256.as_bytes());
+        digest.update(b"\0");
+        digest.update(file.size.to_string().as_bytes());
+        digest.update(b"\0");
+    }
+    if total > 16 * 1024 * 1024 * 1024
+        || closure.content_digest != format!("sha256:{:x}", digest.finalize())
+    {
+        anyhow::bail!("model closure size or digest mismatch");
+    }
+    for path in [
+        &manifest.entrypoint,
+        &model.license.path,
+        &model.provenance.base_license.path,
+        &model.provenance.path,
+    ] {
+        if !closure.files.iter().any(|file| &file.path == path) {
+            anyhow::bail!("model content reference is absent from the closure");
+        }
+    }
+    for path in [
+        &model.license.path,
+        &model.provenance.base_license.path,
+        &model.provenance.path,
+    ] {
+        if path == &manifest.entrypoint || path == "capsule.json" {
+            anyhow::bail!("model notice must be a distinct closure file");
+        }
+    }
+    let capsule_file = closure
+        .files
+        .iter()
+        .find(|file| file.path == "capsule.json")
+        .ok_or_else(|| anyhow::anyhow!("model closure lacks capsule.json"))?;
+    verify_content_object_file("model-catalog", capsule_file, &capsule_bytes)?;
+    Ok((manifest, total))
 }
 
 pub async fn fetch_content_object_manifest(
@@ -2780,6 +3010,11 @@ impl Provider for ContentProvider {
     }
 }
 
+fn local_backend_needs_prepare(err: &ProviderError) -> bool {
+    let text = err.to_string();
+    text.contains("Bounded content read failed") || text.contains("bounded_read_failed")
+}
+
 impl ContentProvider {
     async fn invoke_provider(
         &self,
@@ -2848,15 +3083,26 @@ impl ContentProvider {
 
         let registry = self.registry()?;
         let transfer = ContentFetchTransfer::from_request(request)?;
+        let local_only = request.get("local_only").and_then(|value| value.as_bool()) == Some(true);
         let result = match self
             .fetch_from_local_backend(&registry, cid, path, &transfer)
             .await
         {
             Ok(result) => result,
-            Err(local_err)
-                if request.get("local_only").and_then(|value| value.as_bool()) == Some(true) =>
-            {
-                return Err(local_err);
+            Err(local_err) if local_only => {
+                if local_backend_needs_prepare(&local_err)
+                    && registry.prepare_local_ipfs_backend().await.is_ok()
+                {
+                    match self
+                        .fetch_from_local_backend(&registry, cid, path, &transfer)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    return Err(local_err);
+                }
             }
             Err(local_err) => match self
                 .fetch_from_availability_provider(&registry, cid, path, &transfer)
@@ -2922,6 +3168,12 @@ impl ContentProvider {
             "op": "cat",
             "cid": cid,
         });
+        if transfer.bounded_read {
+            ipfs_request["bounded_read"] = Value::Bool(true);
+        }
+        if let Some(max_bytes) = transfer.max_bytes {
+            ipfs_request["max_bytes"] = json!(max_bytes);
+        }
         if !path.is_empty() {
             ipfs_request["path"] = Value::String(path.to_string());
         }
@@ -2952,15 +3204,24 @@ impl ContentProvider {
         if !path.is_empty() {
             request["path"] = Value::String(path.to_string());
         }
+        // A bounded read travels as its own request so the holder applies the
+        // exact range or metadata bound once and returns only those bytes.
+        // Runtime's outer invocation carries no range to slice again.
+        let mut hop = transfer.clone();
+        if transfer.bounded_read {
+            request["bounded_read"] = Value::Bool(true);
+            if let Some(range) = transfer.range {
+                request["range"] = json!({ "start": range.start, "end": range.end });
+            }
+            if let Some(max_bytes) = transfer.max_bytes {
+                request["max_bytes"] = json!(max_bytes);
+            }
+            hop.range = None;
+            hop.progress = None;
+        }
 
         let response = match self
-            .invoke_provider_with_fetch_transfer(
-                registry,
-                "availability",
-                "fetch",
-                request,
-                transfer,
-            )
+            .invoke_provider_with_fetch_transfer(registry, "availability", "fetch", request, &hop)
             .await
         {
             Ok(response) => response,
@@ -2968,7 +3229,20 @@ impl ContentProvider {
             Err(err) => return Err(err),
         };
         if response.get("status").and_then(|status| status.as_str()) == Some("error") {
-            return Ok(None);
+            let code = response
+                .get("code")
+                .and_then(|value| value.as_str())
+                .unwrap_or("availability_error");
+            let message = response
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Carrier availability fetch failed");
+            return Err(ProviderError::Provider(format!(
+                "availability fetch failed ({code}): {message}"
+            )));
+        }
+        if transfer.bounded_read {
+            check_bounded_availability_payload(&response, transfer)?;
         }
         let availability = response
             .get("data")
@@ -3530,7 +3804,7 @@ impl ContentProvider {
             ));
         }
 
-        let outcome = AvailabilityOutcome {
+        let local_outcome = AvailabilityOutcome {
             provider: "ipfs-provider".to_string(),
             policy: "carrier_object_import".to_string(),
             status: "local_pinned".to_string(),
@@ -3543,6 +3817,23 @@ impl ContentProvider {
             repair_graph: local_repair_graph_json(),
             abuse_controls: local_abuse_controls_json(),
         };
+        let outcome = self
+            .ensure_network_availability(
+                &registry,
+                cid,
+                request,
+                &local_outcome,
+                AvailabilityRequestContext {
+                    object_did: request.get("object_did").and_then(|value| value.as_str()),
+                    publisher_did: publisher_did.as_deref(),
+                    accounting_observation: ContentAccountingObservation {
+                        files: Some(file_count as u64),
+                        bytes: Some(total_bytes as u64),
+                    },
+                },
+            )
+            .await?
+            .unwrap_or(local_outcome);
         let object_did = request
             .get("object_did")
             .and_then(|value| value.as_str())
@@ -3725,11 +4016,17 @@ impl ContentProvider {
             )
             .await?;
 
-        let (status, policy, replicas, reason) = if ipfs_response
+        let pin_failed = ipfs_response
             .get("status")
             .and_then(|status| status.as_str())
-            == Some("error")
-        {
+            == Some("error");
+        let imported_local_object = if pin_failed {
+            self.import_complete_local_object_matching(&registry, cid)
+                .await?
+        } else {
+            false
+        };
+        let (status, policy, replicas, reason) = if pin_failed && !imported_local_object {
             (
                 "repair_needed",
                 failure_policy,
@@ -3739,6 +4036,8 @@ impl ContentProvider {
                     .and_then(|message| message.as_str())
                     .map(str::to_string),
             )
+        } else if imported_local_object {
+            ("local_pinned", "local_object_import", 1, None)
         } else {
             ("local_pinned", success_policy, 1, None)
         };
@@ -3825,6 +4124,101 @@ impl ContentProvider {
             "repair_task": repair_task,
             "receipt": receipt,
         })))
+    }
+
+    async fn import_complete_local_object_matching(
+        &self,
+        registry: &ProviderRegistry,
+        cid: &str,
+    ) -> Result<bool, ProviderError> {
+        for dir in complete_local_object_dirs(&self.data_dir) {
+            match self.import_local_object_dir(registry, &dir).await {
+                Ok(imported_cid) if imported_cid == cid => return Ok(true),
+                Ok(imported_cid) => {
+                    let _ = self
+                        .invoke_provider(
+                            registry,
+                            "ipfs",
+                            "unpin",
+                            json!({
+                                "op": "unpin",
+                                "cid": imported_cid,
+                            }),
+                            ProviderTransfer::Json,
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        dir = %dir.display(),
+                        error = %err,
+                        "content: local object import skipped"
+                    );
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn import_local_object_dir(
+        &self,
+        registry: &ProviderRegistry,
+        dir: &Path,
+    ) -> Result<String, ProviderError> {
+        let files = local_object_dir_files(dir)?;
+        let ipfs_response = self
+            .invoke_provider(
+                registry,
+                "ipfs",
+                "add_directory",
+                json!({
+                    "op": "add_directory",
+                    "files": files,
+                    "pin": true,
+                }),
+                ProviderTransfer::Json,
+            )
+            .await?;
+        provider_response_ok(&ipfs_response, "content local object import")?;
+        provider_response_cid(&ipfs_response).map_err(|err| {
+            ProviderError::Provider(format!("content local object import missing CID: {err}"))
+        })
+    }
+
+    pub async fn restore_complete_local_objects(&self) {
+        let Ok(registry) = self.registry() else {
+            return;
+        };
+        for dir in complete_local_object_dirs(&self.data_dir) {
+            match self.import_local_object_dir(&registry, &dir).await {
+                Ok(cid) => match self
+                    .ensure(&json!({
+                        "cid": cid,
+                        "availability_requirements": {
+                            "min_replicas": 1,
+                            "max_replicas": 1,
+                            "require_live_multi_peer_proof": false
+                        }
+                    }))
+                    .await
+                {
+                    Ok(_) => tracing::info!(
+                        cid = %cid,
+                        "content: restored complete local object replica"
+                    ),
+                    Err(err) => tracing::warn!(
+                        cid = %cid,
+                        error = %err,
+                        "content: restore local object replica failed"
+                    ),
+                },
+                Err(err) => tracing::debug!(
+                    dir = %dir.display(),
+                    error = %err,
+                    "content: restore local object import skipped"
+                ),
+            }
+        }
     }
 
     async fn ensure_network_availability(
@@ -8158,6 +8552,54 @@ fn provider_transfer_value(response: &Value) -> Option<Value> {
     response.get("_runtime_transfer").cloned()
 }
 
+/// A holder answering a bounded read returns base64 bytes whose length is the
+/// requested range exactly, or one to `max_bytes` for complete metadata.
+fn check_bounded_availability_payload(
+    response: &Value,
+    transfer: &ContentFetchTransfer,
+) -> Result<(), ProviderError> {
+    let invalid =
+        |detail: &str| ProviderError::Provider(format!("bounded availability payload {detail}"));
+    let expected = match (transfer.range, transfer.max_bytes) {
+        (Some(range), None) => range
+            .end
+            .and_then(|end| end.checked_sub(range.start))
+            .and_then(|size| size.checked_add(1))
+            .ok_or_else(|| invalid("requires a closed range"))?,
+        (None, Some(max_bytes)) => max_bytes,
+        _ => return Err(invalid("requires a range or a metadata bound")),
+    };
+    // Runtime normalized a stream transfer from the decoded bytes already;
+    // a bytes transfer still carries the holder's base64 payload.
+    let length = if let Some(stream) = response.pointer("/data/stream") {
+        stream
+            .get("total_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid("stream lacks total_bytes"))?
+    } else {
+        let encoded = response
+            .pointer("/data/data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("must be base64 data or a stream"))?;
+        if encoded.len() as u64 > expected.div_ceil(3) * 4 {
+            return Err(invalid("exceeds the requested bound"));
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| invalid("is not valid base64"))?
+            .len() as u64
+    };
+    let accepted = if transfer.range.is_some() {
+        length == expected
+    } else {
+        (1..=expected).contains(&length)
+    };
+    if !accepted {
+        return Err(invalid("length does not match the requested bound"));
+    }
+    Ok(())
+}
+
 fn is_valid_cid(value: &str) -> bool {
     cid::Cid::try_from(value).is_ok()
 }
@@ -8178,6 +8620,120 @@ fn validate_content_path(path: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn complete_local_object_dirs(data_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    walk_local_object_dirs(data_dir, 0, &mut found);
+    if let Some(owner) = managed_home_owner_data_dir() {
+        if owner != data_dir {
+            walk_local_object_dirs(&owner, 0, &mut found);
+        }
+    }
+    found
+}
+
+fn managed_home_owner_data_dir() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("ELASTOS_MANAGED_GATEWAY_OWNER") {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            if let Some(dir) = value.get("data_dir").and_then(|v| v.as_str()) {
+                let path = PathBuf::from(dir);
+                if path.is_absolute() && path.is_dir() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    std::env::var("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir())
+}
+
+fn walk_local_object_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if found.len() >= MAX_LOCAL_OBJECT_DIRS || depth > MAX_LOCAL_OBJECT_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if found.len() >= MAX_LOCAL_OBJECT_DIRS {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if LOCAL_OBJECT_WALK_SKIP
+            .iter()
+            .any(|skip| *skip == name.as_ref())
+        {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join(OBJECT_MANIFEST_PATH).is_file() {
+            if local_object_dir_is_complete(&path) {
+                found.push(path);
+            }
+            continue;
+        }
+        walk_local_object_dirs(&path, depth + 1, found);
+    }
+}
+
+fn local_object_dir_is_complete(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join(OBJECT_MANIFEST_PATH)) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<ContentObjectManifest>(&bytes) else {
+        return false;
+    };
+    if manifest.schema != OBJECT_MANIFEST_SCHEMA || manifest.files.is_empty() {
+        return false;
+    }
+    manifest.files.iter().all(|file| {
+        if validate_content_path(&file.path).is_err() {
+            return false;
+        }
+        let path = dir.join(&file.path);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        bytes.len() as u64 == file.size
+            && format!("{:x}", sha2::Sha256::digest(&bytes)) == file.sha256
+    })
+}
+
+fn local_object_dir_files(dir: &Path) -> Result<Vec<Value>, ProviderError> {
+    let manifest_path = dir.join(OBJECT_MANIFEST_PATH);
+    let manifest_bytes = std::fs::read(&manifest_path)?;
+    let manifest: ContentObjectManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|err| {
+            ProviderError::Provider(format!(
+                "content local object manifest decode failed: {err}"
+            ))
+        })?;
+    let mut files = Vec::with_capacity(manifest.files.len().saturating_add(1));
+    for file in &manifest.files {
+        if validate_content_path(&file.path).is_err() {
+            return Err(ProviderError::Provider(format!(
+                "content local object path {} is invalid",
+                file.path
+            )));
+        }
+        let bytes = std::fs::read(dir.join(&file.path))?;
+        files.push(json!({
+            "path": file.path,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }));
+    }
+    files.push(json!({
+        "path": OBJECT_MANIFEST_PATH,
+        "data": base64::engine::general_purpose::STANDARD.encode(manifest_bytes),
+    }));
+    Ok(files)
 }
 
 fn with_directory_object_manifest(
@@ -8589,6 +9145,7 @@ mod tests {
         pinned: Mutex<Vec<String>>,
         pin_error: Mutex<Option<String>>,
         unpinned: Mutex<Vec<String>>,
+        bounded_read_not_ready: Mutex<bool>,
     }
 
     struct MockAvailabilityProvider {
@@ -8641,6 +9198,17 @@ mod tests {
                         .and_then(|path| path.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if request
+                        .get("bounded_read")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                        && *self.bounded_read_not_ready.lock().await
+                    {
+                        return Ok(provider_error(
+                            "bounded_read_failed",
+                            "Bounded content read failed",
+                        ));
+                    }
                     if self
                         .missing_paths
                         .lock()
@@ -8905,6 +9473,7 @@ mod tests {
             pinned: Mutex::new(Vec::new()),
             pin_error: Mutex::new(None),
             unpinned: Mutex::new(Vec::new()),
+            bounded_read_not_ready: Mutex::new(false),
         });
         registry
             .register_sub_provider("ipfs", ipfs.clone())
@@ -10967,6 +11536,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_ensure_imports_complete_local_object_when_pin_fails() {
+        let (data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        *ipfs.pin_error.lock().await = Some("not in local repo".to_string());
+        let body = b"hello object";
+        let digest = format!("{:x}", sha2::Sha256::digest(body));
+        let object_dir = data_dir.path().join("held-object");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(object_dir.join("index.md"), body).unwrap();
+        std::fs::write(
+            object_dir.join(OBJECT_MANIFEST_PATH),
+            serde_json::to_vec(&json!({
+                "schema": OBJECT_MANIFEST_SCHEMA,
+                "kind": "directory",
+                "content_digest": format!("sha256:{digest}"),
+                "files": [{
+                    "path": "index.md",
+                    "sha256": digest,
+                    "size": body.len() as u64
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "availability": {
+                    "status": "carrier_announced",
+                    "provider": "carrier-availability",
+                    "policy": "network_default",
+                    "replicas": 1,
+                    "peer_selection": {
+                        "mode": "carrier_topic",
+                        "strategy": "local_holder",
+                        "topic": "elastos.content.availability"
+                    },
+                    "quota": {
+                        "policy": "local_holder",
+                        "status": "within_quota"
+                    },
+                    "repair_worker": {
+                        "scheduled": false,
+                        "status": "idle"
+                    }
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+
+        let response = content
+            .send_raw(&json!({
+                "op": "ensure",
+                "cid": TEST_CID,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_ne!(
+            response["data"]["availability"]["status"], "repair_needed",
+            "complete local object must become a Content replica: {response}"
+        );
+        assert_eq!(response["data"]["availability"]["replicas"], 1);
+        assert_eq!(ipfs.added_directories.lock().await.len(), 1);
+        let sent = availability.requests.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["op"], "ensure");
+        assert_eq!(sent[0]["local"]["replicas"], 1);
+        assert_eq!(sent[0]["local"]["policy"], "local_object_import");
+        assert_eq!(
+            response["data"]["availability"]["status"],
+            "carrier_announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_restore_imports_complete_local_objects() {
+        let (data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let body = b"hello object";
+        let digest = format!("{:x}", sha2::Sha256::digest(body));
+        let object_dir = data_dir.path().join("held-object");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(object_dir.join("index.md"), body).unwrap();
+        std::fs::write(
+            object_dir.join(OBJECT_MANIFEST_PATH),
+            serde_json::to_vec(&json!({
+                "schema": OBJECT_MANIFEST_SCHEMA,
+                "kind": "directory",
+                "content_digest": format!("sha256:{digest}"),
+                "files": [{
+                    "path": "index.md",
+                    "sha256": digest,
+                    "size": body.len() as u64
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        content.restore_complete_local_objects().await;
+
+        assert_eq!(ipfs.added_directories.lock().await.len(), 1);
+        assert_eq!(ipfs.pinned.lock().await.as_slice(), [TEST_CID.to_string()]);
+    }
+
+    #[tokio::test]
     async fn content_publish_file_wraps_ipfs_bytes_with_receipt() {
         let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
         let cid = publish_bytes_via_provider(
@@ -11183,6 +11858,497 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_bounded_read_validates_native_receipt_once_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let content = Arc::new(ContentProvider::new(
+            root.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register_sub_provider("content", content)
+            .await
+            .unwrap();
+        // Reuse the fixture's fixed-response provider at the existing IPFS slot.
+        let backend = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(b"89ab"),
+                "_runtime_applied_range": { "schema": "elastos.provider.applied-range/v1",
+                    "cid": TEST_CID, "path": "weights.gguf", "start": 8, "end": 11 }
+            }))),
+        });
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+        let request = json!({ "op": "fetch", "cid": TEST_CID, "path": "weights.gguf",
+            "bounded_read": true, "range": { "start": 8, "end": 11 },
+            "progress": { "request_id": "bounded-content", "expected_bytes": 4 } });
+        for (transfer, outer_transfer) in [
+            ("bytes", ProviderTransfer::Bytes),
+            ("stream", ProviderTransfer::Stream),
+        ] {
+            let mut request = request.clone();
+            request["transfer"] = json!(transfer);
+            let response = registry
+                .invoke_provider(ProviderInvocation {
+                    source: "fixture-runtime".into(),
+                    target: "content".into(),
+                    op: "fetch".into(),
+                    request,
+                    transfer: outer_transfer,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .unwrap();
+            let bytes = if transfer == "bytes" {
+                base64::engine::general_purpose::STANDARD
+                    .decode(response["data"]["data"].as_str().unwrap())
+                    .unwrap()
+            } else {
+                decode_test_stream_payload(&response["data"]["stream"])
+            };
+            assert_eq!(bytes, b"89ab");
+            assert!(!response.to_string().contains("_runtime_applied_range"));
+            assert_eq!(
+                response["data"]["transfer"]["range"],
+                json!({ "start": 8, "end": 11 })
+            );
+        }
+        let sent = backend.requests.lock().await;
+        assert_eq!(sent.len(), 2);
+        for request in sent.iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(
+                request["_runtime_invocation"]["range"],
+                json!({ "start": 8, "end": 11 })
+            );
+        }
+        drop(sent);
+        let mut stream_request = request.clone();
+        stream_request["transfer"] = json!("stream");
+        let mut session = registry
+            .open_provider_stream(
+                ProviderInvocation {
+                    source: "runtime-content-consumer".into(),
+                    target: "content".into(),
+                    op: "fetch".into(),
+                    request: stream_request,
+                    transfer: ProviderTransfer::Stream,
+                    range: None,
+                    progress: Some(ProviderProgress {
+                        request_id: "bounded-content".into(),
+                        expected_bytes: Some(4),
+                    }),
+                    transport: ProviderInvocationTransport::Local,
+                },
+                ProviderStreamOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.drain_to_vec().unwrap(), b"89ab");
+        for response in [
+            provider_error("not_found", "missing"),
+            provider_ok(
+                json!({ "data": base64::engine::general_purpose::STANDARD.encode(b"89ab") }),
+            ),
+            provider_ok(json!({ "data": "ODlhYg==", "_runtime_applied_range": {
+                "schema": "elastos.provider.applied-range/v1", "cid": TEST_CID,
+                "path": "other.gguf", "start": 8, "end": 11 } })),
+        ] {
+            *backend.response.lock().await = response;
+            assert!(registry
+                .invoke_provider(ProviderInvocation {
+                    source: "fixture-runtime".into(),
+                    target: "content".into(),
+                    op: "fetch".into(),
+                    request: request.clone(),
+                    transfer: ProviderTransfer::Json,
+                    range: None,
+                    progress: None,
+                    transport: ProviderInvocationTransport::Local,
+                })
+                .await
+                .is_err());
+        }
+        assert_eq!(backend.requests.lock().await.len(), 6);
+        // Each local failure consults the availability plane once with the
+        // same bound; its empty answer leaves the read failed.
+        let forwarded = availability.requests.lock().await;
+        assert_eq!(forwarded.len(), 3);
+        for request in forwarded.iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(request["range"], json!({ "start": 8, "end": 11 }));
+            assert!(request["_runtime_invocation"]["range"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn content_bounded_read_retrieves_exact_range_from_availability_when_local_misses() {
+        let (_root, registry, ipfs, _content) = registry_with_content_and_ipfs().await;
+        {
+            let mut missing = ipfs.missing_paths.lock().await;
+            missing.push("weights.gguf".to_string());
+            missing.push(CONTENT_OBJECT_MANIFEST_PATH.to_string());
+        }
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": encode(b"89ab"),
+                "availability": {
+                    "status": "network_available", "provider": "mock-availability",
+                    "policy": "carrier_provider_invoke", "replicas": 1
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+        let invoke = |request: Value, transfer: ProviderTransfer| {
+            registry.invoke_provider(ProviderInvocation {
+                source: "runtime-model-preparation".into(),
+                target: "content".into(),
+                op: "fetch".into(),
+                request,
+                transfer,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+        };
+        let range_request = json!({ "op": "fetch", "cid": TEST_CID, "path": "weights.gguf",
+            "bounded_read": true, "range": { "start": 8, "end": 11 }, "transfer": "bytes" });
+        let response = invoke(range_request.clone(), ProviderTransfer::Bytes)
+            .await
+            .unwrap();
+        assert_eq!(response["data"]["data"], encode(b"89ab"));
+        assert_eq!(
+            response["data"]["availability"]["provider"],
+            "mock-availability"
+        );
+        {
+            let sent = availability.requests.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["cid"], TEST_CID);
+            assert_eq!(sent[0]["path"], "weights.gguf");
+            assert_eq!(sent[0]["bounded_read"], true);
+            assert_eq!(sent[0]["range"], json!({ "start": 8, "end": 11 }));
+            assert!(
+                sent[0]["_runtime_invocation"]["range"].is_null(),
+                "the holder applies the range once; Runtime must not slice again"
+            );
+        }
+        let mut stream_request = range_request.clone();
+        stream_request["transfer"] = json!("stream");
+        let response = invoke(stream_request, ProviderTransfer::Stream)
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_test_stream_payload(&response["data"]["stream"]),
+            b"89ab"
+        );
+        for bytes in [b"89abc".as_slice(), b"89a".as_slice(), b"".as_slice()] {
+            *availability.response.lock().await = provider_ok(json!({ "data": encode(bytes) }));
+            assert!(
+                invoke(range_request.clone(), ProviderTransfer::Bytes)
+                    .await
+                    .is_err(),
+                "{} bytes for a 4-byte range",
+                bytes.len()
+            );
+        }
+        let metadata_request = json!({ "op": "fetch", "cid": TEST_CID,
+            "path": CONTENT_OBJECT_MANIFEST_PATH, "bounded_read": true,
+            "max_bytes": 65536, "transfer": "bytes" });
+        *availability.response.lock().await =
+            provider_ok(json!({ "data": encode(b"{\"schema\":\"fixture\"}") }));
+        let response = invoke(metadata_request.clone(), ProviderTransfer::Bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            response["data"]["data"],
+            encode(b"{\"schema\":\"fixture\"}")
+        );
+        assert_eq!(
+            availability.requests.lock().await.last().unwrap()["max_bytes"],
+            65536
+        );
+        *availability.response.lock().await =
+            provider_ok(json!({ "data": encode(&vec![b'x'; 65537]) }));
+        assert!(invoke(metadata_request, ProviderTransfer::Bytes)
+            .await
+            .is_err());
+        let sent_before_local_only = availability.requests.lock().await.len();
+        let mut local_only = range_request.clone();
+        local_only["local_only"] = json!(true);
+        assert!(invoke(local_only, ProviderTransfer::Bytes).await.is_err());
+        assert_eq!(
+            availability.requests.lock().await.len(),
+            sent_before_local_only,
+            "local_only never reaches the availability plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_bounded_read_invalid_contract_has_no_provider_effect() {
+        let (_root, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        for invalid in [json!("true"), Value::Null, json!(1)] {
+            assert!(content
+                .send_raw(&json!({ "op": "fetch", "cid": TEST_CID,
+                    "bounded_read": invalid, "range": { "start": 8, "end": 11 }
+                }))
+                .await
+                .is_err());
+        }
+        for range in [
+            Value::Null,
+            json!({ "start": 8 }),
+            json!({ "start": 9, "end": 8 }),
+            json!({ "start": 0, "end": 65536 }),
+        ] {
+            assert!(content
+                .send_raw(&json!({ "op": "fetch", "cid": TEST_CID,
+                    "bounded_read": true, "range": range
+                }))
+                .await
+                .is_err());
+        }
+        assert!(ipfs.requests.lock().await.is_empty());
+        assert!(registry.get("availability").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn content_complete_metadata_preserves_exact_bytes_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let content = Arc::new(ContentProvider::new(
+            root.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register_sub_provider("content", content)
+            .await
+            .unwrap();
+        let bytes = b" \n{ \"files\": [] }\t\n";
+        let valid = provider_ok(json!({
+            "data":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "_runtime_complete_metadata":{
+                "schema":"elastos.provider.complete-metadata/v1", "cid":TEST_CID,
+                "path":OBJECT_MANIFEST_PATH, "max_bytes":65536,
+                "actual_bytes":bytes.len(), "completed":true
+            }
+        }));
+        let backend = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(valid.clone()),
+        });
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+        let invocation = |transfer, name| ProviderInvocation {
+            source: "fixture-runtime".into(),
+            target: "content".into(),
+            op: "fetch".into(),
+            request: json!({"op":"fetch", "cid":TEST_CID, "path":OBJECT_MANIFEST_PATH,
+                "bounded_read":true, "max_bytes":65536, "transfer":name}),
+            transfer,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        };
+        for (transfer, name) in [
+            (ProviderTransfer::Bytes, "bytes"),
+            (ProviderTransfer::Stream, "stream"),
+        ] {
+            let response = registry
+                .invoke_provider(invocation(transfer, name))
+                .await
+                .unwrap();
+            let actual = if name == "bytes" {
+                base64::engine::general_purpose::STANDARD
+                    .decode(response["data"]["data"].as_str().unwrap())
+                    .unwrap()
+            } else {
+                decode_test_stream_payload(&response["data"]["stream"])
+            };
+            assert_eq!(actual, bytes);
+            assert!(!response.to_string().contains("_runtime_complete_metadata"));
+            assert!(!response.to_string().contains("_runtime_applied_range"));
+        }
+        let mut failures = vec![
+            provider_error("bounded_read_failed", "Bounded content read failed"),
+            provider_ok(json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes)})),
+        ];
+        for (field, value) in [
+            ("cid", json!("other-cid")),
+            ("path", json!("other.json")),
+            ("completed", json!(false)),
+            ("actual_bytes", json!(bytes.len() + 1)),
+            ("max_bytes", json!(65535)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["data"]["_runtime_complete_metadata"][field] = value;
+            failures.push(invalid);
+        }
+        let count = 2 + failures.len();
+        for failure in failures {
+            *backend.response.lock().await = failure;
+            assert!(registry
+                .invoke_provider(invocation(ProviderTransfer::Bytes, "bytes"))
+                .await
+                .is_err());
+        }
+        let sent = backend.requests.lock().await;
+        assert_eq!(sent.len(), count);
+        for request in sent.iter() {
+            assert_eq!(request["cid"], TEST_CID);
+            assert_eq!(request["path"], OBJECT_MANIFEST_PATH);
+            assert_eq!(request["max_bytes"], 65536);
+            assert_eq!(request["bounded_read"], true);
+            assert!(request["_runtime_invocation"]["range"].is_null());
+            assert!(request["_runtime_invocation"]["progress"]["expected_bytes"].is_null());
+        }
+        drop(sent);
+        // Each local failure forwards the same metadata bound to the
+        // availability plane once; its empty answer leaves the read failed.
+        let forwarded = availability.requests.lock().await;
+        assert_eq!(forwarded.len(), count - 2);
+        for request in forwarded.iter() {
+            assert_eq!(request["bounded_read"], true);
+            assert_eq!(request["max_bytes"], 65536);
+            assert_eq!(request["path"], OBJECT_MANIFEST_PATH);
+            assert!(request["_runtime_invocation"]["range"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn content_complete_metadata_invalid_contract_has_no_provider_effect() {
+        let (_root, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let request = json!({"op":"fetch", "cid":TEST_CID, "path":OBJECT_MANIFEST_PATH,
+            "bounded_read":true, "max_bytes":65536});
+        for (field, value) in [
+            ("max_bytes", Value::Null),
+            ("max_bytes", json!("65536")),
+            ("max_bytes", json!(0)),
+            ("max_bytes", json!(65537)),
+            ("range", json!({"start":0,"end":3})),
+            (
+                "progress",
+                json!({"request_id":"metadata","expected_bytes":4}),
+            ),
+            ("path", json!("weights.gguf")),
+            ("bounded_read", json!(false)),
+            ("transfer", json!("json")),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = value;
+            assert!(content.send_raw(&invalid).await.is_err(), "{field}");
+        }
+        assert!(ipfs.requests.lock().await.is_empty());
+        assert!(registry.get("availability").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn content_fetch_rejects_max_bytes_for_a_non_index_path_and_forwards_declared_range() {
+        // Exclusive LICENSE miss: max_bytes is the whole-index metadata bound.
+        // A non-index file uses the signed size as a closed 64 KiB range.
+        let (_root, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let err = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": "docs/readme.md",
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "transfer": "stream"
+            }))
+            .await
+            .expect_err("max_bytes stays the whole-index bound");
+        assert!(
+            err.to_string()
+                .contains("complete metadata requires a local bounded whole index"),
+            "{err}"
+        );
+        assert!(ipfs.requests.lock().await.is_empty());
+        assert!(registry.get("availability").await.is_none());
+
+        ipfs.missing_paths
+            .lock()
+            .await
+            .push("docs/readme.md".to_string());
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": encode(b"89ab"),
+                "availability": {
+                    "status": "network_available",
+                    "provider": "mock-availability",
+                    "policy": "carrier_provider_invoke",
+                    "replicas": 1
+                }
+            }))),
+        });
+        registry.register(availability.clone()).await;
+        let response = registry
+            .invoke_provider(ProviderInvocation {
+                source: "runtime-model-preparation".into(),
+                target: "content".into(),
+                op: "fetch".into(),
+                request: json!({
+                    "op": "fetch",
+                    "cid": TEST_CID,
+                    "path": "docs/readme.md",
+                    "bounded_read": true,
+                    "range": { "start": 0, "end": 3 },
+                    "transfer": "stream"
+                }),
+                transfer: ProviderTransfer::Stream,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_test_stream_payload(&response["data"]["stream"]),
+            b"89ab"
+        );
+        let sent = availability.requests.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["path"], "docs/readme.md");
+        assert_eq!(sent[0]["bounded_read"], true);
+        assert_eq!(sent[0]["range"], json!({ "start": 0, "end": 3 }));
+        assert!(sent[0].get("max_bytes").is_none());
+        assert!(sent[0]["_runtime_invocation"]["range"].is_null());
+    }
+
+    #[tokio::test]
+    async fn fetch_model_part_requires_a_declared_range_for_a_non_index_path() {
+        let (_root, registry, _ipfs, _content) = registry_with_content_and_ipfs().await;
+        let err = fetch_model_part(&registry, TEST_CID, "docs/readme.md", None)
+            .await
+            .expect_err("non-index files use a declared range");
+        assert!(
+            err.to_string().contains("complete model index required"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn content_fetch_ranges_availability_provider_when_local_backend_misses() {
         let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
         ipfs.missing_paths
@@ -11347,6 +12513,52 @@ mod tests {
 
         assert!(err.to_string().contains("content fetch"));
         assert!(availability.requests.lock().await.is_empty());
+    }
+
+    #[test]
+    fn local_backend_needs_prepare_matches_holder_cold_bounded_read() {
+        assert!(local_backend_needs_prepare(&ProviderError::Provider(
+            "content fetch failed: Bounded content read failed".into(),
+        )));
+        assert!(local_backend_needs_prepare(&ProviderError::Provider(
+            "bounded_read_failed".into(),
+        )));
+        assert!(!local_backend_needs_prepare(&ProviderError::Provider(
+            "content fetch failed: mock content path missing".into(),
+        )));
+    }
+
+    #[tokio::test]
+    async fn content_fetch_local_only_cold_bounded_read_does_not_use_availability() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(b"remote content"),
+            }))),
+        });
+        registry.register(availability.clone()).await;
+        *ipfs.bounded_read_not_ready.lock().await = true;
+        let err = content
+            .send_raw(&json!({
+                "op": "fetch",
+                "cid": TEST_CID,
+                "path": CONTENT_OBJECT_MANIFEST_PATH,
+                "bounded_read": true,
+                "max_bytes": 65536,
+                "local_only": true,
+            }))
+            .await
+            .expect_err("cold bounded local_only fetch must fail closed");
+        assert!(
+            err.to_string().contains("Bounded content read failed"),
+            "{err}"
+        );
+        assert!(availability.requests.lock().await.is_empty());
+        assert!(
+            ipfs.requests.lock().await.len() <= 2,
+            "one bounded miss plus at most one prepare retry"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fixture owns setup, launch, and cleanup after bootstrap.
+export ELASTOS_INSTALL_ONLY=1
+
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 TEST_ROOT="${ELASTOS_NATIVE_CHAT_TEST_ROOT:-$(mktemp -d /tmp/elastos-installed-native-chat.XXXXXX)}"
 SMOKE_ID="$(python3 - <<'PY'

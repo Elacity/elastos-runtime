@@ -2,16 +2,15 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process;
-#[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{self, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicI32, Ordering},
+    Arc, Once,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,14 +35,18 @@ const VZ_TRANSPORT_SECRET_SCHEMA: &str = "elastos.browser.vz-transport-secret/v1
 const VZ_LAUNCH_SETTLEMENT_SCHEMA: &str = "elastos.browser.vz-launch-settlement/v1";
 const VZ_MEDIA_DIAGNOSTIC_SCHEMA: &str = "elastos.browser.media-diagnostic/v1";
 const DEFAULT_CONTROL_PORT: u32 = 19092;
+const TURN_PORT_ABSENCE_BUDGET: Duration = Duration::from_secs(3);
+const TURN_PORT_ABSENCE_POLL: Duration = Duration::from_millis(50);
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
 const EGRESS_COPY_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GUEST_CONTROL_ERROR_CHARS: usize = 512;
 const MAX_SETTLEMENT_MESSAGE_CHARS: usize = 2 * 1024;
 const DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS: u32 = 120_000;
+const DEFAULT_PROFILE_FLUSH_TIMEOUT_MS: u32 = 30_000;
 const BROWSER_VM_TARGET_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -79,6 +82,22 @@ const VZ_AUTHORITY_BOOT_ARG_PREFIXES: [&str; 4] = [
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--host-capabilities") {
+        let supported = elastos_vz::is_supported();
+        let entitled = std::env::current_exe()
+            .ok()
+            .is_some_and(|path| verify_virtualization_entitlement(&path).is_ok());
+        println!(
+            "{}",
+            json!({
+                "schema": "elastos.browser.vm-host-capabilities/v1",
+                "available": supported && entitled,
+                "reason": if !supported { Some("host_unsupported") }
+                    else if !entitled { Some("preparation_required") } else { None },
+            })
+        );
+        return;
+    }
     init_tracing();
     if let Err(error) = run().await {
         eprintln!("{error}");
@@ -235,11 +254,25 @@ impl VzLaunchOwner {
         self.settlement_with_absence(message, absence)
     }
 
+    async fn settle_failed_profile_flush(&mut self, message: impl AsRef<str>) -> String {
+        let absence = self.cleanup().await;
+        self.settlement_with_absence_and_profile_durability(message, absence, Some("failed"))
+    }
+
     fn settlement_with_absence(&self, message: impl AsRef<str>, absence: Value) -> String {
+        self.settlement_with_absence_and_profile_durability(message, absence, None)
+    }
+
+    fn settlement_with_absence_and_profile_durability(
+        &self,
+        message: impl AsRef<str>,
+        absence: Value,
+        profile_durability: Option<&str>,
+    ) -> String {
         let terminal = absence
             .as_object()
             .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)));
-        serde_json::to_string(&json!({
+        let mut settlement = json!({
             "schema": VZ_LAUNCH_SETTLEMENT_SCHEMA,
             "state": if terminal {
                 "terminal_post_effect_cleanup"
@@ -255,8 +288,11 @@ impl VzLaunchOwner {
             "media_stream_id": self.identity.media_stream_id,
             "effects": self.effects(),
             "absence": absence,
-        }))
-        .unwrap_or_else(|_| {
+        });
+        if let Some(durability) = profile_durability {
+            settlement["profile_durability"] = json!(durability);
+        }
+        serde_json::to_string(&settlement).unwrap_or_else(|_| {
             "Browser VZ launch cleanup settlement serialization failed; cleanup remains indeterminate"
                 .to_string()
         })
@@ -343,10 +379,7 @@ impl VzLaunchOwner {
             .as_str()
             .is_some_and(|vm_id| remove_owned_vm_state(&self.paths, vm_id, vm_absent));
         let (turn_listener_absent, turn_relay_ports_absent) = if probe_turn_ports {
-            (
-                turn_listener_port_absent(&self.transport),
-                turn_relay_ports_absent(&self.transport),
-            )
+            wait_for_owned_turn_ports_absent(&self.transport).await
         } else {
             (true, true)
         };
@@ -459,6 +492,11 @@ async fn run() -> Result<(), String> {
             .as_ref()
             .expect("Browser VZ profile disk owner")
             .profile_key,
+        owner
+            .profile_disk
+            .as_ref()
+            .expect("Browser VZ profile disk owner")
+            .initialize,
     );
     owner.turn_process = true;
     owner.turn_cleanup = TurnCleanupEvidence::Indeterminate;
@@ -657,7 +695,41 @@ async fn run() -> Result<(), String> {
     trace_stage("open_guest_page_done", "");
 
     println!("{}", post_effect_try!(serde_json::to_string(&result)));
-    wait_for_shutdown_or_transport_expiry(Some(&owner.transport)).await;
+    let shutdown_reason = wait_for_shutdown_or_transport_expiry(
+        Some(&owner.transport),
+        owner.provider.clone(),
+        owner.handle.clone(),
+    )
+    .await;
+    eprintln!("{}", format_shutdown_wait_reason(&shutdown_reason));
+    if let ShutdownWaitReason::Signal { sender_pid, .. } = &shutdown_reason {
+        eprintln!(
+            "browser-vz-engine-supervisor stage=shutdown_wait_sender sender_pid={sender_pid} comm={}",
+            shutdown_signal_sender_comm(*sender_pid)
+        );
+    }
+    if let ShutdownWaitReason::GuestStopped { state } = &shutdown_reason {
+        return Err(owner
+            .settle_failure(format!("Browser VZ guest or framework stopped ({state})"))
+            .await);
+    }
+    let mut profile_durability = None;
+    if let (Some(provider), Some(handle)) = (owner.provider.clone(), owner.handle.clone()) {
+        let flush =
+            request_guest_profile_disk_flush(provider, &handle, owner.paths.control_port).await;
+        eprintln!(
+            "browser-vz-engine-supervisor stage=guest_profile_flush {}",
+            format_guest_profile_flush(&flush)
+        );
+        if !guest_profile_disk_flush_accepted(&flush) {
+            return Err(owner
+                .settle_failed_profile_flush(
+                    "Browser VZ guest shutdown did not flush the profile disk",
+                )
+                .await);
+        }
+        profile_durability = Some("proved");
+    }
     let absence = owner.cleanup().await;
     if !absence
         .as_object()
@@ -667,6 +739,16 @@ async fn run() -> Result<(), String> {
             "Browser VZ normal shutdown did not prove terminal cleanup",
             absence,
         ));
+    }
+    if let Some(durability) = profile_durability {
+        eprintln!(
+            "{}",
+            owner.settlement_with_absence_and_profile_durability(
+                "Browser VZ guest shutdown flushed the profile disk",
+                absence,
+                Some(durability),
+            )
+        );
     }
     Ok(())
 }
@@ -1498,12 +1580,22 @@ impl LaunchTurn {
             .and_then(|_| file.sync_all())
             .map_err(|err| format!("Browser VZ TURN config write failed: {err}"))?;
         drop(file);
-        let mut child = std::process::Command::new(&program)
+        let mut command = std::process::Command::new(&program);
+        command
             .arg("-c")
             .arg(&config_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .spawn()
             .map_err(|err| format!("Browser VZ TURN process failed to start: {err}"))?;
         let mut log_threads = Vec::with_capacity(2);
@@ -1568,9 +1660,12 @@ impl LaunchTurn {
     }
 
     fn terminate_and_reap(&mut self) -> bool {
+        let child_pid = self.child.id() as i32;
+        signal_owned_turn_process_group(child_pid, libc::SIGTERM);
         let child_absent = match self.child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => {
+                signal_owned_turn_process_group(child_pid, libc::SIGKILL);
                 let _ = self.child.kill();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
@@ -1983,6 +2078,29 @@ fn turn_listener_port_absent(transport: &VzTransportLaunch) -> bool {
     std::net::TcpListener::bind((bindings.listen_host.as_str(), bindings.listen_port)).is_ok()
 }
 
+fn signal_owned_turn_process_group(child_pid: i32, signum: libc::c_int) {
+    if child_pid > 1 {
+        unsafe {
+            libc::killpg(child_pid, signum);
+        }
+    }
+}
+
+async fn wait_for_owned_turn_ports_absent(transport: &VzTransportLaunch) -> (bool, bool) {
+    let deadline = Instant::now() + TURN_PORT_ABSENCE_BUDGET;
+    loop {
+        let listener = turn_listener_port_absent(transport);
+        let relays = turn_relay_ports_absent(transport);
+        if listener && relays {
+            return (true, true);
+        }
+        if Instant::now() >= deadline {
+            return (listener, relays);
+        }
+        tokio::time::sleep(TURN_PORT_ABSENCE_POLL).await;
+    }
+}
+
 fn turn_relay_ports_absent(transport: &VzTransportLaunch) -> bool {
     let Ok(bindings) = turn_port_bindings(transport) else {
         return false;
@@ -2284,10 +2402,242 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
             err
         )
     })?;
+    overlay_guest_selkies_control_service(&launch_rootfs)?;
+    overlay_guest_webrtc_send_diagnostic(&launch_rootfs)?;
     Ok(PreparedLaunchRootfs {
         path: launch_rootfs,
         _lock: None,
     })
+}
+
+const GUEST_SELKIES_CONTROL_SERVICE: &str = "/opt/elastos/bin/browser-selkies-control-service.mjs";
+const GUEST_GSTWEBRTC_APP: &str =
+    "/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py";
+const GUEST_SELKIES_START: &str = "/opt/elastos/bin/browser-vm-selkies-start";
+
+fn find_debugfs_bin() -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("ELASTOS_DEBUGFS_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "ELASTOS_DEBUGFS_BIN is not a file: {}",
+            path.display()
+        ));
+    }
+    for candidate in [
+        "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
+        "/usr/local/opt/e2fsprogs/sbin/debugfs",
+        "/usr/sbin/debugfs",
+        "/sbin/debugfs",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("debugfs is required to overlay the guest Browser control service".to_string())
+}
+
+fn host_selkies_control_service_path() -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE is not a file: {}",
+            path.display()
+        ));
+    }
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    if let Some(bin_dir) = exe.parent() {
+        if let Some(data_dir) = bin_dir.parent() {
+            let candidate = data_dir.join("scripts/browser-selkies-control-service.mjs");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("Browser selkies control service source is missing".to_string())
+}
+
+fn overlay_guest_selkies_control_service(rootfs: &Path) -> Result<(), String> {
+    let source = host_selkies_control_service_path()?;
+    let debugfs = find_debugfs_bin()?;
+    let staging =
+        std::env::temp_dir().join(format!("evz-selkies-control-{}.mjs", std::process::id()));
+    fs::copy(&source, &staging).map_err(|err| {
+        format!(
+            "stage guest Browser control service {} failed: {err}",
+            source.display()
+        )
+    })?;
+    let rm = Command::new(&debugfs)
+        .args([
+            "-w",
+            "-R",
+            &format!("rm {GUEST_SELKIES_CONTROL_SERVICE}"),
+            rootfs
+                .as_os_str()
+                .to_str()
+                .ok_or_else(|| "per-launch Browser VM rootfs path is not UTF-8".to_string())?,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("debugfs rm guest Browser control service failed: {err}"))?;
+    if !rm.success() {
+        let _ = fs::remove_file(&staging);
+        return Err("debugfs rm guest Browser control service failed".to_string());
+    }
+    let write = Command::new(&debugfs)
+        .args([
+            "-w",
+            "-R",
+            &format!(
+                "write {} {GUEST_SELKIES_CONTROL_SERVICE}",
+                staging.display()
+            ),
+            rootfs
+                .as_os_str()
+                .to_str()
+                .ok_or_else(|| "per-launch Browser VM rootfs path is not UTF-8".to_string())?,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("debugfs write guest Browser control service failed: {err}"))?;
+    let _ = fs::remove_file(&staging);
+    if !write.success() {
+        return Err("debugfs write guest Browser control service failed".to_string());
+    }
+    eprintln!(
+        "browser-vz-engine-supervisor stage=guest_control_overlay source={}",
+        source.display()
+    );
+    Ok(())
+}
+
+fn host_data_script(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.parent()?.join("scripts").join(name);
+    candidate.is_file().then_some(candidate)
+}
+
+fn webrtc_send_overlay_requested() -> bool {
+    std::env::var("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn host_webrtc_send_overlay_sources() -> Option<(PathBuf, PathBuf)> {
+    let gst = std::env::var("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| host_data_script("browser-webrtc-send-gstwebrtc.py"));
+    let start = std::env::var("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| host_data_script("browser-webrtc-send-selkies-start.sh"));
+    match (gst, start) {
+        (Some(gst), Some(start)) if gst.is_file() && start.is_file() => Some((gst, start)),
+        _ => None,
+    }
+}
+
+fn sha256_file_label(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("read overlay {} failed: {err}", path.display()))?;
+    Ok(sha256_label(&bytes))
+}
+
+fn require_overlay_input_hash(env_name: &str, actual: &str) -> Result<(), String> {
+    let expected = std::env::var(env_name).map_err(|_| {
+        format!("{env_name} is required when Browser webrtc send overlay is enabled")
+    })?;
+    let expected = expected
+        .strip_prefix("sha256:")
+        .unwrap_or(expected.as_str());
+    let actual = actual.strip_prefix("sha256:").unwrap_or(actual);
+    if expected != actual {
+        return Err(format!("{env_name} does not match overlay input"));
+    }
+    Ok(())
+}
+
+fn overlay_guest_file(rootfs: &Path, source: &Path, guest_path: &str) -> Result<(), String> {
+    let debugfs = find_debugfs_bin()?;
+    let staging = std::env::temp_dir().join(format!(
+        "evz-overlay-{}-{}",
+        std::process::id(),
+        source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("guest")
+    ));
+    fs::copy(source, &staging)
+        .map_err(|err| format!("stage guest overlay {} failed: {err}", source.display()))?;
+    let rootfs_text = rootfs
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| "per-launch Browser VM rootfs path is not UTF-8".to_string())?;
+    let rm = Command::new(&debugfs)
+        .args(["-w", "-R", &format!("rm {guest_path}"), rootfs_text])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("debugfs rm {guest_path} failed: {err}"))?;
+    if !rm.success() {
+        let _ = fs::remove_file(&staging);
+        return Err(format!("debugfs rm {guest_path} failed"));
+    }
+    let write = Command::new(&debugfs)
+        .args([
+            "-w",
+            "-R",
+            &format!("write {} {guest_path}", staging.display()),
+            rootfs_text,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("debugfs write {guest_path} failed: {err}"))?;
+    let _ = fs::remove_file(&staging);
+    if !write.success() {
+        return Err(format!("debugfs write {guest_path} failed"));
+    }
+    Ok(())
+}
+
+fn overlay_guest_webrtc_send_diagnostic(rootfs: &Path) -> Result<(), String> {
+    if !webrtc_send_overlay_requested() {
+        return Ok(());
+    }
+    let Some((gst, start)) = host_webrtc_send_overlay_sources() else {
+        return Err(
+            "Browser webrtc send overlay is enabled but host overlay files are absent".to_string(),
+        );
+    };
+    let gst_hash = sha256_file_label(&gst)?;
+    let start_hash = sha256_file_label(&start)?;
+    require_overlay_input_hash("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC_SHA256", &gst_hash)?;
+    require_overlay_input_hash(
+        "ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START_SHA256",
+        &start_hash,
+    )?;
+    overlay_guest_file(rootfs, &gst, GUEST_GSTWEBRTC_APP)?;
+    overlay_guest_file(rootfs, &start, GUEST_SELKIES_START)?;
+    eprintln!(
+        "browser-vz-engine-supervisor stage=guest_webrtc_send_overlay gst={} gst_sha256={} start={} start_sha256={}",
+        gst.display(),
+        gst_hash,
+        start.display(),
+        start_hash
+    );
+    Ok(())
 }
 
 fn clone_or_copy_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -2380,6 +2730,7 @@ fn profile_disk_from_request(request: &Value) -> Result<(String, PathBuf), Strin
 struct PreparedBrowserProfileDisk {
     profile_key: String,
     path: PathBuf,
+    initialize: bool,
     _lock: LifetimeFileLock,
 }
 
@@ -2389,28 +2740,45 @@ fn prepare_browser_profile_disk(request: &Value) -> Result<PreparedBrowserProfil
         fs::create_dir_all(parent)
             .map_err(|err| format!("create Browser profile disk root failed: {err}"))?;
     }
-    ensure_sparse_profile_disk(&disk_path)?;
+    let lock =
+        LifetimeFileLock::acquire_disk_sidecar(&disk_path, "principal Browser profile disk")?;
+    let initialize = ensure_sparse_profile_disk(&disk_path, &profile_key)?;
     Ok(PreparedBrowserProfileDisk {
         profile_key,
-        _lock: LifetimeFileLock::acquire_disk_sidecar(
-            &disk_path,
-            "principal Browser profile disk",
-        )?,
+        initialize,
+        _lock: lock,
         path: disk_path,
     })
 }
 
-fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str) {
+fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str, initialize: bool) {
+    // This host owns profile arguments, including any caller-supplied override.
+    *boot_args = boot_args
+        .split_whitespace()
+        .filter(|arg| {
+            !arg.starts_with("elastos.browser_profile=")
+                && !arg.starts_with("elastos.browser_profile_disk=")
+                && !arg.starts_with("elastos.browser_profile_initialize=")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     *boot_args = format!(
         "{boot_args} elastos.browser_profile={profile_key} elastos.browser_profile_disk=required"
     );
+    if initialize {
+        boot_args.push_str(" elastos.browser_profile_initialize=new");
+    }
 }
 
 #[cfg(test)]
 fn attach_browser_profile_disk(vm_config: &mut VmConfig, request: &Value) -> Result<(), String> {
     let profile_disk = prepare_browser_profile_disk(request)?;
     vm_config.data_disk_path = Some(profile_disk.path);
-    append_browser_profile_boot_arg(&mut vm_config.boot_args, &profile_disk.profile_key);
+    append_browser_profile_boot_arg(
+        &mut vm_config.boot_args,
+        &profile_disk.profile_key,
+        profile_disk.initialize,
+    );
     Ok(())
 }
 
@@ -2430,9 +2798,17 @@ fn validate_profile_disk_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_sparse_profile_disk(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
+fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err("Browser profile disk must be a regular file with one link".to_string());
+            }
+            // Existing bytes, including incomplete creation, never renew intent.
+            return Ok(false);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect Browser profile disk failed: {error}")),
     }
     let size_mib = env_u64(
         "ELASTOS_BROWSER_VM_PROFILE_DISK_MIB",
@@ -2441,19 +2817,28 @@ fn ensure_sparse_profile_disk(path: &Path) -> Result<(), String> {
     if !(128..=65536).contains(&size_mib) {
         return Err("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB must be 128..65536".to_string());
     }
-    let file = File::create(path).map_err(|err| {
-        format!(
-            "create Browser profile disk {} failed: {err}",
-            path.display()
-        )
-    })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| {
+            format!(
+                "create Browser profile disk {} failed: {err}",
+                path.display()
+            )
+        })?;
     file.set_len(size_mib * 1024 * 1024).map_err(|err| {
         format!(
             "resize Browser profile disk {} failed: {err}",
             path.display()
         )
     })?;
-    Ok(())
+    // The guest consumes this marker before its sole authorized format attempt.
+    file.write_all(format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{profile_key}").as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("initialize Browser profile disk intent failed: {err}"))?;
+    Ok(true)
 }
 
 fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
@@ -2497,6 +2882,8 @@ fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
         providers: None,
         icon: None,
         viewer: None,
+        window_policy: None,
+        model_content: None,
         signature: None,
     }
 }
@@ -2651,13 +3038,69 @@ fn sdp_has_media_kind(sdp: &str, kind: &str) -> bool {
 }
 
 fn is_retryable_guest_control_open_error(error: &str) -> bool {
-    error.contains("Browser VM guest control HTTP 503")
-        || error.contains("Connection reset")
-        || error.contains("Broken pipe")
+    // Only raw connection failures can mean the control service is still starting.
+    // A completed HTTP response is a page-open outcome, including HTTP 503.
+    let error = error.to_ascii_lowercase();
+    error.starts_with("connection reset") || error.starts_with("broken pipe")
 }
 
 fn is_guest_control_response_timeout(error: &str) -> bool {
     error.contains("Browser VM control HTTP response timed out")
+}
+
+fn guest_profile_disk_flush_accepted(result: &Value) -> bool {
+    result.get("ok") == Some(&Value::Bool(true))
+        && result.get("profile_disk_flushed") == Some(&Value::Bool(true))
+        && result.get("profile_disk_unmounted") == Some(&Value::Bool(true))
+        && result.get("leftover_writers_killed") != Some(&Value::Bool(true))
+}
+
+fn format_guest_profile_flush(result: &Value) -> String {
+    let flushed = result.get("profile_disk_flushed") == Some(&Value::Bool(true));
+    let unmounted = result.get("profile_disk_unmounted") == Some(&Value::Bool(true));
+    let leftover_killed = result.get("leftover_writers_killed") == Some(&Value::Bool(true));
+    let fields = format!(
+        "profile_disk_flushed={flushed} profile_disk_unmounted={unmounted} leftover_writers_killed={leftover_killed}"
+    );
+    if guest_profile_disk_flush_accepted(result) {
+        format!("ok=true {fields}")
+    } else if let Some(error) = result.get("error").and_then(Value::as_str) {
+        format!("ok=false {fields} error={error}")
+    } else {
+        format!("ok=false {fields}")
+    }
+}
+
+async fn request_guest_profile_disk_flush(
+    provider: Arc<VzProvider>,
+    handle: &CapsuleHandle,
+    control_port: u32,
+) -> Value {
+    let timeout = match env_u32(
+        "ELASTOS_BROWSER_VM_PROFILE_FLUSH_TIMEOUT_MS",
+        DEFAULT_PROFILE_FLUSH_TIMEOUT_MS,
+    ) {
+        Ok(ms) => Duration::from_millis(ms as u64),
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": bounded_message(&error),
+            });
+        }
+    };
+    match connect_vsock_with_retry(provider, handle, control_port, timeout).await {
+        Ok(fd) => match http_json_over_fd(fd, "POST", "/shutdown", None, Some(timeout)) {
+            Ok(result) => result,
+            Err(error) => json!({
+                "ok": false,
+                "error": bounded_message(&error),
+            }),
+        },
+        Err(error) => json!({
+            "ok": false,
+            "error": bounded_message(&error),
+        }),
+    }
 }
 
 async fn connect_vsock_with_retry(
@@ -2727,10 +3170,17 @@ async fn bootstrap_vz_transport(
         .write_all(&bytes)
         .and_then(|_| stream.flush())
         .map_err(|err| format!("Browser VZ transport bootstrap write failed: {err}"))?;
+    let receipt = read_vz_transport_bootstrap_receipt(&mut stream)?;
+    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
+    Ok(receipt)
+}
+
+fn read_vz_transport_bootstrap_receipt(stream: &mut impl Read) -> Result<Value, String> {
     let mut response = Vec::new();
-    stream
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut response)
+    // Bootstrap is one bounded JSON line. The peer may keep its write side
+    // open until we release the connection after validating that receipt.
+    BufReader::new(stream.take(64 * 1024 + 1))
+        .read_until(b'\n', &mut response)
         .map_err(|err| format!("Browser VZ transport bootstrap read failed: {err}"))?;
     if response.len() > 64 * 1024 {
         return Err("Browser VZ transport bootstrap receipt is too large".to_string());
@@ -2742,7 +3192,6 @@ async fn bootstrap_vz_transport(
             .ok_or_else(|| "Browser VZ transport bootstrap receipt is empty".to_string())?,
     )
     .map_err(|err| format!("Browser VZ transport bootstrap receipt is invalid JSON: {err}"))?;
-    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
     Ok(receipt)
 }
 
@@ -2979,13 +3428,7 @@ fn parse_http_json_response(response: &[u8]) -> Result<Value, String> {
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| {
-            format!(
-                "Browser VM guest control returned an invalid HTTP response: len={} preview={}",
-                response.len(),
-                response_preview(response)
-            )
-        })?;
+        .ok_or_else(|| "Browser VM guest control returned an invalid HTTP response".to_string())?;
     let (head, body) = response.split_at(split + 4);
     let head_text =
         std::str::from_utf8(head).map_err(|_| "Browser VM guest HTTP head is not UTF-8")?;
@@ -2995,39 +3438,60 @@ fn parse_http_json_response(response: &[u8]) -> Result<Value, String> {
         .nth(1)
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| "Browser VM guest HTTP status is invalid".to_string())?;
-    let parsed: Value = serde_json::from_slice(body)
-        .map_err(|err| format!("Browser VM guest control response is not JSON: {err}"))?;
+    let parsed = serde_json::from_slice::<Value>(body);
     if !(200..300).contains(&status) {
         let error = parsed
-            .get("error")
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("error"))
             .and_then(Value::as_str)
-            .unwrap_or("Browser VM guest control returned an error")
-            .to_string();
-        let mut message = format!("Browser VM guest control HTTP {status}: {error}");
-        if let Some(logs) = parsed.get("logs") {
-            let logs_text = serde_json::to_string(logs)
-                .unwrap_or_else(|_| "<failed to encode guest logs>".to_string());
-            let mut bounded = logs_text.chars().take(20_000).collect::<String>();
-            if logs_text.len() > bounded.len() {
-                bounded.push_str("...");
-            }
-            message.push_str(" logs=");
-            message.push_str(&bounded);
-        }
-        return Err(message);
+            .unwrap_or("Browser VM guest control returned an error");
+        // Guest log tails and call logs stay behind the private control /logs endpoint.
+        return Err(format!(
+            "Browser VM guest control HTTP {status}: {}",
+            brief_guest_control_error(error)
+        ));
     }
-    Ok(parsed)
+    parsed.map_err(|err| format!("Browser VM guest control response is not JSON: {err}"))
 }
 
-fn response_preview(response: &[u8]) -> String {
-    let mut preview = String::new();
-    for byte in response.iter().take(160) {
-        let _ = write!(preview, "{byte:02x}");
+fn brief_guest_control_error(error: &str) -> String {
+    let first_line: String = error
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_GUEST_CONTROL_ERROR_CHARS)
+        .filter(|character| !character.is_control())
+        .collect();
+    let brief = first_line
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://") || word.starts_with("turn:") || word.starts_with("turns:") {
+                "[redacted URL]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = brief.to_ascii_lowercase();
+    if brief.is_empty()
+        || [
+            "credential",
+            "secret",
+            "password",
+            "authorization",
+            "bearer ",
+            "home_token",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return "Browser VM guest control returned an error (details in private guest logs)"
+            .to_string();
     }
-    if response.len() > 160 {
-        preview.push_str("...");
-    }
-    preview
+    brief.chars().take(MAX_GUEST_CONTROL_ERROR_CHARS).collect()
 }
 
 fn spawn_control_proxy(
@@ -3547,38 +4011,225 @@ fn write_error_response(mut stream: UnixStream, message: &str) -> Result<(), Str
     stream.write_all(&body).map_err(|err| err.to_string())
 }
 
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut term) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-            return;
-        }
-    }
-    let _ = tokio::signal::ctrl_c().await;
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownWaitReason {
+    Signal {
+        signum: i32,
+        sender_pid: u32,
+        si_code: i32,
+    },
+    TransportExpired {
+        expires_at_unix_ms: u64,
+        now_unix_ms: u64,
+    },
+    GuestStopped {
+        state: String,
+    },
 }
 
-async fn wait_for_shutdown_or_transport_expiry(transport: Option<&VzTransportLaunch>) {
-    let Some(transport) = transport else {
-        wait_for_shutdown_signal().await;
+fn transport_remaining_ms(expires_at_unix_ms: u64, now_unix_ms: u64) -> u64 {
+    expires_at_unix_ms.checked_sub(now_unix_ms).unwrap_or(0)
+}
+
+fn format_shutdown_wait_reason(reason: &ShutdownWaitReason) -> String {
+    match reason {
+        ShutdownWaitReason::Signal {
+            signum,
+            sender_pid,
+            si_code,
+        } => format!(
+            "browser-vz-engine-supervisor stage=shutdown_wait reason=signal signum={signum} sender_pid={sender_pid} si_code={si_code}"
+        ),
+        ShutdownWaitReason::TransportExpired {
+            expires_at_unix_ms,
+            now_unix_ms,
+        } => format!(
+            "browser-vz-engine-supervisor stage=shutdown_wait reason=transport_expired expires_at_unix_ms={expires_at_unix_ms} now_unix_ms={now_unix_ms}"
+        ),
+        ShutdownWaitReason::GuestStopped { state } => format!(
+            "browser-vz-engine-supervisor stage=shutdown_wait reason=guest_stopped state={state}"
+        ),
+    }
+}
+
+static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static SHUTDOWN_SIGNAL_INSTALL: Once = Once::new();
+
+extern "C" fn report_shutdown_signal(
+    signum: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _: *mut libc::c_void,
+) {
+    let fd = SHUTDOWN_SIGNAL_WRITE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
         return;
+    }
+    let sender_pid = if info.is_null() {
+        0
+    } else {
+        unsafe { (*info).si_pid }.max(0)
     };
+    let si_code = if info.is_null() {
+        0
+    } else {
+        unsafe { (*info).si_code }
+    };
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&signum.to_ne_bytes());
+    buf[4..8].copy_from_slice(&sender_pid.to_ne_bytes());
+    buf[8..12].copy_from_slice(&si_code.to_ne_bytes());
+    unsafe {
+        libc::write(fd, buf.as_ptr().cast(), buf.len());
+    }
+}
+
+fn install_shutdown_signal_reporter() -> Result<OwnedFd, String> {
+    let mut fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err("Browser VZ shutdown signal pipe failed".to_string());
+    }
+    unsafe {
+        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    SHUTDOWN_SIGNAL_WRITE_FD.store(fds[1], Ordering::SeqCst);
+    SHUTDOWN_SIGNAL_INSTALL.call_once(|| {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        action.sa_sigaction = report_shutdown_signal as libc::sighandler_t;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            let _ = libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        }
+    });
+    Ok(unsafe { OwnedFd::from_raw_fd(fds[0]) })
+}
+
+fn parse_delivered_shutdown_signal(buf: [u8; 12]) -> ShutdownWaitReason {
+    ShutdownWaitReason::Signal {
+        signum: i32::from_ne_bytes(buf[0..4].try_into().expect("signum bytes")),
+        sender_pid: u32::from_ne_bytes(buf[4..8].try_into().expect("sender bytes")),
+        si_code: i32::from_ne_bytes(buf[8..12].try_into().expect("si_code bytes")),
+    }
+}
+
+fn shutdown_signal_sender_comm(sender_pid: u32) -> String {
+    if sender_pid == 0 {
+        return "unknown".to_string();
+    }
+    let output = process::Command::new("ps")
+        .args(["-p", &sender_pid.to_string(), "-o", "comm="])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if comm.is_empty() {
+                "unknown".to_string()
+            } else {
+                comm
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+async fn wait_for_shutdown_signal() -> ShutdownWaitReason {
+    let read_fd = match install_shutdown_signal_reporter() {
+        Ok(fd) => fd,
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownWaitReason::Signal {
+                signum: libc::SIGINT,
+                sender_pid: 0,
+                si_code: 0,
+            };
+        }
+    };
+    let afd = match tokio::io::unix::AsyncFd::new(read_fd) {
+        Ok(afd) => afd,
+        Err(_) => {
+            return ShutdownWaitReason::Signal {
+                signum: 0,
+                sender_pid: 0,
+                si_code: 0,
+            };
+        }
+    };
+    loop {
+        let mut ready = match afd.readable().await {
+            Ok(ready) => ready,
+            Err(_) => {
+                return ShutdownWaitReason::Signal {
+                    signum: 0,
+                    sender_pid: 0,
+                    si_code: 0,
+                };
+            }
+        };
+        let mut buf = [0u8; 12];
+        let read = unsafe { libc::read(afd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        ready.clear_ready();
+        if read == 12 {
+            return parse_delivered_shutdown_signal(buf);
+        }
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::WouldBlock {
+                continue;
+            }
+        }
+        return ShutdownWaitReason::Signal {
+            signum: 0,
+            sender_pid: 0,
+            si_code: 0,
+        };
+    }
+}
+
+async fn wait_until_guest_stopped(provider: Arc<VzProvider>, handle: CapsuleHandle) -> String {
+    provider.wait_for_guest_exit(&handle).await
+}
+
+async fn wait_for_shutdown_or_transport_expiry(
+    transport: Option<&VzTransportLaunch>,
+    provider: Option<Arc<VzProvider>>,
+    handle: Option<CapsuleHandle>,
+) -> ShutdownWaitReason {
     let expires_at = transport
-        .authority
-        .get("expires_at_unix_ms")
+        .and_then(|value| value.authority.get("expires_at_unix_ms"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let remaining = current_unix_millis()
-        .ok()
-        .and_then(|now| expires_at.checked_sub(now))
-        .unwrap_or(0);
-    tokio::select! {
-        _ = wait_for_shutdown_signal() => {}
-        _ = tokio::time::sleep(Duration::from_millis(remaining)) => {}
+    let now = current_unix_millis().unwrap_or(0);
+    let remaining = if transport.is_some() {
+        transport_remaining_ms(expires_at, now)
+    } else {
+        u64::MAX
+    };
+    if let (Some(provider), Some(handle)) = (provider, handle) {
+        tokio::select! {
+            reason = wait_for_shutdown_signal() => reason,
+            _ = tokio::time::sleep(Duration::from_millis(remaining)) => {
+                ShutdownWaitReason::TransportExpired {
+                    expires_at_unix_ms: expires_at,
+                    now_unix_ms: now,
+                }
+            }
+            state = wait_until_guest_stopped(provider, handle) => {
+                ShutdownWaitReason::GuestStopped { state }
+            }
+        }
+    } else {
+        tokio::select! {
+            reason = wait_for_shutdown_signal() => reason,
+            _ = tokio::time::sleep(Duration::from_millis(remaining)) => {
+                ShutdownWaitReason::TransportExpired {
+                    expires_at_unix_ms: expires_at,
+                    now_unix_ms: now,
+                }
+            }
+        }
     }
 }
 
@@ -4060,6 +4711,82 @@ mod tests {
         assert!(serde_json::from_str::<Value>(&error).is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_wait_does_not_return_signal_without_a_delivered_signal() {
+        // A current-thread timeout around wait_for_shutdown_signal() never
+        // fires: the signal waiter parks on AsyncFd and the no-transport
+        // branch sleeps u64::MAX. Expire the transport instead.
+        let mut transport = transport_fixture('w');
+        transport.authority["expires_at_unix_ms"] = json!(current_unix_millis().unwrap() + 50);
+        let outcome = wait_for_shutdown_or_transport_expiry(Some(&transport), None, None).await;
+        assert!(
+            matches!(outcome, ShutdownWaitReason::TransportExpired { .. }),
+            "shutdown wait invented a signal: {outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_turn_port_absence_waits_for_released_relay_udp() {
+        let listen = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listen_port = listen.local_addr().unwrap().port();
+        drop(listen);
+        let holder = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let relay_port = holder.local_addr().unwrap().port();
+        let tcp_holder = std::net::TcpListener::bind(("127.0.0.1", relay_port)).ok();
+        let mut transport = transport_fixture('p');
+        transport.authority["turn"]["listen_host"] = json!("127.0.0.1");
+        transport.authority["turn"]["listen_port"] = json!(listen_port);
+        transport.authority["turn"]["relay_host"] = json!("127.0.0.1");
+        transport.authority["turn"]["relay_port_min"] = json!(relay_port);
+        transport.authority["turn"]["relay_port_max"] = json!(relay_port);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            drop(holder);
+            drop(tcp_holder);
+        });
+        let (listener, relays) = wait_for_owned_turn_ports_absent(&transport).await;
+        release.await.unwrap();
+        assert!(listener, "owned TURN listen port stayed occupied");
+        assert!(
+            relays,
+            "owned TURN relay port stayed occupied after release"
+        );
+    }
+
+    #[test]
+    fn leftover_transport_remaining_ms_stays_live_after_launch_ready() {
+        assert_eq!(
+            transport_remaining_ms(1_789_458_477_000, 1_789_457_887_000),
+            590_000
+        );
+        assert_eq!(transport_remaining_ms(1_000, 2_000), 0);
+    }
+
+    #[test]
+    fn shutdown_wait_reason_names_signal_expiry_and_guest_stop() {
+        assert_eq!(
+            format_shutdown_wait_reason(&ShutdownWaitReason::Signal {
+                signum: 15,
+                sender_pid: 64094,
+                si_code: 0,
+            }),
+            "browser-vz-engine-supervisor stage=shutdown_wait reason=signal signum=15 sender_pid=64094 si_code=0"
+        );
+        assert_eq!(
+            format_shutdown_wait_reason(&ShutdownWaitReason::TransportExpired {
+                expires_at_unix_ms: 1_789_458_477_000,
+                now_unix_ms: 1_789_457_887_000,
+            }),
+            "browser-vz-engine-supervisor stage=shutdown_wait reason=transport_expired expires_at_unix_ms=1789458477000 now_unix_ms=1789457887000"
+        );
+        assert_eq!(
+            format_shutdown_wait_reason(&ShutdownWaitReason::GuestStopped {
+                state: "Error".to_string(),
+            }),
+            "browser-vz-engine-supervisor stage=shutdown_wait reason=guest_stopped state=Error"
+        );
+    }
+
     #[test]
     fn turn_log_diagnostics_classify_outcomes_without_retaining_log_content() {
         assert_eq!(
@@ -4454,6 +5181,40 @@ mod tests {
         assert!(vm_config
             .boot_args
             .contains("elastos.browser_profile_disk=required"));
+        assert!(vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize=new"));
+        let marker = b"ELASTOS_BROWSER_PROFILE_NEW_V1:profile-99bb2b58175e1e062cd2fb6b1b00feec63d169f520dd0a8cfe7230517cfc43e4";
+        let mut header = vec![0; marker.len()];
+        File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(header.as_slice(), marker);
+        assert_eq!(fs::metadata(&disk_path).unwrap().mode() & 0o777, 0o600);
+
+        // Reattaching even a marked, unformatted disk never renews creation
+        // intent; stale boot arguments from the first attachment are removed.
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
+        File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(header.as_slice(), marker);
+
+        // A corrupt or signature-free existing profile must remain byte exact.
+        fs::write(&disk_path, b"existing profile with unreadable filesystem").unwrap();
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert_eq!(
+            fs::read(&disk_path).unwrap(),
+            b"existing profile with unreadable filesystem"
+        );
+        assert!(!vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize="));
     }
 
     #[test]
@@ -4480,6 +5241,7 @@ mod tests {
             }
         });
         let owner = prepare_browser_profile_disk(&request).unwrap();
+        assert!(owner.initialize);
         let lock_path = disk_lifetime_lock_path(&disk_path);
         assert_eq!(
             lock_path,
@@ -4500,7 +5262,36 @@ mod tests {
         assert_eq!(typed["path"], disk_path.to_string_lossy().as_ref());
 
         drop(owner);
-        prepare_browser_profile_disk(&request).unwrap();
+        assert!(!prepare_browser_profile_disk(&request).unwrap().initialize);
+    }
+
+    #[test]
+    fn profile_initialization_rejects_symlink_and_preserves_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing");
+        let disk = tmp.path().join("profile.ext4");
+        fs::write(&target, b"existing profile bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &disk).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing profile bytes");
+        fs::remove_file(&target).unwrap();
+        assert!(ensure_sparse_profile_disk(&disk, "profile-test").is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn profile_initialization_intent_is_owned_by_exclusive_creation() {
+        let mut args = "console=hvc0 elastos.browser_profile_initialize=new elastos.browser_profile=other elastos.browser_profile_disk=other".to_string();
+        append_browser_profile_boot_arg(&mut args, "profile-owned", false);
+        assert_eq!(args, "console=hvc0 elastos.browser_profile=profile-owned elastos.browser_profile_disk=required");
+        append_browser_profile_boot_arg(&mut args, "profile-owned", true);
+        assert_eq!(
+            args.matches("elastos.browser_profile_initialize=new")
+                .count(),
+            1
+        );
+        append_browser_profile_boot_arg(&mut args, "profile-owned", false);
+        assert!(!args.contains("elastos.browser_profile_initialize="));
     }
 
     #[test]
@@ -4536,6 +5327,321 @@ mod tests {
         let (guest_to_runtime, runtime_to_guest) = bridge.join().unwrap().unwrap();
         assert_eq!(guest_to_runtime, 0);
         assert_eq!(runtime_to_guest, 4);
+    }
+
+    #[test]
+    fn bootstrap_receipt_completes_while_the_peer_write_side_stays_open() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let receipt = json!({"schema": "elastos.browser.vz-transport-bootstrap-receipt/v1"});
+        writeln!(peer, "{receipt}").unwrap();
+        assert_eq!(
+            read_vz_transport_bootstrap_receipt(&mut client).unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn bootstrap_receipt_read_rejects_empty_malformed_and_oversized_frames() {
+        for bytes in [b"".as_slice(), b"\n", b"{broken}\n"] {
+            assert!(read_vz_transport_bootstrap_receipt(&mut std::io::Cursor::new(bytes)).is_err());
+        }
+        let oversized = vec![b'x'; 64 * 1024 + 1];
+        assert!(
+            read_vz_transport_bootstrap_receipt(&mut std::io::Cursor::new(oversized))
+                .unwrap_err()
+                .contains("too large")
+        );
+    }
+
+    #[test]
+    fn guest_control_completed_http_errors_are_terminal_and_keep_brief_cause() {
+        for status in [503, 400, 403, 500] {
+            for cause in [
+                "Chromium did not accept the Runtime online-state projection",
+                "page.goto: net::ERR_NAME_NOT_RESOLVED",
+                "Connection reset while opening the page",
+                "Broken pipe while opening the page",
+            ] {
+                let body = json!({
+                    "schema": "elastos.browser.selkies-control.error/v1",
+                    "error": cause,
+                    "logs": {
+                        "browser-vm-control.log": { "tail": "Connection reset; Broken pipe" },
+                        "browser-vm-chromium.log": { "tail": "DevTools listening on ws://127.0.0.1:9222/private-control-id" },
+                        "turn": { "credential": "private-turn-credential", "auth_secret": "private-turn-secret" },
+                    },
+                });
+                let response = format!("HTTP/1.1 {status} Error\r\n\r\n{body}");
+                let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+                assert!(!is_retryable_guest_control_open_error(&error), "{error}");
+                assert_eq!(
+                    error,
+                    format!("Browser VM guest control HTTP {status}: {cause}")
+                );
+                assert!(!error.contains("logs="));
+                assert!(!error.contains("private-"));
+                assert!(!error.contains("ws://"));
+            }
+        }
+    }
+
+    #[test]
+    fn guest_control_non_json_http_error_keeps_status_and_discards_private_body() {
+        assert_eq!(
+            parse_http_json_response(b"credential=private-value").unwrap_err(),
+            "Browser VM guest control returned an invalid HTTP response"
+        );
+        for body in ["Broken pipe; credential=private-value", "{\"error\":", ""] {
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n{body}");
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+            assert!(
+                error.starts_with("Browser VM guest control HTTP 503:"),
+                "{error}"
+            );
+            assert!(!is_retryable_guest_control_open_error(&error));
+            assert!(!error.contains("private-value"));
+        }
+    }
+
+    #[test]
+    fn guest_control_brief_error_omits_urls_secrets_and_call_logs() {
+        for cause in [
+            "page.goto: net::ERR_NAME_NOT_RESOLVED at http://user:private-password@localhost/main?home_token=private-token\nCall log:\ncredential=private-credential",
+            "page.goto: net::ERR_NAME_NOT_RESOLVED\r\nDevTools listening on ws://127.0.0.1:9222/private-control-id",
+        ] {
+            let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+
+            assert!(error.contains("net::ERR_NAME_NOT_RESOLVED"), "{error}");
+            assert!(!error.contains("private-"));
+            assert!(!error.contains("://"));
+            assert!(!error.contains('\n'));
+            assert!(!is_retryable_guest_control_open_error(&error));
+        }
+        for cause in [
+            "TURN credential=private-value",
+            "auth_secret=private-value",
+            "transport_secret=private-value",
+        ] {
+            let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
+            let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+            assert!(!error.contains("private-value"));
+            assert!(error.contains("private guest logs"));
+        }
+        let response = format!(
+            "HTTP/1.1 503 Error\r\n\r\n{}",
+            json!({ "error": "é".repeat(4096) })
+        );
+        let error = parse_http_json_response(response.as_bytes()).unwrap_err();
+        assert!(error.chars().count() <= 550);
+    }
+
+    #[test]
+    fn guest_control_retry_is_limited_to_connection_startup_errors() {
+        for error in [
+            std::io::Error::from(ErrorKind::ConnectionReset).to_string(),
+            std::io::Error::from(ErrorKind::BrokenPipe).to_string(),
+            std::io::Error::from_raw_os_error(libc::ECONNRESET).to_string(),
+            std::io::Error::from_raw_os_error(libc::EPIPE).to_string(),
+        ] {
+            assert!(is_retryable_guest_control_open_error(&error), "{error}");
+        }
+        for error in [
+            "Browser VM guest control HTTP 503: Connection reset; Broken pipe",
+            "Browser VM guest control HTTP 500: failure logs=Broken pipe",
+            "Browser VM guest control returned an invalid HTTP response",
+            "Browser VM guest control response is not JSON: Broken pipe",
+            "Browser VM control HTTP response timed out",
+        ] {
+            assert!(!is_retryable_guest_control_open_error(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn guest_control_private_log_response_remains_available() {
+        let logs = json!({ "schema": "elastos.browser.selkies-control.logs/v1", "logs": { "control": "private-log-fixture" } });
+        let response = format!("HTTP/1.1 200 OK\r\n\r\n{logs}");
+        assert_eq!(parse_http_json_response(response.as_bytes()).unwrap(), logs);
+    }
+
+    #[test]
+    fn guest_profile_disk_flush_requires_unmount_receipt() {
+        assert!(guest_profile_disk_flush_accepted(&json!({
+            "schema": "elastos.browser.selkies-control.shutdown/v1",
+            "ok": true,
+            "profile_disk_flushed": true,
+            "profile_disk_unmounted": true,
+        })));
+        assert!(!guest_profile_disk_flush_accepted(&json!({
+            "schema": "elastos.browser.selkies-control.shutdown/v1",
+            "ok": true,
+        })));
+        assert!(!guest_profile_disk_flush_accepted(&json!({
+            "schema": "elastos.browser.selkies-control.shutdown/v1",
+            "ok": true,
+            "profile_disk_flushed": true,
+            "profile_disk_unmounted": true,
+            "leftover_writers_killed": true,
+        })));
+    }
+
+    #[test]
+    fn failed_profile_flush_keeps_truthful_child_absence_and_failed_durability() {
+        let absence = json!({
+            "child_absent": true,
+            "supervisor_child_absent": true,
+            "control_socket_absent": true,
+            "route_absent": true,
+            "turn_listener_absent": true,
+            "turn_relay_ports_absent": true,
+            "ordinary_stream_bridge_absent": true,
+            "media_stream_bridge_absent": true,
+            "session_directory_absent": true,
+            "vm_absent": true,
+        });
+        let terminal = absence
+            .as_object()
+            .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)));
+        assert!(terminal);
+        let mut settlement = json!({
+            "schema": VZ_LAUNCH_SETTLEMENT_SCHEMA,
+            "state": "terminal_post_effect_cleanup",
+            "message": "Browser VZ guest shutdown did not flush the profile disk",
+            "absence": absence,
+        });
+        settlement["profile_durability"] = json!("failed");
+        assert_eq!(settlement["absence"]["child_absent"], true);
+        assert_eq!(settlement["profile_durability"], "failed");
+        assert_eq!(settlement["state"], "terminal_post_effect_cleanup");
+    }
+
+    #[test]
+    fn accepted_profile_flush_keeps_truthful_child_absence_and_proved_durability() {
+        let absence = json!({
+            "child_absent": true,
+            "supervisor_child_absent": true,
+            "control_socket_absent": true,
+            "route_absent": true,
+            "turn_listener_absent": true,
+            "turn_relay_ports_absent": true,
+            "ordinary_stream_bridge_absent": true,
+            "media_stream_bridge_absent": true,
+            "session_directory_absent": true,
+            "vm_absent": true,
+        });
+        let terminal = absence
+            .as_object()
+            .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)));
+        assert!(terminal);
+        let mut settlement = json!({
+            "schema": VZ_LAUNCH_SETTLEMENT_SCHEMA,
+            "state": "terminal_post_effect_cleanup",
+            "message": "Browser VZ guest shutdown flushed the profile disk",
+            "absence": absence,
+        });
+        settlement["profile_durability"] = json!("proved");
+        assert_eq!(settlement["absence"]["child_absent"], true);
+        assert_eq!(settlement["profile_durability"], "proved");
+        assert_eq!(settlement["state"], "terminal_post_effect_cleanup");
+    }
+
+    #[test]
+    fn guest_profile_disk_flush_without_error_keeps_disk_fields() {
+        assert_eq!(
+            format_guest_profile_flush(&json!({
+                "ok": false,
+                "profile_disk_flushed": false,
+                "profile_disk_unmounted": false,
+                "leftover_writers_killed": false,
+            })),
+            "ok=false profile_disk_flushed=false profile_disk_unmounted=false leftover_writers_killed=false"
+        );
+    }
+
+    #[test]
+    fn guest_profile_disk_flush_unmount_receipt_keeps_error_text() {
+        assert_eq!(
+            format_guest_profile_flush(&json!({
+                "ok": false,
+                "error": "Browser VZ guest shutdown did not flush the profile disk",
+            })),
+            "ok=false profile_disk_flushed=false profile_disk_unmounted=false leftover_writers_killed=false error=Browser VZ guest shutdown did not flush the profile disk"
+        );
+    }
+
+    #[test]
+    fn overlay_guest_control_fails_closed_without_debugfs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _debugfs = EnvVarRestore::capture("ELASTOS_DEBUGFS_BIN");
+        let _source = EnvVarRestore::capture("ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE");
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("browser-selkies-control-service.mjs");
+        fs::write(
+            &source,
+            b"export function flushAndUnmountBrowserProfileDisk() {}\n",
+        )
+        .unwrap();
+        let rootfs = tmp.path().join("rootfs.ext4");
+        fs::write(&rootfs, b"rootfs").unwrap();
+        std::env::set_var("ELASTOS_DEBUGFS_BIN", tmp.path().join("absent-debugfs"));
+        std::env::set_var("ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE", &source);
+        let error = overlay_guest_selkies_control_service(&rootfs).unwrap_err();
+        assert!(
+            error.contains("ELASTOS_DEBUGFS_BIN is not a file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn overlay_webrtc_send_is_noop_without_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _overlay = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY");
+        let _gst = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC");
+        let _start = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START");
+        std::env::remove_var("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY");
+        let tmp = tempfile::tempdir().unwrap();
+        let gst = tmp.path().join("gstwebrtc.py");
+        let start = tmp.path().join("selkies-start.sh");
+        fs::write(&gst, b"guest-gst").unwrap();
+        fs::write(&start, b"guest-start").unwrap();
+        std::env::set_var("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC", &gst);
+        std::env::set_var("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START", &start);
+        let rootfs = tmp.path().join("rootfs.ext4");
+        fs::write(&rootfs, b"rootfs").unwrap();
+        overlay_guest_webrtc_send_diagnostic(&rootfs).unwrap();
+    }
+
+    #[test]
+    fn overlay_webrtc_send_fails_closed_without_bound_hashes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _overlay = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY");
+        let _gst = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC");
+        let _start = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START");
+        let _gst_hash = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC_SHA256");
+        let _start_hash =
+            EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START_SHA256");
+        std::env::set_var("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let gst = tmp.path().join("gstwebrtc.py");
+        let start = tmp.path().join("selkies-start.sh");
+        fs::write(&gst, b"guest-gst").unwrap();
+        fs::write(&start, b"guest-start").unwrap();
+        std::env::set_var("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC", &gst);
+        std::env::set_var("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START", &start);
+        std::env::remove_var("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC_SHA256");
+        std::env::remove_var("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START_SHA256");
+        let rootfs = tmp.path().join("rootfs.ext4");
+        fs::write(&rootfs, b"rootfs").unwrap();
+        let error = overlay_guest_webrtc_send_diagnostic(&rootfs).unwrap_err();
+        assert!(
+            error.contains("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC_SHA256"),
+            "{error}"
+        );
     }
 
     #[test]

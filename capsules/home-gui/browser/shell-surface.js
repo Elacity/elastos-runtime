@@ -59,6 +59,7 @@ import {
   browserWindowEntriesForTarget,
   browserWindowCount,
   browserWindowDisplayTitle,
+  supportsMenuNewWindow,
   activeBrowserTargetId,
   openTarget,
   launchHomeTarget,
@@ -1096,24 +1097,25 @@ function contextMenuAnchorPoint(event, node) {
   };
 }
 
-function openDesktopObject(entryId) {
+function openDesktopObject(entryId, options = {}) {
   const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
   if (!object || !canOpenDesktopObject(object)) {
     return false;
   }
-  openFileObject(object);
+  openFileObject(object, options);
   return true;
 }
 
 /* One canonical "open this file object" path — desktop double-click and
    Spotlight activation both land here. */
-export function openFileObject(object) {
+export function openFileObject(object, options = {}) {
   if (object.kind === "directory") {
-    openTarget("library", { query: { uri: object.uri } });
+    openTarget("library", { ...options, query: { uri: object.uri } });
     return;
   }
   const viewer = desktopObjectViewer(object);
   openTarget(viewer, {
+    ...options,
     query: {
       objectUri: object.uri,
       uri: object.uri,
@@ -2095,6 +2097,7 @@ function desktopObjectContextMenuItems(target) {
 
 function targetContextMenuItems(target) {
   const openWindows = sortWindowEntriesByZOrder(browserWindowEntriesForTarget(target.targetId));
+  const newWindow = supportsMenuNewWindow(target.targetId) && (openWindows.length > 0 || target.source === "taskbar");
   const items = [];
   if (target.source === "taskbar" && openWindows.length > 0) {
     for (const entry of openWindows) {
@@ -2103,8 +2106,8 @@ function targetContextMenuItems(target) {
     items.push({ kind: "divider" });
   }
   items.push({
-    action: "open-target",
-    label: openWindows.length === 0 && target.source !== "taskbar"
+    action: newWindow ? "open-target-new-window" : "open-target",
+    label: !newWindow
       ? `Open ${targetTitle(shellState.currentSummary, target.targetId)}`
       : "New Window",
   });
@@ -2150,7 +2153,7 @@ export function handleContextAction(action) {
   }
   if (shellState.contextMenuTarget.kind === "desktop-object") {
     if (action === "open-desktop-object" || action === "open-desktop-object-new-window") {
-      openDesktopObject(shellState.contextMenuTarget.entryId);
+      openDesktopObject(shellState.contextMenuTarget.entryId, { newWindow: action === "open-desktop-object-new-window" });
       return;
     }
     if (action === "reveal-desktop-object") {
@@ -2226,11 +2229,11 @@ export function handleContextAction(action) {
   if (!shellState.contextMenuTarget.targetId) {
     return;
   }
-  if (action === "open-target") {
+  if (action === "open-target" || action === "open-target-new-window") {
     if (shellState.contextMenuTarget.source === "launcher") {
       hideLauncher();
     }
-    openTarget(shellState.contextMenuTarget.targetId);
+    openTarget(shellState.contextMenuTarget.targetId, { newWindow: action === "open-target-new-window" });
     return;
   }
   if (action === "rename-desktop-icon") {

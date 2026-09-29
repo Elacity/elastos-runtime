@@ -3,6 +3,8 @@ import {
   MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
+import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
+import { applyRunEventsPage, parseCursor } from "./model-contract.js";
 
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
@@ -125,6 +127,7 @@ function normalizeWorkspace(workspace) {
       typeof workspace?.selected_offer_id === "string" && workspace.selected_offer_id.trim()
         ? workspace.selected_offer_id
         : null,
+    selected_model_cid: workspace?.selected_model_cid ?? null,
   };
 }
 
@@ -146,7 +149,7 @@ function eligibleTextOffers(payload) {
   );
 }
 
-function eligibleStudioOffers(payload) {
+export function eligibleStudioOffers(payload) {
   const offers = Array.isArray(payload?.offers)
     ? payload.offers
     : Array.isArray(payload?.data?.offers)
@@ -188,10 +191,6 @@ function parseRunEventsPage(payload) {
   return page && typeof page === "object" && Array.isArray(page.events) ? page : null;
 }
 
-function parseCursorValue(value) {
-  const cursor = Number(value);
-  return Number.isInteger(cursor) && cursor >= 0 ? cursor : null;
-}
 
 function studioInputSchema(operation) {
   if (operation === "image.generate") {
@@ -233,25 +232,6 @@ function parseStudioOutput(output) {
   return null;
 }
 
-function parseStudioProgress(data) {
-  const phase =
-    typeof data?.phase === "string" && data.phase.trim() === data.phase
-      ? data.phase
-      : "";
-  const completed = Number(data?.completed);
-  const total = Number(data?.total);
-  if (
-    !phase ||
-    !Number.isInteger(completed) ||
-    !Number.isInteger(total) ||
-    completed < 0 ||
-    total < 0 ||
-    completed > total
-  ) {
-    return null;
-  }
-  return { phase, completed, total };
-}
 
 function createSessionRecord({ id, mode, title = "", pinned = false } = {}) {
   const nextMode = mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
@@ -350,6 +330,7 @@ function serializeWorkspace(state) {
     })),
     draft: boundedText(state.draft, MAX_DRAFT_BYTES),
     selected_offer_id: state.selectedOfferId,
+    ...(state.selectedModelCid != null ? { selected_model_cid: state.selectedModelCid } : {}),
   };
 }
 
@@ -370,6 +351,8 @@ function initialState(homeToken) {
     studioDraft: "",
     searchQuery: "",
     selectedOfferId: null,
+    selectedModelCid: null,
+    models: [],
     selectedStudioOfferId: null,
     activeSessionId: "",
     deletingSessionId: "",
@@ -381,6 +364,7 @@ function initialState(homeToken) {
     copyingTranscript: false,
     studioProgress: null,
     studioResult: null,
+    studioHistory: [],
     pollTimer: 0,
     saveTimer: 0,
     saving: false,
@@ -402,8 +386,20 @@ export function createAssistantApp({
   sourceWindow = globalThis.window,
   homeClipboardClientFactory = createHomeClipboardClient,
   onStateChange = () => {},
+  studioOnly = false,
+  studioState = null,
+  studioSessionId = "",
+  beforeRunCreate = async () => true,
 } = {}) {
   const state = initialState(homeToken);
+  if (studioOnly && studioState) {
+    for (const key of ["studioDraft", "selectedStudioOfferId", "studioProgress", "studioResult", "studioHistory", "activeRun"]) {
+      if (studioState[key] !== undefined) state[key] = structuredClone(studioState[key]);
+    }
+  }
+  let offersEpoch = 0;
+  let disposed = false;
+  let pollInFlight = false;
   const homeClipboard = homeClipboardClientFactory({
     targetId: "assistant",
     homeOrigin,
@@ -444,6 +440,8 @@ export function createAssistantApp({
       filteredSessions,
       offersReady: offersReady.filter((offer) => offer.id && offer.operation),
       selectedOfferId,
+      selectedModelCid: currentMode === MODE_STUDIO ? null : state.selectedModelCid,
+      modelChoices: readyModelChoices(state.models, offersReady),
       draft,
       studioUnavailable: currentMode === MODE_STUDIO && offersReady.length === 0,
       starters:
@@ -473,14 +471,23 @@ export function createAssistantApp({
       sendDisabled:
         !homeToken ||
         state.offersLoading ||
+        Boolean(state.offersError) ||
         state.workspaceLoading ||
-        !selectedOfferId ||
+        !selectedOffer() ||
         !draft.trim() ||
         Boolean(state.activeRun && !state.activeRun.terminal),
     };
   }
 
   function notify() {
+    if (disposed) return;
+    if (state.activeRun?.mode === MODE_STUDIO) {
+      const run = structuredClone(state.activeRun);
+      const index = state.studioHistory.findIndex(item =>
+        (run.createRequestId && item.createRequestId === run.createRequestId) || (run.runId && item.runId === run.runId));
+      if (index < 0) state.studioHistory.push(run);
+      else state.studioHistory[index] = { ...state.studioHistory[index], ...run };
+    }
     onStateChange(snapshot());
   }
 
@@ -541,6 +548,10 @@ export function createAssistantApp({
   }
 
   async function loadOffers() {
+    const epoch = ++offersEpoch;
+    state.offersLoading = true;
+    state.offersError = "";
+    notify();
     if (!homeToken) {
       state.offersLoading = false;
       state.offersError = "Model provider unavailable.";
@@ -548,7 +559,20 @@ export function createAssistantApp({
       notify();
       return;
     }
-    const { response, payload } = await requestJson("/api/provider/model/offers_list", {});
+    let response, payload;
+    try {
+      const [offers, catalog] = await Promise.all([
+        requestJson("/api/provider/model/offers_list", {}),
+        requestJson("/api/capsules/catalog", null, "GET").catch(() => null),
+      ]);
+      if (epoch !== offersEpoch) return;
+      ({ response, payload } = offers);
+      try { state.models = catalog?.response.ok ? catalogModels(catalog.payload) : []; }
+      catch { state.models = []; }
+    } catch {
+      response = { ok: false };
+    }
+    if (epoch !== offersEpoch) return;
     if (!response.ok || payload?.status === "error") {
       state.offersLoading = false;
       state.offersError = readStatusMessage(payload, "Model provider unavailable.");
@@ -560,21 +584,17 @@ export function createAssistantApp({
     state.studioOffers = eligibleStudioOffers(payload);
     state.offersLoading = false;
     if (!state.textOffers.length && !state.studioOffers.length) {
-      state.selectedOfferId = null;
-      state.selectedStudioOfferId = null;
       state.statusMessage = "No model offers available.";
       notify();
       return;
     }
     if (
-      !state.selectedOfferId ||
-      !state.textOffers.some((offer) => offer.id === state.selectedOfferId)
+      !state.workspaceLoading && !state.selectedOfferId
     ) {
       state.selectedOfferId = state.textOffers[0]?.id ?? null;
     }
     if (
-      !state.selectedStudioOfferId ||
-      !state.studioOffers.some((offer) => offer.id === state.selectedStudioOfferId)
+      !state.selectedStudioOfferId
     ) {
       state.selectedStudioOfferId = state.studioOffers[0]?.id ?? null;
     }
@@ -611,6 +631,7 @@ export function createAssistantApp({
     state.sessions = workspace.sessions;
     state.draft = workspace.draft;
     state.selectedOfferId = workspace.selected_offer_id;
+    state.selectedModelCid = workspace.selected_model_cid;
       state.workspaceVersion = 0;
       state.savedWorkspaceVersion = 0;
       state.saveQueued = false;
@@ -633,8 +654,7 @@ export function createAssistantApp({
     state.activeMode = activeSession?.mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
     if (
       state.textOffers.length &&
-      (!state.selectedOfferId ||
-        !state.textOffers.some((offer) => offer.id === state.selectedOfferId))
+      !state.selectedOfferId && !state.offersError
     ) {
       state.selectedOfferId = state.textOffers[0].id;
     }
@@ -887,8 +907,7 @@ export function createAssistantApp({
 
   function setDraft(text) {
     if (state.activeMode === MODE_STUDIO) {
-      state.studioDraft = boundedText(text, MAX_MESSAGE_CONTENT_BYTES);
-      state.studioResult = null;
+      state.studioDraft = String(text ?? "");
       notify();
       return;
     }
@@ -897,14 +916,16 @@ export function createAssistantApp({
     notify();
   }
 
-  function setSelectedOfferId(nextOfferId) {
+  function setSelectedOfferId(nextOfferId, modelCid = null) {
+    const offers = state.activeMode === MODE_STUDIO ? state.studioOffers : state.textOffers;
+    if (state.offersLoading || state.workspaceLoading || state.offersError || !selectedModelOffer(offers, nextOfferId, modelCid, state.models)) return;
     if (state.activeMode === MODE_STUDIO) {
       state.selectedStudioOfferId = nextOfferId || null;
-      state.studioResult = null;
       notify();
       return;
     }
     state.selectedOfferId = nextOfferId || null;
+    state.selectedModelCid = modelCid;
     markWorkspaceDirty();
     notify();
   }
@@ -915,7 +936,7 @@ export function createAssistantApp({
         state.studioOffers.find((offer) => offer.id === state.selectedStudioOfferId) || null
       );
     }
-    return state.textOffers.find((offer) => offer.id === state.selectedOfferId) || null;
+    return selectedModelOffer(state.textOffers, state.selectedOfferId, state.selectedModelCid, state.models);
   }
 
   function clearPollTimer() {
@@ -938,6 +959,17 @@ export function createAssistantApp({
       state.studioProgress = null;
     }
     if (terminal.status === "completed") {
+      if (terminal.outputRetained === false) {
+        if (run.mode === MODE_STUDIO) {
+          state.studioResult = null;
+        }
+        state.statusMessage = "The run completed. This Runtime did not keep the output.";
+        if (run.mode !== MODE_STUDIO) {
+          markWorkspaceDirty();
+        }
+        notify();
+        return true;
+      }
       if (run.mode === MODE_STUDIO) {
         const output = parseStudioOutput(terminal.output);
         if (!output) {
@@ -983,65 +1015,32 @@ export function createAssistantApp({
       status: runView.status,
       output: runView.terminal?.output ?? null,
       error: runView.terminal?.error ?? null,
+      outputRetained: runView.output_retained !== false,
     });
   }
 
-  function applyRunEvents(events) {
+  function applyDecodedEvents(applied) {
     const run = state.activeRun;
     if (!run) {
       return false;
     }
-    let nextText = run.outputText;
-    let terminal = null;
-    for (const event of events) {
-      if (!event || typeof event !== "object") {
-        continue;
+    if (run.mode === MODE_STUDIO) {
+      if (applied.studioProgress) {
+        state.studioProgress = applied.studioProgress;
       }
-      if (run.mode !== MODE_STUDIO && event.kind === "text_delta") {
-        nextText = boundedText(
-          nextText + String(event.data?.text ?? ""),
-          MAX_MESSAGE_CONTENT_BYTES,
-        );
-      } else if (run.mode === MODE_STUDIO && event.kind === "progress") {
-        const progress = parseStudioProgress(event.data);
-        if (!progress) {
-          stopPollingUnavailable(run, "Model provider unavailable.");
-          return false;
-        }
-        state.studioProgress = progress;
-      } else if (event.kind === "output") {
-        terminal = {
-          status: "completed",
-          output: event.data ?? null,
-          error: null,
-        };
-      } else if (event.kind === "failed") {
-        terminal = {
-          status: "failed",
-          output: null,
-          error: event.data ?? null,
-        };
-      } else if (event.kind === "cancelled") {
-        terminal = {
-          status: "cancelled",
-          output: null,
-          error: event.data ?? null,
-        };
-      } else if (event.kind === "settlement_unknown") {
-        terminal = {
-          status: "settlement_unknown",
-          output: null,
-          error: event.data ?? null,
-        };
+    } else if (applied.textDeltas.length) {
+      let nextText = run.outputText;
+      for (const delta of applied.textDeltas) {
+        nextText = boundedText(nextText + delta, MAX_MESSAGE_CONTENT_BYTES);
+      }
+      if (nextText !== run.outputText) {
+        run.outputText = nextText;
+        updateStreamingMessage(run.sessionId, run.runId, nextText);
+        markWorkspaceDirty();
       }
     }
-    if (run.mode !== MODE_STUDIO && nextText !== run.outputText) {
-      run.outputText = nextText;
-      updateStreamingMessage(run.sessionId, run.runId, nextText);
-      markWorkspaceDirty();
-    }
-    if (terminal) {
-      return settleTerminal(run.runId, terminal);
+    if (applied.terminal) {
+      return settleTerminal(run.runId, applied.terminal);
     }
     notify();
     return false;
@@ -1050,14 +1049,27 @@ export function createAssistantApp({
   function stopPollingUnavailable(run, message) {
     clearPollTimer();
     if (state.activeRun === run && !run?.terminal) {
+      run.status = "settlement_unknown";
       state.statusMessage = message;
       notify();
     }
   }
 
-  async function pollRun(run = state.activeRun, immediateDepth = 0) {
+  async function pollRun(run = state.activeRun) {
+    if (pollInFlight) return;
+    pollInFlight = true;
+    try { await pollRunPage(run); }
+    finally { pollInFlight = false; }
+  }
+
+  async function pollRunPage(run = state.activeRun, immediateDepth = 0) {
+    if (disposed) return;
     if (!run || run.terminal) {
       clearPollTimer();
+      return;
+    }
+    if (!run.runId || (run.actorCapsule && run.actorCapsule !== "assistant") || run.attachmentAllowed === false) {
+      stopPollingUnavailable(run, "Outcome unknown. The original request and run identity are preserved.");
       return;
     }
     if (immediateDepth >= MAX_IMMEDIATE_EVENT_PAGES) {
@@ -1066,11 +1078,19 @@ export function createAssistantApp({
       }, POLL_DELAY_MS);
       return;
     }
-    const { response, payload } = await requestJson("/api/provider/model/runs_events", {
-      run_id: run.runId,
-      request_id: cryptoRef.randomUUID(),
-      after_sequence: run.afterSequence,
-    });
+    let response, payload;
+    try {
+      ({ response, payload } = await requestJson("/api/provider/model/runs_events", {
+        run_id: run.runId,
+        request_id: cryptoRef.randomUUID(),
+        after_sequence: run.afterSequence,
+      }));
+    } catch {
+      run.status = "settlement_unknown";
+      stopPollingUnavailable(run, "Connection lost. The run outcome is unknown. Check its status before starting another run.");
+      return;
+    }
+    if (disposed) return;
     if (!response.ok || payload?.status === "error") {
       run.pollErrorCount += 1;
       if (
@@ -1092,36 +1112,22 @@ export function createAssistantApp({
       stopPollingUnavailable(run, "Model provider unavailable.");
       return;
     }
-    const previousCursor = run.afterSequence;
-    const nextCursor = parseCursorValue(page.next_cursor);
-    if (nextCursor === null || nextCursor < previousCursor) {
-      stopPollingUnavailable(run, "Model provider unavailable.");
-      return;
-    }
-    const events = [];
-    let lastSequence = previousCursor;
-    for (const event of page.events) {
-      const sequence = parseCursorValue(event?.sequence);
-      if (sequence === null || sequence <= lastSequence) {
-        stopPollingUnavailable(run, "Model provider unavailable.");
-        return;
-      }
-      events.push(event);
-      lastSequence = sequence;
-    }
-    if (nextCursor < lastSequence) {
+    let applied;
+    try {
+      applied = applyRunEventsPage(page, run.afterSequence);
+    } catch {
       stopPollingUnavailable(run, "Model provider unavailable.");
       return;
     }
     run.pollErrorCount = 0;
-    run.afterSequence = nextCursor;
-    const settled = applyRunEvents(events);
+    run.afterSequence = applied.nextCursor;
+    const settled = applyDecodedEvents(applied);
     if (settled || run.terminal) {
       clearPollTimer();
       return;
     }
     if (page.has_more) {
-      await pollRun(run, immediateDepth + 1);
+      await pollRunPage(run, immediateDepth + 1);
       return;
     }
     state.pollTimer = setTimeoutFn(() => {
@@ -1132,9 +1138,9 @@ export function createAssistantApp({
   async function sendDraft() {
     const promptSource =
       state.activeMode === MODE_STUDIO ? state.studioDraft : state.draft;
-    const prompt = boundedText(promptSource.trim(), MAX_MESSAGE_CONTENT_BYTES);
+    const prompt = state.activeMode === MODE_STUDIO ? String(promptSource).trim() : boundedText(promptSource.trim(), MAX_MESSAGE_CONTENT_BYTES);
     const offer = selectedOffer();
-    if (!prompt || !offer || state.offersLoading || state.workspaceLoading) {
+    if (!prompt || !offer || state.offersLoading || state.offersError || state.workspaceLoading || (state.activeRun && !state.activeRun.terminal)) {
       notify();
       return false;
     }
@@ -1157,17 +1163,49 @@ export function createAssistantApp({
       notify();
       return false;
     }
-    const { response, payload } = await requestJson("/api/provider/model/runs_create", {
+    const createRequestId = cryptoRef.randomUUID();
+    // Reserve the request identity synchronously, before either persistence or
+    // network work can yield. A second click observes this pending run.
+    const pendingRun = {
+      runId: "", createRequestId, sessionId: isStudio ? studioSessionId : session?.id || "",
+      actorCapsule: "assistant", mode: isStudio ? MODE_STUDIO : session.mode,
+      prompt, draft: promptSource, offerId: offer.id, operation: offer.operation, mediaLabel: offer.mediaLabel || "",
+      afterSequence: 0, outputText: "", terminal: false, cancelRequested: false,
+      status: "submitting", output: null, error: null, progress: null,
+      pollErrorCount: 0, pollDeadlineAt: nowFn() + MAX_POLL_ERROR_WINDOW_MS,
+    };
+    state.activeRun = pendingRun;
+    notify();
+    let savedBeforeCreate = true;
+    try { if (isStudio) savedBeforeCreate = await beforeRunCreate(structuredClone(pendingRun)); }
+    catch { savedBeforeCreate = false; }
+    if (!savedBeforeCreate) {
+      pendingRun.status = "not_sent";
+      pendingRun.terminal = true;
+      state.statusMessage = "Save the conversation before sending this request.";
+      notify();
+      return false;
+    }
+    let response, payload;
+    try {
+      ({ response, payload } = await requestJson("/api/provider/model/runs_create", {
       offer_id: offer.id,
       operation: offer.operation,
-      request_id: cryptoRef.randomUUID(),
+      request_id: createRequestId,
       input: {
         schema: inputSchema,
         prompt,
       },
-    });
+      }));
+    } catch {
+      pendingRun.status = "settlement_unknown";
+      state.statusMessage = "The create response was lost. Outcome unknown; the original request ID is preserved.";
+      notify();
+      return false;
+    }
     if (!response.ok || payload?.status === "error") {
       state.statusMessage = readStatusMessage(payload, "Model provider unavailable.");
+      pendingRun.status = "settlement_unknown";
       if (session) {
         markWorkspaceDirty();
       }
@@ -1177,19 +1215,20 @@ export function createAssistantApp({
     const runView = parseRunView(payload);
     const runId = runView?.run_id;
     if (typeof runId !== "string" || !runId) {
-      state.statusMessage = "Model provider unavailable.";
+      pendingRun.status = "settlement_unknown";
+      state.statusMessage = "The create response has no run ID. Outcome unknown; the original request ID is preserved.";
       notify();
       return false;
     }
     if (isStudio) {
-      state.studioDraft = "";
+      if (state.studioDraft === promptSource) state.studioDraft = "";
     }
-    state.activeRun = {
+    Object.assign(pendingRun, {
       runId,
-      sessionId: session?.id || "",
+      sessionId: isStudio ? studioSessionId : session?.id || "",
       mode: isStudio ? MODE_STUDIO : session.mode,
       mediaLabel: offer.mediaLabel || "",
-      afterSequence: parseCursorValue(runView.sequence_cursor) ?? 0,
+      afterSequence: parseCursor(runView.sequence_cursor) ?? 0,
       outputText: "",
       terminal: false,
       cancelRequested: false,
@@ -1199,7 +1238,7 @@ export function createAssistantApp({
       progress: null,
       pollErrorCount: 0,
       pollDeadlineAt: nowFn() + MAX_POLL_ERROR_WINDOW_MS,
-    };
+    });
     if (session) {
       updateStreamingMessage(session.id, runId, "");
       markWorkspaceDirty();
@@ -1213,15 +1252,24 @@ export function createAssistantApp({
 
   async function stopRun() {
     const run = state.activeRun;
-    if (!run || run.terminal || run.cancelRequested) {
+    if (!run || !run.runId || run.terminal || run.cancelRequested ||
+        (run.actorCapsule && run.actorCapsule !== "assistant") || run.attachmentAllowed === false) {
       return false;
     }
     run.cancelRequested = true;
     notify();
-    const { response, payload } = await requestJson("/api/provider/model/runs_cancel", {
+    let response, payload;
+    try {
+      ({ response, payload } = await requestJson("/api/provider/model/runs_cancel", {
       run_id: run.runId,
       request_id: cryptoRef.randomUUID(),
-    });
+      }));
+    } catch {
+      run.status = "settlement_unknown";
+      state.statusMessage = "The stop response was lost. The run outcome is unknown.";
+      notify();
+      return false;
+    }
     if (!response.ok || payload?.status === "error") {
       state.statusMessage = readStatusMessage(payload, "Model provider unavailable.");
       notify();
@@ -1235,10 +1283,22 @@ export function createAssistantApp({
   }
 
   async function initialize() {
-    if (homeToken) {
+    if (homeToken && !studioOnly) {
       homeClipboard.start();
     }
-    await Promise.all([loadOffers(), loadWorkspace()]);
+    if (studioOnly) {
+      state.workspaceLoading = false;
+      state.activeMode = MODE_STUDIO;
+      await loadOffers();
+      if (state.activeRun && !state.activeRun.terminal) {
+        state.activeRun.pollErrorCount = 0;
+        state.activeRun.pollDeadlineAt = nowFn() + MAX_POLL_ERROR_WINDOW_MS;
+        void pollRun(state.activeRun);
+      }
+      notify();
+    } else {
+      await Promise.all([loadOffers(), loadWorkspace()]);
+    }
   }
 
   async function copyTranscript() {
@@ -1273,6 +1333,18 @@ export function createAssistantApp({
 
   return {
     initialize,
+    refreshModels: loadOffers,
+    openModels() {
+      try {
+        const origin = new URL(homeOrigin);
+        if (!["http:", "https:"].includes(origin.protocol) || origin.origin !== homeOrigin) return false;
+      } catch { return false; }
+      if (!homeToken || !targetWindow || targetWindow === sourceWindow) return false;
+      const query = { category: "models" };
+      if (state.selectedModelCid) query.model_cid = state.selectedModelCid;
+      targetWindow.postMessage({ type: "home:open-target", homeToken, target: "marketplace", query }, homeOrigin);
+      return true;
+    },
     snapshot,
     createSession,
     selectSession,
@@ -1289,6 +1361,15 @@ export function createAssistantApp({
     copyTranscript,
     sendDraft,
     stopRun,
+    resumeRun() {
+      clearPollTimer();
+      if (state.activeRun) {
+        state.activeRun.pollErrorCount = 0;
+        state.activeRun.pollDeadlineAt = nowFn() + MAX_POLL_ERROR_WINDOW_MS;
+      }
+      return pollRun(state.activeRun);
+    },
+    dispose() { disposed = true; clearPollTimer(); },
     updateRenameValue(value) {
       state.renameValue = boundedText(value, MAX_SESSION_TITLE_BYTES);
       notify();
@@ -1741,16 +1822,31 @@ export function mountAssistantApp(root, app) {
       offerNode.append(option);
       offerNode.disabled = true;
     } else {
+      if (!view.offersReady.some(offer => offer.id === view.selectedOfferId) ||
+          (view.selectedModelCid != null && !view.modelChoices.some(row => row.cid === view.selectedModelCid && row.offerId === view.selectedOfferId))) {
+        const missing = document.createElement("option");
+        missing.value = ""; missing.textContent = "Chosen model unavailable"; missing.selected = true;
+        offerNode.append(missing);
+      }
       for (const offer of view.offersReady) {
+        if (view.modelChoices.some(model => model.offerId === offer.id)) continue;
         const option = document.createElement("option");
         option.value = offer.id;
         option.textContent = studioActive
           ? `${offer.title} - ${offer.mediaLabel}`
           : offer.title;
-        option.selected = offer.id === view.selectedOfferId;
+        option.selected = offer.id === view.selectedOfferId && view.selectedModelCid == null;
         offerNode.append(option);
       }
-      offerNode.disabled = false;
+      for (const model of view.modelChoices) {
+        const option = document.createElement("option");
+        option.value = `content:${model.cid}`;
+        option.textContent = model.title;
+        option.title = model.cid;
+        option.selected = (view.selectedModelCid == null || model.cid === view.selectedModelCid) && model.offerId === view.selectedOfferId;
+        offerNode.append(option);
+      }
+      offerNode.disabled = view.offersLoading || Boolean(view.offersError) || view.workspaceLoading;
     }
   }
 
@@ -1764,7 +1860,11 @@ export function mountAssistantApp(root, app) {
     }
     const action = button.dataset.action;
     const sessionId = button.dataset.sessionId || "";
-    if (action === "select-session") {
+    if (action === "open-models") {
+      app.openModels();
+    } else if (action === "refresh-models") {
+      void app.refreshModels();
+    } else if (action === "select-session") {
       app.selectSession(sessionId);
     } else if (action === "toggle-pin") {
       app.togglePinSession(sessionId);
@@ -1792,7 +1892,8 @@ export function mountAssistantApp(root, app) {
   });
 
   offerNode.addEventListener("change", () => {
-    app.setSelectedOfferId(offerNode.value);
+    const model = app.snapshot().modelChoices.find(row => `content:${row.cid}` === offerNode.value);
+    app.setSelectedOfferId(model?.offerId || offerNode.value, model?.cid ?? null);
     rerender();
   });
 

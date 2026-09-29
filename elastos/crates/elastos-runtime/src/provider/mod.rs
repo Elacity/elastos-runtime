@@ -11,10 +11,10 @@ mod registry;
 
 pub use bridge::{CapsuleProvider, ProviderBridge, ProviderConfig as BridgeProviderConfig};
 pub use registry::{
-    EntryType, Provider, ProviderByteRange, ProviderCarrierInvoker, ProviderCarrierRoute,
-    ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderProgress,
-    ProviderRegistration, ProviderRegistry, ProviderStreamOptions, ProviderStreamRead,
-    ProviderStreamSession, ProviderTransfer, ResourceAction, ResourceResponse,
+    EntryType, LocalIpfsCapacityObservation, Provider, ProviderByteRange, ProviderCarrierInvoker,
+    ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
+    ProviderProgress, ProviderRegistration, ProviderRegistry, ProviderStreamOptions,
+    ProviderStreamRead, ProviderStreamSession, ProviderTransfer, ResourceAction, ResourceResponse,
 };
 
 // Re-export for use by external provider implementations

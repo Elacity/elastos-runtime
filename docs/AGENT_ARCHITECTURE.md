@@ -356,17 +356,19 @@ The repository already establishes several parts of this model:
 - Capability and audit policy already applies to typed model-provider
   resources.
 - The old terminal `chat` and `agent` source capsules are retired. Product Chat
-  is the `chat-room` App; no general Agent Host is currently in the install set.
+  is the `chat-room` App. The installed `home-agent` capsule is the
+  Home-integrated conversational Agent surface and uses typed Runtime model and
+  workspace operations. It is not the future general autonomous Agent Host.
 - The architecture already separates mutable capsule state from immutable
   capsule artifacts.
 
 The complete parity path is not yet proven. In particular, `state.md` records
 that principal, proof binding, device, capsule, launch grant, and session are
 not yet independently established end to end for the Component path. The
-repository does not yet ship a general Agent Host with durable task/session
-recovery, persistent approvals, and arbitrary governed tools. It also does not
-yet prove a corresponding signed agent identity document, private persona
-contract, or standing mandate product end to end.
+installed Home Agent does not yet provide the general Agent Host contract with
+durable task/session recovery, persistent approvals, and arbitrary governed
+tools. End-to-end proof for a corresponding signed agent identity document,
+private persona contract, and standing mandate product remains open.
 
 No product-readiness claim should be inferred from this architecture document.
 A conforming implementation must prove the exact installed Runtime, capsule,

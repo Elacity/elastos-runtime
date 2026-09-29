@@ -3,6 +3,58 @@
 > Architecture target, not current shipped behavior. For current proof level see
 > [../state.md](../state.md).
 
+The shared wire definitions and version rules are in
+[Browser contract](BROWSER_PROTOCOL.md). Device roles, resource requirements and
+qualification gates are in [Browser support](BROWSER_SUPPORT.md).
+
+## Capsule delivery and service selection
+
+Browser uses the common [Digital Capsule model](CAPSULE_MODEL.md). Its entry
+point and UI can remain one app capsule. Engine and Exit implementations are
+provider capsules. Each installable package has a complete signed artifact
+closure, including its declared dependencies and compatible platform payloads.
+Native Engine helpers and the VM image belong to that verified closure; Runtime
+owns admission onto the supported host substrate. A library may be a verified
+member of a package without becoming another independently managed capsule.
+
+The Browser entry declares required interfaces and dependencies. Runtime resolves
+them through the trusted catalog to exact artifact identities, verifies and
+admits locally needed packages, and binds approved running services. Dependency
+names alone do not identify acceptable bytes. Service selection and mutable
+profiles stay outside the shared immutable Browser artifact.
+
+Admission also defines update and removal. An active instance retains its exact
+verified package and dependencies. A replacement activates atomically. Removal
+waits for consumers to release ownership; a failed close retains that ownership
+for reconciliation. These rules belong to the common capsule path.
+
+[Content availability](CONTENT_AVAILABILITY.md) owns retention and retrieval.
+Multiple nodes can retain the same capsule CID. Their availability receipts are
+separate from offers to execute an Engine or provide Exit service. A retained
+Engine package remains useful while its original execution host is offline, but
+another host can run it only if that host has a compatible substrate and grants
+the required authority. Pinning bytes does not promise running capacity.
+
+For local execution, the selected Runtime acquires and admits the Engine closure
+on demand. For remote execution, the provider Runtime owns that preparation;
+the consumer acquires only its local dependencies and attaches to the approved
+service. Both paths use the same Browser entry and Runtime contracts. Content
+and availability providers select the byte source; Carrier carries off-box
+traffic. Browser does not implement its own downloader or call IPFS directly.
+
+The installer supplies a small verified bootstrap set with enough Content and
+Carrier support to acquire other capsules, plus trusted catalog roots and an
+upgrade path. The installer and Runtime distribution paths must agree on artifact
+identity and admission. They must not require developer source-home files.
+
+Delivery proof includes fresh acquisition from each declared availability node
+with the other source offline, verified reuse, interrupted acquisition and
+tamper rejection. Execution-service unavailability is tested separately. Browser
+proof then distinguishes local Engine admission from remote service use without a local
+Engine image. Runtime preserves user state and reports unavailable content or
+services as separate outcomes. This section defines the target contract; current
+installation and replication evidence remains in state.md.
+
 ## Decision
 
 ElastOS needs a real browser capsule, but the first production target should not
@@ -655,12 +707,17 @@ capture, and Runtime Exit proxying.
 
 `scripts/browser-selkies-target-preflight.sh` is the operator gate for such a
 target. It does not launch Selkies or Chromium; given an already-running Selkies
-WebSocket endpoint and private loopback CDP endpoint, it starts the ElastOS
+WebSocket endpoint, private loopback CDP endpoint and explicit
+`--runtime-fetch-proxy-url`, it starts the ElastOS
 control bridge and runs the hosted product-display preflight through
 `browser-engine-adapter`. Passing this gate means the target can return a typed
-`product_compositor` session with audio/video and engine-offer signaling. It
-does not by itself prove long-session durability, YouTube quality, or direct
-network denial inside the browser process.
+`product_compositor` session with declared audio/video and engine-offer signaling,
+then exact generation-bound terminal cleanup and adapter Shutdown. The control
+service validates the existing Runtime proxy field. Fake signaling proves the
+fixture contract; media quality, real Exit routing, direct-network denial and
+long-session durability remain target tests. The current-wheel and real-Chromium
+wrappers require `ELASTOS_BROWSER_RUNTIME_FETCH_PROXY_URL` before starting their
+target work.
 
 Real Selkies targets often protect the signaling endpoint with Basic auth. The
 preflight must be given those credentials explicitly with

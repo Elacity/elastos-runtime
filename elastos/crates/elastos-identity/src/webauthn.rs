@@ -23,12 +23,13 @@ const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
 
 /// Challenge type
 enum ChallengeType {
-    Registration,
+    Registration { rp_id: String, rp_origin: String },
     Authentication,
 }
 
 struct PendingChallenge {
     challenge: Vec<u8>,
+    registration_binding: Option<[u8; 32]>,
     challenge_type: ChallengeType,
     created: Instant,
 }
@@ -44,6 +45,16 @@ pub struct IdentityStatus {
 #[derive(Debug, Clone)]
 pub struct RegistrationOutcome {
     pub user_id: String,
+    pub credential: StoredCredential,
+    pub origin: String,
+    pub user_verified: bool,
+}
+
+/// Verified public credential facts. Runtime must durably bind these to its
+/// admitted enrollment operation before asking identity persistence to recover.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationCandidate {
     pub credential: StoredCredential,
     pub origin: String,
     pub user_verified: bool,
@@ -137,7 +148,7 @@ pub struct PublicKeyCredentialRequestOptions {
 }
 
 /// Browser → Server: registration response
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegistrationResponse {
     #[serde(rename = "id")]
@@ -149,7 +160,7 @@ pub struct RegistrationResponse {
     pub _type: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticatorAttestationResponse {
     pub client_data_json: String,   // base64url
@@ -186,6 +197,9 @@ struct CollectedClientData {
     type_: String,
     challenge: String,
     origin: String,
+    #[serde(default)]
+    cross_origin: bool,
+    top_origin: Option<String>,
 }
 
 /// Manages WebAuthn registration and authentication
@@ -228,6 +242,86 @@ impl IdentityManager {
         self.store.get_credentials()
     }
 
+    pub fn reload_credentials(&mut self) -> anyhow::Result<()> {
+        self.store.load()
+    }
+
+    pub fn has_credential_history(&self) -> bool {
+        self.store.data().is_some()
+    }
+
+    /// Only Runtime's durable first-owner operation may call this after verifying
+    /// its own claimant, candidate and ownership history under the auth lock.
+    pub fn persist_enrollment_candidate(
+        &mut self,
+        candidate: &RegistrationCandidate,
+    ) -> anyhow::Result<String> {
+        self.store.persist_first_owner(&candidate.credential)
+    }
+
+    pub fn guest_credential_history(&self) -> anyhow::Result<crate::store::GuestCredentialHistory> {
+        self.store.guest_credential_history()
+    }
+
+    /// Runtime durably binds the verified guest candidate before this effect.
+    pub fn persist_guest_candidate(
+        &mut self,
+        candidate: &RegistrationCandidate,
+        previous_history: &crate::store::GuestCredentialHistory,
+    ) -> anyhow::Result<StoredCredential> {
+        self.store
+            .persist_guest_candidate(&candidate.credential, previous_history)
+    }
+
+    pub fn begin_bound_principal_registration(
+        &mut self,
+        ceremony: &str,
+        rp_id: &str,
+        origin: &str,
+        binding: [u8; 32],
+    ) -> anyhow::Result<CreationOptions> {
+        self.cleanup_expired();
+        if ceremony.len() > 128
+            || rp_id.len() > 253
+            || origin.len() > 512
+            || self.challenges.len() >= 16
+        {
+            anyhow::bail!("guided registration limit exceeded");
+        }
+        let options = self.begin_principal_registration(ceremony, rp_id, origin)?;
+        self.challenges
+            .get_mut(ceremony)
+            .expect("created challenge")
+            .registration_binding = Some(binding);
+        Ok(options)
+    }
+
+    pub fn verify_bound_registration(
+        &self,
+        ceremony: &str,
+        response: &RegistrationResponse,
+        rp_id: &str,
+        origin: &str,
+        binding: [u8; 32],
+    ) -> anyhow::Result<RegistrationCandidate> {
+        let pending = self
+            .challenges
+            .get(ceremony)
+            .ok_or_else(|| anyhow::anyhow!("registration challenge unavailable"))?;
+        if pending.created.elapsed() > CHALLENGE_EXPIRY
+            || pending.registration_binding != Some(binding)
+            || !matches!(&pending.challenge_type, ChallengeType::Registration { rp_id: saved_rp, rp_origin: saved_origin } if saved_rp == rp_id && saved_origin == origin)
+        {
+            anyhow::bail!("registration binding mismatch");
+        }
+        Self::verify_registration_candidate(
+            response,
+            rp_id,
+            origin,
+            &URL_SAFE_NO_PAD.encode(&pending.challenge),
+        )
+    }
+
     /// Revoke one passkey credential from the local identity store.
     pub fn revoke_credential(&mut self, credential_id: &str) -> anyhow::Result<StoredCredential> {
         let credential = self
@@ -254,8 +348,9 @@ impl IdentityManager {
         &mut self,
         session_token: &str,
         rp_id: &str,
+        rp_origin: &str,
     ) -> anyhow::Result<CreationOptions> {
-        self.begin_registration_inner(session_token, rp_id, "ElastOS User", true)
+        self.begin_registration_inner(session_token, rp_id, rp_origin, "ElastOS User", true)
     }
 
     /// Begin registration for a separate runtime principal.
@@ -267,14 +362,16 @@ impl IdentityManager {
         &mut self,
         session_token: &str,
         rp_id: &str,
+        rp_origin: &str,
     ) -> anyhow::Result<CreationOptions> {
-        self.begin_registration_inner(session_token, rp_id, "ElastOS Passkey", false)
+        self.begin_registration_inner(session_token, rp_id, rp_origin, "ElastOS Passkey", false)
     }
 
     fn begin_registration_inner(
         &mut self,
         session_token: &str,
         rp_id: &str,
+        rp_origin: &str,
         display_name: &str,
         exclude_existing: bool,
     ) -> anyhow::Result<CreationOptions> {
@@ -337,7 +434,11 @@ impl IdentityManager {
             session_token.to_string(),
             PendingChallenge {
                 challenge,
-                challenge_type: ChallengeType::Registration,
+                registration_binding: None,
+                challenge_type: ChallengeType::Registration {
+                    rp_id: rp_id.to_string(),
+                    rp_origin: rp_origin.to_string(),
+                },
                 created: Instant::now(),
             },
         );
@@ -353,21 +454,71 @@ impl IdentityManager {
         rp_id: &str,
         rp_origin: &str,
     ) -> anyhow::Result<RegistrationOutcome> {
+        if self
+            .challenges
+            .get(session_token)
+            .is_some_and(|pending| pending.registration_binding.is_some())
+        {
+            anyhow::bail!("guided registration intent required");
+        }
         let pending = self
             .challenges
             .remove(session_token)
             .ok_or_else(|| anyhow::anyhow!("No pending registration challenge"))?;
 
-        if !matches!(pending.challenge_type, ChallengeType::Registration) {
+        let ChallengeType::Registration {
+            rp_id: saved_rp_id,
+            rp_origin: saved_origin,
+        } = pending.challenge_type
+        else {
             anyhow::bail!("Pending challenge is not a registration");
-        }
+        };
         if pending.created.elapsed() > CHALLENGE_EXPIRY {
             anyhow::bail!("Registration challenge expired");
         }
+        if rp_id != saved_rp_id || rp_origin != saved_origin {
+            anyhow::bail!("Registration ceremony RP or origin mismatch");
+        }
+
+        let candidate = Self::verify_registration_candidate(
+            response,
+            &saved_rp_id,
+            &saved_origin,
+            &URL_SAFE_NO_PAD.encode(pending.challenge),
+        )?;
+        let user_id = self.store.add_credential(candidate.credential.clone());
+        self.store.save()?;
+        Ok(RegistrationOutcome {
+            user_id,
+            credential: candidate.credential,
+            origin: candidate.origin,
+            user_verified: candidate.user_verified,
+        })
+    }
+
+    /// Verify a Runtime-bound challenge without mutating credential persistence.
+    pub fn verify_registration_candidate(
+        response: &RegistrationResponse,
+        rp_id: &str,
+        rp_origin: &str,
+        challenge: &str,
+    ) -> anyhow::Result<RegistrationCandidate> {
+        if response.response.client_data_json.len() > 4096
+            || response.response.attestation_object.len() > 32768
+        {
+            anyhow::bail!("Registration response exceeds limit");
+        }
+        let saved_rp_id = rp_id.to_string();
+        let saved_origin = rp_origin.to_string();
 
         // Decode and verify client data
         let client_data_bytes = URL_SAFE_NO_PAD.decode(&response.response.client_data_json)?;
         let client_data: CollectedClientData = serde_json::from_slice(&client_data_bytes)?;
+
+        // Top-level Home owns registration. Embedded ceremonies are not admitted.
+        if client_data.cross_origin || client_data.top_origin.is_some() {
+            anyhow::bail!("Registration requires top-level Home");
+        }
 
         if client_data.type_ != "webauthn.create" {
             anyhow::bail!("Invalid client data type: {}", client_data.type_);
@@ -375,13 +526,13 @@ impl IdentityManager {
 
         // Verify challenge matches
         let received_challenge = URL_SAFE_NO_PAD.decode(&client_data.challenge)?;
-        if received_challenge != pending.challenge {
+        if received_challenge != URL_SAFE_NO_PAD.decode(challenge)? {
             anyhow::bail!("Challenge mismatch");
         }
 
         // Verify origin
-        let expected_origin = rp_origin.trim_end_matches('/');
-        if client_data.origin.trim_end_matches('/') != expected_origin {
+        let expected_origin = saved_origin.as_str();
+        if client_data.origin != expected_origin {
             anyhow::bail!(
                 "Origin mismatch: expected {}, got {}",
                 expected_origin,
@@ -398,12 +549,12 @@ impl IdentityManager {
         let auth_data_bytes = extract_cbor_bytes(&att_obj, "authData")?;
 
         // Parse authenticator data
-        if auth_data_bytes.len() < 37 {
+        if auth_data_bytes.len() < 55 {
             anyhow::bail!("AuthData too short");
         }
 
         // Verify RP ID hash (first 32 bytes)
-        let expected_rp_hash = Sha256::digest(rp_id.as_bytes());
+        let expected_rp_hash = Sha256::digest(saved_rp_id.as_bytes());
         if auth_data_bytes[..32] != expected_rp_hash[..] {
             anyhow::bail!("RP ID hash mismatch");
         }
@@ -426,8 +577,14 @@ impl IdentityManager {
         // AAGUID (16 bytes) + credential ID length (2 bytes) + credential ID + COSE key
         let _aaguid = &auth_data_bytes[37..53];
         let cred_id_len = u16::from_be_bytes([auth_data_bytes[53], auth_data_bytes[54]]) as usize;
+        if cred_id_len == 0 || cred_id_len > 1024 || auth_data_bytes.len() <= 55 + cred_id_len {
+            anyhow::bail!("Invalid attested credential length");
+        }
         let cred_id = &auth_data_bytes[55..55 + cred_id_len];
         let cose_key_bytes = &auth_data_bytes[55 + cred_id_len..];
+        if cose_key_bytes.len() > 4096 {
+            anyhow::bail!("Credential key exceeds limit");
+        }
 
         let credential_id = URL_SAFE_NO_PAD.encode(cred_id);
         let public_key = URL_SAFE_NO_PAD.encode(cose_key_bytes);
@@ -439,14 +596,10 @@ impl IdentityManager {
             credential_id,
             public_key,
             sign_count,
-            rp_id: rp_id.to_string(),
+            rp_id: saved_rp_id,
         };
 
-        let user_id = self.store.add_credential(stored.clone());
-        self.store.save()?;
-
-        Ok(RegistrationOutcome {
-            user_id,
+        Ok(RegistrationCandidate {
             credential: stored,
             origin: client_data.origin,
             user_verified: true,
@@ -492,6 +645,7 @@ impl IdentityManager {
             PendingChallenge {
                 challenge,
                 challenge_type: ChallengeType::Authentication,
+                registration_binding: None,
                 created: Instant::now(),
             },
         );
@@ -887,13 +1041,292 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use sha2::{Digest, Sha256};
 
+    fn registration_response(challenge: &str, rp_id: &str, origin: &str) -> RegistrationResponse {
+        use ciborium::Value;
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let cose = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(3.into()), Value::Integer((-7).into())),
+            (Value::Integer((-1).into()), Value::Integer(1.into())),
+            (
+                Value::Integer((-2).into()),
+                Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                Value::Integer((-3).into()),
+                Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let credential_id = b"ceremony-credential";
+        let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
+        auth_data.push(FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL_DATA);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(credential_id);
+        ciborium::ser::into_writer(&cose, &mut auth_data).unwrap();
+        let mut attestation = Vec::new();
+        ciborium::ser::into_writer(
+            &Value::Map(vec![
+                (Value::Text("fmt".into()), Value::Text("none".into())),
+                (Value::Text("attStmt".into()), Value::Map(vec![])),
+                (Value::Text("authData".into()), Value::Bytes(auth_data)),
+            ]),
+            &mut attestation,
+        )
+        .unwrap();
+        RegistrationResponse {
+            _id: URL_SAFE_NO_PAD.encode(credential_id),
+            _raw_id: URL_SAFE_NO_PAD.encode(credential_id),
+            _type: "public-key".into(),
+            response: AuthenticatorAttestationResponse {
+                client_data_json: URL_SAFE_NO_PAD.encode(
+                    serde_json::json!({
+                        "type": "webauthn.create", "challenge": challenge, "origin": origin
+                    })
+                    .to_string(),
+                ),
+                attestation_object: URL_SAFE_NO_PAD.encode(attestation),
+            },
+        }
+    }
+
+    #[test]
+    fn owner_registration_rejects_cross_origin_and_top_origin() {
+        for fields in [
+            serde_json::json!({"crossOrigin": true}),
+            serde_json::json!({"crossOrigin": false, "topOrigin": "https://home.example"}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            let options = manager
+                .begin_principal_registration("owner", "home.example", "https://home.example")
+                .unwrap();
+            let mut response = registration_response(
+                &options.public_key.challenge,
+                "home.example",
+                "https://home.example",
+            );
+            let mut client: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(&response.response.client_data_json)
+                    .unwrap(),
+            )
+            .unwrap();
+            for (key, value) in fields.as_object().unwrap() {
+                client[key] = value.clone();
+            }
+            response.response.client_data_json =
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&client).unwrap());
+            assert!(manager
+                .complete_registration("owner", &response, "home.example", "https://home.example")
+                .is_err());
+            assert!(!manager.status().registered);
+        }
+    }
+
+    #[test]
+    fn registration_rejects_changed_authority_even_when_completion_caller_accepts_it() {
+        for (rp_id, origin) in [
+            ("other.example", "https://other.example"),
+            ("localhost", "http://localhost:9000"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            let seed = manager
+                .begin_registration("seed", "localhost", "http://localhost")
+                .unwrap();
+            let response =
+                registration_response(&seed.public_key.challenge, "localhost", "http://localhost");
+            manager
+                .complete_registration("seed", &response, "localhost", "http://localhost")
+                .unwrap();
+            let path = temp.path().join("identity/credentials.json");
+            let before = std::fs::read(&path).unwrap();
+            let credentials = serde_json::to_value(manager.credentials()).unwrap();
+            let options = manager
+                .begin_principal_registration("ceremony", "localhost", "http://localhost")
+                .unwrap();
+            let response = registration_response(&options.public_key.challenge, rp_id, origin);
+            let error = manager
+                .complete_registration("ceremony", &response, rp_id, origin)
+                .unwrap_err();
+            assert!(error.to_string().contains("ceremony RP or origin mismatch"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(manager.credentials()).unwrap(),
+                credentials
+            );
+            assert!(manager
+                .complete_registration("ceremony", &response, "localhost", "http://localhost")
+                .unwrap_err()
+                .to_string()
+                .contains("No pending registration challenge"));
+        }
+    }
+
+    #[test]
+    fn registration_bound_loopback_and_https_complete_once() {
+        for (rp_id, origin) in [
+            ("localhost", "http://localhost:61180"),
+            ("home.example", "https://home.example"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            let options = manager
+                .begin_registration("ceremony", rp_id, origin)
+                .unwrap();
+            let response = registration_response(&options.public_key.challenge, rp_id, origin);
+            let outcome = manager
+                .complete_registration("ceremony", &response, rp_id, origin)
+                .unwrap();
+            assert_eq!(outcome.credential.rp_id, rp_id);
+            assert_eq!(outcome.origin, origin);
+            let path = temp.path().join("identity/credentials.json");
+            let before = std::fs::read(&path).unwrap();
+            assert!(manager
+                .complete_registration("ceremony", &response, rp_id, origin)
+                .unwrap_err()
+                .to_string()
+                .contains("No pending registration challenge"));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+            let reloaded = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            assert_eq!(reloaded.credentials().len(), 1);
+            assert_eq!(reloaded.credentials()[0].rp_id, rp_id);
+        }
+    }
+
+    #[test]
+    fn registration_missing_and_expired_ceremonies_leave_store_empty() {
+        for expired in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            let options = manager
+                .begin_principal_registration("ceremony", "localhost", "http://localhost")
+                .unwrap();
+            if expired {
+                manager.expire_challenge_for_test("ceremony");
+            } else {
+                assert!(manager.cancel_challenge("ceremony"));
+            }
+            let response = registration_response(
+                &options.public_key.challenge,
+                "localhost",
+                "http://localhost",
+            );
+            let error = manager
+                .complete_registration("ceremony", &response, "localhost", "http://localhost")
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(if expired { "expired" } else { "No pending" }));
+            assert!(manager.credentials().is_empty());
+            assert!(!temp.path().join("identity/credentials.json").exists());
+        }
+    }
+
+    #[test]
+    fn guided_registration_bounds_challenges_and_requires_exact_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().into()).unwrap();
+        let rp = "home.example";
+        let origin = "https://home.example";
+        let options = manager
+            .begin_bound_principal_registration("first", rp, origin, [1; 32])
+            .unwrap();
+        let response = registration_response(&options.public_key.challenge, rp, origin);
+        assert!(manager
+            .complete_registration("first", &response, rp, origin)
+            .is_err());
+        assert!(manager
+            .verify_bound_registration("first", &response, rp, origin, [2; 32])
+            .is_err());
+        assert!(manager
+            .verify_bound_registration("first", &response, rp, origin, [1; 32])
+            .is_ok());
+        for n in 1..16 {
+            manager
+                .begin_bound_principal_registration(&format!("pending-{n}"), rp, origin, [1; 32])
+                .unwrap();
+        }
+        assert!(manager
+            .begin_bound_principal_registration("overflow", rp, origin, [1; 32])
+            .is_err());
+        manager.expire_challenge_for_test("first");
+        assert!(manager
+            .verify_bound_registration("first", &response, rp, origin, [1; 32])
+            .is_err());
+        manager
+            .begin_bound_principal_registration("replacement", rp, origin, [1; 32])
+            .unwrap();
+        assert!(manager.credentials().is_empty());
+        assert!(!temp.path().join("identity/credentials.json").exists());
+        let restarted = IdentityManager::new(temp.path().into()).unwrap();
+        assert!(restarted
+            .verify_bound_registration("first", &response, rp, origin, [1; 32])
+            .is_err());
+    }
+
+    #[test]
+    fn new_registration_ceremony_cannot_adopt_an_existing_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+        let rp = "home.example";
+        let origin = "https://home.example";
+        let first = manager
+            .begin_principal_registration("first", rp, origin)
+            .unwrap();
+        let response = registration_response(&first.public_key.challenge, rp, origin);
+        manager
+            .complete_registration("first", &response, rp, origin)
+            .unwrap();
+        let before = std::fs::read(temp.path().join("identity/credentials.json")).unwrap();
+        let credentials = manager.credentials();
+        let fresh = manager
+            .begin_principal_registration("fresh", rp, origin)
+            .unwrap();
+        let response = registration_response(&fresh.public_key.challenge, rp, origin);
+        assert!(manager
+            .complete_registration("fresh", &response, rp, origin)
+            .is_err());
+        assert_eq!(manager.credentials(), credentials);
+        assert_eq!(
+            std::fs::read(temp.path().join("identity/credentials.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn registration_validates_client_data_and_attestation_against_bound_authority() {
+        for (rp_id, origin, expected) in [
+            ("localhost", "https://other.example", "Origin mismatch"),
+            ("localhost", "http://localhost/", "Origin mismatch"),
+            ("other.example", "http://localhost", "RP ID hash mismatch"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+            let options = manager
+                .begin_principal_registration("ceremony", "localhost", "http://localhost")
+                .unwrap();
+            let response = registration_response(&options.public_key.challenge, rp_id, origin);
+            assert!(manager
+                .complete_registration("ceremony", &response, "localhost", "http://localhost")
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+            assert!(manager.credentials().is_empty());
+            assert!(!temp.path().join("identity/credentials.json").exists());
+        }
+    }
+
     #[test]
     fn registration_options_require_user_verification() {
         let temp = tempfile::tempdir().unwrap();
         let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
 
         let options = manager
-            .begin_registration("session-token", "localhost")
+            .begin_registration("session-token", "localhost", "http://localhost")
             .unwrap();
 
         assert_eq!(
@@ -908,7 +1341,7 @@ mod tests {
         let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
 
         let options = manager
-            .begin_principal_registration("session-token", "localhost")
+            .begin_principal_registration("session-token", "localhost", "http://localhost")
             .unwrap();
         let algorithms: Vec<i64> = options
             .public_key
@@ -988,12 +1421,12 @@ mod tests {
         });
 
         let backup_options = manager
-            .begin_registration("backup-session", "localhost")
+            .begin_registration("backup-session", "localhost", "http://localhost")
             .unwrap();
         assert_eq!(backup_options.public_key.exclude_credentials.len(), 1);
 
         let principal_options = manager
-            .begin_principal_registration("guest-session", "localhost")
+            .begin_principal_registration("guest-session", "localhost", "http://localhost")
             .unwrap();
         assert!(principal_options.public_key.exclude_credentials.is_empty());
     }

@@ -10,7 +10,14 @@ Home audit snapshot reviewed on 31 August 2026: 61 findings, the journey and
 control registers, evidence summaries, and a finding-by-finding principles
 review.
 
-Of 179 applicable GUI journeys, 54 have a complete verdict: 19 Pass and 35 Fail.
+The 10 September source update adds AUTH-11, SITE-01 and SITE-02 for the
+canonical `/home/` entry, installed-shortcut migration and public storefront.
+The register now has 198 journeys, including 182 applicable GUI journeys. These
+three additions await target proof. AUTH-05 and CLI-05 clarify the expected
+sign-out path; all existing verdicts, evidence and findings remain unchanged.
+
+In the August snapshot, 54 of 179 applicable GUI journeys have a complete
+verdict: 19 Pass and 35 Fail. These result counts remain unchanged.
 The 106 observed journeys also include partial observations. The 61 findings
 combine defects, setup prerequisites and deferred scope. The 100% source-mapping
 figure describes the installed capsule inventory; live acceptance is measured

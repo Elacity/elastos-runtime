@@ -179,6 +179,7 @@ required = {
     "save.state_get_after_put": result.get("save", {}).get("state_get_after_put", 0) > 0,
     "save.state_bytes": result.get("save", {}).get("state_bytes", 0) > 0,
     "stateLoadedAfterReload": result.get("stateLoadedAfterReload") is True,
+    "opaque ETag and conditional saves": result.get("initial", {}).get("conditionalSave") is True,
     "errors": not result.get("errors"),
 }
 failed = [name for name, passed in required.items() if not passed]

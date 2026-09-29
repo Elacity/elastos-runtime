@@ -97,6 +97,8 @@ struct RelayOpen {
     principal_id: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    public_only: bool,
 }
 
 fn main() {
@@ -161,10 +163,27 @@ fn run_server(config: LocalExitConfig, stdout: &mut dyn Write) -> Result<(), Str
 fn handle_session(mut runtime_stream: UnixStream, config: &LocalExitConfig) -> Result<(), String> {
     validate_config(config)?;
     let open = read_relay_open(&mut runtime_stream)?;
+    let restricted;
+    let config = if open.public_only {
+        if config.upstream_http_proxy.is_some() {
+            return Err("public-only Exit cannot use unverified proxy DNS".to_string());
+        }
+        restricted = public_relay_config(config);
+        &restricted
+    } else {
+        config
+    };
     let target = validate_relay_open(&open, config)?;
     eprintln!("{}", relay_open_log(&open, &target));
     let remote = connect_target(&target, config)?;
     forward_pair(runtime_stream, remote, config.buffer_bytes)
+}
+
+fn public_relay_config(config: &LocalExitConfig) -> LocalExitConfig {
+    let mut restricted = config.clone();
+    restricted.allow_private_targets = false;
+    restricted.allowed_private_targets.clear();
+    restricted
 }
 
 fn read_relay_open(stream: &mut UnixStream) -> Result<RelayOpen, String> {
@@ -593,6 +612,9 @@ fn validate_public_ip(ip: IpAddr) -> Result<(), ()> {
             }
         }
         IpAddr::V6(ip) => {
+            if let Some(ipv4) = ip.to_ipv4_mapped() {
+                return validate_public_ip(IpAddr::V4(ipv4));
+            }
             if ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
@@ -1095,6 +1117,103 @@ mod tests {
         assert!(validate_relay_open(&blocked_port, &config)
             .unwrap_err()
             .contains("port is not allowlisted"));
+    }
+
+    #[test]
+    fn public_only_rejects_unverified_proxy_resolution_before_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut config = config("/tmp/unused-exit-proxy-test.sock".into(), vec!["*".into()]);
+        config.upstream_http_proxy = Some(UpstreamHttpProxyConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            authorization_header: None,
+        });
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&relay_open("tls://example.com:443", "example.com")).unwrap();
+        payload["public_only"] = json!(true);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(client, "{payload}").unwrap();
+        let error = handle_session(server, &config).unwrap_err();
+        assert!(
+            error.contains("public-only Exit cannot use unverified proxy DNS"),
+            "{error}"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(
+            config.upstream_http_proxy.is_some(),
+            "configured route must remain owned by Runtime"
+        );
+    }
+
+    #[test]
+    fn public_only_normalizes_ipv4_mapped_addresses_at_host_and_dns_boundaries() {
+        for ip in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.1.1",
+            "::ffff:0.0.0.0",
+        ] {
+            assert!(
+                validate_public_host(ip, false).is_err(),
+                "host accepted {ip}"
+            );
+            let addr = SocketAddr::new(ip.parse().unwrap(), 443);
+            assert!(
+                validate_public_socket_addr(addr, false).is_err(),
+                "DNS accepted {ip}"
+            );
+        }
+        let public = "::ffff:93.184.216.34";
+        assert!(validate_public_host(public, false).is_ok());
+        assert!(
+            validate_public_socket_addr(SocketAddr::new(public.parse().unwrap(), 443), false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn remote_public_only_stream_cannot_inherit_local_private_exceptions() {
+        for explicit in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut config = config("/tmp/unused-exit-test.sock".into(), vec!["*".into()]);
+            config.allowed_ports = vec![addr.port()];
+            config.allow_private_targets = !explicit;
+            if explicit {
+                config.allowed_private_targets.push(PrivateTargetConfig {
+                    host: "127.0.0.1".into(),
+                    ports: vec![addr.port()],
+                    schemes: vec!["tcp".into()],
+                });
+            }
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&relay_open(&format!("tcp://{addr}"), "127.0.0.1")).unwrap();
+            let local: RelayOpen = serde_json::from_value(payload.clone()).unwrap();
+            assert!(
+                validate_relay_open(&local, &config).is_ok(),
+                "existing local scope stays valid"
+            );
+            payload["public_only"] = json!(true);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            writeln!(client, "{payload}").unwrap();
+            let error = handle_session(server, &config).unwrap_err();
+            assert!(error.contains("private"), "{error}");
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "a remotely granted stream must not reach the local listener"
+            );
+            let restricted = public_relay_config(&config);
+            assert!(
+                !restricted.allow_private_targets && restricted.allowed_private_targets.is_empty(),
+                "DNS socket checks use the same public-only policy"
+            );
+            assert!(validate_public_socket_addr(addr, restricted.allow_private_targets).is_err());
+        }
     }
 
     #[test]

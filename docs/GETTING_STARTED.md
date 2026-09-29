@@ -35,16 +35,9 @@ elastos chat --nick alice
 elastos update --check
 ```
 
-The default setup installs the core Home profile. Add content publishing tools
-only when you need them:
-
-```bash
-elastos setup --with kubo --with ipfs-provider --with documents
-elastos share README.md
-elastos open elastos://CID
-```
-
-Replace `CID` with the value returned by `elastos share`.
+Open Documents or Library from Home to work with your files. The source Home
+profile includes these apps and their content backend. For an installed release,
+its signed manifest determines the available components.
 
 The demo profile adds more Apps and tools. The operator profile supports
 `serve`, remote node control, agents, WASM or microVM `run`, and non-interactive

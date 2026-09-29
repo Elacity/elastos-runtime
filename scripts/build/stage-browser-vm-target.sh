@@ -255,6 +255,7 @@ install -m 755 "$native_proxy_bin" "$staging_dir/opt/elastos/bin/browser-native-
 install -m 755 "$runtime_relay_bin" "$staging_dir/opt/elastos/bin/browser-vm-runtime-relay"
 install -m 755 "$guest_control_bridge_bin" "$staging_dir/opt/elastos/bin/browser-vm-guest-control-bridge"
 install -m 644 "$control_service" "$staging_dir/opt/elastos/bin/browser-selkies-control-service.mjs"
+install -m 644 "$repo_root/scripts/browser-input-writer-gate.py" "$staging_dir/opt/elastos/bin/browser_input_writer_gate.py"
 install -m 755 "$vz_transport_bootstrap" "$staging_dir/opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs"
 install -m 755 "$node_bin" "$staging_dir/opt/elastos/bin/node"
 install -m 755 "$chromium_bin" "$staging_dir/opt/elastos/bin/chromium.real"
@@ -490,7 +491,7 @@ mount_if_needed tmpfs shm /dev/shm "mode=1777,nosuid,nodev"
 mount_if_needed tmpfs tmpfs /tmp "mode=1777,nosuid,nodev"
 rootfs_checkpoint "runtime filesystems mounted"
 
-for module in virtio virtio_ring virtio_pci virtio_console virtio_net; do
+for module in virtio virtio_ring virtio_pci virtio_rng virtio_console virtio_net; do
   modprobe "$module" 2>/dev/null || true
 done
 
@@ -629,8 +630,12 @@ JSON
     echo "browser-vm-init: VZ transport bootstrap relay did not start" >&2
     exit 1
   }
+  rootfs_mark "VZ bootstrap helper starting at $(date -u +%FT%TZ)"
+  rootfs_mark "VZ bootstrap entropy_bits=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || true) rng=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null || true)"
   ELASTOS_BROWSER_VM_VZ_TRANSPORT_BOOTSTRAP_CONFIG='{"schema":"elastos.browser.vz-transport-bootstrap.config/v1","relay_socket_path":"/run/elastos/browser-vz-transport-bootstrap.sock","authority_path":"/run/elastos/browser-vz-transport-authority.json","ice_servers_path":"/run/elastos/browser-ice-servers.json"}' \
     /opt/elastos/bin/node /opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs
+  rootfs_mark "VZ bootstrap helper exited at $(date -u +%FT%TZ)"
+  rootfs_mark "VZ bootstrap entropy_bits=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || true) rng=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null || true)"
   wait "$ELASTOS_BROWSER_VM_BOOTSTRAP_RELAY_PID"
   read_vz_authority_field() {
     /opt/elastos/bin/node -e '
@@ -912,6 +917,7 @@ cmdline_value() {
 
 profile_key="$(cmdline_value elastos.browser_profile || true)"
 profile_disk_policy="$(cmdline_value elastos.browser_profile_disk || true)"
+profile_disk_initialize="$(cmdline_value elastos.browser_profile_initialize || true)"
 mount_browser_profile_disk() {
   key="$1"
   disk="/dev/vdb"
@@ -927,10 +933,22 @@ mount_browser_profile_disk() {
   mkdir -p "$mount_dir"
   if ! grep -qs " $mount_dir " /proc/mounts 2>/dev/null; then
     if ! mount -t ext4 -o rw,noatime "$disk" "$mount_dir" 2>/dev/null; then
+      # Only the host's exclusively created disk has this one-use marker.
+      # A mount failure or absent filesystem signature cannot authorize format.
+      marker="ELASTOS_BROWSER_PROFILE_NEW_V1:$key"
+      if [ "$profile_disk_initialize" != "new" ] ||
+         [ "$(dd if="$disk" bs=1 count="${#marker}" 2>/dev/null)" != "$marker" ]; then
+        echo "browser-vm-selkies-start: Browser profile mount failed; existing disk preserved; profile recovery is required" >&2
+        exit 1
+      fi
       command -v mke2fs >/dev/null 2>&1 || {
         echo "browser-vm-selkies-start: mke2fs is required to initialize Browser profile disk" >&2
         exit 1
       }
+      # Consume and flush the intent before format, including failed format.
+      # Reusing these boot arguments must never reformat an initialized disk.
+      dd if=/dev/zero of="$disk" bs=1 count="${#marker}" conv=notrunc 2>/dev/null || exit 1
+      sync || exit 1
       mke2fs -q -t ext4 -F "$disk"
       mount -t ext4 -o rw,noatime "$disk" "$mount_dir"
     fi
@@ -1221,6 +1239,7 @@ ELASTOS_BROWSER_NATIVE_PROXY_ENGINE_CONFIG="$(cat <<JSON
   "startup_grace_ms": 1000,
   "browser_args": [
     "--proxy-server={proxy_url}",
+    "--proxy-bypass-list=<-loopback>",
     "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
     "--disable-dev-shm-usage",
     "--no-first-run",
@@ -1336,7 +1355,122 @@ text = path.read_text()
 main_path = path.with_name("__main__.py")
 if not main_path.is_file():
     raise SystemExit("browser-vm-selkies-start: Selkies __main__.py not found")
-main_text = main_path.read_text()
+def patch_selkies_signaling_retries(source):
+    # Both peers share the asyncio loop with the signaling server. A blocking
+    # retry delay stops HELLO, SDP, and healthy peer traffic on that loop.
+    for handler, peer in (("on_signalling_error", "signalling"),
+                          ("on_audio_signalling_error", "audio_signalling")):
+        before = f"""    async def {handler}(e):
+       if isinstance(e, WebRTCSignallingErrorNoPeer):
+           # Waiting for peer to connect, retry in 2 seconds.
+           time.sleep(2)
+           await {peer}.setup_call()
+"""
+        after = before.replace("time.sleep(2)", "await asyncio.sleep(2)")
+        if before in source:
+            source = source.replace(before, after, 1)
+        elif after not in source:
+            raise SystemExit(f"browser-vm-selkies-start: Selkies {handler} retry patch target not found")
+    return source
+
+def patch_selkies_input_writer(source):
+    input_marker = "    app.on_data_message = webrtc_input.on_message\n"
+    input_patch = """    from browser_input_writer_gate import InputWriterGate
+    input_writer = InputWriterGate(webrtc_input, "/run/elastos/browser-input-writer.sock")
+    app.on_data_message = input_writer.on_message
+"""
+    import_marker = "import sys\n"
+    import_patch = 'import sys\nsys.path.insert(0, "/opt/elastos/bin")\n'
+    close_marker = "        webrtc_input.disconnect()\n"
+    close_patch = "        input_writer.close()\n        webrtc_input.disconnect()\n"
+    if input_patch in source:
+        if any(source.count(value) != 1 for value in (input_patch, import_patch, close_patch)):
+            raise SystemExit("browser-vm-selkies-start: incomplete input writer patch")
+        return source
+    for marker in (input_marker, import_marker, close_marker):
+        if source.count(marker) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies input writer patch target not found")
+    return source.replace(input_marker, input_patch, 1).replace(import_marker, import_patch, 1).replace(close_marker, close_patch, 1)
+
+def patch_selkies_display_renegotiate(signalling_source, gst_source, main_source):
+    signalling_cb = "        self.on_session = lambda peer_id, meta: logger.warn('unhandled on_session callback')\n"
+    signalling_cb_patch = signalling_cb + "        self.on_renegotiate = lambda: logger.warn('unhandled on_renegotiate callback')\n"
+    signalling_json = '''                elif data.get("ice", None):
+                    logger.info("received ICE")
+                    logger.debug("ICE:\\n%s" % data.get("ice"))
+                    self.on_ice(data['ice'].get('sdpMLineIndex'),
+                                data['ice'].get('candidate'))
+                else:
+'''
+    signalling_json_patch = '''                elif data.get("ice", None):
+                    logger.info("received ICE")
+                    logger.debug("ICE:\\n%s" % data.get("ice"))
+                    self.on_ice(data['ice'].get('sdpMLineIndex'),
+                                data['ice'].get('candidate'))
+                elif data.get("elastos_display_renegotiate") is True:
+                    logger.info("received display renegotiate")
+                    self.on_renegotiate()
+                else:
+'''
+    gst_marker = "    def __on_negotiation_needed(self, webrtcbin):\n"
+    gst_offer_plain = """    def request_display_offer(self):
+        if self.webrtcbin:
+            self.__on_negotiation_needed(self.webrtcbin)
+
+    def __on_negotiation_needed(self, webrtcbin):
+"""
+    gst_offer_restart = """    def request_display_offer(self):
+        if not self.webrtcbin:
+            return
+        logger.info("creating display offer with ICE restart")
+        options = Gst.Structure("application/x-gst-webrtc-offer-options")
+        options.set_value("IceRestart", True)
+        promise = Gst.Promise.new_with_change_func(
+            self.__on_offer_created, self.webrtcbin, None)
+        self.webrtcbin.emit("create-offer", options, promise)
+
+    def __on_negotiation_needed(self, webrtcbin):
+"""
+    gst_patch = """    def request_display_offer(self):
+        logger.info("recreating display pipeline for a new viewer")
+        audio_only = bool(getattr(self, "_elastos_audio_only", False))
+        self.stop_pipeline()
+        self.start_pipeline(audio_only=audio_only)
+
+    def __on_negotiation_needed(self, webrtcbin):
+"""
+    start_marker = '        logger.info("starting pipeline")\n'
+    start_patch = '        self._elastos_audio_only = audio_only\n        logger.info("starting pipeline")\n'
+    main_marker = "    app.on_sdp = signalling.send_sdp\n    audio_app.on_sdp = audio_signalling.send_sdp\n"
+    main_patch = main_marker + "    signalling.on_renegotiate = app.request_display_offer\n    audio_signalling.on_renegotiate = audio_app.request_display_offer\n"
+    if signalling_cb_patch not in signalling_source:
+        if signalling_source.count(signalling_cb) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate callback target not found")
+        signalling_source = signalling_source.replace(signalling_cb, signalling_cb_patch, 1)
+    if signalling_json_patch not in signalling_source:
+        if signalling_source.count(signalling_json) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate JSON target not found")
+        signalling_source = signalling_source.replace(signalling_json, signalling_json_patch, 1)
+    if gst_patch not in gst_source:
+        if gst_offer_restart in gst_source:
+            gst_source = gst_source.replace(gst_offer_restart, gst_patch, 1)
+        elif gst_offer_plain in gst_source:
+            gst_source = gst_source.replace(gst_offer_plain, gst_patch, 1)
+        elif gst_source.count(gst_marker) == 1:
+            gst_source = gst_source.replace(gst_marker, gst_patch, 1)
+        else:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate offer target not found")
+    if start_patch not in gst_source:
+        if gst_source.count(start_marker) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies pipeline audio flag target not found")
+        gst_source = gst_source.replace(start_marker, start_patch, 1)
+    if main_patch not in main_source:
+        if main_source.count(main_marker) != 1:
+            raise SystemExit("browser-vm-selkies-start: Selkies renegotiate wiring target not found")
+        main_source = main_source.replace(main_marker, main_patch, 1)
+    return signalling_source, gst_source, main_source
+
+main_text = patch_selkies_input_writer(patch_selkies_signaling_retries(main_path.read_text()))
 transport_helper_marker = "\ndef parse_rtc_config(data):\n"
 transport_helper_patch = '''
 def _elastos_turn_transport_query(url):
@@ -1385,57 +1519,6 @@ if "_elastos_turn_transport_query" not in main_text:
     main_text = main_text.replace(turn_uri_marker, turn_uri_patch, 1)
 if "_elastos_turn_transport_query(url)" not in main_text:
     raise SystemExit("browser-vm-selkies-start: Selkies TURN transport patch incomplete")
-fraction_needle = "from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC\n    fract = Gst.Fraction(60, 1)"
-fraction_replacement = """from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC
-    def _elastos_raw_caps_with_framerate(framerate):
-        return Gst.caps_from_string(f"video/x-raw,framerate={int(framerate)}/1")
-    fract = Gst.Fraction()"""
-if "_elastos_raw_caps_with_framerate" not in text:
-    if fraction_needle not in text:
-        raise SystemExit("browser-vm-selkies-start: Selkies Gst.Fraction compatibility patch target not found")
-    text = text.replace(fraction_needle, fraction_replacement, 1)
-initial_caps = """        # Create capabilities for ximagesrc
-        self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-        self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
-"""
-patched_initial_caps = """        # Create capabilities for ximagesrc
-        self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)
-"""
-if initial_caps in text:
-    text = text.replace(initial_caps, patched_initial_caps, 1)
-text = text.replace(
-    '        self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))',
-    '        self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)',
-)
-for set_framerate_caps in (
-    """            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(framerate, 1))
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""",
-    """            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""",
-):
-    if set_framerate_caps in text:
-        text = text.replace(set_framerate_caps, """            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(framerate)
-            self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
-""", 1)
-text = text.replace(
-    '            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(framerate, 1))',
-    '            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(framerate)',
-)
-text = text.replace(
-    '            self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))',
-    '            self.ximagesrc_caps = _elastos_raw_caps_with_framerate(self.framerate)',
-)
-for stale_fraction in (
-    "Gst.Fraction(60, 1)",
-    "Gst.Fraction(self.framerate, 1)",
-    "Gst.Fraction(framerate, 1)",
-):
-    if stale_fraction in text:
-        raise SystemExit(f"browser-vm-selkies-start: stale Selkies Gst.Fraction constructor remains: {stale_fraction}")
 marker = '        self.webrtcbin.set_property("latency", 0)\n'
 patch = '''        elastos_ice_transport_policy = os.environ.get("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY", "").strip().lower()
         if elastos_ice_transport_policy:
@@ -1460,15 +1543,6 @@ turn_patch = '''        if elastos_ice_transport_policy:
             self.webrtcbin.set_property("ice-transport-policy", policy_value)
             logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
 '''
-local_address_marker = '        self.pipeline.add(self.webrtcbin)\n'
-local_address_patch = '''        if os.environ.get("ELASTOS_BROWSER_VM_VZ_TRANSPORT", "").strip() == "vsock_v1":
-            self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")
-            if self._elastos_vz_ice_agent is None:
-                raise GSTWebRTCAppError("VZ ICE agent is unavailable")
-            if not self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1"):
-                raise GSTWebRTCAppError("VZ ICE loopback address was rejected")
-            logger.info("using explicit VZ ICE local address: 127.0.0.1")
-'''
 if "elastos_ice_transport_policy" not in text:
     if marker not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies relay patch target not found")
@@ -1479,17 +1553,41 @@ if "confirmed ICE transport policy after TURN setup" not in text:
     text = text.replace(turn_marker, turn_marker + turn_patch, 1)
 if "confirmed ICE transport policy after TURN setup" not in text:
     raise SystemExit("browser-vm-selkies-start: Selkies relay policy patch incomplete")
-if local_address_patch in text:
-    text = text.replace(local_address_patch, "", 1)
-if local_address_marker not in text:
-    raise SystemExit("browser-vm-selkies-start: Selkies ICE local address patch target not found")
-text = text.replace(
-    local_address_marker,
-    local_address_marker + local_address_patch,
-    1,
-)
-if 'self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1")' not in text:
-    raise SystemExit("browser-vm-selkies-start: Selkies VZ ICE local address patch incomplete")
+def patch_selkies_vz_ice_ownership(source):
+    marker = '        self.pipeline.add(self.webrtcbin)\n'
+    old_hook = '''        if os.environ.get("ELASTOS_BROWSER_VM_VZ_TRANSPORT", "").strip() == "vsock_v1":
+            self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")
+            if self._elastos_vz_ice_agent is None:
+                raise GSTWebRTCAppError("VZ ICE agent is unavailable")
+            if not self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1"):
+                raise GSTWebRTCAppError("VZ ICE loopback address was rejected")
+            logger.info("using explicit VZ ICE local address: 127.0.0.1")
+'''
+    reference = '''            # This fresh, unstarted agent has two owners: webrtcbin and
+            # its Python wrapper. GStreamer 1.22 leaves the default floating;
+            # PyGObject sinks the bin's reference instead of adding its own.
+            # Restore only that missing reference. Already-owned agents need none.
+            if self._elastos_vz_ice_agent.__grefcount__ == 1:
+                self._elastos_vz_ice_agent._ref()
+'''
+    hook = old_hook.replace('            if not self._elastos_vz_ice_agent.emit(',
+                            reference + '            if not self._elastos_vz_ice_agent.emit(', 1)
+    for previous in (hook, old_hook):
+        if source.count(previous) > 1:
+            raise SystemExit("browser-vm-selkies-start: duplicate VZ ICE hook")
+        source = source.replace(previous, "", 1)
+    if source.count(marker) != 1 or "self._elastos_vz_ice_agent" in source.replace(
+            '        self._elastos_vz_ice_agent = None\n', ""):
+        raise SystemExit("browser-vm-selkies-start: Selkies ICE ownership patch target changed")
+    source = source.replace(marker, marker + hook, 1)
+    stopped = '        logger.info("pipeline stopped")\n'
+    release = '        self._elastos_vz_ice_agent = None\n'
+    if source.count(stopped) != 1:
+        raise SystemExit("browser-vm-selkies-start: Selkies pipeline stop patch target changed")
+    source = source.replace(release + stopped, stopped, 1)
+    return source.replace(stopped, release + stopped, 1)
+
+text = patch_selkies_vz_ice_ownership(text)
 ice_log_marker = '        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)\n'
 ice_log_patch = '        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)\n'
 if ice_log_patch not in text:
@@ -1634,6 +1732,12 @@ if audio_offer_patch not in text:
     if audio_offer_marker not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies split audio offer patch target not found")
     text = text.replace(audio_offer_marker, audio_offer_patch, 1)
+signalling_path = path.with_name("webrtc_signalling.py")
+if not signalling_path.is_file():
+    raise SystemExit("browser-vm-selkies-start: webrtc_signalling.py not found")
+signalling_text = signalling_path.read_text()
+signalling_text, text, main_text = patch_selkies_display_renegotiate(signalling_text, text, main_text)
+signalling_path.write_text(signalling_text)
 path.write_text(text)
 main_path.write_text(main_text)
 PY

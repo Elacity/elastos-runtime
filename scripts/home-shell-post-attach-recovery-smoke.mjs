@@ -244,6 +244,7 @@ let rootShellLaunchCount = 0;
 
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
+  getElementById: id => elementForSelector(`#${id}`),
   activeElement: null,
   body: elementForSelector("body"),
   documentElement: elementForSelector("html"),
@@ -257,6 +258,7 @@ Object.defineProperty(globalThis, "navigator", {
   value: {},
 });
 globalThis.window = {
+  sessionStorage: { getItem: () => null },
   EventSource: FakeEventSource,
   crypto: { randomUUID: () => "home-shell-post-attach-recovery-smoke" },
   location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180" },

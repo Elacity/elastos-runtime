@@ -11,6 +11,7 @@ mod home_cmd;
 mod identity_cmd;
 mod init_cmd;
 mod node_cmd;
+mod provider_host;
 mod publish;
 mod release_cmd;
 mod room_cmd;
@@ -84,15 +85,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Power-user path: run an arbitrary capsule from a local directory or IPFS CID
+    /// Power-user path: run an arbitrary capsule from a local directory or IPFS
+    /// CID, or host a native provider (e.g. `custody-provider`) standalone
     Run {
-        /// Path to capsule directory (or use --cid for IPFS)
+        /// Capsule directory, or a native provider name or binary path
         #[arg(required_unless_present = "cid")]
         path: Option<PathBuf>,
 
         /// IPFS CID of the capsule to run
         #[arg(long, conflicts_with = "path")]
         cid: Option<String>,
+
+        /// Additional native provider to host, by name or binary path (repeatable)
+        #[arg(long = "with", value_name = "NAME_OR_PATH")]
+        with: Vec<String>,
+
+        /// Carrier bind address for a native provider host
+        #[arg(long, value_name = "ADDR")]
+        carrier_addr: Option<String>,
 
         /// Arguments to pass to the capsule (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -188,6 +198,11 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         capsules: Vec<String>,
 
+        /// Prepared native input for each release platform (repeat PLATFORM=DIR three times)
+        #[arg(long = "platform-input", value_name = "PLATFORM=DIR",
+              conflicts_with_all = &["skip_build", "skip_rootfs", "cross", "capsules"])]
+        platform_inputs: Vec<String>,
+
         /// Override release signing key path
         #[arg(long)]
         key: Option<PathBuf>,
@@ -272,6 +287,10 @@ enum Commands {
 
     /// Launch Home
     Home {
+        /// Open local Home in the default web browser
+        #[arg(long, conflicts_with_all = &["status", "json"])]
+        browser: bool,
+
         /// Print a local Home-state probe without opening the home-cli surface
         #[arg(long)]
         status: bool,
@@ -444,9 +463,13 @@ enum Commands {
         #[arg(long)]
         list: bool,
 
-        /// Prepare selected component prerequisites without installing components
+        /// Prepare selected component prerequisites without installing the remaining components
         #[arg(long, hide = true)]
         prerequisites_only: bool,
+
+        /// Developer-supplied directory containing ffmpeg and ffprobe
+        #[arg(long, hide = true, requires = "prerequisites_only")]
+        media_tools_dir: Option<PathBuf>,
     },
 
     /// Manage trusted release sources
@@ -1100,6 +1123,15 @@ enum ConfigCommand {
 pub(crate) enum IdentityCommand {
     /// Show the current DID-backed local profile
     Show,
+    /// Admit one first-owner passkey at an exact public HTTPS Home origin
+    ArmOwner {
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        rp_id: String,
+        #[arg(long, default_value_t = 300)]
+        expires_in: u64,
+    },
     /// Manage the profile nickname
     #[command(subcommand)]
     Nickname(IdentityNicknameCommand),
@@ -1178,6 +1210,11 @@ async fn main() -> anyhow::Result<()> {
                 libc::setpgid(0, 0);
             }
 
+            // Gateway shutdown owns draining and awaiting separate child groups.
+            // Its two-second HTTP drain must finish before the host lock is released.
+            let gateway_lifecycle = argv.first().is_some_and(|arg| arg == "gateway")
+                || (matches!(argv.first().map(String::as_str), None | Some("home"))
+                    && argv.iter().any(|arg| arg == "--browser"));
             tokio::spawn(async move {
                 let mut sigint =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -1194,7 +1231,12 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     libc::kill(0, libc::SIGTERM);
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(if gateway_lifecycle {
+                    10
+                } else {
+                    2
+                }))
+                .await;
                 // Force kill if still alive
                 unsafe {
                     libc::kill(0, libc::SIGKILL);
@@ -1217,6 +1259,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Home {
+        browser: false,
         status: false,
         json: false,
     });
@@ -1225,9 +1268,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run {
             path,
             cid,
+            with,
+            carrier_addr,
             capsule_args,
         } => {
-            return run_cmd::run_capsule(path, cid, capsule_args).await;
+            return run_cmd::run_capsule(path, cid, with, carrier_addr, capsule_args).await;
         }
 
         Commands::Serve {
@@ -1276,7 +1321,14 @@ async fn main() -> anyhow::Result<()> {
             return chat_cmd::run_chat(nick, connect).await;
         }
 
-        Commands::Home { status, json } => {
+        Commands::Home {
+            browser,
+            status,
+            json,
+        } => {
+            if browser {
+                return gateway_entry::run_browser_home().await;
+            }
             return home_cmd::run(status, json).await;
         }
 
@@ -1367,6 +1419,7 @@ async fn main() -> anyhow::Result<()> {
             skip_rootfs,
             cross,
             capsules,
+            platform_inputs,
             key,
             dry_run,
             preflight_only,
@@ -1385,6 +1438,7 @@ async fn main() -> anyhow::Result<()> {
                 skip_rootfs,
                 cross,
                 capsules,
+                platform_inputs,
                 key,
                 dry_run,
                 preflight_only,
@@ -1425,8 +1479,17 @@ async fn main() -> anyhow::Result<()> {
             without,
             list,
             prerequisites_only,
+            media_tools_dir,
         } => {
-            setup::run(profile, with, without, list, prerequisites_only).await?;
+            setup::run(
+                profile,
+                with,
+                without,
+                list,
+                prerequisites_only,
+                media_tools_dir,
+            )
+            .await?;
         }
 
         Commands::Source(cmd) => {
@@ -2146,6 +2209,89 @@ mod tests {
     use clap::Parser;
     use sha2::Digest;
     use std::fs;
+
+    #[test]
+    fn publish_release_cli_accepts_repeated_platform_inputs() {
+        let args = [
+            "elastos",
+            "publish-release",
+            "--version",
+            "0.7.1",
+            "--platform-input",
+            "x86_64-linux=/prepared/amd64",
+            "--platform-input",
+            "aarch64-linux=/prepared/arm64",
+            "--platform-input",
+            "aarch64-darwin=/prepared/mac",
+        ];
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        let Some(super::Commands::PublishRelease {
+            platform_inputs,
+            profile,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected publish-release command");
+        };
+        assert_eq!(profile, "home");
+        assert_eq!(
+            platform_inputs,
+            [
+                "x86_64-linux=/prepared/amd64",
+                "aarch64-linux=/prepared/arm64",
+                "aarch64-darwin=/prepared/mac",
+            ]
+        );
+        for conflict in [
+            vec!["--skip-build"],
+            vec!["--skip-rootfs"],
+            vec!["--cross", "aarch64"],
+            vec!["--capsules", "home"],
+        ] {
+            let mut invalid = args.to_vec();
+            invalid.extend(conflict);
+            assert!(super::Cli::try_parse_from(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn home_browser_cli_preserves_terminal_default_and_probe_options() {
+        assert!(super::Cli::try_parse_from(["elastos"])
+            .unwrap()
+            .command
+            .is_none());
+        let terminal = super::Cli::try_parse_from(["elastos", "home"]).unwrap();
+        assert!(matches!(
+            terminal.command,
+            Some(super::Commands::Home {
+                browser: false,
+                status: false,
+                json: false
+            })
+        ));
+        let browser = super::Cli::try_parse_from(["elastos", "home", "--browser"]).unwrap();
+        assert!(matches!(
+            browser.command,
+            Some(super::Commands::Home { browser: true, .. })
+        ));
+        for probe in ["--status", "--json"] {
+            assert!(super::Cli::try_parse_from(["elastos", "home", probe]).is_ok());
+            assert!(super::Cli::try_parse_from(["elastos", "home", "--browser", probe]).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_browser_process_group_keeps_the_terminal_frontdoor_policy() {
+        use std::io::IsTerminal;
+
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        for args in [Vec::new(), vec!["home"], vec!["home", "--browser"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(super::should_isolate_process_group(&args), !interactive);
+        }
+        assert!(super::should_isolate_process_group(&["serve".to_string()]));
+    }
 
     #[test]
     fn verify_component_binary_with_data_dir_rejects_dev_path() {

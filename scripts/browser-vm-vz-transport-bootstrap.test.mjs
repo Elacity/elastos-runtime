@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import vm from "node:vm";
 
 import {
   directNetworkErrorProvesUnavailable,
@@ -208,4 +209,81 @@ test("bootstrap direct-network probe fails closed on a reachable target", async 
     proveDirectNetworkUnavailable(launch, 1_000),
     /indeterminate \(ECONNREFUSED\)/,
   );
+});
+
+test("bootstrap flushes its bound receipt and closes without waiting for the descriptor deadline", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vz-bootstrap-close-"));
+  const socketPath = path.join(root, "relay.sock");
+  const descriptor = fixture("f");
+  const sockets = new Set();
+  let data = "";
+  let peerEnded;
+  const ended = new Promise(resolve => { peerEnded = resolve; });
+  let clientClosed;
+  const closed = new Promise(resolve => { clientClosed = resolve; });
+  // Match the relay/host: receive until EOF while keeping its write side open.
+  const server = net.createServer({ allowHalfOpen: true }, socket => {
+    sockets.add(socket);
+    socket.on("data", chunk => { data += chunk; });
+    socket.on("end", peerEnded);
+    socket.write(`${JSON.stringify({ schema: "elastos.browser.vz-transport-bootstrap/v1", ...descriptor })}\n`);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  const source = fs.readFileSync(new URL("./browser-vm-vz-transport-bootstrap.mjs", import.meta.url), "utf8");
+  const program = source.slice(source.indexOf("function readDescriptor("), source.indexOf("\nexport {"));
+  const deadlineTimers = new Set();
+  const stages = [];
+  const context = vm.createContext({
+    Buffer,
+    JSON,
+    performance,
+    console: { error: (line) => stages.push(JSON.parse(line)) },
+    net: { createConnection(options) {
+      const socket = net.createConnection(options);
+      sockets.add(socket);
+      socket.once("close", clientClosed);
+      return socket;
+    } },
+    MAX_DESCRIPTOR_BYTES: 64 * 1024,
+    REQUEST_SCHEMA: "elastos.browser.vz-transport-bootstrap/v1",
+    RECEIPT_SCHEMA: "elastos.browser.vz-transport-bootstrap-receipt/v1",
+    setTimeout(callback, delay) { const timer = setTimeout(callback, delay); deadlineTimers.add(timer); return timer; },
+    clearTimeout(timer) { clearTimeout(timer); deadlineTimers.delete(timer); },
+    readConfig: () => ({ relay_socket_path: socketPath,
+      authority_path: path.join(root, "authority.json"), ice_servers_path: path.join(root, "ice.json") }),
+    exactObjectKeys: (value, keys) => Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)),
+    validateAuthority, validateSecret, writeOwnerOnlyAtomic,
+    guestNetworkState: () => ({ interfaces: ["lo"], default_route_absent: true }),
+    proveDirectNetworkUnavailable: async () => true,
+  });
+  let failureTimer;
+  try {
+    await vm.runInContext(`${program}\nmain()`, context);
+    await Promise.race([Promise.all([ended, closed]), new Promise((_, reject) => {
+      failureTimer = setTimeout(() => reject(new Error("bootstrap connection remains open after receipt write")), 500);
+    })]);
+    const receipt = JSON.parse(data);
+    assert.equal(receipt.schema, "elastos.browser.vz-transport-bootstrap-receipt/v1");
+    assert.equal(receipt.binding_hash, descriptor.authority.binding_hash);
+    assert.equal(receipt.generation, descriptor.authority.generation);
+    assert.equal(receipt.terminal, true);
+    assert.equal(deadlineTimers.size, 0, "a completed descriptor has no pending read deadline");
+    assert.deepEqual(stages.map(event => event.stage), ["descriptor_wait", "descriptor_received",
+      "authority_validated", "direct_network_checked", "authority_written", "ice_written", "receipt_write_callback"]);
+    for (const event of stages) {
+      assert.deepEqual(Object.keys(event).sort(), ["at", "elapsed_ms", "schema", "stage"]);
+      assert.equal(event.schema, "elastos.browser.vz-bootstrap-stage/v1");
+      assert.ok(Number.isInteger(event.elapsed_ms) && event.elapsed_ms >= 0);
+      assert.ok(Number.isFinite(Date.parse(event.at)));
+    }
+  } finally {
+    clearTimeout(failureTimer);
+    for (const timer of deadlineTimers) clearTimeout(timer);
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

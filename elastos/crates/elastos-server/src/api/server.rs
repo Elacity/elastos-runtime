@@ -3,7 +3,7 @@
 //! Provides the session/capability HTTP surface used by the runtime, Home, and
 //! browser-hosted capsule adapters.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::Arc;
 
@@ -67,7 +67,8 @@ pub struct ServerConfig {
     pub docs_dir: Option<PathBuf>,
     pub addr: String,
     pub capsule_dir: Option<PathBuf>,
-    /// Directory containing data capsule files (served at /capsule-data/)
+    /// Optional admitted public data-capsule tree served at `/capsule-data/`.
+    /// Runtime data roots stay private and are never mounted here.
     pub data_dir: Option<PathBuf>,
     pub tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     /// Capsule supervisor for VM-based capsule lifecycle (supervisor path only)
@@ -94,6 +95,26 @@ impl Drop for HostHelperProcess {
         let _ = self.child.wait();
         tracing::info!("{} host helper stopped", self.name);
     }
+}
+
+fn is_private_runtime_data_root(dir: &Path) -> bool {
+    const MARKERS: &[&str] = &["identity/device.key", "runtime-coords.json", "bin/elastos"];
+    MARKERS.iter().any(|rel| dir.join(rel).is_file())
+}
+
+fn attach_public_capsule_data(app: Router, dir: Option<&Path>) -> Router {
+    let Some(dir) = dir else {
+        return app;
+    };
+    if is_private_runtime_data_root(dir) {
+        tracing::warn!(
+            path = %dir.display(),
+            "refusing to publish the runtime data root at /capsule-data"
+        );
+        return app;
+    }
+    tracing::info!("Serving capsule data from: {}", dir.display());
+    app.nest_service("/capsule-data", ServeDir::new(dir))
 }
 
 /// Start the HTTP API server with full session and capability support
@@ -473,12 +494,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         tracing::info!("Test endpoints enabled (debug build)");
     }
 
-    // Add data capsule file serving at /capsule-data/ if data_dir is provided
-    if let Some(ref dir) = data_dir {
-        tracing::info!("Serving capsule data from: {}", dir.display());
-        let data_serve = ServeDir::new(dir);
-        app = app.nest_service("/capsule-data", data_serve);
-    }
+    app = attach_public_capsule_data(app, data_dir.as_deref());
 
     // Add static file serving for web capsules if directory is provided
     let has_capsule = capsule_dir.is_some();
@@ -555,5 +571,55 @@ mod tests {
         assert!(!is_allowed_capsule_origin(&HeaderValue::from_static(
             "https://example.com"
         )));
+    }
+
+    #[tokio::test]
+    async fn private_runtime_data_root_is_not_published_at_capsule_data() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity");
+        std::fs::create_dir_all(&identity).unwrap();
+        std::fs::write(identity.join("device.key"), [7u8; 32]).unwrap();
+
+        let app = super::attach_public_capsule_data(axum::Router::new(), Some(dir.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/capsule-data/identity/device.key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admitted_public_capsule_data_remains_reachable() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rom.bin"), b"public-asset").unwrap();
+
+        let app = super::attach_public_capsule_data(axum::Router::new(), Some(dir.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/capsule-data/rom.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"public-asset");
     }
 }

@@ -98,6 +98,23 @@ test("successful close is terminal and calls the terminal hook once", async () =
   assert.equal(controller.status(pageOwner).terminal, true);
 });
 
+test("failed profile durability stays on a terminal close", async () => {
+  const pageOwner = owner();
+  const controller = createRuntimePageCleanupController({
+    closePage: async () =>
+      closeReceipt(pageOwner.page_id, {
+        profile_durability: "failed",
+        terminal_effects: { child_absent: true },
+      }),
+  });
+
+  const outcome = await controller.reconcile(pageOwner);
+
+  assert.equal(outcome.state, "terminal");
+  assert.equal(outcome.terminal_kind, "closed");
+  assert.equal(outcome.profile_durability, "failed");
+});
+
 test("Runtime-proven already-absent receipt is terminal", async () => {
   const pageOwner = owner();
   const receiptController = createRuntimePageCleanupController({

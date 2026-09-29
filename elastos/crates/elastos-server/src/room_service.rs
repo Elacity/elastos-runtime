@@ -203,6 +203,7 @@ pub struct PendingRequestView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSessionView {
     pub session_id: String,
+    #[serde(skip_serializing, default)]
     pub token: String,
     pub display_name: String,
     pub device_label: String,
@@ -5449,6 +5450,21 @@ mod tests {
     }
 
     #[test]
+    fn room_summary_json_omits_session_bearer_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
+        let _ = approve_request(tmp.path(), &request.request_id)
+            .unwrap()
+            .unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        assert!(!summary.active_sessions[0].token.is_empty());
+        let encoded = serde_json::to_value(&summary.active_sessions[0]).unwrap();
+        assert!(encoded.get("token").is_none());
+        assert_eq!(encoded["session_id"], summary.active_sessions[0].session_id);
+    }
+
+    #[test]
     fn revoke_guest_session_by_public_id_never_revokes_runtime_nodes() {
         let tmp = tempfile::tempdir().unwrap();
         let request =
@@ -6536,15 +6552,15 @@ mod tests {
         let first = start_local_runtime_session(tmp.path(), &did, "Local runtime", "ElastOS shell")
             .unwrap();
         let second =
-            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+            start_local_runtime_session(tmp.path(), &did, "owner", "ElastOS shell").unwrap();
 
         assert_eq!(first.token, second.token);
-        assert_eq!(second.display_name, "anders");
+        assert_eq!(second.display_name, "owner");
 
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 1);
         assert_eq!(summary.active_participants.len(), 1);
-        assert_eq!(summary.active_participants[0].display_name, "anders");
+        assert_eq!(summary.active_participants[0].display_name, "owner");
         assert_eq!(
             summary.active_participants[0].member_did.as_deref(),
             Some(did.as_str())
@@ -6557,7 +6573,7 @@ mod tests {
         let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
 
         let local =
-            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+            start_local_runtime_session(tmp.path(), &did, "owner", "ElastOS shell").unwrap();
         let _ = append_object(tmp.path(), &local.token, "hello from shell").unwrap();
 
         let request =
@@ -6575,7 +6591,7 @@ mod tests {
         assert!(poll
             .participants
             .iter()
-            .any(|participant| participant.display_name == "anders"
+            .any(|participant| participant.display_name == "owner"
                 && !participant.is_current_session));
         assert!(poll
             .objects
@@ -6590,16 +6606,14 @@ mod tests {
         let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
 
         let local =
-            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+            start_local_runtime_session(tmp.path(), &did, "owner", "ElastOS shell").unwrap();
         let sent = append_object(tmp.path(), &local.token, "hello from shell").unwrap();
         assert!(sent.from_current_session);
 
         let poll = room_poll(tmp.path(), &local.token, 0).unwrap();
-        assert!(poll
-            .participants
-            .iter()
-            .any(|participant| participant.display_name == "anders"
-                && participant.is_current_session));
+        assert!(poll.participants.iter().any(
+            |participant| participant.display_name == "owner" && participant.is_current_session
+        ));
         assert!(poll
             .objects
             .iter()

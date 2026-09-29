@@ -108,7 +108,7 @@ ci-source-home-linux arch='arm64':
     tar --no-xattrs --no-mac-metadata --no-fflags --exclude='.git' --exclude='target' --exclude='target-capsules' --exclude='target-build' --exclude='*/target' --exclude='capsules/*/target' -cf - . | \
       docker run --rm -i --platform linux/{{arch}} -e CARGO_TERM_COLOR=never rust:1.91-bookworm bash -c '\
         mkdir /w && tar -xf - -C /w && cd /w && \
-        apt-get update -qq >/dev/null && apt-get install -y -qq coturn e2fsprogs ffmpeg nodejs git jq >/dev/null && \
+        apt-get update -qq >/dev/null && apt-get install -y -qq coturn e2fsprogs ffmpeg nodejs git jq musl-tools nasm pkg-config >/dev/null && \
         rustup target add wasm32-unknown-unknown "$(uname -m)-unknown-linux-musl" >/dev/null 2>&1 && \
         useradd -m ci && chown -R ci:ci /w && \
         su -s /bin/bash ci -c "set -euo pipefail && \
@@ -117,7 +117,7 @@ ci-source-home-linux arch='arm64':
         export ELASTOS_COLLABORATION_STARTUP_MODE=isolated && \
         SOURCE_HOME=/home/ci/rtemp/elastos-source-home && mkdir -p \$SOURCE_HOME && \
         export HOME=\$SOURCE_HOME XDG_DATA_HOME=\$SOURCE_HOME/.local/share && \
-        scripts/setup-source-home.sh && \
+        SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR=/usr/bin scripts/setup-source-home.sh && \
         ELASTOS_DATA_DIR=\$XDG_DATA_HOME/elastos scripts/installed-provider-verify.sh && \
         scripts/local-carrier-setup-smoke.sh"'
 
@@ -146,6 +146,11 @@ verify:
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
     node scripts/home-entropy-check.mjs
+    python3 scripts/components-release-integrity-check.py --self-test
+    python3 scripts/publish-platform-artifacts-test.py
+    python3 scripts/release-platform-input-test.py
+    python3 scripts/prepare-release-platform-test.py
+    python3 scripts/media-tools-build-test.py
     node scripts/home-agent-shell-smoke.mjs
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source

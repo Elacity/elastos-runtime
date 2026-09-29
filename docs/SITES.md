@@ -39,7 +39,7 @@ What exists today:
   - `elastos site promote <channel> <release>`
   - `elastos site bind-domain`
   - `elastos site serve`
-  - CID-backed `publish` / `activate` use the `elastos://content/*` availability path, backed by the explicit `kubo` + `ipfs-provider` extras for now
+  - CID-backed `publish` / `activate` use the `elastos://content/*` availability path with a local IPFS backend. The source Home profile includes `kubo` and `ipfs-provider`; a published release uses its signed manifest. See [operator dependencies](INSTALL.md#content-commands-for-operators).
 - a first-party site serving component
   - `site-provider` owns the local HTTP edge for `localhost://MyWebSite`
 - direct local opening

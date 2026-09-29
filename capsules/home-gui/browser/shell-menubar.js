@@ -16,6 +16,7 @@ import {
   toolbarActiveTitleNode,
   canonicalTargetTitle,
   targetTitle,
+  targetById,
 } from "./shell-core.js?v=home-20260813a";
 import {
   dismissWithMotion,
@@ -98,9 +99,7 @@ function cleanLabel(value) {
 }
 
 function defaultMenus(targetId) {
-  // "New Window" only where opening one is what actually happens: single-
-  // session apps refocus, and the protected viewers must never get a menu
-  // side door into a dKMS open.
+  // Capsule policy decides whether a generic blank window is useful.
   const items = [];
   if (deps?.supportsNewWindow?.(targetId)) {
     items.push({ label: "New Window", cmd: CMD_NEW_WINDOW, disabled: false }, "-");
@@ -157,9 +156,31 @@ export function syncMenubar() {
   if (!entry) {
     return;
   }
-  const menus = manifests.get(entry.id) || defaultMenus(entry.targetId);
+  const menus = windowMenus(entry);
   menus.forEach((menu, index) => {
     root.appendChild(buildMenu(menu, index, entry.id));
+  });
+}
+
+function windowMenus(entry) {
+  const declared = manifests.get(entry.id);
+  if (!declared) return defaultMenus(entry.targetId);
+  const policy = targetById(shellState.currentSummary, entry.targetId)?.window_policy;
+  if (!policy) return declared;
+  const menus = declared.map((menu) => ({ ...menu,
+    items: menu.items.filter((item) => item.cmd !== CMD_NEW_WINDOW),
+  })).filter((menu) => menu.items.some((item) => item !== "-"));
+  if (policy !== "hybrid") return menus.length ? menus : defaultMenus(entry.targetId);
+  const newWindow = { label: "New Window", cmd: CMD_NEW_WINDOW, disabled: false };
+  // Capsule input is bounded; Home adds one command and at most one File menu.
+  if (!menus.some((menu) => menu.title === "File")) {
+    return [{ title: "File", items: [newWindow] }, ...menus];
+  }
+  let inserted = false;
+  return menus.map((menu) => {
+    if (menu.title !== "File" || inserted) return menu;
+    inserted = true;
+    return { ...menu, items: [newWindow, "-", ...menu.items] };
   });
 }
 
@@ -339,7 +360,9 @@ function runMenuCommand(windowId, cmd) {
     return;
   }
   if (cmd === CMD_NEW_WINDOW) {
-    deps?.openTarget(entry.targetId);
+    if (deps?.supportsNewWindow?.(entry.targetId)) {
+      deps?.openTarget(entry.targetId, { newWindow: true });
+    }
     return;
   }
   const frame = entry.node.querySelector(".window-frame");

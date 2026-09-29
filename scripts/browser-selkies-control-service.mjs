@@ -1,6 +1,6 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -11,6 +11,15 @@ import tls from "node:tls";
 import { fileURLToPath, URL } from "node:url";
 
 const CONFIG_ENV = "ELASTOS_BROWSER_SELKIES_CONTROL_CONFIG";
+const DISPLAY_CONTROL_HTTP_STATUS = Object.freeze({
+  display_attach_busy: 409,
+  display_generation_mismatch: 409,
+  display_owner_changed: 409,
+  display_attach_unsupported: 501,
+  display_attach_failed: 503,
+  display_attach_uncertain: 503,
+});
+const DISPLAY_RENEGOTIATE_SIGNAL = JSON.stringify({ elastos_display_renegotiate: true });
 const HOSTED_PRODUCT_OPEN_SCHEMA = "elastos.browser.hosted-product.open/v1";
 const VM_GUEST_OPEN_SCHEMA = "elastos.browser.vm-guest.open/v1";
 const VM_LOG_DIR = "/var/log/elastos";
@@ -595,9 +604,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withTimeout(label, timeoutMs, promise) {
+function withTimeout(label, timeoutMs, promise, onTimeout = () => {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
+      onTimeout();
       reject(new Error(`${label} timed out after ${timeoutMs} ms`));
     }, timeoutMs);
     Promise.resolve(promise)
@@ -754,6 +764,7 @@ function normalizeWalletBridge(wallet) {
     accounts.some((account) => account.account_id === wallet.default_account_id)
       ? wallet.default_account_id
       : accounts[0]?.account_id || "";
+  const consumerMediation = walletUsesConsumerMediation(wallet);
   return {
     accounts,
     default_chain_namespace: defaultChain,
@@ -767,11 +778,27 @@ function normalizeWalletBridge(wallet) {
     transaction_broadcast_url:
       typeof wallet?.transaction_broadcast_url === "string" ? wallet.transaction_broadcast_url : "",
     approval_status_url: typeof wallet?.approval_status_url === "string" ? wallet.approval_status_url : "",
-    home_token: typeof wallet?.home_token === "string" ? wallet.home_token : "",
+    home_token: consumerMediation
+      ? ""
+      : typeof wallet?.home_token === "string"
+        ? wallet.home_token
+        : "",
     principal_id: typeof wallet?.principal_id === "string" ? wallet.principal_id : "",
     session_id: typeof wallet?.session_id === "string" ? wallet.session_id : "",
     launch_id: typeof wallet?.launch_id === "string" ? wallet.launch_id : "",
+    schema: typeof wallet?.schema === "string" ? wallet.schema : "",
+    resolution: typeof wallet?.resolution === "string" ? wallet.resolution : "",
+    page_id: typeof wallet?.page_id === "string" ? wallet.page_id : "",
+    lifecycle_generation:
+      typeof wallet?.lifecycle_generation === "string" ? wallet.lifecycle_generation : "",
   };
+}
+
+function walletUsesConsumerMediation(wallet) {
+  return (
+    wallet?.schema === "elastos.browser.wallet-consumer-mediation/v1" &&
+    wallet.resolution === "consumer_runtime"
+  );
 }
 
 function chainNamespaceToDecimal(namespace) {
@@ -1786,122 +1813,7 @@ function readTail(path, maxBytes) {
   return buffer.toString("utf8");
 }
 
-function guestAudioEnv() {
-  const runtimeDir = process.env.XDG_RUNTIME_DIR || "/run/elastos/browser-runtime";
-  const pulseRuntimePath = process.env.PULSE_RUNTIME_PATH || `${runtimeDir}/pulse`;
-  return {
-    ...process.env,
-    XDG_RUNTIME_DIR: runtimeDir,
-    PIPEWIRE_RUNTIME_DIR: process.env.PIPEWIRE_RUNTIME_DIR || runtimeDir,
-    PULSE_RUNTIME_PATH: pulseRuntimePath,
-    PULSE_SERVER: process.env.PULSE_SERVER || `unix:${pulseRuntimePath}/native`,
-  };
-}
-
-function runGuestAudioCommand(command, args = [], timeoutMs = 2500) {
-  try {
-    return execFileSync(command, args, {
-      encoding: "utf8",
-      timeout: timeoutMs,
-      maxBuffer: 512 * 1024,
-      env: guestAudioEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    const stdout = error?.stdout ? String(error.stdout) : "";
-    const stderr = error?.stderr ? String(error.stderr) : "";
-    const message = error instanceof Error ? error.message : String(error);
-    return [stdout, stderr, `[${command} failed: ${message}]`].filter(Boolean).join("\n");
-  }
-}
-
-function compactPipewireDump() {
-  const raw = runGuestAudioCommand("pw-dump", [], 3000);
-  let objects = [];
-  try {
-    objects = JSON.parse(raw);
-  } catch {
-    return raw
-      .split(/\r?\n/)
-      .filter((line) => /"(type|id|node\.name|node\.description|media\.class|application\.name|client\.api|object\.path|factory\.name|pulse\.server\.type|audio\.position)"/.test(line))
-      .join("\n");
-  }
-  const interestingKeys = [
-    "node.name",
-    "node.description",
-    "media.class",
-    "application.name",
-    "client.api",
-    "object.path",
-    "factory.name",
-    "pulse.server.type",
-    "audio.position",
-    "node.target",
-    "target.object",
-    "link.output.node",
-    "link.input.node",
-  ];
-  return objects
-    .map((object) => {
-      const props = object?.info?.props || {};
-      const facts = interestingKeys
-        .filter((key) => props[key] !== undefined)
-        .map((key) => `${key}=${JSON.stringify(props[key])}`)
-        .join(" ");
-      if (!facts && !/Client|Node|Link|Metadata|Module|Factory/.test(String(object?.type || ""))) {
-        return "";
-      }
-      return `${object?.id ?? "?"} ${object?.type || "unknown"}${facts ? ` ${facts}` : ""}`;
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function refreshBrowserVmAudioSummary() {
-  const path = `${VM_LOG_DIR}/browser-vm-pipewire-summary.log`;
-  try {
-    const env = guestAudioEnv();
-    const runtimeDir = env.XDG_RUNTIME_DIR;
-    const pulseRuntimePath = env.PULSE_RUNTIME_PATH;
-    const lines = [
-      "=== browser audio environment ===",
-      `XDG_RUNTIME_DIR=${runtimeDir}`,
-      `PIPEWIRE_RUNTIME_DIR=${env.PIPEWIRE_RUNTIME_DIR}`,
-      `PULSE_RUNTIME_PATH=${pulseRuntimePath}`,
-      `PULSE_SERVER=${env.PULSE_SERVER}`,
-      "=== browser audio sockets ===",
-    ];
-    for (const dir of [runtimeDir, pulseRuntimePath].filter(Boolean)) {
-      try {
-        lines.push(`${dir}: ${fs.readdirSync(dir).join(" ")}`);
-      } catch (error) {
-        lines.push(`${dir}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    lines.push("=== pw-cli info 0 ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["info", "0"]));
-    lines.push("=== pw-cli ls Node ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Node"]));
-    lines.push("=== pw-cli ls Client ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Client"]));
-    lines.push("=== pw-cli ls Port ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Port"]));
-    lines.push("=== pw-cli ls Link ===");
-    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Link"]));
-    lines.push("=== pw-link outputs ===");
-    lines.push(runGuestAudioCommand("pw-link", ["-o"]));
-    lines.push("=== pw-link inputs ===");
-    lines.push(runGuestAudioCommand("pw-link", ["-i"]));
-    lines.push("=== pw-link links ===");
-    lines.push(runGuestAudioCommand("pw-link", ["-l"]));
-    lines.push("=== pw-dump compact audio facts ===");
-    lines.push(compactPipewireDump());
-    fs.writeFileSync(path, `${lines.join("\n")}\n`);
-  } catch {}
-}
-
 function readBrowserVmLogTails() {
-  refreshBrowserVmAudioSummary();
   const logs = {};
   for (const name of VM_LOG_NAMES) {
     const path = `${VM_LOG_DIR}/${name}`;
@@ -1914,6 +1826,7 @@ function readBrowserVmLogTails() {
       logs[name] = {
         present: true,
         bytes: stat.size,
+        mtime: stat.mtime.toISOString(),
         tail: readTail(path, 8192),
       };
     } catch (error) {
@@ -1928,6 +1841,92 @@ function readBrowserVmLogTails() {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isSdpOffer(message) {
+  return message?.sdp?.type === "offer" && typeof message.sdp.sdp === "string";
+}
+
+function isRelayIce(message) {
+  return Boolean(message?.ice) && summarizeIceCandidate(message.ice)?.type === "relay";
+}
+
+function relayIceCandidates(list) {
+  return (Array.isArray(list) ? list : []).filter(
+    (candidate) => summarizeIceCandidate(candidate)?.type === "relay",
+  );
+}
+
+function rememberIceCandidate(candidates, history, ice) {
+  if (!ice) {
+    return;
+  }
+  const exists = (Array.isArray(history) ? history : []).some((candidate) => (
+    candidate?.candidate === ice.candidate &&
+    candidate?.sdpMLineIndex === ice.sdpMLineIndex &&
+    candidate?.sdpMid === ice.sdpMid
+  ));
+  if (exists) {
+    return;
+  }
+  if (Array.isArray(candidates)) {
+    candidates.push(ice);
+  }
+  if (Array.isArray(history)) {
+    history.push(ice);
+  }
+}
+
+async function waitForRenegotiatedOffer(waitFor, clearHistory, rememberIce) {
+  let offer = await waitFor(isSdpOffer, "Selkies SDP offer");
+  for (;;) {
+    const next = await waitFor(
+      (message) => isSdpOffer(message) || isRelayIce(message),
+      "Selkies relay ICE for the new offer",
+    );
+    if (isSdpOffer(next)) {
+      clearHistory();
+      offer = next;
+      continue;
+    }
+    rememberIce(next.ice);
+    return offer;
+  }
+}
+
+function takeQueuedMessage(messages, predicate) {
+  const index = (Array.isArray(messages) ? messages : []).findIndex(predicate);
+  if (index < 0) {
+    return null;
+  }
+  const [message] = messages.splice(index, 1);
+  return message;
+}
+
+async function settleRenegotiatedOffer(offer, waitFor, rememberIce, takeQueuedOffer, getHistory) {
+  let current = offer;
+  let sawNewer = false;
+  for (;;) {
+    const newer = takeQueuedOffer();
+    if (newer && isSdpOffer(newer)) {
+      current = newer;
+      sawNewer = true;
+      continue;
+    }
+    const candidates = relayIceCandidates(getHistory());
+    if (candidates.length > 0 || !sawNewer) {
+      return { offer: current, candidates };
+    }
+    const next = await waitFor(
+      (message) => isSdpOffer(message) || isRelayIce(message),
+      "Selkies relay ICE for the new offer",
+    );
+    if (isSdpOffer(next)) {
+      current = next;
+      continue;
+    }
+    rememberIce(next.ice);
+  }
 }
 
 function summarizeIceCandidate(candidate) {
@@ -1966,10 +1965,15 @@ function summarizeIceCandidate(candidate) {
   };
 }
 
-function readJsonRequest(req) {
+function readJsonRequest(req, maxBytes = Infinity) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    let received = 0;
+    req.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > maxBytes) { reject(browserInspectionError("invalid_inspection")); return; }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
@@ -1982,105 +1986,107 @@ function readJsonRequest(req) {
   });
 }
 
-class MinimalWebSocketClient {
-  constructor(url, { basicAuth } = {}) {
+export class MinimalWebSocketClient {
+  constructor(url, { basicAuth, maxIncomingBytes } = {}) {
     this.url = url;
     this.basicAuth = basicAuth;
+    this.maxIncomingBytes = maxIncomingBytes;
     this.socket = null;
     this.buffer = Buffer.alloc(0);
     this.textHandler = () => {};
     this.errorHandler = () => {};
     this.closeHandler = () => {};
     this.closed = true;
+    this.closeCode = null;
+    this.closeReason = null;
   }
 
   async connect(timeoutMs) {
     const port = Number(this.url.port || (this.url.protocol === "wss:" ? 443 : 80));
     const host = this.url.hostname;
-    const path = `${this.url.pathname || "/"}${this.url.search || ""}`;
-    this.socket = await new Promise((resolve, reject) => {
-      const connect = this.url.protocol === "wss:" ? tls.connect : net.connect;
-      const socket = connect({ host, port, servername: host });
-      const timer = setTimeout(() => {
-        socket.destroy(new Error("Selkies WebSocket connect timed out"));
-      }, timeoutMs);
-      socket.once("connect", () => {
-        clearTimeout(timer);
-        resolve(socket);
+    const requestPath = `${this.url.pathname || "/"}${this.url.search || ""}`;
+    if (this.socket && !this.socket.destroyed) throw new Error("Selkies WebSocket is already connecting");
+    const connectSocket = this.url.protocol === "wss:" ? tls.connect : net.connect;
+    const socket = connectSocket({ host, port, servername: host });
+    this.socket = socket;
+    this.closed = true;
+    this.buffer = Buffer.alloc(0);
+    this.closeCode = null;
+    this.closeReason = null;
+    const current = () => {
+      if (this.socket !== socket || socket.destroyed) throw new Error("Selkies WebSocket connect canceled");
+    };
+    socket.on("error", error => {
+      if (this.socket === socket) { this.closed = true; this.errorHandler(error); }
+    });
+    socket.on("close", () => {
+      if (this.socket === socket) { this.closed = true; this.closeHandler(); }
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          socket.off("connect", ready); socket.off("error", failed); socket.off("close", closed);
+        };
+        const ready = () => { cleanup(); resolve(); };
+        const failed = error => { cleanup(); reject(error); };
+        const closed = () => failed(new Error("Selkies WebSocket closed during connect"));
+        const timer = setTimeout(() => { failed(new Error("Selkies WebSocket connect timed out")); socket.destroy(); }, timeoutMs);
+        socket.once("connect", ready); socket.once("error", failed); socket.once("close", closed);
       });
-      socket.once("error", reject);
-    });
-    const key = crypto.randomBytes(16).toString("base64");
-    const headers = [
-      `GET ${path} HTTP/1.1`,
-      `Host: ${host}:${port}`,
-      "Upgrade: websocket",
-      "Connection: Upgrade",
-      `Sec-WebSocket-Key: ${key}`,
-      "Sec-WebSocket-Version: 13",
-    ];
-    if (this.basicAuth?.user && this.basicAuth?.password) {
-      const value = Buffer.from(`${this.basicAuth.user}:${this.basicAuth.password}`).toString("base64");
-      headers.push(`Authorization: Basic ${value}`);
-    }
-    this.socket.write(`${headers.join("\r\n")}\r\n\r\n`);
-    await this.readHandshake(timeoutMs);
-    this.closed = false;
-    this.socket.on("data", (chunk) => {
-      try {
-        this.handleData(chunk);
-      } catch (error) {
-        this.errorHandler(error);
-        this.close();
+      current();
+      const key = crypto.randomBytes(16).toString("base64");
+      const headers = [
+        `GET ${requestPath} HTTP/1.1`, `Host: ${host}:${port}`, "Upgrade: websocket", "Connection: Upgrade",
+        `Sec-WebSocket-Key: ${key}`, "Sec-WebSocket-Version: 13",
+      ];
+      if (this.basicAuth?.user && this.basicAuth?.password) {
+        const value = Buffer.from(`${this.basicAuth.user}:${this.basicAuth.password}`).toString("base64");
+        headers.push(`Authorization: Basic ${value}`);
       }
-    });
-    this.socket.on("error", (error) => {
-      this.closed = true;
-      this.errorHandler(error);
-    });
-    this.socket.on("close", () => {
-      this.closed = true;
-      this.closeHandler();
-    });
-    if (this.buffer.length > 0) {
-      this.handleData(Buffer.alloc(0));
+      socket.write(`${headers.join("\r\n")}\r\n\r\n`);
+      await this.readHandshake(timeoutMs, socket);
+      current();
+      this.closed = false;
+      socket.on("data", chunk => {
+        if (this.socket !== socket || this.closed) return;
+        try { this.handleData(chunk); }
+        catch (error) { this.errorHandler(error); this.close(); }
+      });
+      if (this.buffer.length > 0) this.handleData(Buffer.alloc(0));
+    } catch (error) {
+      socket.destroy();
+      throw error;
     }
   }
 
-  readHandshake(timeoutMs) {
+  readHandshake(timeoutMs, socket = this.socket) {
     return new Promise((resolve, reject) => {
       let data = Buffer.alloc(0);
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("Selkies WebSocket handshake timed out"));
-      }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
-        this.socket.off("data", onData);
-        this.socket.off("error", onError);
+        socket.off("data", onData); socket.off("error", onError); socket.off("close", onClose);
       };
-      const onError = (error) => {
-        cleanup();
-        reject(error);
-      };
-      const onData = (chunk) => {
+      const onError = error => { cleanup(); reject(error); };
+      const onClose = () => onError(new Error("Selkies WebSocket closed during handshake"));
+      const onData = chunk => {
+        if (this.maxIncomingBytes && data.length + chunk.length > this.maxIncomingBytes + 16384) {
+          onError(new Error("WebSocket handshake exceeded its byte limit")); return;
+        }
         data = Buffer.concat([data, chunk]);
         const end = data.indexOf("\r\n\r\n");
-        if (end < 0) {
-          return;
-        }
+        if (end < 0) return;
         const head = data.subarray(0, end).toString("utf8");
         if (!head.startsWith("HTTP/1.1 101") && !head.startsWith("HTTP/1.0 101")) {
-          cleanup();
-          reject(new Error(`Selkies WebSocket handshake failed: ${head.split("\r\n")[0]}`));
+          onError(new Error(`Selkies WebSocket handshake failed: ${head.split("\r\n")[0]}`));
           return;
         }
+        if (this.socket !== socket || socket.destroyed) { onClose(); return; }
         this.buffer = data.subarray(end + 4);
-        cleanup();
-        resolve();
+        cleanup(); resolve();
       };
-      this.socket.on("data", onData);
-      this.socket.on("error", onError);
+      const timer = setTimeout(() => onError(new Error("Selkies WebSocket handshake timed out")), timeoutMs);
+      socket.on("data", onData); socket.on("error", onError); socket.on("close", onClose);
     });
   }
 
@@ -2131,13 +2137,16 @@ class MinimalWebSocketClient {
       // The socket may already be closing; TCP teardown below is still required.
     }
     this.closed = true;
-    this.socket.end();
+    this.socket.destroy();
   }
 
   handleData(chunk) {
+    if (this.maxIncomingBytes && this.buffer.length + chunk.length > this.maxIncomingBytes + 65536) {
+      throw new Error("WebSocket input exceeded its byte limit");
+    }
     this.buffer = Buffer.concat([this.buffer, chunk]);
     for (;;) {
-      const frame = readFrame(this.buffer);
+      const frame = readFrame(this.buffer, this.maxIncomingBytes);
       if (!frame) {
         return;
       }
@@ -2145,6 +2154,8 @@ class MinimalWebSocketClient {
       if (frame.opcode === 0x1) {
         this.textHandler(frame.payload.toString("utf8"));
       } else if (frame.opcode === 0x8) {
+        this.closeCode = frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : null;
+        this.closeReason = frame.payload.length >= 2 ? frame.payload.subarray(2).toString("utf8") : null;
         this.close();
         return;
       } else if (frame.opcode === 0x9) {
@@ -2154,7 +2165,7 @@ class MinimalWebSocketClient {
   }
 }
 
-function readFrame(buffer) {
+function readFrame(buffer, maxBytes = MAX_WEBSOCKET_FRAME_BYTES) {
   if (buffer.length < 2) {
     return null;
   }
@@ -2170,12 +2181,12 @@ function readFrame(buffer) {
     if (buffer.length < offset + 8) return null;
     const bigLength = buffer.readBigUInt64BE(offset);
     offset += 8;
-    if (bigLength > BigInt(MAX_WEBSOCKET_FRAME_BYTES)) {
+    if (bigLength > BigInt(maxBytes)) {
       throw new Error("Selkies WebSocket frame is too large");
     }
     length = Number(bigLength);
   }
-  if (length > MAX_WEBSOCKET_FRAME_BYTES) {
+  if (length > maxBytes) {
     throw new Error("Selkies WebSocket frame is too large");
   }
   let mask;
@@ -2196,7 +2207,7 @@ function readFrame(buffer) {
   return { opcode, payload, consumed: offset + length };
 }
 
-class SelkiesPage {
+export class SelkiesPage {
   constructor(config, launchRequest, onClosed = () => {}, options = {}) {
     this.config = config;
     this.launchRequest = launchRequest;
@@ -2223,6 +2234,12 @@ class SelkiesPage {
     this.audioRemoteCandidateHistory = [];
     this.webrtcMedia = { audio: false, video: false };
     this.displaySession = null;
+    this.displayGeneration = `display:${crypto.randomBytes(16).toString("hex")}`;
+    this.displayAttachment = null;
+    this.establishedVideoProtocol = null;
+    this.establishedAudioProtocol = null;
+    this.displayAvailable = false;
+    this.legacyDisplaySignalsAllowed = true;
     this.signalingStats = {
       opened_at: null,
       last_selkies_message_at: null,
@@ -2238,6 +2255,7 @@ class SelkiesPage {
       last_selkies_candidate: null,
     };
     this.closed = false;
+    this.videoClosed = false;
     this.audioClosed = false;
     this.resetSignaling();
     this.resetAudioSignaling();
@@ -2281,6 +2299,9 @@ class SelkiesPage {
       audioOffer.sdp.sdp,
     );
     this.displaySession = result.display_session || null;
+    this.displayAvailable = true;
+    this.establishedVideoProtocol = this.signalingEnvelope;
+    this.establishedAudioProtocol = this.audioSignalingEnvelope;
     return result;
   }
 
@@ -2293,7 +2314,7 @@ class SelkiesPage {
     });
     ws.onClose(() => {
       if (this.ws === ws) {
-        this.markClosed();
+        this.markVideoClosed();
       }
     });
     return ws;
@@ -2330,7 +2351,7 @@ class SelkiesPage {
     this.waiters = [];
     this.remoteCandidates = [];
     this.remoteCandidateHistory = [];
-    this.closed = false;
+    this.videoClosed = false;
   }
 
   resetAudioSignaling() {
@@ -2398,63 +2419,164 @@ class SelkiesPage {
   }
 
   async openCurrentSelkiesAudioSession() {
-    await this.audioWs.connect(this.config.connectTimeoutMs);
-    this.audioWs.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
-    await this.waitForAudio((message) => message.kind === "hello", "Selkies audio HELLO");
-    this.audioWs.sendText("SESSION server");
-    const session = await this.waitForAudio((message) => message.kind === "session_ok", "Selkies audio SESSION_OK");
-    this.audioServerPeerId = session.serverPeerId;
-    this.audioSignalingEnvelope = "peer_routed";
-    return await this.waitForAudio(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "Selkies audio SDP offer",
-    );
+    const socket = this.audioWs;
+    const current = () => {
+      if (this.closed || this.audioWs !== socket || this.audioClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
+    };
+    current();
+    const reuse = socket.closed !== true && (this.audioServerPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 3, client_strict_viewer: false }));
+      await this.waitForAudio((message) => message.kind === "hello", "Selkies audio HELLO");
+      current();
+      socket.sendText("SESSION server");
+    }
+    if (!reuse) {
+      const session = await this.waitForAudio((message) => message.kind === "session_ok", "Selkies audio SESSION_OK");
+      current();
+      this.audioServerPeerId = session.serverPeerId;
+      this.audioSignalingEnvelope = "peer_routed";
+    }
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitForAudio(predicate, label),
+          () => {
+            this.audioRemoteCandidates = [];
+            this.audioRemoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.audioRemoteCandidates, this.audioRemoteCandidateHistory, ice),
+        )
+      : await this.waitForAudio(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "Selkies audio SDP offer",
+        );
+    current();
+    return offer;
   }
 
   async openLegacySelkiesAudioSession(displaySize) {
-    await this.audioWs.connect(this.config.connectTimeoutMs);
-    const helloMeta = Buffer.from(JSON.stringify({
-      res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
-      scale: displaySize.scale || 1,
-    })).toString("base64");
-    this.audioWs.sendText(`HELLO 3 ${helloMeta}`);
-    await this.waitForAudio((message) => message.kind === "hello", "legacy Selkies audio HELLO");
-    const offer = await this.waitForAudio(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "legacy Selkies audio SDP offer",
-    );
+    const socket = this.audioWs;
+    const current = () => {
+      if (this.closed || this.audioWs !== socket || this.audioClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
+    };
+    current();
+    const reuse = socket.closed !== true && (this.audioServerPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      const helloMeta = Buffer.from(JSON.stringify({
+        res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
+        scale: displaySize.scale || 1,
+      })).toString("base64");
+      socket.sendText(`HELLO 3 ${helloMeta}`);
+      await this.waitForAudio((message) => message.kind === "hello", "legacy Selkies audio HELLO");
+      socket.legacyHelloAccepted = true;
+    }
+    current();
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitForAudio(predicate, label),
+          () => {
+            this.audioRemoteCandidates = [];
+            this.audioRemoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.audioRemoteCandidates, this.audioRemoteCandidateHistory, ice),
+        )
+      : await this.waitForAudio(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "legacy Selkies audio SDP offer",
+        );
+    current();
     this.audioServerPeerId = offer.from || "2";
     this.audioSignalingEnvelope = "raw_json";
     return offer;
   }
 
   async openCurrentSelkiesSession() {
-    await this.ws.connect(this.config.connectTimeoutMs);
-    this.ws.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
-    await this.waitFor((message) => message.kind === "hello", "Selkies HELLO");
-    this.ws.sendText("SESSION server");
-    const session = await this.waitFor((message) => message.kind === "session_ok", "Selkies SESSION_OK");
-    this.serverPeerId = session.serverPeerId;
-    this.signalingEnvelope = "peer_routed";
-    const offer = await this.waitFor(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "Selkies SDP offer",
-    );
+    const socket = this.ws;
+    const current = () => {
+      if (this.closed || this.ws !== socket || this.videoClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
+    };
+    current();
+    const reuse = socket.closed !== true && (this.serverPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      socket.sendText("HELLO client " + JSON.stringify({ client_type: "controller", client_slot: 1, client_strict_viewer: false }));
+      await this.waitFor((message) => message.kind === "hello", "Selkies HELLO");
+      current();
+      socket.sendText("SESSION server");
+    }
+    if (!reuse) {
+      const session = await this.waitFor((message) => message.kind === "session_ok", "Selkies SESSION_OK");
+      current();
+      this.serverPeerId = session.serverPeerId;
+      this.signalingEnvelope = "peer_routed";
+    }
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitFor(predicate, label),
+          () => {
+            this.remoteCandidates = [];
+            this.remoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.remoteCandidates, this.remoteCandidateHistory, ice),
+        )
+      : await this.waitFor(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "Selkies SDP offer",
+        );
+    current();
     return offer;
   }
 
   async openLegacySelkiesSession(displaySize) {
-    await this.ws.connect(this.config.connectTimeoutMs);
-    const helloMeta = Buffer.from(JSON.stringify({
-      res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
-      scale: displaySize.scale || 1,
-    })).toString("base64");
-    this.ws.sendText(`HELLO 1 ${helloMeta}`);
-    await this.waitFor((message) => message.kind === "hello", "legacy Selkies HELLO");
-    const offer = await this.waitFor(
-      (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
-      "legacy Selkies SDP offer",
-    );
+    const socket = this.ws;
+    const current = () => {
+      if (this.closed || this.ws !== socket || this.videoClosed) throw new Error("Selkies signaling session changed");
+      this.checkDisplayAttachmentDeadline();
+    };
+    current();
+    const reuse = socket.closed !== true && (this.serverPeerId || socket.legacyHelloAccepted);
+    if (reuse) {
+      socket.sendText(DISPLAY_RENEGOTIATE_SIGNAL);
+    } else {
+      await socket.connect(this.config.connectTimeoutMs);
+      current();
+      const helloMeta = Buffer.from(JSON.stringify({
+        res: `${this.config.displaySurface.stream.width}x${this.config.displaySurface.stream.height}`,
+        scale: displaySize.scale || 1,
+      })).toString("base64");
+      socket.sendText(`HELLO 1 ${helloMeta}`);
+      await this.waitFor((message) => message.kind === "hello", "legacy Selkies HELLO");
+      socket.legacyHelloAccepted = true;
+    }
+    current();
+    const offer = reuse
+      ? await waitForRenegotiatedOffer(
+          (predicate, label) => this.waitFor(predicate, label),
+          () => {
+            this.remoteCandidates = [];
+            this.remoteCandidateHistory = [];
+          },
+          (ice) => rememberIceCandidate(this.remoteCandidates, this.remoteCandidateHistory, ice),
+        )
+      : await this.waitFor(
+          (message) => message.sdp?.type === "offer" && typeof message.sdp.sdp === "string",
+          "legacy Selkies SDP offer",
+        );
+    current();
     this.serverPeerId = offer.from || "1";
     this.signalingEnvelope = "raw_json";
     return offer;
@@ -2493,6 +2615,7 @@ class SelkiesPage {
       display_session: {
         schema: "elastos.browser.display-session/v1",
         session_id: `display:${this.launchRequest.stream_id}`,
+        display_generation: this.displayGeneration,
         mode: "webrtc_remote_display",
         width: this.config.displaySurface.stream.width,
         height: this.config.displaySurface.stream.height,
@@ -2532,6 +2655,8 @@ class SelkiesPage {
     }
     if (parsed?.sdp?.type === "offer") {
       this.signalingStats.selkies_offers_received += 1;
+      this.remoteCandidates = [];
+      this.remoteCandidateHistory = [];
     }
     if (parsed?.ice) {
       this.remoteCandidates.push(parsed.ice);
@@ -2553,6 +2678,8 @@ class SelkiesPage {
     }
     if (parsed?.sdp?.type === "offer") {
       this.signalingStats.selkies_offers_received += 1;
+      this.audioRemoteCandidates = [];
+      this.audioRemoteCandidateHistory = [];
     }
     if (parsed?.ice) {
       this.audioRemoteCandidates.push(parsed.ice);
@@ -2566,6 +2693,38 @@ class SelkiesPage {
     }
   }
 
+  canReuseDisplaySignaling() {
+    return Boolean(
+      this.ws &&
+      this.audioWs &&
+      !this.videoClosed &&
+      !this.audioClosed &&
+      this.ws.closed !== true &&
+      this.audioWs.closed !== true &&
+      (this.serverPeerId || this.ws.legacyHelloAccepted) &&
+      (this.audioServerPeerId || this.audioWs.legacyHelloAccepted)
+    );
+  }
+
+  rejectStaleDisplayWaiters() {
+    for (const waiter of this.waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`Selkies WebSocket closed while waiting for ${waiter.label}`));
+    }
+    this.waiters = [];
+    this.messages = [];
+    this.remoteCandidates = [];
+    this.remoteCandidateHistory = [];
+    for (const waiter of this.audioWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`Selkies audio WebSocket closed while waiting for ${waiter.label}`));
+    }
+    this.audioWaiters = [];
+    this.audioMessages = [];
+    this.audioRemoteCandidates = [];
+    this.audioRemoteCandidateHistory = [];
+  }
+
   flushWaiters() {
     for (const waiter of [...this.waiters]) {
       const matchIndex = this.messages.findIndex(waiter.predicate);
@@ -2574,7 +2733,7 @@ class SelkiesPage {
         this.waiters = this.waiters.filter((entry) => entry !== waiter);
         clearTimeout(waiter.timer);
         waiter.resolve(message);
-      } else if (this.closed) {
+      } else if (this.closed || this.videoClosed) {
         this.waiters = this.waiters.filter((entry) => entry !== waiter);
         clearTimeout(waiter.timer);
         waiter.reject(new Error(`Selkies WebSocket closed while waiting for ${waiter.label}`));
@@ -2604,7 +2763,7 @@ class SelkiesPage {
       const [message] = this.messages.splice(matchIndex, 1);
       return Promise.resolve(message);
     }
-    if (this.closed) {
+    if (this.closed || this.videoClosed) {
       return Promise.reject(new Error(`Selkies WebSocket closed while waiting for ${label}`));
     }
     return new Promise((resolve, reject) => {
@@ -2646,7 +2805,175 @@ class SelkiesPage {
     });
   }
 
-  signal(signal, channel = "video") {
+  checkDisplayAttachmentDeadline() {
+    const attachment = this.displayAttachment;
+    if (attachment && (!attachment.pending || performance.now() >= attachment.deadline)) {
+      throw new Error("Browser display attachment expired");
+    }
+  }
+
+  attachDisplay(signal) {
+    const failure = (code, message) => Object.assign(new Error(message), { code });
+    if (signal?.type !== "display_attach" || typeof signal.request_id !== "string" ||
+        !/^[a-f0-9]{32}$/.test(signal.request_id) || typeof signal.display_generation !== "string" ||
+        !/^display:[a-f0-9]{32}$/.test(signal.display_generation) ||
+        Object.keys(signal).some(key => !["schema", "type", "request_id", "display_generation"].includes(key))) {
+      throw failure("invalid_request", "Browser display attachment request is invalid");
+    }
+    if (this.closed) throw failure("display_attach_failed", "Browser page is closed");
+    const previous = this.displayAttachment;
+    if (previous?.requestId === signal.request_id) {
+      if (previous.previousGeneration !== signal.display_generation) {
+        throw failure("display_generation_mismatch", "Browser display request identity changed");
+      }
+      return previous.promise;
+    }
+    if (previous?.pending) throw failure("display_attach_busy", "Browser display attachment is pending");
+    if (signal.display_generation !== this.displayGeneration) {
+      throw failure("display_generation_mismatch", "Browser display generation changed");
+    }
+    if (!this.displaySession) throw failure("display_attach_unsupported", "Browser display attachment is unavailable");
+    const attachment = { requestId: signal.request_id, previousGeneration: this.displayGeneration, pending: true, deadline: performance.now() + 4000 };
+    const videoProtocol = this.establishedVideoProtocol;
+    const audioProtocol = this.establishedAudioProtocol;
+    this.displayAttachment = attachment;
+    this.displayAvailable = false;
+    this.legacyDisplaySignalsAllowed = false;
+    const current = () => {
+      if (this.closed || this.displayAttachment !== attachment || !attachment.pending) {
+        throw failure("display_attach_failed", "Browser display attachment was canceled");
+      }
+      this.checkDisplayAttachmentDeadline();
+    };
+    const retire = () => {
+      // Detach both identities before close callbacks can observe the old pair.
+      const video = this.ws, audio = this.audioWs;
+      this.ws = null;
+      this.audioWs = null;
+      this.markVideoClosed();
+      this.markAudioClosed();
+      for (const socket of [video, audio]) {
+        try { socket?.close(); } catch (_) {}
+      }
+    };
+    const prepare = Promise.resolve().then(async () => {
+      current();
+      const reusedSignaling = this.canReuseDisplaySignaling();
+      if (reusedSignaling) {
+        this.rejectStaleDisplayWaiters();
+      } else {
+        retire();
+        this.resetSignaling();
+        this.resetAudioSignaling();
+      }
+      const size = browserDisplayMetrics(this.config);
+      const negotiate = async (channel, protocol) => {
+        for (;;) {
+          current();
+          const socket = channel === "video" ? this.ws : this.audioWs;
+          try {
+            return await (channel === "video"
+              ? (protocol === "raw_json" ? this.openLegacySelkiesSession(size) : this.openCurrentSelkiesSession())
+              : (protocol === "raw_json" ? this.openLegacySelkiesAudioSession(size) : this.openCurrentSelkiesAudioSession()));
+          } catch (error) {
+            current();
+            // The legacy broker closes the producer before releasing its fixed
+            // viewer UID. A socket close alone does not acknowledge that release.
+            // Retry only its explicit UID rejection, within this same 4s attempt.
+            if (protocol !== "raw_json" || socket?.legacyHelloAccepted === true || socket?.closeCode !== 1002 || socket?.closeReason !== "invalid peer uid") throw error;
+            await new Promise(resolve => setTimeout(resolve, 50));
+            current();
+            if (channel === "video") this.resetSignaling();
+            else this.resetAudioSignaling();
+          }
+        }
+      };
+      // Register both viewers before either producer's next SESSION retry;
+      // waiting for video SDP first can cost audio another retry interval.
+      const [videoOffer, audioOffer] = await Promise.all([
+        negotiate("video", videoProtocol),
+        negotiate("audio", audioProtocol),
+      ]);
+      current();
+      if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
+      let videoBound = {
+        offer: videoOffer,
+        candidates: relayIceCandidates(this.remoteCandidateHistory),
+      };
+      let audioBound = {
+        offer: audioOffer,
+        candidates: relayIceCandidates(this.audioRemoteCandidateHistory),
+      };
+      if (reusedSignaling) {
+        videoBound = await settleRenegotiatedOffer(
+          videoOffer,
+          (predicate, label) => this.waitFor(predicate, label),
+          (ice) => rememberIceCandidate(this.remoteCandidates, this.remoteCandidateHistory, ice),
+          () => takeQueuedMessage(this.messages, isSdpOffer),
+          () => this.remoteCandidateHistory,
+        );
+        current();
+        audioBound = await settleRenegotiatedOffer(
+          audioOffer,
+          (predicate, label) => this.waitForAudio(predicate, label),
+          (ice) => rememberIceCandidate(this.audioRemoteCandidates, this.audioRemoteCandidateHistory, ice),
+          () => takeQueuedMessage(this.audioMessages, isSdpOffer),
+          () => this.audioRemoteCandidateHistory,
+        );
+        current();
+      }
+      if (this.videoClosed || this.audioClosed) throw new Error("Browser display signaling closed");
+      const generation = `display:${crypto.randomBytes(16).toString("hex")}`;
+      const display = this.supervisorResult(
+        videoBound.offer.sdp.sdp,
+        this.browserPage,
+        this.wallet,
+        audioBound.offer.sdp.sdp,
+      ).display_session;
+      const initial_offer = {
+        ...display.initial_offer,
+        candidates: videoBound.candidates,
+      };
+      const audio_offer = {
+        ...display.audio_offer,
+        candidates: audioBound.candidates,
+      };
+      const result = {
+        schema: "elastos.browser.display-attach-result/v1",
+        page_id: this.pageId,
+        request_id: attachment.requestId,
+        previous_display_generation: attachment.previousGeneration,
+        display_generation: generation,
+        initial_offer,
+        audio_offer,
+      };
+      this.displayGeneration = generation;
+      this.displaySession = { ...display, display_generation: generation, initial_offer, audio_offer };
+      this.displayAvailable = true;
+      return result;
+    });
+    attachment.promise = withTimeout("Browser display attachment", 4000, prepare, () => { attachment.pending = false; })
+      .catch(() => {
+        attachment.pending = false;
+        if (this.displayAttachment === attachment) retire();
+        throw failure("display_attach_failed", "Browser display attachment failed");
+      })
+      .finally(() => { attachment.pending = false; });
+    return attachment.promise;
+  }
+
+  signal(signal, channel) {
+    if (signal?.schema === "elastos.browser.display-attach-request/v1") {
+      if (channel !== undefined) throw Object.assign(new Error("Display attachment replaces both channels"), { code: "invalid_request" });
+      return this.attachDisplay(signal);
+    }
+    if (this.closed || !this.displayAvailable) {
+      throw Object.assign(new Error("Browser display is unavailable"), { code: "display_attach_failed" });
+    }
+    if (signal?.display_generation !== this.displayGeneration &&
+        !(signal?.display_generation === undefined && this.legacyDisplaySignalsAllowed)) {
+      throw Object.assign(new Error("Browser display generation changed"), { code: "display_generation_mismatch" });
+    }
     if (channel === "audio") {
       return this.signalAudio(signal);
     }
@@ -2720,13 +3047,16 @@ class SelkiesPage {
       ...this.signalingStats,
       pending_selkies_candidates: this.remoteCandidates.length,
       websocket_closed: this.closed,
+      video_signaling_closed: this.videoClosed,
     };
   }
 
   ack(type) {
-    const candidates = type === "answer"
-      ? this.remoteCandidateHistory.slice()
-      : this.remoteCandidates.splice(0);
+    const candidates = relayIceCandidates(
+      type === "answer"
+        ? this.remoteCandidateHistory.slice()
+        : this.remoteCandidates.splice(0),
+    );
     if (type === "answer") {
       this.remoteCandidates = [];
     }
@@ -2735,15 +3065,18 @@ class SelkiesPage {
       page_id: this.pageId,
       type,
       accepted: true,
+      display_generation: this.displayGeneration,
       candidates,
       end_of_candidates: false,
     };
   }
 
   ackAudio(type) {
-    const candidates = type === "answer"
-      ? this.audioRemoteCandidateHistory.slice()
-      : this.audioRemoteCandidates.splice(0);
+    const candidates = relayIceCandidates(
+      type === "answer"
+        ? this.audioRemoteCandidateHistory.slice()
+        : this.audioRemoteCandidates.splice(0),
+    );
     if (type === "answer") {
       this.audioRemoteCandidates = [];
     }
@@ -2752,18 +3085,23 @@ class SelkiesPage {
       page_id: this.pageId,
       type,
       accepted: true,
+      display_generation: this.displayGeneration,
       candidates,
       end_of_candidates: false,
     };
   }
 
   close() {
+    this.closeAndPersist().catch(() => {});
+  }
+
+  async closeAndPersist() {
     this.markClosed();
-    this.ws.close();
+    this.ws?.close();
     this.markAudioClosed();
-    this.audioWs.close();
-    if (this.browserPage?.target_id) {
-      closeBrowserPage(this.config.browserControl, this.browserPage).catch(() => {});
+    this.audioWs?.close();
+    if (this.browserPage) {
+      await closeBrowserPage(this.config.browserControl, this.browserPage).catch(() => {});
     }
   }
 
@@ -2772,7 +3110,26 @@ class SelkiesPage {
       return;
     }
     this.closed = true;
+    if (this.operatorLease) {
+      this.operatorLease.active = false;
+      clearTimeout(this.operatorLease.timer);
+      browserInputWriterGate("release", this.operatorLease.id).catch(() => {});
+    }
+    if (this.browserPage?._inspection) {
+      const inspection = this.browserPage._inspection;
+      clearTimeout(inspection.expiryTimer);
+      inspection.snapshot = null;
+      for (const remove of inspection.removeHandlers || []) remove();
+      inspection.removeHandlers = [];
+    }
+    this.displayAvailable = false;
     this.onClosed(this);
+    this.flushWaiters();
+  }
+
+  markVideoClosed() {
+    this.videoClosed = true;
+    this.displayAvailable = false;
     this.flushWaiters();
   }
 
@@ -2786,8 +3143,9 @@ class SelkiesPage {
 }
 
 class CdpClient {
-  constructor(webSocketUrl, defaultTimeoutMs = 15000) {
-    this.ws = new MinimalWebSocketClient(new URL(webSocketUrl));
+  constructor(webSocketUrl, defaultTimeoutMs = 15000, { maxIncomingBytes, retainEvents = true } = {}) {
+    this.ws = new MinimalWebSocketClient(new URL(webSocketUrl), { maxIncomingBytes });
+    this.retainEvents = retainEvents;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.nextId = 1;
     this.pending = new Map();
@@ -2881,7 +3239,7 @@ class CdpClient {
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error) {
-        pending.reject(new Error(message.error.message || "browser CDP request failed"));
+        pending.reject(Object.assign(new Error(message.error.message || "browser CDP request failed"), { cdpCode: message.error.code }));
       } else {
         pending.resolve(message.result || {});
       }
@@ -2908,7 +3266,7 @@ class CdpClient {
           }));
         });
     }
-    this.events.push(message);
+    if (this.retainEvents) this.events.push(message);
     if (this.events.length > 100) {
       this.events.splice(0, this.events.length - 100);
     }
@@ -3023,7 +3381,11 @@ export async function projectRuntimeProxyOnlineState(cdp, runtimeFetchProxyUrl) 
   await cdp.request("Network.enable");
   await cdp.request("Network.overrideNetworkState", {
     offline: false,
-    latency: 0,
+    // Chromium clears an override when latency is zero and both throughputs
+    // are disabled. Keep a 1 ms navigator RTT hint so a no-NIC guest stays
+    // online through Runtime. This command changes navigator state only;
+    // Runtime's proxy still owns traffic and applies no CDP throttling.
+    latency: 1,
     downloadThroughput: -1,
     uploadThroughput: -1,
     connectionType: "other",
@@ -3169,6 +3531,11 @@ async function walletRuntimeFetchJson(
   url,
   { method = "GET", body = null, timeoutMs: requestedTimeoutMs = null } = {},
 ) {
+  if (walletUsesConsumerMediation(runtime.wallet)) {
+    throw walletRuntimeHttpError(
+      "Consumer Wallet mediation is bound for this Browser session. Wallet Bus stays on the consumer Runtime.",
+    );
+  }
   if (!url || !runtime.wallet.home_token) {
     throw walletRuntimeHttpError("Runtime wallet endpoint is unavailable for this Browser session.");
   }
@@ -3301,23 +3668,26 @@ export function walletRuntimeRequestedAccount(runtime, rawBody, { required = tru
   if (!/^eip155:\d+$/.test(requestedChain)) {
     throw walletRuntimeHttpError("Runtime wallet request chain is invalid.", 4902);
   }
-  const managed = (candidate) => candidate.proof_type === "managed_evm";
+  const selectable = (candidate) =>
+    candidate.proof_type === "managed_evm" ||
+    (typeof candidate.connector_id === "string" && candidate.connector_id);
   const account =
     runtime.wallet.accounts.find(
       (candidate) =>
-        managed(candidate) &&
+        selectable(candidate) &&
         candidate.chain_namespace === requestedChain &&
         candidate.account_id === runtime.wallet.default_account_id,
     ) ||
     runtime.wallet.accounts.find(
-      (candidate) => managed(candidate) && candidate.chain_namespace === requestedChain,
+      (candidate) =>
+        selectable(candidate) && candidate.chain_namespace === requestedChain,
     );
   if (!account) {
     if (!required) {
       return null;
     }
     throw walletRuntimeHttpError(
-      `No Runtime-managed wallet account is available for ${requestedChain}.`,
+      `No principal-owned wallet account is available for ${requestedChain}.`,
       4902,
     );
   }
@@ -3938,6 +4308,10 @@ function sanitizeBrowserUploadFileName(value) {
 }
 
 function validateBrowserFileUploadEvent(event) {
+  const requestId = event?.request_id;
+  if (typeof requestId !== "string" || !/^[A-Za-z0-9_:-]{1,128}$/.test(requestId)) {
+    throw new Error("Browser file upload requires its current file picker request.");
+  }
   const contentBase64 = String(event?.content_base64 || "");
   if (!contentBase64) {
     throw new Error("browser file_upload input requires Library file bytes");
@@ -3965,6 +4339,7 @@ function validateBrowserFileUploadEvent(event) {
     .slice(0, 2048);
   return {
     contentBase64,
+    requestId,
     fileName: sanitizeBrowserUploadFileName(event?.file_name),
     mimeType,
     objectUri,
@@ -3972,17 +4347,21 @@ function validateBrowserFileUploadEvent(event) {
   };
 }
 
-async function pasteTextIntoBrowserPage(browserPage, event, timeoutMs) {
+async function pasteTextIntoBrowserPage(browserPage, event, timeoutMs, suppliedCdp = null) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
   }
   const text = validatePasteText(event?.text);
-  await withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
+  const insert = async (cdp) => {
+    if (!suppliedCdp) {
     await cdp.request("Page.enable").catch(() => {});
     await cdp.request("Runtime.enable").catch(() => {});
     await ensureBrowserFileChooserInterception(cdp, browserPage);
+    }
     await cdp.request("Input.insertText", { text });
-  });
+  };
+  if (suppliedCdp) await insert(suppliedCdp);
+  else await withBrowserCdp(browserPage, timeoutMs, insert);
   return {
     url: browserPage.url || "",
     title: browserPage.title || "Selkies Browser",
@@ -4039,14 +4418,21 @@ async function uploadFileIntoBrowserPage(browserPage, event, timeoutMs) {
   }
   const upload = validateBrowserFileUploadEvent(event);
   const chooser = browserPage.file_chooser?.pending || null;
-  if (!Number.isInteger(chooser?.backend_node_id)) {
+  if (!Number.isInteger(chooser?.backend_node_id) || chooser.request_id !== upload.requestId || chooser.upload_started) {
     throw new Error("Browser file upload requires an active Runtime Library file picker request.");
   }
+  chooser.upload_started = true;
+  const requireCurrentChooser = () => {
+    if (browserPage.file_chooser?.pending !== chooser) {
+      throw new Error("Browser file picker target is no longer available.");
+    }
+  };
   return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
     await cdp.request("Page.enable");
     await cdp.request("Runtime.enable");
     await ensureBrowserFileChooserInterception(cdp, browserPage);
     await cdp.request("DOM.enable");
+    requireCurrentChooser();
     const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "elastos-browser-upload-"));
     const uploadPath = path.join(uploadDir, upload.fileName || "Library item");
     fs.writeFileSync(uploadPath, Buffer.from(upload.contentBase64, "base64"), { mode: 0o600 });
@@ -4058,10 +4444,12 @@ async function uploadFileIntoBrowserPage(browserPage, event, timeoutMs) {
       backendNodeId: chooser.backend_node_id,
       files: [uploadPath],
     });
+    requireCurrentChooser();
     const node = await cdp.request("DOM.resolveNode", {
       backendNodeId: chooser.backend_node_id,
     });
     const objectId = node?.object?.objectId;
+    requireCurrentChooser();
     if (!objectId) {
       throw new Error("Browser file picker target is no longer available.");
     }
@@ -4091,12 +4479,14 @@ async function uploadFileIntoBrowserPage(browserPage, event, timeoutMs) {
     if (uploadResult.ok !== true) {
       throw new Error("Browser file picker did not accept the Library item.");
     }
+    requireCurrentChooser();
     browserPage.file_chooser.pending = null;
     const state = await browserPageStateFromCdp(browserPage, cdp, timeoutMs);
     return {
       ...state,
       file_upload: {
         schema: "elastos.browser.file-upload-result/v1",
+        request_id: upload.requestId,
         file_name: uploadResult.file_name || upload.fileName,
         mime_type: uploadResult.type || upload.mimeType,
         size_bytes: Number(uploadResult.size || upload.sizeBytes),
@@ -4485,7 +4875,493 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
   });
 }
 
-async function withBrowserCdp(browserPage, timeoutMs, action) {
+const BROWSER_INSPECTION_LIMITS = Object.freeze({
+  max_nodes: 512, max_page_nodes: 64, max_snapshot_bytes: 131072,
+  max_response_bytes: 32768, snapshot_ttl_ms: 30000, timeout_ms: 1500,
+});
+const INSPECTION_HTTP_STATUS = Object.freeze({
+  invalid_inspection: 400, inspection_unsupported: 501, stale_inspection: 409,
+  inspection_busy: 409, inspection_owner_changed: 409, inspection_failed: 503,
+});
+
+function browserInspectionError(code) {
+  return Object.assign(new Error("Browser page inspection could not complete."), { code });
+}
+
+function browserInspectionCapabilities(page) {
+  if (page.closed || !page.browserPage?.debugger_url) throw browserInspectionError("inspection_unsupported");
+  return { schema: "elastos.browser.inspect-capabilities/v1", page_id: page.pageId,
+    formats: ["accessibility_tree"], ...BROWSER_INSPECTION_LIMITS };
+}
+
+function validateBrowserInspectionRequest(request) {
+  if (typeof request?.schema === "string" && request.schema !== "elastos.browser.inspect-request/v1") {
+    throw browserInspectionError("inspection_unsupported");
+  }
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      Object.keys(request).some(key => !["schema", "limit", "cursor"].includes(key)) ||
+      request.schema !== "elastos.browser.inspect-request/v1" ||
+      (request.limit !== undefined && (!Number.isInteger(request.limit) || request.limit < 1 || request.limit > 64)) ||
+      (request.cursor !== undefined && request.cursor !== null &&
+        (typeof request.cursor !== "string" || !/^[a-f0-9]{32}:[0-9]{1,3}$/.test(request.cursor)))) {
+    throw browserInspectionError("invalid_inspection");
+  }
+  return { limit: request.limit ?? 64, cursor: request.cursor ?? null };
+}
+
+// AX owns role/name/visibility semantics. A short-lived connection bounds native
+// replies without disturbing the page's existing network/input CDP connection.
+async function collectBrowserAccessibilityDocument(browserPage, frameId, deadline, current) {
+  const cdp = new CdpClient(browserPage.debugger_url, 1500, { maxIncomingBytes: 262144, retainEvents: false });
+  const timer = setTimeout(() => cdp.close(), Math.max(1, deadline - performance.now()));
+  const nodes = [], backendNodes = [], seen = new Set();
+  let calls = 0, bytes = 2, truncated = false;
+  const short = value => {
+    if (!["string", "number", "boolean"].includes(typeof value)) return "";
+    const text = String(value);
+    if (text.length > 256) truncated = true;
+    return text.slice(0, 256);
+  };
+  const call = async (method, params = {}) => {
+    current();
+    if (performance.now() >= deadline) throw browserInspectionError("inspection_failed");
+    const result = await cdp.request(method, params, Math.max(1, Math.floor(deadline - performance.now())));
+    current();
+    if (performance.now() >= deadline) throw browserInspectionError("inspection_failed");
+    return result;
+  };
+  try {
+    await cdp.connect(Math.max(1, Math.floor(deadline - performance.now())));
+    current();
+    await call("Accessibility.enable");
+    const root = (await call("Accessibility.getRootAXNode", { frameId })).node;
+    if (!root || typeof root.nodeId !== "string") throw browserInspectionError("inspection_failed");
+    const pending = [root];
+    while (pending.length) {
+      if (seen.size >= 1024 || nodes.length >= 512 || calls >= 64) { truncated = true; break; }
+      const node = pending.shift();
+      if (!node || typeof node.nodeId !== "string" || node.nodeId.length > 128) throw browserInspectionError("inspection_failed");
+      if (seen.has(node.nodeId) || (node.frameId && node.frameId !== frameId)) continue;
+      seen.add(node.nodeId);
+      // Anonymous AX nodes can supply descendants, but an exposed ref always
+      // names an actual DOM node in this acquired document.
+      if (node.ignored === false && Number.isSafeInteger(node.backendDOMNodeId) && node.backendDOMNodeId > 0) {
+        let value = node.value?.value;
+        if (value !== undefined) {
+          calls++;
+          const dom = (await call("DOM.describeNode", { backendNodeId: node.backendDOMNodeId, depth: 0 })).node;
+          if (!dom || dom.backendNodeId !== node.backendDOMNodeId) throw browserInspectionError("stale_inspection");
+          const attrs = dom.attributes || [];
+          const type = attrs.findIndex((item, index) => index % 2 === 0 && item.toLowerCase() === "type");
+          if (dom.nodeName === "INPUT" && type >= 0 && ["password", "file"].includes(String(attrs[type + 1]).toLowerCase())) value = undefined;
+        }
+        const item = { role: short(node.role?.value), name: short(node.name?.value),
+          description: short(node.description?.value), value: value === undefined ? null : short(value) };
+        const binding = { backendDOMNodeId: node.backendDOMNodeId, frameId };
+        const size = Buffer.byteLength(JSON.stringify(item)) + Buffer.byteLength(JSON.stringify(binding)) + 64;
+        if (bytes + size > BROWSER_INSPECTION_LIMITS.max_snapshot_bytes) { truncated = true; break; }
+        bytes += size; nodes.push(item); backendNodes.push(binding);
+      }
+      if (Array.isArray(node.childIds) && node.childIds.length) {
+        if (calls >= 64) { truncated = true; break; }
+        calls++;
+        const children = (await call("Accessibility.getChildAXNodes", { id: node.nodeId, frameId })).nodes;
+        if (!Array.isArray(children)) throw browserInspectionError("inspection_failed");
+        const room = Math.max(0, 1024 - seen.size - pending.length);
+        if (children.length > room) truncated = true;
+        pending.push(...children.slice(0, room));
+      }
+    }
+    return { nodes, backendNodes, truncated };
+  } catch (error) {
+    if (error?.cdpCode === -32601) throw browserInspectionError("inspection_unsupported");
+    throw error;
+  } finally {
+    // Disconnect is also the terminal path for an expired read or failed disable.
+    // The page, its existing CDP client, and its media keep their own lifetimes.
+    try {
+      const remaining = Math.floor(deadline - performance.now());
+      if (!cdp.closed && remaining > 0) await cdp.request("Accessibility.disable", {}, Math.min(remaining, 100));
+    } catch {} finally { clearTimeout(timer); cdp.close(); }
+  }
+}
+
+async function inspectBrowserPage(page, request, isCurrent) {
+  const input = validateBrowserInspectionRequest(request);
+  browserInspectionCapabilities(page);
+  const browserPage = page.browserPage;
+  const deadline = performance.now() + BROWSER_INSPECTION_LIMITS.timeout_ms;
+  const state = browserPage._inspection ||= { cdp: null, generation: null, snapshot: null, busy: false };
+  const current = () => {
+    if (page.closed || page.browserPage !== browserPage || !isCurrent()) throw browserInspectionError("inspection_owner_changed");
+    if (performance.now() >= deadline) throw browserInspectionError("inspection_failed");
+  };
+  current();
+  if (state.busy) throw browserInspectionError("inspection_busy");
+  state.busy = true;
+  try {
+    return await withBrowserCdp(browserPage, BROWSER_INSPECTION_LIMITS.timeout_ms, async cdp => {
+      current();
+      const call = async (method, params = {}) => {
+        current();
+        const result = await cdp.request(method, params, Math.max(1, Math.floor(deadline - performance.now())));
+        current();
+        if (browserPage._cdp !== cdp || cdp.closed) throw browserInspectionError("stale_inspection");
+        return result;
+      };
+      if (state.cdp !== cdp) {
+        for (const remove of state.removeHandlers || []) remove();
+        state.cdp = cdp;
+        state.generation = crypto.randomBytes(16).toString("hex");
+        state.snapshot = null;
+        const invalidate = params => {
+          if (params.frame?.parentId || (state.frameId && (params.frame?.id || params.frameId) !== state.frameId)) return;
+          state.generation = crypto.randomBytes(16).toString("hex");
+          state.snapshot = null;
+        };
+        state.removeHandlers = ["Page.frameNavigated", "Page.navigatedWithinDocument", "Page.frameStartedLoading"]
+          .map(method => cdp.onEvent(method, invalidate));
+        await call("Page.enable");
+      }
+      const frame = (await call("Page.getFrameTree")).frameTree?.frame;
+      if (!frame?.id || !frame.loaderId) throw browserInspectionError("inspection_failed");
+      state.frameId = frame.id;
+      const binding = `${frame.id}:${frame.loaderId}:${frame.url}`;
+      if (state.binding !== binding) {
+        state.binding = binding;
+        state.generation = crypto.randomBytes(16).toString("hex");
+        state.snapshot = null;
+      }
+      const generation = state.generation;
+      let snapshot = state.snapshot;
+      let offset = 0;
+      if (input.cursor) {
+        const [id, index] = input.cursor.split(":");
+        offset = Number(index);
+        if (!snapshot || snapshot.id !== id || snapshot.generation !== generation ||
+            performance.now() >= snapshot.expires || offset < 1 || offset >= snapshot.nodes.length) {
+          throw browserInspectionError("stale_inspection");
+        }
+      } else {
+        const value = await collectBrowserAccessibilityDocument(browserPage, frame.id, deadline, current);
+        current();
+        const after = (await call("Page.getFrameTree")).frameTree?.frame;
+        if (state.generation !== generation || `${after?.id}:${after?.loaderId}:${after?.url}` !== binding) {
+          throw browserInspectionError("stale_inspection");
+        }
+        snapshot = { id: crypto.randomBytes(16).toString("hex"), generation, nodes: value.nodes, backendNodes: value.backendNodes,
+          truncated: value.truncated === true, expires: performance.now() + BROWSER_INSPECTION_LIMITS.snapshot_ttl_ms };
+      }
+      current();
+      if (state.generation !== generation) throw browserInspectionError("stale_inspection");
+      const result = { schema: "elastos.browser.inspect-result/v1", page_id: page.pageId,
+        document_generation: generation, snapshot_id: snapshot.id, nodes: [], next_cursor: null, truncated: snapshot.truncated };
+      let index = offset;
+      while (index < snapshot.nodes.length && result.nodes.length < input.limit) {
+        result.nodes.push({ ...snapshot.nodes[index], ref: `${snapshot.id}:${index}` });
+        if (Buffer.byteLength(JSON.stringify(result)) + 128 > BROWSER_INSPECTION_LIMITS.max_response_bytes) {
+          result.nodes.pop(); break;
+        }
+        index++;
+      }
+      if (index < snapshot.nodes.length) result.next_cursor = `${snapshot.id}:${index}`;
+      if (index === offset && snapshot.nodes.length) throw browserInspectionError("inspection_failed");
+      state.snapshot = snapshot;
+      clearTimeout(state.expiryTimer);
+      state.expiryTimer = setTimeout(() => { if (state.snapshot === snapshot) state.snapshot = null; }, Math.max(1, snapshot.expires - performance.now()));
+      state.expiryTimer.unref?.();
+      return result;
+    });
+  } catch (error) {
+    current();
+    throw Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? error : browserInspectionError("inspection_failed");
+  } finally {
+    state.busy = false;
+  }
+}
+
+const OPERATOR_ID = /^[a-f0-9-]{32,36}$/;
+function browserOperatorError(code = "operator_input_rejected") {
+  return Object.assign(new Error("Browser operator input could not complete."), { code });
+}
+
+async function browserInputWriterGate(command, admissionId, durationMs, effectId) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: "/run/elastos/browser-input-writer.sock" });
+    let received = "", settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); socket.destroy();
+      error ? reject(browserOperatorError("operator_writer_unavailable")) : resolve(result);
+    };
+    const timer = setTimeout(() => finish(new Error("deadline")), 1200);
+    socket.on("error", finish);
+    socket.on("end", () => finish(new Error("incomplete receipt")));
+    socket.on("connect", () => socket.write(JSON.stringify({ command, admission_id: admissionId,
+      ...(durationMs === undefined ? {} : { duration_ms: durationMs }),
+      ...(effectId === undefined ? {} : { effect_id: effectId }) }) + "\n"));
+    socket.on("data", data => {
+      received += data.toString("utf8");
+      if (received.length > 1024) return finish(new Error("oversize receipt"));
+      if (!received.includes("\n")) return;
+      try {
+        const value = JSON.parse(received);
+        if (value.schema !== "elastos.browser.input-writer/v1" || value.admission_id !== admissionId ||
+            (command === "release" ? value.held !== false :
+              command === "settle" ? value.pending_effect !== null : value.active !== true || value.held !== true) ||
+            (command === "begin" && value.pending_effect !== effectId)) throw new Error("invalid receipt");
+        finish(null, value);
+      } catch (error) { finish(error); }
+    });
+  });
+}
+
+async function withBrowserInputWriter(page, isCurrent, action, cleanup = false) {
+  const state = page.inputWriter ||= { tail: Promise.resolve(), pending: 0, failed: false };
+  if (state.pending >= 128) throw browserOperatorError("operator_writer_busy");
+  state.pending++;
+  const pending = state.tail.then(async () => {
+    if ((state.failed && !cleanup) || page.closed || !isCurrent()) throw browserOperatorError("operator_owner_changed");
+    return action();
+  });
+  state.tail = pending.catch(() => {
+    state.failed = true;
+    if (page.inputWriter === state) page.inputWriter = null;
+  });
+  try { return await pending; } finally { state.pending--; }
+}
+
+function cancelBrowserOperatorLease(page, id) {
+  if (!OPERATOR_ID.test(id || "")) throw browserOperatorError();
+  page.revokedOperatorLeases ||= new Set();
+  if (page.revokedOperatorLeases.size < 128) page.revokedOperatorLeases.add(id);
+  if (page.operatorLease?.id === id) page.operatorLease.active = false;
+}
+
+async function settleBrowserOperatorEffect(lease) {
+  const effect = lease?.effect;
+  if (!effect?.held) return true;
+  if (!effect.done || effect.pending > 0 || effect.uncertain) return false;
+  if (!effect.settling) {
+    effect.settling = browserInputWriterGate("settle", lease.id, undefined, effect.id)
+      .then(() => { if (lease.effect === effect) lease.effect = null; return true; })
+      .catch(error => { effect.settling = null; throw error; });
+  }
+  return effect.settling;
+}
+
+async function browserOperatorLease(page, event, isCurrent) {
+  if (!OPERATOR_ID.test(event.admission_id || "")) throw browserOperatorError();
+  const id = event.admission_id;
+  const current = () => {
+    if (page.closed || !isCurrent()) throw browserOperatorError("operator_owner_changed");
+  };
+  current();
+  if (event.command === "release") {
+    cancelBrowserOperatorLease(page, id);
+    if (page.operatorLease?.id === id) {
+      page.operatorLease.active = false;
+      clearTimeout(page.operatorLease.timer);
+    }
+    if (page.operatorLease?.id === id) await settleBrowserOperatorEffect(page.operatorLease);
+    await browserInputWriterGate("release", id);
+    current();
+    if (page.operatorLease?.id === id) page.operatorLease = null;
+  } else if (event.command === "acquire") {
+    if (page.revokedOperatorLeases?.has(id) || page.revokedOperatorLeases?.size >= 128) throw browserOperatorError("operator_admission_inactive");
+    const inspection = page.browserPage?._inspection;
+    if (!/^[a-f0-9]{32}$/.test(event.document_generation || "") || !inspection?.snapshot ||
+        inspection.generation !== event.document_generation || performance.now() >= inspection.snapshot.expires ||
+        !Number.isInteger(event.duration_ms) || event.duration_ms < 2000 || event.duration_ms > 30000 ||
+        !Array.isArray(event.actions) || event.actions.length < 1 || event.actions.length > 2 ||
+        event.actions.some(action => !["click", "type", "fill"].includes(action)) || new Set(event.actions).size !== event.actions.length) throw browserOperatorError("stale_inspection");
+    if (page.operatorLease?.active) throw browserOperatorError("operator_writer_busy");
+    const lease = { id, active: true, generation: event.document_generation, actions: event.actions,
+      deadline: performance.now() + event.duration_ms, receipts: new Map(), timer: null };
+    page.operatorLease = lease;
+    try {
+      await browserInputWriterGate("acquire", id, event.duration_ms);
+      current();
+      if (page.operatorLease !== lease || !lease.active || inspection.generation !== lease.generation ||
+          performance.now() >= lease.deadline) throw browserOperatorError("operator_owner_changed");
+      lease.timer = setTimeout(() => {
+        lease.active = false;
+        withBrowserInputWriter(page, isCurrent, () => browserOperatorLease(page,
+          { command: "release", admission_id: id }, isCurrent), true).catch(() => {});
+      }, Math.max(1, lease.deadline - performance.now()));
+      lease.timer.unref?.();
+    } catch (error) {
+      lease.active = false;
+      await browserInputWriterGate("release", id).catch(() => {});
+      throw error;
+    }
+  } else throw browserOperatorError();
+  return { schema: "elastos.browser.input-result/v1", page_id: page.pageId, accepted: true,
+    admission_id: id, writer_acquired: event.command === "acquire" };
+}
+
+// Evaluated only in the Engine's isolated world on the exact resolved ref.
+function browserFillPrepare() {
+  const input = this instanceof HTMLInputElement;
+  if ((!input && !(this instanceof HTMLTextAreaElement)) || !this.isConnected || this.matches(":disabled") || this.readOnly ||
+    (input && !["text", "search", "tel", "url", "password"].includes(this.type)) || this.closest("[inert]")) return false;
+  const style = getComputedStyle(this), rect = this.getBoundingClientRect();
+  if (style.visibility !== "visible" || style.display === "none" || rect.width <= 0 || rect.height <= 0) return false;
+  this.focus({ preventScroll: true });
+  this.select();
+  return this.isConnected && this.getRootNode().activeElement === this && !this.matches(":disabled") && !this.readOnly &&
+    this.selectionStart === 0 && this.selectionEnd === this.value.length;
+}
+
+function browserFillMatches(expected) {
+  return this.isConnected && this.value === expected;
+}
+
+async function browserRefInput(page, event, isCurrent) {
+  const lease = page.operatorLease, browserPage = page.browserPage;
+  const inspection = browserPage?._inspection, snapshot = inspection?.snapshot;
+  const match = /^([a-f0-9]{32}):(0|[1-9][0-9]{0,2})$/.exec(event.ref || "");
+  if (event.schema !== "elastos.browser.ref-input/v1" || !/^[a-f0-9]{32}$/.test(event.request_id || "") ||
+      !match || !["click", "type", "fill"].includes(event.action) ||
+      (event.action === "click" ? event.text != null : typeof event.text !== "string" || (event.action !== "fill" && !event.text) ||
+        Buffer.byteLength(event.text) > 1024 || /[\u0000-\u001f\u007f-\u009f]/u.test(event.text))) throw browserOperatorError();
+  const binding = snapshot?.backendNodes[Number(match[2])];
+  const current = () => {
+    if (page.closed || page.browserPage !== browserPage || !isCurrent()) throw browserOperatorError("operator_owner_changed");
+    if (!lease?.active || page.operatorLease !== lease || lease.id !== event.admission_id ||
+        lease.generation !== event.document_generation || !lease.actions.includes(event.action) || performance.now() >= lease.deadline) throw browserOperatorError("operator_admission_inactive");
+    if (!snapshot || inspection.snapshot !== snapshot || inspection.generation !== event.document_generation ||
+        snapshot.id !== match[1] || performance.now() >= snapshot.expires || !binding) throw browserOperatorError("stale_inspection");
+  };
+  current();
+  if (lease.receipts.has(event.request_id)) {
+    const previous = lease.receipts.get(event.request_id);
+    if (previous.binding !== JSON.stringify(event)) throw browserOperatorError("operator_request_conflict");
+    if (previous.error) throw browserOperatorError(previous.error);
+    return previous.result;
+  }
+  if (lease.receipts.size >= 16 || lease.deadline - performance.now() < 1500) throw browserOperatorError("operator_admission_inactive");
+  const receipt = { binding: JSON.stringify(event), error: "operator_outcome_uncertain", result: null };
+  lease.receipts.set(event.request_id, receipt);
+  const deadline = Math.min(lease.deadline, performance.now() + 1500);
+  const effect = { id: event.request_id, held: false, pending: 0, uncertain: false, done: false, settling: null };
+  lease.effect = effect;
+  try {
+    const result = await withBrowserCdp(browserPage, 1500, async cdp => {
+      const effectRequest = (method, params, waitMs) => {
+        effect.pending++;
+        // Keep the original ACK observable after the public action deadline.
+        // It may settle the native hold, but can never start another action.
+        let sent;
+        try { sent = cdp.request(method, params, 15000); }
+        catch (error) { sent = Promise.reject(error); }
+        const observed = Promise.resolve(sent).then(value => { effect.pending--; return value; }, error => {
+            effect.pending--; effect.uncertain = true; throw error;
+          });
+        observed.finally(() => settleBrowserOperatorEffect(lease).catch(() => {})).catch(() => {});
+        return withTimeout("Browser operator effect", waitMs, observed);
+      };
+      const call = async (method, params = {}, effectful = false) => {
+        const mutates = method.startsWith("Input.") || effectful;
+        current();
+        if (performance.now() >= deadline || browserPage._cdp !== cdp || cdp.closed) throw browserOperatorError("operator_outcome_uncertain");
+        if (effect.uncertain) throw browserOperatorError("operator_outcome_uncertain");
+        if (mutates && !effect.held) {
+          effect.held = true;
+          await browserInputWriterGate("begin", lease.id, undefined, effect.id);
+          current();
+          if (performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
+        }
+        const remaining = Math.max(1, Math.floor(deadline - performance.now()));
+        const value = await (mutates
+          ? effectRequest(method, params, remaining) : cdp.request(method, params, remaining));
+        current();
+        if (performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
+        return value;
+      };
+      const frame = (await call("Page.getFrameTree")).frameTree?.frame;
+      if (`${frame?.id}:${frame?.loaderId}:${frame?.url}` !== inspection.binding || frame.id !== binding.frameId) throw browserOperatorError("stale_inspection");
+      const dom = (await call("DOM.describeNode", { backendNodeId: binding.backendDOMNodeId, depth: 0 })).node;
+      if (dom?.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("stale_inspection");
+      await browserInputWriterGate("check", lease.id);
+      current();
+      if (event.action === "click") {
+        const quad = (await call("DOM.getContentQuads", { backendNodeId: binding.backendDOMNodeId })).quads?.[0];
+        if (!Array.isArray(quad) || quad.length !== 8 || quad.some(n => !Number.isFinite(n))) throw browserOperatorError("operator_target_unavailable");
+        const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+        const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+        // CDP quads and input use CSS viewport coordinates. Read the current
+        // viewport; the owned page has no cached width/height contract.
+        const viewport = (await call("Page.getLayoutMetrics")).cssVisualViewport;
+        if (!Number.isFinite(viewport?.clientWidth) || !Number.isFinite(viewport?.clientHeight) ||
+            x < 0 || y < 0 || x >= viewport.clientWidth || y >= viewport.clientHeight) throw browserOperatorError("operator_target_unavailable");
+        const hit = await call("DOM.getNodeForLocation", { x: Math.floor(x), y: Math.floor(y), includeUserAgentShadowDOM: false });
+        if (hit.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("operator_target_unavailable");
+        await dispatchBrowserInputEvent(browserPage, { type: "click", x, y }, 1500, {
+          request: call,
+          // This releases only the press started above, on that same CDP client.
+          // It finishes before a waiting owner handoff can acquire the writer.
+          releasePointer: (method, params) => effectRequest(method, params, 250),
+        });
+      } else if (event.action === "fill") {
+        let world = browserPage._operatorFillWorld;
+        if (!world || world.generation !== event.document_generation || world.cdp !== cdp) {
+          const created = await call("Page.createIsolatedWorld", { frameId: binding.frameId,
+            worldName: "elastos-reference-fill-v1", grantUniveralAccess: false });
+          if (!Number.isInteger(created.executionContextId)) throw browserOperatorError("operator_target_unavailable");
+          world = { generation: event.document_generation, context: created.executionContextId, cdp };
+          browserPage._operatorFillWorld = world;
+        }
+        const resolved = await call("DOM.resolveNode", { backendNodeId: binding.backendDOMNodeId,
+          executionContextId: world.context });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) throw browserOperatorError("stale_inspection");
+        try {
+          // This fixed internal action has no caller-supplied script. Focus and
+          // selection are effects: retain the native hold before either starts.
+          const prepared = await call("Runtime.callFunctionOn", { objectId, returnByValue: true,
+            functionDeclaration: browserFillPrepare.toString() }, true);
+          if (prepared.exceptionDetails || prepared.result?.value !== true) throw browserOperatorError("operator_target_unavailable");
+          if (event.text) await call("Input.insertText", { text: event.text });
+          else {
+            try { await call("Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 }); }
+            finally { await effectRequest("Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 }, 250); }
+          }
+          const verified = await call("Runtime.callFunctionOn", { objectId, returnByValue: true,
+            functionDeclaration: browserFillMatches.toString(), arguments: [{ value: event.text }] });
+          if (verified.exceptionDetails || verified.result?.value !== true) throw browserOperatorError("operator_outcome_uncertain");
+        } finally {
+          // Release this one remote object even if the action deadline expired.
+          await cdp.request("Runtime.releaseObject", { objectId }, 250).catch(() => {});
+        }
+      } else {
+        const attributes = Object.fromEntries(Array.from({ length: Math.floor((dom.attributes?.length || 0) / 2) }, (_, i) => [dom.attributes[2*i], dom.attributes[2*i+1]]));
+        if (!["INPUT", "TEXTAREA"].includes(dom.nodeName) || attributes.disabled !== undefined || attributes.readonly !== undefined ||
+            (dom.nodeName === "INPUT" && !["text", "search", "email", "url", "tel", "password"].includes((attributes.type || "text").toLowerCase()))) throw browserOperatorError("operator_target_unavailable");
+        const root = (await call("DOM.getDocument", { depth: 0 })).root;
+        const focused = await call("DOM.querySelector", { nodeId: root.nodeId, selector: ":focus" });
+        if (!focused.nodeId || (await call("DOM.describeNode", { nodeId: focused.nodeId, depth: 0 })).node?.backendNodeId !== binding.backendDOMNodeId) throw browserOperatorError("operator_target_unavailable");
+        await pasteTextIntoBrowserPage(browserPage, { type: "paste_text", text: event.text }, 1500, { request: call });
+      }
+      current();
+      return { schema: "elastos.browser.ref-input-result/v1", page_id: page.pageId, request_id: event.request_id,
+        admission_id: lease.id, document_generation: lease.generation, accepted: true };
+    }, { retryAction: false });
+    effect.done = true;
+    if (!(await settleBrowserOperatorEffect(lease)) || performance.now() >= deadline) throw browserOperatorError("operator_outcome_uncertain");
+    current();
+    receipt.error = null; receipt.result = result;
+    return result;
+  } catch (error) {
+    effect.done = true;
+    await settleBrowserOperatorEffect(lease).catch(() => {});
+    receipt.error = error.code || "operator_outcome_uncertain";
+    lease.active = false;
+    throw browserOperatorError(receipt.error);
+  }
+}
+
+async function withBrowserCdp(browserPage, timeoutMs, action, { retryAction = true } = {}) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
   }
@@ -4510,7 +5386,8 @@ async function withBrowserCdp(browserPage, timeoutMs, action) {
         throw error;
       }
       cachedCdp.close();
-      browserPage._cdp = null;
+      if (browserPage._cdp === cachedCdp) browserPage._cdp = null;
+      if (!retryAction) throw error;
     }
   }
   const cdp = new CdpClient(browserPage.debugger_url, timeoutMs);
@@ -4564,11 +5441,13 @@ function keyEventDefinition(key) {
   return map[key] || null;
 }
 
-async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
-  return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
+async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, suppliedCdp = null) {
+  const dispatch = async (cdp) => {
+    if (!suppliedCdp) {
     await cdp.request("Page.enable");
     await cdp.request("Runtime.enable");
     await ensureBrowserFileChooserInterception(cdp, browserPage);
+    }
     await cdp.request("Input.setIgnoreInputEvents", { ignore: false }).catch(() => {});
     if (event?.type === "click") {
       const x = finiteCoordinate(event.x);
@@ -4581,6 +5460,7 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
         buttons: 0,
         pointerType: "mouse",
       });
+      try {
       await cdp.request("Input.dispatchMouseEvent", {
         type: "mousePressed",
         x,
@@ -4590,7 +5470,8 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
         clickCount: 1,
         pointerType: "mouse",
       });
-      await cdp.request("Input.dispatchMouseEvent", {
+      } finally {
+      await (cdp.releasePointer || cdp.request.bind(cdp))("Input.dispatchMouseEvent", {
         type: "mouseReleased",
         x,
         y,
@@ -4599,6 +5480,7 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
         clickCount: 1,
         pointerType: "mouse",
       });
+      }
       return;
     }
     if (event?.type === "wheel") {
@@ -4626,7 +5508,8 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs) {
       return;
     }
     throw new Error("unsupported browser input event");
-  });
+  };
+  return suppliedCdp ? dispatch(suppliedCdp) : withBrowserCdp(browserPage, timeoutMs, dispatch);
 }
 
 function validateBrowserNavigationUrl(value) {
@@ -4686,7 +5569,10 @@ async function applyBrowserCommand(config, browserPage, event, timeoutMs) {
       } else {
         throw new Error("unsupported browser command");
       }
-      await cdp.waitForEvent("Page.domContentEventFired", Math.min(timeoutMs, 15000), "domcontent").catch(() => {});
+      // navigateInitialBrowserPage already observes and consumes this event.
+      if (command !== "navigate") {
+        await cdp.waitForEvent("Page.domContentEventFired", Math.min(timeoutMs, 15000), "domcontent").catch(() => {});
+      }
       await projectAndLogRuntimeProxyOnlineState(
         cdp,
         config.runtimeFetchProxyUrl,
@@ -4883,6 +5769,179 @@ function validateOpenRequest(body) {
   return launch;
 }
 
+export const BROWSER_PROFILE_DISK_MOUNT = "/var/lib/elastos/browser-profile-disk";
+
+function defaultExec(command, args = []) {
+  return spawnSync(command, args, { encoding: "utf8" });
+}
+
+function defaultReadMounts() {
+  return fs.readFileSync("/proc/mounts", "utf8");
+}
+
+function defaultListProc() {
+  return fs.readdirSync("/proc");
+}
+
+function defaultReadCmdline(pid) {
+  return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+}
+
+function defaultPidAlive(pid) {
+  try {
+    fs.accessSync(`/proc/${pid}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function guestProcessIdsHoldingProfileDisk({
+  listProc = defaultListProc,
+  readCmdline = defaultReadCmdline,
+  mountPoint = BROWSER_PROFILE_DISK_MOUNT,
+  selfPid = process.pid,
+} = {}) {
+  const ids = [];
+  let names;
+  try {
+    names = listProc();
+  } catch {
+    return ids;
+  }
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    if (pid === selfPid) continue;
+    let cmdline = "";
+    try {
+      cmdline = readCmdline(name);
+    } catch {
+      continue;
+    }
+    if (
+      cmdline.includes("browser-native-proxy-engine") ||
+      cmdline.includes(`--user-data-dir=${mountPoint}`)
+    ) {
+      ids.push(pid);
+    }
+  }
+  return ids;
+}
+
+export function signalGuestProfileDiskWriters(pids, { exec = defaultExec, signal = "TERM" } = {}) {
+  for (const pid of pids) {
+    exec("kill", [`-${signal}`, String(pid)]);
+  }
+}
+
+export function flushAndUnmountBrowserProfileDisk({
+  exec = defaultExec,
+  readMounts = defaultReadMounts,
+  mountPoint = BROWSER_PROFILE_DISK_MOUNT,
+  sleep = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  },
+  umountAttempts = 8,
+  umountRetryMs = 250,
+} = {}) {
+  const syncResult = exec("sync", []);
+  if (syncResult.status !== 0) {
+    throw new Error("Browser profile disk sync failed");
+  }
+  const mounts = readMounts();
+  if (!mounts.includes(` ${mountPoint} `)) {
+    return { flushed: true, unmounted: true, already_absent: true };
+  }
+  const attempts = Math.max(1, Number(umountAttempts) || 1);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const umount = exec("umount", [mountPoint]);
+    if (umount.status === 0) {
+      return { flushed: true, unmounted: true, already_absent: false };
+    }
+    if (attempt + 1 < attempts) {
+      sleep(umountRetryMs);
+    }
+  }
+  throw new Error("Browser profile disk umount failed");
+}
+
+export async function quitGuestProfileDiskWriters({
+  exec = defaultExec,
+  listProc = defaultListProc,
+  readCmdline = defaultReadCmdline,
+  pidAlive = defaultPidAlive,
+  nowMs = () => Date.now(),
+  sleep = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  },
+  graceMs = 4000,
+  timeoutMs = 5000,
+} = {}) {
+  const pids = guestProcessIdsHoldingProfileDisk({ listProc, readCmdline });
+  const graceDeadline = nowMs() + Math.max(0, graceMs);
+  while (nowMs() < graceDeadline) {
+    sleep(Math.min(50, Math.max(0, graceDeadline - nowMs())));
+  }
+  let leftover = pids.filter((pid) => pidAlive(pid));
+  if (leftover.length === 0) {
+    return leftover;
+  }
+  signalGuestProfileDiskWriters(leftover, { exec, signal: "TERM" });
+  const deadline = nowMs() + timeoutMs;
+  while (leftover.some((pid) => pidAlive(pid)) && nowMs() < deadline) {
+    sleep(50);
+  }
+  leftover = leftover.filter((pid) => pidAlive(pid));
+  if (leftover.length > 0) {
+    signalGuestProfileDiskWriters(leftover, { exec, signal: "KILL" });
+  }
+  return leftover;
+}
+
+export function browserProfileDiskDurability(profile, leftoverWriterPids = []) {
+  const leftover = Array.isArray(leftoverWriterPids) ? leftoverWriterPids : [];
+  const leftoverKilled = leftover.length > 0;
+  if (leftoverKilled) {
+    return {
+      ok: false,
+      profile_disk_flushed: false,
+      profile_disk_unmounted: profile?.unmounted === true,
+      leftover_writers_killed: true,
+      error:
+        "Guest profile disk writers required SIGKILL; application writes are unproven",
+    };
+  }
+  return {
+    ok: profile?.flushed === true && profile?.unmounted === true,
+    profile_disk_flushed: profile?.flushed === true,
+    profile_disk_unmounted: profile?.unmounted === true,
+    leftover_writers_killed: false,
+  };
+}
+
+async function quitChromiumBrowser(browserControl) {
+  if (!browserControl) {
+    return;
+  }
+  try {
+    const version = await fetchBrowserControlJson(browserControl, "/json/version");
+    const wsUrl = version?.webSocketDebuggerUrl;
+    if (!wsUrl) {
+      return;
+    }
+    const cdp = new CdpClient(wsUrl, 5000, { retainEvents: false });
+    await cdp.connect(5000);
+    try {
+      await cdp.request("Browser.close", {}, 5000);
+    } finally {
+      cdp.close();
+    }
+  } catch {
+    // Chromium may already be gone. Process-group kill still flushes or fails closed.
+  }
+}
+
 async function main() {
   const config = readConfig();
   if (fs.existsSync(config.controlSocketPath)) {
@@ -4896,11 +5955,9 @@ async function main() {
   const markSessionClosed = () => {
     lastSessionClosedAt = Date.now();
   };
-  const closeActivePages = () => {
+  const closeActivePages = async () => {
     const pageIds = [...pages.keys()];
-    for (const page of pages.values()) {
-      page.close();
-    }
+    await Promise.all([...pages.values()].map((page) => page.closeAndPersist()));
     pages.clear();
     if (pageIds.length > 0) {
       markSessionClosed();
@@ -4918,10 +5975,31 @@ async function main() {
       const url = new URL(req.url, "http://browser-engine");
       if (req.method === "POST" && url.pathname === "/shutdown") {
         logControlEvent("request", { method: req.method, path: url.pathname });
-        closeActivePages();
+        const closedPageIds = await closeActivePages();
+        await quitChromiumBrowser(config.browserControl);
+        const leftover = await quitGuestProfileDiskWriters();
+        let profile;
+        try {
+          profile = flushAndUnmountBrowserProfileDisk();
+        } catch (error) {
+          profile = {
+            flushed: false,
+            unmounted: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        const durability = {
+          ...browserProfileDiskDurability(profile, leftover),
+          ...(profile?.error ? { error: profile.error } : {}),
+        };
+        logControlEvent("shutdown_result", {
+          closed_page_ids: closedPageIds,
+          ...durability,
+        });
         httpJson(res, 200, {
           schema: "elastos.browser.selkies-control.shutdown/v1",
-          ok: true,
+          closed_page_ids: closedPageIds,
+          ...durability,
         });
         setTimeout(() => {
           server.close(() => {
@@ -4950,7 +6028,6 @@ async function main() {
         return;
       }
       if (req.method === "GET" && url.pathname === "/logs") {
-        logControlEvent("request", { method: req.method, path: url.pathname });
         httpJson(res, 200, {
           schema: "elastos.browser.selkies-control.logs/v1",
           logs: readBrowserVmLogTails(),
@@ -5019,7 +6096,7 @@ async function main() {
         }
         return;
       }
-      const pageMatch = url.pathname.match(/^\/pages\/([^/]+)\/(webrtc|input|close|status|diagnostics)$/);
+      const pageMatch = url.pathname.match(/^\/pages\/([^/]+)\/(webrtc|input|close|status|diagnostics|inspect)$/);
       if (!pageMatch) {
         httpJson(res, 404, { error: "not found" });
         return;
@@ -5029,6 +6106,10 @@ async function main() {
       const page = pages.get(pageId);
       if (!page) {
         httpJson(res, 404, { error: "browser page not found" });
+        return;
+      }
+      if (req.method === "GET" && op === "inspect") {
+        httpJson(res, 200, browserInspectionCapabilities(page));
         return;
       }
       if (req.method === "GET" && op === "status") {
@@ -5077,12 +6158,37 @@ async function main() {
         });
         return;
       }
-      const body = await readJsonRequest(req);
+      const body = await readJsonRequest(req, op === "inspect" ? 1024 : Infinity).catch(error => {
+        throw op === "inspect" ? browserInspectionError("invalid_inspection") : error;
+      });
+      if (req.method === "POST" && op === "inspect") {
+        httpJson(res, 200, await inspectBrowserPage(page, body, () => pages.get(pageId) === page));
+        return;
+      }
       if (req.method === "POST" && op === "webrtc") {
-        httpJson(res, 200, page.signal(body.signal, body.channel || "video"));
+        httpJson(res, 200, await page.signal(body.signal, body.channel));
         return;
       }
       if (req.method === "POST" && op === "input") {
+        if (body?.event?.type === "operator_lease" && body.event.command === "release") cancelBrowserOperatorLease(page, body.event.admission_id);
+        const ownerHandoff = !String(body?.event?.type || "").startsWith("operator_") && page.operatorLease;
+        if (ownerHandoff) cancelBrowserOperatorLease(page, ownerHandoff.id);
+        const inputStarted = performance.now();
+        // A disconnected/timed-out caller cannot acquire or use a late writer.
+        // Release retains its cleanup obligation after its caller has gone.
+        const operatorCurrent = () => pages.get(pageId) === page &&
+          !res.destroyed && performance.now() - inputStarted < 1800;
+        await withBrowserInputWriter(page, () => pages.get(pageId) === page, async () => {
+        if (body?.event?.type === "operator_lease") {
+          httpJson(res, 200, await browserOperatorLease(page, body.event,
+            body.event.command === "release" ? () => pages.get(pageId) === page : operatorCurrent));
+          return;
+        }
+        if (body?.event?.type === "operator_ref") {
+          httpJson(res, 200, await browserRefInput(page, body.event, operatorCurrent));
+          return;
+        }
+        if (ownerHandoff) await browserOperatorLease(page, { command: "release", admission_id: ownerHandoff.id }, () => pages.get(pageId) === page);
         if (body?.event?.type === "browser_command") {
           const state = await applyBrowserCommand(
             config,
@@ -5179,10 +6285,11 @@ async function main() {
           accepted: false,
           reason: "Selkies input is carried by the WebRTC data channel",
         });
+        }, Boolean(ownerHandoff) || (body?.event?.type === "operator_lease" && body.event.command === "release"));
         return;
       }
       if (req.method === "POST" && op === "close") {
-        page.close();
+        await page.closeAndPersist();
         pages.delete(pageId);
         markSessionClosed();
         httpJson(res, 200, { schema: "elastos.browser.close-result/v1", page_id: pageId, closed: true });
@@ -5194,7 +6301,13 @@ async function main() {
         message: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack || null : null,
       });
-      httpJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS, error?.code)
+        ? DISPLAY_CONTROL_HTTP_STATUS[error.code] : null;
+      const inspectionStatus = Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? INSPECTION_HTTP_STATUS[error.code] : null;
+      httpJson(res, inspectionStatus || displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
+        error: error instanceof Error ? error.message : String(error),
+        ...(displayStatus || inspectionStatus ? { code: error.code } : {}),
+      });
     }
   });
   server.on("clientError", (error, socket) => {

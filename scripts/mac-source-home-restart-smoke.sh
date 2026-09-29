@@ -240,7 +240,13 @@ if os.environ.get("ELASTOS_SMOKE_BAD_HOME") == "1":
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path != "/apps/home/":
+        if self.path == "/apps/home/":
+            self.send_response(308)
+            self.send_header("Location", "/home/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path != "/home/":
             self.send_error(404)
             return
         self.send_response(200)
@@ -443,6 +449,8 @@ def run_smoke(temp_root):
         receipt = json.loads(empty.restart_receipt.read_text())
         if receipt.get("ok") is not True or receipt.get("http_code") != 200:
             raise AssertionError("empty installation did not reach readiness")
+        if receipt.get("home_url") != f"http://{empty.addr}/home/":
+            raise AssertionError("restart receipt did not name canonical Home")
         if "principal_root_rollback" in receipt or list((empty.data / "backups").iterdir()):
             raise AssertionError("empty installation manufactured or claimed a rollback")
     finally:

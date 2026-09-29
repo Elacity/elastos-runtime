@@ -249,6 +249,7 @@ const { onAccountClick, onDocumentClick } = createWalletAccountActions({
 boot();
 
 function boot() {
+  configureWalletWindowSelection();
   applyCurrencySelection();
   applyPrivacyState();
   accountsNode?.addEventListener("click", onAccountClick);
@@ -287,6 +288,69 @@ function boot() {
   window.addEventListener("message", onShellMenuCommand);
   window.addEventListener("message", onWalletChromeCommand);
   refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+}
+
+function walletSelectionBlocked() {
+  return Boolean((modalNode && !modalNode.hidden)
+    || document.querySelector("#wallet-settings-drawer:not([hidden]), #wallet-activity-drawer:not([hidden]), .wallet-request button:disabled")
+    || heroNode?.classList.contains("is-flipped") || accountsSectionNode?.classList.contains("is-flipped"));
+}
+
+function configureWalletWindowSelection() {
+  if (!activeHomeToken || readQueryParam("presentation") === "rail" || window.parent === window.top) return;
+  const homeToken = activeHomeToken;
+  const documentNonce = window.crypto.randomUUID();
+  let active = true;
+  let busy = false;
+  let lastSequence = 0;
+  const exact = (value, keys) => Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)));
+  window.addEventListener("pagehide", () => {
+    active = false;
+    window.parent.postMessage({ type: "home:app-unloading", homeToken, documentNonce }, "*");
+  }, { once: true });
+  window.addEventListener("message", async (event) => {
+    const data = event.data;
+    if (!active || event.source !== window.parent || event.origin !== "null"
+      || homeToken !== activeHomeToken || !data || data.homeToken !== homeToken
+      || typeof data.requestId !== "string" || !/^[a-zA-Z0-9-]{1,64}$/.test(data.requestId)) return;
+    if (data.type === "elastos.wallet.window-ready.request/v1"
+      && exact(data, ["type", "homeToken", "requestId"])) {
+      window.parent.postMessage({ type: "elastos.wallet.window-ready.result/v1",
+        homeToken, documentNonce, requestId: data.requestId }, "*");
+      return;
+    }
+    if (data.type !== "elastos:wallet-chrome-command" || data.cmd !== "review-request"
+      || !exact(data, ["type", "cmd", "homeToken", "requestId", "documentNonce", "sequence", "expiresAt", "query"])
+      || data.documentNonce !== documentNonce || !Number.isSafeInteger(data.sequence)
+      || data.sequence <= lastSequence || !Number.isSafeInteger(data.expiresAt)
+      || data.expiresAt <= Date.now() || data.expiresAt > Date.now() + 15000) return;
+    lastSequence = data.sequence;
+    const current = () => active && homeToken === activeHomeToken && Date.now() < data.expiresAt;
+    let ok = false;
+    let failureCopy = "Finish the current review or edit, then open this request again.";
+    if (!busy && !walletSelectionBlocked() && exact(data.query, ["wallet_request"])
+      && typeof data.query.wallet_request === "string" && /^[a-zA-Z0-9:._-]{1,256}$/.test(data.query.wallet_request)) {
+      busy = true;
+      try {
+        // Read without repainting: the person can start a review while this waits.
+        const summary = await fetchJson("/api/apps/wallet/wallet/summary", { headers: shellHeaders() });
+        if (current() && !walletSelectionBlocked()) {
+          currentRequests = Array.isArray(summary?.wallet_approvals?.approval_requests)
+            ? summary.wallet_approvals.approval_requests : [];
+          reviewWalletRequestId = data.query.wallet_request;
+          renderWalletReviewRequests();
+          ok = true;
+        }
+      } catch (_error) {
+        failureCopy = "Could not open this request. Refresh Wallet and try again.";
+      } finally { busy = false; }
+    }
+    if (current() && !ok) showStatus(failureCopy, "muted");
+    if (active) window.parent.postMessage({ type: "elastos.wallet.window.result/v1",
+      homeToken, documentNonce, requestId: data.requestId, ok }, "*");
+  });
+  window.parent.postMessage({ type: "home:app-ready", homeToken, documentNonce }, "*");
 }
 
 function applyRailPresentationChrome() {
@@ -462,22 +526,27 @@ async function loadWalletState() {
 function renderAll() {
   const allAccounts = buildViewAccounts();
   const pending = pendingWalletRequests(currentRequests);
-  const reviewRequests = reviewWalletRequestId
-    ? pending.filter((request) => readText(request.request_id) === reviewWalletRequestId)
-    : pending;
   renderHero(allAccounts);
   renderHeroAccount(allAccounts);
   renderAccounts(allAccounts);
-  const focusedRequestVisible = renderRequests(reviewRequests, reviewWalletRequestId);
-  if (reviewWalletRequestId && focusedRequestVisible) {
-    showStatus("Review and approve this request in Wallet.", "muted");
-  } else if (reviewWalletRequestId) {
-    reviewWalletRequestId = "";
-  }
+  renderWalletReviewRequests();
   renderMethods(allAccounts, currentApprovalMethods);
   renderActivity(currentRequests);
   renderApprovalsBadge(pending.length);
   updateFlowButtons(allAccounts);
+}
+
+function renderWalletReviewRequests() {
+  const pending = pendingWalletRequests(currentRequests);
+  const reviewRequests = reviewWalletRequestId
+    ? pending.filter((request) => readText(request.request_id) === reviewWalletRequestId)
+    : pending;
+  const focusedRequestVisible = renderRequests(reviewRequests, reviewWalletRequestId);
+  if (reviewWalletRequestId && focusedRequestVisible) {
+    showStatus("Review and approve this request in Wallet.", "muted");
+  } else if (reviewWalletRequestId) {
+    showStatus("This request is unavailable. Choose another request in Inbox.", "muted");
+  }
 }
 
 function buildViewAccounts() {

@@ -1,9 +1,14 @@
-use crate::config::{AdapterConfig, ConfiguredOffer};
+use crate::config::{
+    AdapterConfig, ConfiguredOffer, LocalArtifactConfig, LocalLlamaSettings,
+    MAX_BACKEND_COST_BYTES, MAX_BACKEND_COST_UNIT_BYTES, MAX_MODEL_BYTES,
+};
 use crate::contract::{
-    ErrorClass, RunError, RunStatus, RuntimeCreateBinding, RUN_OUTPUT_CONTENT_SCHEMA,
-    RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+    BackendCost, BackendFact, BackendReport, BackendTokenUsage, ErrorClass, RunError, RunEvent,
+    RunStatus, RuntimeCreateBinding, BACKEND_REPORT_SCHEMA, MAX_EVENT_SEQUENCE, RUN_EVENT_SCHEMA,
+    RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
 };
 use crate::journal::{deterministic_run_id, now_ms};
+use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -26,8 +31,11 @@ const HTTP_JOB_BACKEND_STATE_ACTIVE: &str = "active";
 pub(crate) const LOCAL_TEXT_BACKEND_STATE_SCHEMA: &str =
     "elastos.model.provider-local-text-state/v1";
 const BACKEND_CONNECT_TIMEOUT_MS: u64 = 500;
-const BACKEND_READ_IDLE_TIMEOUT_MS: u64 = 500;
 const LOCAL_TEXT_DELTA_FLUSH_BYTES: usize = 8 * 1024;
+const LOCAL_TEXT_DELTA_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+// Leave at least half the journal event count for size flushes and lifecycle
+// events. The state owner still enforces exact count/aggregate/terminal bounds.
+const LOCAL_TEXT_TIMED_FLUSH_LIMIT: usize = crate::config::MAX_RUN_EVENT_COUNT_LIMIT / 2;
 const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
 
@@ -35,7 +43,6 @@ fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, Adapt
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(BACKEND_CONNECT_TIMEOUT_MS))
-        .read_timeout(Duration::from_millis(BACKEND_READ_IDLE_TIMEOUT_MS))
         .timeout(Duration::from_millis(timeout_ms))
         .build()
         .map_err(|err| {
@@ -44,6 +51,17 @@ fn backend_client(timeout_ms: u64) -> std::result::Result<reqwest::Client, Adapt
                 format!("failed to build backend client: {err}"),
             )
         })
+}
+
+fn remaining_run_timeout(deadline_ms: u64) -> std::result::Result<Duration, AdapterFault> {
+    let remaining_ms = deadline_ms.saturating_sub(now_ms());
+    if remaining_ms == 0 {
+        return Err(AdapterFault::timeout(
+            "model backend timed out",
+            "model run deadline expired",
+        ));
+    }
+    Ok(Duration::from_millis(remaining_ms))
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +166,7 @@ pub enum ReconcileResult {
         status: RunStatus,
         output: Option<Value>,
         error: Option<RunError>,
+        backend_report: Option<Box<BackendReport>>,
     },
 }
 
@@ -187,6 +206,7 @@ pub(crate) enum WorkerUpdate {
     Exited {
         run_id: String,
         generation: u64,
+        timed_out: bool,
     },
 }
 
@@ -194,6 +214,7 @@ pub(crate) enum WorkerUpdate {
 pub(crate) enum WorkerApplyAck {
     Applied,
     Rejected,
+    TimedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -229,16 +250,136 @@ struct LocalTextStreamState {
     consumed_response_bytes: u64,
 }
 
+#[derive(Debug)]
+enum ParsedTextStreamEvent {
+    Delta(String),
+    Completed,
+    Ignored,
+}
+
+#[derive(Default)]
+enum CapturedBackendFact<T> {
+    #[default]
+    Unknown,
+    Reported(T),
+    Invalid,
+}
+
+impl<T: PartialEq> CapturedBackendFact<T> {
+    fn observe(&mut self, value: std::result::Result<Option<T>, ()>) {
+        match value {
+            Ok(Some(value)) => match self {
+                Self::Unknown => *self = Self::Reported(value),
+                Self::Reported(current) if current == &value => {}
+                Self::Reported(_) => *self = Self::Invalid,
+                Self::Invalid => {}
+            },
+            Ok(None) => {}
+            Err(()) => *self = Self::Invalid,
+        }
+    }
+
+    fn into_report(self) -> BackendFact<T> {
+        match self {
+            Self::Reported(value) => BackendFact::Reported { value },
+            Self::Unknown | Self::Invalid => BackendFact::Unknown,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HostedBackendReport {
+    resolved_model: CapturedBackendFact<String>,
+    usage: CapturedBackendFact<BackendTokenUsage>,
+    cost: CapturedBackendFact<BackendCost>,
+}
+
+impl HostedBackendReport {
+    fn observe_chat_completions(&mut self, value: &Value) {
+        if let Some(model) = value.get("model") {
+            self.resolved_model
+                .observe(parse_bounded_backend_string(model, MAX_MODEL_BYTES));
+        }
+        let Some(usage) = value.get("usage") else {
+            return;
+        };
+        let Some(usage) = usage.as_object() else {
+            self.usage.observe(Err(()));
+            self.cost.observe(Err(()));
+            return;
+        };
+        self.usage.observe(parse_backend_usage(
+            usage,
+            "prompt_tokens",
+            "completion_tokens",
+        ));
+        if usage.contains_key("cost") || usage.contains_key("cost_unit") {
+            self.cost.observe(parse_backend_cost(usage));
+        }
+    }
+
+    fn observe_responses_completed(&mut self, response: &serde_json::Map<String, Value>) {
+        if let Some(model) = response.get("model") {
+            self.resolved_model
+                .observe(parse_bounded_backend_string(model, MAX_MODEL_BYTES));
+        }
+        let Some(usage) = response.get("usage") else {
+            return;
+        };
+        let Some(usage) = usage.as_object() else {
+            self.usage.observe(Err(()));
+            return;
+        };
+        self.usage
+            .observe(parse_backend_usage(usage, "input_tokens", "output_tokens"));
+    }
+
+    fn finish(self) -> BackendReport {
+        BackendReport {
+            schema: BACKEND_REPORT_SCHEMA.to_string(),
+            resolved_model: self.resolved_model.into_report(),
+            usage: self.usage.into_report(),
+            cost: self.cost.into_report(),
+        }
+    }
+}
+
 struct LocalTextWorkerTask {
     run_id: String,
     generation: u64,
-    api_url: String,
-    api_key: Option<String>,
-    model: String,
+    backend: LocalTextBackend,
     offer: ConfiguredOffer,
+    deadline_ms: u64,
     prompt: String,
     cancel_rx: watch::Receiver<bool>,
     updates: mpsc::Sender<WorkerUpdate>,
+}
+
+enum LocalTextBackend {
+    OpenAiCompatible {
+        api_url: String,
+        api_key: Option<String>,
+        model: String,
+    },
+    OpenAiResponses {
+        api_url: String,
+        api_key: Option<String>,
+        model: String,
+    },
+    LocalLlama {
+        engines: LocalLlamaEngines,
+        offer_id: String,
+        engine: LocalArtifactConfig,
+        model: LocalArtifactConfig,
+        settings: LocalLlamaSettings,
+    },
+}
+
+struct PreparedLocalTextWorker {
+    run_id: String,
+    generation: u64,
+    cancel_rx: watch::Receiver<bool>,
+    backend_state: Value,
 }
 
 struct HttpArtifactCreateWorkerTask {
@@ -293,7 +434,12 @@ pub trait AdapterExecutor {
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         input: &Value,
+        deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault>;
+
+    fn has_active_local_text_worker(&self, _run_id: &str) -> bool {
+        false
+    }
 
     fn reconcile(
         &self,
@@ -327,15 +473,33 @@ pub struct LiveAdapterExecutor {
     updates: mpsc::Sender<WorkerUpdate>,
     workers: Arc<Mutex<BTreeMap<String, WorkerRecord>>>,
     next_generation: Arc<AtomicU64>,
+    local_llama: LocalLlamaEngines,
 }
 
 impl LiveAdapterExecutor {
+    pub(crate) async fn retains_execution(&self) -> bool {
+        let workers = !self.workers.lock().unwrap().is_empty();
+        workers || self.local_llama.retains_artifacts().await
+    }
+
+    pub(crate) fn retained_worker_ids(&self) -> Vec<String> {
+        self.workers.lock().unwrap().keys().cloned().collect()
+    }
+
+    pub(crate) async fn close_local_model_offer(
+        &self,
+        offer_id: &str,
+    ) -> Result<(), LocalLlamaFault> {
+        self.local_llama.close_offer(offer_id).await
+    }
+
     pub fn new(runtime: Handle, updates: mpsc::Sender<WorkerUpdate>) -> Self {
         Self {
             runtime,
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            local_llama: LocalLlamaEngines::default(),
         }
     }
 
@@ -449,14 +613,17 @@ impl LiveAdapterExecutor {
         }
     }
 
+    pub(crate) async fn shutdown_local_llama(&self) -> Result<(), LocalLlamaFault> {
+        self.local_llama.shutdown().await
+    }
+
     fn spawn_local_text_worker(
         &self,
-        api_url: &str,
-        api_key: Option<&str>,
-        model: &str,
+        backend: LocalTextBackend,
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         prompt: &str,
+        deadline_ms: u64,
     ) -> std::result::Result<Value, AdapterFault> {
         let run_id = deterministic_run_id(binding);
         let backend_state = serialize_local_text_backend_state(false)?;
@@ -480,21 +647,47 @@ impl LiveAdapterExecutor {
                 retired_handles: Vec::new(),
             },
         );
+        self.spawn_text_worker(
+            backend,
+            offer,
+            prompt,
+            deadline_ms,
+            PreparedLocalTextWorker {
+                run_id,
+                generation,
+                cancel_rx,
+                backend_state,
+            },
+            workers,
+        )
+    }
+
+    fn spawn_text_worker(
+        &self,
+        backend: LocalTextBackend,
+        offer: &ConfiguredOffer,
+        prompt: &str,
+        deadline_ms: u64,
+        prepared: PreparedLocalTextWorker,
+        mut workers: std::sync::MutexGuard<'_, BTreeMap<String, WorkerRecord>>,
+    ) -> std::result::Result<Value, AdapterFault> {
+        let PreparedLocalTextWorker {
+            run_id,
+            generation,
+            cancel_rx,
+            backend_state,
+        } = prepared;
         let updates = self.updates.clone();
         let offer = offer.clone();
-        let api_url = api_url.to_string();
-        let api_key = api_key.map(str::to_string);
-        let model = model.to_string();
         let prompt = prompt.to_string();
         let run_id_for_task = run_id.clone();
         let join_handle = self.runtime.spawn(async move {
-            run_local_text_worker(LocalTextWorkerTask {
+            let timed_out = run_local_text_worker(LocalTextWorkerTask {
                 run_id: run_id_for_task.clone(),
                 generation,
-                api_url,
-                api_key,
-                model,
+                backend,
                 offer,
+                deadline_ms,
                 prompt,
                 cancel_rx,
                 updates: updates.clone(),
@@ -504,6 +697,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out,
                 })
                 .await;
         });
@@ -566,6 +760,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out: false,
                 })
                 .await;
         });
@@ -629,6 +824,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out: false,
                 })
                 .await;
         });
@@ -710,6 +906,7 @@ impl LiveAdapterExecutor {
                 .send(WorkerUpdate::Exited {
                     run_id: run_id_for_task,
                     generation,
+                    timed_out: false,
                 })
                 .await;
         });
@@ -728,20 +925,60 @@ impl AdapterExecutor for LiveAdapterExecutor {
         offer: &ConfiguredOffer,
         binding: &RuntimeCreateBinding,
         input: &Value,
+        deadline_ms: u64,
     ) -> std::result::Result<DispatchResult, AdapterFault> {
         match adapter {
             AdapterConfig::OpenAiCompatibleText {
                 api_url,
                 api_key,
                 model,
-            } => dispatch_openai_text(
+                ..
+            } => dispatch_text(
                 self,
-                api_url,
-                api_key.as_deref(),
-                model,
+                LocalTextBackend::OpenAiCompatible {
+                    api_url: api_url.clone(),
+                    api_key: api_key.clone(),
+                    model: model.clone(),
+                },
                 offer,
                 binding,
                 input,
+                deadline_ms,
+            ),
+            AdapterConfig::OpenAiResponsesText {
+                api_url,
+                api_key,
+                model,
+                ..
+            } => dispatch_text(
+                self,
+                LocalTextBackend::OpenAiResponses {
+                    api_url: api_url.clone(),
+                    api_key: api_key.clone(),
+                    model: model.clone(),
+                },
+                offer,
+                binding,
+                input,
+                deadline_ms,
+            ),
+            AdapterConfig::LocalLlamaCppText {
+                engine,
+                model,
+                settings,
+            } => dispatch_text(
+                self,
+                LocalTextBackend::LocalLlama {
+                    engines: self.local_llama.clone(),
+                    offer_id: offer.id.clone(),
+                    engine: engine.clone(),
+                    model: model.clone(),
+                    settings: settings.clone(),
+                },
+                offer,
+                binding,
+                input,
+                deadline_ms,
             ),
             AdapterConfig::HttpJobArtifact {
                 create_url,
@@ -766,6 +1003,10 @@ impl AdapterExecutor for LiveAdapterExecutor {
         }
     }
 
+    fn has_active_local_text_worker(&self, run_id: &str) -> bool {
+        self.has_local_text_worker(run_id)
+    }
+
     fn reconcile(
         &self,
         adapter: &AdapterConfig,
@@ -774,7 +1015,9 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<ReconcileResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => {
                 reconcile_local_text(self, binding, backend_state)
             }
             AdapterConfig::HttpJobArtifact {
@@ -804,7 +1047,9 @@ impl AdapterExecutor for LiveAdapterExecutor {
         allow_send: bool,
     ) -> std::result::Result<CancelResult, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => {
                 cancel_local_text(self, binding, backend_state)
             }
             AdapterConfig::HttpJobArtifact {
@@ -833,7 +1078,9 @@ impl AdapterExecutor for LiveAdapterExecutor {
         backend_state: &Value,
     ) -> std::result::Result<CancelReservation, AdapterFault> {
         match adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => reserve_local_text_cancel(backend_state),
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => reserve_local_text_cancel(backend_state),
             AdapterConfig::HttpJobArtifact { cancel_url, .. } => {
                 reserve_http_job_cancel(backend_state, cancel_url.is_some(), offer)
             }
@@ -841,18 +1088,17 @@ impl AdapterExecutor for LiveAdapterExecutor {
     }
 }
 
-fn dispatch_openai_text(
+fn dispatch_text(
     executor: &LiveAdapterExecutor,
-    api_url: &str,
-    api_key: Option<&str>,
-    model: &str,
+    backend: LocalTextBackend,
     offer: &ConfiguredOffer,
     binding: &RuntimeCreateBinding,
     input: &Value,
+    deadline_ms: u64,
 ) -> std::result::Result<DispatchResult, AdapterFault> {
     let prompt = validate_text_prompt(input)?;
     let backend_state =
-        executor.spawn_local_text_worker(api_url, api_key, model, offer, binding, prompt)?;
+        executor.spawn_local_text_worker(backend, offer, binding, prompt, deadline_ms)?;
     Ok(DispatchResult::Running {
         events: vec![EventSeed {
             kind: "dispatched",
@@ -946,6 +1192,7 @@ fn reconcile_local_text(
             code: "settlement_unknown".to_string(),
             message: "model backend settlement is unknown".to_string(),
         }),
+        backend_report: None,
     })
 }
 
@@ -980,9 +1227,10 @@ fn cancel_local_text(
     })
 }
 
-async fn run_local_text_worker(mut task: LocalTextWorkerTask) {
+async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
     let result = match run_local_text_worker_inner(&mut task).await {
         Ok(result) => result,
+        Err(fault) if fault.error.class == ErrorClass::BackendTimeout => return true,
         Err(fault) => ReconcileResult::Terminal {
             events: Vec::new(),
             status: match fault.error.class {
@@ -992,16 +1240,26 @@ async fn run_local_text_worker(mut task: LocalTextWorkerTask) {
             },
             output: None,
             error: Some(fault.error),
+            backend_report: None,
         },
     };
-    let _ = send_worker_apply_update(
-        &task.run_id,
-        task.generation,
-        WorkerApplyGuard::None,
-        result,
-        &task.updates,
+    matches!(
+        send_worker_apply_update(
+            &task.run_id,
+            task.generation,
+            WorkerApplyGuard::None,
+            result,
+            &task.updates,
+        )
+        .await,
+        Err(AdapterFault {
+            error: RunError {
+                class: ErrorClass::BackendTimeout,
+                ..
+            },
+            ..
+        })
     )
-    .await;
 }
 
 async fn run_http_artifact_create_worker(task: HttpArtifactCreateWorkerTask) {
@@ -1188,28 +1446,80 @@ async fn run_http_artifact_status_worker_inner(
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
-    let client = backend_client(task.offer.policy.runtime_ms_limit)?;
+    let mut backend_report = matches!(
+        &task.backend,
+        LocalTextBackend::OpenAiCompatible { .. } | LocalTextBackend::OpenAiResponses { .. }
+    )
+    .then(HostedBackendReport::default);
+    let (api_url, api_key, body, private_endpoint) = match &task.backend {
+        LocalTextBackend::OpenAiCompatible {
+            api_url,
+            api_key,
+            model,
+        } => (
+            api_url.clone(),
+            api_key.clone(),
+            text_generation_request_body(&task.offer, model, &task.prompt, None),
+            false,
+        ),
+        LocalTextBackend::OpenAiResponses {
+            api_url,
+            api_key,
+            model,
+        } => (
+            api_url.clone(),
+            api_key.clone(),
+            responses_text_request_body(&task.offer, model, &task.prompt),
+            false,
+        ),
+        LocalTextBackend::LocalLlama {
+            engines,
+            offer_id,
+            engine,
+            model,
+            settings,
+        } => {
+            let endpoint = engines
+                .endpoint_with_timeout(
+                    offer_id,
+                    engine,
+                    model,
+                    settings,
+                    remaining_run_timeout(task.deadline_ms)?,
+                )
+                .await
+                .map_err(map_local_llama_fault)?;
+            let body = text_generation_request_body(
+                &task.offer,
+                &endpoint.model,
+                &task.prompt,
+                Some(endpoint.enable_thinking),
+            );
+            (endpoint.api_url, None, body, true)
+        }
+    };
+    let client = backend_client(
+        remaining_run_timeout(task.deadline_ms)?
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )?;
     let request = {
         let mut builder = client
-            .post(&task.api_url)
+            .post(&api_url)
             .header("content-type", "application/json")
-            .json(&json!({
-                "model": task.model,
-                "stream": true,
-                "messages": [
-                    { "role": "user", "content": task.prompt }
-                ]
-            }));
-        if let Some(api_key) = task.api_key.as_deref() {
+            .json(&body);
+        if let Some(api_key) = api_key.as_deref() {
             builder = builder.header("authorization", format!("Bearer {api_key}"));
         }
         builder
     };
     let response = tokio::select! {
-        changed = task.cancel_rx.changed() => {
-            return handle_local_text_cancel_signal(&task.cancel_rx, changed);
+        _ = task.cancel_rx.changed() => {
+            // Closing a local or hosted HTTP stream does not confirm backend stop.
+            return Ok(worker_settlement_unknown_result());
         }
-        response = request.send() => response.map_err(map_reqwest_failure)?
+        response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
     if !response.status().is_success() {
         return Err(AdapterFault::backend_failed(
@@ -1223,13 +1533,26 @@ async fn run_local_text_worker_inner(
     let mut event_data = Vec::new();
     let mut stream_state = LocalTextStreamState::new();
     let mut done = false;
+    let mut flush_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + LOCAL_TEXT_DELTA_FLUSH_INTERVAL,
+        LOCAL_TEXT_DELTA_FLUSH_INTERVAL,
+    );
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut timed_flushes = 0;
 
     while !done {
         let next = tokio::select! {
-            changed = task.cancel_rx.changed() => {
-                return handle_local_text_cancel_signal(&task.cancel_rx, changed);
+            _ = task.cancel_rx.changed() => {
+                return Ok(worker_settlement_unknown_result());
             }
-            chunk = response.chunk() => chunk.map_err(map_reqwest_failure)?
+            _ = flush_timer.tick(), if timed_flushes < LOCAL_TEXT_TIMED_FLUSH_LIMIT
+                && !stream_state.delta_buffer.is_empty() => {
+                flush_local_text_delta(&task.offer, &task.run_id, task.generation,
+                    &task.updates, &mut stream_state.delta_buffer).await?;
+                timed_flushes += 1;
+                continue;
+            }
+            chunk = response.chunk() => chunk.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
         };
         let Some(chunk) = next else {
             return Err(AdapterFault::malformed(
@@ -1266,23 +1589,37 @@ async fn run_local_text_worker_inner(
                         "text stream event must be valid utf-8",
                     )
                 })?;
-                if payload.trim() == "[DONE]" {
-                    done = true;
-                    break;
-                }
-                let delta = extract_stream_text_delta(&payload)?;
-                if !delta.is_empty() {
-                    append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
-                    if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES {
-                        flush_local_text_delta(
-                            &task.offer,
-                            &task.run_id,
-                            task.generation,
-                            &task.updates,
-                            &mut stream_state.delta_buffer,
-                        )
-                        .await?;
+                let parsed = match &task.backend {
+                    LocalTextBackend::OpenAiResponses { .. } => parse_responses_stream_event(
+                        &payload,
+                        backend_report
+                            .as_mut()
+                            .expect("responses worker must collect backend evidence"),
+                    )?,
+                    _ => parse_chat_completions_stream_event(&payload, backend_report.as_mut())?,
+                };
+                match parsed {
+                    ParsedTextStreamEvent::Delta(delta) if !delta.is_empty() => {
+                        append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
+                        if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES
+                            || local_text_event_bytes(&stream_state.delta_buffer)?
+                                >= task.offer.policy.event_bytes_limit
+                        {
+                            flush_local_text_delta(
+                                &task.offer,
+                                &task.run_id,
+                                task.generation,
+                                &task.updates,
+                                &mut stream_state.delta_buffer,
+                            )
+                            .await?;
+                        }
                     }
+                    ParsedTextStreamEvent::Completed => {
+                        done = true;
+                        break;
+                    }
+                    ParsedTextStreamEvent::Delta(_) | ParsedTextStreamEvent::Ignored => {}
                 }
                 continue;
             }
@@ -1324,29 +1661,124 @@ async fn run_local_text_worker_inner(
         status: RunStatus::Completed,
         output: Some(output),
         error: None,
+        backend_report: backend_report
+            .map(HostedBackendReport::finish)
+            .map(Box::new),
     })
 }
 
-fn handle_local_text_cancel_signal(
-    cancel_rx: &watch::Receiver<bool>,
-    changed: std::result::Result<(), tokio::sync::watch::error::RecvError>,
-) -> std::result::Result<ReconcileResult, AdapterFault> {
-    match changed {
-        Ok(()) => {
-            if *cancel_rx.borrow() {
-                Ok(local_text_cancelled_result())
-            } else {
-                Ok(worker_settlement_unknown_result())
-            }
+fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
+    match fault {
+        LocalLlamaFault::Timeout => AdapterFault::timeout(
+            "model backend timed out",
+            "local llama engine health deadline expired",
+        ),
+        LocalLlamaFault::Failed => AdapterFault::backend_failed(
+            "model backend failed",
+            "local llama engine was unavailable",
+        ),
+    }
+}
+
+fn text_generation_request_body(
+    offer: &ConfiguredOffer,
+    model: &str,
+    prompt: &str,
+    enable_thinking: Option<bool>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "stream": true,
+        "max_tokens": text_generation_max_tokens(offer),
+        "messages": [
+            { "role": "user", "content": prompt }
+        ]
+    });
+    if let Some(enable_thinking) = enable_thinking {
+        body["chat_template_kwargs"] = json!({
+            "enable_thinking": enable_thinking,
+        });
+    }
+    body
+}
+
+fn responses_text_request_body(offer: &ConfiguredOffer, model: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "input": prompt,
+        "stream": true,
+        "store": false,
+        "max_output_tokens": text_generation_max_tokens(offer),
+    })
+}
+
+fn text_generation_max_tokens(offer: &ConfiguredOffer) -> u64 {
+    // Four output bytes per token is an operational estimate. The exact serialized output byte
+    // check remains authoritative.
+    const ESTIMATED_OUTPUT_BYTES_PER_TOKEN: u64 = 4;
+
+    (offer.policy.inline_output_bytes_limit / ESTIMATED_OUTPUT_BYTES_PER_TOKEN).max(1)
+}
+
+fn map_text_reqwest_failure(err: reqwest::Error, private_endpoint: bool) -> AdapterFault {
+    if private_endpoint {
+        if err.is_timeout() {
+            return AdapterFault::timeout(
+                "model backend timed out",
+                "local llama request deadline expired",
+            );
         }
-        Err(_) => {
-            if *cancel_rx.borrow() {
-                Ok(local_text_cancelled_result())
-            } else {
-                Ok(worker_settlement_unknown_result())
-            }
+        return AdapterFault::transport(
+            "model backend transport was interrupted",
+            "local llama request was interrupted",
+        );
+    }
+    map_reqwest_failure(err)
+}
+
+fn local_text_event_bytes(text: &str) -> std::result::Result<u64, AdapterFault> {
+    // Match the complete local delta envelope stored by the coordinator. The
+    // largest allowed sequence bounds its overhead without predicting a cursor.
+    serde_json::to_vec(&RunEvent {
+        schema: RUN_EVENT_SCHEMA.into(),
+        sequence: MAX_EVENT_SEQUENCE,
+        kind: "text_delta".into(),
+        data: json!({"text": text}),
+        backend_report: None,
+        terminal: false,
+    })
+    .map(|bytes| bytes.len() as u64)
+    .map_err(|err| {
+        AdapterFault::malformed(
+            "model backend returned invalid data",
+            format!("failed to encode text stream event: {err}"),
+        )
+    })
+}
+
+fn local_text_chunk_end(text: &str, limit: u64) -> std::result::Result<usize, AdapterFault> {
+    let (mut low, mut high) = (0, text.len());
+    while low < high {
+        let mut middle = low + (high - low).div_ceil(2);
+        while !text.is_char_boundary(middle) {
+            middle -= 1;
+        }
+        if middle == low {
+            middle += text[low..].chars().next().unwrap().len_utf8();
+        }
+        if local_text_event_bytes(&text[..middle])? <= limit {
+            low = middle;
+        } else {
+            high = text[..middle].char_indices().next_back().unwrap().0;
         }
     }
+    if low == 0 {
+        return Err(AdapterFault::malformed(
+            "model backend returned invalid data",
+            "text stream event exceeds configured limits",
+        ));
+    }
+    Ok(low)
 }
 
 async fn flush_local_text_delta(
@@ -1360,34 +1792,29 @@ async fn flush_local_text_delta(
         return Ok(());
     }
     let delta = std::mem::take(delta_buffer);
-    let delta_event = json!({ "text": delta });
-    let encoded = serde_json::to_vec(&delta_event).map_err(|err| {
-        AdapterFault::malformed(
-            "model backend returned invalid data",
-            format!("failed to encode text stream event: {err}"),
+    let mut remaining = delta.as_str();
+    while !remaining.is_empty() {
+        let end = local_text_chunk_end(remaining, offer.policy.event_bytes_limit)?;
+        let delta_event = json!({ "text": &remaining[..end] });
+        send_worker_apply_update(
+            run_id,
+            generation,
+            WorkerApplyGuard::None,
+            ReconcileResult::StillRunning {
+                events: vec![EventSeed {
+                    kind: "text_delta",
+                    data: delta_event,
+                }],
+                backend_state: serialize_local_text_backend_state(false)?,
+                status: RunStatus::Running,
+            },
+            updates,
         )
-    })?;
-    if encoded.len() as u64 > offer.policy.event_bytes_limit {
-        return Err(AdapterFault::malformed(
-            "model backend returned invalid data",
-            "text stream event exceeds configured limits",
-        ));
+        .await?;
+        // Only an applied acknowledgement permits the next chunk.
+        remaining = &remaining[end..];
     }
-    send_worker_apply_update(
-        run_id,
-        generation,
-        WorkerApplyGuard::None,
-        ReconcileResult::StillRunning {
-            events: vec![EventSeed {
-                kind: "text_delta",
-                data: delta_event,
-            }],
-            backend_state: serialize_local_text_backend_state(false)?,
-            status: RunStatus::Running,
-        },
-        updates,
-    )
-    .await
+    Ok(())
 }
 
 fn append_local_text_delta(
@@ -1422,39 +1849,161 @@ fn consume_local_text_stream_bytes(
     Ok(())
 }
 
-fn extract_stream_text_delta(payload: &str) -> std::result::Result<String, AdapterFault> {
-    let value = serde_json::from_str::<Value>(payload).map_err(|_| {
+fn parse_stream_json(payload: &str) -> std::result::Result<Value, AdapterFault> {
+    serde_json::from_str::<Value>(payload).map_err(|_| {
         AdapterFault::malformed(
             "model backend returned invalid data",
             "text stream event must be valid json",
         )
+    })
+}
+
+fn parse_chat_completions_stream_event(
+    payload: &str,
+    backend_report: Option<&mut HostedBackendReport>,
+) -> std::result::Result<ParsedTextStreamEvent, AdapterFault> {
+    if payload.trim() == "[DONE]" {
+        return Ok(ParsedTextStreamEvent::Completed);
+    }
+    let value = parse_stream_json(payload)?;
+    if let Some(report) = backend_report {
+        report.observe_chat_completions(&value);
+    }
+    let delta = extract_stream_text_delta(&value);
+    if delta.is_empty() {
+        return Ok(ParsedTextStreamEvent::Ignored);
+    }
+    Ok(ParsedTextStreamEvent::Delta(delta))
+}
+
+fn parse_responses_stream_event(
+    payload: &str,
+    backend_report: &mut HostedBackendReport,
+) -> std::result::Result<ParsedTextStreamEvent, AdapterFault> {
+    let value = parse_stream_json(payload)?;
+    let event_type = value.get("type").and_then(Value::as_str).ok_or_else(|| {
+        AdapterFault::malformed(
+            "model backend returned invalid data",
+            "responses stream event must contain a string type",
+        )
     })?;
+    match event_type {
+        "response.output_text.delta" => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|delta| ParsedTextStreamEvent::Delta(delta.to_string()))
+            .ok_or_else(|| {
+                AdapterFault::malformed(
+                    "model backend returned invalid data",
+                    "responses output text delta must be a string",
+                )
+            }),
+        "response.completed" => {
+            let response = value
+                .get("response")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    AdapterFault::malformed(
+                        "model backend returned invalid data",
+                        "responses completed event must contain a response object",
+                    )
+                })?;
+            if response.get("status").and_then(Value::as_str) != Some("completed") {
+                return Err(AdapterFault::malformed(
+                    "model backend returned invalid data",
+                    "responses completed event response status must be completed",
+                ));
+            }
+            backend_report.observe_responses_completed(response);
+            Ok(ParsedTextStreamEvent::Completed)
+        }
+        "response.failed" | "response.incomplete" | "error" => {
+            let fault = AdapterFault::backend_failed(
+                "model backend failed",
+                format!("responses stream ended with {event_type}"),
+            );
+            fault.log();
+            Err(fault)
+        }
+        _ => Ok(ParsedTextStreamEvent::Ignored),
+    }
+}
+
+fn extract_stream_text_delta(value: &Value) -> String {
     if let Some(text) = value
         .pointer("/choices/0/delta/content")
         .and_then(Value::as_str)
     {
-        return Ok(text.to_string());
+        return text.to_string();
     }
     if let Some(text) = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
     {
-        return Ok(text.to_string());
+        return text.to_string();
     }
-    Ok(String::new())
+    String::new()
 }
 
-fn local_text_cancelled_result() -> ReconcileResult {
-    ReconcileResult::Terminal {
-        events: Vec::new(),
-        status: RunStatus::Cancelled,
-        output: None,
-        error: Some(RunError {
-            class: ErrorClass::Cancelled,
-            code: "cancelled".to_string(),
-            message: "model run was cancelled".to_string(),
-        }),
+fn parse_bounded_backend_string(
+    value: &Value,
+    max_bytes: usize,
+) -> std::result::Result<Option<String>, ()> {
+    let value = value.as_str().ok_or(())?;
+    if value.trim().is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(());
     }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_backend_usage(
+    usage: &serde_json::Map<String, Value>,
+    input_name: &str,
+    output_name: &str,
+) -> std::result::Result<Option<BackendTokenUsage>, ()> {
+    fn token(
+        usage: &serde_json::Map<String, Value>,
+        name: &str,
+    ) -> std::result::Result<Option<u64>, ()> {
+        match usage.get(name) {
+            Some(value) => value.as_u64().map(Some).ok_or(()),
+            None => Ok(None),
+        }
+    }
+
+    let input_tokens = token(usage, input_name)?;
+    let output_tokens = token(usage, output_name)?;
+    let total_tokens = token(usage, "total_tokens")?;
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(BackendTokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    }))
+}
+
+fn parse_backend_cost(
+    usage: &serde_json::Map<String, Value>,
+) -> std::result::Result<Option<BackendCost>, ()> {
+    let cost = usage.get("cost").ok_or(())?;
+    let Value::Number(cost) = cost else {
+        return Err(());
+    };
+    let value = cost.to_string();
+    if value.starts_with('-') || value.len() > MAX_BACKEND_COST_BYTES {
+        return Err(());
+    }
+    let unit = match usage.get("cost_unit") {
+        Some(value) => parse_bounded_backend_string(value, MAX_BACKEND_COST_UNIT_BYTES)?,
+        None => None,
+    };
+    Ok(Some(BackendCost { value, unit }))
 }
 
 fn worker_settlement_unknown_result() -> ReconcileResult {
@@ -1467,6 +2016,7 @@ fn worker_settlement_unknown_result() -> ReconcileResult {
             code: "settlement_unknown".to_string(),
             message: "model backend settlement is unknown".to_string(),
         }),
+        backend_report: None,
     }
 }
 
@@ -1491,6 +2041,10 @@ async fn send_worker_apply_update(
     match ack_rx.await {
         Ok(WorkerApplyAck::Applied) => Ok(()),
         Ok(WorkerApplyAck::Rejected) => Err(worker_update_rejected_fault()),
+        Ok(WorkerApplyAck::TimedOut) => Err(AdapterFault::timeout(
+            "model backend timed out",
+            "model run deadline expired before worker update",
+        )),
         Err(_) => Err(worker_control_lost_fault(
             "worker acknowledgement channel was dropped",
         )),
@@ -1516,6 +2070,7 @@ fn worker_control_lost_fault(detail: &'static str) -> AdapterFault {
 }
 
 fn map_reqwest_failure(err: reqwest::Error) -> AdapterFault {
+    let err = err.without_url();
     if err.is_timeout() {
         return AdapterFault::timeout(
             "model backend timed out",
@@ -1577,6 +2132,7 @@ fn reconcile_http_job(
                 code: "settlement_unknown".to_string(),
                 message: "model backend settlement is unknown".to_string(),
             }),
+            backend_report: None,
         });
     }
     let state = parse_http_job_backend_state(backend_state)?;
@@ -1596,6 +2152,7 @@ fn reconcile_http_job(
                 code: "settlement_unknown".to_string(),
                 message: "model backend settlement is unknown".to_string(),
             }),
+            backend_report: None,
         });
     }
     let run_id = deterministic_run_id(binding);
@@ -1771,6 +2328,7 @@ fn absorb_cancel_poll_fault(
                 code: "settlement_unknown".to_string(),
                 message: "model backend settlement is unknown".to_string(),
             }),
+            backend_report: None,
         });
     }
     state.next_poll_at_ms = next_poll_at_ms(now, poll_interval_ms).min(deadline);
@@ -2074,6 +2632,7 @@ fn parse_http_job_status_result(
                     code: "cancelled".to_string(),
                     message: "model run was cancelled".to_string(),
                 }),
+                backend_report: None,
             })
         }
         "failed" => {
@@ -2092,6 +2651,7 @@ fn parse_http_job_status_result(
                     code: "backend_failed".to_string(),
                     message: "model backend failed".to_string(),
                 }),
+                backend_report: None,
             })
         }
         "completed" => {
@@ -2108,6 +2668,7 @@ fn parse_http_job_status_result(
                 status: RunStatus::Completed,
                 output: Some(output),
                 error: None,
+                backend_report: None,
             })
         }
         "settlement_unknown" => {
@@ -2303,12 +2864,22 @@ mod tests {
             self.shutdown.store(true, Ordering::Relaxed);
             let _ = TcpStream::connect(self.base_url.strip_prefix("http://").unwrap_or(""));
             if let Some(join) = self.join.take() {
-                let _ = join.join();
+                let result = join.join();
+                if !thread::panicking() {
+                    result.expect("HTTP fixture thread failed");
+                }
             }
         }
     }
 
     fn start_server(responses: Vec<HttpResponseSpec>) -> TestServer {
+        start_server_with_first_byte_delay(responses, Duration::ZERO)
+    }
+
+    fn start_server_with_first_byte_delay(
+        responses: Vec<HttpResponseSpec>,
+        first_byte_delay: Duration,
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -2316,7 +2887,9 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests_clone = Arc::clone(&requests);
         let shutdown_clone = Arc::clone(&shutdown);
-        let join = thread::spawn(move || {
+        let join = thread::Builder::new()
+            .name(format!("http-fixture:{}", thread::current().name().unwrap_or("unnamed-test")))
+            .spawn(move || {
             for spec in responses {
                 let (mut stream, _) = loop {
                     match listener.accept() {
@@ -2330,6 +2903,10 @@ mod tests {
                         Err(err) => panic!("test server accept failed: {err}"),
                     }
                 };
+                // Drop's connection wakes accept; it is not a client request.
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    return;
+                }
                 stream.set_nonblocking(false).unwrap();
                 let request = read_request(&mut stream);
                 requests_clone.lock().unwrap().push(request);
@@ -2345,11 +2922,12 @@ mod tests {
                     response.push_str("\r\n");
                 }
                 response.push_str("\r\n");
+                thread::sleep(first_byte_delay);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.write_all(&spec.body).unwrap();
                 stream.flush().unwrap();
             }
-        });
+        }).unwrap();
         TestServer {
             base_url,
             requests,
@@ -2449,6 +3027,7 @@ mod tests {
                 api_url: api_url.to_string(),
                 api_key: Some("secret".to_string()),
                 model: "gpt-test".to_string(),
+                hosted: crate::config::test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -2502,6 +3081,162 @@ mod tests {
     }
 
     #[test]
+    fn responses_and_chat_request_json_use_policy_token_ceiling() {
+        let mut offer = openai_offer("http://example.invalid/chat");
+        offer.policy.inline_output_bytes_limit = 64;
+        let hosted = text_generation_request_body(&offer, "hosted", "hello", None);
+        let local = text_generation_request_body(&offer, "local", "hello", Some(false));
+        let responses = responses_text_request_body(&offer, "responses", "hello");
+        assert_eq!(
+            hosted,
+            json!({
+                "model": "hosted",
+                "stream": true,
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hello" }],
+            })
+        );
+        assert_eq!(
+            local,
+            json!({
+                "model": "local",
+                "stream": true,
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hello" }],
+                "chat_template_kwargs": { "enable_thinking": false },
+            })
+        );
+        assert_eq!(
+            responses,
+            json!({
+                "model": "responses",
+                "input": "hello",
+                "stream": true,
+                "store": false,
+                "max_output_tokens": 16,
+            })
+        );
+
+        let first = hosted["max_tokens"].as_u64().unwrap();
+        assert!(first > 0 && first <= offer.policy.inline_output_bytes_limit);
+        assert_eq!(text_generation_max_tokens(&offer), first);
+        offer.policy.inline_output_bytes_limit = 4_096;
+        assert_eq!(text_generation_max_tokens(&offer), 1_024);
+        assert_ne!(text_generation_max_tokens(&offer), first);
+    }
+
+    #[test]
+    fn reqwest_failure_detail_omits_configured_url_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let sentinel = "private-query-sentinel";
+        let url = format!("http://{address}/unavailable?token={sentinel}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(reqwest::Client::new().get(&url).send())
+            .unwrap_err();
+
+        let fault = map_reqwest_failure(error);
+        assert_eq!(fault.error.class, ErrorClass::TransportInterrupted);
+        let loggable = format!("{fault:?}");
+        assert!(!fault.detail.as_deref().unwrap().contains(&url));
+        assert!(!loggable.contains(sentinel));
+    }
+
+    #[test]
+    fn responses_parser_requires_authoritative_completion_envelope() {
+        for payload in [
+            json!({"type": "response.completed"}),
+            json!({"type": "response.completed", "response": []}),
+            json!({"type": "response.completed", "response": {}}),
+            json!({"type": "response.completed", "response": {"status": "failed"}}),
+            json!({"type": "response.output_text.delta", "delta": {}}),
+        ] {
+            let mut report = HostedBackendReport::default();
+            let Err(fault) = parse_responses_stream_event(&payload.to_string(), &mut report) else {
+                panic!("invalid responses event was accepted");
+            };
+            assert_eq!(fault.error.class, ErrorClass::ResponseMalformed);
+        }
+
+        let mut report = HostedBackendReport::default();
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "model": "m".repeat(MAX_MODEL_BYTES + 1),
+                "usage": {"input_tokens": "invalid"},
+            },
+        });
+        assert!(matches!(
+            parse_responses_stream_event(&completed.to_string(), &mut report).unwrap(),
+            ParsedTextStreamEvent::Completed
+        ));
+        assert_eq!(report.finish(), BackendReport::unknown());
+    }
+
+    #[test]
+    fn local_text_first_bytes_can_use_the_offer_runtime_limit() {
+        let server = start_server_with_first_byte_delay(
+            vec![HttpResponseSpec {
+                status_line: "200 OK",
+                body: sse_body(&[], true),
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            }],
+            Duration::from_millis(700),
+        );
+        let mut offer = openai_offer(&format!("{}/chat", server.base_url));
+        offer.policy.runtime_ms_limit = 2_000;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            run_id: "run-delayed-first-byte".to_string(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
+            offer,
+            deadline_ms: now_ms().saturating_add(30_000),
+            prompt: "hello".to_string(),
+            cancel_rx,
+            updates: update_tx,
+        };
+
+        let result = runtime
+            .block_on(run_local_text_worker_inner(&mut task))
+            .unwrap();
+        let ReconcileResult::Terminal {
+            status,
+            output,
+            backend_report,
+            ..
+        } = result
+        else {
+            panic!("expected completed result");
+        };
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(
+            output,
+            Some(json!({ "schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "" }))
+        );
+        assert_eq!(
+            backend_report.map(|report| *report),
+            Some(BackendReport::unknown())
+        );
+        assert!(update_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn duplicate_local_text_dispatch_creates_no_unowned_or_duplicate_worker() {
         let server = start_server(vec![
             HttpResponseSpec {
@@ -2535,14 +3270,17 @@ mod tests {
             let url = format!("{}/chat", server.base_url);
             thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                let result = dispatch_openai_text(
+                let result = dispatch_text(
                     &executor,
-                    &url,
-                    Some("secret"),
-                    "gpt-test",
+                    LocalTextBackend::OpenAiCompatible {
+                        api_url: url,
+                        api_key: Some("secret".to_string()),
+                        model: "gpt-test".to_string(),
+                    },
                     &offer,
                     &run_binding,
                     &input,
+                    now_ms().saturating_add(30_000),
                 )
                 .map(|_| ());
                 result_tx.send(result).unwrap();
@@ -2619,6 +3357,7 @@ mod tests {
                 WorkerUpdate::Exited {
                     run_id: update_run_id,
                     generation: update_generation,
+                    ..
                 } => {
                     assert_eq!(update_run_id, run_id);
                     assert_eq!(update_generation, generation);
@@ -2672,10 +3411,13 @@ mod tests {
                 let mut task = LocalTextWorkerTask {
                     run_id: "run-coalesced".to_string(),
                     generation: 1,
-                    api_url: url,
-                    api_key: Some("secret".to_string()),
-                    model: "gpt-test".to_string(),
+                    backend: LocalTextBackend::OpenAiCompatible {
+                        api_url: url,
+                        api_key: Some("secret".to_string()),
+                        model: "gpt-test".to_string(),
+                    },
                     offer,
+                    deadline_ms: now_ms().saturating_add(30_000),
                     prompt: "hello".to_string(),
                     cancel_rx,
                     updates: update_tx,
@@ -2774,6 +3516,264 @@ mod tests {
             }))
         );
         assert!(update_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_text_small_delta_is_visible_before_stream_completion() {
+        check_small_live_delta(false).await;
+    }
+
+    #[tokio::test]
+    async fn local_text_small_delta_can_cancel_before_stream_completion() {
+        check_small_live_delta(true).await;
+    }
+
+    async fn check_small_live_delta(cancel: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chat", listener.local_addr().unwrap());
+        let prefix = sse_body(
+            &[r#"{"choices":[{"delta":{"content":"small live delta"}}]}"#],
+            false,
+        );
+        let suffix = sse_body(&[], true);
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            read_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n", prefix.len() + suffix.len()).unwrap();
+            stream.write_all(&prefix).unwrap();
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = stream.write_all(&suffix).and_then(|_| stream.flush());
+            if !cancel {
+                result.unwrap();
+            }
+        });
+        let mut offer = openai_offer(&url);
+        offer.policy.runtime_ms_limit = 120_000;
+        offer.policy.event_bytes_limit = 65536 + 1024;
+        offer.policy.inline_output_bytes_limit = 65536;
+        let (update_tx, mut update_rx) = mpsc::channel(8);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let worker = tokio::spawn(async move {
+            let mut task = LocalTextWorkerTask {
+                run_id: "small-live-delta".into(),
+                generation: 1,
+                backend: LocalTextBackend::OpenAiCompatible {
+                    api_url: url,
+                    api_key: None,
+                    model: "fixture".into(),
+                },
+                offer,
+                deadline_ms: now_ms() + 120_000,
+                prompt: "hello".into(),
+                cancel_rx,
+                updates: update_tx,
+            };
+            run_local_text_worker_inner(&mut task).await
+        });
+        // The server cannot complete until this observation has settled. Even
+        // the RED path releases it and drains Applied acknowledgements first.
+        let early = tokio::time::timeout(Duration::from_secs(2), update_rx.recv()).await;
+        let visible_while_active = matches!(&early, Ok(Some(_)));
+        if cancel {
+            cancel_tx.send(true).unwrap();
+        } else {
+            release_tx.send(()).unwrap();
+        }
+        let mut delivered = String::new();
+        let mut next = early.ok().flatten();
+        loop {
+            let update = if let Some(update) = next.take() {
+                Some(update)
+            } else {
+                update_rx.recv().await
+            };
+            let Some(update) = update else { break };
+            match update {
+                WorkerUpdate::Apply {
+                    result: ReconcileResult::StillRunning { events, status, .. },
+                    acknowledge,
+                    ..
+                } => {
+                    assert_eq!(status, RunStatus::Running);
+                    assert!(
+                        !worker.is_finished(),
+                        "worker must await Applied acknowledgement"
+                    );
+                    assert!(
+                        update_rx.try_recv().is_err(),
+                        "unacknowledged update must apply backpressure"
+                    );
+                    for event in events {
+                        delivered.push_str(event.data["text"].as_str().unwrap());
+                    }
+                    acknowledge.send(WorkerApplyAck::Applied).unwrap();
+                }
+                other => panic!("unexpected streaming update: {other:?}"),
+            }
+        }
+        let result = worker.await.unwrap().unwrap();
+        if cancel {
+            release_tx.send(()).unwrap();
+        }
+        server.await.unwrap();
+        assert_eq!(delivered, "small live delta");
+        if cancel {
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::SettlementUnknown,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::Completed,
+                    ..
+                }
+            ));
+        }
+        assert!(
+            visible_while_active,
+            "small delta stayed buffered until completion"
+        );
+    }
+
+    #[test]
+    fn local_text_timed_flushes_leave_qwen_journal_headroom() {
+        // Runtime's current Qwen output profile. Size flushes consume at least
+        // 8 KiB each; timed flushes have their own hard cap. Allow a final delta
+        // and four lifecycle events in addition to the reserved terminal event.
+        let output_limit = 65536usize;
+        let deltas =
+            LOCAL_TEXT_TIMED_FLUSH_LIMIT + output_limit.div_ceil(LOCAL_TEXT_DELTA_FLUSH_BYTES) + 1;
+        assert!(deltas + 4 < crate::config::MAX_RUN_EVENT_COUNT_LIMIT);
+        let encoded_overhead = local_text_event_bytes("").unwrap();
+        let aggregate = output_limit as u64 + deltas as u64 * encoded_overhead;
+        assert!(
+            aggregate + crate::config::MAX_EVENT_BYTES_LIMIT
+                < crate::config::MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn local_text_small_event_budget_splits_one_large_escaped_delta() {
+        use crate::contract::{RunEvent, MAX_EVENT_SEQUENCE, RUN_EVENT_SCHEMA};
+
+        // Same streaming worker as LocalLlama, with deterministic SSE bytes.
+        let text = "🌿\"\\\n".repeat(1600);
+        let delta = json!({"choices":[{"delta":{"content":text}}]}).to_string();
+        let server = start_server(vec![HttpResponseSpec {
+            status_line: "200 OK",
+            body: sse_body(&[&delta], true),
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+        }]);
+        let mut offer = openai_offer(&format!("{}/chat", server.base_url));
+        offer.policy.event_bytes_limit = 4096;
+        offer.policy.inline_output_bytes_limit = 65536;
+        offer.policy.runtime_ms_limit = 120000;
+        let (update_tx, mut update_rx) = mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            run_id: "run-admitted-budget".into(),
+            generation: 1,
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: None,
+                model: "fixture".into(),
+            },
+            offer,
+            deadline_ms: now_ms().saturating_add(120000),
+            prompt: "fixture".into(),
+            cancel_rx,
+            updates: update_tx,
+        };
+        let worker = tokio::spawn(async move { run_local_text_worker_inner(&mut task).await });
+        let mut reconstructed = String::new();
+        let mut event_count = 0usize;
+        let mut aggregate = 0usize;
+        let mut full_events_bounded = true;
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(10), update_rx.recv())
+            .await
+            .expect("bounded delta acknowledgement wait")
+        {
+            match update {
+                WorkerUpdate::Apply {
+                    result: ReconcileResult::StillRunning { events, status, .. },
+                    acknowledge,
+                    ..
+                } => {
+                    assert_eq!(status, RunStatus::Running);
+                    assert!(
+                        !worker.is_finished(),
+                        "worker must wait for apply acknowledgement"
+                    );
+                    for seed in events {
+                        assert_eq!(seed.kind, "text_delta");
+                        let part = seed.data["text"].as_str().unwrap();
+                        assert!(!part.is_empty());
+                        reconstructed.push_str(part);
+                        let event = RunEvent {
+                            schema: RUN_EVENT_SCHEMA.into(),
+                            sequence: MAX_EVENT_SEQUENCE,
+                            kind: seed.kind.into(),
+                            data: seed.data,
+                            backend_report: None, // Actual text_delta envelope has no report.
+                            terminal: false,
+                        };
+                        let bytes = serde_json::to_vec(&event).unwrap().len();
+                        full_events_bounded &= bytes <= 4096;
+                        aggregate += bytes;
+                        event_count += 1;
+                    }
+                    acknowledge
+                        .send(if full_events_bounded {
+                            WorkerApplyAck::Applied
+                        } else {
+                            WorkerApplyAck::Rejected
+                        })
+                        .unwrap();
+                }
+                other => panic!("unexpected streaming update: {other:?}"),
+            }
+        }
+        let result = worker.await.unwrap();
+        assert!(
+            full_events_bounded,
+            "complete serialized RunEvent exceeds configured budget"
+        );
+        assert!(
+            event_count > 1,
+            "one oversized SSE delta must yield bounded active events; result={result:?}"
+        );
+        assert_eq!(reconstructed, text);
+        assert!(event_count < crate::config::MAX_RUN_EVENT_COUNT_LIMIT);
+        assert!(
+            aggregate as u64
+                <= crate::config::MAX_RUN_EVENT_AGGREGATE_BYTES_LIMIT
+                    - crate::config::MAX_EVENT_BYTES_LIMIT
+        );
+        let ReconcileResult::Terminal {
+            status,
+            output,
+            error,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("worker did not complete");
+        };
+        assert_eq!(status, RunStatus::Completed);
+        assert!(error.is_none());
+        assert_eq!(output.unwrap()["text"], text);
+        // This adapter result is not proof that a large terminal output event
+        // passes the coordinator's separate complete-event budget.
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2886,10 +3886,13 @@ mod tests {
         let mut task = LocalTextWorkerTask {
             run_id: "run-truncated".to_string(),
             generation: 1,
-            api_url: format!("{}/chat", server.base_url),
-            api_key: Some("secret".to_string()),
-            model: "gpt-test".to_string(),
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
+            deadline_ms: now_ms().saturating_add(30_000),
             prompt: "hello".to_string(),
             cancel_rx,
             updates: update_tx,
@@ -2921,10 +3924,13 @@ mod tests {
         let mut task = LocalTextWorkerTask {
             run_id: "run-control-loss".to_string(),
             generation: 1,
-            api_url: format!("{}/chat", server.base_url),
-            api_key: Some("secret".to_string()),
-            model: "gpt-test".to_string(),
+            backend: LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", server.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
             offer: openai_offer(&format!("{}/chat", server.base_url)),
+            deadline_ms: now_ms().saturating_add(30_000),
             prompt: "hello".to_string(),
             cancel_rx,
             updates: update_tx,
@@ -3061,6 +4067,7 @@ mod tests {
             error,
             events,
             output,
+            ..
         } = result
         else {
             panic!("expected cancelled terminal reconcile result");
@@ -3200,22 +4207,75 @@ mod tests {
             )],
         }]);
         let runtime = RunningRuntime::start();
-        let executor = LiveAdapterExecutor::new(runtime.handle.clone(), mpsc::channel(4).0);
+        let (update_tx, mut update_rx) = mpsc::channel(4);
+        let executor = LiveAdapterExecutor::new(runtime.handle.clone(), update_tx);
         let openai_offer = openai_offer(&format!("{}/chat", redirect.base_url));
 
-        let fault = dispatch_openai_text(
+        let fault = dispatch_text(
             &executor,
-            &format!("{}/chat", redirect.base_url),
-            Some("secret"),
-            "gpt-test",
+            LocalTextBackend::OpenAiCompatible {
+                api_url: format!("{}/chat", redirect.base_url),
+                api_key: Some("secret".to_string()),
+                model: "gpt-test".to_string(),
+            },
             &openai_offer,
             &openai_binding(),
             &text_input("hello"),
+            now_ms().saturating_add(30_000),
         )
         .unwrap();
 
         assert!(matches!(fault, DispatchResult::Running { .. }));
+        let mut saw_rejection = false;
+        loop {
+            let update = runtime
+                .handle
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), update_rx.recv()).await
+                })
+                .unwrap()
+                .unwrap();
+            match update {
+                WorkerUpdate::Apply {
+                    result:
+                        ReconcileResult::Terminal {
+                            status,
+                            error,
+                            output,
+                            ..
+                        },
+                    acknowledge,
+                    ..
+                } => {
+                    assert_eq!(status, RunStatus::Failed);
+                    assert_eq!(error.unwrap().class, ErrorClass::BackendFailed);
+                    assert!(output.is_none());
+                    acknowledge.send(WorkerApplyAck::Applied).unwrap();
+                    saw_rejection = true;
+                }
+                WorkerUpdate::Exited { .. } => break,
+                other => panic!("unexpected redirect update: {other:?}"),
+            }
+        }
+        runtime.handle.block_on(executor.shutdown_workers());
+        assert!(
+            saw_rejection,
+            "redirect dispatch must actually fail before teardown"
+        );
+        assert_eq!(redirect.requests.lock().unwrap().len(), 1);
         assert_eq!(target.requests.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn http_fixture_wake_only_teardown_records_no_request() {
+        let server = start_server(vec![HttpResponseSpec {
+            status_line: "200 OK",
+            body: b"unused".to_vec(),
+            headers: Vec::new(),
+        }]);
+        let requests = server.requests.clone();
+        drop(server);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

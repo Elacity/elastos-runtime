@@ -23,7 +23,7 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MANIFEST="$PROJECT_ROOT/models/manifest.json"
+MANIFEST="${ELASTOS_COMPONENTS_MANIFEST:-$PROJECT_ROOT/components.json}"
 INSTALL_DIR="${ELASTOS_DATA_DIR:-$HOME/.local/share/elastos}"
 BIN_DIR="$INSTALL_DIR/bin"
 
@@ -31,8 +31,19 @@ die()  { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
 info() { echo -e "  ${CYAN}▶${NC} $*"; }
 ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
 
-# Read pinned version from manifest
-VERSION=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['llama_server']['version'])")
+# Read the pinned source revision from the canonical external-artifact inventory.
+VERSION=$(python3 - "$MANIFEST" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+version = manifest["external"]["llama-server"].get("version")
+if not isinstance(version, str) or not version:
+    raise SystemExit("components.json has no pinned llama-server version")
+print(version)
+PY
+)
 
 USE_CUDA=true
 if [ "${1:-}" = "--no-cuda" ]; then

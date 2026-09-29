@@ -6,12 +6,12 @@ mod gateway_browser_wallet_bridge;
 #[path = "gateway_browser_wallet_reads.rs"]
 mod gateway_browser_wallet_reads;
 
-use gateway_browser_wallet_bridge::browser_wallet_account_is_signable_evm;
+use gateway_browser_wallet_bridge::{
+    browser_account_access_account, browser_account_access_request_uses_supported_signer,
+    browser_wallet_account_is_signable_evm, BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES,
+};
 pub(in crate::api::gateway) use gateway_browser_wallet_bridge::{
     browser_chain_namespace_network, browser_wallet_bridge_payload, is_browser_wallet_intent,
-};
-use gateway_browser_wallet_bridge::{
-    browser_projected_evm_accounts, BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES,
 };
 use gateway_browser_wallet_reads::browser_wallet_read;
 
@@ -387,21 +387,15 @@ async fn create_browser_wallet_account_access_request(
         ));
     }
     let summary = system_wallet_accounts_summary(state, authority).await;
-    let account = browser_projected_evm_accounts(&summary)
-        .into_iter()
-        .find(|account| {
-            account.chain_namespace == input.chain_namespace
-                && browser_wallet_account_is_signable_evm(account)
-                && is_managed_wallet_proof_type(&account.proof_type)
-                && account.connector_id.is_none()
-        })
-        .ok_or_else(|| {
+    let account = browser_account_access_account(&summary, &input.chain_namespace).ok_or_else(
+        || {
             (
                 StatusCode::FORBIDDEN,
-                "Browser account access requires a Runtime-managed EVM account for the selected chain"
+                "Browser account access requires a principal-owned EVM account for the selected chain"
                     .to_string(),
             )
-        })?;
+        },
+    )?;
     let chain_namespaces = BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES
         .iter()
         .map(|namespace| (*namespace).to_string())
@@ -957,6 +951,62 @@ fn completed_browser_wallet_result_string<'a>(
         .ok_or_else(|| completed_browser_wallet_result_error(&format!("is missing {field}")))
 }
 
+fn bind_completed_browser_signature_caller(
+    request: &serde_json::Value,
+    authority: &RuntimeWalletAuthority,
+    page_url: Option<&str>,
+    origin: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let context = authority.verified_context();
+    let page_url = page_url.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Browser signature status requires the exact page URL".to_string(),
+        )
+    })?;
+    let origin = origin.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Browser signature status requires the exact page origin".to_string(),
+        )
+    })?;
+    let canonical_origin = validate_browser_wallet_page_origin(page_url, origin)?;
+    for (field, expected) in [
+        ("principal_id", context.principal_id()),
+        ("session_id", context.session_id()),
+        ("launch_id", context.launch_id()),
+        ("requested_by_actor", BROWSER_CAPSULE_ID),
+    ] {
+        if request.get(field).and_then(|value| value.as_str()) != Some(expected) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "browser wallet approval request not found".to_string(),
+            ));
+        }
+    }
+    let payload = request
+        .get("payload")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "browser wallet approval request not found".to_string(),
+            )
+        })?;
+    for (field, expected) in [
+        ("page_url", page_url),
+        ("origin", canonical_origin.as_str()),
+    ] {
+        if completed_browser_wallet_result_string(payload, field)? != expected {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "browser wallet approval request not found".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn browser_account_access_request_payload<'a>(
     request: &'a serde_json::Value,
     authority: &RuntimeWalletAuthority,
@@ -977,17 +1027,9 @@ fn browser_account_access_request_payload<'a>(
         )
     })?;
     let canonical_origin = validate_browser_wallet_page_origin(page_url, origin)?;
-    if !is_managed_wallet_proof_type(
-        request
-            .get("proof_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default(),
-    ) || request
-        .get("connector_id")
-        .is_some_and(|value| !value.is_null())
-    {
+    if !browser_account_access_request_uses_supported_signer(request) {
         return Err(completed_browser_wallet_result_error(
-            "is not backed by a Runtime-managed signer",
+            "is not backed by a principal-owned signer",
         ));
     }
     for (field, expected) in [
@@ -1285,6 +1327,7 @@ async fn browser_wallet_approval_status(
             intent,
             Some("browser_personal_sign") | Some("browser_typed_data_sign")
         ) {
+            bind_completed_browser_signature_caller(request, authority, page_url, origin)?;
             let signature = result
                 .get("signature")
                 .and_then(|value| value.as_str())

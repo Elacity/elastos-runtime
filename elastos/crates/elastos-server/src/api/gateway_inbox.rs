@@ -363,24 +363,30 @@ async fn dispatch_inbox_action(
         return deny_runtime_capability_request(data_dir, request_id).await;
     }
     if let Some(request_id) = action_id.strip_prefix("service-approve-request:") {
+        let discovery_service = state.collaboration_discovery_service.clone();
         let data_dir = data_dir.clone();
         let context = context.clone();
         let request_id = request_id.to_string();
         return tokio::task::spawn_blocking(move || {
-            approve_home_service_access_request(&data_dir, &context, &request_id)
+            approve_home_service_access_request(
+                &data_dir,
+                &context,
+                discovery_service.as_ref(),
+                &request_id,
+            )
         })
         .await
         .map_err(|err| anyhow::anyhow!(err))?;
     }
     if let Some(request_id) = action_id.strip_prefix("service-deny-request:") {
-        let data_dir = data_dir.clone();
-        let context = context.clone();
-        let request_id = request_id.to_string();
-        return tokio::task::spawn_blocking(move || {
-            deny_home_service_access_request(&data_dir, &context, &request_id)
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!(err))?;
+        return super::deny_model_grant_and_settle(
+            state.provider_registry.clone(),
+            data_dir,
+            context,
+            state.collaboration_discovery_service.as_ref(),
+            request_id,
+        )
+        .await;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-approve-request:") {
         let Some(step_up_token) = action.step_up_token.as_deref() else {

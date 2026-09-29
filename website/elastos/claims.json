@@ -1,0 +1,32 @@
+{
+  "schema": "elastos.website.claims/v1",
+  "reviewed_at": "2026-09-10",
+  "candidate": {
+    "version": "0.7.1",
+    "base_ref": "upstream/0.7.1-dev",
+    "base_commit": "6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac",
+    "evidence": "https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md"
+  },
+  "hosted": {
+    "status": "unverified",
+    "version": null,
+    "source_commit": null,
+    "evidence": null
+  },
+  "public_observation": {
+    "observed_at": "2026-09-10",
+    "version": "0.1.2",
+    "platforms": ["x86_64-linux", "aarch64-linux"],
+    "release_head_sha256": "16eaffbfd18e51225755c6b170776690a418d97ab729c5d61cc8392b9d4f67c0",
+    "release_sha256": "4294526d87d4af52832d9ae25a149ce6c4bb3722b268704867d2579e44c6db57",
+    "installer_sha256": "e0dec5ac29f848f34d4806f2d376b133a190fcc3a0504b1e5a81aa6f35158dc3",
+    "evidence": ["/release-head.json", "/release.json", "/install.sh"]
+  },
+  "journeys": [
+    {"id": "home", "status": "Source preview", "evidence": "https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#installed-candidate-proof"},
+    {"id": "update", "status": "Release proof open", "evidence": "https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#public-install-truth"},
+    {"id": "ai", "status": "Model setup required", "evidence": "https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#installed-candidate-proof"},
+    {"id": "browser", "status": "Device proof open", "evidence": "https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/state.md#browser-truth"},
+    {"id": "publish", "status": "Publishing preview", "evidence": "https://github.com/Elacity/elastos-runtime/blob/6c61c990b9a1d0f2c1b00ee6f5f091d3354cafac/docs/SITES.md"}
+  ]
+}

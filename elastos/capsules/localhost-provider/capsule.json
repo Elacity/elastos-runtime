@@ -7,6 +7,7 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "icon": "icons",
   "provides": "localhost://*",
   "authority": {
     "reason": "Owns rooted local object storage for approved localhost:// roots without leaking arbitrary host filesystem paths.",

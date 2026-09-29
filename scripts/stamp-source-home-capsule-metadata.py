@@ -42,6 +42,15 @@ def browser_assets(capsule_root):
 STAMPS_RUNTIME_ABIS = {"elastos.component/v1", "elastos.runtime-projection/v1"}
 MANAGED_STATE_SCHEMA = "elastos.source-home.managed-capsules/v1"
 SAFE_CAPSULE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Match Runtime setup.rs: exact platform, then its alias, then wildcard.
+PLATFORM_ALIASES = {
+    "x86_64-linux": "linux-amd64",
+    "linux-amd64": "x86_64-linux",
+    "aarch64-linux": "linux-arm64",
+    "linux-arm64": "aarch64-linux",
+    "aarch64-darwin": "darwin-arm64",
+    "darwin-arm64": "aarch64-darwin",
+}
 
 
 def stamps_source_capsule(manifest):
@@ -167,6 +176,7 @@ def copy_declared_icon_set(source_root, installed_root, manifest):
 def stamp_component_capsules(components_path, data_dir, root, platform, capsules):
     manifest = json.loads(components_path.read_text())
     capsule_entries = manifest.setdefault("capsules", {})
+    obsolete_sidecars = []
 
     for name in capsules:
         source_manifest_path = root / "capsules" / name / "capsule.json"
@@ -193,9 +203,8 @@ def stamp_component_capsules(components_path, data_dir, root, platform, capsules
             )
 
         entry = capsule_entries.setdefault(name, {})
-        entry.setdefault("cid", "")
-        entry.setdefault("sha256", "")
-        entry.setdefault("size", 0)
+        # This is a source installation, not the copied release archive.
+        entry.update(cid="", sha256="", size=0)
         platforms = set(entry.get("platforms") or [])
         platforms.add(platform)
         entry["platforms"] = sorted(platforms)
@@ -213,8 +222,29 @@ def stamp_component_capsules(components_path, data_dir, root, platform, capsules
             entry["type"] = "data"
             entry["viewer"] = installed_manifest.get("viewer")
         entry["browser_assets"] = browser_assets(installed_root)
+        component = manifest.get("external", {}).get(name)
+        if component is not None:
+            mappings = component.setdefault("platforms", {})
+            selected = next((dict(mappings[key]) for key in (
+                platform, PLATFORM_ALIASES.get(platform), "*",
+            ) if key in mappings), {})
+            install_path = selected.get("install_path")
+            if install_path is None:
+                install_path = component.get("install_path")
+            if install_path != f"capsules/{name}":
+                raise SystemExit(f"{name} external install path mismatch: {install_path!r}")
+            for field in ("cid", "checksum", "size", "release_path", "url"):
+                selected[field] = None
+            selected["strategy"] = "source-build"
+            mappings[platform] = selected
+        obsolete_sidecars.extend(installed_root / filename for filename in (
+            ".elastos-cid", ".elastos-artifact-sha256",
+        ))
 
+    # Validate every selected entrypoint before changing any installed metadata.
     atomic_write_json(components_path, manifest)
+    for sidecar in obsolete_sidecars:
+        sidecar.unlink(missing_ok=True)
 
 
 def finalize_source_home_capsules(

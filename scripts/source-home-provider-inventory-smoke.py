@@ -66,8 +66,8 @@ def assert_provider_names_and_loops(setup_text: str) -> None:
     )[0]
     if "setup --with media-provider --prerequisites-only" not in prerequisite_fn:
         raise AssertionError("source-home must use the setup media prerequisite preflight")
-    if "PATH=" in prerequisite_fn:
-        raise AssertionError("media prerequisite discovery must use the setup process PATH")
+    if '--media-tools-dir "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}"' not in prerequisite_fn:
+        raise AssertionError("source-home must pass its explicit media tools directory")
 
     if 'SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}"' not in setup_text:
         raise AssertionError("source-home stamp must receive SOURCE_HOME_BINARY_NAMES_JSON")
@@ -137,7 +137,7 @@ def assert_release_support_inventory() -> None:
     if len(provider_handoff_loop) != 2:
         raise AssertionError("publisher artifacts must include provider capsule metadata archives")
     provider_handoff_body = provider_handoff_loop[1].split("done", 1)[0]
-    if '"${PUBLISHER_ARTIFACTS_DIR}/$(basename "$f")"' not in provider_handoff_body:
+    if '"${artifact_dir}/$(basename "$f")"' not in provider_handoff_body:
         raise AssertionError("publisher metadata archive names must match their stamped release paths")
 
 

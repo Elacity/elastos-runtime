@@ -14,6 +14,11 @@ pub const RUN_SCHEMA: &str = "elastos.model.run/v1";
 pub const RUN_EVENTS_SCHEMA: &str = "elastos.model.run-events/v1";
 pub const RUN_EVENT_SCHEMA: &str = "elastos.model.run-event/v1";
 pub const MODEL_POLICY_SCHEMA: &str = "elastos.model.policy/v1";
+pub const BACKEND_REPORT_SCHEMA: &str = "elastos.model.backend-report/v1";
+pub const HOSTED_PLACEMENT: &str = "hosted";
+pub const HOSTED_SELECTION_PINNED: &str = "pinned";
+pub const SINGLE_DISPATCH_NO_RETRY: &str = "single_dispatch_no_retry";
+pub const UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED: &str = "operator_asserted_disabled";
 pub const RUN_OUTPUT_TEXT_SCHEMA: &str = "elastos.model.output.text/v1";
 pub const RUN_OUTPUT_OBJECT_SCHEMA: &str = "elastos.model.output.object/v1";
 pub const RUN_OUTPUT_CONTENT_SCHEMA: &str = "elastos.model.output.content/v1";
@@ -160,7 +165,55 @@ pub struct RunEvent {
     pub sequence: u64,
     pub kind: String,
     pub data: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_report: Option<BackendReport>,
     pub terminal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BackendFact<T> {
+    Reported { value: T },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendTokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendCost {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendReport {
+    pub schema: String,
+    pub resolved_model: BackendFact<String>,
+    pub usage: BackendFact<BackendTokenUsage>,
+    pub cost: BackendFact<BackendCost>,
+}
+
+impl BackendReport {
+    pub fn unknown() -> Self {
+        Self {
+            schema: BACKEND_REPORT_SCHEMA.to_string(),
+            resolved_model: BackendFact::Unknown,
+            usage: BackendFact::Unknown,
+            cost: BackendFact::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +239,21 @@ pub struct OfferSummary {
     pub output_modalities: Vec<String>,
     pub stream_output: bool,
     pub policy: OfferPolicySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<HostedOfferDisclosure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostedOfferDisclosure {
+    pub placement: String,
+    pub backend_provider_label: String,
+    pub selection_mode: String,
+    pub requested_selector: String,
+    pub privacy_policy_ref: String,
+    pub terms_ref: String,
+    pub provider_request_policy: String,
+    pub upstream_routing_fallback_assertion: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +264,8 @@ pub struct RunTerminalOutcome {
     pub output: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RunError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_report: Option<BackendReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -350,6 +420,9 @@ pub fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> R
     validate_trimmed(value, label)?;
     if value.len() > max_bytes {
         anyhow::bail!("{label} exceeds {max_bytes} bytes");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} contains control characters");
     }
     Ok(())
 }

@@ -510,7 +510,7 @@ impl Provider for ObjectProvider {
 
         Ok(match result {
             Ok(data) => provider_ok(data),
-            Err(err) => provider_error("library_error", &err.to_string()),
+            Err(err) => provider_error_from("library_error", &err),
         })
     }
 }
@@ -544,7 +544,7 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
 
     match result {
         Ok(data) => provider_ok(data),
-        Err(err) => provider_error("library_error", &err.to_string()),
+        Err(err) => provider_error_from("library_error", &err),
     }
 }
 
@@ -719,7 +719,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         let result = handle_library_webspace_request(&data_dir, &registry, request).await;
         return match result {
             Ok(data) => provider_ok(data),
-            Err(err) => provider_error("library_error", &err.to_string()),
+            Err(err) => provider_error_from("library_error", &err),
         };
     }
 
@@ -781,7 +781,7 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
 
     match result {
         Ok(data) => provider_ok(data),
-        Err(err) => provider_error("library_error", &err.to_string()),
+        Err(err) => provider_error_from("library_error", &err),
     }
 }
 
@@ -7122,8 +7122,51 @@ fn provider_error(code: &str, message: &str) -> Value {
     })
 }
 
+/// Error envelope for a failed provider request: `message` stays the stable,
+/// app-facing sentence (the outermost error), and `detail` carries the cause
+/// chain beneath it (fail-closed site, provider verdict, RPC revert data) so
+/// an operator or driver can see why without the runtime log.
+fn provider_error_from(code: &str, error: &anyhow::Error) -> Value {
+    let mut response = provider_error(code, &error.to_string());
+    let detail = anyhow_error_detail(error);
+    if !detail.is_empty() {
+        response["detail"] = Value::String(detail);
+    }
+    response
+}
+
+fn anyhow_error_detail(error: &anyhow::Error) -> String {
+    let mut detail = error
+        .chain()
+        .skip(1)
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(" <- ");
+    if detail.len() > 1024 {
+        detail.truncate(1024);
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_error_from_keeps_the_stable_message_and_exposes_the_cause_chain() {
+        let error = anyhow::anyhow!("(400, \"upstream_rpc_error: reverted\")")
+            .context("gateway_provider_proxy.rs:1")
+            .context("Runtime custody purchase is unavailable");
+        let value = super::provider_error_from("library_error", &error);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["code"], "library_error");
+        assert_eq!(value["message"], "Runtime custody purchase is unavailable");
+        assert_eq!(
+            value["detail"],
+            "gateway_provider_proxy.rs:1 <- (400, \"upstream_rpc_error: reverted\")"
+        );
+        let plain = super::provider_error_from("library_error", &anyhow::anyhow!("only"));
+        assert!(plain.get("detail").is_none());
+    }
+
     use super::*;
 
     #[test]

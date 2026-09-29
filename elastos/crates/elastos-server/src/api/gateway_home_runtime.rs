@@ -13,7 +13,12 @@ pub(super) async fn home_launch(
             )
         })?;
 
-    let target = req.target.trim();
+    // Old Home bookmarks launch the canonical app. Normalize before package
+    // resolution and token creation; existing run actor bindings stay intact.
+    let target = match req.target.trim() {
+        "home-agent" => "assistant",
+        target => target,
+    };
     if target.is_empty() || target == HOME_CAPSULE_ID {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -48,6 +53,7 @@ pub(super) async fn home_launch(
     // legacy Services mailbox behavior while keeping Inbox summary pure.
     let data_dir = state.data_dir.clone();
     let launch_context = context.clone();
+    let discovery_service = state.collaboration_discovery_service.clone();
     let sync_services = target_summary.target == INBOX_CAPSULE_ID;
     let services_sync_error = tokio::task::spawn_blocking(move || {
         super::gateway_home_system::migrate_legacy_services_peer_contacts(
@@ -58,6 +64,7 @@ pub(super) async fn home_launch(
             super::gateway_home_system::home_services_sync_access_requests(
                 &data_dir,
                 &launch_context,
+                discovery_service.as_ref(),
             )
             .err()
             .map(|error| error.to_string())
@@ -121,6 +128,7 @@ pub(super) async fn home_launch(
 
     Ok(Json(HomeLaunchResponse {
         target: target_summary.target,
+        window_policy: target_summary.window_policy,
         title: target_summary.title,
         route,
         attach_kind: target_summary.attach_kind,
@@ -240,6 +248,7 @@ pub(super) fn home_targets_from_catalog(
         .filter_map(|capsule| {
             Some(HomeTargetSummary {
                 target: capsule.launch_target.clone()?,
+                window_policy: capsule.window_policy,
                 title: capsule.title.clone(),
                 description: capsule.description.clone(),
                 route: capsule.route.clone()?,
@@ -284,12 +293,13 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
     let mut targets: Vec<_> =
         crate::api::browser_capsules::list_launchable_browser_capsules(data_dir)
             .into_iter()
-            .filter(|app| app.name != HOME_CAPSULE_ID)
+            .filter(|app| app.name != HOME_CAPSULE_ID && app.name != "home-agent")
             .filter(|app| {
                 !visible_only
                     || (app.role != CapsuleRole::Shell && is_home_visible_target(&app.name))
             })
             .map(|app| HomeTargetSummary {
+                window_policy: app.window_policy,
                 route: format!("/apps/{}/", app.name),
                 title: app_shell_title(&app.name),
                 description: app_shell_description(&app.name, app.description),
@@ -314,6 +324,7 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
             let icon =
                 capsule_icon_variants(&capsule.name, &capsule.entrypoint, capsule.icon.as_deref());
             HomeTargetSummary {
+                window_policy: capsule.window_policy,
                 route: format!("/apps/{}/?capsule={}", capsule.viewer, capsule.name),
                 title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
                 description: viewer_object_shell_description(
@@ -340,7 +351,10 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
 pub(super) fn is_home_visible_target(name: &str) -> bool {
     !matches!(
         name,
-        WALLET_METAMASK_CAPSULE_ID | WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID
+        WALLET_METAMASK_CAPSULE_ID
+            | WALLET_UNISAT_CAPSULE_ID
+            | WALLET_WALLETCONNECT_CAPSULE_ID
+            | "home-agent"
     )
 }
 
@@ -1100,7 +1114,7 @@ pub(super) fn home_service_offers_for_people_contact(
     }
     offers.push(HomeServiceOfferSummary {
         schema: "elastos.service.offer/v1".to_string(),
-        offer_id: format!("offer:{}:browser-exit", contact.contact_id),
+        offer_id: super::gateway_home_system::home_services_contact_offer_id(&contact.contact_id, "remote_exit"),
         service_uri: "elastos://peer/browser-exit".to_string(),
         service_kind: "remote_exit".to_string(),
         display_name: format!("{}'s Browser Exit", contact.display_name),
@@ -1116,6 +1130,41 @@ pub(super) fn home_service_offers_for_people_contact(
         runtime_contract: None,
         contact_id: Some(contact.contact_id.clone()),
         capsule_hint: Some("browser".to_string()),
+        route: None,
+    });
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: super::gateway_home_system::home_services_contact_offer_id(&contact.contact_id, crate::carrier::ENGINE_SERVICE_KIND),
+        service_uri: crate::carrier::ENGINE_SERVICE_URI.to_string(),
+        service_kind: crate::carrier::ENGINE_SERVICE_KIND.to_string(),
+        display_name: format!("{}'s Browser Engine", contact.display_name),
+        provider_uri: Some("elastos://browser-engine/*".to_string()),
+        provider_label: "Remote Engine".to_string(),
+        policy_summary: "Ask this person to run Browser pages with a profile stored on their Runtime. Your Runtime keeps control of the page and its selected Exit. Existing profiles require an approved transfer.".to_string(),
+        status: "requestable".to_string(), enabled: false, grant_required: true,
+        grant_scope: crate::carrier::browser_engine_binding::EXECUTION_SCOPE.to_string(),
+        capsule_contract: "browser -> Runtime service grant -> owner-bound Engine page".to_string(),
+        source: "people_contact".to_string(), runtime_contract: None,
+        contact_id: Some(contact.contact_id.clone()), capsule_hint: Some("browser".to_string()), route: None,
+    });
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: super::gateway_home_system::home_services_contact_offer_id(&contact.contact_id, super::MODEL_SERVICE_KIND),
+        service_uri: super::MODEL_SERVICE_URI.to_string(),
+        service_kind: super::MODEL_SERVICE_KIND.to_string(),
+        display_name: format!("{}'s AI model", contact.display_name),
+        provider_uri: Some("elastos://model/*".to_string()),
+        provider_label: "Remote model".to_string(),
+        policy_summary: "Ask this person to run their local AI model for you. Their Runtime keeps the model and decides every request; your conversation stays on your Home.".to_string(),
+        status: "requestable".to_string(),
+        enabled: false,
+        grant_required: true,
+        grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
+        capsule_contract: "assistant -> Runtime service grant -> owner-bound model run".to_string(),
+        source: "people_contact".to_string(),
+        runtime_contract: None,
+        contact_id: Some(contact.contact_id.clone()),
+        capsule_hint: Some("assistant".to_string()),
         route: None,
     });
     offers
@@ -1437,6 +1486,28 @@ fn home_local_service_offers(
             contact_id: None,
             capsule_hint: Some("browser".to_string()),
             route: Some("/apps/browser/".to_string()),
+        });
+    }
+    if data_dir.join("bin/model-provider").is_file() {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: super::MODEL_LOCAL_OFFER.to_string(),
+            service_uri: "elastos://model/offers".to_string(),
+            service_kind: super::MODEL_SERVICE_KIND.to_string(),
+            display_name: "AI model".to_string(),
+            provider_uri: Some("elastos://model/*".to_string()),
+            provider_label: "Model provider".to_string(),
+            policy_summary: "Share your local AI model with accepted contacts. Each request needs your approval in Inbox; hosted models stay private; this Runtime decides every run and can revoke access.".to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: super::MODEL_GRANT_SCOPE.to_string(),
+            capsule_contract: "assistant -> model capability -> model provider".to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: None,
+            contact_id: None,
+            capsule_hint: Some("assistant".to_string()),
+            route: Some("/apps/assistant/".to_string()),
         });
     }
     if data_dir.join("bin/ipfs-provider").is_file() {

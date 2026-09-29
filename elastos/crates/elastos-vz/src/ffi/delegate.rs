@@ -72,6 +72,30 @@ pub(crate) enum DelegateExit {
     ForcedAfterTimeout,
 }
 
+fn truncate_delegate_exit_message(message: &mut String, max_bytes: usize) {
+    if message.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+}
+
+pub(crate) fn format_delegate_exit_reason(exit: &DelegateExit) -> String {
+    match exit {
+        DelegateExit::GuestCleanStop => "guest_clean_stop".to_string(),
+        DelegateExit::HostInitiatedStop => "host_initiated_stop".to_string(),
+        DelegateExit::ForcedAfterTimeout => "forced_after_timeout".to_string(),
+        DelegateExit::StoppedWithError(message) => {
+            let mut message = message.replace(['\n', '\r'], " ");
+            truncate_delegate_exit_message(&mut message, 512);
+            format!("stopped_with_error {message}")
+        }
+    }
+}
+
 /// Shared exit-signal handle — held by both
 /// [`ElastosVzDelegate`]'s ivars and the
 /// [`VzMachineHandle`][super::lifecycle::VzMachineHandle]'s
@@ -151,6 +175,11 @@ impl ElastosVzDelegate {
     /// and become no-ops at the channel level.
     fn signal_exit(&self, exit: DelegateExit) {
         let ivars = self.ivars();
+        let reason = format_delegate_exit_reason(&exit);
+        eprintln!(
+            "browser-vz-engine-supervisor stage=vz_delegate_exit vm_id={} reason={reason}",
+            ivars.vm_id
+        );
         tracing::info!(
             target: "vz-delegate",
             vm_id = %ivars.vm_id,
@@ -205,6 +234,30 @@ mod tests {
         assert!(
             shared.lock().unwrap().is_none(),
             "sender must be consumed after first signal"
+        );
+    }
+
+    #[test]
+    fn format_delegate_exit_reason_keeps_apple_error_on_one_line() {
+        assert_eq!(
+            format_delegate_exit_reason(&DelegateExit::GuestCleanStop),
+            "guest_clean_stop"
+        );
+        assert_eq!(
+            format_delegate_exit_reason(&DelegateExit::StoppedWithError(
+                "VZError\nkernel panic\rcode=1".into()
+            )),
+            "stopped_with_error VZError kernel panic code=1"
+        );
+    }
+
+    #[test]
+    fn format_delegate_exit_reason_truncates_before_multibyte_char() {
+        let message = format!("{}é", "a".repeat(511));
+        assert_eq!(message.len(), 513);
+        assert_eq!(
+            format_delegate_exit_reason(&DelegateExit::StoppedWithError(message)),
+            format!("stopped_with_error {}", "a".repeat(511))
         );
     }
 }

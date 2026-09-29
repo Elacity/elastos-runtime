@@ -2,20 +2,34 @@
 
 ## Install from the publisher
 
-The public installer is the current Linux `x86_64`/`aarch64` preview.
-For macOS, use the [source-home staging runbook](MAC.md).
+The public endpoint currently serves the older 0.1.2 Linux preview. Its
+installer prints separate setup commands. The 0.7.1 installer in this checkout
+combines installation, Home setup, and launch into one command:
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-elastos setup
-elastos
 ```
 
-The installer verifies the signed release, then installs the `elastos` binary.
-`elastos setup` fetches the core Home profile from the trusted publisher.
-Running `elastos` opens Home. This path does not need a separate
-`elastos serve` process.
+That complete flow becomes available at this URL when the candidate installer
+and signed release are published. macOS Apple silicon downloads are still in
+preparation; developers can use the [Mac source guide](MAC.md).
+
+The candidate installer detects the platform, verifies the signed release,
+installs Runtime, and fetches the Home profile from the trusted publisher. It
+starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
+terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
+setup completes and prints the full command for opening Home later. The installer
+uses the installed binary's full path, so editing PATH is optional.
+
+For automated provisioning or a different setup profile, use `--install-only`:
+
+```bash
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --install-only
+```
+
+`ELASTOS_INSTALL_ONLY=1` also selects bootstrap only. Test scripts use this
+setting to own setup, launch, and cleanup; older installers ignore it and already
+stop after bootstrap.
 
 The current default Home exposes System, People, Services, Browser, Wallet,
 Documents, Library, Marketplace, Archive, and Inbox. People is installed as a
@@ -56,22 +70,32 @@ published install path.
 
 ## Optional components
 
-The default Home setup installs only core components. Add content, site, or
-operator dependencies explicitly:
+The Home profile in this checkout includes Documents, Library, Kubo and the
+IPFS provider. Running an additional setup command for those components repeats
+the default selection. A published release uses its own signed manifest.
+
+Add site-serving tools when operating a website:
 
 ```bash
-# Content-backed share and open
-elastos setup --with kubo --with ipfs-provider --with documents
-
 # Local site preview
 elastos setup --with site-provider
 
 # Ephemeral public site edge
 elastos setup --with site-provider --with tunnel-provider --with cloudflared
-
-# CID-backed site publication
-elastos setup --with kubo --with ipfs-provider
 ```
+
+### Content commands for operators
+
+The current `elastos share` and CID-backed site commands use the Runtime
+content provider with a local IPFS backend. Kubo and the IPFS provider remain
+dependencies of that CLI path. A reduced installation needs those components;
+opening a shared document also needs Documents.
+
+The release plan's Content/Carrier journey has separate acceptance checks.
+Installing the CLI backend establishes its prerequisites; cross-Runtime content
+delivery needs target proof. See [Sites](SITES.md) for the site commands and
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md) for the content
+contract.
 
 ## Setup and content Get are different operations
 
@@ -106,8 +130,6 @@ curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash
 curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash \
   -s -- --head-cid HEAD_CID --maintainer-did MAINTAINER_DID
 
-~/.local/bin/elastos setup
-~/.local/bin/elastos
 ```
 
 Replace the uppercase placeholders with the publisher's values. Use one gateway
@@ -120,9 +142,6 @@ The installer detects Linux `aarch64`:
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-~/.local/bin/elastos setup
-~/.local/bin/elastos
-~/.local/bin/elastos update --check
 ```
 
 Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.

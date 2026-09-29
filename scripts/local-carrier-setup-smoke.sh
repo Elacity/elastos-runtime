@@ -24,7 +24,9 @@ case "$(uname -m)" in
         ;;
 esac
 
-TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/elastos-local-carrier-setup.XXXXXX")}"
+SMOKE_TEMP_BASE="${CARGO_TARGET_DIR:-${REPO_ROOT}/target-build}"
+mkdir -p "$SMOKE_TEMP_BASE"
+TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${SMOKE_TEMP_BASE}/elastos-local-carrier-setup.XXXXXX")}"
 XDG_DATA_HOME="${TEST_ROOT}/xdg-data"
 DATA_DIR="${XDG_DATA_HOME}/elastos"
 PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
@@ -116,14 +118,29 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/wallet-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/content-block-graph-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/home-cli" && cargo build --release --bin home-cli)
+HOME_CLI_RENDERER=$(cargo build --locked --manifest-path "${REPO_ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli --message-format=json | python3 -c '
+import json, sys
+artifacts = [json.loads(line) for line in sys.stdin]
+paths = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact"
+         and item.get("target", {}).get("name") == "home-cli" and item.get("executable")]
+if len(paths) != 1:
+    raise SystemExit("expected one built Home CLI renderer")
+print(paths[0])')
+export HOME_CLI_RENDERER
+MEDIA_TOOLS_ARCHIVE=$(
+    cd "${REPO_ROOT}"
+    source scripts/publish-release.sh
+    TMPDIR="${TEST_ROOT}/media-package"
+    mkdir -p "$TMPDIR"
+    build_packaged_media_tools_archive "${SETUP_PLATFORM}"
+)
+export MEDIA_TOOLS_ARCHIVE
 for capsule in \
     home \
     home-cli \
     home-gui \
     archive-manager \
     assistant \
-    home-agent \
     browser \
     system \
     services \
@@ -186,7 +203,6 @@ LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
-HOME_AGENT_CAPSULE_DIR="${REPO_ROOT}/capsules/home-agent" \
 ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
@@ -257,6 +273,12 @@ for name, src in mapping.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
+media_info = platform_info("media-tools")
+media_archive = artifacts_dir / media_info["release_path"]
+shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
+media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
+media_info["size"] = media_archive.stat().st_size
+
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())
     entrypoint = capsule_manifest.get("entrypoint")
@@ -276,6 +298,11 @@ def write_capsule_archive(name, capsule_dir):
         browser_dir = capsule_dir / "browser"
         if browser_dir.is_dir():
             tar.add(browser_dir, arcname=f"{name}/browser")
+        if name == "home-cli":
+            renderer = pathlib.Path(os.environ["HOME_CLI_RENDERER"])
+            if not renderer.is_file() or renderer.is_symlink() or not os.access(renderer, os.X_OK):
+                raise SystemExit(f"missing built Home CLI renderer: {renderer}")
+            tar.add(renderer, arcname="home-cli/bin/home-cli")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -295,7 +322,6 @@ browser_capsules = {
     "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
-    "home-agent": pathlib.Path(os.environ["HOME_AGENT_CAPSULE_DIR"]),
     "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
@@ -498,7 +524,7 @@ for installed in \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
     "${DATA_DIR}/capsules/archive-manager/browser/index.html" \
-    "${DATA_DIR}/capsules/home-agent/browser/index.html" \
+    "${DATA_DIR}/capsules/assistant/browser/index.html" \
     "${DATA_DIR}/capsules/wallet/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-metamask/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-unisat/browser/index.html" \
@@ -511,6 +537,8 @@ do
 done
 
 STATUS_OUT="${TEST_ROOT}/home-status.txt"
+test -x "${DATA_DIR}/capsules/home-cli/bin/home-cli"
+cmp "$HOME_CLI_RENDERER" "${DATA_DIR}/capsules/home-cli/bin/home-cli"
 (
     cd "${ELASTOS_ROOT}"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \

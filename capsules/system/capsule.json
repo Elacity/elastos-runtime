@@ -5,6 +5,7 @@
   "description": "Manage your account, appearance, security, apps, and device",
   "author": "elastos",
   "role": "app",
+  "window_policy": "single",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
@@ -44,6 +45,42 @@
           "audit": "event",
           "resource": "elastos://system/settings",
           "operation": "update"
+        },
+        {
+          "id": "content.use",
+          "description": "Prepare a verified model",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "use"
+        },
+        {
+          "id": "content.status",
+          "description": "Check model preparation",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "status"
+        },
+        {
+          "id": "content.cancel",
+          "description": "Cancel model preparation",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "cancel"
+        },
+        {
+          "id": "content.retention",
+          "description": "Keep or release a model on this device",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://capsules/*",
+          "operation": "retention"
         }
       ]
     }

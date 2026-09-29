@@ -10,7 +10,12 @@ use elastos_protected_content_provider_contracts::ValidatedClearFmp4MediaSession
 use serde_json::json;
 
 const OPERATION_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const NORMAL_TIMEOUT_MS: u64 = 5_000;
+// Success-path budget. The mock tools are shell scripts, and under the full
+// parallel suite on a loaded host a bare `sh` invocation has been observed to
+// take several seconds to exit; keep this well above that. Tests that must
+// observe a timeout use SHORT_TIMEOUT_MS, and the hang-mode tests are bounded
+// by the output monitor / stdio caps rather than by this deadline.
+const NORMAL_TIMEOUT_MS: u64 = 30_000;
 const SHORT_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Clone, Copy)]
@@ -148,6 +153,10 @@ impl ToolFixture {
         let segment_one_fixture = root.path().join("00000001.m4s");
         let segment_two_fixture = root.path().join("00000002.m4s");
         let oversize_segment_fixture = root.path().join("oversize.m4s");
+        // What real ffmpeg emits per DASH segment: styp + sidx ahead of the
+        // moof/mdat pair. The provider must strip the prefix.
+        let dash_prefixed_segment_fixture = root.path().join("dash-prefixed.m4s");
+        let two_fragment_segment_fixture = root.path().join("two-fragments.m4s");
 
         fs::write(&ffprobe_stdout, valid_ffprobe_json()).unwrap();
         fs::write(&ffprobe_stderr, "").unwrap();
@@ -160,6 +169,25 @@ impl ToolFixture {
         fs::write(&segment_one_fixture, clear_segment(1, b"segment-1")).unwrap();
         fs::write(&segment_two_fixture, clear_segment(1, b"segment-2")).unwrap();
         fs::write(&oversize_segment_fixture, vec![0x55; 4096]).unwrap();
+        fs::write(
+            &dash_prefixed_segment_fixture,
+            [
+                make_box(b"styp", b"msdh\0\0\0\0msdhmsix"),
+                make_box(b"sidx", &[0u8; 44]),
+                clear_segment(1, b"segment-0"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        fs::write(
+            &two_fragment_segment_fixture,
+            [
+                clear_segment(1, b"segment-0"),
+                clear_segment(1, b"segment-1"),
+            ]
+            .concat(),
+        )
+        .unwrap();
 
         let ffprobe_path = tools.join("ffprobe.sh");
         let ffmpeg_path = tools.join("ffmpeg.sh");
@@ -178,7 +206,7 @@ impl ToolFixture {
         fs::write(
             &ffmpeg_path,
             format!(
-                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{pid}'\n: > '{args}'\nmanifest=''\nfor arg in \"$@\"; do\n  manifest=\"$arg\"\n  printf '%s\\n' \"$arg\" >> '{args}'\ndone\nmode=\"$(tr -d '\\n' < '{mode}')\"\nif [ -s '{stderr}' ]; then\n  cat '{stderr}' >&2\nfi\nmkdir -p ./segments\ncase \"$mode\" in\n  success)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000000.m4s\n    cp '{seg1}' ./segments/00000001.m4s\n    printf '%s\\n' '<MPD />' > \"$manifest\"\n    ;;\n  too_many_segments)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000000.m4s\n    cp '{seg1}' ./segments/00000001.m4s\n    cp '{seg2}' ./segments/00000002.m4s\n    ;;\n  too_many_empty_segments_then_hang)\n    cp '{init_src}' ./init.mp4\n    : > ./segments/00000000.m4s\n    : > ./segments/00000001.m4s\n    : > ./segments/00000002.m4s\n    while :; do sleep 1; done\n    ;;\n  oversize_segment)\n    cp '{init_src}' ./init.mp4\n    cp '{oversize}' ./segments/00000000.m4s\n    ;;\n  oversize_then_hang)\n    cp '{init_src}' ./init.mp4\n    cp '{oversize}' ./segments/00000000.m4s\n    while :; do sleep 1; done\n    ;;\n  exit_nonzero)\n    exit 17\n    ;;\n  timeout)\n    while :; do sleep 1; done\n    ;;\n  *)\n    exit 23\n    ;;\nesac\n",
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > '{pid}'\n: > '{args}'\nmanifest=''\nfor arg in \"$@\"; do\n  manifest=\"$arg\"\n  printf '%s\\n' \"$arg\" >> '{args}'\ndone\nmode=\"$(tr -d '\\n' < '{mode}')\"\nif [ -s '{stderr}' ]; then\n  cat '{stderr}' >&2\nfi\nmkdir -p ./segments\ncase \"$mode\" in\n  success)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000000.m4s\n    cp '{seg1}' ./segments/00000001.m4s\n    printf '%s\\n' '<MPD />' > \"$manifest\"\n    ;;\n  success_one_based)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000001.m4s\n    cp '{seg1}' ./segments/00000002.m4s\n    printf '%s\\n' '<MPD />' > \"$manifest\"\n    ;;\n  success_dash_prefixed)\n    cp '{init_src}' ./init.mp4\n    cp '{seg_prefixed}' ./segments/00000001.m4s\n    cp '{seg1}' ./segments/00000002.m4s\n    printf '%s\\n' '<MPD />' > \"$manifest\"\n    ;;\n  two_fragment_segment)\n    cp '{init_src}' ./init.mp4\n    cp '{seg_double}' ./segments/00000000.m4s\n    cp '{seg1}' ./segments/00000001.m4s\n    ;;\n  gapped_numbering)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000000.m4s\n    cp '{seg1}' ./segments/00000002.m4s\n    ;;\n  two_based_numbering)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000002.m4s\n    cp '{seg1}' ./segments/00000003.m4s\n    ;;\n  too_many_segments)\n    cp '{init_src}' ./init.mp4\n    cp '{seg0}' ./segments/00000000.m4s\n    cp '{seg1}' ./segments/00000001.m4s\n    cp '{seg2}' ./segments/00000002.m4s\n    ;;\n  too_many_empty_segments_then_hang)\n    cp '{init_src}' ./init.mp4\n    : > ./segments/00000000.m4s\n    : > ./segments/00000001.m4s\n    : > ./segments/00000002.m4s\n    while :; do sleep 1; done\n    ;;\n  oversize_segment)\n    cp '{init_src}' ./init.mp4\n    cp '{oversize}' ./segments/00000000.m4s\n    ;;\n  oversize_then_hang)\n    cp '{init_src}' ./init.mp4\n    cp '{oversize}' ./segments/00000000.m4s\n    while :; do sleep 1; done\n    ;;\n  exit_nonzero)\n    exit 17\n    ;;\n  timeout)\n    while :; do sleep 1; done\n    ;;\n  *)\n    exit 23\n    ;;\nesac\n",
                 pid = ffmpeg_pid.display(),
                 args = ffmpeg_args_log.display(),
                 mode = ffmpeg_mode.display(),
@@ -188,6 +216,8 @@ impl ToolFixture {
                 seg1 = segment_one_fixture.display(),
                 seg2 = segment_two_fixture.display(),
                 oversize = oversize_segment_fixture.display(),
+                seg_prefixed = dash_prefixed_segment_fixture.display(),
+                seg_double = two_fragment_segment_fixture.display(),
             ),
         )
         .unwrap();
@@ -289,7 +319,18 @@ fn runtime_prepare_request() -> serde_json::Value {
             "carrier": null,
             "transfer": "json",
             "range": null,
-            "progress": null
+            "progress": null,
+            "abi": {
+                "schema": "elastos.provider.transfer-abi/v1",
+                "transfer": "json",
+                "transport": "runtime-local-provider-plane",
+                "range_supported": false,
+                "progress_supported": false,
+                "progress_mode": "none",
+                "transport_native_stream": false,
+                "backpressure": "not_applicable",
+                "cancel_supported": false
+            }
         }
     })
 }
@@ -532,13 +573,11 @@ fn process_init_status_prepare_shutdown_emits_valid_clear_fmp4() {
             "-seg_duration".to_string(),
             "4".to_string(),
             "-streaming".to_string(),
-            "1".to_string(),
+            "0".to_string(),
             "-use_timeline".to_string(),
             "0".to_string(),
             "-use_template".to_string(),
             "1".to_string(),
-            "-start_number".to_string(),
-            "0".to_string(),
             "-init_seg_name".to_string(),
             "init.mp4".to_string(),
             "-media_seg_name".to_string(),
@@ -589,6 +628,93 @@ fn process_timeout_returns_settled_error_and_provider_remains_available() {
     assert_eq!(prepare["data"]["operation_settled"], true);
 
     provider.shutdown_and_assert_clean();
+}
+
+#[test]
+fn process_prepare_normalizes_ffmpeg_one_based_dash_segments_to_zero_based() {
+    // Real ffmpeg's DASH muxer numbers media segments from 1; the Runtime
+    // contract is 0-based, so the provider must shift the run down by one.
+    let fixture = ToolFixture::new();
+    fixture.set_ffmpeg_mode("success_one_based");
+    let operation_root = fixture.prepare_operation();
+    let mut provider = ProviderProcess::start();
+    let init = provider.request_json(fixture.init_request(InitRequestConfig::default()));
+    assert_eq!(init["status"], "ok");
+
+    let prepare = provider.request_json(runtime_prepare_request());
+    assert_eq!(prepare["status"], "ok");
+    let mut segment_names = fs::read_dir(operation_root.join("prepared/segments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    segment_names.sort();
+    assert_eq!(
+        segment_names,
+        vec!["00000000.m4s".to_string(), "00000001.m4s".to_string()]
+    );
+    assert_eq!(
+        fs::read(operation_root.join("prepared/segments/00000000.m4s")).unwrap(),
+        clear_segment(1, b"segment-0")
+    );
+    assert_eq!(
+        fs::read(operation_root.join("prepared/segments/00000001.m4s")).unwrap(),
+        clear_segment(1, b"segment-1")
+    );
+
+    provider.shutdown_and_assert_clean();
+}
+
+#[test]
+fn process_prepare_strips_ffmpeg_dash_styp_and_sidx_prefix_from_segments() {
+    // Real ffmpeg DASH segments start with styp + sidx and are numbered from
+    // 1; the provider must hand the Runtime bare, 0-based moof/mdat pairs.
+    let fixture = ToolFixture::new();
+    fixture.set_ffmpeg_mode("success_dash_prefixed");
+    let operation_root = fixture.prepare_operation();
+    let mut provider = ProviderProcess::start();
+    let init = provider.request_json(fixture.init_request(InitRequestConfig::default()));
+    assert_eq!(init["status"], "ok");
+
+    let prepare = provider.request_json(runtime_prepare_request());
+    assert_eq!(prepare["status"], "ok", "prepare response: {prepare}");
+    assert_eq!(
+        fs::read(operation_root.join("prepared/segments/00000000.m4s")).unwrap(),
+        clear_segment(1, b"segment-0")
+    );
+    assert_eq!(
+        fs::read(operation_root.join("prepared/segments/00000001.m4s")).unwrap(),
+        clear_segment(1, b"segment-1")
+    );
+    let init_bytes = fs::read(operation_root.join("prepared/init.mp4")).unwrap();
+    let session = ValidatedClearFmp4MediaSessionLayoutV1::new(&init_bytes).unwrap();
+    session
+        .validate_segment(&fs::read(operation_root.join("prepared/segments/00000000.m4s")).unwrap())
+        .unwrap();
+
+    provider.shutdown_and_assert_clean();
+}
+
+#[test]
+fn process_prepare_rejects_gapped_or_offset_segment_numbering() {
+    for mode in [
+        "gapped_numbering",
+        "two_based_numbering",
+        "two_fragment_segment",
+    ] {
+        let fixture = ToolFixture::new();
+        fixture.set_ffmpeg_mode(mode);
+        fixture.prepare_operation();
+        let mut provider = ProviderProcess::start();
+        let init = provider.request_json(fixture.init_request(InitRequestConfig::default()));
+        assert_eq!(init["status"], "ok");
+
+        let prepare = provider.request_json(runtime_prepare_request());
+        assert_eq!(prepare["status"], "error", "mode {mode}");
+        assert_eq!(prepare["code"], "internal_error", "mode {mode}");
+        assert_eq!(prepare["data"]["operation_settled"], true, "mode {mode}");
+
+        provider.shutdown_and_assert_clean();
+    }
 }
 
 #[test]
@@ -840,8 +966,21 @@ fn process_prepare_rejects_nonruntime_authority_and_topology_fields() {
     wrong_capability["_runtime_invocation"]["capability"] = json!("provider:caller->media:prepare");
     let mut caller_path = runtime_prepare_request();
     caller_path["local_path"] = json!("/private/source.mp4");
+    let mut wrong_abi = runtime_prepare_request();
+    wrong_abi["_runtime_invocation"]["abi"]["range_supported"] = json!(true);
+    let mut missing_abi = runtime_prepare_request();
+    missing_abi["_runtime_invocation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("abi");
 
-    for request in [wrong_transport, wrong_capability, caller_path] {
+    for request in [
+        wrong_transport,
+        wrong_capability,
+        caller_path,
+        wrong_abi,
+        missing_abi,
+    ] {
         let response = provider.request_json(request);
         assert_eq!(response["status"], "error");
         assert_eq!(response["code"], "invalid_request");

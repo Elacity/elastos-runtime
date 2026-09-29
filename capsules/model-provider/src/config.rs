@@ -1,9 +1,15 @@
-use crate::contract::{validate_trimmed, OfferPolicySummary, OfferSummary, MODEL_POLICY_SCHEMA};
+use crate::contract::{
+    validate_bounded_trimmed, HostedOfferDisclosure, OfferPolicySummary, OfferSummary,
+    HOSTED_PLACEMENT, HOSTED_SELECTION_PINNED, MODEL_POLICY_SCHEMA, SINGLE_DISPATCH_NO_RETRY,
+    UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED,
+};
 use anyhow::Result;
 use elastos_model_contract::model_input_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -20,6 +26,10 @@ pub const MAX_MODALITY_BYTES: usize = 64;
 pub const MAX_URL_BYTES: usize = 2 * 1024;
 pub const MAX_SECRET_BYTES: usize = 4 * 1024;
 pub const MAX_MODEL_BYTES: usize = 128;
+pub const MAX_HOSTED_PROVIDER_LABEL_BYTES: usize = 128;
+pub const MAX_HOSTED_POLICY_REF_BYTES: usize = 2 * 1024;
+pub const MAX_BACKEND_COST_BYTES: usize = 128;
+pub const MAX_BACKEND_COST_UNIT_BYTES: usize = 64;
 pub const MAX_POLL_INTERVAL_MS: u64 = 300_000;
 pub const MAX_CONCURRENCY_LIMIT: u32 = 64;
 pub const MAX_INPUT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
@@ -32,6 +42,12 @@ pub const MAX_RUN_EVENTS_PAGE_BYTES_LIMIT: u64 = 224 * 1024;
 pub const MAX_RUNTIME_MS_LIMIT: u64 = 3_600_000;
 pub const MAX_RETENTION_SECS: u64 = 604_800;
 pub const MAX_CANCEL_SETTLEMENT_TIMEOUT_MS: u64 = 300_000;
+pub const MAX_LOCAL_LLAMA_CONTEXT_SIZE: u32 = 32_768;
+pub const MAX_LOCAL_LLAMA_PARALLEL: u32 = 64;
+pub const MAX_LOCAL_LLAMA_THREADS: u32 = 512;
+pub const MAX_LOCAL_LLAMA_GPU_LAYERS: u32 = 4_096;
+pub const MAX_LOCAL_LLAMA_HEALTH_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_LOCAL_LLAMA_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,10 +99,20 @@ pub struct ProviderInitExtra {
     pub journal_dir: Option<String>,
     #[serde(default)]
     pub offers: Vec<ConfiguredOffer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_admitted_offers: Vec<RuntimeAdmittedOffer>,
+}
+
+/// Private Init provenance projected by Runtime from its verified inventory.
+/// It grants neither content deletion nor inference authority.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAdmittedOffer {
+    pub offer_id: String,
 }
 
 impl ProviderInitExtra {
-    pub fn validate(&self, base_path: &str) -> Result<()> {
+    pub fn validate(&self, bridge: &BridgeProviderConfig) -> Result<()> {
         if let Some(provider_id) = self.provider_id.as_deref() {
             validate_bounded_trimmed(provider_id, "provider_id", MAX_PROVIDER_ID_BYTES)?;
         }
@@ -96,7 +122,7 @@ impl ProviderInitExtra {
                 anyhow::bail!("journal_dir must be an absolute path");
             }
         }
-        if base_path.is_empty() && self.journal_dir.is_none() {
+        if bridge.base_path.is_empty() && self.journal_dir.is_none() {
             anyhow::bail!("model provider init requires base_path or journal_dir");
         }
         if self.offers.len() > MAX_OFFER_COUNT {
@@ -105,11 +131,114 @@ impl ProviderInitExtra {
         let mut offer_ids = BTreeSet::new();
         for offer in &self.offers {
             offer.validate()?;
+            offer.validate_local_artifacts(bridge)?;
             if !offer_ids.insert(offer.id.as_str()) {
                 anyhow::bail!("duplicate model offer id in provider config");
             }
         }
+        if self.runtime_admitted_offers.len() > MAX_OFFER_COUNT {
+            anyhow::bail!("too many Runtime model admissions");
+        }
+        let mut admitted_ids = BTreeSet::new();
+        for admission in &self.runtime_admitted_offers {
+            let offer = self
+                .offers
+                .iter()
+                .find(|o| o.id == admission.offer_id)
+                .ok_or_else(|| anyhow::anyhow!("Runtime admission offer unavailable"))?;
+            if !offer.enabled
+                || !matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+                || !admitted_ids.insert(&admission.offer_id)
+            {
+                anyhow::bail!("invalid Runtime model admission binding");
+            }
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalArtifactConfig {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalLlamaSettings {
+    pub context_size: u32,
+    pub parallel: u32,
+    pub threads: u32,
+    pub batch_threads: u32,
+    pub gpu_layers: u32,
+    pub health_timeout_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    pub enable_thinking: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostedDisclosureConfig {
+    pub backend_provider_label: String,
+    pub selection_mode: String,
+    pub privacy_policy_ref: String,
+    pub terms_ref: String,
+    pub upstream_routing_fallback_assertion: String,
+}
+
+impl HostedDisclosureConfig {
+    fn validate(&self) -> Result<()> {
+        validate_bounded_trimmed(
+            &self.backend_provider_label,
+            "hosted backend_provider_label",
+            MAX_HOSTED_PROVIDER_LABEL_BYTES,
+        )?;
+        if self.selection_mode != HOSTED_SELECTION_PINNED {
+            anyhow::bail!("hosted selection_mode must be pinned");
+        }
+        validate_bounded_trimmed(
+            &self.privacy_policy_ref,
+            "hosted privacy_policy_ref",
+            MAX_HOSTED_POLICY_REF_BYTES,
+        )?;
+        validate_bounded_trimmed(
+            &self.terms_ref,
+            "hosted terms_ref",
+            MAX_HOSTED_POLICY_REF_BYTES,
+        )?;
+        if self.upstream_routing_fallback_assertion != UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
+        {
+            anyhow::bail!(
+                "hosted upstream_routing_fallback_assertion must be operator_asserted_disabled"
+            );
+        }
+        Ok(())
+    }
+
+    fn summary(&self, requested_selector: &str) -> HostedOfferDisclosure {
+        HostedOfferDisclosure {
+            placement: HOSTED_PLACEMENT.to_string(),
+            backend_provider_label: self.backend_provider_label.clone(),
+            selection_mode: self.selection_mode.clone(),
+            requested_selector: requested_selector.to_string(),
+            privacy_policy_ref: self.privacy_policy_ref.clone(),
+            terms_ref: self.terms_ref.clone(),
+            provider_request_policy: SINGLE_DISPATCH_NO_RETRY.to_string(),
+            upstream_routing_fallback_assertion: self.upstream_routing_fallback_assertion.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_hosted_disclosure() -> HostedDisclosureConfig {
+    HostedDisclosureConfig {
+        backend_provider_label: "Fixture Provider".to_string(),
+        selection_mode: HOSTED_SELECTION_PINNED.to_string(),
+        privacy_policy_ref: "fixture:privacy:v1".to_string(),
+        terms_ref: "fixture:terms:v1".to_string(),
+        upstream_routing_fallback_assertion: UPSTREAM_FALLBACK_OPERATOR_ASSERTED_DISABLED
+            .to_string(),
     }
 }
 
@@ -121,6 +250,19 @@ pub enum AdapterConfig {
         #[serde(default)]
         api_key: Option<String>,
         model: String,
+        hosted: HostedDisclosureConfig,
+    },
+    OpenAiResponsesText {
+        api_url: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        model: String,
+        hosted: HostedDisclosureConfig,
+    },
+    LocalLlamaCppText {
+        engine: LocalArtifactConfig,
+        model: LocalArtifactConfig,
+        settings: LocalLlamaSettings,
     },
     HttpJobArtifact {
         create_url: String,
@@ -140,12 +282,29 @@ impl AdapterConfig {
                 api_url,
                 api_key,
                 model,
+                hosted,
+            }
+            | Self::OpenAiResponsesText {
+                api_url,
+                api_key,
+                model,
+                hosted,
             } => {
                 validate_url(api_url, "openai adapter api_url")?;
                 if let Some(api_key) = api_key.as_deref() {
                     validate_bounded_trimmed(api_key, "openai adapter api_key", MAX_SECRET_BYTES)?;
                 }
                 validate_bounded_trimmed(model, "openai adapter model", MAX_MODEL_BYTES)?;
+                hosted.validate()?;
+            }
+            Self::LocalLlamaCppText {
+                engine,
+                model,
+                settings,
+            } => {
+                validate_local_artifact_config(engine, "local llama engine")?;
+                validate_local_artifact_config(model, "local llama model")?;
+                settings.validate()?;
             }
             Self::HttpJobArtifact {
                 create_url,
@@ -177,7 +336,47 @@ impl AdapterConfig {
     }
 
     pub fn stream_output(&self) -> bool {
-        matches!(self, Self::OpenAiCompatibleText { .. })
+        matches!(
+            self,
+            Self::OpenAiCompatibleText { .. }
+                | Self::OpenAiResponsesText { .. }
+                | Self::LocalLlamaCppText { .. }
+        )
+    }
+}
+
+impl LocalLlamaSettings {
+    fn validate(&self) -> Result<()> {
+        validate_nonzero_bounded(
+            self.context_size,
+            MAX_LOCAL_LLAMA_CONTEXT_SIZE,
+            "local llama context_size",
+        )?;
+        validate_nonzero_bounded(
+            self.parallel,
+            MAX_LOCAL_LLAMA_PARALLEL,
+            "local llama parallel",
+        )?;
+        validate_nonzero_bounded(self.threads, MAX_LOCAL_LLAMA_THREADS, "local llama threads")?;
+        validate_nonzero_bounded(
+            self.batch_threads,
+            MAX_LOCAL_LLAMA_THREADS,
+            "local llama batch_threads",
+        )?;
+        if self.gpu_layers > MAX_LOCAL_LLAMA_GPU_LAYERS {
+            anyhow::bail!("local llama gpu_layers must be in 0..={MAX_LOCAL_LLAMA_GPU_LAYERS}");
+        }
+        validate_nonzero_bounded(
+            self.health_timeout_ms,
+            MAX_LOCAL_LLAMA_HEALTH_TIMEOUT_MS,
+            "local llama health_timeout_ms",
+        )?;
+        validate_nonzero_bounded(
+            self.shutdown_timeout_ms,
+            MAX_LOCAL_LLAMA_SHUTDOWN_TIMEOUT_MS,
+            "local llama shutdown_timeout_ms",
+        )?;
+        Ok(())
     }
 }
 
@@ -247,7 +446,7 @@ impl OfferPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfiguredOffer {
     pub id: String,
@@ -279,6 +478,13 @@ impl ConfiguredOffer {
     }
 
     pub fn summary(&self) -> OfferSummary {
+        let hosted = match &self.adapter {
+            AdapterConfig::OpenAiCompatibleText { model, hosted, .. }
+            | AdapterConfig::OpenAiResponsesText { model, hosted, .. } => {
+                Some(hosted.summary(model))
+            }
+            _ => None,
+        };
         OfferSummary {
             id: self.id.clone(),
             title: self.title.clone(),
@@ -287,6 +493,7 @@ impl ConfiguredOffer {
             output_modalities: self.output_modalities.clone(),
             stream_output: self.adapter.stream_output(),
             policy: self.policy.summary(),
+            hosted,
         }
     }
 
@@ -296,6 +503,21 @@ impl ConfiguredOffer {
                 "kind": "open_ai_compatible_text",
                 "api_url": api_url,
                 "model": model,
+            }),
+            AdapterConfig::OpenAiResponsesText { api_url, model, .. } => json!({
+                "kind": "open_ai_responses_text",
+                "api_url": api_url,
+                "model": model,
+            }),
+            AdapterConfig::LocalLlamaCppText {
+                engine,
+                model,
+                settings,
+            } => json!({
+                "kind": "local_llama_cpp_text",
+                "engine_sha256": engine.sha256,
+                "model_sha256": model.sha256,
+                "settings": settings,
             }),
             AdapterConfig::HttpJobArtifact {
                 create_url,
@@ -319,19 +541,21 @@ impl ConfiguredOffer {
 
     fn validate_canonical_modalities(&self) -> Result<()> {
         match &self.adapter {
-            AdapterConfig::OpenAiCompatibleText { .. } => {
+            AdapterConfig::OpenAiCompatibleText { .. }
+            | AdapterConfig::OpenAiResponsesText { .. }
+            | AdapterConfig::LocalLlamaCppText { .. } => {
                 if self.operation != "text.generate" {
-                    anyhow::bail!("openai compatible text offers require operation text.generate");
+                    anyhow::bail!("text generation offers require operation text.generate");
                 }
                 validate_exact_modalities(
                     &self.input_modalities,
                     &["text/plain"],
-                    "openai compatible text input_modalities",
+                    "text generation input_modalities",
                 )?;
                 validate_exact_modalities(
                     &self.output_modalities,
                     &["text/plain"],
-                    "openai compatible text output_modalities",
+                    "text generation output_modalities",
                 )?;
             }
             AdapterConfig::HttpJobArtifact { .. } => {
@@ -353,6 +577,14 @@ impl ConfiguredOffer {
             }
         }
         Ok(())
+    }
+
+    fn validate_local_artifacts(&self, bridge: &BridgeProviderConfig) -> Result<()> {
+        let AdapterConfig::LocalLlamaCppText { engine, model, .. } = &self.adapter else {
+            return Ok(());
+        };
+        validate_local_artifact(bridge, engine, true, "local llama engine")?;
+        validate_local_artifact(bridge, model, false, "local llama model")
     }
 }
 
@@ -411,10 +643,147 @@ fn validate_exact_modalities(actual: &[String], expected: &[&str], label: &str) 
     Ok(())
 }
 
-fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> Result<()> {
-    validate_trimmed(value, label)?;
-    if value.len() > max_bytes {
-        anyhow::bail!("{label} exceeds {max_bytes} bytes");
+fn validate_nonzero_bounded<T>(value: T, max: T, label: &str) -> Result<()>
+where
+    T: Copy + Ord + From<u8> + std::fmt::Display,
+{
+    if value < T::from(1) || value > max {
+        anyhow::bail!("{label} must be in 1..={max}");
+    }
+    Ok(())
+}
+
+fn validate_local_artifact_config(config: &LocalArtifactConfig, label: &str) -> Result<()> {
+    validate_bounded_trimmed(&config.path, label, MAX_BASE_PATH_BYTES)?;
+    if !Path::new(&config.path).is_absolute() {
+        anyhow::bail!("{label} path must be absolute");
+    }
+    let digest = config.sha256.strip_prefix("sha256:").unwrap_or_default();
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("{label} sha256 must be canonical lowercase sha256 hex");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_local_artifact(
+    bridge: &BridgeProviderConfig,
+    artifact: &LocalArtifactConfig,
+    executable: bool,
+    label: &str,
+) -> Result<()> {
+    validate_local_artifact_config(artifact, label)?;
+    validate_bounded_trimmed(&bridge.base_path, "base_path", MAX_BASE_PATH_BYTES)?;
+    let base = Path::new(&bridge.base_path);
+    if !base.is_absolute() {
+        anyhow::bail!("base_path must be an absolute path");
+    }
+    let canonical_base =
+        fs::canonicalize(base).map_err(|_| anyhow::anyhow!("base_path is unavailable"))?;
+    if canonical_base != base {
+        anyhow::bail!("base_path must not contain symlinks");
+    }
+    let path = Path::new(&artifact.path);
+    let canonical =
+        fs::canonicalize(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    if canonical != path {
+        anyhow::bail!("{label} path must not contain symlinks");
+    }
+    let allowed = if bridge.allowed_paths.is_empty() {
+        canonical.starts_with(&canonical_base)
+    } else {
+        bridge.allowed_paths.iter().any(|relative| {
+            let relative = Path::new(relative);
+            relative.is_relative()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && fs::canonicalize(canonical_base.join(relative))
+                    .map(|root| root.starts_with(&canonical_base) && canonical.starts_with(root))
+                    .unwrap_or(false)
+        })
+    };
+    if !allowed {
+        anyhow::bail!("{label} is outside Runtime-admitted paths");
+    }
+    validate_local_artifact_metadata(artifact, executable)
+}
+
+pub(crate) fn revalidate_local_artifact(
+    artifact: &LocalArtifactConfig,
+    executable: bool,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let label = if executable {
+        "local llama engine"
+    } else {
+        "local llama model"
+    };
+    if std::time::Instant::now() >= deadline {
+        anyhow::bail!("{label} verification deadline expired");
+    }
+    let path = Path::new(&artifact.path);
+    let canonical =
+        fs::canonicalize(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    if canonical != path {
+        anyhow::bail!("{label} path must not contain symlinks");
+    }
+    validate_local_artifact_metadata(artifact, executable)?;
+    let expected = artifact.sha256.strip_prefix("sha256:").unwrap_or_default();
+    let mut file = fs::File::open(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("{label} verification deadline expired");
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| anyhow::anyhow!("{label} could not be verified"))?;
+        if read == 0 {
+            break;
+        }
+        use sha2::Digest as _;
+        hasher.update(&buffer[..read]);
+    }
+    use sha2::Digest as _;
+    if format!("{:x}", hasher.finalize()) != expected {
+        anyhow::bail!("{label} checksum does not match operator config");
+    }
+    Ok(())
+}
+
+fn validate_local_artifact_metadata(
+    artifact: &LocalArtifactConfig,
+    executable: bool,
+) -> Result<()> {
+    let label = if executable {
+        "local llama engine"
+    } else {
+        "local llama model"
+    };
+    let path = Path::new(&artifact.path);
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| anyhow::anyhow!("{label} is unavailable"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        anyhow::bail!("{label} must be a non-empty regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || mode & 0o022 != 0
+        {
+            anyhow::bail!("{label} must be an owner-controlled single-link file");
+        }
+        if executable && mode & 0o111 == 0 {
+            anyhow::bail!("{label} must be executable");
+        }
     }
     Ok(())
 }
@@ -423,6 +792,37 @@ fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> Resul
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    #[test]
+    #[ignore = "requires exact read-only Qwen weights; measures the production verifier"]
+    fn qwen_artifact_verification_within_runtime_profile() {
+        let path = fs::canonicalize(
+            std::env::var_os("ELASTOS_TEST_QWEN_PATH").expect("explicit Qwen weights prerequisite"),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 6_169_341_984);
+        let artifact = LocalArtifactConfig {
+            path: path.to_string_lossy().into_owned(),
+            sha256: "sha256:d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43"
+                .into(),
+        };
+        let started = std::time::Instant::now();
+        // The Runtime's current first profile shares 120 s across verification,
+        // startup and generation. This diagnostic isolates verification only.
+        let result = revalidate_local_artifact(
+            &artifact,
+            false,
+            started + std::time::Duration::from_millis(120_000),
+        );
+        eprintln!(
+            "Qwen artifact verification elapsed_ms={} result={:?}",
+            started.elapsed().as_millis(),
+            result
+        );
+        result.expect("exact Qwen verification within unchanged Runtime profile");
+    }
 
     fn base_offer() -> ConfiguredOffer {
         ConfiguredOffer {
@@ -444,6 +844,7 @@ mod tests {
                 api_url: "https://example.test/v1/chat/completions".to_string(),
                 api_key: Some("secret-a".to_string()),
                 model: "gpt-test".to_string(),
+                hosted: test_hosted_disclosure(),
             },
             enabled: true,
         }
@@ -463,6 +864,133 @@ mod tests {
             },
             ..base_offer()
         }
+    }
+
+    fn local_llama_offer(engine: &Path, model: &Path) -> ConfiguredOffer {
+        ConfiguredOffer {
+            adapter: AdapterConfig::LocalLlamaCppText {
+                engine: LocalArtifactConfig {
+                    path: engine.to_string_lossy().into_owned(),
+                    sha256:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
+                },
+                model: LocalArtifactConfig {
+                    path: model.to_string_lossy().into_owned(),
+                    sha256:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                },
+                settings: LocalLlamaSettings {
+                    context_size: 4_096,
+                    parallel: 1,
+                    threads: 2,
+                    batch_threads: 2,
+                    gpu_layers: 0,
+                    health_timeout_ms: 1_000,
+                    shutdown_timeout_ms: 100,
+                    enable_thinking: false,
+                },
+            },
+            ..base_offer()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_llama_init_admits_metadata_without_hashing_large_artifacts() {
+        let root = crate::test_support::temp_root_path("model-provider-config", "local-llama");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let bin = root.join("bin");
+        let models = root.join("models");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&models).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let engine = bin.join("llama-server");
+        let model = models.join("model.gguf");
+        fs::write(&engine, b"engine bytes").unwrap();
+        fs::write(&model, b"model bytes do not match configured digest").unwrap();
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&model, fs::Permissions::from_mode(0o600)).unwrap();
+        let extra = ProviderInitExtra {
+            runtime_admitted_offers: Vec::new(),
+            provider_id: Some("model-provider".to_string()),
+            journal_dir: Some(root.join("journal").to_string_lossy().into_owned()),
+            offers: vec![local_llama_offer(&engine, &model)],
+        };
+        let bridge = BridgeProviderConfig {
+            base_path: root.to_string_lossy().into_owned(),
+            allowed_paths: Vec::new(),
+            ..Default::default()
+        };
+
+        extra.validate(&bridge).unwrap();
+
+        let mut admitted = extra.clone();
+        let binding = RuntimeAdmittedOffer {
+            offer_id: admitted.offers[0].id.clone(),
+        };
+        admitted.runtime_admitted_offers = vec![binding.clone()];
+        admitted.validate(&bridge).unwrap();
+        for invalid in [
+            json!({}),
+            json!({"offer_id": binding.offer_id, "package_cid": "unused"}),
+            json!({"offer_id": binding.offer_id, "admission_id": "unused"}),
+            json!({"offer_id": binding.offer_id, "execution_binding_hash": "unused"}),
+        ] {
+            assert!(serde_json::from_value::<RuntimeAdmittedOffer>(invalid).is_err());
+        }
+        let mut invalid = admitted.clone();
+        invalid.runtime_admitted_offers.push(binding.clone());
+        assert!(invalid.validate(&bridge).is_err());
+        invalid.runtime_admitted_offers = vec![binding.clone(); MAX_OFFER_COUNT + 1];
+        assert!(invalid.validate(&bridge).is_err());
+        for id in ["", "missing"] {
+            let mut invalid = admitted.clone();
+            invalid.runtime_admitted_offers[0].offer_id = id.into();
+            assert!(invalid.validate(&bridge).is_err());
+        }
+        let mut invalid = admitted.clone();
+        invalid.offers[0].enabled = false;
+        assert!(invalid.validate(&bridge).is_err());
+        invalid.offers[0] = base_offer();
+        assert!(
+            invalid.validate(&bridge).is_err(),
+            "hosted offer acquired retirement provenance"
+        );
+
+        let outside = crate::test_support::temp_root_path("model-provider-config", "outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside = fs::canonicalize(outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_model = outside.join("model.gguf");
+        fs::write(&outside_model, b"outside").unwrap();
+        fs::set_permissions(&outside_model, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut outside_extra = extra.clone();
+        if let AdapterConfig::LocalLlamaCppText { model, .. } = &mut outside_extra.offers[0].adapter
+        {
+            model.path = outside_model.to_string_lossy().into_owned();
+        }
+        assert!(outside_extra.validate(&bridge).is_err());
+
+        let linked_allowed = root.join("linked-models");
+        symlink(&outside, &linked_allowed).unwrap();
+        let linked_allowed_bridge = BridgeProviderConfig {
+            base_path: root.to_string_lossy().into_owned(),
+            allowed_paths: vec!["linked-models".to_string()],
+            ..Default::default()
+        };
+        assert!(outside_extra.validate(&linked_allowed_bridge).is_err());
+
+        let linked_engine = bin.join("linked-server");
+        symlink(&engine, &linked_engine).unwrap();
+        let mut linked_extra = extra;
+        if let AdapterConfig::LocalLlamaCppText { engine, .. } = &mut linked_extra.offers[0].adapter
+        {
+            engine.path = linked_engine.to_string_lossy().into_owned();
+        }
+        assert!(linked_extra.validate(&bridge).is_err());
     }
 
     #[test]
@@ -485,6 +1013,7 @@ mod tests {
     #[test]
     fn adapter_config_rejects_unsafe_urls_and_secret_length() {
         let config = ProviderInitExtra {
+            runtime_admitted_offers: Vec::new(),
             provider_id: None,
             journal_dir: Some("/tmp/model-provider".to_string()),
             offers: vec![ConfiguredOffer {
@@ -498,7 +1027,11 @@ mod tests {
                 ..base_offer()
             }],
         };
-        assert!(config.validate("/tmp/base").is_err());
+        let bridge = BridgeProviderConfig {
+            base_path: "/tmp/base".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate(&bridge).is_err());
 
         let bridge = BridgeProviderConfig {
             base_path: "/tmp/base".to_string(),
@@ -525,13 +1058,20 @@ mod tests {
                     "adapter": {
                         "kind": "open_ai_compatible_text",
                         "api_url": "https://user@example.test/v1/chat#frag",
-                        "model": "gpt-test"
+                        "model": "gpt-test",
+                        "hosted": {
+                            "backend_provider_label": "Fixture Provider",
+                            "selection_mode": "pinned",
+                            "privacy_policy_ref": "fixture:privacy:v1",
+                            "terms_ref": "fixture:terms:v1",
+                            "upstream_routing_fallback_assertion": "operator_asserted_disabled"
+                        }
                     }
                 }]
             }),
         };
-        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra).unwrap();
-        assert!(extra.validate(&bridge.base_path).is_err());
+        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra.clone()).unwrap();
+        assert!(extra.validate(&bridge).is_err());
     }
 
     #[test]
@@ -550,8 +1090,8 @@ mod tests {
         .unwrap();
 
         bridge.validate().unwrap();
-        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra).unwrap();
-        extra.validate(&bridge.base_path).unwrap();
+        let extra = serde_json::from_value::<ProviderInitExtra>(bridge.extra.clone()).unwrap();
+        extra.validate(&bridge).unwrap();
     }
 
     #[test]
@@ -684,6 +1224,19 @@ mod tests {
     fn offer_summary_redacts_adapter_secrets_and_reports_streaming_truthfully() {
         let openai_summary = base_offer().summary();
         assert!(openai_summary.stream_output);
+        assert_eq!(
+            serde_json::to_value(&openai_summary).unwrap()["hosted"],
+            json!({
+                "placement": "hosted",
+                "backend_provider_label": "Fixture Provider",
+                "selection_mode": "pinned",
+                "requested_selector": "gpt-test",
+                "privacy_policy_ref": "fixture:privacy:v1",
+                "terms_ref": "fixture:terms:v1",
+                "provider_request_policy": "single_dispatch_no_retry",
+                "upstream_routing_fallback_assertion": "operator_asserted_disabled",
+            })
+        );
         let openai_json = serde_json::to_string(&openai_summary).unwrap();
         assert!(!openai_json.contains("example.test"));
         assert!(!openai_json.contains("secret-a"));
@@ -691,9 +1244,67 @@ mod tests {
 
         let artifact_summary = artifact_offer("video.generate").summary();
         assert!(!artifact_summary.stream_output);
+        assert!(artifact_summary.hosted.is_none());
         let artifact_json = serde_json::to_string(&artifact_summary).unwrap();
         assert!(!artifact_json.contains("jobs.example.test"));
         assert!(!artifact_json.contains("token-a"));
+    }
+
+    #[test]
+    fn responses_adapter_has_distinct_binding_and_shared_hosted_disclosure() {
+        let endpoint = "https://example.test/v1/text";
+        let model = "model-test";
+        let mut chat = base_offer();
+        if let AdapterConfig::OpenAiCompatibleText {
+            api_url,
+            model: configured_model,
+            ..
+        } = &mut chat.adapter
+        {
+            *api_url = endpoint.to_string();
+            *configured_model = model.to_string();
+        }
+        let mut responses = chat.clone();
+        responses.adapter = AdapterConfig::OpenAiResponsesText {
+            api_url: endpoint.to_string(),
+            api_key: Some("sentinel-responses-key".to_string()),
+            model: model.to_string(),
+            hosted: test_hosted_disclosure(),
+        };
+
+        responses.validate().unwrap();
+        let responses_hash = responses.execution_binding_hash().unwrap();
+        assert_ne!(responses_hash, chat.execution_binding_hash().unwrap());
+        let mut rotated = responses.clone();
+        if let AdapterConfig::OpenAiResponsesText { api_key, .. } = &mut rotated.adapter {
+            *api_key = Some("rotated-responses-key".to_string());
+        }
+        assert_eq!(responses_hash, rotated.execution_binding_hash().unwrap());
+        assert_eq!(responses.summary(), chat.summary());
+        let public = serde_json::to_string(&responses.summary()).unwrap();
+        assert!(!public.contains("example.test"));
+        assert!(!public.contains("sentinel-responses-key"));
+    }
+
+    #[test]
+    fn hosted_disclosure_requires_pinned_selection_and_operator_fallback_assertion() {
+        let mut offer = base_offer();
+        if let AdapterConfig::OpenAiCompatibleText { hosted, .. } = &mut offer.adapter {
+            hosted.selection_mode = "provider_auto".to_string();
+        }
+        assert!(offer.validate().is_err());
+
+        if let AdapterConfig::OpenAiCompatibleText { hosted, .. } = &mut offer.adapter {
+            hosted.selection_mode = HOSTED_SELECTION_PINNED.to_string();
+            hosted.upstream_routing_fallback_assertion = "disabled".to_string();
+        }
+        assert!(offer.validate().is_err());
+
+        let mut offer = base_offer();
+        if let AdapterConfig::OpenAiCompatibleText { hosted, .. } = &mut offer.adapter {
+            hosted.backend_provider_label = "Fixture\nProvider".to_string();
+        }
+        assert!(offer.validate().is_err());
     }
 
     #[test]

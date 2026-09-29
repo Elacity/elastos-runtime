@@ -1,0 +1,70 @@
+{
+  "repository": "https://github.com/jo-inc/camofox-browser",
+  "revision": "e5a36f5cd0332fde6597de474329a308a53a0716",
+  "core_version": "1.14.0",
+  "client_package": "@askjo/camofox-browser-mcp",
+  "client_version": "1.14.0",
+  "license": "MIT",
+  "purpose": "Unchanged upstream runTool/fetchSpec/adaptResponse executed in source contract tests. No SDK installation or MCP stdio process.",
+  "vendored": [
+    {
+      "upstream": "mcp/lib/tool-contracts.mjs",
+      "local": "tool-contracts.mjs",
+      "bytes": 16966,
+      "sha256": "3177875a9e41eeec147980d45dcc630b00ba5c1e5cd39ca1866ddbd9034f5d5a",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/mcp/lib/tool-contracts.mjs"
+    },
+    {
+      "upstream": "mcp/lib/cookies.mjs",
+      "local": "cookies.mjs",
+      "bytes": 4915,
+      "sha256": "c8d593d416bf22e1961d1b806a572fa018c0791f2addf1d55cc0a3c66b14aa67",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/mcp/lib/cookies.mjs"
+    },
+    {
+      "upstream": "LICENSE",
+      "local": "LICENSE",
+      "bytes": 1064,
+      "sha256": "3b2341f964d5b16d4c53cd8f516b73134944ea28f89d397e2c0167aa5a4b630e",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/LICENSE"
+    }
+  ],
+  "examined": [
+    {
+      "path": "package.json",
+      "bytes": 4893,
+      "sha256": "a0b5713b4df8ad40e7fae7f14000a69af9731e6e25cc8301731071113d77dc44",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/package.json"
+    },
+    {
+      "path": "mcp/package.json",
+      "bytes": 1215,
+      "sha256": "c88ddeaacd1f9585d371b086a69c24eb1bda89f1306d6d672374f3f82769dc69",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/mcp/package.json"
+    },
+    {
+      "path": "plugin.ts",
+      "bytes": 15651,
+      "sha256": "bb39e0076cef6b9e88c97cd4c713ddeea12b6f618db5107b47a5ffec557d79bf",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/plugin.ts"
+    },
+    {
+      "path": "lib/mcp-tool-contracts.mjs",
+      "bytes": 214,
+      "sha256": "22af14c44a6e452dd44e7c5d630c3b8813cce1b1804bf5145d6f64d8ade2fe49",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/lib/mcp-tool-contracts.mjs"
+    },
+    {
+      "path": "mcp/server.mjs",
+      "bytes": 4462,
+      "sha256": "ea8e570bf229a655c994ccc149443906db66a16e7d7cdc7e1bc4ac31a79d4bee",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/mcp/server.mjs"
+    },
+    {
+      "path": "server.js",
+      "bytes": 241531,
+      "sha256": "3b806158bb5962120415d0074e9c6a4223e74b268869d774fd25d7613a93b9d7",
+      "source_url": "https://github.com/jo-inc/camofox-browser/blob/e5a36f5cd0332fde6597de474329a308a53a0716/server.js"
+    }
+  ]
+}

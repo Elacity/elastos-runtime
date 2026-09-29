@@ -16,6 +16,7 @@ import {
   viewerOptions,
 } from "./model.js";
 import { createLibraryRuntime } from "./api.js?v=library-20260711c";
+import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
 import { createLibraryActions } from "./actions.js?v=library-20260711d";
 import { createLibraryDialog } from "./dialog.js?v=library-20260711d";
 import { createLibraryEditor } from "./editor.js";
@@ -56,6 +57,8 @@ import {
     state.searchOpen = false;
     state.sidebarWidth = LIBRARY_SIDEBAR_WIDTH_DEFAULT;
     const homeOrigin = queryParams.get("home_origin") || "";
+    const homeNavigation = createHomeNavigationClient({ homeToken: state.homeToken, homeOrigin,
+      enabled: state.mode === "browse" && !queryParams.get("returnTarget") });
     const homeClipboard = createHomeClipboardClient({
       targetId: "library",
       homeOrigin,
@@ -626,20 +629,20 @@ import {
         : await providerApi("compress_archive", { uris: objects.map((object) => object.uri) });
       const archiveObject = response?.object;
       await loadCurrentFolder();
-      if (archiveObject && deliverArchiveToArchive(archiveObject)) {
+      if (archiveObject && await deliverArchiveToArchive(archiveObject)) {
         setStatus(`Created ${archiveObject.name || "archive"} and opened it in Archive.`);
         return;
       }
       setStatus("ZIP created. Select it and press Open in Archive.");
     }
 
-    function deliverArchiveToArchive(object) {
+    async function deliverArchiveToArchive(object) {
       const payload = {
         type: "archive:open-library-object",
         object: archiveLibraryObjectPayload(object),
       };
-      if (deliverToTarget("archive-manager", payload) || openWithViewer(object, "archive-manager")) {
-        window.setTimeout(closeSelf, 80);
+      if (await deliverToTarget("archive-manager", payload)) {
+        closeSelf();
         return true;
       }
       return false;
@@ -736,6 +739,9 @@ import {
         const currentObject = data.object || null;
         const nextCache = cacheFolderListing(state, perf, uri, objects, currentObject);
         state.currentObject = currentObject;
+        if (state.mode === "browse" && currentObject?.uri === uri && isDirectory(currentObject)) {
+          homeNavigation.setQuery({ uri });
+        }
         if (renderedCached && cached.signature === nextCache.signature) {
           renderAfterFetch = false;
           setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
