@@ -517,6 +517,18 @@ fn validate_stored_offer(path: &Path, offer: &OfferSummary) -> Result<(), Provid
     )?;
     validate_modalities(path, "input", &offer.input_modalities)?;
     validate_modalities(path, "output", &offer.output_modalities)?;
+    if let Some(context) = &offer.context {
+        if context.context_window_tokens < 128
+            || context.context_window_tokens > crate::config::MAX_LOCAL_LLAMA_CONTEXT_SIZE
+            || context.max_output_tokens == 0
+            || context.max_output_tokens >= context.context_window_tokens
+        {
+            return Err(ProviderFault::corrupt_journal(format!(
+                "model run journal context limit is invalid at {}",
+                path.display()
+            )));
+        }
+    }
     if let Some(hosted) = offer.hosted.as_ref() {
         if hosted.placement != HOSTED_PLACEMENT
             || hosted.selection_mode != HOSTED_SELECTION_PINNED
