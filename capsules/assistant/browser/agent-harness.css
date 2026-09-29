@@ -1456,13 +1456,13 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   grid-template-columns: minmax(7rem, 9rem) minmax(0, 1fr);
   gap: 6px 12px;
   margin: 12px 0 0;
-  color: color-mix(in srgb, var(--text) 78%, transparent);
+  color: color-mix(in srgb, var(--text) 82%, transparent);
   font-size: 12px;
 }
 
 .agent-model-selection-facts dt {
   margin: 0;
-  font-weight: 650;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
 }
 
 .agent-model-selection-facts dd {
