@@ -904,13 +904,15 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         let Some(offer) = self.offers.get(&run.offer.id) else {
             return Ok(None);
         };
-        let current_summary = offer.summary();
+        let current_summary = offer.execution_summary();
+        let mut recorded_summary = run.offer.clone();
+        recorded_summary.input_schemas.clear();
         let current_hash = offer.execution_binding_hash().map_err(|err| {
             ProviderFault::internal(format!(
                 "failed to derive model execution binding hash: {err}"
             ))
         })?;
-        if current_summary != run.offer || current_hash != run.execution_binding_hash {
+        if current_summary != recorded_summary || current_hash != run.execution_binding_hash {
             return Ok(None);
         }
         Ok(Some(offer.clone()))
@@ -2613,6 +2615,179 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code(), "internal_error");
+    }
+
+    #[test]
+    fn old_v1_journals_preserve_authority_and_never_redispatch() {
+        for status in [
+            RunStatus::Completed,
+            RunStatus::Running,
+            RunStatus::SettlementUnknown,
+        ] {
+            let root = temp_root("old-v1-capability");
+            let current = offer("local-text");
+            let input =
+                json!({"schema":elastos_model_contract::TEXT_INPUT_V1_SCHEMA,"prompt":"original"});
+            let binding = create_binding("request:old-v1", &current.id, &input);
+            let mut run = running_run_for_offer(binding.clone(), &current);
+            if status == RunStatus::Completed {
+                transition_terminal(
+                    &current,
+                    &mut run,
+                    status.clone(),
+                    Some(json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"done"})),
+                    None,
+                )
+                .unwrap();
+            } else if status == RunStatus::SettlementUnknown {
+                transition_terminal(
+                    &current,
+                    &mut run,
+                    status.clone(),
+                    None,
+                    Some(RunError {
+                        class: ErrorClass::SettlementUnknown,
+                        code: "settlement_unknown".into(),
+                        message: "Unknown".into(),
+                    }),
+                )
+                .unwrap();
+            }
+            let adapters = FakeAdapters {
+                reconcile_results: Arc::new(Mutex::new(vec![Ok(ReconcileResult::StillRunning {
+                    events: vec![],
+                    backend_state: running_backend_state(),
+                    status: RunStatus::Running,
+                })])),
+                ..Default::default()
+            };
+            let state = init_state(&root, vec![current.clone()], adapters.clone());
+            let config = state.config.clone();
+            state.journal.store_run(&run).unwrap();
+            let path = run_path(&root, &run.run_id);
+            let mut old = serde_json::to_value(&run).unwrap();
+            old["offer"]
+                .as_object_mut()
+                .unwrap()
+                .remove("input_schemas");
+            let bytes = serde_json::to_vec_pretty(&old).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            drop(state);
+            let mut restarted =
+                ModelProviderState::from_init(config.clone(), adapters.clone()).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(restarted
+                .journal
+                .load_run(&run.run_id)
+                .unwrap()
+                .offer
+                .input_schemas
+                .is_empty());
+            let request = RunsCreateRequest {
+                op: "runs_create".into(),
+                offer_id: current.id.clone(),
+                operation: current.operation.clone(),
+                input: input.clone(),
+                runtime_binding: binding.clone(),
+                expected_execution_binding_hash: Some(run.execution_binding_hash.clone()),
+            };
+            let result = restarted.handle_runs_create(request).unwrap();
+            assert_eq!(result["data"]["run_id"], run.run_id);
+            let stored = restarted.journal.load_run(&run.run_id).unwrap();
+            assert_eq!(stored.runtime_binding, binding);
+            assert_eq!(stored.input_hash, run.input_hash);
+            assert_eq!(stored.execution_binding_hash, run.execution_binding_hash);
+            assert_eq!(stored.backend_state, run.backend_state);
+            assert_eq!(stored.status, status);
+            assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+            assert_eq!(
+                *adapters.reconcile_calls.lock().unwrap(),
+                u32::from(status == RunStatus::Running)
+            );
+            if status != RunStatus::Completed {
+                for (pointer, value) in [
+                    ("/offers/0/adapter/model", json!("different-model")),
+                    (
+                        "/offers/0/adapter/api_url",
+                        json!("https://example.invalid/other"),
+                    ),
+                    ("/offers/0/policy/runtime_ms_limit", json!(31_000)),
+                ] {
+                    let mut drift = config.clone();
+                    *drift.extra.pointer_mut(pointer).unwrap() = value;
+                    assert!(ModelProviderState::from_init(drift, adapters.clone()).is_err());
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn text_v2_retry_binds_roles_order_content_and_byte_limit() {
+        let root = temp_root("v2-idempotency");
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Terminal {
+                events: vec![],
+                status: RunStatus::SettlementUnknown,
+                output: None,
+                error: Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            })])),
+            ..Default::default()
+        };
+        let current = offer("local-text");
+        let mut state = init_state(&root, vec![current.clone()], adapters.clone());
+        let input = json!({"schema":elastos_model_contract::TEXT_INPUT_V2_SCHEMA,"messages":[
+            {"role":"system","content":"Be concise."},{"role":"user","content":"first"},
+            {"role":"assistant","content":"reply"},{"role":"user","content":"last"}
+        ]});
+        let request = |input: Value| RunsCreateRequest {
+            op: "runs_create".into(),
+            offer_id: current.id.clone(),
+            operation: current.operation.clone(),
+            runtime_binding: create_binding("request:v2-retry", &current.id, &input),
+            input,
+            expected_execution_binding_hash: None,
+        };
+        let first = state.handle_runs_create(request(input.clone())).unwrap();
+        let config = state.config.clone();
+        drop(state);
+        let mut state = ModelProviderState::from_init(config, adapters.clone()).unwrap();
+        assert_eq!(
+            state.handle_runs_create(request(input.clone())).unwrap(),
+            first
+        );
+        let mut role = input.clone();
+        role["messages"][2]["role"] = json!("user");
+        let mut order = input.clone();
+        order["messages"].as_array_mut().unwrap().swap(1, 2);
+        let mut content = input.clone();
+        content["messages"][2]["content"] = json!("changed");
+        for changed in [role, order, content] {
+            assert_eq!(
+                state
+                    .handle_runs_create(request(changed))
+                    .unwrap_err()
+                    .code(),
+                "invalid_request"
+            );
+        }
+        let mut oversized = input;
+        oversized["messages"][3]["content"] =
+            json!("x".repeat(current.policy.input_bytes_limit as usize));
+        assert_eq!(
+            state
+                .handle_runs_create(request(oversized))
+                .unwrap_err()
+                .code(),
+            "policy_limit"
+        );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -3098,6 +3098,17 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn confined_broker_rejects_changed_prompt_for_active_run() {
+        confined_broker_text_fixture(false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_broker_text_v2_preserves_exact_conversation() {
+        confined_broker_text_fixture(true).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn confined_broker_text_fixture(v2: bool) {
         use elastos_model_contract::{
             model_input_hash, model_run_id, RuntimeCreateBinding, RUNTIME_CREATE_BINDING_SCHEMA,
         };
@@ -3113,7 +3124,21 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/openrouter/api/v1/chat/completions");
         let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let request_id = "fixture-bound-request";
-        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"authorized text"});
+        let messages = if v2 {
+            json!([
+                {"role":"system","content":"Be concise."},
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":"reply"},
+                {"role":"user","content":"authorized text"}
+            ])
+        } else {
+            json!([{"role":"user","content":"authorized text"}])
+        };
+        let input = if v2 {
+            json!({"schema":elastos_model_contract::TEXT_INPUT_V2_SCHEMA,"messages":messages})
+        } else {
+            json!({"schema":elastos_model_contract::TEXT_INPUT_V1_SCHEMA,"prompt":"authorized text"})
+        };
         let binding = RuntimeCreateBinding {
             schema: RUNTIME_CREATE_BINDING_SCHEMA.into(),
             principal_id: "principal:fixture".into(),
@@ -3191,11 +3216,23 @@ for line in sys.stdin:
         extra = request['config']['extra']
         print('{"status":"ok"}', flush=True)
     elif request['op'] == 'runs_create':
+        approved_input = request['input']
         print('{"status":"ok"}', flush=True)
     elif request['op'] == 'exists':
-        prompt = 'changed text' if request['path'] == 'altered' else 'authorized text'
+        messages = json.loads(json.dumps(approved_input.get('messages', [{'role':'user','content':approved_input.get('prompt')}])))
+        path = request['path']
+        if path == 'altered':
+            messages[-1]['content'] = 'changed text'
+        elif path == 'extra-message':
+            messages.append({'role':'user','content':'extra'})
+        elif path == 'extra-field':
+            messages[0]['name'] = 'hidden'
+        elif path == 'changed-role':
+            messages[0]['role'] = 'assistant'
+        elif path == 'swapped':
+            messages[0], messages[1] = messages[1], messages[0]
         body = json.dumps({'model':'fixture/model','stream':True,'max_tokens':32,
-                           'messages':[{'role':'user','content':prompt}]}).encode()
+                           'messages':messages}).encode()
         if request['path'] in ('raised-cap', 'missing-cap'):
             payload = json.loads(body)
             if request['path'] == 'raised-cap':
@@ -3285,7 +3322,17 @@ for line in sys.stdin:
                 .await
                 .is_err()
         );
-        for path in ["raised-cap", "missing-cap"] {
+        let mut rejected_paths = vec![
+            "raised-cap",
+            "missing-cap",
+            "extra-message",
+            "extra-field",
+            "changed-role",
+        ];
+        if v2 {
+            rejected_paths.push("swapped");
+        }
+        for path in rejected_paths {
             let rejected = bridge.request(probe(path)).await.unwrap();
             let ProviderResponse::Ok {
                 data: Some(rejected),
@@ -3309,7 +3356,10 @@ for line in sys.stdin:
             .await
             .unwrap()
             .unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("authorized text"));
+        let captured = String::from_utf8(bytes).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(captured.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["messages"], messages);
         sink_task.abort();
         bridge.shutdown().await.unwrap();
     }

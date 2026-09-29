@@ -1791,6 +1791,37 @@ mod tests {
     }
 
     #[test]
+    fn shared_offers_preserve_schema_capabilities() {
+        for schemas in [
+            None,
+            Some(json!([elastos_model_contract::TEXT_INPUT_V1_SCHEMA])),
+            Some(json!([
+                elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+                elastos_model_contract::TEXT_INPUT_V2_SCHEMA
+            ])),
+        ] {
+            let mut offer = json!({"id":"fixture","operation":"text.generate","input_modalities":["text/plain"],"output_modalities":["text/plain"]});
+            if let Some(schemas) = &schemas {
+                offer["input_schemas"] = schemas.clone();
+            }
+            let listed = json!({"status":"ok","data":{"offers":[offer]}});
+            let published = with_offers(
+                listed.clone(),
+                shareable_offers(&listed)
+                    .into_iter()
+                    .map(public_shared_offer)
+                    .collect(),
+            );
+            let wire: Value =
+                serde_json::from_slice(&serde_json::to_vec(&published).unwrap()).unwrap();
+            assert_eq!(
+                wire["data"]["offers"][0].get("input_schemas"),
+                schemas.as_ref()
+            );
+        }
+    }
+
+    #[test]
     fn shareable_offers_exclude_hosted_adapters() {
         let result = json!({ "status": "ok", "data": { "offers": [
             { "id": "qwen", "hosted": null },

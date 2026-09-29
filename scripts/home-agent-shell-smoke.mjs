@@ -356,6 +356,7 @@ assert.deepEqual(rows, [
     label: "Local chat",
     detail: "This Home · local",
     streamOutput: true,
+    inputSchemas: [],
     selectionFacts: localFacts,
   },
 ]);
@@ -501,6 +502,35 @@ assert.deepEqual(body, {
   request_id: "req-1",
   input: { schema: "elastos.model.input.text/v1", prompt: contract.transcriptPrompt(messages) },
 });
+// Follow the serialized offer response through selection into the run request.
+const conversation = [
+  { role: "system", content: " Keep spacing. " },
+  { role: "user", content: "Hi" },
+  { role: "agent", content: "Hello." },
+  { role: "user", content: "Continue" },
+];
+for (const inputSchemas of [undefined, [contract.MODEL_TEXT_INPUT_SCHEMA], [contract.MODEL_TEXT_INPUT_SCHEMA, contract.MODEL_TEXT_INPUT_V2_SCHEMA]]) {
+  for (const remote of [false, true]) {
+    const listed = { ...textOffers[0], input_schemas: inputSchemas };
+    if (remote) {
+      listed.id = "remote:grant:fixture";
+      listed.remote_service = { grant_id: "grant", display_name: "Other Home" };
+    }
+    const response = JSON.parse(JSON.stringify({ status: "ok", data: { offers: [listed] } }));
+    const selected = contract.textOfferRows(contract.eligibleTextOffers(response))[0];
+    const request = contract.textRunCreateBody({ offer: selected, messages: conversation, requestId: "roles" });
+    assert.equal(request.offer_id, listed.id);
+    if (inputSchemas?.includes(contract.MODEL_TEXT_INPUT_V2_SCHEMA)) {
+      assert.deepEqual(request.input, {
+        schema: contract.MODEL_TEXT_INPUT_V2_SCHEMA,
+        messages: conversation.map(({ role, content }) => ({ role: role === "agent" ? "assistant" : role, content })),
+      });
+    } else {
+      assert.deepEqual(request.input, { schema: contract.MODEL_TEXT_INPUT_SCHEMA, prompt: contract.transcriptPrompt(conversation) });
+    }
+  }
+}
+assert.equal(contract.MODEL_TEXT_INPUT_SCHEMA, "elastos.model.input.text/v1", "direct assistant.js prompt caller keeps v1");
 assert.throws(() => contract.textRunCreateBody({ offer: null, messages, requestId: "r" }), /no text model offer/);
 assert.throws(() => contract.textRunCreateBody({ offer: rows[0], messages, requestId: "" }), /request id/);
 
