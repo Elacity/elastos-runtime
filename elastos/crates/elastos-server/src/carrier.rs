@@ -1255,7 +1255,15 @@ async fn bind_carrier_endpoint(
     allow_ephemeral_fallback: bool,
 ) -> anyhow::Result<Endpoint> {
     let builder = || short_lived_endpoint_builder(secret_key.clone(), network, approved_relay);
-    let bound = builder()?.bind_addr(requested_bind_addr).map_err(|error| {
+    let requested = builder()?;
+    // Iroh retains the other address family's default wildcard listener.
+    // A configured loopback endpoint owns only its requested IP transport.
+    let requested = if requested_bind_addr.ip().is_loopback() {
+        requested.clear_ip_transports()
+    } else {
+        requested
+    };
+    let bound = requested.bind_addr(requested_bind_addr).map_err(|error| {
         anyhow::anyhow!("Invalid Carrier address {requested_bind_addr}: {error}")
     })?;
     match bound.bind().await {
@@ -15504,6 +15512,25 @@ pub(crate) mod tests {
                 .contains("trusted source publisher_node_id must be one raw Iroh endpoint ID"),
             "unexpected configured transport-id error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_loopback_carrier_bind_has_only_requested_transport() {
+        let signing_key = SecretKey::from_bytes(&[108u8; 32]);
+        let address = "127.0.0.1:0".parse().unwrap();
+        let endpoint = bind_carrier_endpoint(
+            signing_key,
+            CarrierNodeNetwork::Isolated,
+            None,
+            address,
+            false,
+        )
+        .await
+        .unwrap();
+        let sockets = endpoint.bound_sockets();
+        endpoint.close().await;
+        assert_eq!(sockets.len(), 1, "loopback endpoint bound {sockets:?}");
+        assert_eq!(sockets[0].ip(), address.ip());
     }
 
     #[tokio::test]
