@@ -185,6 +185,7 @@ else:
     signal.signal(signal.SIGTERM, terminate)
 record('start:' + str(os.getpid()))
 record('parent:' + str(os.getppid()))
+record('memory_caches:' + arg('--cache-ram') + ':' + arg('--ctx-checkpoints'))
 if mode == 'healthy_with_subtree':
     subtree = subprocess.Popen([
         sys.executable,

@@ -280,6 +280,37 @@ fn terminal_local_run_before(
 }
 
 #[test]
+fn warm_requests_reuse_engine_with_snapshot_caches_disabled() {
+    let _lease = LOCAL_ENGINE_TEST.lock().unwrap();
+    let (mut provider, events) = init_local_llama("warm-without-cache", false);
+    for label in ["first", "warm"] {
+        let created = create_local_run(&mut provider, label);
+        let completed = terminal_local_run(&mut provider, &created);
+        assert_eq!(completed["data"]["status"], "completed", "{completed}");
+    }
+    let recorded = event_lines(&events);
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|line| line.starts_with("start:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|line| line.as_str() == "memory_caches:0:0")
+            .count(),
+        1
+    );
+    let engine = engine_pid(&events);
+    let subtree = subtree_pid(&events);
+    provider.shutdown();
+    assert!(wait_for_process_exit(engine));
+    assert!(wait_for_process_exit(subtree));
+}
+
+#[test]
 fn two_roots_refuse_busy_and_recover_after_owner_crash() {
     let (mut first, first_events) = start_local_llama_run("lease-first");
     let (mut second, second_events) = init_local_llama("lease-second", false);
