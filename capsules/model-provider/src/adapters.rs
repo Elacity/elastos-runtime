@@ -1507,7 +1507,7 @@ async fn run_queued_local_text_worker(
         .close_other_offers(&offer_id)
         .await
         .map_err(map_local_llama_fault)?;
-    let result = tokio::select! {
+    let mut result = tokio::select! {
         biased;
         _ = cancel.wait_for(|cancelled| *cancelled) => Ok(worker_settlement_unknown_result()),
         result = run_local_text_worker_inner(task) => result,
@@ -1521,13 +1521,24 @@ async fn run_queued_local_text_worker(
     ) {
         // Closing the HTTP stream alone can leave generation running. Retain the
         // execution permit until the owned engine has stopped or closure fails.
-        engines
-            .close_offer(&offer_id)
-            .await
-            .map_err(map_local_llama_fault)?;
+        result = after_local_cleanup(result, engines.close_offer(&offer_id).await);
     }
     engines.release_when_idle().await;
     result
+}
+
+fn after_local_cleanup(
+    result: std::result::Result<ReconcileResult, AdapterFault>,
+    cleanup: std::result::Result<(), LocalLlamaFault>,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    if let Err(fault) = cleanup {
+        map_local_llama_fault(fault).log();
+        // The retained engine and lease still own any unconfirmed work. A
+        // cleanup failure cannot turn that uncertainty into a known failure.
+        Ok(worker_settlement_unknown_result())
+    } else {
+        result
+    }
 }
 
 fn queued_local_cancelled() -> ReconcileResult {
@@ -4321,6 +4332,24 @@ mod tests {
             Some(BackendReport::unknown())
         );
         assert!(update_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unconfirmed_local_cleanup_preserves_settlement_uncertainty() {
+        for cleanup in [LocalLlamaFault::Failed, LocalLlamaFault::Timeout] {
+            let result =
+                after_local_cleanup(Ok(worker_settlement_unknown_result()), Err(cleanup)).unwrap();
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::SettlementUnknown,
+                    output: None,
+                    ..
+                }
+            ));
+        }
+        let fault = map_local_llama_fault(LocalLlamaFault::MemoryUnavailable);
+        assert!(after_local_cleanup(Err(fault), Ok(())).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
