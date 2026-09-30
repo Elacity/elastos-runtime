@@ -4455,6 +4455,7 @@ mod tests {
             backend: LocalTextBackend::LocalLlama {
                 engines: engines.clone(),
                 offer_id: "local".into(),
+                requested_output_tokens: None,
                 engine: LocalArtifactConfig {
                     path: "/unavailable-engine".into(),
                     sha256: String::new(),
