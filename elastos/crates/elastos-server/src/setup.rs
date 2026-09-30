@@ -2706,7 +2706,9 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .default_source()
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
-    crate::carrier::fetch_file_from_trusted_source(&source, release_path, 15, 30).await
+    let bind_addr = crate::carrier::configured_carrier_bind_addr(data_dir)?;
+    crate::carrier::fetch_file_from_trusted_source_bound(&source, release_path, 15, 30, bind_addr)
+        .await
 }
 
 pub(crate) async fn install_first_party_component_via_carrier(
