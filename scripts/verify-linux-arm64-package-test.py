@@ -7,6 +7,7 @@ import struct
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("gate", Path(__file__).with_name("verify-linux-arm64-package.py"))
 gate = importlib.util.module_from_spec(spec)
@@ -57,6 +58,34 @@ class CompatibilityTests(unittest.TestCase):
     def test_other_architecture_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "AArch64"):
             gate.glibc_requirements(executable(machine=62))
+
+    def test_version_record_counts_and_chain_termination_are_checked(self):
+        for offset, value in ((192 + 44, 0), (192 + 44, 2),
+                              (len(executable()) - 20, 16), (len(executable()) - 4, 16)):
+            blob = bytearray(executable("GLIBC_2.39"))
+            struct.pack_into("<I", blob, offset, value)
+            with self.assertRaisesRegex(ValueError, "version-needs"):
+                gate.glibc_requirements(blob)
+
+    def test_special_or_shared_write_permissions_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "package.tar.gz"
+            for mode in (0o4755, 0o775, 0o757, 0o777):
+                with tarfile.open(path, "w:gz") as archive:
+                    entry = tarfile.TarInfo(gate.PACKAGE_ROOT + "/elastos")
+                    entry.mode = mode
+                    entry.size = len(executable())
+                    archive.addfile(entry, io.BytesIO(executable()))
+                with self.assertRaisesRegex(ValueError, "unexpected package member"):
+                    gate.verify_package(path)
+
+    def test_archive_resource_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "package.tar.gz"
+            package(path, [("elastos", executable()), ("model-provider", executable())])
+            for limit in ("MAX_EXECUTABLE_BYTES", "MAX_PACKAGE_BYTES", "MAX_EXECUTABLES"):
+                with patch.object(gate, limit, 1), self.assertRaises(ValueError):
+                    gate.verify_package(path)
 
     def test_every_provider_is_checked(self):
         with tempfile.TemporaryDirectory() as directory:

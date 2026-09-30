@@ -9,6 +9,9 @@ import tarfile
 
 PACKAGE_ROOT = "elastos-runtime-linux-arm64"
 GLIBC_MAX = (2, 35)
+MAX_EXECUTABLE_BYTES = 256 * 1024**2
+MAX_PACKAGE_BYTES = 1024**3
+MAX_EXECUTABLES = 128
 
 
 def glibc_requirements(blob):
@@ -38,10 +41,12 @@ def glibc_requirements(blob):
             raise ValueError("invalid version-needs string table")
         strings = section_data(sections[section[6]])
         raw = section_data(section)
+        if not 0 < section[7] <= len(raw) // 16:
+            raise ValueError("invalid version-needs record count")
         cursor = 0
         for record in range(section[7]):
             version, entries, _, aux, following = struct.unpack_from("<HHIII", raw, cursor)
-            if version != 1 or not entries:
+            if version != 1 or not 0 < entries <= len(raw) // 16 or aux < 16:
                 raise ValueError("invalid version-needs record")
             child = cursor + aux
             for entry in range(entries):
@@ -51,9 +56,13 @@ def glibc_requirements(blob):
                     requirements.add(value)
                 if entry + 1 < entries and next_aux < 16:
                     raise ValueError("invalid version-needs auxiliary chain")
+                if entry + 1 == entries and next_aux:
+                    raise ValueError("unterminated version-needs auxiliary chain")
                 child += next_aux
             if record + 1 < section[7] and following < 16:
                 raise ValueError("invalid version-needs chain")
+            if record + 1 == section[7] and following:
+                raise ValueError("unterminated version-needs chain")
             cursor += following
     for value in requirements:
         try:
@@ -66,15 +75,25 @@ def glibc_requirements(blob):
 
 
 def verify_package(path):
+    if path.stat().st_size > MAX_PACKAGE_BYTES:
+        raise ValueError("compressed package size limit exceeded")
     members = {}
+    total_size = 0
     with tarfile.open(path, "r:gz") as archive:
-        for item in archive:
+        for index, item in enumerate(archive):
+            if index >= MAX_EXECUTABLES + 1:
+                raise ValueError("package has too many members")
             if item.isdir() and item.name.rstrip("/") == PACKAGE_ROOT:
                 continue
             parts = item.name.split("/")
             if (len(parts) != 2 or parts[0] != PACKAGE_ROOT or parts[1] in ("", ".", "..")
-                    or not item.isfile() or not item.mode & 0o100 or parts[1] in members):
+                    or not item.isfile() or not item.mode & 0o100 or item.mode & 0o7022
+                    or parts[1] in members):
                 raise ValueError(f"unexpected package member: {item.name}")
+            total_size += item.size
+            if (len(members) >= MAX_EXECUTABLES or item.size > MAX_EXECUTABLE_BYTES
+                    or total_size > MAX_PACKAGE_BYTES):
+                raise ValueError(f"package size limit exceeded: {item.name}")
             blob = archive.extractfile(item).read()
             try:
                 versions = glibc_requirements(blob)
@@ -84,8 +103,12 @@ def verify_package(path):
                                  "glibc_requirements": versions}
     if not {"elastos", "model-provider"}.issubset(members):
         raise ValueError("package requires Runtime and model-provider executables")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024**2), b""):
+            digest.update(chunk)
     return {"schema": "elastos.linux-arm64-package/v1", "architecture": "aarch64",
-            "glibc_max": "2.35", "package_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "glibc_max": "2.35", "package_sha256": digest.hexdigest(),
             "package_size": path.stat().st_size, "executables": members}
 
 

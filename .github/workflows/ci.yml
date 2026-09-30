@@ -294,7 +294,7 @@ jobs:
   # packaging the binaries for its architecture — no separate cold
   # build-release job is needed.
   source-home-linux:
-    name: source-home-linux (${{ matrix.os }})
+    name: source-home-linux (${{ matrix.check_name || matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: source-gate
@@ -303,6 +303,10 @@ jobs:
       matrix:
         # Jetson's Ubuntu 22.04 host provides glibc 2.35.
         os: [ubuntu-24.04, ubuntu-22.04-arm]
+        include:
+          # Keep the established check name; os controls the build and artifact.
+          - os: ubuntu-22.04-arm
+            check_name: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
