@@ -3233,6 +3233,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hosted_text_rejects_requested_output_limit_before_dispatch() {
+        let server = start_server(vec![]);
+        let v1 = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V1_SCHEMA,
+            "prompt": "hello",
+            "max_output_tokens": 64,
+        });
+        let v2 = json!({
+            "schema": elastos_model_contract::TEXT_INPUT_V2_SCHEMA,
+            "messages": [{"role":"user","content":"hello"}],
+            "max_output_tokens": 64,
+        });
+        for (offer, input) in [
+            (local_text_offer(&server.base_url), v1.clone()),
+            (local_text_offer(&server.base_url), v2),
+            (responses_text_offer(&server.base_url), v1),
+        ] {
+            let root = temp_root("hosted-output-limit");
+            let mut provider = ProviderCoordinatorHandle::start();
+            init_provider(&provider, &root, vec![offer.clone()]);
+            let binding = create_binding("request:hosted-output-limit", &offer, &input);
+            let created = create_run(&provider, &offer, &binding, &input);
+            let run_id = created["data"]["run_id"].as_str().unwrap();
+            let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
+            assert_eq!(terminal["data"]["status"], "failed", "{terminal:#}");
+            assert_eq!(
+                terminal["data"]["terminal"]["error"]["code"], "context_rejected",
+                "{terminal:#}"
+            );
+            assert_eq!(
+                terminal["data"]["terminal"]["error"]["message"],
+                "model output request is not supported by this offer"
+            );
+            provider.shutdown_on_eof();
+        }
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_llama_counts_template_before_generation_and_bounds_output() {

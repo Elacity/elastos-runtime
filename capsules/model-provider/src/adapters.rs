@@ -1300,6 +1300,14 @@ fn validate_text_messages(
     offer: &ConfiguredOffer,
     input: &Value,
 ) -> std::result::Result<Vec<Value>, AdapterFault> {
+    if input.get("max_output_tokens").is_some()
+        && !matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+    {
+        return Err(AdapterFault::context(
+            "model output request is not supported by this offer",
+            "max_output_tokens is supported only by local llama offers",
+        ));
+    }
     let invalid = || {
         AdapterFault::context(
             "model input is invalid",
