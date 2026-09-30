@@ -1162,7 +1162,7 @@ pub(super) fn home_service_offers_for_people_contact(
         display_name: format!("{}'s Browser Engine", contact.display_name),
         provider_uri: Some("elastos://browser-engine/*".to_string()),
         provider_label: "Remote Engine".to_string(),
-        policy_summary: "Ask this person to run Browser pages with a profile stored on their Runtime. Your Runtime keeps control of the page and its selected Exit. Existing profiles require an approved transfer.".to_string(),
+        policy_summary: "Ask this person to run Browser pages with a profile stored on their Runtime. They must share their Browser Engine in Services and approve in Inbox before Browser can use it. Your Runtime keeps control of the page and its selected Exit. Existing profiles require an approved transfer.".to_string(),
         status: "requestable".to_string(), enabled: false, grant_required: true,
         grant_scope: crate::carrier::browser_engine_binding::EXECUTION_SCOPE.to_string(),
         capsule_contract: "browser -> Runtime service grant -> owner-bound Engine page".to_string(),
