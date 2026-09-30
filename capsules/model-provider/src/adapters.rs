@@ -476,6 +476,7 @@ enum LocalTextBackend {
         engine: LocalArtifactConfig,
         model: LocalArtifactConfig,
         settings: LocalLlamaSettings,
+        requested_output_tokens: Option<u32>,
     },
 }
 
@@ -1171,6 +1172,7 @@ impl AdapterExecutor for LiveAdapterExecutor {
                     engine: engine.clone(),
                     model: model.clone(),
                     settings: settings.clone(),
+                    requested_output_tokens: requested_local_output_tokens(input, settings)?,
                 },
                 offer,
                 binding,
@@ -1314,6 +1316,14 @@ fn validate_text_messages(
     offer: &ConfiguredOffer,
     input: &Value,
 ) -> std::result::Result<Vec<Value>, AdapterFault> {
+    if input.get("max_output_tokens").is_some()
+        && !matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+    {
+        return Err(AdapterFault::context(
+            "model output request is not supported by this offer",
+            "max_output_tokens is supported only by local llama offers",
+        ));
+    }
     let invalid = || {
         AdapterFault::context(
             "model input is invalid",
@@ -1341,6 +1351,28 @@ fn validate_text_messages(
         }
         _ => Err(invalid()),
     }
+}
+
+fn requested_local_output_tokens(
+    input: &Value,
+    settings: &LocalLlamaSettings,
+) -> std::result::Result<Option<u32>, AdapterFault> {
+    let Some(value) = input.get("max_output_tokens") else {
+        return Ok(None);
+    };
+    let requested = value.as_u64().ok_or_else(|| {
+        AdapterFault::context(
+            "model output request is invalid",
+            "max_output_tokens must be a positive integer",
+        )
+    })?;
+    if requested == 0 || requested > u64::from(crate::config::local_output_token_limit(settings)) {
+        return Err(AdapterFault::context(
+            "model output request exceeds the profile",
+            "max_output_tokens exceeds local model limit",
+        ));
+    }
+    Ok(Some(requested as u32))
 }
 
 pub(crate) fn is_local_text_backend_state(value: &Value) -> bool {
@@ -1773,7 +1805,7 @@ async fn run_local_text_worker_inner(
     )
     .then(HostedBackendReport::default);
     let mut local_socket = None;
-    let (api_url, api_key, body, private_endpoint) = match &task.backend {
+    let (api_url, api_key, body, private_endpoint, context_window_tokens) = match &task.backend {
         LocalTextBackend::OpenRouterDecisions {
             api_url,
             api_key,
@@ -1803,6 +1835,7 @@ async fn run_local_text_worker_inner(
             api_key.clone(),
             text_generation_request_body(&task.offer, model, &task.messages, None),
             false,
+            None,
         ),
         LocalTextBackend::OpenAiResponses {
             api_url,
@@ -1825,6 +1858,7 @@ async fn run_local_text_worker_inner(
                     })?,
             ),
             false,
+            None,
         ),
         LocalTextBackend::LocalLlama {
             engines,
@@ -1832,6 +1866,7 @@ async fn run_local_text_worker_inner(
             engine,
             model,
             settings,
+            requested_output_tokens,
         } => {
             let endpoint = engines
                 .endpoint_with_timeout(
@@ -1843,14 +1878,22 @@ async fn run_local_text_worker_inner(
                 )
                 .await
                 .map_err(map_local_llama_fault)?;
-            let body = text_generation_request_body(
+            let mut body = text_generation_request_body(
                 &task.offer,
                 &endpoint.model,
                 &task.messages,
                 Some(endpoint.enable_thinking),
             );
+            body["max_tokens"] = json!(requested_output_tokens
+                .unwrap_or_else(|| { crate::config::local_output_token_limit(settings) }));
             local_socket = endpoint.unix_socket;
-            (endpoint.api_url, None, body, true)
+            (
+                endpoint.api_url,
+                None,
+                body,
+                true,
+                Some(settings.context_size / settings.parallel),
+            )
         }
     };
     let client = backend_client_with_socket(
@@ -1864,6 +1907,52 @@ async fn run_local_text_worker_inner(
         None
     } else {
         task.hosted_socket.as_deref()
+    };
+    if let Some(context_window_tokens) = context_window_tokens {
+        let count_url = format!("{api_url}/input_tokens");
+        let count_request = client
+            .post(count_url)
+            .header("content-type", "application/json")
+            .json(&body);
+        let counted = tokio::select! {
+            _ = task.cancel_rx.changed() => return Ok(worker_settlement_unknown_result()),
+            response = count_request.send() => response.map_err(|err| map_text_reqwest_failure(err, true))?,
+        };
+        if !counted.status().is_success() {
+            return Err(map_effect_http_status(&counted, None));
+        }
+        let count = tokio::select! {
+            _ = task.cancel_rx.changed() => return Ok(worker_settlement_unknown_result()),
+            response = read_bounded_json_response_async(counted) => response?,
+        };
+        let input_tokens = count["input_tokens"]
+            .as_u64()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                AdapterFault::malformed(
+                    "model backend returned invalid data",
+                    "missing chat input token count",
+                )
+            })?;
+        let output_tokens = body["max_tokens"].as_u64().unwrap_or(0);
+        if input_tokens.saturating_add(output_tokens) >= u64::from(context_window_tokens) {
+            return Err(AdapterFault::context(
+                "model context is full",
+                format!("templated input {input_tokens} plus output {output_tokens} exceeds context {context_window_tokens}"),
+            ));
+        }
+    }
+    // The count and generation share the one run deadline.
+    let client = if context_window_tokens.is_some() {
+        backend_client_with_socket(
+            remaining_run_timeout(task.deadline_ms)?
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            local_socket.as_deref(),
+        )?
+    } else {
+        client
     };
     let request = {
         let effect = if matches!(&task.backend, LocalTextBackend::OpenAiResponses { .. }) {

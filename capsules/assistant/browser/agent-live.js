@@ -18,6 +18,7 @@ import {
 } from "./model-contract.js";
 import {
   compileContext,
+  capabilitiesForOffer,
   attachProviderPayload,
   splitSessionMessages,
   makeBudget,
@@ -324,6 +325,8 @@ export function compileLiveContext({
   degradedFallback = false,
   debug = false,
 } = {}) {
+  const offer = selectedLiveOffer();
+  const effectiveCapabilities = capabilitiesForOffer(offer, capabilities);
   const raw = sessionMessages || session?.messages || [];
   let { history, currentInput: splitCurrent } = splitSessionMessages(raw);
   const current = currentInput || splitCurrent;
@@ -365,12 +368,13 @@ export function compileLiveContext({
     currentInput: current,
     constraints,
     intent: "",
-    budget: makeBudget(capabilities.context, clampLiveMaxTokens(maxTokens)),
-    capabilities,
+    budget: makeBudget(effectiveCapabilities.context, clampLiveMaxTokens(maxTokens)),
+    capabilities: effectiveCapabilities,
     transcriptChars: transcriptCharCount(raw),
     thinkingChars,
   });
   attachProviderPayload(compiled);
+  compiled.manifest.offerId = offer?.offerId || "";
   logContextManifest(compiled.manifest, compiled.invariants, { debug });
   return compiled;
 }
@@ -523,6 +527,10 @@ export async function streamChatViaContract(
     activeRun = null;
     throw contractError("no_model_offers", "no text model offer on this Home");
   }
+  if (!turn.providerRunId && manifest.offerId && offer?.offerId !== manifest.offerId) {
+    activeRun = null;
+    throw contractError("model_selection_changed", "Selected model changed while context was prepared");
+  }
   const resuming = Boolean(turn.providerRunId);
   let created;
   let runId;
@@ -535,7 +543,10 @@ export async function streamChatViaContract(
   try {
     created = resuming
       ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
-      : await modelRunCall("runs_create", textRunCreateBody({ offer, messages, requestId: createRequestId }));
+      : await modelRunCall("runs_create", textRunCreateBody({
+          offer, messages, requestId: createRequestId,
+          maxOutputTokens: manifest.outputReserve,
+        }));
     runId = typeof created?.run_id === "string" ? created.run_id : "";
     if (!runId || runId.trim() !== runId || runId.length > 80 || (resuming && runId !== turn.providerRunId)) {
       throw contractError("no_run_id", "contract returned no run id");

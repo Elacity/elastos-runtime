@@ -220,7 +220,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode('utf-8'))
 
     def do_POST(self):
-        if self.path != '/v1/chat/completions':
+        if self.path not in ('/v1/chat/completions', '/v1/chat/completions/input_tokens'):
             self.send_error(404)
             return
         length = int(self.headers.get('Content-Length', '0'))
@@ -229,10 +229,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body.get('model') != alias or body.get('chat_template_kwargs') != {'enable_thinking': False}:
             self.send_error(400)
             return
+        if self.path == '/v1/chat/completions/input_tokens':
+            # A fixture tokenizer charges UTF-8 content and per-message template
+            # markers. The pinned engine's endpoint owns exact production counts.
+            count = sum(len(message['content'].encode('utf-8')) + 8 for message in body['messages'])
+            record('count:' + str(count))
+            response = {'object': 'response.input_tokens', 'input_tokens': count}
+            if mode == 'incomplete_count':
+                del response['input_tokens']
+            if mode == 'stalled_count':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', '100')
+                self.end_headers()
+                self.wfile.write(b'{')
+                self.wfile.flush()
+                record('count_body_started')
+                while True:
+                    try:
+                        self.wfile.write(b' ')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        record('count_disconnected')
+                        return
+                    time.sleep(0.025)
+            data = json.dumps(response).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         active = model_path.with_suffix('.active')
         if mode == 'active_after_disconnect' and prompt == 'stall':
             active.touch()
         record('request:' + prompt)
+        record('max_tokens:' + str(body.get('max_tokens')))
         if mode == 'crash_once' and prompt == 'crash':
             marker = model_path.with_suffix('.crashed')
             if not marker.exists():
