@@ -77,6 +77,36 @@ pub(crate) fn sha256_file(path: &Path) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+pub(crate) fn fake_gguf_metadata(
+    layers: u32,
+    embedding: u32,
+    heads: u32,
+    kv_heads: u32,
+) -> Vec<u8> {
+    fn string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u64.to_le_bytes());
+    bytes.extend_from_slice(&5_u64.to_le_bytes());
+    string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8_u32.to_le_bytes());
+    string(&mut bytes, "llama");
+    for (key, value) in [
+        ("llama.block_count", layers),
+        ("llama.embedding_length", embedding),
+        ("llama.attention.head_count", heads),
+        ("llama.attention.head_count_kv", kv_heads),
+    ] {
+        string(&mut bytes, key);
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(unix)]
 pub(crate) fn write_fake_llama_server(root: &Path, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
     let engine = root.join("bin/fake-llama-server");
@@ -103,7 +133,7 @@ def arg(name):
 model_path = pathlib.Path(arg('-m'))
 port = int(arg('--port'))
 alias = arg('--alias')
-mode = model_path.read_text(encoding='utf-8').strip()
+mode = model_path.with_suffix('.mode').read_text(encoding='utf-8').strip()
 events = model_path.with_suffix('.events')
 unresponsive = model_path.with_suffix('.unresponsive')
 wrong_alias = model_path.with_suffix('.wrong-alias')
@@ -210,7 +240,8 @@ server.serve_forever()
 "#,
     )
     .unwrap();
-    std::fs::write(&model, mode.as_bytes()).unwrap();
+    std::fs::write(&model, fake_gguf_metadata(32, 2048, 32, 8)).unwrap();
+    std::fs::write(model.with_extension("mode"), mode.as_bytes()).unwrap();
     std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o600)).unwrap();
     (engine, model, events)

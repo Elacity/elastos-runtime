@@ -177,6 +177,12 @@ impl ProviderCoordinator {
                     self.update_tx.clone(),
                     runtime_sockets.runtime_local_sockets,
                     runtime_sockets.runtime_hosted_socket,
+                    Some(std::path::PathBuf::from(
+                        runtime_sockets
+                            .journal_dir
+                            .as_deref()
+                            .unwrap_or(&init.config.base_path),
+                    )),
                 );
                 let mut provider = ModelProviderState::from_init(init.config, adapter)?;
                 provider.settle_active_local_text_runs_unknown()?;

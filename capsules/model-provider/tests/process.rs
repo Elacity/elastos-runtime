@@ -14,10 +14,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+static LOCAL_ENGINE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const PROCESS_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 struct ProviderProcess {
+    _local_engine_test: Option<std::sync::MutexGuard<'static, ()>>,
     child: Child,
     stdin: Option<ChildStdin>,
     responses: Receiver<Value>,
@@ -68,6 +71,7 @@ impl ProviderProcess {
             }
         });
         Self {
+            _local_engine_test: None,
             stdin: child.stdin.take(),
             child,
             responses,
@@ -115,13 +119,16 @@ impl Drop for ProviderProcess {
     }
 }
 
-fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
+fn init_local_llama(label: &str, oversized: bool) -> (ProviderProcess, PathBuf) {
     let root = test_support::temp_root_path("model-provider-process", label);
     std::fs::create_dir_all(&root).unwrap();
     let root = std::fs::canonicalize(root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (engine, model, events) =
         test_support::write_fake_llama_server(&root, "healthy_with_subtree");
+    if oversized {
+        std::fs::write(&model, test_support::fake_gguf_metadata(512, 131_072, 1, 1)).unwrap();
+    }
     let offer = json!({
         "id": "local-text",
         "title": "Local Text",
@@ -148,7 +155,7 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
                 "sha256": test_support::sha256_file(&model)
             },
             "settings": {
-                "context_size": 256,
+                "context_size": if oversized { 32768 } else { 256 },
                 "parallel": 1,
                 "threads": 1,
                 "batch_threads": 1,
@@ -177,9 +184,17 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
     }));
     assert_eq!(init["status"], "ok", "unexpected init response: {init}");
 
+    (provider, events)
+}
+
+fn create_local_run(provider: &mut ProviderProcess, label: &str) -> Value {
+    create_local_prompt(provider, label, "process-lifecycle")
+}
+
+fn create_local_prompt(provider: &mut ProviderProcess, label: &str, prompt: &str) -> Value {
     let input = json!({
         "schema": "elastos.model.input.text/v1",
-        "prompt": "process-lifecycle"
+        "prompt": prompt
     });
     let create = provider.request(json!({
         "op": "runs_create",
@@ -202,10 +217,131 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
         create["status"], "ok",
         "unexpected create response: {create}"
     );
+    create
+}
+
+fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
+    let lease = LOCAL_ENGINE_TEST.lock().unwrap();
+    let (mut provider, events) = init_local_llama(label, false);
+    provider._local_engine_test = Some(lease);
+    create_local_run(&mut provider, label);
     wait_for_event(&events, "start:");
     wait_for_event(&events, "parent:");
     wait_for_event(&events, "subtree:");
     (provider, events)
+}
+
+fn cancel_local_run(provider: &mut ProviderProcess, created: &Value) {
+    let response = provider.request(json!({
+        "op":"runs_cancel", "run_id":created["data"]["run_id"],
+        "runtime_binding": {
+            "schema":"elastos.model.runtime-access-binding/v1",
+            "principal_id":"person:local:test", "session_id":"session:test",
+            "capsule_id":"assistant", "grant_id":"grant:test", "request_id":"request:cancel",
+            "run_id":created["data"]["run_id"]
+        }
+    }));
+    assert_eq!(response["status"], "ok");
+}
+
+fn terminal_local_run(provider: &mut ProviderProcess, created: &Value) -> Value {
+    let deadline = Instant::now() + PROCESS_DEADLINE;
+    loop {
+        let view = provider.request(json!({
+            "op":"runs_get", "run_id":created["data"]["run_id"],
+            "runtime_binding": {
+                "schema":"elastos.model.runtime-access-binding/v1",
+                "principal_id":"person:local:test", "session_id":"session:test",
+                "capsule_id":"assistant", "grant_id":"grant:test", "request_id":"request:read",
+                "run_id":created["data"]["run_id"]
+            }
+        }));
+        if matches!(
+            view["data"]["status"].as_str(),
+            Some("failed" | "completed" | "cancelled" | "settlement_unknown")
+        ) {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "run failed to settle: {view}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn two_roots_refuse_busy_and_recover_after_owner_crash() {
+    let (mut first, first_events) = start_local_llama_run("lease-first");
+    let (mut second, second_events) = init_local_llama("lease-second", false);
+    let created = create_local_run(&mut second, "lease-busy");
+    let refused = terminal_local_run(&mut second, &created);
+    assert_eq!(refused["data"]["terminal"]["error"]["code"], "model_busy");
+    assert_eq!(
+        refused["data"]["terminal"]["error"]["message"],
+        "Model is busy."
+    );
+    assert!(event_lines(&second_events).is_empty());
+    let public = serde_json::to_string(&refused).unwrap();
+    assert!(!public.contains("lease-first") && !public.contains("elastos-local-model"));
+    first.hard_kill();
+    assert!(wait_for_process_exit(engine_pid(&first_events)));
+    assert!(wait_for_process_exit(guard_pid(&first_events)));
+    assert!(wait_for_process_exit(subtree_pid(&first_events)));
+    let created = create_local_run(&mut second, "lease-recovered");
+    let recovered = terminal_local_run(&mut second, &created);
+    assert_eq!(recovered["data"]["status"], "completed", "{recovered}");
+    second.shutdown();
+    assert!(wait_for_process_exit(engine_pid(&second_events)));
+}
+
+#[test]
+fn queue_saturation_and_waiting_cancellation_preserve_active_engine() {
+    let _lease = LOCAL_ENGINE_TEST.lock().unwrap();
+    let (mut provider, events) = init_local_llama("queue", false);
+    let first = create_local_prompt(&mut provider, "queue-active", "stall");
+    wait_for_event(&events, "request:stall");
+    let mut waiting = Vec::new();
+    for index in 0..8 {
+        let created = create_local_run(&mut provider, &format!("queue-{index}"));
+        assert_eq!(created["data"]["status"], "running");
+        waiting.push(created);
+    }
+    let excess = create_local_run(&mut provider, "queue-full");
+    assert_eq!(excess["data"]["terminal"]["error"]["code"], "model_busy");
+    for created in &waiting {
+        cancel_local_run(&mut provider, created);
+        assert_eq!(
+            terminal_local_run(&mut provider, created)["data"]["status"],
+            "cancelled"
+        );
+    }
+    assert_eq!(
+        event_lines(&events)
+            .iter()
+            .filter(|event| event.starts_with("start:"))
+            .count(),
+        1
+    );
+    assert!(process_exists(engine_pid(&events)));
+    cancel_local_run(&mut provider, &first);
+    assert_eq!(
+        terminal_local_run(&mut provider, &first)["data"]["status"],
+        "settlement_unknown"
+    );
+    assert!(wait_for_process_exit(engine_pid(&events)));
+    provider.shutdown();
+}
+
+#[test]
+fn insufficient_memory_refuses_before_any_engine_process() {
+    let _lease = LOCAL_ENGINE_TEST.lock().unwrap();
+    let (mut provider, events) = init_local_llama("memory-refused", true);
+    let created = create_local_run(&mut provider, "memory-refused");
+    let refused = terminal_local_run(&mut provider, &created);
+    provider.shutdown();
+    assert_eq!(
+        refused["data"]["terminal"]["error"]["code"], "model_memory_unavailable",
+        "{refused}"
+    );
+    assert!(event_lines(&events).is_empty());
 }
 
 fn wait_for_event(path: &Path, prefix: &str) {

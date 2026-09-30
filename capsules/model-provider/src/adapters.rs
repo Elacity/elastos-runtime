@@ -480,6 +480,7 @@ enum LocalTextBackend {
 }
 
 struct PreparedLocalTextWorker {
+    local_run_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     run_id: String,
     generation: u64,
     cancel_rx: watch::Receiver<bool>,
@@ -616,7 +617,7 @@ impl LiveAdapterExecutor {
         updates: mpsc::Sender<WorkerUpdate>,
         sockets: BTreeMap<String, String>,
     ) -> Self {
-        Self::new_with_runtime_sockets(runtime, updates, sockets, None)
+        Self::new_with_runtime_sockets(runtime, updates, sockets, None, None)
     }
 
     pub(crate) fn new_with_runtime_sockets(
@@ -624,13 +625,16 @@ impl LiveAdapterExecutor {
         updates: mpsc::Sender<WorkerUpdate>,
         sockets: BTreeMap<String, String>,
         hosted_socket: Option<String>,
+        resource_root: Option<std::path::PathBuf>,
     ) -> Self {
+        let mut local_llama = LocalLlamaEngines::with_runtime_sockets(sockets);
+        local_llama.resource_root = resource_root;
         Self {
             runtime,
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
-            local_llama: LocalLlamaEngines::with_runtime_sockets(sockets),
+            local_llama,
             hosted_socket,
         }
     }
@@ -799,9 +803,9 @@ impl LiveAdapterExecutor {
                 generation,
                 cancel_rx,
                 backend_state,
+                local_run_slot,
             },
             workers,
-            local_run_slot,
         )
     }
 
@@ -814,9 +818,9 @@ impl LiveAdapterExecutor {
         deadline_ms: u64,
         prepared: PreparedLocalTextWorker,
         mut workers: std::sync::MutexGuard<'_, BTreeMap<String, WorkerRecord>>,
-        local_run_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> std::result::Result<Value, AdapterFault> {
         let PreparedLocalTextWorker {
+            local_run_slot,
             run_id,
             generation,
             cancel_rx,
@@ -2128,6 +2132,28 @@ async fn run_decision_worker(
 
 fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
     match fault {
+        LocalLlamaFault::MemoryUnavailable
+        | LocalLlamaFault::DiskUnavailable
+        | LocalLlamaFault::ResourcesUnavailable => AdapterFault {
+            error: RunError {
+                class: ErrorClass::ContextRejected,
+                code: match fault {
+                    LocalLlamaFault::MemoryUnavailable => "model_memory_unavailable",
+                    LocalLlamaFault::DiskUnavailable => "model_disk_unavailable",
+                    _ => "model_resources_unavailable",
+                }
+                .into(),
+                message: match fault {
+                    LocalLlamaFault::MemoryUnavailable => "Free memory or select a smaller model.",
+                    LocalLlamaFault::DiskUnavailable => {
+                        "Free disk space before running this model."
+                    }
+                    _ => "This model's resource profile is unavailable.",
+                }
+                .into(),
+            },
+            detail: None,
+        },
         LocalLlamaFault::Busy => AdapterFault {
             error: RunError {
                 class: ErrorClass::RateLimited,

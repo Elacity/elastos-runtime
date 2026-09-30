@@ -31,6 +31,9 @@ pub(crate) enum LocalLlamaFault {
     Failed,
     Timeout,
     Busy,
+    MemoryUnavailable,
+    DiskUnavailable,
+    ResourcesUnavailable,
 }
 
 #[derive(Clone)]
@@ -40,6 +43,7 @@ pub(crate) struct LocalLlamaEngines {
     run_slots: Arc<Semaphore>,
     pub(crate) execution: Arc<Semaphore>,
     idle_release: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub(crate) resource_root: Option<std::path::PathBuf>,
 }
 
 impl Default for LocalLlamaEngines {
@@ -64,6 +68,7 @@ struct RunningEngine {
     models_url: String,
     shutdown_timeout: Duration,
     closing: bool,
+    _lease: Option<std::fs::File>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -91,6 +96,7 @@ impl LocalLlamaEngines {
             run_slots: Arc::new(Semaphore::new(LOCAL_RUN_QUEUE_CAPACITY + 1)),
             execution: Arc::new(Semaphore::new(1)),
             idle_release: Arc::new(Mutex::new(None)),
+            resource_root: None,
         }
     }
 
@@ -193,11 +199,26 @@ impl LocalLlamaEngines {
             close_engine(&mut engines, offer_id).await?;
         }
 
+        #[cfg(not(test))]
+        let lease = Some(crate::local_resources::acquire_lease(
+            &crate::local_resources::account_lease_path(),
+        )?);
         revalidate_local_artifact(engine, true, deadline).map_err(|_| deadline_fault(deadline))?;
         revalidate_local_artifact(model, false, deadline).map_err(|_| deadline_fault(deadline))?;
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
+        #[cfg(not(test))]
+        crate::local_memory::admit(
+            std::path::Path::new(&model.path),
+            settings.context_size,
+            settings.parallel,
+            self.resource_root
+                .as_deref()
+                .ok_or(LocalLlamaFault::ResourcesUnavailable)?,
+        )?;
+        #[cfg(test)]
+        let lease = None;
         let sockets = self.runtime_sockets.read().await;
         let (target, broker_socket) = if sockets.is_empty() {
             (EngineTarget::Tcp(reserve_loopback_port()?), None)
@@ -228,7 +249,7 @@ impl LocalLlamaEngines {
         };
         let models_url = format!("{base_url}/v1/models");
         let (child, liveness, guard_group) =
-            spawn_managed_engine(engine, model, settings, &target, &alias).await?;
+            spawn_managed_engine(engine, model, settings, &target, &alias, lease.as_ref()).await?;
         let health_timeout = Duration::from_millis(settings.health_timeout_ms)
             .min(deadline.saturating_duration_since(Instant::now()));
         let shutdown_timeout = Duration::from_millis(settings.shutdown_timeout_ms);
@@ -242,6 +263,7 @@ impl LocalLlamaEngines {
                 models_url,
                 shutdown_timeout,
                 closing: false,
+                _lease: lease,
             },
         );
         let health_result = match engines.get_mut(offer_id) {
@@ -322,11 +344,13 @@ async fn spawn_managed_engine(
     settings: &LocalLlamaSettings,
     target: &EngineTarget,
     alias: &str,
+    lease: Option<&std::fs::File>,
 ) -> Result<(Child, Option<ChildStdin>, Option<libc::pid_t>), LocalLlamaFault> {
     #[cfg(test)]
     {
         let mut command = Command::new(&engine.path);
         configure_tokio_engine_command(&mut command, &model.path, settings, target, alias);
+        crate::local_resources::inherit_lease(command.as_std_mut(), lease);
         let child = command.spawn().map_err(|_| LocalLlamaFault::Failed)?;
         Ok((child, None, None))
     }
@@ -334,7 +358,7 @@ async fn spawn_managed_engine(
     #[cfg(not(test))]
     {
         let _ = (engine, model, settings, target, alias);
-        spawn_guarded_engine()
+        spawn_guarded_engine(lease)
     }
 }
 
@@ -377,6 +401,7 @@ async fn initialize_guard(
 
 #[cfg(not(test))]
 fn spawn_guarded_engine(
+    lease: Option<&std::fs::File>,
 ) -> Result<(Child, Option<ChildStdin>, Option<libc::pid_t>), LocalLlamaFault> {
     let executable = std::env::current_exe().map_err(|_| LocalLlamaFault::Failed)?;
     let mut command = Command::new(executable);
@@ -391,6 +416,7 @@ fn spawn_guarded_engine(
         use std::os::unix::process::CommandExt as _;
         command.as_std_mut().process_group(0);
     }
+    crate::local_resources::inherit_lease(command.as_std_mut(), lease);
     let mut child = command.spawn().map_err(|_| LocalLlamaFault::Failed)?;
     let guard_group = child.id().map(|pid| pid as libc::pid_t);
     let liveness = child.stdin.take();
