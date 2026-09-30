@@ -93,10 +93,11 @@ Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/
   version bump and changelog, and opened as a PR to `main`.
 - Three people confirm the candidate before the tag. Sasha reviews the visible
   changes (CI screenshots and a short look) on his Wednesday. `irzhywau`
-  approves the release PR. Anders runs the ten-minute journey on his Mac:
-  update from the previous weekly release or a fresh install, sign in, one local
-  AI reply, one chat message and one Browser page. A failed journey or a visible
-  regression holds the tag for that week.
+  approves the release PR. Anders runs the ten-minute journey on his Mac: a
+  fresh install (an update from the previous weekly release once the signed
+  update tasks UP-01 to UP-03 are merged), sign in, one local AI reply, one chat
+  message and one Browser page. A failed journey or a visible regression holds
+  the tag for that week.
 - On Wednesday the PR merges, `v0.7.N` is tagged on the merge commit, and `main`
   merges back into `develop`.
 - 0.8.0 is the weekly release in which every result in the 0.8.0 milestone meets

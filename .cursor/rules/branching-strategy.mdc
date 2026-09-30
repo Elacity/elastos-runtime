@@ -6,10 +6,4 @@ alwaysApply: false
 
 # Branching Strategy
 
-Task branches start from `develop` (or the base the owning issue names) and merge back into it. `main` changes only through the weekly release PR.
-
-1. `git fetch origin --prune`.
-2. Create the branch as `feat/<slug>` or `fix/<slug>` from `origin/develop` or the issue's base.
-3. If the base is another in-flight branch, say so in the PR; it merges after its parent.
-
-Canonical workflow: @.claude/skills/branching-strategy/SKILL.md
+Follow **Creating Work Branches** and **Branch Roles** in @AGENTS.md. They are the only source for bases, branch names and merge targets.
