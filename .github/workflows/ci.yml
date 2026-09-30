@@ -65,6 +65,7 @@ jobs:
           python3 scripts/release-platform-input-test.py
           python3 scripts/prepare-release-platform-test.py
           python3 scripts/media-tools-build-test.py
+          python3 scripts/verify-linux-arm64-package-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
 
@@ -300,7 +301,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # Jetson's Ubuntu 22.04 host provides glibc 2.35.
+        os: [ubuntu-24.04, ubuntu-22.04-arm]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -314,7 +316,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos-bd
+          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
       - name: require 16 GiB free disk
@@ -350,7 +352,7 @@ jobs:
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
       - name: fetch pinned Jetson engine archive
-        if: matrix.os == 'ubuntu-24.04-arm'
+        if: matrix.os == 'ubuntu-22.04-arm'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -374,6 +376,13 @@ jobs:
           # Incremental on top of setup-source-home's release builds.
           cargo build --manifest-path elastos/Cargo.toml --workspace --release
           scripts/package-release-binaries.sh
+      - name: verify Jetson release compatibility
+        if: matrix.os == 'ubuntu-22.04-arm'
+        run: |
+          python3 scripts/verify-linux-arm64-package.py elastos-runtime-linux-arm64.tar.gz \
+            --source-commit "$(git rev-parse HEAD)" \
+            --source-tree "$(git rev-parse HEAD^{tree})" \
+            --receipt elastos-runtime-linux-arm64.receipt.json
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v5
@@ -382,6 +391,7 @@ jobs:
           path: |
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
+            elastos-runtime-*.receipt.json
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@v5
