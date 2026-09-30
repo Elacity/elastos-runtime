@@ -337,6 +337,19 @@ fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("journal")
 }
 
+/// Declare the installed component's engine read boundary for macOS startup.
+/// Activation still verifies its full receipt and payload closure before Init.
+#[cfg(target_os = "macos")]
+pub fn model_provider_engine_bundle(data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let bytes = super::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    )?;
+    let manifest = serde_json::from_slice(&bytes)?;
+    crate::setup::local_model_engine_confinement_bundle(data_dir, &manifest)
+}
+
 pub fn model_provider_bridge_config(
     data_dir: &Path,
 ) -> anyhow::Result<provider::BridgeProviderConfig> {

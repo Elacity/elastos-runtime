@@ -91,7 +91,28 @@ int main(void) {
         close(engine_fd);
         int system_read = opened("/usr/bin", O_RDONLY);
         int canary_read = opened(canary, O_RDONLY);
+        char data_alias[4096];
+        snprintf(data_alias, sizeof(data_alias), "/System/Volumes/Data%s", canary);
+        int data_alias_read = opened(data_alias, O_RDONLY);
         int model_read = opened(model, O_RDONLY);
+        char namespace_probe[4096];
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/model-preparation/stage/canary", base);
+        int stage_read = opened(namespace_probe, O_RDONLY);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/model-preparation/state.json", base);
+        int inventory_read = opened(namespace_probe, O_RDONLY);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/model-preparation/worker", base);
+        int worker_read = opened(namespace_probe, O_RDONLY);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/libexec/llama.cpp/fixture/darwin-arm64/late-engine", base);
+        int late_engine_read = opened(namespace_probe, O_RDONLY);
+        int late_engine_write = opened(namespace_probe, O_WRONLY | O_TRUNC);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s.external", model);
+        int admitted_alias_read = opened(namespace_probe, O_RDONLY);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/model-preparation/admitted-%063d/canary", base, 0);
+        int short_admission_read = opened(namespace_probe, O_RDONLY);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/model-preparation/admitted-%064d-extra/canary", base, 0);
+        int suffixed_admission_read = opened(namespace_probe, O_RDONLY);
+        snprintf(namespace_probe, sizeof(namespace_probe), "%s/libexec/llama.cpp/other/darwin-arm64/canary", base);
+        int other_engine_read = opened(namespace_probe, O_RDONLY);
         int model_write = opened(model, O_WRONLY | O_TRUNC);
         char alias[4096];
         snprintf(alias, sizeof(alias), "%s/probe-link", journal);
@@ -143,6 +164,12 @@ int main(void) {
                "\"journal_write_errno\":%d,\"base_canonical_errno\":%d,"
                "\"engine_preflight_errno\":%d,\"engine_bind_errno\":%d,"
                "\"engine_stat_errno\":%d,\"engine_unlink_errno\":%d,"
+               "\"stage_read_errno\":%d,\"inventory_read_errno\":%d,"
+               "\"worker_read_errno\":%d,\"late_engine_read_errno\":%d,"
+               "\"other_engine_read_errno\":%d,"
+               "\"late_engine_write_errno\":%d,\"admitted_alias_read_errno\":%d,"
+               "\"short_admission_read_errno\":%d,\"suffixed_admission_read_errno\":%d,"
+               "\"data_alias_read_errno\":%d,"
                "\"inherited_writable_regular_fds\":%d}}\n",
                external, descendant[0], unrelated, descendant[1], other_socket,
                descendant[2], selected_socket, descendant[3], system_read,
@@ -150,6 +177,11 @@ int main(void) {
                descendant[6], model_link, descendant[7], model_rename, descendant[8],
                symlink_create, alias_write, journal_write, base_canonical,
                engine_preflight, engine_bind, engine_stat, engine_unlink,
+               stage_read, inventory_read, worker_read, late_engine_read,
+               other_engine_read,
+               late_engine_write, admitted_alias_read,
+               short_admission_read, suffixed_admission_read,
+               data_alias_read,
                inherited_writable_regular_fds);
         fflush(stdout);
     }

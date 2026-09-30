@@ -216,6 +216,7 @@ fn model_file_policy(
     binary_path: &Path,
     config: &ProviderConfig,
     journal: &Path,
+    pinned_engine_bundle: Option<&Path>,
 ) -> Result<String, BridgeError> {
     let base = Path::new(&config.base_path);
     let mut files = std::collections::BTreeSet::new();
@@ -331,6 +332,47 @@ fn model_file_policy(
     let mut policy = String::from(
         "(version 1)\n(allow default)\n(deny network-outbound)\n(deny file-read*)\n(deny file-write*)\n(allow file-read* (literal \"/\") (subpath \"/System\") (subpath \"/usr/lib\") (literal \"/dev/urandom\") (literal \"/dev/null\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
     );
+    // Runtime owns admission and descriptor verification. The child can read
+    // admitted payloads created after startup, while staging and inventory stay
+    // outside its file boundary. Seatbelt resolves aliases before this match.
+    let admitted_parent = base.join("model-preparation");
+    let mut admitted_pattern = String::from("^");
+    for character in admitted_parent
+        .to_str()
+        .ok_or_else(|| BridgeError::InitFailed("invalid model sandbox path".into()))?
+        .chars()
+    {
+        if "\\.^$|?*+()[]{}".contains(character) {
+            admitted_pattern.push('\\');
+        }
+        admitted_pattern.push(character);
+    }
+    admitted_pattern.push_str("/admitted-");
+    admitted_pattern.push_str(&"[a-f0-9]".repeat(64));
+    admitted_pattern.push_str("(/|$)");
+    policy.push_str(&format!(
+        "(allow file-read* (regex \"{}\"))\n",
+        seatbelt_path(Path::new(&admitted_pattern))?
+    ));
+    metadata_paths.insert(admitted_parent);
+    if let Some(bundle) = pinned_engine_bundle {
+        let prefix = base.join("libexec/llama.cpp");
+        let relative = bundle
+            .strip_prefix(&prefix)
+            .map_err(|_| BridgeError::InitFailed("unsafe model engine bundle".into()))?;
+        if relative.components().count() != 2
+            || !relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(BridgeError::InitFailed("unsafe model engine bundle".into()));
+        }
+        policy.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            seatbelt_path(bundle)?
+        ));
+        metadata_paths.extend(bundle.ancestors().map(Path::to_path_buf));
+    }
     metadata_paths.remove(Path::new("/"));
     for ancestor in metadata_paths {
         policy.push_str(&format!(
@@ -595,7 +637,27 @@ impl ProviderBridge {
     #[cfg(target_os = "macos")]
     pub async fn spawn_confined_model(
         binary_path: &Path,
+        config: ProviderConfig,
+    ) -> Result<
+        (
+            Self,
+            BTreeMap<String, String>,
+            Vec<String>,
+            ProviderConfig,
+            tokio::net::UnixListener,
+        ),
+        BridgeError,
+    > {
+        Self::spawn_confined_model_with_engine_bundle(binary_path, config, None).await
+    }
+
+    /// Predeclare the current component-pinned engine bundle for later admission.
+    /// Runtime retains verification and offer authority through every Init.
+    #[cfg(target_os = "macos")]
+    pub async fn spawn_confined_model_with_engine_bundle(
+        binary_path: &Path,
         mut config: ProviderConfig,
+        pinned_engine_bundle: Option<&Path>,
     ) -> Result<
         (
             Self,
@@ -623,7 +685,7 @@ impl ProviderBridge {
         // Seatbelt resolves /var to /private/var before comparing literal paths.
         let ipc_path = std::fs::canonicalize(ipc_dir.path()).map_err(BridgeError::Spawn)?;
         let journal = model_journal_for_sandbox(&config)?;
-        let mut policy = model_file_policy(binary_path, &config, &journal)?;
+        let mut policy = model_file_policy(binary_path, &config, &journal, pinned_engine_bundle)?;
         let local_ids = offers
             .iter()
             .filter(|offer| {
@@ -2736,7 +2798,10 @@ mod tests {
         use sha2::{Digest as _, Sha256};
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temp = TempDir::new().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("model.[probe]-")
+            .tempdir()
+            .unwrap();
         let unrelated = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let unrelated_port = unrelated.local_addr().unwrap().port();
         let base = temp.path().canonicalize().unwrap();
@@ -2776,6 +2841,8 @@ mod tests {
         std::fs::write(&model, b"synthetic model").unwrap();
         let canary = base.join("canary");
         std::fs::write(&canary, b"synthetic canary").unwrap();
+        let data_alias = format!("/System/Volumes/Data{}", canary.display());
+        assert_eq!(std::fs::read(&data_alias).unwrap(), b"synthetic canary");
         let journal = base.join("providers/model-provider/journal");
         let config = ProviderConfig {
             base_path: base.to_string_lossy().into_owned(),
@@ -2803,7 +2870,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut profile = model_file_policy(&script, &config, &journal).unwrap();
+        let mut profile = model_file_policy(&script, &config, &journal, None).unwrap();
         profile.push_str(&format!(
             "(allow file-read* (literal \"{}\"))\n",
             seatbelt_path(&rust_probe).unwrap()
@@ -2864,6 +2931,7 @@ mod tests {
         assert_eq!(data["descendant_system_read_errno"], libc::EPERM);
         assert_eq!(data["model_read_errno"], 0);
         assert_eq!(data["canary_read_errno"], libc::EPERM);
+        assert_eq!(data["data_alias_read_errno"], libc::EPERM);
         assert_eq!(data["descendant_canary_read_errno"], libc::EPERM);
         assert_eq!(data["model_write_errno"], libc::EPERM);
         assert_eq!(data["descendant_model_write_errno"], libc::EPERM);
@@ -2879,14 +2947,94 @@ mod tests {
         bridge.shutdown().await.unwrap();
         assert!(!Path::new(&sockets["fixture-local"]).exists());
         std::fs::write(&listed_library, b"changed fixture library").unwrap();
-        assert!(model_file_policy(&script, &policy_config, &journal).is_err());
+        assert!(model_file_policy(&script, &policy_config, &journal, None).is_err());
+
+        // Keep one confined child through a zero-offer startup and files that
+        // arrive later. The declared read namespace excludes mutable staging,
+        // inventory and other engine versions, even with regex chars in root.
+        let empty_config = ProviderConfig {
+            base_path: base.to_string_lossy().into_owned(),
+            extra: serde_json::json!({"offers":[], "journal_dir":journal}),
+            ..Default::default()
+        };
+        let (empty_bridge, _, vacant, _, _hosted_listener) =
+            ProviderBridge::spawn_confined_model_with_engine_bundle(
+                &script,
+                empty_config,
+                Some(&engine_dir),
+            )
+            .await
+            .unwrap();
+        let preparation = base.join("model-preparation");
+        let admitted = preparation.join(format!("admitted-{}", "a".repeat(64)));
+        std::fs::create_dir_all(&admitted).unwrap();
+        let late_model = admitted.join("weights.gguf");
+        std::fs::write(&late_model, b"late synthetic model").unwrap();
+        std::os::unix::fs::symlink(&canary, format!("{}.external", late_model.display())).unwrap();
+        for name in [
+            format!("admitted-{}", "0".repeat(63)),
+            format!("admitted-{}-extra", "0".repeat(64)),
+        ] {
+            let invalid = preparation.join(name);
+            std::fs::create_dir_all(&invalid).unwrap();
+            std::fs::write(invalid.join("canary"), b"outside admission boundary").unwrap();
+        }
+        std::fs::create_dir_all(preparation.join("stage")).unwrap();
+        std::fs::write(preparation.join("stage/canary"), b"unverified").unwrap();
+        std::fs::write(preparation.join("state.json"), b"private inventory").unwrap();
+        std::fs::write(preparation.join("worker"), b"private lock").unwrap();
+        std::fs::write(engine_dir.join("late-engine"), b"pinned engine artifact").unwrap();
+        let other_engine = base.join("libexec/llama.cpp/other/darwin-arm64");
+        std::fs::create_dir_all(&other_engine).unwrap();
+        std::fs::write(other_engine.join("canary"), b"other engine version").unwrap();
+        let other_socket = format!("{}.other", vacant[0]);
+        let _other_listener = std::os::unix::net::UnixListener::bind(&other_socket).unwrap();
+        let response = empty_bridge
+            .request(ProviderRequest::Exists {
+                path: format!(
+                    "{}|{}|{}|{}|{}|{}|{}",
+                    vacant[0],
+                    unrelated_port,
+                    other_socket,
+                    late_model.display(),
+                    canary.display(),
+                    journal.display(),
+                    base.display()
+                ),
+                token: String::new(),
+            })
+            .await
+            .unwrap();
+        let ProviderResponse::Ok { data: Some(data) } = response else {
+            panic!("expected native namespace probe response");
+        };
+        assert_eq!(data["model_read_errno"], 0);
+        assert_eq!(data["late_engine_read_errno"], 0);
+        for denied in [
+            "stage_read_errno",
+            "inventory_read_errno",
+            "worker_read_errno",
+            "other_engine_read_errno",
+            "late_engine_write_errno",
+            "admitted_alias_read_errno",
+            "short_admission_read_errno",
+            "suffixed_admission_read_errno",
+            "canary_read_errno",
+            "model_write_errno",
+            "descendant_model_write_errno",
+            "direct_errno",
+            "descendant_errno",
+        ] {
+            assert_eq!(data[denied], libc::EPERM, "{denied}");
+        }
+        empty_bridge.shutdown().await.unwrap();
         std::fs::write(&listed_library, b"listed fixture library").unwrap();
         std::fs::write(
             engine_dir.join("unlisted.dylib"),
             b"unlisted fixture library",
         )
         .unwrap();
-        assert!(model_file_policy(&script, &policy_config, &journal).is_err());
+        assert!(model_file_policy(&script, &policy_config, &journal, None).is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
