@@ -211,8 +211,10 @@ next local run. Hosted offers keep their configured concurrency limits.
 
 Before loading or switching a local model, admission checks available host
 memory against the model weights, the selected context with per-slot KV padding,
-a scratch reserve of at least the weight size or 512 MiB, and Home headroom of
-at least 1 GiB or 10% of physical memory. It also preserves a 10% free-space
+a scratch reserve that includes at least the weight size or 512 MiB plus
+context-dependent attention buffers, logits, and layer activation buffers, and
+Home headroom of at least 1 GiB or 10% of physical memory. The launch pins both
+batch sizes to 128, matching the estimate. It also preserves a 10% free-space
 floor plus journal space on the model and Home volumes. The supported memory
 profiles are the ordinary `llama`, `qwen2` and `qwen3` GGUF attention layouts.
 Incomplete metadata, split models, arithmetic overflow and other layouts return

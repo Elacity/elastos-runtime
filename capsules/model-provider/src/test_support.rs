@@ -83,6 +83,24 @@ pub(crate) fn fake_gguf_metadata(
     heads: u32,
     kv_heads: u32,
 ) -> Vec<u8> {
+    fake_gguf_profile(
+        layers,
+        embedding,
+        heads,
+        kv_heads,
+        embedding.saturating_mul(4),
+        32,
+    )
+}
+
+pub(crate) fn fake_gguf_profile(
+    layers: u32,
+    embedding: u32,
+    heads: u32,
+    kv_heads: u32,
+    feed_forward: u32,
+    vocabulary: u64,
+) -> Vec<u8> {
     fn string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
         bytes.extend_from_slice(value.as_bytes());
@@ -90,7 +108,7 @@ pub(crate) fn fake_gguf_metadata(
     let mut bytes = b"GGUF".to_vec();
     bytes.extend_from_slice(&3_u32.to_le_bytes());
     bytes.extend_from_slice(&1_u64.to_le_bytes());
-    bytes.extend_from_slice(&5_u64.to_le_bytes());
+    bytes.extend_from_slice(&7_u64.to_le_bytes());
     string(&mut bytes, "general.architecture");
     bytes.extend_from_slice(&8_u32.to_le_bytes());
     string(&mut bytes, "llama");
@@ -99,10 +117,18 @@ pub(crate) fn fake_gguf_metadata(
         ("llama.embedding_length", embedding),
         ("llama.attention.head_count", heads),
         ("llama.attention.head_count_kv", kv_heads),
+        ("llama.feed_forward_length", feed_forward),
     ] {
         string(&mut bytes, key);
         bytes.extend_from_slice(&4_u32.to_le_bytes());
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    string(&mut bytes, "tokenizer.ggml.tokens");
+    bytes.extend_from_slice(&9_u32.to_le_bytes());
+    bytes.extend_from_slice(&8_u32.to_le_bytes());
+    bytes.extend_from_slice(&vocabulary.to_le_bytes());
+    for _ in 0..vocabulary {
+        string(&mut bytes, "token");
     }
     bytes
 }
