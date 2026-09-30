@@ -15,8 +15,10 @@ case "${1:-}" in
             # #97's Carrier fixture already installs this pinned archive through
             # Runtime setup. Reuse its complete verified bundle and receipt.
             python3 - "$DATA" "${HOME}/.elastos-ci/carrier-fixture/xdg-data/elastos" <<'PY'
-import hashlib, json, shutil, sys
+import json, shutil, sys
 from pathlib import Path
+from runpy import run_path
+digest = run_path("scripts/ci-installed-journeys.py")["digest"]
 data, fixture = map(Path, sys.argv[1:])
 info = json.loads((data / "components.json").read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
 bundle = fixture / info["install_path"]
@@ -24,7 +26,7 @@ receipt = json.loads((bundle / ".elastos-engine.json").read_text())
 assert receipt["platform"] == "linux-arm64"
 assert receipt["archive_sha256"] == info["checksum"]
 binary = next(row for row in receipt["entries"] if row["path"] == "llama-server")
-assert "sha256:" + hashlib.file_digest((bundle / "llama-server").open("rb"), "sha256").hexdigest() == binary["sha256"]
+assert "sha256:" + digest(bundle / "llama-server") == binary["sha256"]
 destination = data / info["install_path"]
 destination.parent.mkdir(parents=True, exist_ok=True)
 shutil.copytree(bundle, destination, symlinks=True)
@@ -39,12 +41,14 @@ PY
         ;;
     summary)
         python3 - "$EVIDENCE" "$DATA" <<'PY'
-import hashlib, json, os, subprocess, sys
+import json, os, subprocess, sys
 from pathlib import Path
+from runpy import run_path
+digest = run_path("scripts/ci-installed-journeys.py")["digest"]
 root, data = map(Path, sys.argv[1:])
 commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 runtime = data / "bin/elastos"
-sha = hashlib.file_digest(runtime.open("rb"), "sha256").hexdigest() if runtime.is_file() else "unavailable: installation did not complete"
+sha = digest(runtime) if runtime.is_file() else "unavailable: installation did not complete"
 results = {"home_screenshots": "failed or not run", "model_package_admission": "failed or not run", "installed_runtime_reply": "failed or not run"}
 elapsed = 0
 for name in ["installed-journeys.json"]:
