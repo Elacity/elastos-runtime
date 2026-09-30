@@ -181,6 +181,17 @@ jobs:
               (cd "$capsule" && cargo test --no-fail-fast) || failed=1
           done
           exit "$failed"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: install browser layout smoke tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+          npm ci --prefix elastos/tools/browser-playwright-engine
+          npx --prefix elastos/tools/browser-playwright-engine playwright install --with-deps chromium webkit
+      - name: browser layout smokes
+        run: just product-ui-browser
 
   # Rehearses the ELACITY-2298 dKMS ceremony (offline custody composition +
   # Carrier dial-proof preflight) against a fresh instance of the
