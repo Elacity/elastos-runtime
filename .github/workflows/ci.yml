@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -64,6 +65,7 @@ jobs:
           python3 scripts/release-platform-input-test.py
           python3 scripts/prepare-release-platform-test.py
           python3 scripts/media-tools-build-test.py
+          python3 scripts/verify-linux-arm64-package-test.py
           python3 scripts/update-hop-compare-test.py
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
@@ -293,14 +295,19 @@ jobs:
   # packaging the binaries for its architecture — no separate cold
   # build-release job is needed.
   source-home-linux:
-    name: source-home-linux (${{ matrix.os }})
+    name: source-home-linux (${{ matrix.check_name || matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: source-gate
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # Jetson's Ubuntu 22.04 host provides glibc 2.35.
+        os: [ubuntu-24.04, ubuntu-22.04-arm]
+        include:
+          # Keep the established check name; os controls the build and artifact.
+          - os: ubuntu-22.04-arm
+            check_name: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
@@ -314,7 +321,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos-bd
+          prefix-key: ${{ matrix.os }}-${{ runner.arch }}-elastos-bd
           # Shared intermediate build dir (root .cargo/config.toml build-dir)
           cache-directories: target-build
       - name: require 16 GiB free disk
@@ -350,7 +357,21 @@ jobs:
           scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
           ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
             scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: fetch pinned Jetson engine archive
+        if: matrix.os == 'ubuntu-22.04-arm'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 36501810782 \
+            --repo Elacity/elastos-runtime \
+            --name llama-b10516-ubuntu22.04-arm64-cpu-36501810782-1 \
+            --dir "${RUNNER_TEMP}/llama-arm64-bundle"
+          echo 'da2b1e87fd7ffb90e540a6ded7a725994594e9bc260bf539858392d5fc96b205  llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz' \
+            | (cd "${RUNNER_TEMP}/llama-arm64-bundle" && sha256sum --check -)
       - name: local-carrier setup smoke
+        env:
+          ELASTOS_LLAMA_ARM64_BUNDLE: ${{ runner.temp }}/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
@@ -384,6 +405,13 @@ jobs:
           # Incremental on top of setup-source-home's release builds.
           cargo build --manifest-path elastos/Cargo.toml --workspace --release
           scripts/package-release-binaries.sh
+      - name: verify Jetson release compatibility
+        if: matrix.os == 'ubuntu-22.04-arm'
+        run: |
+          python3 scripts/verify-linux-arm64-package.py elastos-runtime-linux-arm64.tar.gz \
+            --source-commit "$(git rev-parse HEAD)" \
+            --source-tree "$(git rev-parse HEAD^{tree})" \
+            --receipt elastos-runtime-linux-arm64.receipt.json
       - name: upload release binaries
         if: github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v5
@@ -392,6 +420,7 @@ jobs:
           path: |
             elastos-runtime-*.tar.gz
             elastos-runtime-*.tar.gz.sha256
+            elastos-runtime-*.receipt.json
       - name: upload source-home logs
         if: failure()
         uses: actions/upload-artifact@v5

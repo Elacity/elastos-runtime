@@ -24,6 +24,22 @@ case "$(uname -m)" in
         ;;
 esac
 
+if [[ "${SETUP_PLATFORM}" == linux-arm64 ]]; then
+    [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]] || {
+        echo "ELASTOS_LLAMA_ARM64_BUNDLE is required for the ARM64 Carrier smoke." >&2
+        exit 1
+    }
+    python3 - "${REPO_ROOT}/components.json" "${ELASTOS_LLAMA_ARM64_BUNDLE}" <<'PY'
+import hashlib, json, pathlib, sys
+info = json.loads(pathlib.Path(sys.argv[1]).read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
+source = pathlib.Path(sys.argv[2])
+if not source.is_file() or source.is_symlink() or source.stat().st_size != info["size"]:
+    raise SystemExit("ARM64 Carrier smoke engine archive is missing or has the wrong size")
+if "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() != info["checksum"]:
+    raise SystemExit("ARM64 Carrier smoke engine archive checksum differs from components.json")
+PY
+fi
+
 SMOKE_TEMP_BASE="${RUNNER_TEMP:-${CARGO_TARGET_DIR:-${REPO_ROOT}/target-build}}"
 mkdir -p "$SMOKE_TEMP_BASE"
 TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${SMOKE_TEMP_BASE}/elastos-local-carrier-setup.XXXXXX")}"
@@ -282,6 +298,14 @@ media_archive = artifacts_dir / media_info["release_path"]
 shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
 media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
 media_info["size"] = media_archive.stat().st_size
+
+if platform == "linux-arm64":
+    engine_info = platform_info("llama-server")
+    engine_archive = artifacts_dir / engine_info["release_path"]
+    shutil.copyfile(os.environ["ELASTOS_LLAMA_ARM64_BUNDLE"], engine_archive)
+    if (engine_archive.stat().st_size != engine_info["size"] or
+            "sha256:" + hashlib.sha256(engine_archive.read_bytes()).hexdigest() != engine_info["checksum"]):
+        raise SystemExit("staged ARM64 engine archive differs from components.json")
 
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())

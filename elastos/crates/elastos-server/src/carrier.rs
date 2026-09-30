@@ -19,7 +19,7 @@
 //! See `docs/CARRIER_TRUST_DECISION.md` for the rationale.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -1255,7 +1255,18 @@ async fn bind_carrier_endpoint(
     allow_ephemeral_fallback: bool,
 ) -> anyhow::Result<Endpoint> {
     let builder = || short_lived_endpoint_builder(secret_key.clone(), network, approved_relay);
-    let bound = builder()?.bind_addr(requested_bind_addr).map_err(|error| {
+    let requested = builder()?;
+    // Iroh retains the other address family's default wildcard listener.
+    // A configured loopback endpoint uses only its requested IP transport.
+    // Its local-only address has no external router port to map.
+    let requested = if requested_bind_addr.ip().is_loopback() {
+        requested
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+    } else {
+        requested
+    };
+    let bound = requested.bind_addr(requested_bind_addr).map_err(|error| {
         anyhow::anyhow!("Invalid Carrier address {requested_bind_addr}: {error}")
     })?;
     match bound.bind().await {
@@ -1272,8 +1283,37 @@ async fn bind_carrier_endpoint(
     }
 }
 
+/// Read the operator's Carrier address for Runtime startup and standalone setup.
+pub fn configured_carrier_bind_addr(
+    data_dir: &Path,
+) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    let contents = match std::fs::read_to_string(data_dir.join("config.toml")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Cannot read Runtime config.toml"),
+    };
+    let table: toml::Table = contents.parse().context("Invalid Runtime config.toml")?;
+    table
+        .get("carrier_bind_addr")
+        .map(|value| {
+            value
+                .as_str()
+                .context("carrier_bind_addr must be a socket address string")?
+                .parse()
+                .context("Invalid carrier_bind_addr")
+        })
+        .transpose()
+}
+
 pub(crate) async fn bind_short_lived_carrier_dial(
     addr: iroh::EndpointAddr,
+) -> anyhow::Result<(Endpoint, iroh::EndpointAddr)> {
+    bind_short_lived_carrier_dial_bound(addr, None).await
+}
+
+async fn bind_short_lived_carrier_dial_bound(
+    addr: iroh::EndpointAddr,
+    bind_addr: Option<std::net::SocketAddr>,
 ) -> anyhow::Result<(Endpoint, iroh::EndpointAddr)> {
     let network =
         parse_elastos_carrier_network(std::env::var("ELASTOS_CARRIER_NETWORK").ok().as_deref())?;
@@ -1282,10 +1322,15 @@ pub(crate) async fn bind_short_lived_carrier_dial(
     let mut rng_bytes = [0u8; 32];
     getrandom::getrandom(&mut rng_bytes).map_err(|err| anyhow::anyhow!("rng: {err}"))?;
     let secret_key = SecretKey::from_bytes(&rng_bytes);
-    let endpoint = short_lived_endpoint_builder(secret_key, network, approved.as_ref())?
-        .bind()
-        .await
-        .context("Failed to bind")?;
+    let endpoint = match bind_addr {
+        Some(address) => {
+            bind_carrier_endpoint(secret_key, network, approved.as_ref(), address, false).await?
+        }
+        None => short_lived_endpoint_builder(secret_key, network, approved.as_ref())?
+            .bind()
+            .await
+            .context("Failed to bind")?,
+    };
     Ok((endpoint, addr))
 }
 
@@ -8044,7 +8089,15 @@ impl CarrierClient {
         addr: iroh::EndpointAddr,
         timeout_secs: u64,
     ) -> Result<Self> {
-        let (endpoint, addr) = bind_short_lived_carrier_dial(addr).await?;
+        Self::connect_endpoint_addr_bound(addr, timeout_secs, None).await
+    }
+
+    async fn connect_endpoint_addr_bound(
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+        bind_addr: Option<std::net::SocketAddr>,
+    ) -> Result<Self> {
+        let (endpoint, addr) = bind_short_lived_carrier_dial_bound(addr, bind_addr).await?;
         Self::connect_owned_endpoint(endpoint, addr, timeout_secs).await
     }
 
@@ -8077,6 +8130,15 @@ impl CarrierClient {
         publisher_addrs: &[String],
         timeout_secs: u64,
     ) -> Result<Self> {
+        Self::connect_bound(publisher_node_id, publisher_addrs, timeout_secs, None).await
+    }
+
+    async fn connect_bound(
+        publisher_node_id: &str,
+        publisher_addrs: &[String],
+        timeout_secs: u64,
+        bind_addr: Option<std::net::SocketAddr>,
+    ) -> Result<Self> {
         let public_key: iroh::PublicKey = publisher_node_id.parse().context("Invalid node ID")?;
         let mut addr = iroh::EndpointAddr::from(public_key);
         for addr_str in publisher_addrs {
@@ -8098,7 +8160,7 @@ impl CarrierClient {
             }
         }
 
-        Self::connect_endpoint_addr(addr, timeout_secs).await
+        Self::connect_endpoint_addr_bound(addr, timeout_secs, bind_addr).await
     }
 
     pub async fn connect_trusted_source(source: &TrustedSource, timeout_secs: u64) -> Result<Self> {
@@ -8341,11 +8403,30 @@ pub async fn fetch_file_from_trusted_source(
     connect_timeout_secs: u64,
     fetch_timeout_secs: u64,
 ) -> Result<Vec<u8>> {
+    fetch_file_from_trusted_source_bound(
+        source,
+        path,
+        connect_timeout_secs,
+        fetch_timeout_secs,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_file_from_trusted_source_bound(
+    source: &TrustedSource,
+    path: &str,
+    connect_timeout_secs: u64,
+    fetch_timeout_secs: u64,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> Result<Vec<u8>> {
     let node_id = source_transport_endpoint_id(source)?;
     let mut errors = Vec::new();
     let ticket_endpoints = decode_ticket_endpoints(&source.connect_ticket);
     for (index, endpoint) in ticket_endpoints.into_iter().enumerate() {
-        match CarrierClient::connect_endpoint_addr(endpoint, connect_timeout_secs).await {
+        match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
+            .await
+        {
             Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
@@ -8356,7 +8437,9 @@ pub async fn fetch_file_from_trusted_source(
 
     let relay_endpoints = relay_only_ticket_endpoints(source);
     for (index, endpoint) in relay_endpoints.into_iter().enumerate() {
-        match CarrierClient::connect_endpoint_addr(endpoint, connect_timeout_secs).await {
+        match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
+            .await
+        {
             Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
@@ -8368,7 +8451,7 @@ pub async fn fetch_file_from_trusted_source(
     let node_id =
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
-    match CarrierClient::connect(&node_id, &addrs, connect_timeout_secs).await {
+    match CarrierClient::connect_bound(&node_id, &addrs, connect_timeout_secs, bind_addr).await {
         Ok(client) => match fetch_file_with_timeout(client, path, fetch_timeout_secs).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
@@ -10131,6 +10214,88 @@ pub(crate) mod tests {
         assert!(!carrier_provider_target_allowed(
             "protected-content-decrypt"
         ));
+    }
+
+    #[tokio::test]
+    async fn carrier_configured_setup_fetch_owns_fixed_port() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind_addr = occupied.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("carrier_bind_addr = \"{bind_addr}\"\n"),
+        )
+        .unwrap();
+        let source = TrustedSource {
+            name: "fixture".into(),
+            publisher_dids: vec![],
+            channel: "stable".into(),
+            discovery_uri: String::new(),
+            connect_ticket: encode_ticket_for(address),
+            gateways: vec![],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: server.id().to_string(),
+            ipns_name: String::new(),
+        };
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.default_source = source.name.clone();
+        sources.sources.push(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::setup::fetch_first_party_component_via_carrier(dir.path(), "artifact"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains(&bind_addr.to_string()));
+        assert_eq!(occupied.local_addr().unwrap(), bind_addr);
+        drop(occupied);
+
+        let server_endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            for _ in 0..2 {
+                let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(recv).read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["path"],
+                    "artifact"
+                );
+                assert!(std::net::UdpSocket::bind(bind_addr).is_err());
+                send.write_all(&7u64.to_be_bytes()).await.unwrap();
+                send.write_all(b"fixture").await.unwrap();
+                send.finish().unwrap();
+                conn.closed().await;
+            }
+        });
+        for _ in 0..2 {
+            let bytes =
+                crate::setup::fetch_first_party_component_via_carrier(dir.path(), "artifact")
+                    .await
+                    .unwrap();
+            assert_eq!(bytes, b"fixture");
+            // The next component can immediately take the same configured port.
+            drop(std::net::UdpSocket::bind(bind_addr).unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        server.close().await;
     }
 
     async fn carrier_client_fetch_cleanup_case(reply: &str) {
@@ -15504,6 +15669,25 @@ pub(crate) mod tests {
                 .contains("trusted source publisher_node_id must be one raw Iroh endpoint ID"),
             "unexpected configured transport-id error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_loopback_carrier_bind_has_only_requested_transport() {
+        let signing_key = SecretKey::from_bytes(&[108u8; 32]);
+        let address = "127.0.0.1:0".parse().unwrap();
+        let endpoint = bind_carrier_endpoint(
+            signing_key,
+            CarrierNodeNetwork::Isolated,
+            None,
+            address,
+            false,
+        )
+        .await
+        .unwrap();
+        let sockets = endpoint.bound_sockets();
+        endpoint.close().await;
+        assert_eq!(sockets.len(), 1, "loopback endpoint bound {sockets:?}");
+        assert_eq!(sockets[0].ip(), address.ip());
     }
 
     #[tokio::test]
