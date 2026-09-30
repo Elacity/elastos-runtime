@@ -113,20 +113,21 @@ import hashlib, json, os, subprocess, sys
 from pathlib import Path
 root, data = map(Path, sys.argv[1:])
 commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-sha = hashlib.file_digest((data / "bin/elastos").open("rb"), "sha256").hexdigest()
+runtime = data / "bin/elastos"
+sha = hashlib.file_digest(runtime.open("rb"), "sha256").hexdigest() if runtime.is_file() else "unavailable: installation did not complete"
 results = {"home_screenshots": "failed or not run", "model_package_admission": "failed or not run", "installed_runtime_reply": "failed or not run", "la04_lifecycle": "not required on macOS" if sys.platform == "darwin" else "failed or not run"}
-elapsed = None
+elapsed = 0
 for name in ["installed-journeys.json", "la04-result.json"]:
     if (root / name).exists():
         row = json.loads((root / name).read_text())
         results.update(row.get("results", row if name == "la04-result.json" else {}))
-        elapsed = row.get("elapsed_seconds", elapsed)
+        elapsed += row.get("elapsed_seconds", 0)
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     summary.write(f"### Installed journeys\n\nCandidate: `{commit}`\n\nInstalled Runtime SHA-256: `{sha}`\n\n")
     summary.write("| Journey | Result |\n| --- | --- |\n")
     for name, result in results.items():
         summary.write(f"| {name} | {result} |\n")
-    summary.write(f"\nHome journey time: {elapsed} seconds. Cgroup ancestry, finite limits, package identity and screenshots are in the journey artifact.\n")
+    summary.write(f"\nRecorded journey execution time: {elapsed} seconds. Cgroup ancestry, finite limits, package identity and screenshots are in the journey artifact.\n")
 PY
         ;;
     *) echo "Usage: $0 prepare|home|lifecycle|summary" >&2; exit 2 ;;

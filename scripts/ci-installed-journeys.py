@@ -50,11 +50,13 @@ def run(home, data, evidence):
     environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / ".local/share"))
     with socket.socket() as port:
         port.bind(("127.0.0.1", 0))
-        address = f"localhost:{port.getsockname()[1]}"
+        number = port.getsockname()[1]
+        address = f"localhost:{number}"
+        bind_address = f"127.0.0.1:{number}"
     started = time.monotonic()
     # Runtime logs stay private in the isolated Home; upload receipts/screenshots only.
     log = (home / "journey-runtime.private.log").open("wb")
-    child = subprocess.Popen([str(installed), "serve", "--addr", address], env=environment, stdout=log, stderr=log, start_new_session=True)
+    child = subprocess.Popen([str(installed), "serve", "--addr", bind_address], env=environment, stdout=log, stderr=log, start_new_session=True)
     try:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
