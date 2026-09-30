@@ -481,6 +481,7 @@ enum LocalTextBackend {
 }
 
 struct PreparedLocalTextWorker {
+    local_run_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     run_id: String,
     generation: u64,
     cancel_rx: watch::Receiver<bool>,
@@ -617,7 +618,7 @@ impl LiveAdapterExecutor {
         updates: mpsc::Sender<WorkerUpdate>,
         sockets: BTreeMap<String, String>,
     ) -> Self {
-        Self::new_with_runtime_sockets(runtime, updates, sockets, None)
+        Self::new_with_runtime_sockets(runtime, updates, sockets, None, None)
     }
 
     pub(crate) fn new_with_runtime_sockets(
@@ -625,13 +626,16 @@ impl LiveAdapterExecutor {
         updates: mpsc::Sender<WorkerUpdate>,
         sockets: BTreeMap<String, String>,
         hosted_socket: Option<String>,
+        resource_root: Option<std::path::PathBuf>,
     ) -> Self {
+        let mut local_llama = LocalLlamaEngines::with_runtime_sockets(sockets);
+        local_llama.resource_root = resource_root;
         Self {
             runtime,
             updates,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
-            local_llama: LocalLlamaEngines::with_runtime_sockets(sockets),
+            local_llama,
             hosted_socket,
         }
     }
@@ -767,6 +771,15 @@ impl LiveAdapterExecutor {
                 "local text worker already exists for run_id",
             ));
         }
+        let local_run_slot = if matches!(backend, LocalTextBackend::LocalLlama { .. }) {
+            Some(
+                self.local_llama
+                    .reserve_run()
+                    .map_err(map_local_llama_fault)?,
+            )
+        } else {
+            None
+        };
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         workers.insert(
@@ -791,6 +804,7 @@ impl LiveAdapterExecutor {
                 generation,
                 cancel_rx,
                 backend_state,
+                local_run_slot,
             },
             workers,
         )
@@ -807,6 +821,7 @@ impl LiveAdapterExecutor {
         mut workers: std::sync::MutexGuard<'_, BTreeMap<String, WorkerRecord>>,
     ) -> std::result::Result<Value, AdapterFault> {
         let PreparedLocalTextWorker {
+            local_run_slot,
             run_id,
             generation,
             cancel_rx,
@@ -819,6 +834,7 @@ impl LiveAdapterExecutor {
         let hosted_socket = self.hosted_socket.clone();
         let run_id_for_task = run_id.clone();
         let join_handle = self.runtime.spawn(async move {
+            let _local_run_slot = local_run_slot;
             let timed_out = run_local_text_worker(LocalTextWorkerTask {
                 run_id: run_id_for_task.clone(),
                 request_id,
@@ -1464,7 +1480,7 @@ fn cancel_local_text(
 }
 
 async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
-    let result = match run_local_text_worker_inner(&mut task).await {
+    let result = match run_queued_local_text_worker(&mut task).await {
         Ok(result) => result,
         Err(fault) if fault.error.class == ErrorClass::BackendTimeout => return true,
         Err(fault) => ReconcileResult::Terminal {
@@ -1496,6 +1512,79 @@ async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
             ..
         })
     )
+}
+
+async fn run_queued_local_text_worker(
+    task: &mut LocalTextWorkerTask,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    let (engines, offer_id) = match &task.backend {
+        LocalTextBackend::LocalLlama {
+            engines, offer_id, ..
+        } => (engines.clone(), offer_id.clone()),
+        _ => return run_local_text_worker_inner(task).await,
+    };
+    let mut cancel = task.cancel_rx.clone();
+    // The single execution permit covers startup, generation, and uncertain-stop
+    // cleanup. Waiting runs hold only their bounded queue reservation.
+    let _execution = tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => return Ok(queued_local_cancelled()),
+        result = tokio::time::timeout(remaining_run_timeout(task.deadline_ms)?, engines.execution.acquire()) => {
+            result.map_err(|_| map_local_llama_fault(LocalLlamaFault::Timeout))?
+                .map_err(|_| map_local_llama_fault(LocalLlamaFault::Failed))?
+        }
+    };
+    engines.cancel_idle_release().await;
+    if let Err(fault) = engines.close_other_offers(&offer_id).await {
+        engines.release_when_idle().await;
+        return Err(map_local_llama_fault(fault));
+    }
+    let mut result = tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => Ok(worker_settlement_unknown_result()),
+        result = run_local_text_worker_inner(task) => result,
+    };
+    if !matches!(
+        &result,
+        Ok(ReconcileResult::Terminal {
+            status: RunStatus::Completed,
+            ..
+        })
+    ) {
+        // Closing the HTTP stream alone can leave generation running. Retain the
+        // execution permit until the owned engine has stopped or closure fails.
+        result = after_local_cleanup(result, engines.close_offer(&offer_id).await);
+    }
+    engines.release_when_idle().await;
+    result
+}
+
+fn after_local_cleanup(
+    result: std::result::Result<ReconcileResult, AdapterFault>,
+    cleanup: std::result::Result<(), LocalLlamaFault>,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    if let Err(fault) = cleanup {
+        map_local_llama_fault(fault).log();
+        // The retained engine and lease still own any unconfirmed work. A
+        // cleanup failure cannot turn that uncertainty into a known failure.
+        Ok(worker_settlement_unknown_result())
+    } else {
+        result
+    }
+}
+
+fn queued_local_cancelled() -> ReconcileResult {
+    ReconcileResult::Terminal {
+        events: Vec::new(),
+        status: RunStatus::Cancelled,
+        output: None,
+        error: Some(RunError {
+            class: ErrorClass::Cancelled,
+            code: "cancelled".into(),
+            message: "Model run was cancelled before execution.".into(),
+        }),
+        backend_report: None,
+    }
 }
 
 async fn run_http_artifact_create_worker(task: HttpArtifactCreateWorkerTask) {
@@ -2143,6 +2232,36 @@ async fn run_decision_worker(
 
 fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
     match fault {
+        LocalLlamaFault::MemoryUnavailable
+        | LocalLlamaFault::DiskUnavailable
+        | LocalLlamaFault::ResourcesUnavailable => AdapterFault {
+            error: RunError {
+                class: ErrorClass::ContextRejected,
+                code: match fault {
+                    LocalLlamaFault::MemoryUnavailable => "model_memory_unavailable",
+                    LocalLlamaFault::DiskUnavailable => "model_disk_unavailable",
+                    _ => "model_resources_unavailable",
+                }
+                .into(),
+                message: match fault {
+                    LocalLlamaFault::MemoryUnavailable => "Free memory or select a smaller model.",
+                    LocalLlamaFault::DiskUnavailable => {
+                        "Free disk space before running this model."
+                    }
+                    _ => "This model's resource profile is unavailable.",
+                }
+                .into(),
+            },
+            detail: None,
+        },
+        LocalLlamaFault::Busy => AdapterFault {
+            error: RunError {
+                class: ErrorClass::RateLimited,
+                code: "model_busy".into(),
+                message: "Model is busy.".into(),
+            },
+            detail: None,
+        },
         LocalLlamaFault::Timeout => AdapterFault::timeout(
             "model backend timed out",
             "local llama engine health deadline expired",
@@ -4302,6 +4421,94 @@ mod tests {
             Some(BackendReport::unknown())
         );
         assert!(update_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unconfirmed_local_cleanup_preserves_settlement_uncertainty() {
+        for cleanup in [LocalLlamaFault::Failed, LocalLlamaFault::Timeout] {
+            let result =
+                after_local_cleanup(Ok(worker_settlement_unknown_result()), Err(cleanup)).unwrap();
+            assert!(matches!(
+                result,
+                ReconcileResult::Terminal {
+                    status: RunStatus::SettlementUnknown,
+                    output: None,
+                    ..
+                }
+            ));
+        }
+        let fault = map_local_llama_fault(LocalLlamaFault::MemoryUnavailable);
+        assert!(after_local_cleanup(Err(fault), Ok(())).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_local_cancellation_finishes_before_engine_start() {
+        let engines = LocalLlamaEngines::default();
+        let active = engines.execution.acquire().await.unwrap();
+        let (updates, mut updates_rx) = mpsc::channel(1);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            request_id: "queued-request".into(),
+            hosted_socket: None,
+            run_id: "queued-run".into(),
+            generation: 1,
+            backend: LocalTextBackend::LocalLlama {
+                engines: engines.clone(),
+                offer_id: "local".into(),
+                requested_output_tokens: None,
+                engine: LocalArtifactConfig {
+                    path: "/unavailable-engine".into(),
+                    sha256: String::new(),
+                },
+                model: LocalArtifactConfig {
+                    path: "/unavailable-model".into(),
+                    sha256: String::new(),
+                },
+                settings: LocalLlamaSettings {
+                    context_size: 256,
+                    parallel: 1,
+                    threads: 1,
+                    batch_threads: 1,
+                    gpu_layers: 0,
+                    health_timeout_ms: 1000,
+                    shutdown_timeout_ms: 250,
+                    enable_thinking: false,
+                },
+            },
+            offer: openai_offer("http://127.0.0.1/chat"),
+            deadline_ms: now_ms() + 30_000,
+            messages: vec![json!({"role":"user","content":"queued private text"})],
+            cancel_rx,
+            updates,
+        };
+        // Cancellation already set before polling must win over an available
+        // execution slot as well as while another local run owns the slot.
+        cancel.send(true).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_queued_local_text_worker(&mut task),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            result,
+            ReconcileResult::Terminal {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert!(updates_rx.try_recv().is_err());
+        assert!(!engines.retains_artifacts().await);
+        drop(active);
+        let result = run_queued_local_text_worker(&mut task).await.unwrap();
+        assert!(matches!(
+            result,
+            ReconcileResult::Terminal {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
     }
 
     #[test]

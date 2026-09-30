@@ -203,6 +203,46 @@ After an Agent Host or Runtime restart, the session journal must distinguish:
 Resuming a conversation creates a new inference request unless it is only
 reattaching to an existing request. The UI must show which case occurred.
 
+## Local execution resources
+
+Participating Runtime installations in the same OS account share one local
+engine lease, across their data roots. The provider and its guard and engine
+children hold the lease until engine shutdown is confirmed. Another Runtime
+returns `model_busy` with the message "Model is busy." The empty, owner-only
+lease file carries no Home, model, prompt or account details. Other OS accounts
+and applications outside Runtime have separate ownership.
+
+Each Runtime admits one executing local run and up to eight waiting runs across
+all its local offers. The local engine executes one run at a time; an offer's
+`concurrency_limit` remains an execution ceiling. The existing `running` state
+covers both waiting and executing requests. Cancel stops a waiting request
+before engine startup and settles it as `cancelled`. Once execution can have
+started, Runtime retains `settlement_unknown` and closes the engine before the
+next local run. Hosted offers keep their configured concurrency limits.
+
+Before loading or switching a local model, admission checks available host
+memory against the model weights, the selected context with per-slot KV padding,
+a scratch reserve that includes at least the weight size or 512 MiB plus
+context-dependent attention buffers, logits, and layer activation buffers, and
+Home headroom of at least 1 GiB or 10% of physical memory. The launch pins both
+batch sizes to 128, matching the estimate. It also preserves a 10% free-space
+floor plus journal space on the model and Home volumes. The supported memory
+profiles are the ordinary `llama`, `qwen2` and `qwen3` GGUF attention layouts.
+Incomplete metadata, split models, arithmetic overflow and other layouts return
+`model_resources_unavailable`. Low memory returns `model_memory_unavailable`;
+low disk space returns `model_disk_unavailable`. The person can free resources
+or select a supported smaller model, then send a new request.
+Linux admission requires a visible unified cgroup hierarchy through the global
+memory-controller root. A restricted cgroup namespace or unreadable limit
+returns `model_resources_unavailable` because its full memory budget is unknown.
+
+Switching closes the previous local engine. A completed run can reuse its warm
+engine for 60 seconds. An idle timer holds the same execution permit as a run
+before it closes the engine, so a newly active run retains ownership. Provider
+crash cleanup keeps the shared lease held while its engine descendants exit.
+These checks bound participating Runtime work; other applications can change
+host pressure after admission.
+
 ## Errors
 
 Provider results use stable error classes while retaining a redacted backend

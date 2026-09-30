@@ -508,7 +508,13 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         self.journal.store_run(&run)?;
 
         let active_runs = self.journal.active_run_count(&offer.id)?;
-        if active_runs > offer.policy.concurrency_limit as usize {
+        let run_limit = if matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. }) {
+            // One executing local run plus a bounded queue shared across offers.
+            crate::local_llama::LOCAL_RUN_QUEUE_CAPACITY + 1
+        } else {
+            offer.policy.concurrency_limit as usize
+        };
+        if active_runs > run_limit {
             transition_error(
                 &offer,
                 &mut run,
