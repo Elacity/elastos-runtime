@@ -29,7 +29,11 @@ struct ProviderProcess {
 
 impl ProviderProcess {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_model-provider"))
+        Self::start_at(Path::new(env!("CARGO_BIN_EXE_model-provider")))
+    }
+
+    fn start_at(binary: &Path) -> Self {
+        let mut child = Command::new(binary)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -245,7 +249,15 @@ fn cancel_local_run(provider: &mut ProviderProcess, created: &Value) {
 }
 
 fn terminal_local_run(provider: &mut ProviderProcess, created: &Value) -> Value {
-    let deadline = Instant::now() + PROCESS_DEADLINE;
+    terminal_local_run_before(provider, created, PROCESS_DEADLINE)
+}
+
+fn terminal_local_run_before(
+    provider: &mut ProviderProcess,
+    created: &Value,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
     loop {
         let view = provider.request(json!({
             "op":"runs_get", "run_id":created["data"]["run_id"],
@@ -322,9 +334,10 @@ fn queue_saturation_and_waiting_cancellation_preserve_active_engine() {
     );
     assert!(process_exists(engine_pid(&events)));
     cancel_local_run(&mut provider, &first);
+    let cancelled = terminal_local_run(&mut provider, &first);
     assert_eq!(
-        terminal_local_run(&mut provider, &first)["data"]["status"],
-        "settlement_unknown"
+        cancelled["data"]["status"], "settlement_unknown",
+        "{cancelled}"
     );
     assert!(wait_for_process_exit(engine_pid(&events)));
     provider.shutdown();
@@ -624,4 +637,114 @@ for (const id of ['chat','responses']) {
         provider.shutdown();
     }
     assert!(matches!(sink.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+}
+
+/// This proof runs the production provider installed at a stable fixture path.
+/// Its caller supplies copied, hash-verified engine/model inputs and records the
+/// candidate receipt. It establishes provider behavior, separate from Home UX.
+#[test]
+#[ignore = "requires ELASTOS_MODEL_RESOURCE_PROOF_ROOT with an installed provider and real engine/model in first/ and second/"]
+fn installed_local_resource_lifecycle() {
+    let _lease = LOCAL_ENGINE_TEST.lock().unwrap();
+    let root = PathBuf::from(std::env::var_os("ELASTOS_MODEL_RESOURCE_PROOF_ROOT").unwrap());
+    assert!(root.is_absolute());
+    let binary = root.join("bin/model-provider");
+    assert!(binary.is_file());
+    let attempt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let init = |name: &str| {
+        let data = root.join(name);
+        let engine = data.join("engine/llama-server");
+        let model = data.join("model.gguf");
+        let mut provider = ProviderProcess::start_at(&binary);
+        let initialized = provider.request(json!({
+            "op":"init", "config": {
+                "base_path":data,"allowed_paths":[],"read_only":false,"encryption_key":"",
+                "extra":{"journal_dir":data.join(format!("journal-{attempt}")),"offers":[{
+                    "id":"local-text","title":"Resource fixture","operation":"text.generate",
+                    "input_modalities":["text/plain"],"output_modalities":["text/plain"],"enabled":true,
+                    "policy":{"concurrency_limit":1,"input_bytes_limit":8192,
+                        "inline_output_bytes_limit":512,"event_bytes_limit":8192,
+                        "runtime_ms_limit":30000,"retention_secs":60,"cancel_settlement_timeout_ms":1000},
+                    "adapter":{"kind":"local_llama_cpp_text",
+                        "engine":{"path":engine,"sha256":test_support::sha256_file(&engine)},
+                        "model":{"path":model,"sha256":test_support::sha256_file(&model)},
+                        "settings":{"context_size":4096,"parallel":1,"threads":2,"batch_threads":2,
+                            "gpu_layers":0,"health_timeout_ms":10000,"shutdown_timeout_ms":1000,
+                            "enable_thinking":false}}
+                }]}
+            }
+        }));
+        assert_eq!(initialized["status"], "ok", "{initialized}");
+        provider
+    };
+    let descendants = |pid: u32| {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,ppid="])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let rows: Vec<(i32, i32)> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+            })
+            .collect();
+        let mut owned = vec![pid as i32];
+        let mut index = 0;
+        while index < owned.len() {
+            let parent = owned[index];
+            owned.extend(rows.iter().filter(|(_, p)| *p == parent).map(|(p, _)| *p));
+            index += 1;
+        }
+        owned.remove(0);
+        owned
+    };
+    let mut first = init("first");
+    let mut second = init("second");
+    let created = create_local_prompt(&mut first, "real-first", "Say hello.");
+    let ready = terminal_local_run_before(&mut first, &created, Duration::from_secs(35));
+    assert_eq!(ready["data"]["status"], "completed", "{ready}");
+    assert!(!ready["data"]["terminal"]["output"]["text"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    let owned = descendants(first.child.id());
+    assert!(owned.len() >= 2, "guard and engine must be present");
+    let created = create_local_run(&mut second, "real-busy");
+    let busy = terminal_local_run_before(&mut second, &created, Duration::from_secs(35));
+    assert_eq!(
+        busy["data"]["terminal"]["error"]["code"], "model_busy",
+        "{busy}"
+    );
+    assert!(descendants(second.child.id()).is_empty());
+    let idle_deadline = Instant::now() + Duration::from_secs(65);
+    while owned.iter().any(|pid| process_exists(*pid)) {
+        assert!(
+            Instant::now() < idle_deadline,
+            "idle release retained engine descendants"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let created = create_local_prompt(&mut second, "real-after-idle", "Say hello.");
+    let recovered = terminal_local_run_before(&mut second, &created, Duration::from_secs(35));
+    assert_eq!(recovered["data"]["status"], "completed", "{recovered}");
+    let owned = descendants(second.child.id());
+    assert!(owned.len() >= 2);
+    second.hard_kill();
+    for pid in owned {
+        assert!(wait_for_process_exit(pid), "crash retained child {pid}");
+    }
+    let created = create_local_prompt(&mut first, "real-after-crash", "Say hello.");
+    let recovered = terminal_local_run_before(&mut first, &created, Duration::from_secs(35));
+    assert_eq!(recovered["data"]["status"], "completed", "{recovered}");
+    let owned = descendants(first.child.id());
+    first.shutdown();
+    for pid in owned {
+        assert!(wait_for_process_exit(pid), "shutdown retained child {pid}");
+    }
 }
