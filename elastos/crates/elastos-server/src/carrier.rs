@@ -1257,9 +1257,12 @@ async fn bind_carrier_endpoint(
     let builder = || short_lived_endpoint_builder(secret_key.clone(), network, approved_relay);
     let requested = builder()?;
     // Iroh retains the other address family's default wildcard listener.
-    // A configured loopback endpoint owns only its requested IP transport.
+    // A configured loopback endpoint uses only its requested IP transport.
+    // Its local-only address has no external router port to map.
     let requested = if requested_bind_addr.ip().is_loopback() {
-        requested.clear_ip_transports()
+        requested
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
     } else {
         requested
     };
