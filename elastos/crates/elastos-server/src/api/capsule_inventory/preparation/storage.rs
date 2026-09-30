@@ -739,7 +739,7 @@ pub(super) fn space_floor_fits(
     let Some(remaining) = available.checked_sub(reserved) else {
         return Ok(false);
     };
-    Ok(remaining.checked_mul(10).context("disk floor overflow")? >= capacity)
+    Ok(remaining >= u128::from(elastos_common::MIN_FREE_DISK_BYTES))
 }
 
 pub(super) fn require_space_floor(
@@ -751,7 +751,7 @@ pub(super) fn require_space_floor(
     ensure!(available >= reserved, "insufficient preparation space");
     ensure!(
         fits,
-        "preparation requires ten percent free space after reservation"
+        "preparation requires 15 GiB free space after reservation"
     );
     Ok(())
 }

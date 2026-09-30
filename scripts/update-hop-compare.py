@@ -221,7 +221,7 @@ def inspect(config):
     fixture_components(paths["components"])
     disk = shutil.disk_usage(root)
     growth = 2 * sum(paths[key].stat().st_size for key in ("binary", "components"))
-    need((disk.free - growth) / disk.total >= 0.1, "two update copies would breach the 10% disk reserve")
+    need(disk.free - growth >= 15 * 1024**3, "two update copies would breach the 15 GiB disk reserve")
     head, release = read(paths["head"]), read(paths["release"])
     for envelope in (head, release):
         need(envelope["payload"]["version"] == config["new"]["version"], "publication version differs")

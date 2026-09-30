@@ -934,6 +934,9 @@ stage_release_artifacts() {
     if [[ -f model-catalog.json ]]; then
         cp -f model-catalog.json "${artifact_dir}/model-catalog.json"
     fi
+    if [[ -f collaboration-network-release-v1.json ]]; then
+        cp -f collaboration-network-release-v1.json "${artifact_dir}/collaboration-network-release-v1.json"
+    fi
     if [[ -n "${CROSS_PLATFORM:-}" ]]; then
         CROSS_SRC="${TMPDIR}/artifacts-${CROSS_ARCH}"
         [ -d "$CROSS_SRC" ] || CROSS_SRC="artifacts-${CROSS_ARCH}"
@@ -1058,10 +1061,11 @@ merge_direct_assets() {
 generate_components_json() {
     local capsule_entries="$1"
     local direct_assets="$2"
-    local external profiles catalog
+    local external profiles catalog network
     external=$(jq '.external' components.json)
     profiles=$(jq '.profiles' components.json)
     catalog=$(jq -c '.model_catalog // null' components.json)
+    network=$(jq -c '.collaboration_network // null' components.json)
     jq -n \
         --arg schema "elastos.components/v1" \
         --argjson capsules "$capsule_entries" \
@@ -1069,7 +1073,8 @@ generate_components_json() {
         --argjson profiles "$profiles" \
         --argjson direct "$direct_assets" \
         --argjson catalog "$catalog" \
-        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles} + (if $catalog == null then {} else {model_catalog: $catalog} end)'
+        --argjson network "$network" \
+        '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles} + (if $catalog == null then {} else {model_catalog: $catalog} end) + (if $network == null then {} else {collaboration_network: $network} end)'
 }
 
 runtime_tunnel_url() {
@@ -1271,6 +1276,28 @@ try:
         if actual != head:
             raise ValueError(f"model-catalog.json head {actual} does not match pin {head}")
         referenced.add("model-catalog.json")
+        extra = sorted(set(present) - referenced)
+    network_pin = None
+    for name in present:
+        if name.startswith("components-") and name.endswith(".json"):
+            candidate = json.loads(present[name].read_bytes()).get("collaboration_network")
+            if network_pin is None:
+                network_pin = candidate
+            elif network_pin != candidate:
+                raise ValueError("prepared components disagree on collaboration_network")
+    if isinstance(network_pin, dict):
+        head = network_pin.get("head_cid")
+        if not isinstance(head, str) or not head:
+            raise ValueError("collaboration_network.head_cid is required")
+        network_file = "collaboration-network-release-v1.json"
+        if network_file not in present:
+            raise ValueError(f"advertised Community network pin is missing {network_file}")
+        data = present[network_file].read_bytes()
+        digest = hashlib.sha256(data).digest()
+        actual = "b" + __import__("base64").b32encode(b"\x01\x55\x12\x20" + digest).decode("ascii").lower().rstrip("=")
+        if actual != head:
+            raise ValueError(f"{network_file} head {actual} does not match pin {head}")
+        referenced.add(network_file)
         extra = sorted(set(present) - referenced)
     if extra:
         raise ValueError(f"prepared artifacts are not advertised by this release: {extra}")
@@ -2224,6 +2251,26 @@ data = pathlib.Path(sys.argv[2]).read_bytes()
 head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
 if head != pin["head_cid"]:
     raise SystemExit(f"model-catalog.json head {head} does not match pin {pin['head_cid']}")
+PY
+python3 - "${TMPDIR}/components.json" collaboration-network-release-v1.json <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+pin = manifest.get("collaboration_network")
+network = pathlib.Path(sys.argv[2])
+if pin is None:
+    if network.exists():
+        raise SystemExit(f"{network} is present but components.json pins no collaboration_network")
+    raise SystemExit(0)
+if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
+    raise SystemExit("generated components.json has an invalid collaboration_network pin")
+head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(network.read_bytes()).digest()).decode("ascii").lower().rstrip("=")
+if head != pin["head_cid"]:
+    raise SystemExit(f"{network} head {head} does not match pin {pin['head_cid']}")
 PY
 
 COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components.json")

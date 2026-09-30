@@ -16,11 +16,11 @@ source "$HOME/.cargo/env"
 rustup target add wasm32-unknown-unknown
 ```
 
-Source-home imports `ffmpeg`/`ffprobe` from the explicit developer tools directory
-`SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR` for the media-provider prerequisite and
-fail-closed rejects any group-writable ancestor of the resolved binaries. If
-setup stops with `ffmpeg prerequisite parent is unsafe`, tighten the Homebrew
-directory on that path (commonly `chmod g-w /opt/homebrew/Cellar`) and rerun.
+Source-home requires an owner-only directory containing regular, owner-only
+`ffmpeg` and `ffprobe` executables. The build/setup wrapper copies the selected
+host tools into a private temporary directory inside the selected home and
+checks that the copies run. It preserves Homebrew permissions and removes the
+temporary copies on exit. Homebrew libraries remain dependencies of these tools.
 
 Ordinary Home setup fetches the signed `media-tools` package and imports its
 managed executable pair. The host tool instructions above apply to source-home
@@ -44,7 +44,7 @@ CARGO_HOME="$USER_HOME/.cargo" \
 RUSTUP_HOME="$USER_HOME/.rustup" \
 PATH="$USER_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
 ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
-scripts/setup-source-home.sh
+scripts/build-and-setup-source-home.sh
 ```
 
 `setup-source-home.sh` builds the runtime server, native providers,
@@ -54,6 +54,11 @@ and the local Kubo backend used by Library and Documents publish. It installs
 the stable Runtime under the source-home data root at `bin/elastos`, writes the
 owner-only `receipts/source-home-installation.json` receipt, and signs the
 installed VZ supervisor on macOS.
+
+The wrapper defaults to isolated collaboration and leaves Runtime startup as
+a separate step. It disables Browser TURN startup during setup. To check only
+the media tools before a build, run
+`scripts/build-and-setup-source-home.sh --check-tools`.
 
 For Home/passkey use without Browser VM proof artifacts, start the stable
 installed gateway through the restart helper:
@@ -95,7 +100,7 @@ CARGO_HOME="$USER_HOME/.cargo" \
 RUSTUP_HOME="$USER_HOME/.rustup" \
 PATH="$USER_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
 ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
-scripts/setup-source-home.sh
+scripts/build-and-setup-source-home.sh
 
 HOME="$MAC_TEST_HOME" scripts/browser-vm-artifact-preflight.sh
 ```

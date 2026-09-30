@@ -5199,7 +5199,20 @@ async fn home_realtime_snapshot(
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
         home_state.services = HomeServicesSummary::default();
     }
-    let room_signature = home_room_realtime_signature(&home_state.room);
+    // A new direct message refreshes its conversation's notification time,
+    // so the newest such time signals direct messages alongside the room.
+    let direct_message_marker = home_state
+        .notifications
+        .entries
+        .iter()
+        .filter(|entry| crate::notifications::is_direct_message_notification_id(&entry.id))
+        .map(|entry| entry.created_at)
+        .max()
+        .unwrap_or_default();
+    let room_signature = format!(
+        "{}:dm{direct_message_marker}",
+        home_room_realtime_signature(&home_state.room)
+    );
     let mut notifications = home_state.notifications;
     let wallet_approvals = system_wallet_approvals_summary(state, authority, false).await;
     let mut wallet_request_signature = wallet_approvals
@@ -5349,8 +5362,9 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         .collect::<Vec<_>>();
     sessions.sort();
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         room.room_slug,
+        room.latest_seq,
         room.pending_count,
         room.active_session_count,
         room.member_count,
@@ -7781,6 +7795,14 @@ pub(super) async fn home_background_image(
 #[cfg(test)]
 mod home_realtime_tests {
     use super::*;
+
+    #[test]
+    fn room_realtime_signature_changes_when_a_message_arrives() {
+        let mut room = HomeRoomSummary::default();
+        let before = home_room_realtime_signature(&room);
+        room.latest_seq = 7;
+        assert_ne!(home_room_realtime_signature(&room), before);
+    }
 
     #[test]
     fn room_realtime_signature_ignores_session_last_seen_heartbeat() {

@@ -728,7 +728,11 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
 }
 
 fn disk_budget(needed: u64, available: u64, total: u64) -> anyhow::Result<()> {
-    ensure!(needed <= available.saturating_sub(total / 10), "Browser image preparation needs {needed} bytes while keeping 10% free space; free disk space and retry (previous set preserved)");
+    ensure!(
+        available <= total,
+        "Browser image free-space facts are inconsistent"
+    );
+    ensure!(needed <= available.saturating_sub(elastos_common::MIN_FREE_DISK_BYTES), "Browser image preparation needs {needed} bytes while keeping 15 GiB free space; free disk space and retry (previous set preserved)");
     Ok(())
 }
 
@@ -1102,8 +1106,14 @@ mod tests {
             b"operator-owned"
         );
         assert!(!temp.path().join("browser-vm").exists());
-        assert!(disk_budget(100, 199, 1000).is_err());
-        assert!(disk_budget(100, 200, 1000).is_ok());
+        let floor = elastos_common::MIN_FREE_DISK_BYTES;
+        let total = 1 << 40;
+        assert!(disk_budget(100, floor + 99, total).is_err());
+        assert!(disk_budget(100, floor + 100, total).is_ok());
+        assert!(
+            disk_budget(100, floor + 100, 1 << 50).is_ok(),
+            "large volumes need no more"
+        );
     }
 
     #[test]

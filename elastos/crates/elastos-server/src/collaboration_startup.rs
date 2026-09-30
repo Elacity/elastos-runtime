@@ -1199,6 +1199,7 @@ mod tests {
             temp.path().to_path_buf(),
             crate::setup::ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),

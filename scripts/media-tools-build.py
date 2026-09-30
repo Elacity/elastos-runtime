@@ -176,8 +176,8 @@ def main():
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     disk = shutil.disk_usage(output.parent)
-    if disk.free * 10 < disk.total or disk.free < 4 * 1024**3:
-        raise ValueError("Media build needs 4 GiB free and at least 10% free volume space")
+    if disk.free < 15 * 1024**3:
+        raise ValueError("Media build needs 15 GiB free volume space")
     with tempfile.TemporaryDirectory(prefix=".media-tools-build-", dir=output.parent) as temporary:
         work = Path(temporary)
         package = work / "media-tools"

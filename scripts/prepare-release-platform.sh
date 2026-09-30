@@ -129,8 +129,8 @@ for value in sys.argv[1:]:
     while not path.exists():
         path = path.parent
     usage = shutil.disk_usage(path)
-    if usage.free * 10 < usage.total:
-        raise SystemExit(f"At least 10% free space is required on the volume for {value}")
+    if usage.free < 15 * 1024**3:
+        raise SystemExit(f"At least 15 GiB free space is required on the volume for {value}")
 PY
 export CARGO_TARGET_DIR ELASTOS_RELEASE_VERSION="$VERSION"
 rustup target list --installed | grep -Fxq "$TARGET" || die "Required Rust target is not installed: $TARGET"

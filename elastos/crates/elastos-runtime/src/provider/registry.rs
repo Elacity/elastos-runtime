@@ -1489,7 +1489,7 @@ impl ProviderRegistry {
             || observation
                 .available_bytes
                 .checked_sub(required_bytes)
-                .is_none_or(|remaining| remaining < observation.capacity_bytes.div_ceil(10))
+                .is_none_or(|remaining| remaining < elastos_common::MIN_FREE_DISK_BYTES)
         {
             return Err(private_ipfs_unavailable());
         }
@@ -2965,7 +2965,7 @@ mod tests {
                     serde_json::json!({"status":"ok","data":{"cid":"bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"}})
                 }
                 "runtime_check_capacity" => serde_json::json!({"status":"ok","data":{
-                    "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":request["required_bytes"]
+                    "volume_id":7,"capacity_bytes":1_u64 << 40,"available_bytes":elastos_common::MIN_FREE_DISK_BYTES + 10,"required_bytes":request["required_bytes"]
                 }}),
                 _ => panic!("unexpected operation"),
             })
@@ -3361,7 +3361,7 @@ mod tests {
                 observed.available_bytes,
                 observed.required_bytes
             ),
-            (7, 1000, 110, 10)
+            (7, 1 << 40, elastos_common::MIN_FREE_DISK_BYTES + 10, 10)
         );
         assert_eq!(
             provider.requests.lock().await.as_slice(),
@@ -3369,7 +3369,7 @@ mod tests {
         );
         assert!(registry.check_local_ipfs_capacity(11).await.is_err());
         let valid = serde_json::json!({"status":"ok","data":{
-            "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
+            "volume_id":7,"capacity_bytes":1_u64 << 40,"available_bytes":elastos_common::MIN_FREE_DISK_BYTES + 10,"required_bytes":10
         }});
         let mut malformed = vec![
             serde_json::json!({"status":"ok"}),

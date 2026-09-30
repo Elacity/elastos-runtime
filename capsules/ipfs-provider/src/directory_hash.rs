@@ -637,6 +637,10 @@ pub(super) struct CapacityObservation {
     required_bytes: u64,
 }
 
+/// Free space kept after a backend write; mirrors
+/// `elastos_common::MIN_FREE_DISK_BYTES` in the Runtime workspace.
+const MIN_FREE_DISK_BYTES: u64 = 15 * 1024 * 1024 * 1024;
+
 fn capacity_observation(
     volume_id: u64,
     capacity_bytes: u64,
@@ -650,7 +654,7 @@ fn capacity_observation(
         || capacity_bytes == 0
         || available_bytes > capacity_bytes
         || !(1..=super::MAX_CAPACITY_REQUIRED_BYTES).contains(&required_bytes)
-        || remaining_bytes < capacity_bytes.div_ceil(10)
+        || remaining_bytes < MIN_FREE_DISK_BYTES
     {
         return Err(invalid("invalid or insufficient backend capacity"));
     }
@@ -1330,7 +1334,7 @@ mod tests {
         assert_eq!(capacity["data"]["required_bytes"], 1);
         let total = capacity["data"]["capacity_bytes"].as_u64().unwrap();
         let available = capacity["data"]["available_bytes"].as_u64().unwrap();
-        assert!(total > 0 && available <= total && available > total.div_ceil(10));
+        assert!(total > 0 && available <= total && available > MIN_FREE_DISK_BYTES);
         assert!(
             !child_data.join("ipfs-repo").exists(),
             "capacity must observe the daemon's repo, not the child's default"
@@ -1591,12 +1595,16 @@ mod tests {
     }
 
     #[test]
-    fn private_capacity_arithmetic_preserves_ten_percent_floor() {
-        let exact = capacity_observation(7, 1000, 110, 10).unwrap();
-        assert_eq!(exact.available_bytes - exact.required_bytes, 100);
-        assert!(capacity_observation(7, 1000, 110, 11).is_err());
-        assert!(capacity_observation(7, 1001, 110, 10).is_err());
-        assert!(capacity_observation(7, 1001, 111, 10).is_ok());
+    fn private_capacity_arithmetic_preserves_fixed_free_space_floor() {
+        let floor = MIN_FREE_DISK_BYTES;
+        let total = 1 << 40;
+        let exact = capacity_observation(7, total, floor + 10, 10).unwrap();
+        assert_eq!(exact.available_bytes - exact.required_bytes, floor);
+        assert!(capacity_observation(7, total, floor + 10, 11).is_err());
+        assert!(
+            capacity_observation(7, 1 << 50, floor + 10, 10).is_ok(),
+            "a larger volume needs no more free space"
+        );
         for (volume, total, available, required) in [
             (0, 1000, 110, 10),
             (7, 0, 0, 1),

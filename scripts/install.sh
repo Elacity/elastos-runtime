@@ -137,12 +137,14 @@ show_help() {
     echo "  --allow-unsigned      Skip signature verification (NOT recommended)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
+    echo "  --isolated            Keep this Home out of the shared Community room"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
     echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
     echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/model-catalog.json  Signed model catalog, when pinned"
+    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/collaboration-network-release-v1.json  Community network, when pinned"
     echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
@@ -759,7 +761,11 @@ finish_install() {
         return 0
     fi
     info "Setting up Home..."
-    "$runtime_bin" setup </dev/null || return $?
+    if [[ "${ISOLATED:-false}" == true ]]; then
+        "$runtime_bin" setup --isolated </dev/null || return $?
+    else
+        "$runtime_bin" setup </dev/null || return $?
+    fi
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."
         "$runtime_bin" home --browser </dev/tty || return $?
@@ -778,6 +784,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
 fi
 
 ALLOW_UNSIGNED=false
+ISOLATED=false
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 
@@ -802,6 +809,7 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
             PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
         --install-only) INSTALL_ONLY=true; shift ;;
+        --isolated) ISOLATED=true; shift ;;
         --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
@@ -1004,6 +1012,38 @@ if head != expected:
 PY
 fi
 
+# ── Download + verify the pinned Community network ───────────────────
+# The verified components.json names the network configuration head. Setup
+# installs it so this Home joins the shared Community room, unless isolated.
+
+NETWORK_HEAD=$(json_get "${TMPDIR}/components.json" '(d.get("collaboration_network") or {}).get("head_cid")')
+NETWORK_FILE="collaboration-network-release-v1.json"
+if [[ -n "$NETWORK_HEAD" ]]; then
+    if [[ -n "$PUBLISHER_GATEWAY" ]]; then
+        info "Downloading Community network from bootstrap publisher URL"
+        curl -fsSL --max-time 30 -o "${TMPDIR}/${NETWORK_FILE}" "${PG}/artifacts/${NETWORK_FILE}" \
+            || die "Failed to download Community network from ${PG}/artifacts/${NETWORK_FILE}; the current installation was preserved"
+    else
+        info "Downloading Community network by CID: ${NETWORK_HEAD} (bootstrap mode)"
+        ipfs_fetch "$NETWORK_HEAD" "${TMPDIR}/${NETWORK_FILE}"
+    fi
+    info "Verifying Community network head ${NETWORK_HEAD}..."
+    NETWORK_HEAD="$NETWORK_HEAD" python3 - "${TMPDIR}/${NETWORK_FILE}" <<'PY' \
+        || die "Downloaded Community network does not match the pin in components.json; the current installation was preserved"
+import base64
+import hashlib
+import os
+import pathlib
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+expected = os.environ["NETWORK_HEAD"]
+head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
+if head != expected:
+    raise SystemExit(f"Community network head {head} does not match pin {expected}")
+PY
+fi
+
 # ── Install (2 files) ────────────────────────────────────────────────
 
 DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
@@ -1068,6 +1108,12 @@ if [[ -n "$CATALOG_HEAD" ]]; then
     info "Installing signed model catalog ${CATALOG_HEAD} to ${DATA_DIR}/..."
     (umask 077; cp "${TMPDIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json")
     chmod 600 "${DATA_DIR}/model-catalog.json"
+fi
+
+if [[ -n "$NETWORK_HEAD" ]]; then
+    info "Staging Community network ${NETWORK_HEAD} in ${DATA_DIR}/..."
+    (umask 077; cp "${TMPDIR}/${NETWORK_FILE}" "${DATA_DIR}/${NETWORK_FILE}")
+    chmod 600 "${DATA_DIR}/${NETWORK_FILE}"
 fi
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"

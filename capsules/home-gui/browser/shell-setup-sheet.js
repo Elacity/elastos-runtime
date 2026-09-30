@@ -224,7 +224,7 @@ function renderSetupSheet(summary) {
     ? "Open System to check setup."
     : complete ? "Profile and Recovery Kit are ready."
     : profileReady && kitOutdated ? "Your Profile stays unchanged. Save the updated kit offline."
-    : profileReady ? "Keep the kit offline. It restores your account if you lose your passkey."
+    : profileReady ? "Keep the kit offline. It restores your account on a new device."
     : "Confirm your name and save the kit offline.";
   if (recoveryButton) {
     recoveryButton.textContent = complete ? "Ready" : unavailable ? "Open System"

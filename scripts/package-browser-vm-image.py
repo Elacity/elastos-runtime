@@ -19,6 +19,9 @@ import tempfile
 MAX_ARCHIVE_SIZE = 64 * 1024 * 1024 * 1024
 
 
+MIN_FREE_DISK_BYTES = 15 * 1024**3
+
+
 class PackageWriter:
     """Bound compressed output and retain the installation volume's free space."""
     def __init__(self, raw, directory):
@@ -31,8 +34,8 @@ class PackageWriter:
         if self.size - self.checkpoint >= 16 * 1024 * 1024:
             usage = shutil.disk_usage(self.directory)
             # Reserve the next check interval as well as this output chunk.
-            if usage.free - len(data) - 16 * 1024 * 1024 < usage.total // 10:
-                raise ValueError("image packaging must keep 10% free disk space")
+            if usage.free - len(data) - 16 * 1024 * 1024 < MIN_FREE_DISK_BYTES:
+                raise ValueError("image packaging must keep 15 GiB free disk space")
             self.checkpoint = self.size
         written = self.raw.write(data)
         self.size += written
