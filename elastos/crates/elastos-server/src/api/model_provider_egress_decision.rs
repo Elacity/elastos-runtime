@@ -164,7 +164,7 @@ fn lock() -> &'static Mutex<()> {
     DECISION_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-// Inbox End holds this across its admission wait and decision write. Other
+// Product End holds this across its decision write and admission drain. Other
 // product decision transitions take it before changing the same decision.
 pub(super) fn transition_gate() -> &'static tokio::sync::Mutex<()> {
     TRANSITION_GATE.get_or_init(|| tokio::sync::Mutex::new(()))

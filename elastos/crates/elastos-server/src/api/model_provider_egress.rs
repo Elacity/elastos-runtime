@@ -148,7 +148,7 @@ pub(super) async fn hold_admission_for_test(
     }
 }
 
-/// Signal admitted sends first; End commits only after they release admission.
+/// After durable End succeeds, stop admitted sends and drain their admission.
 pub(crate) async fn begin_hosted_end(data_dir: &Path, offer_id: &str) -> HostedEndGuard {
     let gate = admission_gate(data_dir, offer_id);
     gate.ending.fetch_add(1, Ordering::AcqRel);

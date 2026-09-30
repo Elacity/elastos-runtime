@@ -15,10 +15,33 @@ pub(super) fn hosted_setup_gate() -> &'static tokio::sync::Mutex<()> {
     GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-async fn discard_staged_setup(data_dir: &std::path::Path, id: &str) -> anyhow::Result<()> {
+async fn discard_staged_setup(
+    data_dir: &std::path::Path,
+    id: &str,
+    authorize: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let _guard = hosted_setup_gate().lock().await;
-    let _end = crate::api::model_provider_egress::begin_hosted_end(data_dir, id).await;
-    crate::api::model_provider_config::discard_staged_hosted_key(data_dir, id)
+    #[cfg(unix)]
+    let _transition = crate::api::model_provider_egress_decision::transition_gate()
+        .lock()
+        .await;
+    authorize()?;
+    crate::api::model_provider_config::require_staged_hosted_key(data_dir, id)?;
+    #[cfg(unix)]
+    let _end = if crate::api::model_provider_egress_decision::end_offer(data_dir, id)? > 0 {
+        Some(crate::api::model_provider_egress::begin_hosted_end(data_dir, id).await)
+    } else {
+        None
+    };
+    authorize()?;
+    crate::api::model_provider_config::discard_staged_hosted_key(data_dir, id)?;
+    #[cfg(unix)]
+    let _cleanup_end = if _end.is_none() {
+        Some(crate::api::model_provider_egress::begin_hosted_end(data_dir, id).await)
+    } else {
+        None
+    };
+    Ok(())
 }
 
 const HOSTED_EXTERNAL_HTTPS_PAUSED: &str =
@@ -536,6 +559,13 @@ pub(super) async fn system_approval_lens_revoke(
         return system_error_response(err);
     }
     let _setup = hosted_setup_gate().lock().await;
+    #[cfg(unix)]
+    let _transition = crate::api::model_provider_egress_decision::transition_gate()
+        .lock()
+        .await;
+    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
+        return system_error_response(err);
+    }
     #[cfg(target_os = "macos")]
     let operator_applies = match crate::api::model_provider_egress::operator_hosted_end_applicable(
         &state.data_dir,
@@ -544,14 +574,6 @@ pub(super) async fn system_approval_lens_revoke(
         Ok(applies) => applies,
         Err(err) => return system_error_response(err),
     };
-    #[cfg(target_os = "macos")]
-    let _operator_end = if operator_applies {
-        Some(crate::api::model_provider_egress::begin_operator_hosted_end(&state.data_dir).await)
-    } else {
-        None
-    };
-    #[cfg(unix)]
-    let _end = crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &req.id).await;
     #[cfg(unix)]
     let ended_https =
         match crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &req.id) {
@@ -562,25 +584,44 @@ pub(super) async fn system_approval_lens_revoke(
     let ended_https = 0;
     #[cfg(target_os = "macos")]
     let ended_operator = if operator_applies {
-        match crate::api::model_provider_egress::end_operator_hosted_access(
-            &state.data_dir,
-            &req.id,
-        ) {
-            Ok(ended) => ended,
-            Err(err) => return system_error_response(err),
-        }
+        crate::api::model_provider_egress::end_operator_hosted_access(&state.data_dir, &req.id)
     } else {
-        false
+        Ok(false)
+    };
+    let jev_active = crate::jev_approval_lens::approved_connection(&state.data_dir, &req.id);
+    let ended_jev = if jev_active {
+        crate::jev_approval_lens::end_connection_approval(&state.data_dir, &req.id)
+    } else {
+        Ok(())
+    };
+    // Durable authority changes precede cancellation. Drain in the same
+    // operator-before-offer order used by forward admission.
+    #[cfg(target_os = "macos")]
+    let _operator_end = if ended_operator.as_ref().is_ok_and(|ended| *ended) {
+        Some(crate::api::model_provider_egress::begin_operator_hosted_end(&state.data_dir).await)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let _end = if ended_https > 0 {
+        Some(crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &req.id).await)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let ended_operator = match ended_operator {
+        Ok(ended) => ended,
+        Err(err) if ended_https > 0 => {
+            return system_error_response(err.context(
+                "Saved hosted approval ended; temporary operator access still needs End",
+            ));
+        }
+        Err(err) => return system_error_response(err),
     };
     #[cfg(not(target_os = "macos"))]
     let ended_operator = false;
-    let jev_active = crate::jev_approval_lens::approved_connection(&state.data_dir, &req.id);
-    if jev_active {
-        if let Err(err) =
-            crate::jev_approval_lens::end_connection_approval(&state.data_dir, &req.id)
-        {
-            return system_error_response(err);
-        }
+    if let Err(err) = ended_jev {
+        return system_error_response(err);
     }
     if ended_https == 0 && !ended_operator && !jev_active {
         return system_error_response(anyhow::anyhow!("hosted connection has no active approval"));
@@ -890,6 +931,13 @@ pub(super) async fn system_ai_provider_delete(
         return system_error_response(err);
     }
     let _setup = hosted_setup_gate().lock().await;
+    #[cfg(unix)]
+    let _transition = crate::api::model_provider_egress_decision::transition_gate()
+        .lock()
+        .await;
+    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
+        return system_error_response(err);
+    }
     let offer_id = match resolve_hosted_instance_id(
         &state.data_dir,
         req.id.as_deref(),
@@ -899,18 +947,39 @@ pub(super) async fn system_ai_provider_delete(
         Err(err) => return system_error_response(err),
     };
     #[cfg(unix)]
-    let _end =
-        crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &offer_id).await;
+    let ended =
+        match crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &offer_id) {
+            Ok(ended) => ended,
+            Err(err) => return system_error_response(err),
+        };
     #[cfg(unix)]
-    if let Err(err) =
-        crate::api::model_provider_egress_decision::end_offer(&state.data_dir, &offer_id)
-    {
-        return system_error_response(err);
-    }
+    let _end = if ended > 0 {
+        Some(crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &offer_id).await)
+    } else {
+        None
+    };
     let _model_share_guard = super::gateway_model_service::model_share_gate()
         .write()
         .await;
-    match crate::api::remove_hosted_offer(
+    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
+        return system_error_response(err);
+    }
+    if let Err(err) = crate::api::model_provider_config::remove_hosted_offer_configuration(
+        &state.data_dir,
+        &offer_id,
+    ) {
+        return system_error_response(err);
+    }
+    #[cfg(unix)]
+    let _removal_end = if _end.is_none() {
+        Some(crate::api::model_provider_egress::begin_hosted_end(&state.data_dir, &offer_id).await)
+    } else {
+        None
+    };
+    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
+        return system_error_response(err);
+    }
+    match crate::api::model_provider_config::finish_hosted_offer_removal(
         &state.data_dir,
         state.provider_registry.as_deref(),
         &offer_id,
@@ -933,7 +1002,11 @@ pub(super) async fn system_ai_provider_discard_staged(
     let Some(id) = req.id.as_deref() else {
         return system_error_response(anyhow::anyhow!("staged hosted connection id required"));
     };
-    match discard_staged_setup(&state.data_dir, id).await {
+    match discard_staged_setup(&state.data_dir, id, || {
+        require_system_admin(&state.data_dir, &headers).map(|_| ())
+    })
+    .await
+    {
         Ok(()) => Json(serde_json::json!({"discarded": true})).into_response(),
         Err(err) => system_error_response(err),
     }
@@ -1035,7 +1108,7 @@ mod parse_tests {
             "fixture-key",
         )
         .unwrap();
-        let mut discard = Box::pin(super::discard_staged_setup(dir.path(), id));
+        let mut discard = Box::pin(super::discard_staged_setup(dir.path(), id, || Ok(())));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), &mut discard)
                 .await
