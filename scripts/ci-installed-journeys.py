@@ -70,7 +70,10 @@ def run(home, data, evidence):
         subprocess.run(["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence)], env=environment, check=True)
         record["results"].update(json.loads((evidence / "home-journey.json").read_text())["results"])
     finally:
-        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             child.wait(timeout=15)
         except subprocess.TimeoutExpired:

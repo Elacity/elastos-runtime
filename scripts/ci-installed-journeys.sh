@@ -11,6 +11,25 @@ mkdir -p "$EVIDENCE"
 
 case "${1:-}" in
     prepare)
+        if [[ "$(uname -s)-$(uname -m)" == Linux-aarch64 ]]; then
+            # #97's Carrier fixture already installs this pinned archive through
+            # Runtime setup. Reuse its complete verified bundle and receipt.
+            python3 - "$DATA" "${HOME}/.elastos-ci/carrier-fixture/xdg-data/elastos" <<'PY'
+import hashlib, json, shutil, sys
+from pathlib import Path
+data, fixture = map(Path, sys.argv[1:])
+info = json.loads((data / "components.json").read_text())["external"]["llama-server"]["platforms"]["linux-arm64"]
+bundle = fixture / info["install_path"]
+receipt = json.loads((bundle / ".elastos-engine.json").read_text())
+assert receipt["platform"] == "linux-arm64"
+assert receipt["archive_sha256"] == info["checksum"]
+binary = next(row for row in receipt["entries"] if row["path"] == "llama-server")
+assert "sha256:" + hashlib.file_digest((bundle / "llama-server").open("rb"), "sha256").hexdigest() == binary["sha256"]
+destination = data / info["install_path"]
+destination.parent.mkdir(parents=True, exist_ok=True)
+shutil.copytree(bundle, destination, symlinks=True)
+PY
+        fi
         # The existing verifier owns the pinned weight and license identities.
         scripts/pinned-model-consumer-proof.sh "${CI_HOME}/model-inputs" --fetch --check-inputs
         node scripts/ci-model-package.mjs "$DATA" "${CI_HOME}/model-inputs/inputs" "$EVIDENCE"
