@@ -3348,8 +3348,6 @@ mod tests {
     fn local_llama_cancel_with_active_backend_settles_unknown_without_redispatch() {
         let root = temp_root("local-llama-cancel");
         let (offer, events, root) = local_llama_offer(&root, "active_after_disconnect");
-        let active = events.with_extension("active");
-        let release = events.with_extension("release");
         let mut provider = ProviderCoordinatorHandle::start();
         init_provider(&provider, &root, vec![offer.clone()]);
 
@@ -3361,9 +3359,18 @@ mod tests {
         let cancelled = cancel_run(&provider, run_id, &access_binding(&binding));
         assert_eq!(cancelled["data"]["status"], "reconciling");
         let terminal = wait_for_terminal(&provider, run_id, &access_binding(&binding));
-        wait_for_fake_llama_event(&events, "disconnected:stall");
-        assert!(active.exists(), "backend work outlives the HTTP consumer");
-        assert!(!release.exists());
+        wait_for_fake_llama_event(&events, "term");
+        let pid: i32 = fake_llama_events(&events)
+            .iter()
+            .find_map(|event| event.strip_prefix("start:"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "cancelled engine was retained"
+        );
         assert_eq!(terminal["data"]["status"], "settlement_unknown");
         let run = load_run(&root, run_id);
         assert_eq!(run.status, crate::contract::RunStatus::SettlementUnknown);
@@ -3397,7 +3404,6 @@ mod tests {
                 page["data"]["events"]
             );
         }
-        assert!(active.exists());
         assert_eq!(
             fake_llama_events(&events)
                 .iter()
@@ -3405,9 +3411,6 @@ mod tests {
                 .count(),
             1
         );
-        std::fs::write(&release, b"release").unwrap();
-        wait_for_fake_llama_event(&events, "work_stopped:stall");
-        assert!(!active.exists());
 
         let later_input = text_input("later");
         let later_binding = create_binding("request:local-later", &offer, &later_input);
@@ -3429,7 +3432,7 @@ mod tests {
                 .iter()
                 .filter(|line| line.starts_with("start:"))
                 .count(),
-            1
+            2
         );
         provider.shutdown_on_eof();
         let settled_events = fake_llama_events(&events);
@@ -3515,7 +3518,21 @@ mod tests {
         let blocked_binding =
             create_binding("request:local-timeout-blocked", &offer, &blocked_input);
         let blocked = create_run(&provider, &offer, &blocked_binding, &blocked_input);
-        assert_eq!(blocked["data"]["terminal"]["error"]["code"], "model_busy");
+        assert_eq!(blocked["data"]["status"], "running");
+        let queued_id = blocked["data"]["run_id"].as_str().unwrap();
+        cancel_run(&provider, queued_id, &access_binding(&blocked_binding));
+        assert_eq!(
+            wait_for_terminal(&provider, queued_id, &access_binding(&blocked_binding))["data"]
+                ["status"],
+            "cancelled"
+        );
+        assert_eq!(
+            fake_llama_events(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            1
+        );
 
         assert_eq!(
             wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding))["data"]

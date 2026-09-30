@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(test))]
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::sleep;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -22,18 +22,30 @@ const MAX_GUARD_CONFIG_BYTES: usize = 12 * 1024;
 #[cfg(not(test))]
 const GUARD_START_TIMEOUT: Duration = Duration::from_secs(2);
 const GUARD_EXIT_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const LOCAL_RUN_QUEUE_CAPACITY: usize = 8;
+const IDLE_RELEASE_DELAY: Duration = Duration::from_secs(60);
 pub(crate) const INTERNAL_GUARD_ARG: &str = "--internal-local-llama-guard";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalLlamaFault {
     Failed,
     Timeout,
+    Busy,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
     runtime_sockets: Arc<RwLock<BTreeMap<String, String>>>,
+    run_slots: Arc<Semaphore>,
+    pub(crate) execution: Arc<Semaphore>,
+    idle_release: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Default for LocalLlamaEngines {
+    fn default() -> Self {
+        Self::with_runtime_sockets(BTreeMap::new())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +88,63 @@ impl LocalLlamaEngines {
         Self {
             engines: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_sockets: Arc::new(RwLock::new(sockets)),
+            run_slots: Arc::new(Semaphore::new(LOCAL_RUN_QUEUE_CAPACITY + 1)),
+            execution: Arc::new(Semaphore::new(1)),
+            idle_release: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn reserve_run(&self) -> Result<OwnedSemaphorePermit, LocalLlamaFault> {
+        self.run_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| LocalLlamaFault::Busy)
+    }
+
+    pub(crate) async fn cancel_idle_release(&self) {
+        if let Some(task) = self.idle_release.lock().await.take() {
+            task.abort();
+        }
+    }
+
+    pub(crate) async fn release_when_idle(&self) {
+        self.release_after(IDLE_RELEASE_DELAY).await;
+    }
+
+    async fn release_after(&self, delay: Duration) {
+        let mut idle_release = self.idle_release.lock().await;
+        if let Some(task) = idle_release.take() {
+            task.abort();
+        }
+        let engines = self.engines.clone();
+        let execution = self.execution.clone();
+        *idle_release = Some(tokio::spawn(async move {
+            sleep(delay).await;
+            let Ok(_permit) = execution.try_acquire() else {
+                return;
+            };
+            let mut engines = engines.lock().await;
+            let ids: Vec<_> = engines.keys().cloned().collect();
+            for id in ids {
+                // An unconfirmed close retains its child for the next exact retry.
+                let _ = close_engine(&mut engines, &id).await;
+            }
+        }));
+    }
+
+    pub(crate) async fn close_other_offers(&self, offer_id: &str) -> Result<(), LocalLlamaFault> {
+        let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
+            .await
+            .map_err(|_| LocalLlamaFault::Timeout)?;
+        let ids: Vec<_> = engines
+            .keys()
+            .filter(|id| id.as_str() != offer_id)
+            .cloned()
+            .collect();
+        for id in ids {
+            close_engine(&mut engines, &id).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn update_runtime_sockets(&self, sockets: BTreeMap<String, String>) {
@@ -215,6 +283,7 @@ impl LocalLlamaEngines {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), LocalLlamaFault> {
+        self.cancel_idle_release().await;
         let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
             .await
             .map_err(|_| LocalLlamaFault::Timeout)?;
@@ -895,6 +964,73 @@ mod tests {
             },
             events,
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_queue_is_bounded_across_offers_and_releases_cancelled_slot() {
+        let engines = LocalLlamaEngines::default();
+        let mut slots: Vec<_> = (0..=LOCAL_RUN_QUEUE_CAPACITY)
+            .map(|_| engines.reserve_run().unwrap())
+            .collect();
+        assert!(matches!(engines.reserve_run(), Err(LocalLlamaFault::Busy)));
+        slots.pop();
+        let replacement = engines.reserve_run().unwrap();
+        assert!(matches!(engines.reserve_run(), Err(LocalLlamaFault::Busy)));
+        drop((slots, replacement));
+        assert_eq!(
+            engines.run_slots.available_permits(),
+            LOCAL_RUN_QUEUE_CAPACITY + 1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_release_reaps_engine_and_active_run_preserves_it() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let pid = recorded_pid(&events);
+        let active = engines.execution.acquire().await.unwrap();
+        engines.release_after(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(50)).await;
+        assert!(process_exists(pid));
+        drop(active);
+        engines.release_after(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while engines.retains_artifacts().await {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!process_exists(pid));
+        engines.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn switch_closes_previous_engine_before_replacement() {
+        let (engines, engine, model, settings, events) = fixture("healthy");
+        engines
+            .endpoint("first", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let pid = recorded_pid(&events);
+        engines.close_other_offers("second").await.unwrap();
+        assert!(!process_exists(pid));
+        assert!(!engines.retains_artifacts().await);
+        engines
+            .endpoint("second", &engine, &model, &settings)
+            .await
+            .unwrap();
+        assert_eq!(
+            event_lines(&events)
+                .iter()
+                .filter(|line| line.starts_with("start:"))
+                .count(),
+            2
+        );
+        engines.shutdown().await.unwrap();
     }
 
     fn event_lines(path: &std::path::Path) -> Vec<String> {
