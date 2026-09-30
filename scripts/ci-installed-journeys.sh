@@ -102,15 +102,24 @@ PY
 "$2" installed_local_resource_lifecycle --ignored --exact --nocapture' \
             fixture "${EVIDENCE}/la04-${qualification}-cgroup.json" "$TEST_BIN" 2>&1 | tee "${EVIDENCE}/la04-${qualification}.log"
         done
-        python3 - "$EVIDENCE" <<'PY'
-import json, sys
+        python3 - "$EVIDENCE" "$DATA" "$FIXTURE" <<'PY'
+import hashlib, json, re, subprocess, sys
 from pathlib import Path
-root = Path(sys.argv[1])
+root, data, fixture = map(Path, sys.argv[1:])
 for qualification in ["low-memory", "lifecycle"]:
     text = (root / f"la04-{qualification}.log").read_text()
     assert text.count("test installed_local_resource_lifecycle ... ok") == 1
     assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in text
-(root / "la04-result.json").write_text(json.dumps({"la04_low_memory": "passed", "la04_lifecycle": "passed"}))
+sha = lambda path: hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+assert sha(fixture / "bin/model-provider") == sha(data / "bin/model-provider")
+assert sha(fixture / "first/model.gguf") == sha(fixture / "second/model.gguf") == "c4a3dd037301b6ecea31d6da37f5cd793ead920dd5ddfe6d589294628d6ce66a"
+record = {"candidate": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+          "provider_sha256": sha(data / "bin/model-provider"), "engine_sha256": sha(fixture / "first/engine/llama-server"),
+          "model_sha256": sha(fixture / "first/model.gguf"),
+          "qualifications": {"1GiB": {"expected_error": "model_memory_unavailable", "engine_descendants": 0}, "4GiB": {"lifecycle": "reply, busy, idle release, crash cleanup, recovery, shutdown"}},
+          "results": {"la04_low_memory": "passed", "la04_lifecycle": "passed"},
+          "elapsed_seconds": sum(float(re.search(r"finished in ([0-9.]+)s", (root / f"la04-{name}.log").read_text())[1]) for name in ["low-memory", "lifecycle"])}
+(root / "la04-result.json").write_text(json.dumps(record, indent=2))
 PY
         ;;
     summary)
