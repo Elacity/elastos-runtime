@@ -3808,3 +3808,26 @@ html[data-agent-reasoning="off"] .agent-thinking {
 :root[data-el-form-factor="phone"] :is(.agent-harness-new-chat, .agent-harness-home, .agent-harness-nav-row) {
   min-height: var(--el-touch-target);
 }
+
+:root[data-el-form-factor="phone"] .agent-harness-page-close {
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  border: 7px solid transparent;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] :is(.agent-configure-chip, .agent-prompt-reset) {
+  min-height: var(--el-touch-target);
+  border: solid transparent;
+  border-width: 8px 0;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] :is(.agent-prompt-check, .agent-prompt-param input) {
+  min-height: var(--el-touch-target);
+}
+
+/* Under 16px, iOS zooms the page when a field takes focus. */
+:root[data-el-form-factor="phone"] :is(.agent-prompt-textarea, .agent-prompt-param input) {
+  font-size: 16px;
+}
